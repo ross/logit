@@ -36,7 +36,12 @@ edges.
   `logit`-to-`logit` protocol for forwarding between nodes.
 - **Configuration:** YAML, validated against a JSON Schema published alongside the binary and
   generated directly from the Rust config types, so it cannot drift from what the binary actually
-  accepts.
+  accepts. Config is one flat graph of named **components** — each with a `type` and a `sources`
+  list of the other components it reads from — not a fixed inputs/transforms/outputs shape: a
+  listener has no sources, a sink has sources and is nobody's source, and anything in between can
+  feed as many downstream components as need it. See
+  [docs/design/pipeline-graph.md](design/pipeline-graph.md) and
+  [ADR 0009](adr/0009-component-graph-configuration.md).
 
 ## What this is not (for now)
 

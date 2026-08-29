@@ -41,7 +41,10 @@ already built that have a known, accepted rough edge.
   specifically "no installed signal handler," not "no drain logic at all."
 - **A named input/output referenced by more than one pipeline is a config-time error** — real
   fan-out/fan-in support (one input feeding multiple pipelines, or vice versa) is a legitimate future
-  need, not yet built (`crates/logit-cli/src/pipeline.rs`'s `validate_semantics`).
+  need, not yet built (`crates/logit-cli/src/pipeline.rs`'s `validate_semantics`). The proposed
+  component-graph config rework ([ADR 0009](adr/0009-component-graph-configuration.md),
+  [pipeline-graph.md](design/pipeline-graph.md)) is designed to remove this restriction natively —
+  arbitrary fan-out/fan-in is the normal case in that model, not a special case to add later.
 - **A Lua stage's `flush()` has no resource of its own at a timer tick** — unlike an `aggregate`
   stage, which tracks its own per-resource windows, a Lua stage's flushed events are stamped with
   whichever resource the worker most recently saw on a real batch (`crates/logit-cli/src/pipeline.rs`,
