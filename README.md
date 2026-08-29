@@ -6,9 +6,11 @@ agent — same binary, different config. See [docs/OVERVIEW.md](docs/OVERVIEW.md
 scope, [docs/adr/](docs/adr) for why the stack is what it is, and [docs/design/](docs/design) for
 the internal event model, the Lua scripting API, and the native wire protocol.
 
-**Status:** early design/scaffolding. The workspace compiles and the config schema pipeline works
-end to end; the actual pipeline (inputs → transforms → outputs) is not implemented yet. The v0.1
-target is statsd in, one Lua enrichment stage, InfluxDB 2.x out.
+**Status:** the v0.1 vertical slice works end to end — statsd in, a Lua enrichment stage, InfluxDB
+2.x out, via `logit run <config>`. [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml)
+is a working example; `script/server` runs it against the local test stack below. The one piece
+still missing for a *complete* v0.1 is the `aggregate` built-in transform — no built-in transforms
+are implemented yet, so `logit run` rejects a config that references one with a clear error.
 
 ## Development
 

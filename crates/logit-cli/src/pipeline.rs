@@ -35,7 +35,14 @@ pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
     let config: Config = serde_norway::from_str(&raw)
         .with_context(|| format!("parsing config file {}", path.display()))?;
     let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    run_config(config, base_dir).await
+}
 
+/// The rest of [`run_pipelines`], split out so it's callable with an in-memory `Config` --
+/// specifically so the validation this function does can be tested directly, without needing a
+/// real file on disk or (since validation happens before anything is resolved) any real sockets
+/// or HTTP calls either.
+async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
     if config.pipelines.is_empty() {
         anyhow::bail!("config defines no pipelines");
     }
@@ -48,6 +55,27 @@ pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
     for (pipeline_name, pipeline) in &config.pipelines {
+        // `PipelineConfig.inputs`/`outputs` are unconstrained `Vec`s (no `minItems` in the
+        // generated schema), so both empty shapes parse as valid config. Reject both explicitly,
+        // before resolving or spawning anything for this pipeline: `outputs: []` would otherwise
+        // have `run_pipeline_worker` silently discard every transformed batch forever (its
+        // `output_txs.split_last()` is `None`) while the input keeps consuming -- telemetry in,
+        // nothing out, no error anywhere. `inputs: []` would spawn no input tasks, so this
+        // pipeline's `batch_tx` drops at the end of this loop iteration, closing the worker
+        // thread's channel almost immediately -- if this is the only pipeline, `run_pipelines` can
+        // return `Ok(())` having done nothing at all.
+        if pipeline.inputs.is_empty() {
+            anyhow::bail!(
+                "pipeline '{pipeline_name}' has no inputs -- it would never receive any events"
+            );
+        }
+        if pipeline.outputs.is_empty() {
+            anyhow::bail!(
+                "pipeline '{pipeline_name}' has no outputs -- any events it processes would be \
+                 silently discarded"
+            );
+        }
+
         // Outputs first, so the worker thread below can be handed their senders directly.
         let mut output_txs = Vec::with_capacity(pipeline.outputs.len());
         for output_name in &pipeline.outputs {
@@ -64,13 +92,18 @@ pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
             let (tx, mut rx) = mpsc::channel::<EventBatch>(CHANNEL_CAPACITY);
             let output_name = output_name.clone();
             tasks.spawn(async move {
+                // `InfluxDbOutput::send` (and any other Output) already isolates per-event
+                // encoding failures internally -- an `Err` reaching here means the whole write
+                // failed (timeout, connection refused, a rejected request). Propagating via `?`
+                // rather than logging and continuing means a destination that's persistently
+                // broken (a bad token, a dead host) actually ends `logit run` with a real error,
+                // matching this module's documented "runs until the first task fails" contract --
+                // the alternative is reporting healthy forever while silently dropping every
+                // batch. There's no retry/backoff to soften this with yet (output buffering is
+                // still just a trait, no implementation -- logit-proto/src/buffer.rs); that's
+                // where a real answer to "don't die on one transient blip" belongs, not here.
                 while let Some(batch) = rx.recv().await {
-                    if let Err(err) = output.send(batch).await {
-                        // TODO: route through a proper diagnostics facility once one exists,
-                        // instead of stderr -- same gap noted in logit-inputs::statsd and
-                        // logit-outputs::influxdb.
-                        eprintln!("output '{output_name}': {err:#}");
-                    }
+                    output.send(batch).await.with_context(|| format!("output '{output_name}'"))?;
                 }
                 Ok(())
             });
@@ -257,7 +290,54 @@ fn run_pipeline_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logit_config::PipelineConfig;
     use logit_core::{interner::intern, AttrMap, MetricKind, MetricRecord, Payload};
+    use std::collections::HashMap;
+
+    fn influxdb_output_config() -> OutputConfig {
+        OutputConfig::InfluxDb {
+            url: "http://localhost:8086".to_string(),
+            org: "org".to_string(),
+            bucket: "bucket".to_string(),
+            token_env: "LOGIT_TEST_DEFINITELY_UNSET_TOKEN_VAR".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_with_no_inputs_is_rejected() {
+        // Otherwise: no input tasks get spawned, this pipeline's batch_tx drops at the end of the
+        // loop iteration, and (if it's the only pipeline) run_pipelines can return Ok(()) having
+        // done nothing at all -- no error, no sign anything is wrong.
+        let mut pipelines = HashMap::new();
+        pipelines.insert(
+            "p".to_string(),
+            PipelineConfig { inputs: vec![], transforms: vec![], outputs: vec!["out".to_string()] },
+        );
+        let mut outputs = HashMap::new();
+        outputs.insert("out".to_string(), influxdb_output_config());
+        let config = Config { inputs: HashMap::new(), outputs, pipelines };
+
+        let err = expect_err(run_config(config, PathBuf::new()).await);
+        assert!(err.to_string().contains("no inputs"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn pipeline_with_no_outputs_is_rejected() {
+        // Otherwise: run_pipeline_worker's output_txs.split_last() is None, so every transformed
+        // batch is silently discarded forever while the input keeps consuming -- telemetry in,
+        // nothing out, no error anywhere.
+        let mut inputs = HashMap::new();
+        inputs.insert("in".to_string(), InputConfig::Statsd { bind: "127.0.0.1:0".to_string() });
+        let mut pipelines = HashMap::new();
+        pipelines.insert(
+            "p".to_string(),
+            PipelineConfig { inputs: vec!["in".to_string()], transforms: vec![], outputs: vec![] },
+        );
+        let config = Config { inputs, outputs: HashMap::new(), pipelines };
+
+        let err = expect_err(run_config(config, PathBuf::new()).await);
+        assert!(err.to_string().contains("no outputs"), "got: {err}");
+    }
 
     fn counter_event(name: &str, value: f64) -> Event {
         Event {
