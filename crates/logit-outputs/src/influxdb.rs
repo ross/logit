@@ -7,7 +7,7 @@ use bytes::Bytes;
 use logit_core::interner::resolve;
 use logit_core::{Event, EventBatch, MetricKind, MetricRecord, Payload, Resource, Value};
 use logit_proto::{CodecError, Encoder};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 /// `reqwest` has no request timeout by default. Without one, a server that accepts the TCP
@@ -99,10 +99,10 @@ impl Encoder for InfluxLineEncoder {
         // part in identity, and a second point with the same identity overwrites the first
         // rather than coexisting. Two events in the same batch that share a measurement+tag-set
         // *and* timestamp would therefore collide silently; `encode_metric_line` disambiguates
-        // them by nudging the timestamp. This map holds, per series, the last timestamp actually
-        // emitted for it -- not just an occurrence count (see the comment at its use site for
-        // why a flat count isn't enough).
-        let mut series_last_timestamp: HashMap<String, i64> = HashMap::new();
+        // them. This map holds, per series, every timestamp actually allocated to it so far --
+        // not just the most recent one (see the comment at its use site for why that's not
+        // enough either).
+        let mut series_allocated_timestamps: HashMap<String, HashSet<i64>> = HashMap::new();
         for event in &batch.events {
             let Payload::Metric(metric) = &event.payload else {
                 continue;
@@ -116,7 +116,7 @@ impl Encoder for InfluxLineEncoder {
                 &batch.resource,
                 event,
                 metric,
-                &mut series_last_timestamp,
+                &mut series_allocated_timestamps,
             ) {
                 eprintln!("influxdb output: {err}");
             }
@@ -130,7 +130,7 @@ fn encode_metric_line(
     resource: &Resource,
     event: &Event,
     metric: &MetricRecord,
-    series_last_timestamp: &mut HashMap<String, i64>,
+    series_allocated_timestamps: &mut HashMap<String, HashSet<i64>>,
 ) -> Result<(), CodecError> {
     let fields = metric_fields(&metric.kind)?;
     if fields.is_empty() {
@@ -186,32 +186,39 @@ fn encode_metric_line(
         line.push_str(&escape_tag(&value));
     }
 
-    // Disambiguate same-series collisions within this batch (see `encode`'s comment). A flat
-    // "add 1ns per prior occurrence, in arrival order" scheme is *not* enough: it only produces
-    // distinct timestamps if same-series events already arrive in non-decreasing timestamp
-    // order. Out of order -- e.g. this series' events carry timestamps 101 then 100 -- the first
-    // gets stamped 101 (0 prior occurrences) and the second gets 100+1=101 too, colliding again.
-    // Instead, track the last timestamp actually *emitted* for this series and never go at or
-    // below it: `max(last + 1, event.timestamp)`. This is monotonic per series regardless of
-    // input order, and only perturbs a timestamp when there's an actual collision to avoid --
-    // an event whose own timestamp already clears the last emitted one keeps its real value.
+    // Disambiguate same-series collisions within this batch (see `encode`'s comment).
     //
+    // Two schemes were tried and rejected before this one:
+    // - "Add 1ns per prior occurrence, in arrival order" only produces distinct timestamps if
+    //   same-series events already arrive sorted. Out of order -- e.g. timestamps 101 then 100 --
+    //   the first gets stamped 101 (0 prior occurrences) and the second gets 100+1=101 too,
+    //   colliding again.
+    // - "Track the last timestamp emitted per series, enforce max(last+1, own)" fixes that, but
+    //   over-corrects: it forces every subsequent same-series event forward regardless of whether
+    //   its *own* timestamp actually collides with anything. For 101 then 100, it emits 101 then
+    //   102 -- even though 100 was completely free -- discarding a real, distinct timestamp for
+    //   no reason. The gap only grows with how out-of-order the input is.
+    //
+    // Correct approach: track every timestamp actually *allocated* to this series, and linearly
+    // probe forward from each event's own timestamp only while that exact slot is taken. An
+    // event whose timestamp isn't already used keeps it untouched, regardless of arrival order;
+    // only a genuine collision costs a 1ns nudge, and only until a free slot is found.
+    let occupied = series_allocated_timestamps.entry(line.clone()).or_default();
+    let mut timestamp = event.timestamp;
+    while occupied.contains(&timestamp) {
+        timestamp = timestamp.checked_add(1).ok_or_else(|| {
+            CodecError::Malformed(format!(
+                "no free timestamp slot for series {line:?} near {timestamp} (i64 overflow)"
+            ))
+        })?;
+    }
+    occupied.insert(timestamp);
+
     // This matters in practice today: `logit-inputs::statsd` assigns one timestamp to an entire
     // datagram, and its multi-value form (`name:1:2:3|c`) expands into several otherwise-
     // identical events, all sharing that timestamp -- a nanosecond-scale perturbation here is far
     // below any input's actual timing resolution, and far simpler than guessing at how to
     // aggregate same-series samples together, which the source protocol never specified.
-    let timestamp = match series_last_timestamp.entry(line.clone()) {
-        std::collections::hash_map::Entry::Occupied(mut last) => {
-            let next = (*last.get() + 1).max(event.timestamp);
-            *last.get_mut() = next;
-            next
-        }
-        std::collections::hash_map::Entry::Vacant(slot) => {
-            slot.insert(event.timestamp);
-            event.timestamp
-        }
-    };
 
     line.push(' ');
     for (i, (key, value)) in fields.iter().enumerate() {
@@ -518,11 +525,15 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_same_series_timestamps_still_disambiguate() {
-        // A flat "add 1ns per prior occurrence, in arrival order" scheme only produces distinct
-        // timestamps if same-series events already arrive sorted: the first event (ts=101, 0
-        // prior occurrences) gets stamped 101, and the second (ts=100, 1 prior occurrence) gets
-        // 100+1=101 too -- colliding again. This is the review's exact repro.
+    fn out_of_order_same_series_timestamps_keep_their_real_value_when_unoccupied() {
+        // A "track the last emitted timestamp, enforce max(last+1, own)" scheme fixes the
+        // original collision but over-corrects: it forces *every* subsequent same-series event
+        // forward regardless of whether its own timestamp actually collides with anything. For
+        // ts=101 then ts=100, that emits 101 then 102 -- even though 100 was completely free,
+        // discarding a real, distinct timestamp for no reason (and the gap only grows with how
+        // out-of-order the input is). The fix probes forward from each event's *own* timestamp,
+        // only advancing while that exact slot is already taken by this series -- so this must
+        // emit exactly 100 and 101, not 101 and 102.
         let events = vec![
             Event {
                 timestamp: 101,
@@ -545,14 +556,11 @@ mod tests {
         ];
 
         let out = encode(events);
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 2, "got: {out}");
-
-        let timestamps: std::collections::HashSet<&str> =
-            lines.iter().map(|l| l.rsplit(' ').next().unwrap()).collect();
-        assert_eq!(timestamps.len(), 2, "both points must get distinct timestamps: {out}");
-        assert!(out.contains("value=1"), "got: {out}");
-        assert!(out.contains("value=2"), "got: {out}");
+        assert!(out.contains("value=1 101"), "got: {out}");
+        assert!(
+            out.contains("value=2 100"),
+            "timestamp 100 was free and must be kept as-is, not bumped to 102: {out}"
+        );
     }
 
     #[tokio::test]
