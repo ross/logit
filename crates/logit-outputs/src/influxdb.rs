@@ -7,6 +7,13 @@ use bytes::Bytes;
 use logit_core::interner::resolve;
 use logit_core::{Event, EventBatch, MetricKind, MetricRecord, Payload, Resource, Value};
 use logit_proto::{CodecError, Encoder};
+use std::collections::HashMap;
+use std::time::Duration;
+
+/// `reqwest` has no request timeout by default. Without one, a server that accepts the TCP
+/// connection but never responds would hang this output's `send` future -- and the pipeline
+/// worker driving it -- indefinitely.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct InfluxDbOutput {
     url: String,
@@ -19,8 +26,28 @@ pub struct InfluxDbOutput {
 
 impl InfluxDbOutput {
     pub fn new(url: String, org: String, bucket: String, token: String) -> Self {
-        Self { url, org, bucket, token, client: reqwest::Client::new(), encoder: InfluxLineEncoder }
+        Self {
+            url,
+            org,
+            bucket,
+            token,
+            client: build_client(DEFAULT_TIMEOUT),
+            encoder: InfluxLineEncoder,
+        }
     }
+
+    /// Overrides the default 10s request timeout. Rebuilds the underlying HTTP client.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.client = build_client(timeout);
+        self
+    }
+}
+
+fn build_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("reqwest client should build with default TLS settings")
 }
 
 #[async_trait::async_trait]
@@ -68,15 +95,23 @@ struct InfluxLineEncoder;
 impl Encoder for InfluxLineEncoder {
     fn encode(&mut self, batch: &EventBatch) -> Result<Bytes, CodecError> {
         let mut buf = String::new();
+        // InfluxDB identifies a point by (measurement, tag set, timestamp) -- fields play no
+        // part in identity, and a second point with the same identity overwrites the first
+        // rather than coexisting. Two events in the same batch that share a measurement+tag-set
+        // *and* timestamp would therefore collide silently; `encode_metric_line` disambiguates
+        // them by nudging the timestamp, using this map to track what's been seen so far.
+        let mut series_seen: HashMap<String, i64> = HashMap::new();
         for event in &batch.events {
             let Payload::Metric(metric) = &event.payload else {
                 continue;
             };
-            // One bad metric (today, only a `Set` -- see `metric_fields`) shouldn't drop every
-            // other metric in the batch, so this logs and skips rather than propagating via `?`.
+            // One bad metric shouldn't drop every other metric in the batch, so this logs and
+            // skips rather than propagating via `?`.
             // TODO: route through a proper diagnostics facility once one exists, instead of
             // stderr -- same gap noted in logit-inputs::statsd.
-            if let Err(err) = encode_metric_line(&mut buf, &batch.resource, event, metric) {
+            if let Err(err) =
+                encode_metric_line(&mut buf, &batch.resource, event, metric, &mut series_seen)
+            {
                 eprintln!("influxdb output: {err}");
             }
         }
@@ -89,6 +124,7 @@ fn encode_metric_line(
     resource: &Resource,
     event: &Event,
     metric: &MetricRecord,
+    series_seen: &mut HashMap<String, i64>,
 ) -> Result<(), CodecError> {
     let fields = metric_fields(&metric.kind)?;
     if fields.is_empty() {
@@ -97,7 +133,23 @@ fn encode_metric_line(
         return Ok(());
     }
 
-    buf.push_str(&escape_measurement(resolve(metric.name)));
+    let measurement = resolve(metric.name);
+    // A line whose first character is '#' is a comment in line protocol -- a metric name that
+    // happens to start with '#' would otherwise be silently swallowed by InfluxDB (the write
+    // still reports success) rather than actually stored.
+    if measurement.starts_with('#') {
+        return Err(CodecError::Malformed(format!(
+            "measurement name {measurement:?} can't be encoded: a leading '#' is a line-protocol \
+             comment marker"
+        )));
+    }
+
+    // Built in a local buffer first, not `buf` directly: if a later step rejects (there are none
+    // right now, but there were -- see the tag-validation loop below, which used to write
+    // straight into `buf` and could leave a truncated, newline-less fragment behind on an
+    // invalid tag, corrupting whatever line got appended after it). Only a complete, valid line
+    // ever reaches `buf`.
+    let mut line = escape_measurement(measurement);
 
     // Tags: resource attributes (host, service, ...) first, event attributes override on key
     // collision -- an event-level tag is more specific than the batch-wide resource it came from.
@@ -106,44 +158,72 @@ fn encode_metric_line(
         tags.insert(resolve(key), value.clone());
     }
     for (key, value) in tags.iter() {
-        if let Some(v) = value_as_tag_string(value) {
-            buf.push(',');
-            buf.push_str(&escape_tag(resolve(key)));
-            buf.push('=');
-            buf.push_str(&escape_tag(&v));
+        let key = resolve(key);
+        let Some(value) = value_as_tag_string(value) else {
+            continue;
+        };
+        // InfluxDB 2.x rejects an empty tag value outright, and line protocol has no escape for
+        // an embedded newline in a tag value at all -- either would previously have corrupted or
+        // rejected this whole line (and, via the shared-buffer bug above, everything after it in
+        // the batch). Drop just this one tag rather than the whole metric: the point is still
+        // meaningful without it.
+        if key.is_empty()
+            || value.is_empty()
+            || key.contains(['\n', '\r'])
+            || value.contains(['\n', '\r'])
+        {
+            continue;
         }
+        line.push(',');
+        line.push_str(&escape_tag(key));
+        line.push('=');
+        line.push_str(&escape_tag(&value));
     }
 
-    buf.push(' ');
+    // Disambiguate same-series collisions within this batch (see `encode`'s comment) by nudging
+    // the timestamp 1ns per prior occurrence of this exact measurement+tag-set. This matters in
+    // practice today: `logit-inputs::statsd` assigns one timestamp to an entire datagram, and
+    // its multi-value form (`name:1:2:3|c`) expands into several otherwise-identical events, all
+    // sharing that timestamp. A 1ns perturbation is far below any input's actual timing
+    // resolution, and far simpler than guessing at how to aggregate same-series samples together
+    // -- the source protocol never specified a combining semantic for them.
+    let occurrence = series_seen.entry(line.clone()).or_insert(0);
+    let timestamp = event.timestamp + *occurrence;
+    *occurrence += 1;
+
+    line.push(' ');
     for (i, (key, value)) in fields.iter().enumerate() {
         if i > 0 {
-            buf.push(',');
+            line.push(',');
         }
-        buf.push_str(&escape_tag(key));
-        buf.push('=');
-        buf.push_str(value);
+        line.push_str(&escape_tag(key));
+        line.push('=');
+        line.push_str(value);
     }
+    line.push(' ');
+    line.push_str(&timestamp.to_string());
 
-    buf.push(' ');
-    buf.push_str(&event.timestamp.to_string());
+    buf.push_str(&line);
     buf.push('\n');
     Ok(())
 }
 
 /// The line-protocol field set for one metric. `Counter`/`Gauge` are a single `value` field;
-/// `Distribution` writes `count` plus a few fixed percentiles (meaningful today even for the
-/// single-sample sketches `logit-inputs::statsd` currently produces -- p50/p90/p99 of one sample
-/// are all just that sample). `Histogram`/`Summary` map their buckets/quantiles onto fields
-/// directly. `Set` has no encoding yet: it needs a real `HyperLogLog`
-/// (`logit_core::metric::HyperLogLog` is still a stub), so this returns an error rather than
-/// inventing a meaningless one.
+/// `Distribution` writes `count` (as an unsigned integer -- see [`format_uint`]) plus a few fixed
+/// percentiles (meaningful today even for the single-sample sketches `logit-inputs::statsd`
+/// currently produces -- p50/p90/p99 of one sample are all just that sample). `Histogram` maps
+/// its buckets onto fields directly; `Summary` maps its quantiles onto fields keyed by the raw
+/// quantile value rather than a rounded percentage, since rounding isn't collision-free (0.991
+/// and 0.994 would both round to "p99" and overwrite each other within one line's field set).
+/// `Set` has no encoding yet: it needs a real `HyperLogLog` (`logit_core::metric::HyperLogLog` is
+/// still a stub), so this returns an error rather than inventing a meaningless one.
 fn metric_fields(kind: &MetricKind) -> Result<Vec<(String, String)>, CodecError> {
     match kind {
         MetricKind::Counter(v) | MetricKind::Gauge(v) => {
             Ok(format_float(*v).map(|v| vec![("value".to_string(), v)]).unwrap_or_default())
         }
         MetricKind::Distribution(sketch) => {
-            let mut fields = vec![("count".to_string(), sketch.count().to_string())];
+            let mut fields = vec![("count".to_string(), format_uint(sketch.count() as u64))];
             for q in [0.5, 0.9, 0.99] {
                 if let Some(v) = sketch.quantile(q).and_then(format_float) {
                     fields.push((format!("p{}", (q * 100.0).round() as u32), v));
@@ -154,14 +234,12 @@ fn metric_fields(kind: &MetricKind) -> Result<Vec<(String, String)>, CodecError>
         MetricKind::Histogram { buckets } => Ok(buckets
             .iter()
             .filter_map(|(bound, count)| {
-                format_float(*bound).map(|b| (format!("bucket_{b}"), count.to_string()))
+                format_float(*bound).map(|b| (format!("bucket_{b}"), format_uint(*count)))
             })
             .collect()),
         MetricKind::Summary { quantiles } => Ok(quantiles
             .iter()
-            .filter_map(|(q, v)| {
-                format_float(*v).map(|v| (format!("p{}", (q * 100.0).round() as u32), v))
-            })
+            .filter_map(|(q, v)| format_float(*v).map(|v| (format!("q{q}"), v)))
             .collect()),
         MetricKind::Set(_) => {
             Err(CodecError::Malformed("Set metrics have no line-protocol encoding yet".to_string()))
@@ -175,6 +253,13 @@ fn metric_fields(kind: &MetricKind) -> Result<Vec<(String, String)>, CodecError>
 /// theoretical guard.)
 fn format_float(v: f64) -> Option<String> {
     v.is_finite().then(|| v.to_string())
+}
+
+/// Line-protocol unsigned-integer field (the `u` suffix, InfluxDB 2.x). Without it, a bare number
+/// is parsed as `f64` by default, which loses integer semantics and, above 2^53, exactness --
+/// real concerns for a count that legitimately grows past that in a long-running series.
+fn format_uint(v: u64) -> String {
+    format!("{v}u")
 }
 
 fn value_as_tag_string(v: &Value) -> Option<String> {
@@ -245,14 +330,41 @@ mod tests {
     }
 
     #[test]
-    fn distribution_line_has_count_and_percentiles() {
+    fn distribution_line_has_integer_count_and_percentiles() {
         let mut sketch = logit_core::DdSketch::new();
         sketch.add(120.0);
         let out = encode(vec![metric_event("latency", MetricKind::Distribution(sketch), &[])]);
-        assert!(out.starts_with("latency count=1,"));
+        assert!(
+            out.starts_with("latency count=1u,"),
+            "count should be an unsigned int field: {out}"
+        );
         assert!(out.contains("p50="));
         assert!(out.contains("p90="));
         assert!(out.contains("p99="));
+    }
+
+    #[test]
+    fn histogram_bucket_counts_are_unsigned_integers() {
+        let out = encode(vec![metric_event(
+            "resp.size",
+            MetricKind::Histogram { buckets: vec![(100.0, 5), (500.0, 2)] },
+            &[],
+        )]);
+        assert!(out.contains("bucket_100=5u"), "got: {out}");
+        assert!(out.contains("bucket_500=2u"), "got: {out}");
+    }
+
+    #[test]
+    fn summary_quantile_keys_do_not_collide_when_rounded_percentage_would() {
+        // 0.991 and 0.994 both round to "p99" under a percentage-rounding scheme -- the whole
+        // point of this test is that they must not collapse onto the same field key.
+        let out = encode(vec![metric_event(
+            "req.latency",
+            MetricKind::Summary { quantiles: vec![(0.991, 10.0), (0.994, 20.0)] },
+            &[],
+        )]);
+        assert!(out.contains("q0.991=10"), "got: {out}");
+        assert!(out.contains("q0.994=20"), "got: {out}");
     }
 
     #[test]
@@ -311,5 +423,107 @@ mod tests {
             }),
         };
         assert_eq!(encode(vec![log_event]), "");
+    }
+
+    #[test]
+    fn measurement_name_starting_with_hash_is_rejected_not_silently_dropped() {
+        // A line starting with '#' is a comment in line protocol -- writing it would make
+        // InfluxDB report success while storing nothing. It must be rejected up front instead.
+        let out = encode(vec![
+            metric_event("#requests", MetricKind::Counter(1.0), &[]),
+            metric_event("page.views", MetricKind::Counter(1.0), &[]),
+        ]);
+        assert!(!out.contains("#requests"), "got: {out}");
+        assert!(out.contains("page.views value=1"), "got: {out}");
+    }
+
+    #[test]
+    fn empty_tag_value_is_dropped_not_the_whole_metric() {
+        let out =
+            encode(vec![metric_event("page.views", MetricKind::Counter(1.0), &[("env", "")])]);
+        assert!(!out.contains("env="), "empty tag should be dropped entirely: {out}");
+        assert!(out.contains("page.views value=1"), "the rest of the point should survive: {out}");
+    }
+
+    #[test]
+    fn tag_value_with_embedded_newline_does_not_corrupt_the_rest_of_the_batch() {
+        // This used to write a truncated, newline-less fragment straight into the shared buffer
+        // and bail, corrupting whatever line got appended after it. Two full, valid lines must
+        // come out the other side of a batch containing a newline-poisoned tag value in between.
+        let out = encode(vec![
+            metric_event("ok.before", MetricKind::Counter(1.0), &[]),
+            metric_event("bad", MetricKind::Counter(1.0), &[("env", "prod\ninjected")]),
+            metric_event("ok.after", MetricKind::Counter(1.0), &[]),
+        ]);
+        assert!(out.contains("ok.before value=1"), "got: {out}");
+        assert!(out.contains("ok.after value=1"), "got: {out}");
+        assert!(!out.contains("injected"), "got: {out}");
+        assert_eq!(out.lines().count(), 3, "expected exactly 3 well-formed lines, got: {out}");
+    }
+
+    #[test]
+    fn multi_value_samples_in_one_batch_are_not_collapsed_by_influxdb_point_identity() {
+        // InfluxDB identifies a point by (measurement, tag set, timestamp); `logit-inputs::statsd`
+        // assigns one timestamp to an entire datagram, so its multi-value form (`name:1:2:3|c`)
+        // decodes into three events sharing a measurement, tag set, *and* timestamp. Written
+        // verbatim, the second and third would silently overwrite the first in InfluxDB, leaving
+        // only "3" stored. All three must survive as distinct points.
+        let same_ts = 1_700_000_000_000_000_000;
+        let events: Vec<Event> = [1.0, 2.0, 3.0]
+            .into_iter()
+            .map(|v| Event {
+                timestamp: same_ts,
+                attributes: AttrMap::new(),
+                payload: Payload::Metric(MetricRecord {
+                    name: logit_core::interner::intern("page.views"),
+                    kind: MetricKind::Counter(v),
+                    unit: None,
+                }),
+            })
+            .collect();
+
+        let out = encode(events);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "expected 3 distinct points, got: {out}");
+
+        let timestamps: std::collections::HashSet<&str> =
+            lines.iter().map(|l| l.rsplit(' ').next().unwrap()).collect();
+        assert_eq!(timestamps.len(), 3, "each point must get a distinct timestamp: {out}");
+
+        for value in ["value=1", "value=2", "value=3"] {
+            assert!(out.contains(value), "expected {value} to survive, got: {out}");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_times_out_against_a_stalled_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accepts the TCP connection (so this isn't just "connection refused") and then never
+        // responds -- the exact scenario a request timeout exists to catch.
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                std::mem::forget(stream); // keep it open; a dropped socket would close cleanly
+            }
+        });
+
+        let mut output = InfluxDbOutput::new(
+            format!("http://{addr}"),
+            "org".to_string(),
+            "bucket".to_string(),
+            "token".to_string(),
+        )
+        .with_timeout(Duration::from_millis(200));
+
+        let batch = batch_with(vec![metric_event("x", MetricKind::Counter(1.0), &[])]);
+        let start = std::time::Instant::now();
+        let result = output.send(batch).await;
+
+        assert!(result.is_err(), "expected the stalled write to time out, not hang or succeed");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "should have timed out at ~200ms, not hung: took {:?}",
+            start.elapsed()
+        );
     }
 }
