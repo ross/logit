@@ -1,0 +1,11 @@
+#!/bin/bash
+# Usage: script/audit
+# Supply-chain checks: the license/ban policy in deny.toml, and known vulnerabilities across the
+# dependency graph.
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+run cargo deny check
+run cargo audit

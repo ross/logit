@@ -10,5 +10,6 @@ description = "Internal event model: Event, Value, Resource, metric kinds, attri
 bytes.workspace = true
 smallvec.workspace = true
 lasso = { version = "0.7", features = ["multi-threaded"] }
+sketches-ddsketch.workspace = true
 
 [dev-dependencies]

@@ -1,0 +1,10 @@
+#!/bin/bash
+# Usage: script/console
+# Interactive shell in the dev container -- this project's equivalent of a REPL.
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+build_image
+${COMPOSE} run --rm dev bash

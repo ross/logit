@@ -27,20 +27,56 @@ pub enum MetricKind {
     },
 }
 
-/// Placeholder for a mergeable quantile sketch (chosen: `sketches-ddsketch`, per
+/// A mergeable quantile sketch, wrapping `sketches_ddsketch::DDSketch` (per
 /// `docs/design/data-model.md` -- merges with a guaranteed relative-error bound, unlike naive
-/// percentile-of-percentiles). Wraps the real crate's type once the `aggregate` processor is
-/// implemented; kept as a stub here so the core event model doesn't carry that dependency before
-/// anything uses it.
-#[derive(Debug, Clone, Default)]
-pub struct DdSketch {
-    // TODO: wrap `sketches_ddsketch::DDSketch`.
-    _todo: (),
+/// percentile-of-percentiles, which is load-bearing for the split-collection topology in
+/// `docs/OVERVIEW.md`).
+#[derive(Clone)]
+pub struct DdSketch(sketches_ddsketch::DDSketch);
+
+// `sketches_ddsketch::DDSketch` doesn't implement `Debug`; summarize instead of deriving.
+impl std::fmt::Debug for DdSketch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DdSketch").field("count", &self.0.count()).finish()
+    }
+}
+
+impl DdSketch {
+    pub fn new() -> Self {
+        Self(sketches_ddsketch::DDSketch::new(sketches_ddsketch::Config::defaults()))
+    }
+
+    pub fn add(&mut self, value: f64) {
+        self.0.add(value);
+    }
+
+    /// Merges `other` into `self`. Every `DdSketch` in this codebase is built with
+    /// `Config::defaults()` (via [`DdSketch::new`]), so the mismatched-config failure case this
+    /// can't-actually-happen -- if that stops being true, this needs a real `Result`.
+    pub fn merge(&mut self, other: &DdSketch) {
+        self.0.merge(&other.0).expect("DdSketch configs always match (Config::defaults())");
+    }
+
+    pub fn quantile(&self, q: f64) -> Option<f64> {
+        self.0.quantile(q).ok().flatten()
+    }
+
+    pub fn count(&self) -> usize {
+        self.0.count()
+    }
+}
+
+impl Default for DdSketch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Placeholder for a mergeable cardinality estimator (candidate: `cardinality-estimator`). Merges
 /// (unions) exactly by construction, which `Set` needs for the same distributed-aggregation
-/// reason `Distribution` needs `DdSketch`. See `docs/design/data-model.md`.
+/// reason `Distribution` needs `DdSketch`. See `docs/design/data-model.md`. Still a stub as of
+/// the statsd decoder (`crates/logit-inputs/src/statsd.rs`): its `s` (set) metric type returns a
+/// decode error rather than silently losing data until this is wired up.
 #[derive(Debug, Clone, Default)]
 pub struct HyperLogLog {
     // TODO: wrap a real HLL implementation.
