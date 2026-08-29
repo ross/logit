@@ -4,14 +4,18 @@ A logging, metrics, and tracing multiplexer: ingest over many protocols, transfo
 user-defined Lua and built-in parsers, emit to many destinations. Runs as a sidecar or a host
 agent — same binary, different config. See [docs/OVERVIEW.md](docs/OVERVIEW.md) for the full
 scope, [docs/adr/](docs/adr) for why the stack is what it is, [docs/design/](docs/design) for
-the internal event model, the Lua scripting API, and the native wire protocol, and
-[docs/known-gaps.md](docs/known-gaps.md) for already-identified rough edges in what's built so far.
+the internal event model, the Lua scripting API, the pipeline component graph, and the native wire
+protocol, and [docs/known-gaps.md](docs/known-gaps.md) for already-identified rough edges in what's
+built so far.
 
 **Status:** v0.1 is complete — statsd in, a 10s `aggregate` window, a Lua enrichment stage, InfluxDB
-2.x out, via `logit run <config>`. [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml)
+2.x out, via `logit run <config>`. Config is a flat graph of named components, each declaring its
+own `sources` ([ADR 0009](docs/adr/0009-component-graph-configuration.md),
+[docs/design/pipeline-graph.md](docs/design/pipeline-graph.md)) — `logit graph <config>` prints the
+resolved graph as graphviz DOT. [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml)
 is a working example; `script/server` runs it against the local test stack below. `aggregate` is the
 only built-in transform implemented so far — `logit run` rejects a config referencing any other
-`builtin:` stage with a clear error; see [ADR 0008](docs/adr/0008-aggregation-window-semantics.md)
+unimplemented kind with a clear error; see [ADR 0008](docs/adr/0008-aggregation-window-semantics.md)
 for its windowing semantics.
 
 ## Development
@@ -63,12 +67,14 @@ crates/
   logit-config      YAML config types + generated JSON Schema
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
-  logit-inputs      the Input trait; statsd
-  logit-outputs     the Output trait; InfluxDB
-  logit-transforms  built-in native transform stages; aggregate
+  logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution, the node runtime
+  logit-inputs      per-protocol listeners; statsd
+  logit-outputs     per-protocol sinks; InfluxDB
+  logit-transforms  built-in native transform components; aggregate
   logit-cli         the `logit` binary
 docs/
   OVERVIEW.md       project scope, ~1 page
   adr/              architecture decision records
-  design/           the event model, Lua API, and wire protocol design docs
+  design/           the event model, Lua API, pipeline component graph, and wire protocol design docs
+  plans/            staged implementation plans for larger, multi-session pieces of work
 ```

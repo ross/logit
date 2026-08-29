@@ -10,6 +10,7 @@
 
 use logit_core::interner::Symbol;
 use logit_core::{AttrMap, Event, MetricKind, MetricRecord, Payload, Resource, Value};
+use logit_pipeline::Transform;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -140,6 +141,23 @@ impl Aggregator {
                 (g.resource, events)
             })
             .collect()
+    }
+}
+
+/// `Aggregator`'s existing inherent methods already match `Transform`'s contract exactly (a
+/// deliberate match, not a coincidence -- see `crate::Transform`'s doc comment): this impl is
+/// pure delegation, no reshaping needed.
+impl Transform for Aggregator {
+    fn process(&mut self, resource: &Arc<Resource>, event: Event) -> Option<Event> {
+        Aggregator::process(self, resource, event)
+    }
+
+    fn flush_interval(&self) -> Option<Duration> {
+        Some(self.interval())
+    }
+
+    fn flush(&mut self, now: i64) -> Vec<(Arc<Resource>, Vec<Event>)> {
+        Aggregator::flush(self, now)
     }
 }
 

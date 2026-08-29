@@ -8,4 +8,5 @@ description = "Built-in native transform stages (no Lua VM involved) -- aggregat
 
 [dependencies]
 logit-core.workspace = true
+logit-pipeline.workspace = true
 thiserror.workspace = true

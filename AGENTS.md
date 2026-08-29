@@ -14,11 +14,16 @@ broken — it's likely a documented, deliberate gap, not an oversight.
 
 **Current state:** v0.1 is complete — statsd in, a 10s `aggregate` window, a Lua enrichment stage,
 InfluxDB 2.x out, via `logit run <config>` (see [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml),
-`script/server`). `aggregate` (`crates/logit-transforms`) is the only built-in transform implemented
-so far — `logit run` rejects a config referencing any other `builtin:` stage with a clear error; see
-[ADR 0008](docs/adr/0008-aggregation-window-semantics.md) for its windowing semantics,
-`crates/logit-inputs/src/statsd.rs` and `crates/logit-outputs/src/influxdb.rs` for the input/output
-side, `crates/logit-cli/src/pipeline.rs` for orchestration and the flush-tick timer.
+`script/server`). Config is a flat graph of named components (ADR 0009,
+[pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
+`logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
+is now just the kind → implementation registry. `logit graph <config>` prints the resolved graph as
+graphviz DOT (`crates/logit-cli/src/dot.rs`). `aggregate` (`crates/logit-transforms`) is the only
+built-in transform implemented so far — `logit run` rejects a config referencing any other
+unimplemented kind with a clear error; see [ADR 0008](docs/adr/0008-aggregation-window-semantics.md)
+for its windowing semantics, `crates/logit-inputs/src/statsd.rs` and
+`crates/logit-outputs/src/influxdb.rs` for the listener/sink side, `crates/logit-pipeline/src/runtime.rs`
+for orchestration and the per-node flush-tick timer.
 
 ## Environment
 
@@ -98,12 +103,17 @@ crates/
   logit-config      YAML config types + generated JSON Schema
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
-  logit-inputs      the Input trait; statsd (v0.1 target)
-  logit-outputs     the Output trait; InfluxDB (v0.1 target)
-  logit-transforms  built-in native transform stages; aggregate (v0.1 target), more to come
-  logit-cli         the `logit` binary
+  logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
+  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target)
+  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target)
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target)
+  logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
 ```
 
-A new protocol (input or output) implements `logit_proto::Decoder`/`Encoder` plus
-`logit_inputs::Input` or `logit_outputs::Output`, and gets a variant in `logit_config`'s
-`InputConfig`/`OutputConfig` — follow the `statsd`/`influxdb` stubs as the template.
+`logit-inputs`/`logit-outputs`/`logit-transforms` depend on `logit-pipeline` for their trait, not
+the other way around (`docs/design/pipeline-graph.md`'s "Crate layout" section) -- this is what
+keeps the pipeline runtime from having to know about any concrete protocol or transform. A new
+protocol (listener or sink) implements `logit_proto::Decoder`/`Encoder` plus
+`logit_pipeline::Input` or `logit_pipeline::Output`, and gets a variant in `logit_config`'s
+`ComponentKind` — follow the `statsd`/`influxdb` stubs as the template. A new native transform
+implements `logit_pipeline::Transform`, following `logit-transforms::Aggregator`.

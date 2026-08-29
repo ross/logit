@@ -674,10 +674,9 @@ dependencies = [
  "anyhow",
  "clap",
  "logit-config",
- "logit-core",
  "logit-inputs",
  "logit-outputs",
- "logit-script",
+ "logit-pipeline",
  "logit-transforms",
  "serde_json",
  "serde_norway",
@@ -711,6 +710,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "logit-core",
+ "logit-pipeline",
  "logit-proto",
  "tokio",
 ]
@@ -723,9 +723,23 @@ dependencies = [
  "async-trait",
  "bytes",
  "logit-core",
+ "logit-pipeline",
  "logit-proto",
  "logit-script",
  "reqwest",
+ "tokio",
+]
+
+[[package]]
+name = "logit-pipeline"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "logit-config",
+ "logit-core",
+ "logit-script",
+ "thiserror 1.0.69",
  "tokio",
 ]
 
@@ -753,6 +767,7 @@ name = "logit-transforms"
 version = "0.1.0"
 dependencies = [
  "logit-core",
+ "logit-pipeline",
  "thiserror 1.0.69",
 ]
 

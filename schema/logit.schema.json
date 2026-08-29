@@ -3,247 +3,19 @@
   "title": "Config",
   "type": "object",
   "properties": {
-    "inputs": {
-      "default": {},
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/definitions/InputConfig"
-      }
-    },
-    "outputs": {
-      "default": {},
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/definitions/OutputConfig"
-      }
-    },
-    "pipelines": {
+    "components": {
       "default": {},
       "type": "object",
       "minProperties": 1,
       "additionalProperties": {
-        "$ref": "#/definitions/PipelineConfig"
+        "$ref": "#/definitions/Component"
       }
     }
   },
   "definitions": {
-    "BuiltinTransformConfig": {
-      "oneOf": [
-        {
-          "type": "object",
-          "required": [
-            "builtin"
-          ],
-          "properties": {
-            "builtin": {
-              "type": "string",
-              "enum": [
-                "json"
-              ]
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "builtin"
-          ],
-          "properties": {
-            "builtin": {
-              "type": "string",
-              "enum": [
-                "logfmt"
-              ]
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "builtin"
-          ],
-          "properties": {
-            "builtin": {
-              "type": "string",
-              "enum": [
-                "kv"
-              ]
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "builtin",
-            "pattern"
-          ],
-          "properties": {
-            "builtin": {
-              "type": "string",
-              "enum": [
-                "regex"
-              ]
-            },
-            "pattern": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "builtin"
-          ],
-          "properties": {
-            "builtin": {
-              "type": "string",
-              "enum": [
-                "csv"
-              ]
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "builtin",
-            "from",
-            "to"
-          ],
-          "properties": {
-            "builtin": {
-              "type": "string",
-              "enum": [
-                "rename"
-              ]
-            },
-            "from": {
-              "type": "string"
-            },
-            "to": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "builtin",
-            "field"
-          ],
-          "properties": {
-            "builtin": {
-              "type": "string",
-              "enum": [
-                "remove"
-              ]
-            },
-            "field": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "builtin",
-            "where"
-          ],
-          "properties": {
-            "builtin": {
-              "type": "string",
-              "enum": [
-                "filter"
-              ]
-            },
-            "where": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "builtin",
-            "rate"
-          ],
-          "properties": {
-            "builtin": {
-              "type": "string",
-              "enum": [
-                "sample"
-              ]
-            },
-            "rate": {
-              "type": "number",
-              "format": "double"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "builtin",
-            "limit",
-            "window"
-          ],
-          "properties": {
-            "builtin": {
-              "type": "string",
-              "enum": [
-                "throttle"
-              ]
-            },
-            "limit": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0.0
-            },
-            "window": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "builtin",
-            "key"
-          ],
-          "properties": {
-            "builtin": {
-              "type": "string",
-              "enum": [
-                "dedup"
-              ]
-            },
-            "key": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "description": "The stateful aggregator (counters/gauges/sets/distributions). Runs `flush()` on `interval`; see `docs/design/lua-api.md`.",
-          "type": "object",
-          "required": [
-            "builtin",
-            "interval"
-          ],
-          "properties": {
-            "builtin": {
-              "type": "string",
-              "enum": [
-                "aggregate"
-              ]
-            },
-            "interval": {
-              "type": "string"
-            }
-          }
-        }
-      ]
-    },
-    "InputConfig": {
+    "Component": {
+      "description": "One node in the pipeline's component graph. `sources` names the other components this one reads events from -- empty for a listener, required for everything else (enforced at validation time, not in this schema: which arity is legal depends on `kind`, not something a blanket `minItems` on this shared field can express). See `docs/design/pipeline-graph.md` for the full arity table and validation rules.",
+      "type": "object",
       "oneOf": [
         {
           "description": "statsd / DogStatsD-style tagged metrics over UDP.",
@@ -259,7 +31,7 @@
             "type": {
               "type": "string",
               "enum": [
-                "statsd"
+                "statsd_in"
               ]
             }
           }
@@ -278,7 +50,7 @@
             "type": {
               "type": "string",
               "enum": [
-                "syslog"
+                "syslog_in"
               ]
             }
           }
@@ -297,7 +69,7 @@
             "type": {
               "type": "string",
               "enum": [
-                "otlp"
+                "otlp_in"
               ]
             }
           }
@@ -345,16 +117,278 @@
             "type": {
               "type": "string",
               "enum": [
-                "logit"
+                "logit_in"
               ]
             }
           }
-        }
-      ]
-    },
-    "OutputConfig": {
-      "oneOf": [
+        },
         {
+          "description": "Inline Lua source (a YAML block scalar in practice). See `docs/design/lua-api.md`.",
+          "type": "object",
+          "required": [
+            "script",
+            "type"
+          ],
+          "properties": {
+            "interval": {
+              "description": "Runs this component's `flush()`, if the script defines one, on this interval (`docs/design/lua-api.md`'s flush contract). Omitted -- the common case -- means the component never ticks, same as a script with no `flush()` at all.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "script": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "lua"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A `.lua` file path, relative to the config file.",
+          "type": "object",
+          "required": [
+            "lua_file",
+            "type"
+          ],
+          "properties": {
+            "interval": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "lua_file": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "lua_file"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The stateful aggregator (counters/gauges/sets/distributions). Runs `flush()` on `interval`; see `docs/adr/0008-aggregation-window-semantics.md`.",
+          "type": "object",
+          "required": [
+            "interval",
+            "type"
+          ],
+          "properties": {
+            "interval": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "aggregate"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "json"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "logfmt"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "kv"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "pattern",
+            "type"
+          ],
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "regex"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "csv"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "from",
+            "to",
+            "type"
+          ],
+          "properties": {
+            "from": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "rename"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "field",
+            "type"
+          ],
+          "properties": {
+            "field": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "remove"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "where"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "filter"
+              ]
+            },
+            "where": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "rate",
+            "type"
+          ],
+          "properties": {
+            "rate": {
+              "type": "number",
+              "format": "double"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "sample"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "limit",
+            "type",
+            "window"
+          ],
+          "properties": {
+            "limit": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "throttle"
+              ]
+            },
+            "window": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "key",
+            "type"
+          ],
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "dedup"
+              ]
+            }
+          }
+        },
+        {
+          "description": "`rename`d explicitly: `rename_all = \"snake_case\"` alone would tag this `influx_db_out` (a word break at the embedded capital `Db`), not `influxdb_out` as published in `docs/design/pipeline-graph.md` and every example config.",
           "type": "object",
           "required": [
             "bucket",
@@ -377,7 +411,7 @@
             "type": {
               "type": "string",
               "enum": [
-                "influx_db"
+                "influxdb_out"
               ]
             },
             "url": {
@@ -398,7 +432,7 @@
             "type": {
               "type": "string",
               "enum": [
-                "otlp"
+                "otlp_out"
               ]
             }
           }
@@ -417,90 +451,21 @@
             "type": {
               "type": "string",
               "enum": [
-                "logit"
+                "logit_out"
               ]
             }
           }
         }
-      ]
-    },
-    "PipelineConfig": {
-      "description": "One named pipeline: inputs feed transforms feed outputs. See `docs/design/lua-api.md` for the transform chain's config shape.\n\n`inputs`/`outputs` are marked `minItems: 1` in the generated schema -- `logit run` rejects a pipeline with either empty (see `logit-cli::pipeline::validate_semantics`), so the schema shouldn't claim otherwise (ADR 0003).",
-      "type": "object",
-      "required": [
-        "inputs",
-        "outputs"
       ],
       "properties": {
-        "inputs": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "minItems": 1
-        },
-        "outputs": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "minItems": 1
-        },
-        "transforms": {
+        "sources": {
           "default": [],
           "type": "array",
           "items": {
-            "$ref": "#/definitions/TransformConfig"
+            "type": "string"
           }
         }
       }
-    },
-    "TransformConfig": {
-      "description": "A transform pipeline stage. Built-in native processors (no Lua VM involved) are meant to sit in front of user Lua in the same chain -- \"parse the JSON body, then run my logic\" -- rather than being an either/or with scripting. See `docs/design/lua-api.md`.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/BuiltinTransformConfig"
-        },
-        {
-          "description": "Inline Lua source (a YAML block scalar in practice).",
-          "type": "object",
-          "required": [
-            "lua"
-          ],
-          "properties": {
-            "interval": {
-              "description": "Runs this stage's `flush()`, if the script defines one, on this interval (`docs/design/lua-api.md`'s flush contract). Omitted -- the common case -- means the stage never ticks, same as a script with no `flush()` at all.",
-              "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "lua": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "description": "A `.lua` file path, relative to the config file.",
-          "type": "object",
-          "required": [
-            "lua_file"
-          ],
-          "properties": {
-            "interval": {
-              "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "lua_file": {
-              "type": "string"
-            }
-          }
-        }
-      ]
     }
   }
 }

@@ -4,6 +4,14 @@
 //! published JSON Schema (`logit schema`, `schema/logit.schema.json`) can never drift from what
 //! the binary actually accepts. YAML parsing itself (via a maintained `serde_yaml` fork, per
 //! ADR 0003) belongs to `logit-cli`, not here -- this crate only defines the shape.
+//!
+//! Config is one flat graph of named [`Component`]s (ADR 0009,
+//! `docs/design/pipeline-graph.md`) -- there is no separate inputs/outputs/pipelines split. A
+//! component's `sources` name the other components it reads from; its `type`-tagged
+//! [`ComponentKind`] fixes its arity (a listener has none, a sink has at least one and is never
+//! itself a source, a transform has both). Resolving that graph into something runnable -- cycle
+//! detection, arity checks, topological ordering -- is `logit-cli`/`logit-pipeline`'s job, not
+//! this crate's; this crate only defines the shape serde and `schemars` need to agree on.
 
 use schemars::{gen::SchemaGenerator, schema::Schema, JsonSchema};
 use serde::{Deserialize, Serialize};
@@ -13,47 +21,50 @@ use std::time::Duration;
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
     #[serde(default)]
-    pub inputs: HashMap<String, InputConfig>,
-    #[serde(default)]
-    pub outputs: HashMap<String, OutputConfig>,
-    #[serde(default)]
-    #[schemars(schema_with = "non_empty_pipelines_schema")]
-    pub pipelines: HashMap<String, PipelineConfig>,
+    #[schemars(schema_with = "non_empty_components_schema")]
+    pub components: HashMap<String, Component>,
 }
 
-fn non_empty_pipelines_schema(generator: &mut SchemaGenerator) -> Schema {
-    let mut schema = HashMap::<String, PipelineConfig>::json_schema(generator);
+fn non_empty_components_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = HashMap::<String, Component>::json_schema(generator);
     if let Schema::Object(schema) = &mut schema {
         schema.object().min_properties = Some(1);
     }
     schema
 }
 
-/// One named pipeline: inputs feed transforms feed outputs. See `docs/design/lua-api.md` for the
-/// transform chain's config shape.
-///
-/// `inputs`/`outputs` are marked `minItems: 1` in the generated schema -- `logit run` rejects a
-/// pipeline with either empty (see `logit-cli::pipeline::validate_semantics`), so the schema
-/// shouldn't claim otherwise (ADR 0003).
+/// One node in the pipeline's component graph. `sources` names the other components this one
+/// reads events from -- empty for a listener, required for everything else (enforced at
+/// validation time, not in this schema: which arity is legal depends on `kind`, not something a
+/// blanket `minItems` on this shared field can express). See `docs/design/pipeline-graph.md` for
+/// the full arity table and validation rules.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct PipelineConfig {
-    #[schemars(length(min = 1))]
-    pub inputs: Vec<String>,
+pub struct Component {
     #[serde(default)]
-    pub transforms: Vec<TransformConfig>,
-    #[schemars(length(min = 1))]
-    pub outputs: Vec<String>,
+    pub sources: Vec<String>,
+    #[serde(flatten)]
+    pub kind: ComponentKind,
 }
 
+/// A component's kind, tagged by `type` in config. Every protocol kind is suffixed `_in`/`_out`
+/// uniformly (`docs/design/pipeline-graph.md`'s naming rationale) so a listener and a sink for the
+/// same protocol never collide on one tag value; transform kinds take no suffix, since there's
+/// only one direction for a transform to be.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum InputConfig {
+pub enum ComponentKind {
     /// statsd / DogStatsD-style tagged metrics over UDP.
-    Statsd { bind: String },
+    StatsdIn {
+        bind: String,
+    },
     /// RFC 3164 / RFC 5424 syslog over UDP or TCP.
-    Syslog { bind: String },
+    SyslogIn {
+        bind: String,
+    },
     /// OpenTelemetry Protocol (logs, metrics, and/or traces).
-    Otlp { bind: String },
+    OtlpIn {
+        bind: String,
+    },
     /// Tail one or more files as a log source, rotation- and checkpoint-aware.
     FileTail {
         paths: Vec<String>,
@@ -61,41 +72,16 @@ pub enum InputConfig {
         checkpoint_path: Option<String>,
     },
     /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
-    Logit { bind: String },
-}
+    LogitIn {
+        bind: String,
+    },
 
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum OutputConfig {
-    InfluxDb {
-        url: String,
-        org: String,
-        bucket: String,
-        /// Referenced, not inlined -- kept out of the schema/config-dump path deliberately.
-        token_env: String,
-    },
-    Otlp {
-        endpoint: String,
-    },
-    /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
-    Logit {
-        endpoint: String,
-    },
-}
-
-/// A transform pipeline stage. Built-in native processors (no Lua VM involved) are meant to sit
-/// in front of user Lua in the same chain -- "parse the JSON body, then run my logic" -- rather
-/// than being an either/or with scripting. See `docs/design/lua-api.md`.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(untagged)]
-pub enum TransformConfig {
-    Builtin(BuiltinTransformConfig),
-    /// Inline Lua source (a YAML block scalar in practice).
+    /// Inline Lua source (a YAML block scalar in practice). See `docs/design/lua-api.md`.
     Lua {
-        lua: String,
-        /// Runs this stage's `flush()`, if the script defines one, on this interval
+        script: String,
+        /// Runs this component's `flush()`, if the script defines one, on this interval
         /// (`docs/design/lua-api.md`'s flush contract). Omitted -- the common case -- means the
-        /// stage never ticks, same as a script with no `flush()` at all.
+        /// component never ticks, same as a script with no `flush()` at all.
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         interval: Option<Duration>,
@@ -107,11 +93,16 @@ pub enum TransformConfig {
         #[schemars(with = "Option<String>")]
         interval: Option<Duration>,
     },
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "builtin", rename_all = "snake_case")]
-pub enum BuiltinTransformConfig {
+    /// The stateful aggregator (counters/gauges/sets/distributions). Runs `flush()` on
+    /// `interval`; see `docs/adr/0008-aggregation-window-semantics.md`.
+    Aggregate {
+        #[serde(with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        interval: Duration,
+    },
+    // The rest of the built-in native transforms -- not implemented yet (`logit-transforms`),
+    // carried over as unimplemented `ComponentKind` variants so config referencing one gets a
+    // clear "not implemented yet" at validation time rather than a deserialization error.
     Json,
     Logfmt,
     Kv,
@@ -141,12 +132,24 @@ pub enum BuiltinTransformConfig {
     Dedup {
         key: String,
     },
-    /// The stateful aggregator (counters/gauges/sets/distributions). Runs `flush()` on
-    /// `interval`; see `docs/design/lua-api.md`.
-    Aggregate {
-        #[serde(with = "humantime_serde_duration")]
-        #[schemars(with = "String")]
-        interval: Duration,
+
+    /// `rename`d explicitly: `rename_all = "snake_case"` alone would tag this `influx_db_out`
+    /// (a word break at the embedded capital `Db`), not `influxdb_out` as published in
+    /// `docs/design/pipeline-graph.md` and every example config.
+    #[serde(rename = "influxdb_out")]
+    InfluxDbOut {
+        url: String,
+        org: String,
+        bucket: String,
+        /// Referenced, not inlined -- kept out of the schema/config-dump path deliberately.
+        token_env: String,
+    },
+    OtlpOut {
+        endpoint: String,
+    },
+    /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
+    LogitOut {
+        endpoint: String,
     },
 }
 
@@ -184,7 +187,7 @@ mod humantime_serde_duration {
     }
 
     /// The same codec, for `Option<Duration>` fields (`#[serde(default, with =
-    /// "humantime_serde_duration::option")]`) -- used by the Lua transform variants' optional
+    /// "humantime_serde_duration::option")]`) -- used by the Lua component kinds' optional
     /// `interval`. A nested module because `#[serde(with = "...")]` on an `Option<Duration>`
     /// field calls *this* module's `serialize`/`deserialize` with `Option<Duration>`, not the
     /// parent's `Duration` ones.
@@ -217,15 +220,18 @@ mod tests {
 
     // Deserialized via `serde_json` rather than the YAML this crate is actually fed through
     // `logit-cli` (deliberately not a dependency here -- see the crate doc comment): JSON and
-    // YAML are both self-describing formats that pick an `untagged` variant by field presence, so
-    // this exercises exactly the same disambiguation `TransformConfig`'s real deserializer does.
+    // YAML are both self-describing formats, so this exercises the same tagged-enum
+    // disambiguation the real deserializer does.
 
     #[test]
-    fn lua_stage_without_interval_deserializes_as_lua() {
-        let config: TransformConfig = serde_json::from_str(r#"{"lua": "return event"}"#).unwrap();
-        match config {
-            TransformConfig::Lua { lua, interval } => {
-                assert_eq!(lua, "return event");
+    fn lua_component_without_interval_deserializes() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "lua", "sources": ["in"], "script": "return event"}"#)
+                .unwrap();
+        assert_eq!(component.sources, vec!["in".to_string()]);
+        match component.kind {
+            ComponentKind::Lua { script, interval } => {
+                assert_eq!(script, "return event");
                 assert_eq!(interval, None);
             }
             other => panic!("expected Lua, got {other:?}"),
@@ -233,11 +239,13 @@ mod tests {
     }
 
     #[test]
-    fn lua_stage_with_interval_deserializes_as_lua_not_builtin() {
-        let config: TransformConfig =
-            serde_json::from_str(r#"{"lua": "return event", "interval": "10s"}"#).unwrap();
-        match config {
-            TransformConfig::Lua { interval, .. } => {
+    fn lua_component_with_interval_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "lua", "sources": ["in"], "script": "return event", "interval": "10s"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Lua { interval, .. } => {
                 assert_eq!(interval, Some(Duration::from_secs(10)));
             }
             other => panic!("expected Lua, got {other:?}"),
@@ -245,11 +253,13 @@ mod tests {
     }
 
     #[test]
-    fn lua_file_stage_with_interval_deserializes_as_lua_file() {
-        let config: TransformConfig =
-            serde_json::from_str(r#"{"lua_file": "x.lua", "interval": "1m"}"#).unwrap();
-        match config {
-            TransformConfig::LuaFile { lua_file, interval } => {
+    fn lua_file_component_with_interval_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "lua_file", "sources": ["in"], "lua_file": "x.lua", "interval": "1m"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::LuaFile { lua_file, interval } => {
                 assert_eq!(lua_file, "x.lua");
                 assert_eq!(interval, Some(Duration::from_secs(60)));
             }
@@ -258,44 +268,67 @@ mod tests {
     }
 
     #[test]
-    fn builtin_aggregate_with_interval_deserializes_as_builtin() {
-        let config: TransformConfig =
-            serde_json::from_str(r#"{"builtin": "aggregate", "interval": "10s"}"#).unwrap();
-        match config {
-            TransformConfig::Builtin(BuiltinTransformConfig::Aggregate { interval }) => {
-                assert_eq!(interval, Duration::from_secs(10));
-            }
-            other => panic!("expected Builtin(Aggregate), got {other:?}"),
+    fn aggregate_component_with_interval_deserializes() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "aggregate", "sources": ["in"], "interval": "10s"}"#)
+                .unwrap();
+        match component.kind {
+            ComponentKind::Aggregate { interval } => assert_eq!(interval, Duration::from_secs(10)),
+            other => panic!("expected Aggregate, got {other:?}"),
         }
     }
 
     #[test]
+    fn component_with_no_sources_defaults_to_empty() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "statsd_in", "bind": "0.0.0.0:8125"}"#).unwrap();
+        assert!(component.sources.is_empty());
+        assert!(matches!(component.kind, ComponentKind::StatsdIn { .. }));
+    }
+
+    #[test]
+    fn sink_component_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "influxdb_out", "sources": ["enrich"], "url": "http://localhost:8086",
+                "org": "org", "bucket": "bucket", "token_env": "TOKEN"}"#,
+        )
+        .unwrap();
+        assert_eq!(component.sources, vec!["enrich".to_string()]);
+        assert!(matches!(component.kind, ComponentKind::InfluxDbOut { .. }));
+    }
+
+    #[test]
     fn zero_interval_deserializes_fine_left_for_validation_to_reject() {
-        // The codec itself has no opinion on zero -- `logit-cli::pipeline::validate_semantics` is
-        // where a zero flush interval is actually rejected (it would spin the flush loop).
-        let config: TransformConfig =
-            serde_json::from_str(r#"{"lua": "x", "interval": "0s"}"#).unwrap();
-        match config {
-            TransformConfig::Lua { interval, .. } => assert_eq!(interval, Some(Duration::ZERO)),
+        // The codec itself has no opinion on zero -- graph validation (`logit-pipeline`) is where
+        // a zero flush interval is actually rejected (it would spin the flush loop).
+        let component: Component =
+            serde_json::from_str(r#"{"type": "lua", "script": "x", "interval": "0s"}"#).unwrap();
+        match component.kind {
+            ComponentKind::Lua { interval, .. } => assert_eq!(interval, Some(Duration::ZERO)),
             other => panic!("expected Lua, got {other:?}"),
         }
     }
 
     #[test]
     fn negative_interval_is_rejected_by_the_codec() {
-        let result: Result<TransformConfig, _> =
-            serde_json::from_str(r#"{"lua": "x", "interval": "-5s"}"#);
+        let result: Result<Component, _> =
+            serde_json::from_str(r#"{"type": "lua", "script": "x", "interval": "-5s"}"#);
         assert!(result.is_err(), "a negative duration should not silently parse");
     }
 
     #[test]
     fn interval_round_trips_through_serialize_then_deserialize() {
-        let original =
-            TransformConfig::Lua { lua: "x".to_string(), interval: Some(Duration::from_secs(30)) };
+        let original = Component {
+            sources: vec!["in".to_string()],
+            kind: ComponentKind::Lua {
+                script: "x".to_string(),
+                interval: Some(Duration::from_secs(30)),
+            },
+        };
         let json = serde_json::to_string(&original).unwrap();
-        let round_tripped: TransformConfig = serde_json::from_str(&json).unwrap();
-        match round_tripped {
-            TransformConfig::Lua { interval, .. } => {
+        let round_tripped: Component = serde_json::from_str(&json).unwrap();
+        match round_tripped.kind {
+            ComponentKind::Lua { interval, .. } => {
                 assert_eq!(interval, Some(Duration::from_secs(30)));
             }
             other => panic!("expected Lua, got {other:?}"),
@@ -303,20 +336,26 @@ mod tests {
     }
 
     #[test]
-    fn pipelines_schema_requires_at_least_one_entry() {
+    fn unknown_type_tag_is_a_clear_error() {
+        let result: Result<Component, _> = serde_json::from_str(r#"{"type": "nonsense"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn components_schema_requires_at_least_one_entry() {
         let schema = json_schema();
-        let pipelines = schema
+        let components = schema
             .schema
             .object
             .expect("config should be an object")
             .properties
-            .remove("pipelines")
-            .expect("config should define pipelines");
-        let Schema::Object(pipelines) = pipelines else {
-            panic!("pipelines should have an object schema");
+            .remove("components")
+            .expect("config should define components");
+        let Schema::Object(components) = components else {
+            panic!("components should have an object schema");
         };
         assert_eq!(
-            pipelines.object.expect("pipelines should be an object").min_properties,
+            components.object.expect("components should be an object").min_properties,
             Some(1)
         );
     }
