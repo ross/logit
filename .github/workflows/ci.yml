@@ -21,9 +21,10 @@ jobs:
           apt-get install -y --no-install-recommends clang cmake pkg-config libssl-dev
 
       - name: Install cargo tools
-        run: |
-          cargo install cargo-nextest --locked
-          cargo install cargo-deny --locked
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        with:
+          tool: cargo-nextest,cargo-deny
+          fallback: none
 
       - uses: actions/cache@v4
         with:
