@@ -4,15 +4,18 @@
 //! `docs/design/lua-api.md` for the transform-chain contract this wires up.
 
 use anyhow::Context;
-use logit_config::{Config, InputConfig, OutputConfig, TransformConfig};
-use logit_core::{Event, EventBatch};
+use logit_config::{BuiltinTransformConfig, Config, InputConfig, OutputConfig, TransformConfig};
+use logit_core::{Event, EventBatch, Resource};
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::Input;
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::Output;
 use logit_script::{ProcessOutcome, ScriptWorker};
+use logit_transforms::Aggregator;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -80,35 +83,48 @@ async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
             output_txs.push(tx);
         }
 
-        // This pipeline's script *sources* -- not `ScriptWorker`s yet. `ScriptWorker` opts out of
+        // This pipeline's transform *specs* -- not built `Stage`s yet. `ScriptWorker` opts out of
         // both `Send` and `Sync` (`docs/design/lua-api.md`'s concurrency section), so it can't be
         // *moved* into the dedicated thread below at all, let alone held across an `.await`;
-        // `ScriptWorker::new` has to run on that thread itself, not here. Any builtin transform is
-        // a config-time error -- none are implemented yet (not just `aggregate`), so this states
-        // current capability honestly rather than special-casing one variant.
-        let mut script_sources = Vec::with_capacity(pipeline.transforms.len());
+        // `ScriptWorker::new` (and building an `Aggregator`, which is `Send` but has to sit
+        // alongside `ScriptWorker`s in the same ordered chain) has to happen on that thread
+        // itself, not here. `require_implemented_transform` -- called by `validate_semantics`
+        // above -- already rejects any transform that doesn't fit one of the three arms below, so
+        // the fallback arm is unreachable, not a silent gap.
+        let mut transform_specs = Vec::with_capacity(pipeline.transforms.len());
         for transform in &pipeline.transforms {
-            let source = match transform {
-                TransformConfig::Lua { lua } => lua.clone(),
-                TransformConfig::LuaFile { lua_file } => {
-                    let script_path = base_dir.join(lua_file);
-                    std::fs::read_to_string(&script_path)
-                        .with_context(|| format!("reading lua_file {}", script_path.display()))?
+            let spec = match transform {
+                TransformConfig::Lua { lua, interval } => {
+                    TransformSpec::Lua { source: lua.clone(), flush_interval: *interval }
                 }
-                TransformConfig::Builtin(builtin) => {
-                    anyhow::bail!(
-                        "pipeline '{pipeline_name}': builtin transform {builtin:?} is not \
-                         implemented yet"
-                    );
+                TransformConfig::LuaFile { lua_file, interval } => {
+                    let script_path = base_dir.join(lua_file);
+                    let source = std::fs::read_to_string(&script_path)
+                        .with_context(|| format!("reading lua_file {}", script_path.display()))?;
+                    TransformSpec::Lua { source, flush_interval: *interval }
+                }
+                TransformConfig::Builtin(BuiltinTransformConfig::Aggregate { interval }) => {
+                    TransformSpec::Aggregate { interval: *interval }
+                }
+                TransformConfig::Builtin(_) => {
+                    unreachable!("validate_semantics already rejected every unimplemented builtin")
                 }
             };
-            script_sources.push(source);
+            transform_specs.push(spec);
         }
 
         // Fail startup on a bad script, not silently later -- matches `ScriptWorker::new`'s own
         // "fail at load time" contract, just applied one level up. `oneshot::Sender::send` is
         // synchronous (no `.await` needed), so the worker thread can report back over it directly.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+
+        // `Handle::current()` must be called from inside the runtime -- true here since
+        // `run_config` is itself running as an async task on it -- and can then be used to drive
+        // timers from the plain OS thread below via `Handle::block_on`, which is legal off the
+        // runtime's own worker threads as long as it's never called from *within* an async
+        // context (an `.await` on this same runtime). That's exactly the shape here: a bare
+        // `std::thread`, not a tokio task.
+        let runtime = tokio::runtime::Handle::current();
 
         let (batch_tx, batch_rx) = mpsc::channel::<EventBatch>(CHANNEL_CAPACITY);
         let worker_pipeline_name = pipeline_name.clone();
@@ -117,10 +133,11 @@ async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
             .spawn(move || {
                 run_pipeline_worker(
                     worker_pipeline_name,
-                    script_sources,
+                    transform_specs,
                     ready_tx,
                     batch_rx,
                     output_txs,
+                    runtime,
                 )
             })
             .with_context(|| format!("spawning worker thread for pipeline '{pipeline_name}'"))?;
@@ -209,12 +226,7 @@ pub fn validate_semantics(config: &Config) -> anyhow::Result<()> {
         }
 
         for transform in &pipeline.transforms {
-            if let TransformConfig::Builtin(builtin) = transform {
-                anyhow::bail!(
-                    "pipeline '{pipeline_name}': builtin transform {builtin:?} is not \
-                     implemented yet"
-                );
-            }
+            require_implemented_transform(transform)?;
         }
 
         for input_name in &pipeline.inputs {
@@ -272,28 +284,120 @@ fn build_output(config: &OutputConfig) -> anyhow::Result<Box<dyn Output + Send>>
     Ok(Box::new(InfluxDbOutput::new(url.clone(), org.clone(), bucket.clone(), token)))
 }
 
-/// Runs `events` through `workers` in order (`docs/design/lua-api.md`'s `process()` contract:
-/// `Emit`/`EmitMany`/`Drop`). A script error is logged and treated as a drop for that one event,
-/// not an abort of the whole batch -- matches this project's established "one bad item doesn't
-/// take down everything alongside it" policy (`logit-inputs::statsd`, `logit-outputs::influxdb`).
-/// A pure function (no channels/threads) specifically so this logic is directly unit-testable.
+/// The single source of truth for which transform stages `run_config`'s spec-building loop can
+/// actually build -- `Lua`/`LuaFile` (any interval) and the `aggregate` builtin; every other
+/// builtin isn't implemented yet. Split out for the same reason as
+/// [`require_implemented_input`]/[`require_implemented_output`]: `validate_semantics` and
+/// `run_config` used to reject builtin transforms in two separate places with two separate
+/// copies of the message -- precisely the shape of bug that produced those two helpers.
+///
+/// Also where a zero flush interval is rejected, for either kind of stage: the hand-rolled
+/// duration codec (`logit-config`) happily accepts `0s`, but `run_pipeline_worker`'s flush
+/// schedule treats "due now" as "due again immediately" for a zero interval, which would spin the
+/// worker thread. This is pure config validation (no env reads, no Lua compilation), so it
+/// belongs here, not only checked once a pipeline actually starts.
+fn require_implemented_transform(transform: &TransformConfig) -> anyhow::Result<()> {
+    match transform {
+        TransformConfig::Lua { interval, .. } | TransformConfig::LuaFile { interval, .. } => {
+            require_nonzero_interval(*interval)
+        }
+        TransformConfig::Builtin(BuiltinTransformConfig::Aggregate { interval }) => {
+            require_nonzero_interval(Some(*interval))
+        }
+        TransformConfig::Builtin(builtin) => {
+            anyhow::bail!("builtin transform {builtin:?} is not implemented yet")
+        }
+    }
+}
+
+fn require_nonzero_interval(interval: Option<Duration>) -> anyhow::Result<()> {
+    if interval == Some(Duration::ZERO) {
+        anyhow::bail!("a flush interval of 0s would flush continuously -- use a positive duration");
+    }
+    Ok(())
+}
+
+/// A Send-able description of one transform stage, built in `run_config` (where `base_dir` and the
+/// filesystem are reachable) and handed to the worker thread, which turns each into a [`Stage`].
+/// `ScriptWorker` is `!Send`, so as before, only plain data crosses the thread boundary --
+/// construction happens on the worker thread itself.
+enum TransformSpec {
+    Lua { source: String, flush_interval: Option<Duration> },
+    Aggregate { interval: Duration },
+}
+
+/// One stage of a pipeline's transform chain, built from a [`TransformSpec`] on the worker
+/// thread. A plain enum, not `Box<dyn Trait>`: the whole chain lives on one OS thread with no
+/// `Send`/object-safety pressure pushing toward dynamic dispatch, matching how `build_input`/
+/// `build_output` already dispatch on config kind.
+enum Stage {
+    Lua { worker: ScriptWorker, flush_interval: Option<Duration> },
+    Aggregate(Aggregator),
+}
+
+impl Stage {
+    fn build(spec: TransformSpec) -> Result<Self, logit_script::ScriptError> {
+        Ok(match spec {
+            TransformSpec::Lua { source, flush_interval } => {
+                Stage::Lua { worker: ScriptWorker::new(&source)?, flush_interval }
+            }
+            TransformSpec::Aggregate { interval } => Stage::Aggregate(Aggregator::new(interval)),
+        })
+    }
+
+    /// `None` means this stage never flushes -- a Lua stage with no configured `interval`, same
+    /// as a script with no `flush()` at all. Every `Aggregate` stage has one; it's the only way
+    /// to construct one (see `TransformSpec::Aggregate`, `require_implemented_transform`'s
+    /// zero-interval rejection).
+    fn flush_interval(&self) -> Option<Duration> {
+        match self {
+            Stage::Lua { flush_interval, .. } => *flush_interval,
+            Stage::Aggregate(agg) => Some(agg.interval()),
+        }
+    }
+}
+
+/// Runs `events` through `stages` in order. A Lua stage follows `docs/design/lua-api.md`'s
+/// `process()` contract (`Emit`/`EmitMany`/`Drop`); a script error is logged and treated as a drop
+/// for that one event, not an abort of the whole batch -- matches this project's established "one
+/// bad item doesn't take down everything alongside it" policy (`logit-inputs::statsd`,
+/// `logit-outputs::influxdb`). An `Aggregate` stage accumulates what it can and passes everything
+/// else through untouched (logs, spans, and metric kinds with no defined merge rule -- never
+/// silently dropped).
+///
+/// `resource` identifies which of an `Aggregate` stage's per-resource windows `events` belongs to;
+/// see [`Aggregator::process`]. `&mut [Stage]` (not `&[ScriptWorker]` as before `Aggregate`
+/// existed): an aggregator mutates state per event, unlike a Lua stage's `&self` `process`.
 fn apply_transforms(
     pipeline_name: &str,
-    workers: &[ScriptWorker],
+    stages: &mut [Stage],
+    resource: &Arc<Resource>,
     events: Vec<Event>,
 ) -> Vec<Event> {
     let mut events = events;
-    for worker in workers {
+    for stage in stages.iter_mut() {
         let mut next = Vec::with_capacity(events.len());
-        for event in events {
-            match worker.process(event) {
-                Ok(ProcessOutcome::Emit(e)) => next.push(*e),
-                Ok(ProcessOutcome::EmitMany(es)) => next.extend(es),
-                Ok(ProcessOutcome::Drop) => {}
-                Err(err) => {
-                    // TODO: route through a proper diagnostics facility once one exists, instead
-                    // of stderr -- same gap noted in logit-inputs::statsd/logit-outputs::influxdb.
-                    eprintln!("pipeline '{pipeline_name}': script error: {err}");
+        match stage {
+            Stage::Lua { worker, .. } => {
+                for event in events {
+                    match worker.process(event) {
+                        Ok(ProcessOutcome::Emit(e)) => next.push(*e),
+                        Ok(ProcessOutcome::EmitMany(es)) => next.extend(es),
+                        Ok(ProcessOutcome::Drop) => {}
+                        Err(err) => {
+                            // TODO: route through a proper diagnostics facility once one exists,
+                            // instead of stderr -- same gap noted in
+                            // logit-inputs::statsd/logit-outputs::influxdb.
+                            eprintln!("pipeline '{pipeline_name}': script error: {err}");
+                        }
+                    }
+                }
+            }
+            Stage::Aggregate(agg) => {
+                for event in events {
+                    if let Some(passed_through) = agg.process(resource, event) {
+                        next.push(passed_through);
+                    }
                 }
             }
         }
@@ -302,7 +406,106 @@ fn apply_transforms(
     events
 }
 
-/// Builds this pipeline's `Vec<ScriptWorker>` and owns them for the pipeline's lifetime, all on a
+/// Flushes stage `index` (an aggregate window tick or a Lua `flush()` tick) and runs whatever it
+/// emits through every later stage in the chain (`index + 1..`) via [`apply_transforms`] -- a
+/// flushed event is not exempt from downstream enrichment/filtering, it's a source of events into
+/// the rest of the chain like any other. `split_at_mut` is what makes "mutate stage `index` while
+/// also mutating the stages after it" expressible as two disjoint `&mut` slices.
+///
+/// `fallback_resource` is used only for a Lua stage's `flush()`, which -- unlike a normal batch,
+/// or an `Aggregate` stage's own per-resource windows -- has no resource of its own to stamp its
+/// emitted events with.
+fn flush_stage(
+    pipeline_name: &str,
+    stages: &mut [Stage],
+    index: usize,
+    now: i64,
+    fallback_resource: &Arc<Resource>,
+) -> Vec<(Arc<Resource>, Vec<Event>)> {
+    let (head, tail) = stages.split_at_mut(index + 1);
+    let groups: Vec<(Arc<Resource>, Vec<Event>)> = match &mut head[index] {
+        Stage::Lua { worker, .. } => match worker.flush() {
+            Ok(events) if events.is_empty() => Vec::new(),
+            Ok(events) => vec![(fallback_resource.clone(), events)],
+            Err(err) => {
+                eprintln!("pipeline '{pipeline_name}': script flush error: {err}");
+                Vec::new()
+            }
+        },
+        Stage::Aggregate(agg) => agg.flush(now),
+    };
+    groups
+        .into_iter()
+        .map(|(resource, events)| {
+            let events = apply_transforms(pipeline_name, tail, &resource, events);
+            (resource, events)
+        })
+        .filter(|(_, events)| !events.is_empty())
+        .collect()
+}
+
+/// Sends `events` to every output, cloning the batch for all but the last send so the final one
+/// can move it instead. A no-op if `events` is empty (nothing to send, and an empty `EventBatch`
+/// would be a pointless wakeup for every output task).
+fn send_batch(
+    output_txs: &[mpsc::Sender<EventBatch>],
+    resource: Arc<Resource>,
+    events: Vec<Event>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    let out_batch = EventBatch { resource, events };
+    if let Some((last, rest)) = output_txs.split_last() {
+        for tx in rest {
+            let _ = tx.blocking_send(out_batch.clone());
+        }
+        let _ = last.blocking_send(out_batch);
+    }
+}
+
+fn now_unix_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64
+}
+
+/// Flushes every stage whose deadline has passed, in chain order, sending whatever each one
+/// (and, transitively, the stages after it) emits. Each due stage's deadline advances by whole
+/// interval steps from where it was -- not from `now` -- so the schedule doesn't drift, and a
+/// stall long enough to miss several ticks collapses into one flush rather than a burst of
+/// catch-up flushes for a tumbling-window aggregator, which would otherwise emit one real window
+/// followed by several empty ones.
+fn flush_due_stages(
+    pipeline_name: &str,
+    stages: &mut [Stage],
+    next_flush: &mut [Option<tokio::time::Instant>],
+    fallback_resource: &Arc<Resource>,
+    output_txs: &[mpsc::Sender<EventBatch>],
+) {
+    let now_instant = tokio::time::Instant::now();
+    for i in 0..stages.len() {
+        let Some(deadline) = next_flush[i] else { continue };
+        if deadline > now_instant {
+            continue;
+        }
+        let groups = flush_stage(pipeline_name, stages, i, now_unix_nanos(), fallback_resource);
+        for (resource, events) in groups {
+            send_batch(output_txs, resource, events);
+        }
+        let interval = stages[i]
+            .flush_interval()
+            .expect("next_flush[i] is only ever Some for a stage with an interval");
+        let mut next = deadline;
+        while next <= now_instant {
+            next += interval;
+        }
+        next_flush[i] = Some(next);
+    }
+}
+
+/// Builds this pipeline's `Vec<Stage>` and owns them for the pipeline's lifetime, all on a
 /// dedicated OS thread. `ScriptWorker` opts out of both `Send` and `Sync`
 /// (`docs/design/lua-api.md`'s concurrency section, enforced in `logit-script` via a `PhantomData`
 /// marker) -- it can't be *moved* into a thread at all, so construction has to happen here, not
@@ -312,41 +515,101 @@ fn apply_transforms(
 /// Reports success/failure of the initial script loads over `ready_tx` before entering the receive
 /// loop, so a bad script fails `logit run` at startup instead of silently running a broken
 /// pipeline that only ever logs errors into the void.
+///
+/// When no stage has a flush interval, the loop is exactly what it was before flush ticks
+/// existed: a plain `blocking_recv` with no timer involvement at all. Otherwise, `runtime` (a
+/// `Handle` to the multi-thread runtime `logit run` builds -- a `current_thread` runtime can't
+/// drive timers from `Handle::block_on`, but this project's only doesn't apply) drives
+/// `tokio::time::timeout` around the receive so a due flush interrupts a wait instead of being
+/// starved by it. Due stages are additionally checked at the *top* of every loop iteration,
+/// unconditionally: `timeout` polls its inner future first, so under sustained load (where
+/// `batch_rx.recv()` is always immediately ready) its `Elapsed` branch would never fire on its
+/// own, and a flush would never happen. As long as batches keep arriving, the loop keeps
+/// revisiting the top and re-checking -- so a due flush still fires on the very next iteration
+/// after its deadline passes, regardless of how busy the channel is.
 fn run_pipeline_worker(
     pipeline_name: String,
-    script_sources: Vec<String>,
+    transform_specs: Vec<TransformSpec>,
     ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     mut batch_rx: mpsc::Receiver<EventBatch>,
     output_txs: Vec<mpsc::Sender<EventBatch>>,
+    runtime: tokio::runtime::Handle,
 ) {
-    let workers: Vec<ScriptWorker> = match script_sources
-        .iter()
-        .map(|source| ScriptWorker::new(source))
-        .collect::<Result<_, _>>()
-    {
-        Ok(workers) => workers,
-        Err(err) => {
-            // The receiver may already be gone if `run_pipelines` bailed for an unrelated reason
-            // first; nothing useful to do with that here.
-            let _ = ready_tx.send(Err(format!("loading a transform script: {err}")));
-            return;
-        }
-    };
+    let mut stages: Vec<Stage> =
+        match transform_specs.into_iter().map(Stage::build).collect::<Result<_, _>>() {
+            Ok(stages) => stages,
+            Err(err) => {
+                // The receiver may already be gone if `run_pipelines` bailed for an unrelated
+                // reason first; nothing useful to do with that here.
+                let _ = ready_tx.send(Err(format!("loading a transform script: {err}")));
+                return;
+            }
+        };
     // Ignoring a send failure for the same reason as above.
     let _ = ready_tx.send(Ok(()));
 
-    while let Some(batch) = batch_rx.blocking_recv() {
-        let events = apply_transforms(&pipeline_name, &workers, batch.events);
-        if events.is_empty() {
+    let mut next_flush: Vec<Option<tokio::time::Instant>> = stages
+        .iter()
+        .map(|stage| stage.flush_interval().map(|interval| tokio::time::Instant::now() + interval))
+        .collect();
+
+    // Used only as the resource a Lua stage's flush() stamps its emitted events with, before any
+    // real batch has arrived to take one from -- see `flush_stage`'s doc comment. Overwritten by
+    // every real batch below.
+    let mut last_resource = Arc::new(Resource::default());
+
+    loop {
+        flush_due_stages(&pipeline_name, &mut stages, &mut next_flush, &last_resource, &output_txs);
+
+        let earliest_deadline = next_flush.iter().flatten().min().copied();
+        let batch = match earliest_deadline {
+            None => batch_rx.blocking_recv(),
+            Some(deadline) => {
+                let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+                // The `async` block matters, not just style: `tokio::time::timeout` builds its
+                // `Sleep` eagerly, and `Sleep` construction needs a runtime context, which this
+                // plain thread doesn't have outside of `block_on`. Deferring construction to
+                // inside the block (only polled once `block_on` has entered that context) is what
+                // makes this legal rather than an immediate panic.
+                match runtime.block_on(async { tokio::time::timeout(wait, batch_rx.recv()).await })
+                {
+                    Ok(batch) => batch,
+                    Err(_elapsed) => continue,
+                }
+            }
+        };
+        let Some(batch) = batch else {
+            // Inbound channel closed (every input for this pipeline finished, or `run_config`
+            // bailed and dropped its side) -- flush once more so the in-flight window isn't
+            // silently lost, then exit. This is not a substitute for real graceful shutdown
+            // (Ctrl-C still falls through to the OS default, same as before): it only runs when
+            // every sender is already gone, which today's inputs never do on their own.
+            flush_all_stages(&pipeline_name, &mut stages, &last_resource, &output_txs);
+            return;
+        };
+        last_resource = batch.resource.clone();
+        let events = apply_transforms(&pipeline_name, &mut stages, &batch.resource, batch.events);
+        send_batch(&output_txs, batch.resource, events);
+    }
+}
+
+fn flush_all_stages(
+    pipeline_name: &str,
+    stages: &mut [Stage],
+    fallback_resource: &Arc<Resource>,
+    output_txs: &[mpsc::Sender<EventBatch>],
+) {
+    let now = now_unix_nanos();
+    for i in 0..stages.len() {
+        // Only a stage with a flush contract has anything to drain; skip the rest so a pipeline
+        // with no aggregate/flush-bearing stage shuts down exactly like it did before flush ticks
+        // existed -- no wasted flush() calls into every Lua stage on every exit.
+        if stages[i].flush_interval().is_none() {
             continue;
         }
-        let out_batch = EventBatch { resource: batch.resource, events };
-        // Clone for every output but the last, so the final send can move the batch instead.
-        if let Some((last, rest)) = output_txs.split_last() {
-            for tx in rest {
-                let _ = tx.blocking_send(out_batch.clone());
-            }
-            let _ = last.blocking_send(out_batch);
+        let groups = flush_stage(pipeline_name, stages, i, now, fallback_resource);
+        for (resource, events) in groups {
+            send_batch(output_txs, resource, events);
         }
     }
 }
@@ -637,17 +900,30 @@ mod tests {
         assert!(err.to_string().contains("LOGIT_TEST_DEFINITELY_UNSET_TOKEN_VAR"));
     }
 
+    fn lua_stage(source: &str) -> Stage {
+        Stage::Lua { worker: ScriptWorker::new(source).unwrap(), flush_interval: None }
+    }
+
+    fn default_resource() -> Arc<Resource> {
+        Arc::new(logit_core::Resource::default())
+    }
+
     #[test]
     fn apply_transforms_chains_scripts_in_order() {
-        let w1 = ScriptWorker::new(
-            r#"function process(event) event.attributes.stage1 = "yes" return event end"#,
-        )
-        .unwrap();
-        let w2 = ScriptWorker::new(
-            r#"function process(event) event.attributes.stage2 = "yes" return event end"#,
-        )
-        .unwrap();
-        let events = apply_transforms("test", &[w1, w2], vec![counter_event("hits", 1.0)]);
+        let mut stages = vec![
+            lua_stage(
+                r#"function process(event) event.attributes.stage1 = "yes" return event end"#,
+            ),
+            lua_stage(
+                r#"function process(event) event.attributes.stage2 = "yes" return event end"#,
+            ),
+        ];
+        let events = apply_transforms(
+            "test",
+            &mut stages,
+            &default_resource(),
+            vec![counter_event("hits", 1.0)],
+        );
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].attributes.get("stage1").and_then(|v| v.as_str()), Some("yes"));
         assert_eq!(events[0].attributes.get("stage2").and_then(|v| v.as_str()), Some("yes"));
@@ -655,29 +931,168 @@ mod tests {
 
     #[test]
     fn apply_transforms_respects_drop() {
-        let w = ScriptWorker::new("function process(event) return nil end").unwrap();
-        let events = apply_transforms("test", &[w], vec![counter_event("hits", 1.0)]);
+        let mut stages = vec![lua_stage("function process(event) return nil end")];
+        let events = apply_transforms(
+            "test",
+            &mut stages,
+            &default_resource(),
+            vec![counter_event("hits", 1.0)],
+        );
         assert!(events.is_empty());
     }
 
     #[test]
     fn apply_transforms_respects_fan_out() {
-        let w =
-            ScriptWorker::new("function process(event) return {event, event:clone()} end").unwrap();
-        let events = apply_transforms("test", &[w], vec![counter_event("hits", 1.0)]);
+        let mut stages =
+            vec![lua_stage("function process(event) return {event, event:clone()} end")];
+        let events = apply_transforms(
+            "test",
+            &mut stages,
+            &default_resource(),
+            vec![counter_event("hits", 1.0)],
+        );
         assert_eq!(events.len(), 2);
     }
 
     #[test]
-    fn apply_transforms_with_no_workers_is_a_passthrough() {
-        let events = apply_transforms("test", &[], vec![counter_event("hits", 1.0)]);
+    fn apply_transforms_with_no_stages_is_a_passthrough() {
+        let events = apply_transforms(
+            "test",
+            &mut [],
+            &default_resource(),
+            vec![counter_event("hits", 1.0)],
+        );
         assert_eq!(events.len(), 1);
     }
 
     #[test]
     fn apply_transforms_logs_and_drops_on_script_error() {
-        let w = ScriptWorker::new(r#"function process(event) error("boom") end"#).unwrap();
-        let events = apply_transforms("test", &[w], vec![counter_event("hits", 1.0)]);
+        let mut stages = vec![lua_stage(r#"function process(event) error("boom") end"#)];
+        let events = apply_transforms(
+            "test",
+            &mut stages,
+            &default_resource(),
+            vec![counter_event("hits", 1.0)],
+        );
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn apply_transforms_consumes_a_counter_in_an_aggregate_stage() {
+        let mut stages = vec![Stage::Aggregate(Aggregator::new(Duration::from_secs(10)))];
+        let events = apply_transforms(
+            "test",
+            &mut stages,
+            &default_resource(),
+            vec![counter_event("hits", 1.0)],
+        );
+        assert!(events.is_empty(), "an aggregatable counter should be absorbed, not passed on");
+    }
+
+    #[test]
+    fn apply_transforms_passes_a_log_through_an_aggregate_stage() {
+        let mut stages = vec![Stage::Aggregate(Aggregator::new(Duration::from_secs(10)))];
+        let log = Event {
+            timestamp: 0,
+            attributes: AttrMap::new(),
+            payload: Payload::Log(logit_core::LogRecord {
+                message: logit_core::Value::str("hi"),
+                severity: None,
+                body_format: logit_core::BodyFormat::Raw,
+            }),
+        };
+        let events = apply_transforms("test", &mut stages, &default_resource(), vec![log]);
+        assert_eq!(events.len(), 1, "a log has nothing to aggregate into and should pass through");
+    }
+
+    #[test]
+    fn flush_stage_runs_flushed_events_through_later_stages() {
+        // aggregate -> lua stage that tags every event it sees as flushed=yes. The tag should
+        // appear on the aggregate's flushed output, proving a flush isn't exempt from the rest
+        // of the chain.
+        let mut stages = vec![
+            Stage::Aggregate(Aggregator::new(Duration::from_secs(10))),
+            lua_stage(
+                r#"function process(event) event.attributes.flushed = "yes" return event end"#,
+            ),
+        ];
+        let resource = default_resource();
+        apply_transforms("test", &mut stages, &resource, vec![counter_event("hits", 1.0)]);
+
+        let groups = flush_stage("test", &mut stages, 0, 100, &resource);
+        assert_eq!(groups.len(), 1);
+        let (_, events) = &groups[0];
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].attributes.get("flushed").and_then(|v| v.as_str()), Some("yes"));
+    }
+
+    #[test]
+    fn flush_stage_of_the_last_stage_has_no_downstream() {
+        let mut stages = vec![Stage::Aggregate(Aggregator::new(Duration::from_secs(10)))];
+        let resource = default_resource();
+        apply_transforms("test", &mut stages, &resource, vec![counter_event("hits", 1.0)]);
+
+        let groups = flush_stage("test", &mut stages, 0, 100, &resource);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.len(), 1);
+    }
+
+    #[test]
+    fn require_implemented_transform_accepts_aggregate_and_lua() {
+        assert!(require_implemented_transform(&TransformConfig::Builtin(
+            BuiltinTransformConfig::Aggregate { interval: Duration::from_secs(10) }
+        ))
+        .is_ok());
+        assert!(require_implemented_transform(&TransformConfig::Lua {
+            lua: "".into(),
+            interval: None
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn require_implemented_transform_rejects_other_builtins() {
+        let err = expect_err(require_implemented_transform(&TransformConfig::Builtin(
+            BuiltinTransformConfig::Json,
+        )));
+        assert!(err.to_string().contains("not implemented yet"));
+    }
+
+    #[test]
+    fn require_implemented_transform_rejects_a_zero_aggregate_interval() {
+        let err = expect_err(require_implemented_transform(&TransformConfig::Builtin(
+            BuiltinTransformConfig::Aggregate { interval: Duration::ZERO },
+        )));
+        assert!(err.to_string().contains("0s"), "got: {err}");
+    }
+
+    #[test]
+    fn require_implemented_transform_rejects_a_zero_lua_flush_interval() {
+        let err = expect_err(require_implemented_transform(&TransformConfig::Lua {
+            lua: "".into(),
+            interval: Some(Duration::ZERO),
+        }));
+        assert!(err.to_string().contains("0s"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_semantics_accepts_an_aggregate_transform() {
+        let mut inputs = HashMap::new();
+        inputs.insert("in".to_string(), InputConfig::Statsd { bind: "127.0.0.1:0".to_string() });
+        let mut outputs = HashMap::new();
+        outputs.insert("out".to_string(), influxdb_output_config());
+        let mut pipelines = HashMap::new();
+        pipelines.insert(
+            "p".to_string(),
+            PipelineConfig {
+                inputs: vec!["in".to_string()],
+                transforms: vec![TransformConfig::Builtin(BuiltinTransformConfig::Aggregate {
+                    interval: Duration::from_secs(10),
+                })],
+                outputs: vec!["out".to_string()],
+            },
+        );
+        let config = Config { inputs, outputs, pipelines };
+        assert!(validate_semantics(&config).is_ok());
     }
 }

@@ -1,12 +1,8 @@
 # A minimal example matching the v0.1 vertical slice target (docs/OVERVIEW.md): statsd/DogStatsD
-# in, one enrichment script, InfluxDB 2.x out. Matches the `influxdb` service seeded by
-# compose.yaml for local testing.
-#
-# No builtin transforms yet -- none are implemented (`logit run` rejects any `builtin:` stage with
-# a clear error). This originally also had a `builtin: aggregate` window ahead of the Lua stage;
-# dropped for now so this config actually runs end-to-end. Re-add it once the aggregate transform
-# exists -- the stateful, flush-on-interval piece is a separate, well-scoped follow-up from
-# pipeline orchestration itself.
+# in, a 10s aggregation window, one enrichment script, InfluxDB 2.x out. Matches the `influxdb`
+# service seeded by compose.yaml for local testing. `aggregate` is the only implemented builtin
+# transform so far (docs/adr/0008-aggregation-window-semantics.md) -- `logit run` rejects any other
+# `builtin:` stage with a clear error.
 inputs:
   statsd_in:
     type: statsd
@@ -24,6 +20,8 @@ pipelines:
   app_metrics:
     inputs: [statsd_in]
     transforms:
+      - builtin: aggregate
+        interval: 10s
       - lua: |
           function process(event)
             event.attributes.env = event.attributes.env or "dev"

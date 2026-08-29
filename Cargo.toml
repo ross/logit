@@ -7,6 +7,7 @@ members = [
     "crates/logit-proto",
     "crates/logit-inputs",
     "crates/logit-outputs",
+    "crates/logit-transforms",
     "crates/logit-cli",
 ]
 
@@ -23,6 +24,7 @@ logit-script = { path = "crates/logit-script" }
 logit-proto = { path = "crates/logit-proto" }
 logit-inputs = { path = "crates/logit-inputs" }
 logit-outputs = { path = "crates/logit-outputs" }
+logit-transforms = { path = "crates/logit-transforms" }
 
 bytes = "1"
 smallvec = "1"

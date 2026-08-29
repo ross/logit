@@ -467,6 +467,14 @@
             "lua"
           ],
           "properties": {
+            "interval": {
+              "description": "Runs this stage's `flush()`, if the script defines one, on this interval (`docs/design/lua-api.md`'s flush contract). Omitted -- the common case -- means the stage never ticks, same as a script with no `flush()` at all.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "lua": {
               "type": "string"
             }
@@ -479,6 +487,13 @@
             "lua_file"
           ],
           "properties": {
+            "interval": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "lua_file": {
               "type": "string"
             }

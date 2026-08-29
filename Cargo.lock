@@ -678,6 +678,7 @@ dependencies = [
  "logit-inputs",
  "logit-outputs",
  "logit-script",
+ "logit-transforms",
  "serde_json",
  "serde_norway",
  "tokio",
@@ -689,6 +690,7 @@ version = "0.1.0"
 dependencies = [
  "schemars",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -743,6 +745,14 @@ dependencies = [
  "bytes",
  "logit-core",
  "mlua",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "logit-transforms"
+version = "0.1.0"
+dependencies = [
+ "logit-core",
  "thiserror 1.0.69",
 ]
 
