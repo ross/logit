@@ -1,44 +1,51 @@
-# Override e.g. `make DOCKER=docker build` if you're in the `docker` group, or
-# `make DOCKER=podman build` to use rootless Podman -- both are drop-in compatible with the
-# plain Dockerfile/compose.yaml in this repo.
-DOCKER   ?= sudo docker
-COMPOSE  ?= $(DOCKER) compose
-RUN      := $(COMPOSE) run --rm dev
+# Thin wrapper around script/* for anyone who reaches for `make` out of habit. script/* is the
+# canonical interface (the "Scripts to Rule Them All" pattern:
+# https://github.blog/engineering/scripts-to-rule-them-all/) -- see AGENTS.md and README.md, and
+# add new commands there, not here.
 
-.PHONY: build-image up down shell build test lint fmt fmt-check bench schema clean
+.PHONY: bootstrap setup update server test lint fmt fmt-check schema audit cibuild console up down clean
 
-build-image: ## Build the dev container image.
-	$(COMPOSE) build dev
+bootstrap:  ## Build the dev container image.
+	./script/bootstrap
 
-up: ## Start the InfluxDB + Grafana test stack.
-	$(COMPOSE) up -d influxdb grafana
+setup:      ## One-time setup for a fresh checkout.
+	./script/setup
 
-down: ## Stop the test stack.
-	$(COMPOSE) down
+update:     ## Rebuild after pulling changes.
+	./script/update
 
-shell: build-image ## Drop into an interactive shell in the dev container.
-	$(COMPOSE) run --rm dev bash
+server:     ## Run logit against the local test stack.
+	./script/server
 
-build: build-image ## cargo build --workspace
-	$(RUN) cargo build --workspace
+test:       ## cargo nextest run --workspace
+	./script/test
 
-test: build-image ## cargo nextest run --workspace
-	$(RUN) cargo nextest run --workspace
+lint:       ## cargo clippy, warnings denied
+	./script/lint
 
-lint: build-image ## cargo clippy, deny warnings
-	$(RUN) cargo clippy --workspace --all-targets -- -D warnings
+fmt:        ## cargo fmt
+	./script/format
 
-fmt: build-image ## cargo fmt
-	$(RUN) cargo fmt --all
+fmt-check:  ## cargo fmt --check
+	./script/format --check
 
-fmt-check: build-image ## cargo fmt --check
-	$(RUN) cargo fmt --all -- --check
+schema:     ## Regenerate schema/logit.schema.json
+	./script/schema
 
-bench: build-image ## cargo bench --workspace
-	$(RUN) cargo bench --workspace
+audit:      ## Supply-chain checks (cargo-deny, cargo-audit)
+	./script/audit
 
-schema: build-image ## Regenerate schema/logit.schema.json from the config types.
-	$(RUN) cargo run -p logit-cli -- schema > schema/logit.schema.json
+cibuild:    ## Run the full CI-equivalent check sequence
+	./script/cibuild
 
-clean: ## Remove build artifacts (host + container volumes).
-	$(COMPOSE) down -v
+console:    ## Interactive shell in the dev container
+	./script/console
+
+up:         ## Start the InfluxDB + Grafana test stack.
+	$${DOCKER:-sudo docker} compose up -d influxdb grafana
+
+down:       ## Stop the test stack.
+	$${DOCKER:-sudo docker} compose down
+
+clean:      ## Remove build artifacts (host + container volumes).
+	$${DOCKER:-sudo docker} compose down -v

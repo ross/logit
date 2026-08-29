@@ -1,0 +1,19 @@
+#!/bin/bash
+# Usage: script/setup
+# One-time setup for a fresh checkout: builds the dev image and starts the local InfluxDB +
+# Grafana stack the v0.1 slice targets (docs/OVERVIEW.md). Run script/update instead after
+# pulling changes to an already-set-up checkout.
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+"${SCRIPT_PATH}/bootstrap"
+
+echo ""
+echo "## starting local test stack (InfluxDB + Grafana) ##############################"
+${COMPOSE} up -d influxdb grafana
+
+echo ""
+echo "InfluxDB: http://localhost:8086   Grafana: http://localhost:3000"
+echo "Run ./script/server to run logit against it, or ./script/console for a shell."

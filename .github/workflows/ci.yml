@@ -9,21 +9,21 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     container:
-      # Same image contributors use locally (Dockerfile.dev / ADR 0005) -- one definition of the
-      # build environment, not a second one drifting in CI config.
+      # Same image family contributors build locally (Dockerfile.dev / ADR 0005); script/common.sh
+      # detects $CI (set by GitHub Actions) and runs commands directly against it instead of
+      # trying to `docker compose run` from inside a container.
       image: docker.io/library/rust:1-bookworm
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install native build deps (vendored LuaJIT via mlua)
+      - name: Install native build deps (vendored LuaJIT via mlua) and cargo tools
         run: |
           apt-get update
           apt-get install -y --no-install-recommends clang cmake pkg-config libssl-dev
-
-      - name: Install cargo tools
-        run: |
+          rustup component add rustfmt clippy
           cargo install cargo-nextest --locked
           cargo install cargo-deny --locked
+          cargo install cargo-audit --locked
 
       - uses: actions/cache@v4
         with:
@@ -32,13 +32,4 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - run: rustup component add rustfmt clippy
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo nextest run --workspace
-      - run: cargo deny check
-
-      - name: Regenerate schema and fail if stale
-        run: |
-          cargo run -p logit-cli -- schema > /tmp/logit.schema.json
-          diff -u schema/logit.schema.json /tmp/logit.schema.json
+      - run: ./script/cibuild

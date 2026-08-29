@@ -1,0 +1,11 @@
+#!/bin/bash
+# Usage: script/schema
+# Regenerates schema/logit.schema.json from the config types (ADR 0003). Commit the result --
+# script/cibuild fails if it's stale.
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+run cargo run -q -p logit-cli -- schema > schema/logit.schema.json
+echo "Wrote schema/logit.schema.json"

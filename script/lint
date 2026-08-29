@@ -1,0 +1,8 @@
+#!/bin/bash
+# Usage: script/lint
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+run cargo clippy --workspace --all-targets -- -D warnings

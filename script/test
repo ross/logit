@@ -1,0 +1,10 @@
+#!/bin/bash
+# Usage: script/test [nextest args...]
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+# --no-tests=pass: the skeleton has no tests yet (see AGENTS.md's "current state"). Once any
+# crate gets a test, nextest goes back to failing normally if that crate's tests don't run.
+run cargo nextest run --workspace --no-tests=pass "$@"

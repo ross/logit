@@ -1,0 +1,18 @@
+#!/bin/bash
+# Usage: script/bootstrap
+# Ensures the project's environment is ready. Run this first -- nothing else in script/ needs
+# Rust, LuaJIT, or anything else installed on the host; it all runs in the dev container this
+# builds. Safe to re-run any time; a no-op if the image is already up to date.
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+build_image
+
+if [ -z "${CI:-}" ]; then
+    echo ""
+    echo "Dev image built. Try ./script/test, or ./script/console for a shell."
+    echo "Uses 'sudo docker' by default -- override with DOCKER=docker (docker group) or"
+    echo "DOCKER=podman (rootless) if you'd rather not use sudo. See ADR 0005."
+fi
