@@ -7,7 +7,7 @@ use bytes::Bytes;
 use logit_core::interner::resolve;
 use logit_core::{Event, EventBatch, MetricKind, MetricRecord, Payload, Resource, Value};
 use logit_proto::{CodecError, Encoder};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// `reqwest` has no request timeout by default. Without one, a server that accepts the TCP
@@ -99,10 +99,11 @@ impl Encoder for InfluxLineEncoder {
         // part in identity, and a second point with the same identity overwrites the first
         // rather than coexisting. Two events in the same batch that share a measurement+tag-set
         // *and* timestamp would therefore collide silently; `encode_metric_line` disambiguates
-        // them. This map holds, per series, every timestamp actually allocated to it so far --
-        // not just the most recent one (see the comment at its use site for why that's not
-        // enough either).
-        let mut series_allocated_timestamps: HashMap<String, HashSet<i64>> = HashMap::new();
+        // them. This map holds, per series, a "next free slot" successor map covering every
+        // timestamp actually allocated to it so far -- not just the most recent one (see the
+        // comment at its use site for why that's not enough either, and for what the successor
+        // map buys over a plain occupied-set).
+        let mut series_allocated_timestamps: HashMap<String, HashMap<i64, i64>> = HashMap::new();
         for event in &batch.events {
             let Payload::Metric(metric) = &event.payload else {
                 continue;
@@ -130,7 +131,7 @@ fn encode_metric_line(
     resource: &Resource,
     event: &Event,
     metric: &MetricRecord,
-    series_allocated_timestamps: &mut HashMap<String, HashSet<i64>>,
+    series_allocated_timestamps: &mut HashMap<String, HashMap<i64, i64>>,
 ) -> Result<(), CodecError> {
     let fields = metric_fields(&metric.kind)?;
     if fields.is_empty() {
@@ -188,7 +189,7 @@ fn encode_metric_line(
 
     // Disambiguate same-series collisions within this batch (see `encode`'s comment).
     //
-    // Two schemes were tried and rejected before this one:
+    // Three schemes were tried before this one:
     // - "Add 1ns per prior occurrence, in arrival order" only produces distinct timestamps if
     //   same-series events already arrive sorted. Out of order -- e.g. timestamps 101 then 100 --
     //   the first gets stamped 101 (0 prior occurrences) and the second gets 100+1=101 too,
@@ -198,21 +199,28 @@ fn encode_metric_line(
     //   its *own* timestamp actually collides with anything. For 101 then 100, it emits 101 then
     //   102 -- even though 100 was completely free -- discarding a real, distinct timestamp for
     //   no reason. The gap only grows with how out-of-order the input is.
+    // - "Track every timestamp actually allocated in a `HashSet`, linearly re-probing forward
+    //   from `event.timestamp` on every call" gets both of the above right, but restarts the
+    //   probe from scratch for every duplicate: *k* same-series/same-timestamp events cost
+    //   0 + 1 + ... + (k-1) lookups, O(k^2). `logit-inputs::statsd` stamps one timestamp on an
+    //   entire datagram and its multi-value form (`x:1:1:1...|c`) expands into one event per
+    //   value, so a single ~65KB datagram can make k ~30,000 -- ~450 million lookups.
     //
-    // Correct approach: track every timestamp actually *allocated* to this series, and linearly
-    // probe forward from each event's own timestamp only while that exact slot is taken. An
-    // event whose timestamp isn't already used keeps it untouched, regardless of arrival order;
-    // only a genuine collision costs a 1ns nudge, and only until a free slot is found.
-    let occupied = series_allocated_timestamps.entry(line.clone()).or_default();
-    let mut timestamp = event.timestamp;
-    while occupied.contains(&timestamp) {
-        timestamp = timestamp.checked_add(1).ok_or_else(|| {
-            CodecError::Malformed(format!(
-                "no free timestamp slot for series {line:?} near {timestamp} (i64 overflow)"
-            ))
-        })?;
-    }
-    occupied.insert(timestamp);
+    // Correct *and* amortized-cheap: a per-series successor map, same idea as a union-find
+    // "smallest free slot >= t" allocator with path compression. `allocate_timestamp` walks the
+    // chain of already-occupied slots starting at `event.timestamp`, and repoints every slot it
+    // visits directly at the free slot it finds -- so the next probe starting anywhere on that
+    // chain jumps straight there instead of re-walking it. A timestamp that isn't already used is
+    // still returned untouched, regardless of arrival order; only a genuine collision costs a 1ns
+    // nudge, and repeated collisions on the same series no longer cost more than a couple of
+    // lookups each once the chain has been compressed once.
+    let next_free = series_allocated_timestamps.entry(line.clone()).or_default();
+    let timestamp = allocate_timestamp(next_free, event.timestamp).ok_or_else(|| {
+        CodecError::Malformed(format!(
+            "no free timestamp slot for series {line:?} near {} (i64 overflow)",
+            event.timestamp
+        ))
+    })?;
 
     // This matters in practice today: `logit-inputs::statsd` assigns one timestamp to an entire
     // datagram, and its multi-value form (`name:1:2:3|c`) expands into several otherwise-
@@ -235,6 +243,42 @@ fn encode_metric_line(
     buf.push_str(&line);
     buf.push('\n');
     Ok(())
+}
+
+/// Allocates the smallest timestamp `>= requested` not already taken in this series, recording
+/// the allocation in `next_free` so a later call sees it as taken. `next_free` maps an occupied
+/// timestamp to the next candidate to try after it; a timestamp with no entry is free.
+///
+/// This is a union-find "smallest free slot" allocator with path compression: the walk from
+/// `requested` to the eventual free slot passes through zero or more occupied timestamps, and
+/// every one of them gets repointed straight at the free slot (well, `free + 1`, since the free
+/// slot itself is about to become occupied) before returning. A later call starting anywhere on
+/// that walked chain -- including `requested` itself, on a repeat collision -- then reaches the
+/// (new) free slot in one hop instead of re-walking however much of the chain got probed before.
+/// That's what keeps *k* collisions on one series amortized-cheap instead of the O(k^2) cost of
+/// re-probing an occupied set from `requested` on every call (see the comment at the call site).
+///
+/// Returns `None` if the free slot the walk lands on is `i64::MAX`: that timestamp is treated as
+/// permanently unusable (never recorded as occupied, so a repeat request lands here again rather
+/// than looping) purely so `successor` never has to wrap and `next_free` can never contain a
+/// self-loop. `i64::MAX` nanoseconds is the year 2262, so in practice this only ever fires for a
+/// series with over 2^63 timestamps already allocated at or after `requested` -- not reachable
+/// from any real batch.
+fn allocate_timestamp(next_free: &mut HashMap<i64, i64>, requested: i64) -> Option<i64> {
+    let mut visited = Vec::new();
+    let mut cur = requested;
+    while let Some(&next) = next_free.get(&cur) {
+        visited.push(cur);
+        cur = next;
+    }
+    // `cur` is now free. Reserve it, and repoint every occupied slot visited on the way here
+    // directly at its successor so the next walk through any of them stops immediately.
+    let successor = cur.checked_add(1)?;
+    next_free.insert(cur, successor);
+    for slot in visited {
+        next_free.insert(slot, successor);
+    }
+    Some(cur)
 }
 
 /// The line-protocol field set for one metric. `Counter`/`Gauge` are a single `value` field;
@@ -561,6 +605,67 @@ mod tests {
             out.contains("value=2 100"),
             "timestamp 100 was free and must be kept as-is, not bumped to 102: {out}"
         );
+    }
+
+    #[test]
+    fn large_same_timestamp_batch_allocates_a_contiguous_range_without_quadratic_blowup() {
+        // `logit-inputs::statsd` assigns one timestamp to an entire datagram, and its
+        // multi-value form (`x:1:1:1...|c`) expands into one event per value -- so a single
+        // ~65KB datagram can decode into tens of thousands of same-series, same-timestamp
+        // events. A scheme that re-probes an occupied `HashSet` from `event.timestamp` on every
+        // call costs 0 + 1 + ... + (N-1) lookups here -- O(N^2), effectively a hang at this N.
+        // This test is a correctness assertion (exact allocated range), but it also stands in as
+        // the performance regression guard: it must stay fast. Don't shrink N to "simplify" it.
+        const N: i64 = 50_000;
+        let start_ts = 1_700_000_000_000_000_000;
+        let events: Vec<Event> = (0..N)
+            .map(|_| Event {
+                timestamp: start_ts,
+                attributes: AttrMap::new(),
+                payload: Payload::Metric(MetricRecord {
+                    name: logit_core::interner::intern("page.views"),
+                    kind: MetricKind::Counter(1.0),
+                    unit: None,
+                }),
+            })
+            .collect();
+
+        let out = encode(events);
+        let mut timestamps: Vec<i64> =
+            out.lines().map(|l| l.rsplit(' ').next().unwrap().parse().unwrap()).collect();
+        timestamps.sort_unstable();
+
+        assert_eq!(timestamps.len(), N as usize, "expected {N} distinct points");
+        let expected: Vec<i64> = (start_ts..start_ts + N).collect();
+        assert_eq!(
+            timestamps, expected,
+            "allocated timestamps must be exactly the contiguous range [start, start+N)"
+        );
+    }
+
+    #[test]
+    fn interleaved_timestamps_on_one_series_allocate_without_gaps_or_duplicates() {
+        // Two original timestamps whose forward-probe ranges would overlap (100 x3, 101 x2) must
+        // still produce a clean, contiguous, duplicate-free allocation: path compression must
+        // never let one walk skip over a slot another walk is about to claim.
+        let events: Vec<Event> = [100, 100, 100, 101, 101]
+            .into_iter()
+            .map(|ts| Event {
+                timestamp: ts,
+                attributes: AttrMap::new(),
+                payload: Payload::Metric(MetricRecord {
+                    name: logit_core::interner::intern("page.views"),
+                    kind: MetricKind::Counter(1.0),
+                    unit: None,
+                }),
+            })
+            .collect();
+
+        let out = encode(events);
+        let mut timestamps: Vec<i64> =
+            out.lines().map(|l| l.rsplit(' ').next().unwrap().parse().unwrap()).collect();
+        timestamps.sort_unstable();
+        assert_eq!(timestamps, vec![100, 101, 102, 103, 104], "got: {out}");
     }
 
     #[tokio::test]
