@@ -722,6 +722,7 @@ dependencies = [
  "bytes",
  "logit-core",
  "logit-proto",
+ "logit-script",
  "reqwest",
  "tokio",
 ]
