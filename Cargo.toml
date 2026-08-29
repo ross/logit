@@ -32,7 +32,7 @@ schemars = "0.8"
 thiserror = "1"
 anyhow = "1"
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time"] }
 clap = { version = "4", features = ["derive"] }
 serde_norway = "0.9"
 sketches-ddsketch = "0.4"

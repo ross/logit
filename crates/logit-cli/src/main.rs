@@ -1,4 +1,7 @@
+use anyhow::Context;
 use clap::{Parser, Subcommand};
+
+mod pipeline;
 
 #[derive(Parser)]
 #[command(name = "logit", version, about = "A logging, metrics, and tracing multiplexer.")]
@@ -32,10 +35,13 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Run { path } => {
-            // TODO: build the tokio runtime, load `path`, wire inputs -> transforms -> outputs
-            // per pipeline. This is the v0.1 vertical slice's entry point and is deliberately not
-            // implemented in this design/scaffolding pass -- see docs/OVERVIEW.md.
-            anyhow::bail!("not yet implemented: {} (see docs/OVERVIEW.md)", path.display())
+            // Schema/Validate stay synchronous above -- only Run needs an async runtime, so only
+            // Run pays for building one.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building the tokio runtime")?;
+            runtime.block_on(pipeline::run_pipelines(path))
         }
     }
 }
