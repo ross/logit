@@ -11,3 +11,5 @@ logit-core.workspace = true
 logit-proto.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
+reqwest.workspace = true

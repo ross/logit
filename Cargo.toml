@@ -36,6 +36,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 clap = { version = "4", features = ["derive"] }
 serde_norway = "0.9"
 sketches-ddsketch = "0.4"
+# rustls, not the default native-tls/OpenSSL backend -- keeps "no host toolchain needed"
+# (ADR 0005) intact, since rustls has no system OpenSSL to link against.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [profile.release]
 lto = true
