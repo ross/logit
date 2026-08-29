@@ -42,6 +42,11 @@ Work happens on a branch, landed via pull request — never commit straight to `
 `script/cibuild` locally before opening one; it's the same sequence `.github/workflows/ci.yml`
 runs, so a clean local run means a clean CI run.
 
+**To bring a branch with an open PR up to date with `main`, `git merge origin/main` — don't
+rebase.** A rebase rewrites the branch's commits, which means a force-push to update the PR; that's
+disruptive for an open PR (review-comment associations, anyone else with the branch checked out)
+for no real benefit here. A merge commit costs nothing extra and pushes normally.
+
 ## Conventions to hold to
 
 - **A new design decision worth remembering gets an ADR** (`docs/adr/`, numbered, following the
