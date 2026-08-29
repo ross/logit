@@ -9,7 +9,8 @@ LuaJIT. Read [docs/OVERVIEW.md](docs/OVERVIEW.md) first (~1 page) for scope and 
 [docs/adr/](docs/adr) for *why* the stack is what it is, then [docs/design/](docs/design) for the
 internal event model, the Lua scripting API, the pipeline component graph, and the native wire
 protocol — those four design docs are load-bearing; don't improvise around them without reading
-them first.
+them first. Check [docs/known-gaps.md](docs/known-gaps.md) before "fixing" something that looks
+broken — it's likely a documented, deliberate gap, not an oversight.
 
 **Current state:** v0.1 is complete — statsd in, a 10s `aggregate` window, a Lua enrichment stage,
 InfluxDB 2.x out, via `logit run <config>` (see [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml),

@@ -3,8 +3,9 @@
 A logging, metrics, and tracing multiplexer: ingest over many protocols, transform with
 user-defined Lua and built-in parsers, emit to many destinations. Runs as a sidecar or a host
 agent — same binary, different config. See [docs/OVERVIEW.md](docs/OVERVIEW.md) for the full
-scope, [docs/adr/](docs/adr) for why the stack is what it is, and [docs/design/](docs/design) for
-the internal event model, the Lua scripting API, and the native wire protocol.
+scope, [docs/adr/](docs/adr) for why the stack is what it is, [docs/design/](docs/design) for
+the internal event model, the Lua scripting API, and the native wire protocol, and
+[docs/known-gaps.md](docs/known-gaps.md) for already-identified rough edges in what's built so far.
 
 **Status:** v0.1 is complete — statsd in, a 10s `aggregate` window, a Lua enrichment stage, InfluxDB
 2.x out, via `logit run <config>`. [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml)
