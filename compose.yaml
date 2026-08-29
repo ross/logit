@@ -1,0 +1,59 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      args:
+        USER_UID: "1000"
+        USER_GID: "1000"
+    image: logit-dev:local
+    user: "1000:1000"
+    working_dir: /work
+    volumes:
+      # :z relabels the bind mount for SELinux (Enforcing on Fedora); harmless where SELinux is
+      # not in play.
+      - .:/work:z
+      - cargo_home:/home/dev/.cargo
+      - target_cache:/work/target
+    environment:
+      CARGO_HOME: /home/dev/.cargo
+      CARGO_TARGET_DIR: /work/target
+    networks: [logit]
+    command: sleep infinity
+
+  influxdb:
+    image: docker.io/library/influxdb:2
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: logit
+      DOCKER_INFLUXDB_INIT_PASSWORD: logit-dev-password
+      DOCKER_INFLUXDB_INIT_ORG: logit
+      DOCKER_INFLUXDB_INIT_BUCKET: metrics
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: logit-dev-token
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    networks: [logit]
+
+  grafana:
+    image: docker.io/grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:z
+      - grafana_data:/var/lib/grafana
+    depends_on: [influxdb]
+    networks: [logit]
+
+networks:
+  logit: {}
+
+volumes:
+  cargo_home: {}
+  target_cache: {}
+  influxdb_data: {}
+  grafana_data: {}

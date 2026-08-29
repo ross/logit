@@ -1,0 +1,42 @@
+# Development/build image for logit.
+#
+# Not (yet) a production runtime image -- this is the container contributors build and test in,
+# so nobody needs Rust, LuaJIT build deps, or anything else installed on the host.
+FROM rust:1-bookworm
+
+ARG USERNAME=dev
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+# Build deps for the vendored LuaJIT build (mlua "vendored" feature) and general native-dep builds.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang \
+        cmake \
+        pkg-config \
+        libssl-dev \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN cargo install cargo-nextest --locked \
+    && cargo install cargo-deny --locked \
+    && cargo install cargo-audit --locked
+
+# Match the host user (see compose.yaml `user: "1000:1000"`) so bind-mounted files written from
+# inside the container come back owned by the host account, not root.
+RUN groupadd --gid ${USER_GID} ${USERNAME} \
+    && useradd --uid ${USER_UID} --gid ${USER_GID} --create-home --shell /bin/bash ${USERNAME}
+
+ENV CARGO_HOME=/home/${USERNAME}/.cargo
+RUN mkdir -p ${CARGO_HOME} && chown -R ${USER_UID}:${USER_GID} /home/${USERNAME}
+
+# Pre-create the mount point for the target/ named volume, owned by the dev user. Docker
+# initializes a fresh named volume from whatever already exists at its mount point in the image,
+# ownership included -- without this, Docker would create it root-owned on first `up` and every
+# `cargo build` in the container would fail to write to it.
+WORKDIR /work
+RUN mkdir -p /work/target && chown ${USER_UID}:${USER_GID} /work/target
+
+USER ${USERNAME}
+
+CMD ["bash"]

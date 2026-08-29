@@ -1,0 +1,11 @@
+[package]
+name = "logit-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "YAML config types, deserialized with serde and schema'd with schemars (ADR 0003)."
+
+[dependencies]
+serde.workspace = true
+schemars.workspace = true

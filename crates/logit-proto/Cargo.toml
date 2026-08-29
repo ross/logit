@@ -1,0 +1,12 @@
+[package]
+name = "logit-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Codec traits, the native logit-to-logit frame format, and the output Buffer trait."
+
+[dependencies]
+logit-core.workspace = true
+bytes.workspace = true
+thiserror.workspace = true

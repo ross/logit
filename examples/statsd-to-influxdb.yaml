@@ -1,0 +1,28 @@
+# A minimal example matching the v0.1 vertical slice target (docs/OVERVIEW.md): statsd/DogStatsD
+# in, a built-in aggregation window plus one enrichment script, InfluxDB 2.x out. Matches the
+# `influxdb` service seeded by compose.yaml for local testing.
+inputs:
+  statsd_in:
+    type: statsd
+    bind: 0.0.0.0:8125
+
+outputs:
+  influx_out:
+    type: influx_db
+    url: http://influxdb:8086
+    org: logit
+    bucket: metrics
+    token_env: INFLUXDB_TOKEN
+
+pipelines:
+  app_metrics:
+    inputs: [statsd_in]
+    transforms:
+      - builtin: aggregate
+        interval: 10s
+      - lua: |
+          function process(event)
+            event.attributes.env = event.attributes.env or "dev"
+            return event
+          end
+    outputs: [influx_out]

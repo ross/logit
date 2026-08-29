@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    container:
+      # Same image contributors use locally (Dockerfile.dev / ADR 0005) -- one definition of the
+      # build environment, not a second one drifting in CI config.
+      image: docker.io/library/rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native build deps (vendored LuaJIT via mlua)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends clang cmake pkg-config libssl-dev
+
+      - name: Install cargo tools
+        run: |
+          cargo install cargo-nextest --locked
+          cargo install cargo-deny --locked
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo nextest run --workspace
+      - run: cargo deny check
+
+      - name: Regenerate schema and fail if stale
+        run: |
+          cargo run -p logit-cli -- schema > /tmp/logit.schema.json
+          diff -u schema/logit.schema.json /tmp/logit.schema.json

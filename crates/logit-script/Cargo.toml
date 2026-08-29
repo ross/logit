@@ -1,0 +1,12 @@
+[package]
+name = "logit-script"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "LuaJIT scripting: one Lua VM per pipeline worker, and the Event userdata proxy."
+
+[dependencies]
+logit-core.workspace = true
+thiserror.workspace = true
+mlua = { version = "0.9", features = ["luajit", "vendored"] }

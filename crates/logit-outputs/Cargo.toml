@@ -1,0 +1,13 @@
+[package]
+name = "logit-outputs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The Output trait and per-protocol sinks (InfluxDB 2.x first)."
+
+[dependencies]
+logit-core.workspace = true
+logit-proto.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true

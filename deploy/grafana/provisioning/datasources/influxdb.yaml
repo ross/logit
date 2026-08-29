@@ -1,0 +1,17 @@
+# Pre-provisioned datasource so `make up` gives a working Grafana <-> InfluxDB pair with no
+# manual clicking. Matches the DOCKER_INFLUXDB_INIT_* values in compose.yaml.
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB (logit dev)
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    jsonData:
+      version: Flux
+      organization: logit
+      defaultBucket: metrics
+      httpHeaderName1: Authorization
+    secureJsonData:
+      httpHeaderValue1: Token logit-dev-token
+    isDefault: true

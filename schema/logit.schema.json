@@ -1,0 +1,488 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Config",
+  "type": "object",
+  "properties": {
+    "inputs": {
+      "default": {},
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/InputConfig"
+      }
+    },
+    "outputs": {
+      "default": {},
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/OutputConfig"
+      }
+    },
+    "pipelines": {
+      "default": {},
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/PipelineConfig"
+      }
+    }
+  },
+  "definitions": {
+    "BuiltinTransformConfig": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "builtin"
+          ],
+          "properties": {
+            "builtin": {
+              "type": "string",
+              "enum": [
+                "json"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "builtin"
+          ],
+          "properties": {
+            "builtin": {
+              "type": "string",
+              "enum": [
+                "logfmt"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "builtin"
+          ],
+          "properties": {
+            "builtin": {
+              "type": "string",
+              "enum": [
+                "kv"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "builtin",
+            "pattern"
+          ],
+          "properties": {
+            "builtin": {
+              "type": "string",
+              "enum": [
+                "regex"
+              ]
+            },
+            "pattern": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "builtin"
+          ],
+          "properties": {
+            "builtin": {
+              "type": "string",
+              "enum": [
+                "csv"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "builtin",
+            "from",
+            "to"
+          ],
+          "properties": {
+            "builtin": {
+              "type": "string",
+              "enum": [
+                "rename"
+              ]
+            },
+            "from": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "builtin",
+            "field"
+          ],
+          "properties": {
+            "builtin": {
+              "type": "string",
+              "enum": [
+                "remove"
+              ]
+            },
+            "field": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "builtin",
+            "where"
+          ],
+          "properties": {
+            "builtin": {
+              "type": "string",
+              "enum": [
+                "filter"
+              ]
+            },
+            "where": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "builtin",
+            "rate"
+          ],
+          "properties": {
+            "builtin": {
+              "type": "string",
+              "enum": [
+                "sample"
+              ]
+            },
+            "rate": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "builtin",
+            "limit",
+            "window"
+          ],
+          "properties": {
+            "builtin": {
+              "type": "string",
+              "enum": [
+                "throttle"
+              ]
+            },
+            "limit": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "window": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "builtin",
+            "key"
+          ],
+          "properties": {
+            "builtin": {
+              "type": "string",
+              "enum": [
+                "dedup"
+              ]
+            },
+            "key": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "The stateful aggregator (counters/gauges/sets/distributions). Runs `flush()` on `interval`; see `docs/design/lua-api.md`.",
+          "type": "object",
+          "required": [
+            "builtin",
+            "interval"
+          ],
+          "properties": {
+            "builtin": {
+              "type": "string",
+              "enum": [
+                "aggregate"
+              ]
+            },
+            "interval": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "InputConfig": {
+      "oneOf": [
+        {
+          "description": "statsd / DogStatsD-style tagged metrics over UDP.",
+          "type": "object",
+          "required": [
+            "bind",
+            "type"
+          ],
+          "properties": {
+            "bind": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "statsd"
+              ]
+            }
+          }
+        },
+        {
+          "description": "RFC 3164 / RFC 5424 syslog over UDP or TCP.",
+          "type": "object",
+          "required": [
+            "bind",
+            "type"
+          ],
+          "properties": {
+            "bind": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "syslog"
+              ]
+            }
+          }
+        },
+        {
+          "description": "OpenTelemetry Protocol (logs, metrics, and/or traces).",
+          "type": "object",
+          "required": [
+            "bind",
+            "type"
+          ],
+          "properties": {
+            "bind": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "otlp"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Tail one or more files as a log source, rotation- and checkpoint-aware.",
+          "type": "object",
+          "required": [
+            "paths",
+            "type"
+          ],
+          "properties": {
+            "checkpoint_path": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "file_tail"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The native logit-to-logit protocol (`docs/design/wire-protocol.md`).",
+          "type": "object",
+          "required": [
+            "bind",
+            "type"
+          ],
+          "properties": {
+            "bind": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "logit"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "OutputConfig": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "bucket",
+            "org",
+            "token_env",
+            "type",
+            "url"
+          ],
+          "properties": {
+            "bucket": {
+              "type": "string"
+            },
+            "org": {
+              "type": "string"
+            },
+            "token_env": {
+              "description": "Referenced, not inlined -- kept out of the schema/config-dump path deliberately.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "influx_db"
+              ]
+            },
+            "url": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "endpoint",
+            "type"
+          ],
+          "properties": {
+            "endpoint": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "otlp"
+              ]
+            }
+          }
+        },
+        {
+          "description": "The native logit-to-logit protocol (`docs/design/wire-protocol.md`).",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "type"
+          ],
+          "properties": {
+            "endpoint": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "logit"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "PipelineConfig": {
+      "description": "One named pipeline: inputs feed transforms feed outputs. See `docs/design/lua-api.md` for the transform chain's config shape.",
+      "type": "object",
+      "required": [
+        "inputs",
+        "outputs"
+      ],
+      "properties": {
+        "inputs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "transforms": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TransformConfig"
+          }
+        }
+      }
+    },
+    "TransformConfig": {
+      "description": "A transform pipeline stage. Built-in native processors (no Lua VM involved) are meant to sit in front of user Lua in the same chain -- \"parse the JSON body, then run my logic\" -- rather than being an either/or with scripting. See `docs/design/lua-api.md`.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BuiltinTransformConfig"
+        },
+        {
+          "description": "Inline Lua source (a YAML block scalar in practice).",
+          "type": "object",
+          "required": [
+            "lua"
+          ],
+          "properties": {
+            "lua": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "A `.lua` file path, relative to the config file.",
+          "type": "object",
+          "required": [
+            "lua_file"
+          ],
+          "properties": {
+            "lua_file": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
