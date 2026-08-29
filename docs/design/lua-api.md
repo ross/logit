@@ -121,35 +121,59 @@ incomplete or empty result.
 
 ## Config shape
 
-Lua can be inline in YAML (block scalar) or referenced from a file:
+A Lua transform is one component in the pipeline's component graph
+(`docs/design/pipeline-graph.md`, `docs/adr/0009-component-graph-configuration.md`) — it names its
+own `sources` and is available as a source to anything downstream, rather than sitting in a fixed
+per-pipeline `transforms:` chain. Lua can be inline in YAML (block scalar) or referenced from a
+file:
 
 ```yaml
-pipelines:
-  app_metrics:
-    inputs: [statsd_in]
-    transforms:
-      - builtin: aggregate
-        interval: 10s
-      - lua: |
-          function process(event)
-            event.attributes.env = event.attributes.env or "unknown"
-            return event
-          end
-      - lua_file: ./scripts/enrich.lua
-        interval: 30s
-    outputs: [influx_out]
+components:
+  metrics_in:
+    type: statsd_in
+    bind: 0.0.0.0:8125
+
+  windowed:
+    type: aggregate
+    sources: [metrics_in]
+    interval: 10s
+
+  enrich:
+    type: lua
+    sources: [windowed]
+    script: |
+      function process(event)
+        event.attributes.env = event.attributes.env or "unknown"
+        return event
+      end
+
+  enrich_more:
+    type: lua_file
+    sources: [enrich]
+    lua_file: ./scripts/enrich.lua
+    interval: 30s
+
+  influx_out:
+    type: influxdb_out
+    sources: [enrich_more]
+    url: http://influxdb:8086
+    org: logit
+    bucket: metrics
+    token_env: INFLUXDB_TOKEN
 ```
 
-A `lua`/`lua_file` stage's `interval` is optional and drives that stage's own `flush()` the same way
-`aggregate`'s does (see `docs/adr/0008-aggregation-window-semantics.md`) -- omitted, the common
-case, the stage never ticks, same as a script with no `flush()` at all. A zero interval is rejected
-at config-validation time (`logit-cli::pipeline::require_implemented_transform`), on either kind of
-stage.
+A `lua`/`lua_file` component's `interval` is optional and drives that component's own `flush()` the
+same way `aggregate`'s does (see `docs/adr/0008-aggregation-window-semantics.md`) -- omitted, the
+common case, the component never ticks, same as a script with no `flush()` at all. A zero interval
+is rejected at config-validation time, on either kind of component.
 
 Built-in native processors (no Lua involved) handle the common structured-parsing cases without
 per-event VM overhead: `json`, `logfmt`, `kv`, `regex`/`grok`, `csv`, `rename`/`remove`/`copy`,
-`filter`, `sample`, `throttle`, `dedup`, `aggregate`. These are meant to sit in front of user Lua in
-a chain — "parse the JSON body, then run my logic" — rather than being an either/or with scripting.
+`filter`, `sample`, `throttle`, `dedup`, `aggregate`. Each is a transform-kind component like `lua`
+above; nothing about being native rather than scripted changes how a component wires into the
+graph. These are meant to sit in front of user Lua — "parse the JSON body, then run my logic" —
+rather than being an either/or with scripting: a native transform names a Lua component as its
+source, or vice versa, same as any other edge.
 
 ## Concurrency
 
