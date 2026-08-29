@@ -5,7 +5,7 @@
 //! the binary actually accepts. YAML parsing itself (via a maintained `serde_yaml` fork, per
 //! ADR 0003) belongs to `logit-cli`, not here -- this crate only defines the shape.
 
-use schemars::JsonSchema;
+use schemars::{gen::SchemaGenerator, schema::Schema, JsonSchema};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -17,7 +17,16 @@ pub struct Config {
     #[serde(default)]
     pub outputs: HashMap<String, OutputConfig>,
     #[serde(default)]
+    #[schemars(schema_with = "non_empty_pipelines_schema")]
     pub pipelines: HashMap<String, PipelineConfig>,
+}
+
+fn non_empty_pipelines_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = HashMap::<String, PipelineConfig>::json_schema(generator);
+    if let Schema::Object(schema) = &mut schema {
+        schema.object().min_properties = Some(1);
+    }
+    schema
 }
 
 /// One named pipeline: inputs feed transforms feed outputs. See `docs/design/lua-api.md` for the
@@ -25,10 +34,7 @@ pub struct Config {
 ///
 /// `inputs`/`outputs` are marked `minItems: 1` in the generated schema -- `logit run` rejects a
 /// pipeline with either empty (see `logit-cli::pipeline::validate_semantics`), so the schema
-/// shouldn't claim otherwise (ADR 0003). The equivalent "at least one pipeline" rule on
-/// `Config::pipelines` has no schema-level expression: schemars 0.8's `length` attribute covers
-/// array/string schemas, not the `minProperties` a `HashMap`-backed object schema would need --
-/// `validate_semantics` is the only place that rule is enforced.
+/// shouldn't claim otherwise (ADR 0003).
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct PipelineConfig {
     #[schemars(length(min = 1))]
@@ -294,5 +300,24 @@ mod tests {
             }
             other => panic!("expected Lua, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pipelines_schema_requires_at_least_one_entry() {
+        let schema = json_schema();
+        let pipelines = schema
+            .schema
+            .object
+            .expect("config should be an object")
+            .properties
+            .remove("pipelines")
+            .expect("config should define pipelines");
+        let Schema::Object(pipelines) = pipelines else {
+            panic!("pipelines should have an object schema");
+        };
+        assert_eq!(
+            pipelines.object.expect("pipelines should be an object").min_properties,
+            Some(1)
+        );
     }
 }
