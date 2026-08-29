@@ -424,7 +424,7 @@
       ]
     },
     "PipelineConfig": {
-      "description": "One named pipeline: inputs feed transforms feed outputs. See `docs/design/lua-api.md` for the transform chain's config shape.",
+      "description": "One named pipeline: inputs feed transforms feed outputs. See `docs/design/lua-api.md` for the transform chain's config shape.\n\n`inputs`/`outputs` are marked `minItems: 1` in the generated schema -- `logit run` rejects a pipeline with either empty (see `logit-cli::pipeline::validate_semantics`), so the schema shouldn't claim otherwise (ADR 0003). The equivalent \"at least one pipeline\" rule on `Config::pipelines` has no schema-level expression: schemars 0.8's `length` attribute covers array/string schemas, not the `minProperties` a `HashMap`-backed object schema would need -- `validate_semantics` is the only place that rule is enforced.",
       "type": "object",
       "required": [
         "inputs",
@@ -435,13 +435,15 @@
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "minItems": 1
         },
         "outputs": {
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "minItems": 1
         },
         "transforms": {
           "default": [],

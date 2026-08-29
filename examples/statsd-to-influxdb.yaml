@@ -5,8 +5,8 @@
 # No builtin transforms yet -- none are implemented (`logit run` rejects any `builtin:` stage with
 # a clear error). This originally also had a `builtin: aggregate` window ahead of the Lua stage;
 # dropped for now so this config actually runs end-to-end. Re-add it once the aggregate transform
-# exists (tracked in tmp/0.1-status.md) -- the stateful, flush-on-interval piece is a separate,
-# well-scoped follow-up from pipeline orchestration itself.
+# exists -- the stateful, flush-on-interval piece is a separate, well-scoped follow-up from
+# pipeline orchestration itself.
 inputs:
   statsd_in:
     type: statsd

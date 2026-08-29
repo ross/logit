@@ -10,11 +10,13 @@ LuaJIT. Read [docs/OVERVIEW.md](docs/OVERVIEW.md) first (~1 page) for scope and 
 internal event model, the Lua scripting API, and the native wire protocol — those three design
 docs are load-bearing; don't improvise around them without reading them first.
 
-**Current state:** design + scaffolding. The Cargo workspace has real types and trait definitions
-matching the design docs, but no working pipeline — inputs, outputs, and the Lua VM integration
-are `todo!()`. The v0.1 target (statsd in → one Lua enrichment stage → InfluxDB 2.x out) is the
-next thing to build; see `crates/logit-inputs/src/statsd.rs` and
-`crates/logit-outputs/src/influxdb.rs` for where it starts.
+**Current state:** the v0.1 vertical slice works end to end — statsd in, a Lua enrichment stage,
+InfluxDB 2.x out, via `logit run <config>` (see [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml),
+`script/server`). The one piece still missing for a *complete* v0.1 is the `aggregate` built-in
+transform — no built-in transforms are implemented yet, so `logit run` rejects a config that
+references one with a clear error; see `crates/logit-inputs/src/statsd.rs` and
+`crates/logit-outputs/src/influxdb.rs` for the input/output side, `crates/logit-cli/src/pipeline.rs`
+for orchestration.
 
 ## Environment
 

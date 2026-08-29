@@ -43,47 +43,17 @@ pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
 /// real file on disk or (since validation happens before anything is resolved) any real sockets
 /// or HTTP calls either.
 async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
-    if config.pipelines.is_empty() {
-        anyhow::bail!("config defines no pipelines");
-    }
+    // Every check `logit validate` also needs to make -- empty pipelines/inputs/outputs, unknown
+    // or double-claimed names, unimplemented kinds -- lives in `validate_semantics` so the two
+    // paths can't silently disagree about what's acceptable (see its doc comment).
+    validate_semantics(&config)?;
 
-    // A named input/output claimed by more than one pipeline is a config-time error, not
-    // silently-wrong behavior (e.g. two pipelines both trying to bind the same UDP port). Real
-    // fan-out/fan-in support is a legitimate future need, but nothing today's configs need.
-    let mut claimed_inputs: HashSet<String> = HashSet::new();
-    let mut claimed_outputs: HashSet<String> = HashSet::new();
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
     for (pipeline_name, pipeline) in &config.pipelines {
-        // `PipelineConfig.inputs`/`outputs` are unconstrained `Vec`s (no `minItems` in the
-        // generated schema), so both empty shapes parse as valid config. Reject both explicitly,
-        // before resolving or spawning anything for this pipeline: `outputs: []` would otherwise
-        // have `run_pipeline_worker` silently discard every transformed batch forever (its
-        // `output_txs.split_last()` is `None`) while the input keeps consuming -- telemetry in,
-        // nothing out, no error anywhere. `inputs: []` would spawn no input tasks, so this
-        // pipeline's `batch_tx` drops at the end of this loop iteration, closing the worker
-        // thread's channel almost immediately -- if this is the only pipeline, `run_pipelines` can
-        // return `Ok(())` having done nothing at all.
-        if pipeline.inputs.is_empty() {
-            anyhow::bail!(
-                "pipeline '{pipeline_name}' has no inputs -- it would never receive any events"
-            );
-        }
-        if pipeline.outputs.is_empty() {
-            anyhow::bail!(
-                "pipeline '{pipeline_name}' has no outputs -- any events it processes would be \
-                 silently discarded"
-            );
-        }
-
         // Outputs first, so the worker thread below can be handed their senders directly.
         let mut output_txs = Vec::with_capacity(pipeline.outputs.len());
         for output_name in &pipeline.outputs {
-            if !claimed_outputs.insert(output_name.clone()) {
-                anyhow::bail!(
-                    "output '{output_name}' is referenced by more than one pipeline -- not yet supported"
-                );
-            }
             let output_config = config.outputs.get(output_name).with_context(|| {
                 format!("pipeline '{pipeline_name}' references unknown output '{output_name}'")
             })?;
@@ -163,11 +133,6 @@ async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
         }
 
         for input_name in &pipeline.inputs {
-            if !claimed_inputs.insert(input_name.clone()) {
-                anyhow::bail!(
-                    "input '{input_name}' is referenced by more than one pipeline -- not yet supported"
-                );
-            }
             let input_config = config.inputs.get(input_name).with_context(|| {
                 format!("pipeline '{pipeline_name}' references unknown input '{input_name}'")
             })?;
@@ -187,25 +152,124 @@ async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_input(config: &InputConfig) -> anyhow::Result<Box<dyn Input + Send>> {
+/// Semantic checks a `Config` must pass beyond what serde/the generated schema already enforce --
+/// non-empty pipelines/inputs/outputs, no unknown or double-claimed input/output names, no
+/// unimplemented input/output/transform kind. Shared by `logit validate` and `run_config` (called
+/// first thing, before resolving or spawning anything) so the two can never again disagree about
+/// whether a config is acceptable -- `validate` silently passing a config `run` rejects was a real
+/// review finding on this same module, not a hypothetical.
+///
+/// Deliberately stops short of what `run_config` checks *after* this: it doesn't read
+/// `token_env` from the environment or try to load Lua source, since either would change
+/// `logit validate`'s contract from "is this config structurally valid" to "could I run this right
+/// now" -- a bigger, separate decision from the empty-collection gap this closes.
+pub fn validate_semantics(config: &Config) -> anyhow::Result<()> {
+    if config.pipelines.is_empty() {
+        anyhow::bail!("config defines no pipelines");
+    }
+
+    // A named input/output claimed by more than one pipeline is a config-time error, not
+    // silently-wrong behavior (e.g. two pipelines both trying to bind the same UDP port). Real
+    // fan-out/fan-in support is a legitimate future need, but nothing today's configs need.
+    let mut claimed_inputs: HashSet<&str> = HashSet::new();
+    let mut claimed_outputs: HashSet<&str> = HashSet::new();
+
+    for (pipeline_name, pipeline) in &config.pipelines {
+        // `PipelineConfig.inputs`/`outputs` are `minItems: 1` in the generated schema (a
+        // documentation-level match to this check -- schemars' `length` attribute doesn't add
+        // runtime validation of its own, so this is still the check that actually enforces it).
+        // Left unenforced: `outputs: []` would have `run_pipeline_worker` silently discard every
+        // transformed batch forever (its `output_txs.split_last()` is `None`) while the input
+        // keeps consuming -- telemetry in, nothing out, no error anywhere. `inputs: []` would spawn
+        // no input tasks, so the pipeline's `batch_tx` drops at the end of that loop iteration,
+        // closing the worker thread's channel almost immediately -- if it's the only pipeline,
+        // `run_pipelines` can return `Ok(())` having done nothing at all.
+        if pipeline.inputs.is_empty() {
+            anyhow::bail!(
+                "pipeline '{pipeline_name}' has no inputs -- it would never receive any events"
+            );
+        }
+        if pipeline.outputs.is_empty() {
+            anyhow::bail!(
+                "pipeline '{pipeline_name}' has no outputs -- any events it processes would be \
+                 silently discarded"
+            );
+        }
+
+        for output_name in &pipeline.outputs {
+            if !claimed_outputs.insert(output_name) {
+                anyhow::bail!(
+                    "output '{output_name}' is referenced by more than one pipeline -- not yet supported"
+                );
+            }
+            let output_config = config.outputs.get(output_name).with_context(|| {
+                format!("pipeline '{pipeline_name}' references unknown output '{output_name}'")
+            })?;
+            require_implemented_output(output_config)?;
+        }
+
+        for transform in &pipeline.transforms {
+            if let TransformConfig::Builtin(builtin) = transform {
+                anyhow::bail!(
+                    "pipeline '{pipeline_name}': builtin transform {builtin:?} is not \
+                     implemented yet"
+                );
+            }
+        }
+
+        for input_name in &pipeline.inputs {
+            if !claimed_inputs.insert(input_name) {
+                anyhow::bail!(
+                    "input '{input_name}' is referenced by more than one pipeline -- not yet supported"
+                );
+            }
+            let input_config = config.inputs.get(input_name).with_context(|| {
+                format!("pipeline '{pipeline_name}' references unknown input '{input_name}'")
+            })?;
+            require_implemented_input(input_config)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// The single source of truth for which `InputConfig` kinds `build_input` can actually construct
+/// -- split out so `validate_semantics` can reject the same unimplemented kinds `logit run` does
+/// without the side effects (env reads, socket/HTTP setup) real construction can carry.
+fn require_implemented_input(config: &InputConfig) -> anyhow::Result<()> {
     match config {
-        InputConfig::Statsd { bind } => Ok(Box::new(StatsdInput { bind: bind.clone() })),
+        InputConfig::Statsd { .. } => Ok(()),
         other => anyhow::bail!("input kind {other:?} is not implemented yet"),
     }
 }
 
-fn build_output(config: &OutputConfig) -> anyhow::Result<Box<dyn Output + Send>> {
+fn build_input(config: &InputConfig) -> anyhow::Result<Box<dyn Input + Send>> {
+    require_implemented_input(config)?;
+    let InputConfig::Statsd { bind } = config else {
+        unreachable!("require_implemented_input already rejected every other kind");
+    };
+    Ok(Box::new(StatsdInput { bind: bind.clone() }))
+}
+
+/// See [`require_implemented_input`] -- same reasoning, for outputs. `build_output` alone reads
+/// `token_env` from the environment; this doesn't, so `validate_semantics` can use it without
+/// changing `logit validate`'s contract.
+fn require_implemented_output(config: &OutputConfig) -> anyhow::Result<()> {
     match config {
-        OutputConfig::InfluxDb { url, org, bucket, token_env } => {
-            let token = std::env::var(token_env).with_context(|| {
-                format!(
-                    "environment variable '{token_env}' (referenced by output config) is not set"
-                )
-            })?;
-            Ok(Box::new(InfluxDbOutput::new(url.clone(), org.clone(), bucket.clone(), token)))
-        }
+        OutputConfig::InfluxDb { .. } => Ok(()),
         other => anyhow::bail!("output kind {other:?} is not implemented yet"),
     }
+}
+
+fn build_output(config: &OutputConfig) -> anyhow::Result<Box<dyn Output + Send>> {
+    require_implemented_output(config)?;
+    let OutputConfig::InfluxDb { url, org, bucket, token_env } = config else {
+        unreachable!("require_implemented_output already rejected every other kind");
+    };
+    let token = std::env::var(token_env).with_context(|| {
+        format!("environment variable '{token_env}' (referenced by output config) is not set")
+    })?;
+    Ok(Box::new(InfluxDbOutput::new(url.clone(), org.clone(), bucket.clone(), token)))
 }
 
 /// Runs `events` through `workers` in order (`docs/design/lua-api.md`'s `process()` contract:
@@ -290,7 +354,7 @@ fn run_pipeline_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_config::PipelineConfig;
+    use logit_config::{BuiltinTransformConfig, PipelineConfig};
     use logit_core::{interner::intern, AttrMap, MetricKind, MetricRecord, Payload};
     use std::collections::HashMap;
 
@@ -337,6 +401,192 @@ mod tests {
 
         let err = expect_err(run_config(config, PathBuf::new()).await);
         assert!(err.to_string().contains("no outputs"), "got: {err}");
+    }
+
+    /// The exact function `logit validate` calls (`main.rs`'s `Command::Validate` arm) -- there's
+    /// no CLI-subprocess test harness in this workspace to exercise that arm any more directly,
+    /// so testing `validate_semantics` itself is testing what `validate` actually runs.
+    #[test]
+    fn validate_semantics_rejects_no_pipelines() {
+        let config =
+            Config { inputs: HashMap::new(), outputs: HashMap::new(), pipelines: HashMap::new() };
+        let err = expect_err(validate_semantics(&config));
+        assert!(err.to_string().contains("no pipelines"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_semantics_rejects_empty_inputs() {
+        let mut outputs = HashMap::new();
+        outputs.insert("out".to_string(), influxdb_output_config());
+        let mut pipelines = HashMap::new();
+        pipelines.insert(
+            "p".to_string(),
+            PipelineConfig { inputs: vec![], transforms: vec![], outputs: vec!["out".to_string()] },
+        );
+        let config = Config { inputs: HashMap::new(), outputs, pipelines };
+        let err = expect_err(validate_semantics(&config));
+        assert!(err.to_string().contains("no inputs"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_semantics_rejects_empty_outputs() {
+        let mut inputs = HashMap::new();
+        inputs.insert("in".to_string(), InputConfig::Statsd { bind: "127.0.0.1:0".to_string() });
+        let mut pipelines = HashMap::new();
+        pipelines.insert(
+            "p".to_string(),
+            PipelineConfig { inputs: vec!["in".to_string()], transforms: vec![], outputs: vec![] },
+        );
+        let config = Config { inputs, outputs: HashMap::new(), pipelines };
+        let err = expect_err(validate_semantics(&config));
+        assert!(err.to_string().contains("no outputs"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_semantics_rejects_unknown_output_reference() {
+        let mut inputs = HashMap::new();
+        inputs.insert("in".to_string(), InputConfig::Statsd { bind: "127.0.0.1:0".to_string() });
+        let mut pipelines = HashMap::new();
+        pipelines.insert(
+            "p".to_string(),
+            PipelineConfig {
+                inputs: vec!["in".to_string()],
+                transforms: vec![],
+                outputs: vec!["missing".to_string()],
+            },
+        );
+        let config = Config { inputs, outputs: HashMap::new(), pipelines };
+        let err = expect_err(validate_semantics(&config));
+        assert!(err.to_string().contains("unknown output 'missing'"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_semantics_rejects_unknown_input_reference() {
+        let mut outputs = HashMap::new();
+        outputs.insert("out".to_string(), influxdb_output_config());
+        let mut pipelines = HashMap::new();
+        pipelines.insert(
+            "p".to_string(),
+            PipelineConfig {
+                inputs: vec!["missing".to_string()],
+                transforms: vec![],
+                outputs: vec!["out".to_string()],
+            },
+        );
+        let config = Config { inputs: HashMap::new(), outputs, pipelines };
+        let err = expect_err(validate_semantics(&config));
+        assert!(err.to_string().contains("unknown input 'missing'"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_semantics_rejects_output_claimed_by_two_pipelines() {
+        let mut inputs = HashMap::new();
+        inputs.insert("in1".to_string(), InputConfig::Statsd { bind: "127.0.0.1:0".to_string() });
+        inputs.insert("in2".to_string(), InputConfig::Statsd { bind: "127.0.0.1:0".to_string() });
+        let mut outputs = HashMap::new();
+        outputs.insert("out".to_string(), influxdb_output_config());
+        let mut pipelines = HashMap::new();
+        pipelines.insert(
+            "p1".to_string(),
+            PipelineConfig {
+                inputs: vec!["in1".to_string()],
+                transforms: vec![],
+                outputs: vec!["out".to_string()],
+            },
+        );
+        pipelines.insert(
+            "p2".to_string(),
+            PipelineConfig {
+                inputs: vec!["in2".to_string()],
+                transforms: vec![],
+                outputs: vec!["out".to_string()],
+            },
+        );
+        let config = Config { inputs, outputs, pipelines };
+        let err = expect_err(validate_semantics(&config));
+        assert!(err.to_string().contains("more than one pipeline"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_semantics_rejects_unimplemented_output_kind() {
+        let mut inputs = HashMap::new();
+        inputs.insert("in".to_string(), InputConfig::Statsd { bind: "127.0.0.1:0".to_string() });
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "out".to_string(),
+            OutputConfig::Otlp { endpoint: "http://localhost:4317".to_string() },
+        );
+        let mut pipelines = HashMap::new();
+        pipelines.insert(
+            "p".to_string(),
+            PipelineConfig {
+                inputs: vec!["in".to_string()],
+                transforms: vec![],
+                outputs: vec!["out".to_string()],
+            },
+        );
+        let config = Config { inputs, outputs, pipelines };
+        let err = expect_err(validate_semantics(&config));
+        assert!(err.to_string().contains("not implemented yet"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_semantics_rejects_unimplemented_input_kind() {
+        let mut inputs = HashMap::new();
+        inputs.insert("in".to_string(), InputConfig::Otlp { bind: "0.0.0.0:4317".to_string() });
+        let mut outputs = HashMap::new();
+        outputs.insert("out".to_string(), influxdb_output_config());
+        let mut pipelines = HashMap::new();
+        pipelines.insert(
+            "p".to_string(),
+            PipelineConfig {
+                inputs: vec!["in".to_string()],
+                transforms: vec![],
+                outputs: vec!["out".to_string()],
+            },
+        );
+        let config = Config { inputs, outputs, pipelines };
+        let err = expect_err(validate_semantics(&config));
+        assert!(err.to_string().contains("not implemented yet"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_semantics_rejects_builtin_transform() {
+        let mut inputs = HashMap::new();
+        inputs.insert("in".to_string(), InputConfig::Statsd { bind: "127.0.0.1:0".to_string() });
+        let mut outputs = HashMap::new();
+        outputs.insert("out".to_string(), influxdb_output_config());
+        let mut pipelines = HashMap::new();
+        pipelines.insert(
+            "p".to_string(),
+            PipelineConfig {
+                inputs: vec!["in".to_string()],
+                transforms: vec![TransformConfig::Builtin(BuiltinTransformConfig::Json)],
+                outputs: vec!["out".to_string()],
+            },
+        );
+        let config = Config { inputs, outputs, pipelines };
+        let err = expect_err(validate_semantics(&config));
+        assert!(err.to_string().contains("not implemented yet"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_semantics_accepts_a_well_formed_config() {
+        let mut inputs = HashMap::new();
+        inputs.insert("in".to_string(), InputConfig::Statsd { bind: "127.0.0.1:0".to_string() });
+        let mut outputs = HashMap::new();
+        outputs.insert("out".to_string(), influxdb_output_config());
+        let mut pipelines = HashMap::new();
+        pipelines.insert(
+            "p".to_string(),
+            PipelineConfig {
+                inputs: vec!["in".to_string()],
+                transforms: vec![],
+                outputs: vec!["out".to_string()],
+            },
+        );
+        let config = Config { inputs, outputs, pipelines };
+        assert!(validate_semantics(&config).is_ok());
     }
 
     fn counter_event(name: &str, value: f64) -> Event {

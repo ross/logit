@@ -30,7 +30,11 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Validate { path } => {
             let raw = std::fs::read_to_string(&path)?;
-            let _config: logit_config::Config = serde_norway::from_str(&raw)?;
+            let config: logit_config::Config = serde_norway::from_str(&raw)?;
+            // Same semantic checks `logit run` makes before spawning anything (empty
+            // pipelines/inputs/outputs, unknown or double-claimed names, unimplemented kinds) --
+            // shared so `validate` can't silently pass a config `run` would reject.
+            pipeline::validate_semantics(&config)?;
             println!("{} is valid", path.display());
             Ok(())
         }

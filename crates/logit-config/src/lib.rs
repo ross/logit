@@ -22,11 +22,20 @@ pub struct Config {
 
 /// One named pipeline: inputs feed transforms feed outputs. See `docs/design/lua-api.md` for the
 /// transform chain's config shape.
+///
+/// `inputs`/`outputs` are marked `minItems: 1` in the generated schema -- `logit run` rejects a
+/// pipeline with either empty (see `logit-cli::pipeline::validate_semantics`), so the schema
+/// shouldn't claim otherwise (ADR 0003). The equivalent "at least one pipeline" rule on
+/// `Config::pipelines` has no schema-level expression: schemars 0.8's `length` attribute covers
+/// array/string schemas, not the `minProperties` a `HashMap`-backed object schema would need --
+/// `validate_semantics` is the only place that rule is enforced.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct PipelineConfig {
+    #[schemars(length(min = 1))]
     pub inputs: Vec<String>,
     #[serde(default)]
     pub transforms: Vec<TransformConfig>,
+    #[schemars(length(min = 1))]
     pub outputs: Vec<String>,
 }
 
