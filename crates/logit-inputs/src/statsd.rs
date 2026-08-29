@@ -81,7 +81,16 @@ impl Decoder for StatsdDecoder {
             if line.is_empty() {
                 continue;
             }
-            events.extend(parse_line(line, timestamp)?);
+            // One malformed line must not discard unrelated valid metrics elsewhere in the same
+            // datagram -- StatsD clients routinely pack several independent metrics into one
+            // packet, so treating the datagram as atomic would let a single bad line take down
+            // everything alongside it. Isolate per line: keep what parsed, report what didn't.
+            match parse_line(line, timestamp) {
+                Ok(mut line_events) => events.append(&mut line_events),
+                // TODO: route through a proper diagnostics facility once one exists, instead of
+                // stderr -- same gap noted in StatsdInput::run.
+                Err(err) => eprintln!("statsd: {err}"),
+            }
         }
         Ok(EventBatch { resource: self.resource.clone(), events })
     }
@@ -107,7 +116,15 @@ fn parse_line(line: &str, timestamp: i64) -> Result<Vec<Event>, CodecError> {
     let mut attributes = AttrMap::new();
     for extra in segments {
         if let Some(rate) = extra.strip_prefix('@') {
-            sample_rate = rate.parse().map_err(|_| malformed())?;
+            let parsed: f64 = rate.parse().map_err(|_| malformed())?;
+            // A sample rate is a probability: it must be finite and in (0, 1]. `f64::parse`
+            // happily accepts "NaN"/"inf"/negative/zero/>1 text, any of which would turn into a
+            // non-finite or negative Counter (or a divide-by-zero) below -- reject them here
+            // rather than let bad input poison a value that later gets merged and shipped.
+            if !parsed.is_finite() || parsed <= 0.0 || parsed > 1.0 {
+                return Err(malformed());
+            }
+            sample_rate = parsed;
         } else if let Some(tags) = extra.strip_prefix('#') {
             for tag in tags.split(',').filter(|t| !t.is_empty()) {
                 match tag.split_once(':') {
@@ -147,16 +164,20 @@ fn build_event(
             MetricKind::Counter(value / sample_rate)
         }
         "g" => {
-            // TODO: a leading '+'/'-' marks a *relative* adjustment to the gauge's previous
-            // value, per the DogStatsD spec -- that needs state this decoder doesn't have, and
-            // belongs to the `aggregate` processor (docs/design/lua-api.md's `flush()` contract),
-            // not here. For now the magnitude decodes as an absolute value; `str::parse` rejects
-            // a leading '+' outright, so it's stripped uniformly first.
-            let value: f64 = raw_value
-                .strip_prefix('+')
-                .unwrap_or(raw_value)
-                .parse()
-                .map_err(|_| malformed("invalid gauge value"))?;
+            // A leading '+'/'-' marks a *relative* adjustment to the gauge's previous value, per
+            // the DogStatsD spec -- and per that same spec, a plain negative number is
+            // indistinguishable from a relative decrement, so any leading sign is ambiguous, not
+            // just '+'. Applying a relative update needs state this decoder doesn't have (it
+            // belongs to the future `aggregate` processor, docs/design/lua-api.md's `flush()`
+            // contract); silently reinterpreting a delta as an absolute value would produce a
+            // wrong number that looks correct, so this rejects it the same way `s` (set) is
+            // rejected below: a clear not-implemented error instead of quietly wrong data.
+            if raw_value.starts_with('+') || raw_value.starts_with('-') {
+                return Err(malformed(
+                    "relative gauge adjustments ('+'/'-') are not implemented yet",
+                ));
+            }
+            let value: f64 = raw_value.parse().map_err(|_| malformed("invalid gauge value"))?;
             MetricKind::Gauge(value)
         }
         "ms" | "h" | "d" => {
@@ -201,6 +222,14 @@ mod tests {
         }
     }
 
+    /// For asserting a specific line is rejected: `decode()` itself now isolates per-line errors
+    /// (a malformed line must not discard unrelated valid metrics in the same datagram -- see
+    /// `malformed_line_does_not_drop_other_valid_metrics_in_same_datagram` below), so it no
+    /// longer surfaces one. `parse_line` is where that rejection actually happens.
+    fn parse_err(line: &str) -> CodecError {
+        parse_line(line, 0).expect_err("expected this line to be rejected")
+    }
+
     #[test]
     fn counter() {
         let metric = only_metric(decode("page.views:1|c"));
@@ -215,15 +244,33 @@ mod tests {
     }
 
     #[test]
+    fn invalid_sample_rates_are_rejected() {
+        // Zero would divide-by-zero into an infinite counter; negative and >1 aren't valid
+        // probabilities; NaN/inf parse successfully as f64 but aren't finite. Any of these would
+        // otherwise poison a Counter value that later gets merged and shipped downstream.
+        for rate in ["0", "-0.5", "1.5", "NaN", "inf", "-inf"] {
+            let line = format!("hits:1|c|@{rate}");
+            assert!(
+                matches!(parse_err(&line), CodecError::Malformed(_)),
+                "expected @{rate} to be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn gauge() {
         let metric = only_metric(decode("cpu.load:0.75|g"));
         assert!(matches!(metric.kind, MetricKind::Gauge(v) if v == 0.75));
     }
 
     #[test]
-    fn gauge_leading_plus_is_stripped() {
-        let metric = only_metric(decode("cpu.load:+5|g"));
-        assert!(matches!(metric.kind, MetricKind::Gauge(v) if v == 5.0));
+    fn gauge_relative_adjustments_are_rejected_not_silently_reinterpreted() {
+        // Per the DogStatsD spec, a leading '+' or '-' means "adjust the previous value by this
+        // much", which this decoder can't apply (no state). Silently treating '+5' or '-5' as an
+        // absolute value would produce a wrong number that looks like a correct one, so both are
+        // rejected rather than guessed at.
+        assert!(matches!(parse_err("cpu.load:+5|g"), CodecError::Malformed(_)));
+        assert!(matches!(parse_err("cpu.load:-5|g"), CodecError::Malformed(_)));
     }
 
     #[test]
@@ -264,24 +311,32 @@ mod tests {
     }
 
     #[test]
+    fn malformed_line_does_not_drop_other_valid_metrics_in_same_datagram() {
+        // A datagram is not atomic: StatsD clients routinely pack several independent metrics
+        // into one packet, so one bad line must not discard unrelated valid ones alongside it.
+        let events = decode("a:1|c\nbad\nb:2|c");
+        assert_eq!(
+            events.len(),
+            2,
+            "expected both 'a' and 'b' to survive the malformed middle line"
+        );
+        assert_eq!(intern("a"), only_metric(vec![events[0].clone()]).name);
+        assert_eq!(intern("b"), only_metric(vec![events[1].clone()]).name);
+    }
+
+    #[test]
     fn unknown_type_is_rejected() {
-        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
-        let err = decoder.decode(Bytes::from_static(b"x:1|zz")).unwrap_err();
-        assert!(matches!(err, CodecError::Malformed(_)));
+        assert!(matches!(parse_err("x:1|zz"), CodecError::Malformed(_)));
     }
 
     #[test]
     fn missing_colon_is_rejected() {
-        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
-        let err = decoder.decode(Bytes::from_static(b"nocolon|c")).unwrap_err();
-        assert!(matches!(err, CodecError::Malformed(_)));
+        assert!(matches!(parse_err("nocolon|c"), CodecError::Malformed(_)));
     }
 
     #[test]
     fn set_type_is_a_clear_not_implemented_error() {
-        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
-        let err = decoder.decode(Bytes::from_static(b"unique.users:abc123|s")).unwrap_err();
-        assert!(matches!(err, CodecError::Malformed(_)));
+        assert!(matches!(parse_err("unique.users:abc123|s"), CodecError::Malformed(_)));
     }
 
     #[test]
