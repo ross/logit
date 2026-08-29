@@ -263,12 +263,13 @@ mod tests {
         let mut event = counter_event("hits", 1.0);
         event.attributes.insert("x", 9_007_199_254_740_993i64);
         let out = emitted(w.process(event).unwrap());
-        // The fix represents this as an exact decimal string, not (as the review's repro showed)
-        // a silently-wrong Lua number -- so the expectation here is Str, not I64.
-        assert_eq!(
-            out.attributes.get("x"),
-            Some(&logit_core::Value::Str(bytes::Bytes::from(9_007_199_254_740_993i64.to_string())))
-        );
+        // This value takes value_to_lua's string branch (it's outside the exact-integer range),
+        // and the identity assignment above hands that exact same string straight back --
+        // AttrsProxy::__newindex recognizes that as a no-op (lua_value_matches) and leaves the
+        // stored Value untouched, so the variant stays I64, not (as an earlier version of this
+        // test asserted, matching the then-real bug) Str. The precision fix itself -- no silent
+        // truncation to ..._992 -- is unaffected either way.
+        assert_eq!(out.attributes.get("x"), Some(&logit_core::Value::I64(9_007_199_254_740_993)));
     }
 
     #[test]
@@ -307,10 +308,259 @@ mod tests {
         let mut event = counter_event("hits", 1.0);
         event.attributes.insert("x", logit_core::Value::U64(u64::MAX));
         let out = emitted(w.process(event).unwrap());
+        // u64::MAX takes value_to_lua's string branch, and the identity assignment hands that
+        // exact string straight back -- recognized as a no-op (lua_value_matches), so the
+        // variant stays U64 rather than (as an earlier version of this test asserted, matching
+        // the then-real bug) collapsing to Str. The precision fix -- no wrapping negative -- is
+        // unaffected either way.
+        assert_eq!(out.attributes.get("x"), Some(&logit_core::Value::U64(u64::MAX)));
+    }
+
+    // The tests below cover `AttrsProxy::__newindex`'s no-op-assignment rule (value.rs's
+    // `lua_value_matches`) -- the fix for the variant-collapse gap described in
+    // `tmp/lua-value-type-preservation.md` and PR #6 review discussion_r3887008990. Before that
+    // fix, every one of these "stays X" assertions failed: an identity assignment
+    // (`event.attributes.x = event.attributes.x`) always turned the attribute into `Value::Str`
+    // (or, for the two number-branch repros the review added, `Value::I64`), regardless of what
+    // it started as.
+
+    #[test]
+    fn bytes_attribute_with_valid_utf8_stays_bytes_through_identity_round_trip() {
+        // The headline regression: Value::Bytes whose content happens to be valid UTF-8 takes
+        // value_to_lua's plain-string branch (same as Value::Str) with nothing to mark which one
+        // it was -- this is also the concrete case logit-outputs::influxdb's tag handling treats
+        // differently (Str becomes a tag, Bytes doesn't).
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event
+            .attributes
+            .insert("x", logit_core::Value::Bytes(bytes::Bytes::from_static(b"web-01")));
+        let out = emitted(w.process(event).unwrap());
         assert_eq!(
             out.attributes.get("x"),
-            Some(&logit_core::Value::Str(bytes::Bytes::from(u64::MAX.to_string())))
+            Some(&logit_core::Value::Bytes(bytes::Bytes::from_static(b"web-01")))
         );
+    }
+
+    #[test]
+    fn bytes_attribute_with_invalid_utf8_still_round_trips_correctly() {
+        // Unchanged behavior, guarded: invalid-UTF-8 Bytes already round-trips correctly without
+        // this fix, because it fails lua_to_value's UTF-8 check on the way back regardless of the
+        // no-op-assignment rule. Not a case this fix needed to touch, but worth pinning down.
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        let invalid = bytes::Bytes::from_static(&[0xff, 0xfe, 0x00]);
+        event.attributes.insert("x", logit_core::Value::Bytes(invalid.clone()));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(out.attributes.get("x"), Some(&logit_core::Value::Bytes(invalid)));
+    }
+
+    #[test]
+    fn large_timestamp_attribute_stays_timestamp_through_identity_round_trip() {
+        // A Timestamp value large enough to take value_to_lua's string branch (unix-nanos
+        // timestamps always are, in practice).
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event.attributes.insert("x", logit_core::Value::Timestamp(1_700_000_000_000_000_000));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(
+            out.attributes.get("x"),
+            Some(&logit_core::Value::Timestamp(1_700_000_000_000_000_000))
+        );
+    }
+
+    #[test]
+    fn small_timestamp_attribute_stays_timestamp_through_identity_round_trip() {
+        // A Timestamp small enough to fit the exact-integer range takes value_to_lua's
+        // LuaValue::Integer branch instead (exact_i64_to_lua treats Timestamp exactly like I64) --
+        // covered separately from the large case above since it exercises `lua_value_matches`'s
+        // Integer arm, not its String arm.
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event.attributes.insert("x", logit_core::Value::Timestamp(42));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(out.attributes.get("x"), Some(&logit_core::Value::Timestamp(42)));
+    }
+
+    #[test]
+    fn small_u64_attribute_stays_u64_through_identity_round_trip() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event.attributes.insert("x", logit_core::Value::U64(42));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(out.attributes.get("x"), Some(&logit_core::Value::U64(42)));
+    }
+
+    #[test]
+    fn f64_attribute_stays_f64_through_identity_round_trip() {
+        // The PR #6 review's other repro: LuaJIT's dual-number mode canonicalizes an integral
+        // Number (42.0) as an Integer, so a naive `lua_to_value` sees LuaValue::Integer(42) and
+        // silently produces Value::I64(42) instead of the original Value::F64(42.0).
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event.attributes.insert("x", logit_core::Value::F64(42.0));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(out.attributes.get("x"), Some(&logit_core::Value::F64(42.0)));
+    }
+
+    #[test]
+    fn modifying_a_bytes_attribute_still_converts_it_to_str() {
+        // The no-op rule is content-gated, not blanket: a script that genuinely builds a new
+        // string from an old value should still get Value::Str, same as before this fix.
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = tostring(event.attributes.x) .. "-suffix"
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event
+            .attributes
+            .insert("x", logit_core::Value::Bytes(bytes::Bytes::from_static(b"web-01")));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(out.attributes.get("x").and_then(|v| v.as_str()), Some("web-01-suffix"));
+    }
+
+    #[test]
+    fn assigning_a_brand_new_string_key_produces_str() {
+        // A script constructing a genuinely new attribute must not be rejected or coerced to
+        // some other variant just because the no-op rule exists elsewhere.
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.greeting = "hello"
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(counter_event("hits", 1.0)).unwrap());
+        assert_eq!(out.attributes.get("greeting").and_then(|v| v.as_str()), Some("hello"));
+    }
+
+    #[test]
+    fn assigning_different_content_over_a_bytes_attribute_produces_str() {
+        // The rule compares content, not key: overwriting an existing key with genuinely
+        // different content is exactly as much a real change as writing a new key, and should
+        // convert the same way.
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = "replaced"
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event
+            .attributes
+            .insert("x", logit_core::Value::Bytes(bytes::Bytes::from_static(b"web-01")));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(out.attributes.get("x").and_then(|v| v.as_str()), Some("replaced"));
+    }
+
+    #[test]
+    fn generic_copy_all_attributes_script_preserves_every_variant() {
+        // The motivating real-world scenario from tmp/lua-value-type-preservation.md: a script
+        // with no intention of touching a particular attribute -- here, one that just tags every
+        // event with `env` and otherwise copies attributes through via to_table(), a very
+        // ordinary pattern for a generic enrichment stage -- must not silently change that
+        // attribute's variant.
+        let w = worker(
+            r#"
+            function process(event)
+                local attrs = event:to_table().attributes
+                for k, v in pairs(attrs) do
+                    event.attributes[k] = v
+                end
+                event.attributes.env = "prod"
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event
+            .attributes
+            .insert("host", logit_core::Value::Bytes(bytes::Bytes::from_static(b"web-01")));
+        event.attributes.insert("retries", logit_core::Value::U64(42));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(
+            out.attributes.get("host"),
+            Some(&logit_core::Value::Bytes(bytes::Bytes::from_static(b"web-01")))
+        );
+        assert_eq!(out.attributes.get("retries"), Some(&logit_core::Value::U64(42)));
+        assert_eq!(out.attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+    }
+
+    #[test]
+    fn cross_key_copy_of_a_bytes_attribute_is_a_documented_residual_gap() {
+        // The rule this fix implements is keyed on an assignment's Lua-side content matching an
+        // *existing* attribute at the *same key* -- it can't (and isn't meant to) recognize that
+        // a value copied to a different key came from somewhere that remembers its variant, since
+        // by that point it's just a plain Lua string like any other. Asserted deliberately, as a
+        // documented contract rather than an accident -- see
+        // docs/adr/0007-lua-value-identity-preservation.md's Consequences section.
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.y = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event
+            .attributes
+            .insert("x", logit_core::Value::Bytes(bytes::Bytes::from_static(b"web-01")));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(
+            out.attributes.get("x"),
+            Some(&logit_core::Value::Bytes(bytes::Bytes::from_static(b"web-01")))
+        );
+        assert_eq!(out.attributes.get("y").and_then(|v| v.as_str()), Some("web-01"));
     }
 
     #[test]

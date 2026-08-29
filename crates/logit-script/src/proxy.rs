@@ -6,7 +6,7 @@
 //! See `docs/design/lua-api.md` for why this exists instead of full table conversion, and for the
 //! script-visible contract these two types implement.
 
-use crate::value::{attrmap_to_lua_table, lua_to_value, value_to_lua};
+use crate::value::{attrmap_to_lua_table, lua_to_value, lua_value_matches, value_to_lua};
 use logit_core::{Event, Payload};
 use mlua::{AnyUserData, MetaMethod, UserData, UserDataMethods, Value as LuaValue};
 use std::cell::RefCell;
@@ -134,6 +134,24 @@ impl UserData for AttrsProxy {
         methods.add_meta_method(
             MetaMethod::NewIndex,
             |_, this, (key, value): (String, LuaValue)| {
+                // A no-op assignment must stay a no-op: if `value` is byte-for-byte what
+                // value_to_lua would have handed the script for this attribute's current
+                // content, leave the stored Value untouched -- so its variant (e.g. Bytes vs.
+                // Str, U64 vs. I64) survives an unmodified `event.attributes.x =
+                // event.attributes.x` even though a plain Lua string/number can't itself carry
+                // that information. See value.rs's `lua_value_matches` for the full reasoning.
+                // Must run before `lua_to_value` re-borrows mutably below, and must not call
+                // back into Lua while `this.0` is borrowed here -- see that function's doc
+                // comment for why.
+                let is_noop = this
+                    .0
+                    .borrow()
+                    .attributes
+                    .get(&key)
+                    .is_some_and(|existing| lua_value_matches(existing, &value));
+                if is_noop {
+                    return Ok(());
+                }
                 let value = lua_to_value(value)?;
                 this.0.borrow_mut().attributes.insert(&key, value);
                 Ok(())
