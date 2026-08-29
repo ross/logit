@@ -1,0 +1,11 @@
+#!/bin/bash
+# Usage: script/update
+# Run after pulling changes: rebuilds the dev image (in case Dockerfile.dev or the toolchain
+# pin changed) and refreshes the local test stack's images.
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+"${SCRIPT_PATH}/bootstrap"
+${COMPOSE} pull influxdb grafana

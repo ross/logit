@@ -1,0 +1,8 @@
+#!/bin/bash
+# Usage: script/format [--check]
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+run cargo fmt --all -- "$@"

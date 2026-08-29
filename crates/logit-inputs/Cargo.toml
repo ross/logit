@@ -12,3 +12,4 @@ logit-proto.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+bytes.workspace = true
