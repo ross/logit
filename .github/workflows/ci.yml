@@ -16,14 +16,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install native build deps (vendored LuaJIT via mlua) and cargo tools
+      - name: Install native build deps (vendored LuaJIT via mlua)
         run: |
           apt-get update
           apt-get install -y --no-install-recommends clang cmake pkg-config libssl-dev
           rustup component add rustfmt clippy
-          cargo install cargo-nextest --locked
-          cargo install cargo-deny --locked
-          cargo install cargo-audit --locked
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        with:
+          tool: cargo-nextest,cargo-deny,cargo-audit
+          fallback: none
 
       - uses: actions/cache@v4
         with:
