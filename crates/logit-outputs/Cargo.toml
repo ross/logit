@@ -16,3 +16,6 @@ reqwest.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+# Only for the end-to-end regression test that a Lua enrichment stage doesn't silently change an
+# attribute's InfluxDB tag-inclusion behavior -- see value_type_preserved_through_lua_stage below.
+logit-script.workspace = true

@@ -62,30 +62,21 @@ doesn't fit — small values stay real, arithmetic-capable Lua numbers; `Timesta
 enough in practice to always take the string branch anyway, and share the same logic rather than a
 separately maintained rule.
 
-**Known limitation, not silently shipped:** a plain Lua value can't carry which `Value` variant it
-came from — true on both the string and number side, confirmed by two rounds of review against the
-real implementation:
-
-- *String side:* anything that takes the string branch above — `Str`, `Bytes` (when its content
-  happens to be valid UTF-8), `Timestamp`, or an out-of-range `I64`/`U64` — is indistinguishable
-  from an ordinary `Value::Str` once inside Lua. This has a real behavioral consequence today:
-  `logit-outputs::influxdb`'s tag handling treats `Bytes` and `Str` differently.
-- *Number side:* a safe (in-range) `U64` round-trips to `I64` (a Lua integer has no signed/unsigned
-  tag), and a whole-number `F64` (e.g. `42.0`) *also* round-trips to `I64` — LuaJIT's dual-number
-  mode canonicalizes an integral Lua number as an integer internally, independent of how the value
-  was originally pushed. A fractional `F64` is unaffected.
-- *Empty containers:* `Value::Array(vec![])` and `Value::Map(AttrMap::new())` are both just Lua's
-  `{}`, with nothing to distinguish them. `crates/logit-script/src/value.rs` picks one documented,
-  tested default (an empty table decodes as `Map`) rather than solving the unsolvable — attributes
-  are map-shaped and are the primary thing scripts manipulate, so that's the more natural default
-  for the common case.
-
-An identity round-trip through a script can therefore silently change a value's variant even
-though its content is unchanged, in any of these ways. A proper fix needs a tagged/userdata value
-wrapper (its own `__tostring`/`__concat`/`__eq` so it still behaves like a string in scripts)
-preserving origin type through Lua — real enough new surface area to belong in a focused follow-up
-rather than bundled into the fixes that found and widened this gap. Handoff for that follow-up:
-`tmp/lua-value-type-preservation.md`.
+**Variant identity survives an unmodified round-trip, via a no-op-assignment rule, not a tagged
+value.** A plain Lua string or number genuinely can't carry which `Value` variant it came from, so
+an identity round-trip through a script (`event.attributes.x = event.attributes.x`, or the very
+ordinary "read every attribute via `to_table()` and copy it back while tagging the event with
+something else") would otherwise silently change a value's variant even though its content never
+changed — a real behavioral consequence, since `logit-outputs::influxdb`'s tag handling treats
+`Bytes` and `Str` differently. `AttrsProxy::__newindex` (`crates/logit-script/src/proxy.rs`) closes
+this by treating such an assignment as a no-op when it's byte-for-byte (or number-for-number) what
+`value_to_lua` would already produce for the attribute's current content (`value.rs`'s
+`lua_value_matches`) — the stored `Value`, variant included, is left untouched; anything that
+changes content still converts exactly as before. See
+[`lua-value-type-preservation.md`](lua-value-type-preservation.md) for the full mapping, why a
+tagged userdata wrapper was considered and rejected, and every known residual gap (cross-key
+copies, nested container elements, empty-container ambiguity) — each deliberate and
+regression-tested, not an oversight.
 
 **A criterion benchmark against plain table conversion is still outstanding** — tracked as a
 follow-up now that the proxy above exists to benchmark against a baseline. The design commits to

@@ -7,6 +7,7 @@ use bytes::Bytes;
 use logit_core::interner::resolve;
 use logit_core::{AttrMap, Value};
 use mlua::{Lua, Table, Value as LuaValue};
+use std::borrow::Cow;
 
 /// Converts an internal `Value` into an `mlua::Value` for handing to a script.
 pub fn value_to_lua<'lua>(lua: &'lua Lua, value: &Value) -> mlua::Result<LuaValue<'lua>> {
@@ -20,44 +21,39 @@ pub fn value_to_lua<'lua>(lua: &'lua Lua, value: &Value) -> mlua::Result<LuaValu
         // an identity assignment (`event.attributes.x = event.attributes.x`) -- and separately,
         // U64(u64::MAX) wrapping negative through the `as mlua::Integer` cast that used to live
         // here. `exact_i64_to_lua`/`exact_u64_to_lua` below check per-value against the actual
-        // exact-integer boundary (see their doc comments for why that's a magnitude check, not a
-        // round-trip cast -- the obvious round-trip check has its own bug near `u64::MAX`) and
-        // fall back to a decimal string when a value doesn't fit. This is conditional rather than
-        // the blanket string `Timestamp` uses because ordinary I64/U64 attributes are
-        // usually small (`retry_count = 3`), where a real Lua number is both safe and far more
-        // useful to a script (natural comparisons/arithmetic) than a string would be; a
-        // `Timestamp` is *always* large enough in practice to take the string branch anyway, so
-        // it shares this same exact-round-trip logic rather than a separately maintained rule.
+        // exact-integer boundary (see [`i64_is_exact_lua_number`]'s doc comment for why that's a
+        // magnitude check, not a round-trip cast -- the obvious round-trip check has its own bug
+        // near `u64::MAX`) and fall back to a decimal string when a value doesn't fit. This is
+        // conditional rather than the blanket string `Timestamp` uses because ordinary I64/U64
+        // attributes are usually small (`retry_count = 3`), where a real Lua number is both safe
+        // and far more useful to a script (natural comparisons/arithmetic) than a string would
+        // be; a `Timestamp` is *always* large enough in practice to take the string branch
+        // anyway, so it shares this same exact-round-trip logic rather than a separately
+        // maintained rule.
         //
-        // NOTE: this means a value that takes the string branch (any I64/U64 outside the safe
-        // range, every Timestamp, every Bytes/Str) is indistinguishable from an ordinary
-        // Value::Str once inside Lua -- a plain Lua string has no way to carry which of those it
-        // came from. An identity round-trip through a script can therefore turn a Bytes/Timestamp/
-        // large-integer attribute into a Str one. Known, not silently shipped: downstream code
-        // (e.g. logit-outputs::influxdb's tag handling) is allowed to treat these variants
-        // differently, so this is a real, if narrow, gap -- a proper fix needs a tagged/userdata
-        // value wrapper preserving origin type through Lua, which is a large enough addition
-        // (a new userdata type, its own metamethod surface) to belong in a focused follow-up
-        // rather than here.
+        // A value that takes the string branch here (any I64/U64/Timestamp outside the safe
+        // range, every Bytes/Str) would be indistinguishable from an ordinary Value::Str once
+        // inside Lua -- a plain Lua string has no way to carry which of those it came from, and
+        // the same is true of LuaJIT's dual-number mode collapsing an integral F64/U64 onto
+        // LuaValue::Integer (see [`lua_value_matches`]'s F64 arm). `AttrsProxy::__newindex`
+        // (proxy.rs) is what actually closes this gap: an assignment whose Lua-side content is
+        // byte-for-byte what this function would have produced for the attribute's *current*
+        // value is treated as a no-op, so the stored `Value` -- and its variant -- survives an
+        // unmodified round-trip even though nothing here can tell the difference between "this
+        // string came from a Bytes attribute" and "this is a brand-new string a script just
+        // built". See `lua_value_matches` below and `docs/adr/0007-lua-value-identity-preservation.md`
+        // for the full reasoning, including why a tagged userdata wrapper was considered and
+        // rejected.
         //
-        // The same class of loss also happens on the *number* side, not just strings, for
-        // reasons entirely outside this function's control -- a Lua value fundamentally can't
-        // carry which Value variant produced it, regardless of which Lua type represents it.
-        // Review-confirmed: a safe (in-range) U64 round-trips to I64 (a Lua integer has no
-        // signed/unsigned tag to preserve), and a whole-number F64 (e.g. 42.0) *also* round-trips
-        // to I64 -- LuaJIT's dual-number mode canonicalizes an integral Lua number as an integer
-        // internally, so `lua_to_value` sees `LuaValue::Integer`, not `LuaValue::Number`,
-        // regardless of how the value was originally pushed. A fractional F64 (42.5) is
-        // unaffected and round-trips correctly, since LuaJIT has no integer representation for
-        // it. Same deferred fix, same follow-up.
+        // Not covered by that fix, and not attempted here: two empty containers, `Value::Array
+        // (vec![])` and `Value::Map(AttrMap::new())`, both reach Lua as the same empty table --
+        // `lua_table_to_value` below picks a documented default (`Map`) rather than solving what's
+        // genuinely unsolvable without tagging containers too.
         Value::I64(i) => exact_i64_to_lua(lua, *i)?,
         Value::U64(u) => exact_u64_to_lua(lua, *u)?,
         Value::F64(f) => LuaValue::Number(*f),
         Value::Bytes(b) => LuaValue::String(lua.create_string(b)?),
         Value::Str(s) => LuaValue::String(lua.create_string(s)?),
-        // Converting a Lua value back into a `Value::Timestamp` isn't supported by `lua_to_value`
-        // below -- a script-provided string becomes `Value::Str`, per the note above. Nothing
-        // produces a `Value::Timestamp` attribute today, so this has no live consequence yet.
         Value::Timestamp(t) => exact_i64_to_lua(lua, *t)?,
         Value::Array(items) => {
             let table = lua.create_table()?;
@@ -70,20 +66,33 @@ pub fn value_to_lua<'lua>(lua: &'lua Lua, value: &Value) -> mlua::Result<LuaValu
     })
 }
 
-/// Represents an `i64` as a Lua integer if doing so round-trips exactly through Lua's actual
-/// numeric representation (an IEEE-754 double), or as a decimal string otherwise.
+/// The largest magnitude `i64` an IEEE-754 double (Lua's only numeric type) can represent
+/// exactly.
 ///
-/// A magnitude check against [`MAX_EXACT_F64_INT`], not a `(v as f64) as $int == v` round-trip
-/// check: that was the first thing tried here, and it has a real bug for values near `u64::MAX`.
-/// Rust's float-to-int `as` casts saturate rather than wrap (since 1.45), so
-/// `(u64::MAX as f64) as u64` rounds up to 2^64 as an f64 and then *saturates back down* to
-/// exactly `u64::MAX` on the cast back -- the round trip "succeeds" despite real precision loss
-/// in between, because saturation happens to land back on the original value. A direct magnitude
-/// comparison against the actual exact-integer boundary has no such edge case.
+/// A magnitude check against this constant, not a `(v as f64) as $int == v` round-trip check:
+/// that was the first thing tried here, and it has a real bug for values near `u64::MAX`. Rust's
+/// float-to-int `as` casts saturate rather than wrap (since 1.45), so `(u64::MAX as f64) as u64`
+/// rounds up to 2^64 as an f64 and then *saturates back down* to exactly `u64::MAX` on the cast
+/// back -- the round trip "succeeds" despite real precision loss in between, because saturation
+/// happens to land back on the original value. A direct magnitude comparison against the actual
+/// exact-integer boundary has no such edge case.
 const MAX_EXACT_F64_INT: i64 = 1 << 53; // 9_007_199_254_740_992
 
+/// Whether `value_to_lua` represents this `i64` as a real `LuaValue::Integer` (`true`) or falls
+/// back to a decimal string (`false`). Shared by `exact_i64_to_lua` (which produces that
+/// representation) and `lua_value_matches` (which needs to recognize it without producing a new
+/// `LuaValue` just to compare), so the boundary is defined in exactly one place.
+fn i64_is_exact_lua_number(i: i64) -> bool {
+    (-MAX_EXACT_F64_INT..=MAX_EXACT_F64_INT).contains(&i)
+}
+
+/// As [`i64_is_exact_lua_number`], for `u64`.
+fn u64_is_exact_lua_number(u: u64) -> bool {
+    u <= MAX_EXACT_F64_INT as u64
+}
+
 fn exact_i64_to_lua(lua: &Lua, i: i64) -> mlua::Result<LuaValue<'_>> {
-    if (-MAX_EXACT_F64_INT..=MAX_EXACT_F64_INT).contains(&i) {
+    if i64_is_exact_lua_number(i) {
         Ok(LuaValue::Integer(i))
     } else {
         Ok(LuaValue::String(lua.create_string(i.to_string())?))
@@ -94,10 +103,74 @@ fn exact_i64_to_lua(lua: &Lua, i: i64) -> mlua::Result<LuaValue<'_>> {
 /// range too (2^53 is far below `i64::MAX`), so the `as i64` cast on the safe branch never
 /// truncates.
 fn exact_u64_to_lua(lua: &Lua, u: u64) -> mlua::Result<LuaValue<'_>> {
-    if u <= MAX_EXACT_F64_INT as u64 {
+    if u64_is_exact_lua_number(u) {
         Ok(LuaValue::Integer(u as mlua::Integer))
     } else {
         Ok(LuaValue::String(lua.create_string(u.to_string())?))
+    }
+}
+
+/// The exact bytes [`value_to_lua`] hands a script for a value that takes its string branch, or
+/// `None` for a value that reaches Lua as something other than a string (e.g. a small integer,
+/// which becomes a real Lua number instead). Shared with `value_to_lua` only in spirit -- kept as
+/// a single definition here so the string-branch boundary can't drift between the two -- and used
+/// directly by [`lua_value_matches`] to recognize an unmodified round-trip through that branch.
+fn lua_string_repr(value: &Value) -> Option<Cow<'_, [u8]>> {
+    match value {
+        Value::Bytes(b) | Value::Str(b) => Some(Cow::Borrowed(b.as_ref())),
+        Value::I64(i) if !i64_is_exact_lua_number(*i) => {
+            Some(Cow::Owned(i.to_string().into_bytes()))
+        }
+        Value::U64(u) if !u64_is_exact_lua_number(*u) => {
+            Some(Cow::Owned(u.to_string().into_bytes()))
+        }
+        Value::Timestamp(t) if !i64_is_exact_lua_number(*t) => {
+            Some(Cow::Owned(t.to_string().into_bytes()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `new` is exactly what [`value_to_lua`] would have produced for `existing` -- i.e. an
+/// assignment carrying `new` back into the attribute `existing` came from doesn't change its
+/// content, only (absent this check) its variant. [`crate::proxy::AttrsProxy`]'s `__newindex`
+/// uses this to make such an assignment a no-op, so the original `Value` variant survives an
+/// unmodified round-trip through a script -- see the long comment on `value_to_lua`'s match arms
+/// for why a plain string/number can't carry that information on its own.
+///
+/// Deliberately shallow: doesn't recurse into `Table`. An `Array`/`Map` already round-trips
+/// correctly *as a shape* (a real Lua table, not a string -- see `lua_to_value`'s doc comment),
+/// but a scalar variant *nested inside* one is not preserved through an identity assignment the
+/// way a top-level one is -- `Array([Bytes(..)])` assigned back to itself becomes
+/// `Array([Str(..)])`, because the top-level `Table` case here always falls through to a full
+/// `lua_to_value` reconversion with no memory of what the nested elements used to be. This is a
+/// deliberate, documented, and tested scope limit
+/// (`docs/design/lua-value-type-preservation.md`'s "Known residual gaps"), not an oversight:
+/// closing it would mean walking the incoming table to compare nested elements, and that walk
+/// (`Table::get`/`pairs`) can trigger a script-supplied `__index` and reenter this same proxy --
+/// it can't run while the event's `RefCell` is still borrowed the way this check is (see
+/// `AttrsProxy::__newindex`'s comment), and no concrete reported consequence has justified the
+/// restructuring that would take yet, the same complexity-vs-value tradeoff that ruled out a
+/// tagged userdata wrapper for the top-level case (ADR 0007).
+pub(crate) fn lua_value_matches(existing: &Value, new: &LuaValue) -> bool {
+    match new {
+        LuaValue::Nil => matches!(existing, Value::Null),
+        LuaValue::Boolean(b) => matches!(existing, Value::Bool(e) if e == b),
+        LuaValue::Integer(n) => match existing {
+            Value::I64(i) => i == n,
+            Value::U64(u) => u64_is_exact_lua_number(*u) && *u == *n as u64,
+            Value::Timestamp(t) => i64_is_exact_lua_number(*t) && t == n,
+            // LuaJIT's dual-number mode canonicalizes an integral Number as an Integer, so an
+            // F64 that started exact-integral (e.g. 42.0) comes back through this arm, not
+            // LuaValue::Number's -- reproduced via PR #6 review discussion_r3887008990
+            // (`Value::F64(42.0)` silently becoming `Value::I64(42)` after an identity
+            // assignment).
+            Value::F64(f) => *f == *n as f64,
+            _ => false,
+        },
+        LuaValue::Number(n) => matches!(existing, Value::F64(f) if f == n),
+        LuaValue::String(s) => lua_string_repr(existing).as_deref() == Some(s.as_bytes()),
+        _ => false,
     }
 }
 
@@ -174,16 +247,16 @@ fn lua_table_to_value(table: Table) -> mlua::Result<Value> {
     match validated_sequence_len(&table)? {
         // An empty table is genuinely ambiguous between Value::Array(vec![]) and
         // Value::Map(AttrMap::new()) -- Lua's `{}` carries no origin-type information at all, so
-        // there is no correct answer without tagging (the same class of problem as the deferred
-        // type-loss work in tmp/lua-value-type-preservation.md, just for containers instead of
-        // scalars). An earlier version let this fall through to the Array branch below, which
-        // fixed Value::Array(vec![]) losing its variant on a round trip by breaking the opposite
-        // case (Value::Map(AttrMap::new()) also became Array). Documented, tested default:
-        // attributes are the primary thing scripts manipulate and are map-shaped, so an empty
-        // table becomes Value::Map. `validated_sequence_len` itself is unchanged and still
-        // correctly reports `Some(0)` for an empty table -- `ScriptWorker::process`/`flush`'s use
-        // of it (`return {}` meaning zero events) has no such ambiguity and isn't affected by this
-        // special case, which lives here rather than in the shared helper.
+        // there is no correct answer without tagging (the same class of problem this file's
+        // `lua_value_matches` fixes for scalars, just for containers instead). An earlier version
+        // let this fall through to the Array branch below, which fixed Value::Array(vec![])
+        // losing its variant on a round trip by breaking the opposite case
+        // (Value::Map(AttrMap::new()) also became Array). Documented, tested default: attributes
+        // are the primary thing scripts manipulate and are map-shaped, so an empty table becomes
+        // Value::Map. `validated_sequence_len` itself is unchanged and still correctly reports
+        // `Some(0)` for an empty table -- `ScriptWorker::process`/`flush`'s use of it (`return {}`
+        // meaning zero events) has no such ambiguity and isn't affected by this special case,
+        // which lives here rather than in the shared helper.
         Some(0) => Ok(Value::Map(Box::new(AttrMap::new()))),
         Some(seq_len) => {
             let mut items = Vec::with_capacity(seq_len);

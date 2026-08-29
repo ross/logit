@@ -450,6 +450,46 @@ mod tests {
         assert!(out.contains("path=a\\,b\\ c\\=d"), "got: {out}");
     }
 
+    /// The concrete behavioral consequence `docs/design/lua-value-type-preservation.md` and PR #6
+    /// review discussion_r3887008990 describe: `value_as_tag_string` treats `Value::Bytes` and
+    /// `Value::Str` differently (the former is excluded from tags, the latter included), so a
+    /// Lua enrichment stage that carelessly changes an attribute's variant on an unmodified
+    /// round-trip -- which it used to, before `logit-script`'s `AttrsProxy::__newindex` grew its
+    /// no-op-assignment rule -- silently changes what gets written to InfluxDB with no error and
+    /// no script-visible signal. This closes the loop end to end: a `Bytes` attribute must stay
+    /// excluded from tags even after passing through a Lua stage that touches every attribute.
+    #[test]
+    fn bytes_attribute_stays_excluded_from_tags_after_a_lua_enrichment_stage() {
+        let worker = logit_script::ScriptWorker::new(
+            r#"
+            function process(event)
+                local attrs = event:to_table().attributes
+                for k, v in pairs(attrs) do
+                    event.attributes[k] = v
+                end
+                event.attributes.env = "prod"
+                return event
+            end
+            "#,
+        )
+        .expect("script should load");
+
+        let mut event = metric_event("page.views", MetricKind::Counter(1.0), &[]);
+        event.attributes.insert("host", Value::Bytes(Bytes::from_static(b"web-01")));
+        let event = match worker.process(event).expect("process should succeed") {
+            logit_script::ProcessOutcome::Emit(event) => *event,
+            _ => panic!("expected the script to emit the event unchanged"),
+        };
+
+        let out = encode(vec![event]);
+        assert!(out.contains("env=prod"), "the new Str tag should be written: {out}");
+        assert!(
+            !out.contains("host="),
+            "a Bytes attribute must stay excluded from tags even after an unrelated Lua stage \
+             reads and reassigns it: {out}"
+        );
+    }
+
     #[test]
     fn resource_attributes_become_tags_and_event_attrs_override() {
         let mut resource = Resource::default();
