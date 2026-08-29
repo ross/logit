@@ -737,6 +737,7 @@ dependencies = [
 name = "logit-script"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "logit-core",
  "mlua",
  "thiserror 1.0.69",
