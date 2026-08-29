@@ -36,6 +36,32 @@ fn sandbox_libs() -> StdLib {
     StdLib::TABLE | StdLib::STRING | StdLib::MATH
 }
 
+/// Lua 5.1's base library isn't gated by any `StdLib` flag at all -- the same non-gating that
+/// keeps `pairs`/`type`/`tostring` always available also keeps a handful of genuinely dangerous
+/// functions available regardless of `sandbox_libs()`. Confirmed the hard way: a review reproduced
+/// both `loadfile ~= nil` and `dofile ~= nil` in a worker built with only `TABLE | STRING | MATH`
+/// selected, meaning a script could read and execute arbitrary files readable by this process
+/// despite the documented "nothing that reaches the host" sandbox.
+///
+/// Removed here, each for its own reason:
+/// - `loadfile`, `dofile` -- read and execute a file from the process's filesystem. The
+///   concretely reproduced issue.
+/// - `load`, `loadstring` -- compile and execute an arbitrary *constructed* string as Lua code.
+///   Not filesystem access, but it undermines the property that only the one script source this
+///   worker was built from ever runs.
+/// - `getfenv`, `setfenv` -- Lua 5.1-specific, well documented in the wider Lua community as
+///   sandbox-escape-adjacent: they let code inspect/replace a function's environment table, which
+///   is exactly the kind of tampering a "restricted stdlib" sandbox is meant to prevent.
+///
+/// `lua.globals()` *is* `_G` (not a copy), so removing a key here removes it from `_G` too.
+fn remove_unsandboxed_base_globals(lua: &Lua) -> mlua::Result<()> {
+    let globals = lua.globals();
+    for name in ["loadfile", "dofile", "load", "loadstring", "getfenv", "setfenv"] {
+        globals.set(name, LuaValue::Nil)?;
+    }
+    Ok(())
+}
+
 /// Owns one Lua VM and runs the `process`/`flush` globals it defines, for one pipeline stage, on
 /// one worker. Not `Send`/`Sync` (via the `PhantomData<*const ()>` marker) -- see the module docs.
 pub struct ScriptWorker {
@@ -62,6 +88,7 @@ impl ScriptWorker {
     /// should surface immediately, not at the first event that happens to flow through.
     pub fn new(source: &str) -> Result<Self, ScriptError> {
         let lua = Lua::new_with(sandbox_libs(), LuaOptions::new())?;
+        remove_unsandboxed_base_globals(&lua)?;
         lua.load(source).exec()?;
         let has_process =
             matches!(lua.globals().get::<_, LuaValue>("process")?, LuaValue::Function(_));
@@ -80,11 +107,7 @@ impl ScriptWorker {
             LuaValue::Nil => ProcessOutcome::Drop,
             LuaValue::UserData(ud) => ProcessOutcome::Emit(Box::new(proxy::take_event(ud)?)),
             LuaValue::Table(table) => {
-                let mut events = Vec::new();
-                for item in table.sequence_values::<mlua::AnyUserData>() {
-                    events.push(proxy::take_event(item?)?);
-                }
-                ProcessOutcome::EmitMany(events)
+                ProcessOutcome::EmitMany(events_from_table(table, "process")?)
             }
             other => {
                 return Err(ScriptError::Lua(mlua::Error::RuntimeError(format!(
@@ -105,13 +128,7 @@ impl ScriptWorker {
         let result: LuaValue = flush.call(())?;
         Ok(match result {
             LuaValue::Nil => Vec::new(),
-            LuaValue::Table(table) => {
-                let mut events = Vec::new();
-                for item in table.sequence_values::<mlua::AnyUserData>() {
-                    events.push(proxy::take_event(item?)?);
-                }
-                events
-            }
+            LuaValue::Table(table) => events_from_table(table, "flush")?,
             other => {
                 return Err(ScriptError::Lua(mlua::Error::RuntimeError(format!(
                     "flush() must return nil or a table of events, got {}",
@@ -120,6 +137,28 @@ impl ScriptWorker {
             }
         })
     }
+}
+
+/// Extracts a `Vec<Event>` from a table a script returned from `process()` or `flush()`.
+/// `caller` names which, for the error message.
+///
+/// Validates the table is a proper contiguous `1..=n` sequence first, rather than reaching
+/// straight for `Table::sequence_values`, which stops at the first gap and never notices
+/// non-sequence keys -- a review reproduced `return {[2] = event}` silently succeeding as
+/// `EmitMany([])` (`sequence_values` finds index 1 missing and stops immediately), dropping the
+/// event with no indication anything was wrong instead of reporting the malformed return value.
+/// An empty table is a valid (empty) sequence -- equivalent to returning nothing.
+fn events_from_table(table: mlua::Table, caller: &str) -> Result<Vec<Event>, ScriptError> {
+    let Some(len) = value::validated_sequence_len(&table)? else {
+        return Err(ScriptError::Lua(mlua::Error::RuntimeError(format!(
+            "{caller}() must return a contiguous array-like table of events (found non-sequence keys)"
+        ))));
+    };
+    let mut events = Vec::with_capacity(len);
+    for i in 1..=len {
+        events.push(proxy::take_event(table.get(i)?)?);
+    }
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -208,6 +247,91 @@ mod tests {
     }
 
     #[test]
+    fn large_i64_attribute_round_trips_exactly() {
+        // 9_007_199_254_740_993 is exactly 2^53 + 1 -- one past the largest integer an IEEE-754
+        // double can represent exactly, and the review's own repro value: a prior version of
+        // value_to_lua always used LuaValue::Integer for I64, and this became ..._992 after
+        // nothing more than an identity assignment.
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event.attributes.insert("x", 9_007_199_254_740_993i64);
+        let out = emitted(w.process(event).unwrap());
+        // The fix represents this as an exact decimal string, not (as the review's repro showed)
+        // a silently-wrong Lua number -- so the expectation here is Str, not I64.
+        assert_eq!(
+            out.attributes.get("x"),
+            Some(&logit_core::Value::Str(bytes::Bytes::from(9_007_199_254_740_993i64.to_string())))
+        );
+    }
+
+    #[test]
+    fn small_i64_attribute_stays_a_real_lua_number() {
+        // The fix for the above is conditional (a string only when a value doesn't survive an
+        // exact f64 round-trip), not a blanket string like `timestamp` -- ordinary small integer
+        // attributes should still arrive as genuine Lua numbers so scripts can do arithmetic on
+        // them directly. This is a regression test for that ergonomic, not just the precision fix.
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.doubled = event.attributes.x * 2
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event.attributes.insert("x", 21i64);
+        let out = emitted(w.process(event).unwrap());
+        // LuaJIT's dual-number mode keeps small-integer arithmetic as an integer, not a float --
+        // an even better outcome than originally assumed here (this test's first version expected
+        // F64, which was itself a wrong assumption caught by actually running it).
+        assert_eq!(out.attributes.get("doubled"), Some(&logit_core::Value::I64(42)));
+    }
+
+    #[test]
+    fn u64_max_attribute_round_trips_exactly_instead_of_wrapping_negative() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event.attributes.insert("x", logit_core::Value::U64(u64::MAX));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(
+            out.attributes.get("x"),
+            Some(&logit_core::Value::Str(bytes::Bytes::from(u64::MAX.to_string())))
+        );
+    }
+
+    #[test]
+    fn empty_array_round_trips_as_array_not_map() {
+        // An empty table used to always decode as Value::Map (the sequence check short-circuited
+        // on `seq_len > 0`), so Value::Array(vec![]) lost its variant on a round trip.
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event.attributes.insert("x", logit_core::Value::Array(Vec::new()));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(out.attributes.get("x"), Some(&logit_core::Value::Array(Vec::new())));
+    }
+
+    #[test]
     fn event_type_is_readable() {
         let w = worker(
             r#"
@@ -257,6 +381,98 @@ mod tests {
             }
             _ => panic!("expected EmitMany"),
         }
+    }
+
+    #[test]
+    fn non_sequence_table_return_is_a_clear_error_not_a_silent_empty_emit() {
+        // Table::sequence_values stops at the first gap: {[2] = event} has no key 1, so it used
+        // to find nothing and silently succeed as EmitMany([]), dropping the event with no
+        // indication anything was wrong. The review's exact repro.
+        let w = worker("function process(event) return {[2] = event} end");
+        let err = match w.process(counter_event("hits", 1.0)) {
+            Ok(_) => panic!("expected process() to reject the malformed table"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("contiguous array-like table"),
+            "expected a clear malformed-return error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn non_sequence_table_return_from_flush_is_also_a_clear_error() {
+        let w = worker(
+            r#"
+            function process(event) return event end
+            function flush() return {[2] = "not even an event"} end
+            "#,
+        );
+        w.process(counter_event("hits", 1.0)).unwrap();
+        let err = match w.flush() {
+            Ok(_) => panic!("expected flush() to reject the malformed table"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("contiguous array-like table"),
+            "expected a clear malformed-return error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn stashing_and_returning_the_same_event_alias_fails_clearly_on_later_use() {
+        // AnyUserData::take empties the *shared Lua box*, not just the extracted Rust handle: a
+        // Lua userdata is a reference type, so `pending = event` doesn't clone anything at the
+        // Rust level -- `pending` and the returned value are the exact same underlying box. The
+        // review's exact repro: process() stashes the event *and* returns it in the same call;
+        // by the time flush() tries to use the stashed alias, it's already been taken/destructed.
+        // This must fail with this crate's own clear error, not mlua's internal
+        // "UserDataDestructed" terminology.
+        let w = worker(
+            r#"
+            local pending = nil
+            function process(event)
+                pending = event
+                return event
+            end
+            function flush()
+                return {pending}
+            end
+            "#,
+        );
+        emitted(w.process(counter_event("hits", 1.0)).unwrap());
+        let err = match w.flush() {
+            Ok(_) => panic!("expected flush() to fail: pending should already be destructed"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("already been returned") || err.contains("consumed"),
+            "expected this crate's own clear error, not mlua's raw one: {err}"
+        );
+    }
+
+    #[test]
+    fn cloning_before_stashing_avoids_the_alias_problem() {
+        // The documented workaround for the pattern above: stash an independent clone, not the
+        // live alias, so returning the original doesn't invalidate the stashed copy.
+        let w = worker(
+            r#"
+            local pending = nil
+            function process(event)
+                pending = event:clone()
+                return event
+            end
+            function flush()
+                if pending then
+                    local e = pending
+                    pending = nil
+                    return {e}
+                end
+                return {}
+            end
+            "#,
+        );
+        emitted(w.process(counter_event("hits", 1.0)).unwrap());
+        assert_eq!(w.flush().unwrap().len(), 1);
     }
 
     #[test]
@@ -340,6 +556,53 @@ mod tests {
         );
         let out = emitted(w.process(counter_event("hits", 1.0)).unwrap());
         assert!(matches!(out.attributes.get("has_require"), Some(logit_core::Value::Bool(true))));
+    }
+
+    /// `StdLib` selection doesn't gate Lua 5.1's base library at all -- `loadfile`/`dofile`/
+    /// `load`/`loadstring`/`getfenv`/`setfenv` load unconditionally regardless of which `StdLib`
+    /// flags are set, unless explicitly removed (see `remove_unsandboxed_base_globals`). One test
+    /// per global, matching the os/io/ffi/require style above, not a combined assertion -- so a
+    /// regression in any single one fails on its own.
+    fn assert_global_is_nil(global: &str) {
+        let source = format!(
+            "function process(event) event.attributes.present = ({global} ~= nil) return event end"
+        );
+        let w = worker(&source);
+        let out = emitted(w.process(counter_event("hits", 1.0)).unwrap());
+        assert!(
+            matches!(out.attributes.get("present"), Some(logit_core::Value::Bool(false))),
+            "expected global '{global}' to be nil"
+        );
+    }
+
+    #[test]
+    fn loadfile_is_not_available() {
+        assert_global_is_nil("loadfile");
+    }
+
+    #[test]
+    fn dofile_is_not_available() {
+        assert_global_is_nil("dofile");
+    }
+
+    #[test]
+    fn load_is_not_available() {
+        assert_global_is_nil("load");
+    }
+
+    #[test]
+    fn loadstring_is_not_available() {
+        assert_global_is_nil("loadstring");
+    }
+
+    #[test]
+    fn getfenv_is_not_available() {
+        assert_global_is_nil("getfenv");
+    }
+
+    #[test]
+    fn setfenv_is_not_available() {
+        assert_global_is_nil("setfenv");
     }
 
     #[test]
