@@ -5,7 +5,7 @@
 //! the binary actually accepts. YAML parsing itself (via a maintained `serde_yaml` fork, per
 //! ADR 0003) belongs to `logit-cli`, not here -- this crate only defines the shape.
 
-use schemars::JsonSchema;
+use schemars::{gen::SchemaGenerator, schema::Schema, JsonSchema};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -17,16 +17,31 @@ pub struct Config {
     #[serde(default)]
     pub outputs: HashMap<String, OutputConfig>,
     #[serde(default)]
+    #[schemars(schema_with = "non_empty_pipelines_schema")]
     pub pipelines: HashMap<String, PipelineConfig>,
+}
+
+fn non_empty_pipelines_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = HashMap::<String, PipelineConfig>::json_schema(generator);
+    if let Schema::Object(schema) = &mut schema {
+        schema.object().min_properties = Some(1);
+    }
+    schema
 }
 
 /// One named pipeline: inputs feed transforms feed outputs. See `docs/design/lua-api.md` for the
 /// transform chain's config shape.
+///
+/// `inputs`/`outputs` are marked `minItems: 1` in the generated schema -- `logit run` rejects a
+/// pipeline with either empty (see `logit-cli::pipeline::validate_semantics`), so the schema
+/// shouldn't claim otherwise (ADR 0003).
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct PipelineConfig {
+    #[schemars(length(min = 1))]
     pub inputs: Vec<String>,
     #[serde(default)]
     pub transforms: Vec<TransformConfig>,
+    #[schemars(length(min = 1))]
     pub outputs: Vec<String>,
 }
 
@@ -78,10 +93,19 @@ pub enum TransformConfig {
     /// Inline Lua source (a YAML block scalar in practice).
     Lua {
         lua: String,
+        /// Runs this stage's `flush()`, if the script defines one, on this interval
+        /// (`docs/design/lua-api.md`'s flush contract). Omitted -- the common case -- means the
+        /// stage never ticks, same as a script with no `flush()` at all.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        interval: Option<Duration>,
     },
     /// A `.lua` file path, relative to the config file.
     LuaFile {
         lua_file: String,
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        interval: Option<Duration>,
     },
 }
 
@@ -139,20 +163,45 @@ mod humantime_serde_duration {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         let raw = String::deserialize(d)?;
+        parse(&raw).map_err(D::Error::custom)
+    }
+
+    fn parse(raw: &str) -> Result<Duration, String> {
         let (num, unit) = raw.trim().split_at(
-            raw.trim().find(|c: char| !c.is_ascii_digit() && c != '.').ok_or_else(|| {
-                D::Error::custom("expected a number followed by a unit, e.g. 10s")
-            })?,
+            raw.trim()
+                .find(|c: char| !c.is_ascii_digit() && c != '.')
+                .ok_or_else(|| "expected a number followed by a unit, e.g. 10s".to_string())?,
         );
-        let n: f64 = num.parse().map_err(D::Error::custom)?;
+        let n: f64 = num.parse().map_err(|e| format!("{e}"))?;
         let secs = match unit {
             "ms" => n / 1000.0,
             "s" => n,
             "m" => n * 60.0,
             "h" => n * 3600.0,
-            other => return Err(D::Error::custom(format!("unknown duration unit '{other}'"))),
+            other => return Err(format!("unknown duration unit '{other}'")),
         };
         Ok(Duration::from_secs_f64(secs))
+    }
+
+    /// The same codec, for `Option<Duration>` fields (`#[serde(default, with =
+    /// "humantime_serde_duration::option")]`) -- used by the Lua transform variants' optional
+    /// `interval`. A nested module because `#[serde(with = "...")]` on an `Option<Duration>`
+    /// field calls *this* module's `serialize`/`deserialize` with `Option<Duration>`, not the
+    /// parent's `Duration` ones.
+    pub mod option {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+            match d {
+                Some(d) => super::serialize(d, s),
+                None => s.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+            let raw: Option<String> = Option::deserialize(d)?;
+            raw.map(|raw| parse(&raw).map_err(D::Error::custom)).transpose()
+        }
     }
 }
 
@@ -160,4 +209,115 @@ mod humantime_serde_duration {
 /// (ADR 0003) -- CI regenerates `schema/logit.schema.json` from this and fails if it's stale.
 pub fn json_schema() -> schemars::schema::RootSchema {
     schemars::schema_for!(Config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Deserialized via `serde_json` rather than the YAML this crate is actually fed through
+    // `logit-cli` (deliberately not a dependency here -- see the crate doc comment): JSON and
+    // YAML are both self-describing formats that pick an `untagged` variant by field presence, so
+    // this exercises exactly the same disambiguation `TransformConfig`'s real deserializer does.
+
+    #[test]
+    fn lua_stage_without_interval_deserializes_as_lua() {
+        let config: TransformConfig = serde_json::from_str(r#"{"lua": "return event"}"#).unwrap();
+        match config {
+            TransformConfig::Lua { lua, interval } => {
+                assert_eq!(lua, "return event");
+                assert_eq!(interval, None);
+            }
+            other => panic!("expected Lua, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lua_stage_with_interval_deserializes_as_lua_not_builtin() {
+        let config: TransformConfig =
+            serde_json::from_str(r#"{"lua": "return event", "interval": "10s"}"#).unwrap();
+        match config {
+            TransformConfig::Lua { interval, .. } => {
+                assert_eq!(interval, Some(Duration::from_secs(10)));
+            }
+            other => panic!("expected Lua, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lua_file_stage_with_interval_deserializes_as_lua_file() {
+        let config: TransformConfig =
+            serde_json::from_str(r#"{"lua_file": "x.lua", "interval": "1m"}"#).unwrap();
+        match config {
+            TransformConfig::LuaFile { lua_file, interval } => {
+                assert_eq!(lua_file, "x.lua");
+                assert_eq!(interval, Some(Duration::from_secs(60)));
+            }
+            other => panic!("expected LuaFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_aggregate_with_interval_deserializes_as_builtin() {
+        let config: TransformConfig =
+            serde_json::from_str(r#"{"builtin": "aggregate", "interval": "10s"}"#).unwrap();
+        match config {
+            TransformConfig::Builtin(BuiltinTransformConfig::Aggregate { interval }) => {
+                assert_eq!(interval, Duration::from_secs(10));
+            }
+            other => panic!("expected Builtin(Aggregate), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_interval_deserializes_fine_left_for_validation_to_reject() {
+        // The codec itself has no opinion on zero -- `logit-cli::pipeline::validate_semantics` is
+        // where a zero flush interval is actually rejected (it would spin the flush loop).
+        let config: TransformConfig =
+            serde_json::from_str(r#"{"lua": "x", "interval": "0s"}"#).unwrap();
+        match config {
+            TransformConfig::Lua { interval, .. } => assert_eq!(interval, Some(Duration::ZERO)),
+            other => panic!("expected Lua, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negative_interval_is_rejected_by_the_codec() {
+        let result: Result<TransformConfig, _> =
+            serde_json::from_str(r#"{"lua": "x", "interval": "-5s"}"#);
+        assert!(result.is_err(), "a negative duration should not silently parse");
+    }
+
+    #[test]
+    fn interval_round_trips_through_serialize_then_deserialize() {
+        let original =
+            TransformConfig::Lua { lua: "x".to_string(), interval: Some(Duration::from_secs(30)) };
+        let json = serde_json::to_string(&original).unwrap();
+        let round_tripped: TransformConfig = serde_json::from_str(&json).unwrap();
+        match round_tripped {
+            TransformConfig::Lua { interval, .. } => {
+                assert_eq!(interval, Some(Duration::from_secs(30)));
+            }
+            other => panic!("expected Lua, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipelines_schema_requires_at_least_one_entry() {
+        let schema = json_schema();
+        let pipelines = schema
+            .schema
+            .object
+            .expect("config should be an object")
+            .properties
+            .remove("pipelines")
+            .expect("config should define pipelines");
+        let Schema::Object(pipelines) = pipelines else {
+            panic!("pipelines should have an object schema");
+        };
+        assert_eq!(
+            pipelines.object.expect("pipelines should be an object").min_properties,
+            Some(1)
+        );
+    }
 }

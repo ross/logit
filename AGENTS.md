@@ -10,11 +10,13 @@ LuaJIT. Read [docs/OVERVIEW.md](docs/OVERVIEW.md) first (~1 page) for scope and 
 internal event model, the Lua scripting API, and the native wire protocol — those three design
 docs are load-bearing; don't improvise around them without reading them first.
 
-**Current state:** design + scaffolding. The Cargo workspace has real types and trait definitions
-matching the design docs, but no working pipeline — inputs, outputs, and the Lua VM integration
-are `todo!()`. The v0.1 target (statsd in → one Lua enrichment stage → InfluxDB 2.x out) is the
-next thing to build; see `crates/logit-inputs/src/statsd.rs` and
-`crates/logit-outputs/src/influxdb.rs` for where it starts.
+**Current state:** v0.1 is complete — statsd in, a 10s `aggregate` window, a Lua enrichment stage,
+InfluxDB 2.x out, via `logit run <config>` (see [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml),
+`script/server`). `aggregate` (`crates/logit-transforms`) is the only built-in transform implemented
+so far — `logit run` rejects a config referencing any other `builtin:` stage with a clear error; see
+[ADR 0008](docs/adr/0008-aggregation-window-semantics.md) for its windowing semantics,
+`crates/logit-inputs/src/statsd.rs` and `crates/logit-outputs/src/influxdb.rs` for the input/output
+side, `crates/logit-cli/src/pipeline.rs` for orchestration and the flush-tick timer.
 
 ## Environment
 
@@ -78,9 +80,10 @@ not a style preference:
   don't "simplify" this back into `event:to_table()`-by-default.
 - **Metric kinds must stay mergeable.** `Distribution` needs a sketch with a real error bound
   (`DDSketch`, not a naive percentile), `Set` needs a real union (`HyperLogLog`) — this is what
-  makes the split-collection topology in `docs/OVERVIEW.md` correct rather than approximate. Both
-  are stub types in `logit-core::metric` (`DdSketch`, `HyperLogLog`) pending the real crates —
-  don't fill them with a non-mergeable implementation to get something working faster.
+  makes the split-collection topology in `docs/OVERVIEW.md` correct rather than approximate.
+  `logit-core::metric::DdSketch` is a real wrapper with a working `merge` (`crates/logit-transforms`'
+  `aggregate` is its first caller); `HyperLogLog` is still a stub pending a real crate — don't fill
+  it with a non-mergeable implementation to get `Set` aggregation working faster.
 - **The wire encoding (`rkyv` vs. hand-rolled) is an open, benchmark-gated decision** — see
   `docs/design/wire-protocol.md`. Don't pick one in passing while implementing something else;
   benchmark it and record the outcome as an ADR.
@@ -89,13 +92,14 @@ not a style preference:
 
 ```
 crates/
-  logit-core      internal event model: Event, Value, Resource, metric kinds, interner
-  logit-config    YAML config types + generated JSON Schema
-  logit-script    LuaJIT embedding (mlua), the Event proxy
-  logit-proto     codec traits, native wire format, output buffering
-  logit-inputs    the Input trait; statsd (v0.1 target)
-  logit-outputs   the Output trait; InfluxDB (v0.1 target)
-  logit-cli       the `logit` binary
+  logit-core        internal event model: Event, Value, Resource, metric kinds, interner
+  logit-config      YAML config types + generated JSON Schema
+  logit-script      LuaJIT embedding (mlua), the Event proxy
+  logit-proto       codec traits, native wire format, output buffering
+  logit-inputs      the Input trait; statsd (v0.1 target)
+  logit-outputs     the Output trait; InfluxDB (v0.1 target)
+  logit-transforms  built-in native transform stages; aggregate (v0.1 target), more to come
+  logit-cli         the `logit` binary
 ```
 
 A new protocol (input or output) implements `logit_proto::Decoder`/`Encoder` plus

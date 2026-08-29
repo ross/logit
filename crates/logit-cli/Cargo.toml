@@ -12,8 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 logit-config.workspace = true
+logit-core.workspace = true
 logit-inputs.workspace = true
 logit-outputs.workspace = true
+logit-script.workspace = true
+logit-transforms.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 serde_norway.workspace = true

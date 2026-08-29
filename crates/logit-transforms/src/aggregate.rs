@@ -1,0 +1,526 @@
+//! The built-in `aggregate` transform: a stateful, tumbling-window metric aggregator.
+//!
+//! Windowing/merge semantics are recorded in `docs/adr/0008-aggregation-window-semantics.md` and
+//! come from `docs/design/data-model.md`'s mergeable-metric-kinds design: `Counter` sums, `Gauge`
+//! keeps the value with the latest source timestamp, `Distribution` merges via `DdSketch::merge`
+//! (this is that method's first real caller anywhere in the codebase). `Set`/`Histogram`/`Summary`
+//! have no defined merge rule here yet (`Set` specifically is blocked on `HyperLogLog` still being a
+//! method-less stub) and, like logs and spans, pass through untouched rather than being dropped --
+//! this project's consistent stance on data it doesn't know how to handle correctly.
+
+use logit_core::interner::Symbol;
+use logit_core::{AttrMap, Event, MetricKind, MetricRecord, Payload, Resource, Value};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// One tumbling-window aggregator, owned by one pipeline stage. `process` accumulates what it can
+/// and passes everything else straight through; `flush` drains every window it's holding, resetting
+/// each to empty -- state does not carry across flushes (tumbling, not sliding).
+pub struct Aggregator {
+    interval: Duration,
+    groups: Vec<ResourceGroup>,
+}
+
+struct ResourceGroup {
+    resource: Arc<Resource>,
+    series: HashMap<SeriesKey, Accumulator>,
+}
+
+enum Accumulator {
+    Counter(f64),
+    /// `at` is the source event's timestamp, used to pick the last-write-wins value -- not the
+    /// window's timestamp, which doesn't exist until flush.
+    Gauge {
+        value: f64,
+        at: i64,
+    },
+    Distribution(logit_core::DdSketch),
+}
+
+impl Aggregator {
+    pub fn new(interval: Duration) -> Self {
+        Self { interval, groups: Vec::new() }
+    }
+
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Accumulates `event` if its payload is a mergeable metric kind (`Counter`/`Gauge`/
+    /// `Distribution`); otherwise returns it unchanged for the caller to pass through.
+    ///
+    /// Grouped by `resource` *value*, not `Arc` identity: two inputs that each build their own
+    /// `Arc::new(Resource::default())` describe the same (empty) origin and should aggregate
+    /// together, not be split into separate windows because they happen to be different
+    /// allocations. One input's batches do share one `Arc` in practice (see
+    /// `crates/logit-inputs/src/statsd.rs`), so the common case is a single linear-scan group.
+    pub fn process(&mut self, resource: &Arc<Resource>, event: Event) -> Option<Event> {
+        let Payload::Metric(MetricRecord { name, kind, unit }) = &event.payload else {
+            return Some(event);
+        };
+        if matches!(
+            kind,
+            MetricKind::Set(_) | MetricKind::Histogram { .. } | MetricKind::Summary { .. }
+        ) {
+            return Some(event);
+        }
+
+        let key = SeriesKey { name: *name, unit: *unit, attributes: event.attributes.clone() };
+        let group = self.group_for(resource);
+        let acc = group.series.entry(key).or_insert_with(|| Accumulator::new_for(kind));
+        let accumulated = match (acc, kind) {
+            (Accumulator::Counter(sum), MetricKind::Counter(v)) => {
+                *sum += v;
+                true
+            }
+            (Accumulator::Gauge { value, at }, MetricKind::Gauge(v)) => {
+                // Last-write-wins by timestamp (docs/design/data-model.md): a later-or-equal
+                // source timestamp replaces the held value. Equal timestamps favor whichever
+                // arrives second -- arbitrary but deterministic given actual processing order.
+                if event.timestamp >= *at {
+                    *value = *v;
+                    *at = event.timestamp;
+                }
+                true
+            }
+            (Accumulator::Distribution(sketch), MetricKind::Distribution(incoming)) => {
+                sketch.merge(incoming);
+                true
+            }
+            // A series already accumulating under one kind (e.g. it started as a counter) just
+            // saw an event of a different kind under the same name/unit/tags (e.g. a gauge). No
+            // correct merge exists for that -- forward the event untouched rather than silently
+            // dropping it or corrupting the existing accumulator with a type-punned value.
+            _ => false,
+        };
+        if accumulated {
+            None
+        } else {
+            eprintln!(
+                "aggregate: metric '{}' has a kind that conflicts with an already-accumulating \
+                 series under the same name/unit/tags -- forwarding it untouched",
+                logit_core::interner::resolve(*name)
+            );
+            Some(event)
+        }
+    }
+
+    fn group_for(&mut self, resource: &Arc<Resource>) -> &mut ResourceGroup {
+        if let Some(i) = self.groups.iter().position(|g| g.resource.as_ref() == resource.as_ref()) {
+            &mut self.groups[i]
+        } else {
+            self.groups.push(ResourceGroup { resource: resource.clone(), series: HashMap::new() });
+            self.groups.last_mut().expect("just pushed")
+        }
+    }
+
+    /// Drains every window: one `Vec<Event>` per resource group that had any series, each series
+    /// becoming one emitted event stamped with `now`. Resets all state -- the next window starts
+    /// empty, per the tumbling design in ADR 0008.
+    pub fn flush(&mut self, now: i64) -> Vec<(Arc<Resource>, Vec<Event>)> {
+        self.groups
+            .drain(..)
+            .filter(|g| !g.series.is_empty())
+            .map(|g| {
+                let events = g
+                    .series
+                    .into_iter()
+                    .map(|(key, acc)| Event {
+                        timestamp: now,
+                        attributes: key.attributes,
+                        payload: Payload::Metric(MetricRecord {
+                            name: key.name,
+                            kind: acc.into_kind(),
+                            unit: key.unit,
+                        }),
+                    })
+                    .collect();
+                (g.resource, events)
+            })
+            .collect()
+    }
+}
+
+impl Accumulator {
+    fn new_for(kind: &MetricKind) -> Self {
+        match kind {
+            MetricKind::Counter(_) => Accumulator::Counter(0.0),
+            MetricKind::Gauge(_) => Accumulator::Gauge { value: 0.0, at: i64::MIN },
+            MetricKind::Distribution(_) => Accumulator::Distribution(logit_core::DdSketch::new()),
+            MetricKind::Set(_) | MetricKind::Histogram { .. } | MetricKind::Summary { .. } => {
+                unreachable!("process() never creates an accumulator for a pass-through kind")
+            }
+        }
+    }
+
+    fn into_kind(self) -> MetricKind {
+        match self {
+            Accumulator::Counter(sum) => MetricKind::Counter(sum),
+            Accumulator::Gauge { value, .. } => MetricKind::Gauge(value),
+            Accumulator::Distribution(sketch) => MetricKind::Distribution(sketch),
+        }
+    }
+}
+
+/// A metric series' identity: name, unit, and attribute set. Used as a `HashMap` key, which
+/// `AttrMap`/`Value` can't be directly -- neither implements `Eq`/`Hash` (`Value::F64` has no
+/// total order). Projects `f64` through `to_bits()` for both comparison and hashing instead, so
+/// `NaN` keys consistently with itself (`Eq`'s reflexivity requires `a == a`) rather than the
+/// IEEE-754 "NaN != NaN" that would otherwise make an aggregation key grow without bound.
+struct SeriesKey {
+    name: Symbol,
+    unit: Option<Symbol>,
+    attributes: AttrMap,
+}
+
+impl PartialEq for SeriesKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.unit == other.unit
+            && self.attributes.len() == other.attributes.len()
+            && self
+                .attributes
+                .iter()
+                .zip(other.attributes.iter())
+                .all(|((k1, v1), (k2, v2))| k1 == k2 && value_key_eq(v1, v2))
+    }
+}
+
+impl Eq for SeriesKey {}
+
+impl Hash for SeriesKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.unit.hash(state);
+        // `AttrMap::iter()` yields sorted-by-`Symbol` order (see its doc comment), so this is
+        // stable regardless of insertion order -- two events with the same tags added in a
+        // different order still hash and key identically.
+        for (k, v) in self.attributes.iter() {
+            k.hash(state);
+            hash_value(v, state);
+        }
+    }
+}
+
+fn value_key_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::I64(a), Value::I64(b)) => a == b,
+        (Value::U64(a), Value::U64(b)) => a == b,
+        (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
+        (Value::Bytes(a), Value::Bytes(b)) => a == b,
+        (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| value_key_eq(a, b))
+        }
+        (Value::Map(a), Value::Map(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|((k1, v1), (k2, v2))| k1 == k2 && value_key_eq(v1, v2))
+        }
+        _ => false,
+    }
+}
+
+fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
+    // Hash the variant first (by discriminant-ish tag) so e.g. an empty `Array` and an empty
+    // `Map` don't collide.
+    match v {
+        Value::Null => 0u8.hash(state),
+        Value::Bool(b) => {
+            1u8.hash(state);
+            b.hash(state);
+        }
+        Value::I64(n) => {
+            2u8.hash(state);
+            n.hash(state);
+        }
+        Value::U64(n) => {
+            3u8.hash(state);
+            n.hash(state);
+        }
+        Value::F64(n) => {
+            4u8.hash(state);
+            n.to_bits().hash(state);
+        }
+        Value::Bytes(b) => {
+            5u8.hash(state);
+            b.hash(state);
+        }
+        Value::Str(s) => {
+            6u8.hash(state);
+            s.hash(state);
+        }
+        Value::Timestamp(t) => {
+            7u8.hash(state);
+            t.hash(state);
+        }
+        Value::Array(items) => {
+            8u8.hash(state);
+            items.len().hash(state);
+            for item in items {
+                hash_value(item, state);
+            }
+        }
+        Value::Map(map) => {
+            9u8.hash(state);
+            map.len().hash(state);
+            for (k, v) in map.iter() {
+                k.hash(state);
+                hash_value(v, state);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use logit_core::interner::intern;
+
+    fn metric_event(name: &str, kind: MetricKind, timestamp: i64) -> Event {
+        Event {
+            timestamp,
+            attributes: AttrMap::new(),
+            payload: Payload::Metric(MetricRecord { name: intern(name), kind, unit: None }),
+        }
+    }
+
+    fn metric_event_with_tags(
+        name: &str,
+        kind: MetricKind,
+        timestamp: i64,
+        tags: &[(&str, &str)],
+    ) -> Event {
+        let mut event = metric_event(name, kind, timestamp);
+        for (k, v) in tags {
+            event.attributes.insert(k, *v);
+        }
+        event
+    }
+
+    fn default_resource() -> Arc<Resource> {
+        Arc::new(Resource::default())
+    }
+
+    fn kind_of(event: &Event) -> &MetricKind {
+        match &event.payload {
+            Payload::Metric(record) => &record.kind,
+            other => panic!("expected a Metric payload, got {other:?}"),
+        }
+    }
+
+    fn counter_value(kind: &MetricKind) -> f64 {
+        match kind {
+            MetricKind::Counter(v) => *v,
+            other => panic!("expected Counter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn counters_sum_within_a_window() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        assert!(agg
+            .process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0))
+            .is_none());
+        assert!(agg
+            .process(&resource, metric_event("hits", MetricKind::Counter(2.0), 1))
+            .is_none());
+        assert!(agg
+            .process(&resource, metric_event("hits", MetricKind::Counter(3.0), 2))
+            .is_none());
+
+        let flushed = agg.flush(100);
+        assert_eq!(flushed.len(), 1);
+        let (_, events) = &flushed[0];
+        assert_eq!(events.len(), 1);
+        assert_eq!(counter_value(kind_of(&events[0])), 6.0);
+        assert_eq!(events[0].timestamp, 100);
+    }
+
+    #[test]
+    fn gauge_keeps_the_value_with_the_latest_source_timestamp() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        // Deliberately out of arrival order: the later-timestamped value (5) arrives first.
+        agg.process(&resource, metric_event("temp", MetricKind::Gauge(5.0), 50));
+        agg.process(&resource, metric_event("temp", MetricKind::Gauge(1.0), 10));
+
+        let (_, events) = &agg.flush(100)[0];
+        assert_eq!(events.len(), 1);
+        match kind_of(&events[0]) {
+            MetricKind::Gauge(v) => assert_eq!(*v, 5.0, "should keep the value stamped at t=50"),
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distributions_merge_via_ddsketch() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        for v in [10.0, 20.0, 30.0, 40.0, 50.0] {
+            let mut sketch = logit_core::DdSketch::new();
+            sketch.add(v);
+            agg.process(&resource, metric_event("latency", MetricKind::Distribution(sketch), 0));
+        }
+
+        let (_, events) = &agg.flush(100)[0];
+        assert_eq!(events.len(), 1);
+        match kind_of(&events[0]) {
+            MetricKind::Distribution(sketch) => {
+                assert_eq!(sketch.count(), 5);
+                let median = sketch.quantile(0.5).expect("merged sketch has a median");
+                assert!((median - 30.0).abs() < 5.0, "median should be near 30, got {median}");
+            }
+            other => panic!("expected Distribution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_second_flush_after_the_first_emits_nothing() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+
+        assert_eq!(agg.flush(100).len(), 1, "first flush should emit the window");
+        assert!(agg.flush(200).is_empty(), "tumbling: state resets, second flush is empty");
+    }
+
+    #[test]
+    fn logs_and_spans_pass_through_untouched() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        let log = Event {
+            timestamp: 0,
+            attributes: AttrMap::new(),
+            payload: Payload::Log(logit_core::LogRecord {
+                message: Value::str("hello"),
+                severity: None,
+                body_format: logit_core::BodyFormat::Raw,
+            }),
+        };
+        let passed = agg.process(&resource, log);
+        assert!(passed.is_some(), "a log event should pass through, not be absorbed");
+        assert!(agg.flush(100).is_empty(), "nothing should have been accumulated");
+    }
+
+    #[test]
+    fn set_histogram_and_summary_pass_through_untouched() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        for kind in [
+            MetricKind::Set(logit_core::HyperLogLog::default()),
+            MetricKind::Histogram { buckets: vec![(10.0, 1)] },
+            MetricKind::Summary { quantiles: vec![(0.5, 1.0)] },
+        ] {
+            let event = metric_event("m", kind, 0);
+            assert!(
+                agg.process(&resource, event).is_some(),
+                "a kind with no defined merge rule should pass through"
+            );
+        }
+        assert!(agg.flush(100).is_empty());
+    }
+
+    #[test]
+    fn distinct_tag_sets_stay_distinct_series() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        agg.process(
+            &resource,
+            metric_event_with_tags("hits", MetricKind::Counter(1.0), 0, &[("host", "a")]),
+        );
+        agg.process(
+            &resource,
+            metric_event_with_tags("hits", MetricKind::Counter(1.0), 0, &[("host", "b")]),
+        );
+
+        let (_, events) = &agg.flush(100)[0];
+        assert_eq!(events.len(), 2, "different tag values should be different series");
+    }
+
+    #[test]
+    fn same_tags_in_different_insertion_order_collide_into_one_series() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        agg.process(
+            &resource,
+            metric_event_with_tags(
+                "hits",
+                MetricKind::Counter(1.0),
+                0,
+                &[("host", "a"), ("env", "prod")],
+            ),
+        );
+        agg.process(
+            &resource,
+            metric_event_with_tags(
+                "hits",
+                MetricKind::Counter(1.0),
+                0,
+                &[("env", "prod"), ("host", "a")],
+            ),
+        );
+
+        let (_, events) = &agg.flush(100)[0];
+        assert_eq!(events.len(), 1, "AttrMap keeps sorted order regardless of insertion order");
+        assert_eq!(counter_value(kind_of(&events[0])), 2.0);
+    }
+
+    #[test]
+    fn different_resources_do_not_fold_together() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let mut resource_a = Resource::default();
+        resource_a.attributes.insert("host", "a");
+        let mut resource_b = Resource::default();
+        resource_b.attributes.insert("host", "b");
+
+        agg.process(&Arc::new(resource_a), metric_event("hits", MetricKind::Counter(1.0), 0));
+        agg.process(&Arc::new(resource_b), metric_event("hits", MetricKind::Counter(1.0), 0));
+
+        let flushed = agg.flush(100);
+        assert_eq!(flushed.len(), 2, "distinct resources should produce distinct batches");
+    }
+
+    #[test]
+    fn nan_attribute_value_keys_stably_across_events() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        let mut e1 = metric_event("hits", MetricKind::Counter(1.0), 0);
+        e1.attributes.insert("score", f64::NAN);
+        let mut e2 = metric_event("hits", MetricKind::Counter(1.0), 0);
+        e2.attributes.insert("score", f64::NAN);
+
+        agg.process(&resource, e1);
+        agg.process(&resource, e2);
+
+        let (_, events) = &agg.flush(100)[0];
+        assert_eq!(events.len(), 1, "two NaN-tagged events should key into the same series");
+        assert_eq!(counter_value(kind_of(&events[0])), 2.0);
+    }
+
+    #[test]
+    fn a_kind_conflict_on_one_series_is_forwarded_not_dropped_or_a_panic() {
+        // Same name, same (empty) tags, different kinds -- e.g. a misconfigured statsd source
+        // sending both `foo:1|c` and `foo:1|g`. There's no correct merge, so this must forward
+        // the conflicting event rather than panic (this exact shape used to hit an `unreachable!`)
+        // or silently corrupt the counter accumulator already in progress.
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        assert!(agg.process(&resource, metric_event("m", MetricKind::Counter(1.0), 0)).is_none());
+        let conflicting = metric_event("m", MetricKind::Gauge(5.0), 0);
+        let passed = agg.process(&resource, conflicting);
+        assert!(passed.is_some(), "the conflicting event should be forwarded, not absorbed");
+
+        // The counter accumulator should be untouched by the conflicting event.
+        let (_, events) = &agg.flush(100)[0];
+        assert_eq!(events.len(), 1);
+        assert_eq!(counter_value(kind_of(&events[0])), 1.0);
+    }
+}

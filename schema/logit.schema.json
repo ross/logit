@@ -20,6 +20,7 @@
     "pipelines": {
       "default": {},
       "type": "object",
+      "minProperties": 1,
       "additionalProperties": {
         "$ref": "#/definitions/PipelineConfig"
       }
@@ -424,7 +425,7 @@
       ]
     },
     "PipelineConfig": {
-      "description": "One named pipeline: inputs feed transforms feed outputs. See `docs/design/lua-api.md` for the transform chain's config shape.",
+      "description": "One named pipeline: inputs feed transforms feed outputs. See `docs/design/lua-api.md` for the transform chain's config shape.\n\n`inputs`/`outputs` are marked `minItems: 1` in the generated schema -- `logit run` rejects a pipeline with either empty (see `logit-cli::pipeline::validate_semantics`), so the schema shouldn't claim otherwise (ADR 0003).",
       "type": "object",
       "required": [
         "inputs",
@@ -435,13 +436,15 @@
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "minItems": 1
         },
         "outputs": {
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "minItems": 1
         },
         "transforms": {
           "default": [],
@@ -465,6 +468,14 @@
             "lua"
           ],
           "properties": {
+            "interval": {
+              "description": "Runs this stage's `flush()`, if the script defines one, on this interval (`docs/design/lua-api.md`'s flush contract). Omitted -- the common case -- means the stage never ticks, same as a script with no `flush()` at all.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "lua": {
               "type": "string"
             }
@@ -477,6 +488,13 @@
             "lua_file"
           ],
           "properties": {
+            "interval": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "lua_file": {
               "type": "string"
             }

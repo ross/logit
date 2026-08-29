@@ -1,6 +1,8 @@
 # A minimal example matching the v0.1 vertical slice target (docs/OVERVIEW.md): statsd/DogStatsD
-# in, a built-in aggregation window plus one enrichment script, InfluxDB 2.x out. Matches the
-# `influxdb` service seeded by compose.yaml for local testing.
+# in, a 10s aggregation window, one enrichment script, InfluxDB 2.x out. Matches the `influxdb`
+# service seeded by compose.yaml for local testing. `aggregate` is the only implemented builtin
+# transform so far (docs/adr/0008-aggregation-window-semantics.md) -- `logit run` rejects any other
+# `builtin:` stage with a clear error.
 inputs:
   statsd_in:
     type: statsd

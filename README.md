@@ -6,9 +6,12 @@ agent — same binary, different config. See [docs/OVERVIEW.md](docs/OVERVIEW.md
 scope, [docs/adr/](docs/adr) for why the stack is what it is, and [docs/design/](docs/design) for
 the internal event model, the Lua scripting API, and the native wire protocol.
 
-**Status:** early design/scaffolding. The workspace compiles and the config schema pipeline works
-end to end; the actual pipeline (inputs → transforms → outputs) is not implemented yet. The v0.1
-target is statsd in, one Lua enrichment stage, InfluxDB 2.x out.
+**Status:** v0.1 is complete — statsd in, a 10s `aggregate` window, a Lua enrichment stage, InfluxDB
+2.x out, via `logit run <config>`. [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml)
+is a working example; `script/server` runs it against the local test stack below. `aggregate` is the
+only built-in transform implemented so far — `logit run` rejects a config referencing any other
+`builtin:` stage with a clear error; see [ADR 0008](docs/adr/0008-aggregation-window-semantics.md)
+for its windowing semantics.
 
 ## Development
 
@@ -55,15 +58,16 @@ Work happens on branches, landed via pull request — nothing is pushed straight
 
 ```
 crates/
-  logit-core      internal event model: Event, Value, Resource, metric kinds, interner
-  logit-config    YAML config types + generated JSON Schema
-  logit-script    LuaJIT embedding (mlua), the Event proxy
-  logit-proto     codec traits, native wire format, output buffering
-  logit-inputs    the Input trait; statsd
-  logit-outputs   the Output trait; InfluxDB
-  logit-cli       the `logit` binary
+  logit-core        internal event model: Event, Value, Resource, metric kinds, interner
+  logit-config      YAML config types + generated JSON Schema
+  logit-script      LuaJIT embedding (mlua), the Event proxy
+  logit-proto       codec traits, native wire format, output buffering
+  logit-inputs      the Input trait; statsd
+  logit-outputs     the Output trait; InfluxDB
+  logit-transforms  built-in native transform stages; aggregate
+  logit-cli         the `logit` binary
 docs/
-  OVERVIEW.md     project scope, ~1 page
-  adr/            architecture decision records
-  design/         the event model, Lua API, and wire protocol design docs
+  OVERVIEW.md       project scope, ~1 page
+  adr/              architecture decision records
+  design/           the event model, Lua API, and wire protocol design docs
 ```

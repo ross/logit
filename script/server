@@ -1,11 +1,8 @@
 #!/bin/bash
 # Usage: script/server [config-file]
 # Starts the local InfluxDB + Grafana stack and runs logit against a config file (default:
-# examples/statsd-to-influxdb.yaml).
-#
-# `logit run` isn't implemented yet -- it's the v0.1 vertical slice's entry point (see
-# docs/OVERVIEW.md) and currently exits with a clear "not yet implemented" error. script/server
-# exists now anyway so the interface is already the one that'll work once it's built.
+# examples/statsd-to-influxdb.yaml) -- the v0.1 vertical slice (statsd -> Lua -> InfluxDB, see
+# docs/OVERVIEW.md), working end to end via `logit run`.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"

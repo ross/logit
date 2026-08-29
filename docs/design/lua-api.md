@@ -136,8 +136,15 @@ pipelines:
             return event
           end
       - lua_file: ./scripts/enrich.lua
+        interval: 30s
     outputs: [influx_out]
 ```
+
+A `lua`/`lua_file` stage's `interval` is optional and drives that stage's own `flush()` the same way
+`aggregate`'s does (see `docs/adr/0008-aggregation-window-semantics.md`) -- omitted, the common
+case, the stage never ticks, same as a script with no `flush()` at all. A zero interval is rejected
+at config-validation time (`logit-cli::pipeline::require_implemented_transform`), on either kind of
+stage.
 
 Built-in native processors (no Lua involved) handle the common structured-parsing cases without
 per-event VM overhead: `json`, `logfmt`, `kv`, `regex`/`grok`, `csv`, `rename`/`remove`/`copy`,

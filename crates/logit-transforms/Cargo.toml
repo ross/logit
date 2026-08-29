@@ -1,0 +1,11 @@
+[package]
+name = "logit-transforms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Built-in native transform stages (no Lua VM involved) -- aggregate first."
+
+[dependencies]
+logit-core.workspace = true
+thiserror.workspace = true

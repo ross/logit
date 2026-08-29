@@ -9,3 +9,6 @@ description = "YAML config types, deserialized with serde and schema'd with sche
 [dependencies]
 serde.workspace = true
 schemars.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
