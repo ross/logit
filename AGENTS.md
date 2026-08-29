@@ -8,7 +8,9 @@ Guidance for AI coding agents working in this repo. Humans: see [README.md](READ
 LuaJIT. Read [docs/OVERVIEW.md](docs/OVERVIEW.md) first (~1 page) for scope and positioning, then
 [docs/adr/](docs/adr) for *why* the stack is what it is, then [docs/design/](docs/design) for the
 internal event model, the Lua scripting API, and the native wire protocol — those three design
-docs are load-bearing; don't improvise around them without reading them first.
+docs are load-bearing; don't improvise around them without reading them first. Check
+[docs/known-gaps.md](docs/known-gaps.md) before "fixing" something that looks broken — it's likely
+a documented, deliberate gap, not an oversight.
 
 **Current state:** v0.1 is complete — statsd in, a 10s `aggregate` window, a Lua enrichment stage,
 InfluxDB 2.x out, via `logit run <config>` (see [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml),
