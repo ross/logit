@@ -13,9 +13,9 @@ reads and writes two or three fields out of a couple dozen; paying a full table-
 touched, is pure waste — and it's the kind of design mistake that's very expensive to undo once
 scripts exist that depend on the table shape.
 
-Instead, `Event` is exposed as **`mlua` userdata with `__index`/`__newindex`/`__pairs` metamethods**
-that read through to the underlying Rust event lazily, and copy-on-write only the fields a script
-actually assigns to:
+Instead, `Event` is exposed as **`mlua` userdata with `__index`/`__newindex` metamethods**
+(implemented in `crates/logit-script/src/proxy.rs`) that read through to the underlying Rust event
+lazily, and copy-on-write only the fields a script actually assigns to:
 
 ```lua
 function process(event)
@@ -25,14 +25,37 @@ function process(event)
 end
 ```
 
-`event:to_table()` is provided as an explicit escape hatch for scripts that want a real Lua table
-(to build a new structure, log for debugging, etc.) — the cost is opt-in and visible at the call
-site rather than paid unconditionally.
+`event.attributes` is itself a second userdata sharing the same underlying event (not a copy), so
+chained access like the above works without materializing anything beyond what's read or written.
+`event.type` (a read-only string: `"log"`/`"metric"`/`"span"`) and `event:clone()` (an independent
+deep copy, needed for fan-out — see the script contract below) round out the proxy's surface for
+now. Deliberately not exposed yet: typed access to payload fields (a metric's value, a log's
+message, ...) and any `Event.new(...)`-style constructor — real API surface that deserves its own
+design pass once a concrete consumer (the built-in `aggregate` processor is the obvious one) needs
+it, rather than being guessed at ahead of that.
 
-**Before the API is frozen**, benchmark the proxy against plain table conversion with `criterion`
-on realistic scripts (a field rename, a JSON-body-into-attributes flatten, a full-event copy) and
-record the numbers here. The design commits to the proxy; the benchmark is to confirm the expected
-win rather than to leave the choice open.
+No `__pairs`: it isn't available under LuaJIT. `mlua::MetaMethod::Pairs` requires Lua 5.2+, and
+LuaJIT is Lua 5.1 semantics — this was in the original version of this section and is wrong.
+`event:to_table()` is the answer instead: a real, disconnected Lua table with `timestamp`,
+`attributes`, and `type`, for anything the proxy doesn't expose directly — including full
+attribute iteration (`for k, v in pairs(event:to_table().attributes) do ... end`, native `pairs()`
+on a real table) and building new structures or logging for debugging. The cost is opt-in and
+visible at the call site rather than paid unconditionally.
+
+One more thing the proxy design ran into once actually implemented: **`event.timestamp` is a Lua
+*string*, not a Lua number.** Lua's only numeric type is an IEEE-754 double, exact only up to 2^53
+(~9e15) — and a unix-nanos timestamp is routinely ~1.7e18, nearly 200x past that. This was
+verified empirically, not just reasoned about: an early version exposed it as a Lua integer, and a
+script that did nothing but read `event.timestamp` and write it back unchanged already came back
+wrong (`tostring` showed `"1.7e+18"`). A decimal-digit string round-trips exactly; a script that
+needs real arithmetic on it can `tonumber()` at whatever precision it actually needs (millisecond
+granularity, for instance, comfortably fits a Lua number). The same reasoning applies to
+`Value::Timestamp` generally (`crates/logit-script/src/value.rs`), not just `Event::timestamp`.
+
+**A criterion benchmark against plain table conversion is still outstanding** — tracked as a
+follow-up now that the proxy above exists to benchmark against a baseline. The design commits to
+the proxy on the reasoning above; the benchmark is to confirm the expected win with numbers, not to
+leave the choice open.
 
 ## Script contract
 
@@ -102,7 +125,12 @@ way to end up with a design that cannot be parallelized without a rewrite.
 
 ## Sandboxing
 
-Each script's VM is created with a restricted standard library (no `io`, `os.execute`, or arbitrary
-`require`) — scripts transform data, they don't get ambient access to the host. Exact allowlist
-(likely `string`, `table`, `math`, a `json`/`logfmt` helper module, and the event proxy itself) is an
-implementation detail to nail down when `logit-script` is built, not a v1-blocking design question.
+Each script's VM is built with an explicit `StdLib` allowlist — `TABLE | STRING | MATH`
+(`crates/logit-script/src/lib.rs`) — rather than trusting `mlua::Lua::new()`'s "safe" default's
+exact composition. That matters concretely for LuaJIT: its `ffi` library is a genuine sandbox
+escape (raw memory access, arbitrary C calls) if left enabled, and mlua's docs don't commit to
+`Lua::new()` excluding it. No `PACKAGE`, so no `require`, either — scripts transform data, they
+don't get ambient access to the host or to files. (Core language functions like `pairs`/`type`/
+`tostring` are always available and aren't gated behind a `StdLib` flag at all — there's no `BASE`
+flag to include.) Verified with real scripts, not just configured and assumed: `os`, `io`, `ffi`,
+and `require` are all confirmed absent (`crates/logit-script/src/lib.rs`'s tests).
