@@ -44,6 +44,11 @@ pub fn value_to_lua<'lua>(lua: &'lua Lua, value: &Value) -> mlua::Result<LuaValu
         // built". See `lua_value_matches` below and `docs/adr/0007-lua-value-identity-preservation.md`
         // for the full reasoning, including why a tagged userdata wrapper was considered and
         // rejected.
+        //
+        // Not covered by that fix, and not attempted here: two empty containers, `Value::Array
+        // (vec![])` and `Value::Map(AttrMap::new())`, both reach Lua as the same empty table --
+        // `lua_table_to_value` below picks a documented default (`Map`) rather than solving what's
+        // genuinely unsolvable without tagging containers too.
         Value::I64(i) => exact_i64_to_lua(lua, *i)?,
         Value::U64(u) => exact_u64_to_lua(lua, *u)?,
         Value::F64(f) => LuaValue::Number(*f),
@@ -206,24 +211,45 @@ pub fn lua_to_value(value: LuaValue) -> mlua::Result<Value> {
 /// [`lua_table_to_value`] (deciding `Array` vs. `Map`) and `ScriptWorker::process`/`flush`
 /// (validating a script's returned table of events), rather than duplicating the same check.
 ///
-/// Deliberately checks the *total* pair count against `raw_len()` rather than gating on
-/// `raw_len() > 0` first: an earlier version did gate on it, which meant `raw_len() == 0` always
-/// short-circuited to "not a sequence" -- silently turning `Value::Array(vec![])` into
-/// `Value::Map` on a round trip, since an empty table could never be recognized as an empty
-/// sequence. Checking the count unconditionally handles the empty case correctly for free (0
-/// pairs == a `raw_len` of 0 is trivially equal) with no special-casing.
+/// Validates every key directly (each must be a positive Lua integer, and the full set must be
+/// exactly `1..=n` once sorted) rather than comparing the total pair count against `raw_len()`.
+/// An earlier version used the `raw_len()` comparison, which has a real bug: `raw_len()` (Lua's
+/// `#` operator) is *undefined* for a table with holes -- free to return any valid "border," not
+/// necessarily the one that would actually reveal a problem. Review reproduced
+/// `{[1]="a", [2]="b", [4]="d", extra="c"}`: 4 total pairs, and `raw_len()` happens to also return
+/// 4 (LuaJIT's choice of border here), so the count comparison passed despite key `3` being
+/// missing and `extra` not belonging to the sequence at all -- silently decoding as
+/// `Array(["a", "b", Null, "d"])` and dropping `extra` with no error. Checking each key's actual
+/// identity has no such undefined-behavior dependency to exploit.
 pub(crate) fn validated_sequence_len(table: &Table) -> mlua::Result<Option<usize>> {
-    let seq_len: usize = table.raw_len();
-    let mut count = 0usize;
+    let mut keys: Vec<i64> = Vec::new();
     for pair in table.clone().pairs::<LuaValue, LuaValue>() {
-        pair?;
-        count += 1;
+        let (key, _value) = pair?;
+        match key {
+            LuaValue::Integer(i) if i >= 1 => keys.push(i),
+            _ => return Ok(None),
+        }
     }
-    Ok((count == seq_len).then_some(seq_len))
+    keys.sort_unstable();
+    let is_contiguous_from_one = keys.iter().enumerate().all(|(idx, &k)| k == idx as i64 + 1);
+    Ok(is_contiguous_from_one.then_some(keys.len()))
 }
 
 fn lua_table_to_value(table: Table) -> mlua::Result<Value> {
     match validated_sequence_len(&table)? {
+        // An empty table is genuinely ambiguous between Value::Array(vec![]) and
+        // Value::Map(AttrMap::new()) -- Lua's `{}` carries no origin-type information at all, so
+        // there is no correct answer without tagging (the same class of problem this file's
+        // `lua_value_matches` fixes for scalars, just for containers instead). An earlier version
+        // let this fall through to the Array branch below, which fixed Value::Array(vec![])
+        // losing its variant on a round trip by breaking the opposite case
+        // (Value::Map(AttrMap::new()) also became Array). Documented, tested default: attributes
+        // are the primary thing scripts manipulate and are map-shaped, so an empty table becomes
+        // Value::Map. `validated_sequence_len` itself is unchanged and still correctly reports
+        // `Some(0)` for an empty table -- `ScriptWorker::process`/`flush`'s use of it (`return {}`
+        // meaning zero events) has no such ambiguity and isn't affected by this special case,
+        // which lives here rather than in the shared helper.
+        Some(0) => Ok(Value::Map(Box::new(AttrMap::new()))),
         Some(seq_len) => {
             let mut items = Vec::with_capacity(seq_len);
             for i in 1..=seq_len {

@@ -94,6 +94,14 @@ value; recognizing it as "the same content as some other attribute, elsewhere" w
 every string/number a script has read during the call and hope no ordinary new value collides with
 one, which costs more than the case is worth.
 
+**Remaining known limitation, unrelated to the above:** `Value::Array(vec![])` and
+`Value::Map(AttrMap::new())` are both just Lua's empty table `{}`, with nothing to distinguish them
+— a round-trip identity check can't help here, since there's no content difference to compare in
+the first place. `crates/logit-script/src/value.rs`'s `lua_table_to_value` picks one documented,
+tested default (an empty table decodes as `Map`) rather than solving the unsolvable — attributes
+are map-shaped and are the primary thing scripts manipulate, so that's the more natural default for
+the common case.
+
 **A criterion benchmark against plain table conversion is still outstanding** — tracked as a
 follow-up now that the proxy above exists to benchmark against a baseline. The design commits to
 the proxy on the reasoning above; the benchmark is to confirm the expected win with numbers, not to
