@@ -49,8 +49,29 @@ verified empirically, not just reasoned about: an early version exposed it as a 
 script that did nothing but read `event.timestamp` and write it back unchanged already came back
 wrong (`tostring` showed `"1.7e+18"`). A decimal-digit string round-trips exactly; a script that
 needs real arithmetic on it can `tonumber()` at whatever precision it actually needs (millisecond
-granularity, for instance, comfortably fits a Lua number). The same reasoning applies to
-`Value::Timestamp` generally (`crates/logit-script/src/value.rs`), not just `Event::timestamp`.
+granularity, for instance, comfortably fits a Lua number).
+
+The same 2^53 limit applies to ordinary `Value::I64`/`Value::U64` attribute values, not just
+timestamps — also found by review, against the real implementation: `event.attributes.x =
+event.attributes.x` on a value one past 2^53 silently changed it, and `u64::MAX` wrapped negative
+through the naive cast that used to sit here. Unlike a timestamp (always large), an ordinary
+integer attribute is usually small (`retry_count = 3`), where a real Lua number is genuinely more
+useful to a script than a string. So `crates/logit-script/src/value.rs` checks each I64/U64
+individually against the exact-integer boundary and only falls back to a string when a value
+doesn't fit — small values stay real, arithmetic-capable Lua numbers; `Timestamp` values are large
+enough in practice to always take the string branch anyway, and share the same logic rather than a
+separately maintained rule.
+
+**Known limitation, not silently shipped:** a plain Lua string can't carry which `Value` variant it
+came from. Anything that takes the string branch above — `Str`, `Bytes` (when its content happens
+to be valid UTF-8), `Timestamp`, or an out-of-range `I64`/`U64` — is indistinguishable from an
+ordinary `Value::Str` once inside Lua, so an identity round-trip through a script can silently
+change a value's variant even though its content is unchanged. This has a real behavioral
+consequence today: `logit-outputs::influxdb`'s tag handling treats `Bytes` and `Str` differently.
+A proper fix needs a tagged/userdata value wrapper (its own `__tostring`/`__concat`/`__eq` so it
+still behaves like a string in scripts) preserving origin type through Lua — real enough new
+surface area to belong in a focused follow-up rather than bundled into the fix for the precision
+bug that made this gap more relevant.
 
 **A criterion benchmark against plain table conversion is still outstanding** — tracked as a
 follow-up now that the proxy above exists to benchmark against a baseline. The design commits to
@@ -79,6 +100,19 @@ end
 is how the aggregator ([docs/design/data-model.md](data-model.md)'s mergeable metric kinds) turns
 accumulated state into emitted events — this is why the flush/timer contract needs to exist in the
 pipeline design now rather than being bolted on when aggregation is implemented.
+
+**An event handle is consumed once it's returned from `process()` or included in a `flush()`
+table** — don't keep using a Lua variable referencing an event after handing it back that way. A
+Lua userdata is a reference type, so a variable a script stashed elsewhere (`pending = event`) can
+be the *exact same* underlying object as the one returned, not an independent copy; extracting the
+returned one invalidates every other reference to it, and using a stashed alias afterward is a
+clear error, not silently wrong data. If a script genuinely needs to both emit an event now and
+keep something for later (a stateful `flush()` re-emitting it, say), stash `event:clone()` — an
+independent copy — instead of `event` itself.
+
+`return {a, b}` must be a proper array-like table (keys exactly `1..=n`, matching Lua's own
+notion of a sequence) — a malformed table (non-contiguous keys) is a clear error, not a silently
+incomplete or empty result.
 
 ## Config shape
 
@@ -132,5 +166,20 @@ escape (raw memory access, arbitrary C calls) if left enabled, and mlua's docs d
 `Lua::new()` excluding it. No `PACKAGE`, so no `require`, either — scripts transform data, they
 don't get ambient access to the host or to files. (Core language functions like `pairs`/`type`/
 `tostring` are always available and aren't gated behind a `StdLib` flag at all — there's no `BASE`
-flag to include.) Verified with real scripts, not just configured and assumed: `os`, `io`, `ffi`,
-and `require` are all confirmed absent (`crates/logit-script/src/lib.rs`'s tests).
+flag to include.)
+
+**`StdLib` selection alone isn't the whole sandbox — Lua 5.1's base library isn't gated by any
+`StdLib` flag at all**, found by review against the real implementation: `loadfile ~= nil` and
+`dofile ~= nil` both held true in a worker built with only `TABLE | STRING | MATH` selected,
+meaning a script could read and execute arbitrary files readable by this process despite the
+documented sandbox. `remove_unsandboxed_base_globals` (`crates/logit-script/src/lib.rs`) nils out
+six base globals after VM creation: `loadfile`/`dofile` (the reproduced file-access issue),
+`load`/`loadstring` (dynamic execution of arbitrary constructed strings — not file I/O, but
+undermines "only the configured script source ever runs"), and `getfenv`/`setfenv` (Lua
+5.1-specific, well documented in the wider Lua community as sandbox-escape-adjacent tools for
+tampering with a function's environment).
+
+Verified with real scripts, not just configured and assumed: `os`, `io`, `ffi`, `require`,
+`loadfile`, `dofile`, `load`, `loadstring`, `getfenv`, and `setfenv` are all confirmed absent
+(`crates/logit-script/src/lib.rs`'s tests) — ten checks, each its own test, not one combined
+assertion, so a regression in any single one fails on its own.

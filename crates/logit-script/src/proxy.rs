@@ -12,8 +12,16 @@ use mlua::{AnyUserData, MetaMethod, UserData, UserDataMethods, Value as LuaValue
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Wraps one [`Event`] for the duration of a `process()`/`flush()` call -- and possibly longer,
-/// if a script stashes it in a global or upvalue; see [`EventProxy::into_inner`].
+/// Wraps one [`Event`] for the duration of a `process()`/`flush()` call -- and possibly longer, if
+/// a script stashes it in a global or upvalue.
+///
+/// **Contract: an event handle is consumed once it's returned from `process()` or included in a
+/// `flush()` table.** Don't keep using a Lua variable referencing an event after handing it back
+/// that way -- it stops working (see [`take_event`]'s doc comment for exactly why: a Lua userdata
+/// is a reference type, so a stashed alias and the returned value can be the *same* underlying
+/// box, and extracting one invalidates the other). If a script genuinely needs to both emit an
+/// event now and keep something for later (e.g. a stateful `flush()` re-emitting it), stash
+/// `event:clone()` -- an independent copy -- rather than `event` itself.
 pub struct EventProxy(Rc<RefCell<Event>>);
 
 impl EventProxy {
@@ -141,6 +149,33 @@ impl UserData for AttrsProxy {
 /// Extracts the owned `Event` from a Lua value that should be an [`EventProxy`] userdata --
 /// shared by `ScriptWorker::process`'s single-event and table-of-events return-value cases, and
 /// by `flush()`'s table case.
+///
+/// Uses `AnyUserData::take`, not `borrow().clone()`: `take` empties the value out of the Lua
+/// userdata box itself (leaving a "destructed" marker `mlua` returns a clear error for on any
+/// further use), which is what makes `EventProxy::into_inner`'s `Rc::try_unwrap` fast path
+/// actually fire in the ordinary case -- with `borrow().clone()`, the original argument's Lua-side
+/// box would still hold its own reference for as long as Lua's GC keeps it alive, so
+/// `try_unwrap` would essentially never succeed and every call would pay a full `Event` clone.
+///
+/// The real cost of `take`: a Lua userdata is a *reference* type, so `pending = event` doesn't
+/// clone anything at the Rust level (`Rc::strong_count` stays 1 the whole time -- there is no way
+/// to detect this aliasing from Rust at all) -- it makes `pending` a second Lua variable pointing
+/// at the exact same underlying box. `take` empties that box, so it invalidates every alias, not
+/// just the one being extracted here. A script that stashes an event in `process()` (for `flush()`
+/// to pick up later) and *also* returns that same event from `process()` in the same call will
+/// find the stashed alias destructed by the time `flush()` tries to use it -- see the "handles are
+/// consumed once returned" note on [`EventProxy`], and use `event:clone()` for the stash if both
+/// are genuinely needed.
 pub(crate) fn take_event(ud: AnyUserData) -> mlua::Result<Event> {
-    Ok(ud.take::<EventProxy>()?.into_inner())
+    match ud.take::<EventProxy>() {
+        Ok(proxy) => Ok(proxy.into_inner()),
+        Err(mlua::Error::UserDataDestructed) => Err(mlua::Error::RuntimeError(
+            "this event was already returned/emitted elsewhere and can no longer be used -- an \
+             event handle is consumed once it's returned from process() or included in a flush() \
+             table; use event:clone() to keep an independent copy if you need to both return an \
+             event now and hold onto it for later"
+                .to_string(),
+        )),
+        Err(other) => Err(other),
+    }
 }
