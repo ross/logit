@@ -160,7 +160,7 @@ fn build_event(
 
     let kind = match type_part {
         "c" => {
-            let value: f64 = raw_value.parse().map_err(|_| malformed("invalid counter value"))?;
+            let value = parse_finite_value(raw_value, "counter", line)?;
             MetricKind::Counter(value / sample_rate)
         }
         "g" => {
@@ -177,12 +177,11 @@ fn build_event(
                     "relative gauge adjustments ('+'/'-') are not implemented yet",
                 ));
             }
-            let value: f64 = raw_value.parse().map_err(|_| malformed("invalid gauge value"))?;
+            let value = parse_finite_value(raw_value, "gauge", line)?;
             MetricKind::Gauge(value)
         }
         "ms" | "h" | "d" => {
-            let value: f64 =
-                raw_value.parse().map_err(|_| malformed("invalid timing/histogram value"))?;
+            let value = parse_finite_value(raw_value, "timing/histogram", line)?;
             // TODO: DDSketch has no native weighted-add, so a sample rate < 1 here is decoded as
             // a single unweighted sample rather than extrapolated -- a smaller gap in practice
             // than for counters, since timings/histograms are rarely sampled in DogStatsD
@@ -203,6 +202,21 @@ fn build_event(
         attributes: attributes.clone(),
         payload: Payload::Metric(MetricRecord { name: intern(name), kind, unit: None }),
     })
+}
+
+/// Parses a metric value and rejects it unless finite. `f64::parse` accepts the literal text
+/// "NaN"/"inf"/"-inf", which would otherwise become `Counter(NaN)`, `Gauge(inf)`, or -- worse --
+/// get inserted into a `DdSketch`, where a NaN sample corrupts the sketch's summary state rather
+/// than just producing one bad data point. Shared by the counter/gauge/timing-histogram-
+/// distribution branches in `build_event`, which differ only in the value's name for the error.
+fn parse_finite_value(raw_value: &str, what: &str, line: &str) -> Result<f64, CodecError> {
+    let value: f64 = raw_value
+        .parse()
+        .map_err(|_| CodecError::Malformed(format!("invalid {what} value: {line:?}")))?;
+    if !value.is_finite() {
+        return Err(CodecError::Malformed(format!("{what} value must be finite: {line:?}")));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -253,6 +267,43 @@ mod tests {
             assert!(
                 matches!(parse_err(&line), CodecError::Malformed(_)),
                 "expected @{rate} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_counter_values_are_rejected() {
+        // `f64::parse` accepts the literal text "NaN"/"inf"/"-inf" -- unguarded, these would
+        // become Counter(NaN) or Counter(inf) rather than being caught at decode time.
+        for value in ["NaN", "inf", "-inf"] {
+            let line = format!("hits:{value}|c");
+            assert!(
+                matches!(parse_err(&line), CodecError::Malformed(_)),
+                "expected {value} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_gauge_values_are_rejected() {
+        for value in ["NaN", "inf", "-inf"] {
+            let line = format!("load:{value}|g");
+            assert!(
+                matches!(parse_err(&line), CodecError::Malformed(_)),
+                "expected {value} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_distribution_values_are_rejected() {
+        // Worse than a bad Counter/Gauge: a NaN sample inserted into a DdSketch corrupts the
+        // sketch's summary state rather than just producing one bad data point.
+        for value in ["NaN", "inf", "-inf"] {
+            let line = format!("latency:{value}|ms");
+            assert!(
+                matches!(parse_err(&line), CodecError::Malformed(_)),
+                "expected {value} to be rejected"
             );
         }
     }
