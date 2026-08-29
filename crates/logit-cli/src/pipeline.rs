@@ -471,6 +471,27 @@ fn now_unix_nanos() -> i64 {
         .as_nanos() as i64
 }
 
+/// Returns the first point on `deadline`'s interval cadence strictly after `now`. Computing the
+/// remainder makes this constant-time even when a very small interval has missed billions of
+/// ticks. If the platform cannot represent the cadence's next instant, fall back to the smallest
+/// representable useful delay rather than overflowing or leaving the deadline due forever.
+fn advance_flush_deadline(
+    deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+    interval: Duration,
+) -> tokio::time::Instant {
+    debug_assert!(deadline <= now);
+    debug_assert!(!interval.is_zero());
+
+    let remainder_nanos = now.duration_since(deadline).as_nanos() % interval.as_nanos();
+    let remainder = Duration::new(
+        (remainder_nanos / 1_000_000_000) as u64,
+        (remainder_nanos % 1_000_000_000) as u32,
+    );
+    let until_next = if remainder.is_zero() { interval } else { interval - remainder };
+    now.checked_add(until_next).or_else(|| now.checked_add(Duration::from_nanos(1))).unwrap_or(now)
+}
+
 /// Flushes every stage whose deadline has passed, in chain order, sending whatever each one
 /// (and, transitively, the stages after it) emits. Each due stage's deadline advances by whole
 /// interval steps from where it was -- not from `now` -- so the schedule doesn't drift, and a
@@ -497,11 +518,7 @@ fn flush_due_stages(
         let interval = stages[i]
             .flush_interval()
             .expect("next_flush[i] is only ever Some for a stage with an interval");
-        let mut next = deadline;
-        while next <= now_instant {
-            next += interval;
-        }
-        next_flush[i] = Some(next);
+        next_flush[i] = Some(advance_flush_deadline(deadline, now_instant, interval));
     }
 }
 
@@ -628,6 +645,27 @@ mod tests {
             bucket: "bucket".to_string(),
             token_env: "LOGIT_TEST_DEFINITELY_UNSET_TOKEN_VAR".to_string(),
         }
+    }
+
+    #[test]
+    fn advancing_a_missed_flush_deadline_is_constant_time_and_preserves_cadence() {
+        let deadline = tokio::time::Instant::from_std(std::time::Instant::now());
+        let interval = Duration::from_nanos(7);
+        let now = deadline + Duration::from_secs(2) + Duration::from_nanos(5);
+
+        let next = advance_flush_deadline(deadline, now, interval);
+
+        assert!(next > now);
+        assert_eq!(next.duration_since(deadline).as_nanos() % interval.as_nanos(), 0);
+
+        // Two billion missed ticks must still collapse directly to the next one.
+        let nanosecond_interval = Duration::from_nanos(1);
+        let next = advance_flush_deadline(
+            deadline,
+            deadline + Duration::from_secs(2),
+            nanosecond_interval,
+        );
+        assert_eq!(next, deadline + Duration::from_secs(2) + nanosecond_interval);
     }
 
     #[tokio::test]
