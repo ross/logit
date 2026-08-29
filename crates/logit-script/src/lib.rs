@@ -314,9 +314,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_array_round_trips_as_array_not_map() {
-        // An empty table used to always decode as Value::Map (the sequence check short-circuited
-        // on `seq_len > 0`), so Value::Array(vec![]) lost its variant on a round trip.
+    fn empty_table_decodes_as_map_not_array() {
+        // An empty Lua table can't carry which of Value::Array(vec![])/Value::Map(AttrMap::new())
+        // it came from -- there's nothing to inspect. An earlier version always decoded it as
+        // Array (fixing Array losing its variant by breaking Map the other way); this documents
+        // and tests the chosen default instead: an empty table becomes Map, since attributes
+        // (map-shaped) are the primary thing scripts manipulate. See value.rs's
+        // lua_table_to_value for the full reasoning, and tmp/lua-value-type-preservation.md for
+        // why a real fix (tagging) is deferred rather than attempted here.
         let w = worker(
             r#"
             function process(event)
@@ -328,7 +333,116 @@ mod tests {
         let mut event = counter_event("hits", 1.0);
         event.attributes.insert("x", logit_core::Value::Array(Vec::new()));
         let out = emitted(w.process(event).unwrap());
-        assert_eq!(out.attributes.get("x"), Some(&logit_core::Value::Array(Vec::new())));
+        assert_eq!(
+            out.attributes.get("x"),
+            Some(&logit_core::Value::Map(Box::new(AttrMap::new())))
+        );
+    }
+
+    #[test]
+    fn empty_map_stays_a_map() {
+        // The regression this round's review caught in the previous round's empty-array fix:
+        // Value::Map(AttrMap::new()) used to also become Array once the seq_len > 0 guard was
+        // removed. Must stay Map now that the empty case is handled explicitly.
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event.attributes.insert("x", logit_core::Value::Map(Box::new(AttrMap::new())));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(
+            out.attributes.get("x"),
+            Some(&logit_core::Value::Map(Box::new(AttrMap::new())))
+        );
+    }
+
+    #[test]
+    fn table_with_a_hole_and_an_extra_key_becomes_a_map_not_a_silently_truncated_array() {
+        // raw_len() (Lua's `#` operator) is undefined for a table with holes: {[1]="a", [2]="b",
+        // [4]="d", extra="c"} has 4 total pairs, and raw_len() happens to also return 4 here
+        // (LuaJIT's choice of border), so a count-based check couldn't tell this apart from a
+        // real 4-element sequence -- it used to silently decode as Array(["a","b",Null,"d"]),
+        // dropping "extra" with no error. validated_sequence_len now checks every key's actual
+        // identity, correctly recognizing "extra" makes this a non-sequence -- so it falls back
+        // to the Map branch instead, preserving all 4 entries rather than silently dropping one.
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = {[1] = "a", [2] = "b", [4] = "d", extra = "c"}
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(counter_event("hits", 1.0)).unwrap());
+        match out.attributes.get("x") {
+            Some(logit_core::Value::Map(map)) => {
+                assert_eq!(map.len(), 4, "expected all 4 entries preserved, got: {map:?}");
+            }
+            other => panic!("expected a Map preserving all entries, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safe_u64_round_trips_to_i64_documented_number_branch_loss() {
+        // Part of the same deferred type-loss limitation as the string-branch cases above, just
+        // via Lua's number representation instead: a Lua integer has no signed/unsigned tag, so a
+        // safe (in-range) U64 comes back as I64 even though the numeric value survives exactly.
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event.attributes.insert("x", logit_core::Value::U64(42));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(out.attributes.get("x"), Some(&logit_core::Value::I64(42)));
+    }
+
+    #[test]
+    fn whole_number_f64_round_trips_to_i64_documented_number_branch_loss() {
+        // LuaJIT's dual-number mode canonicalizes an integral Lua number as an integer
+        // internally, so lua_to_value sees LuaValue::Integer regardless of how the value was
+        // originally pushed (LuaValue::Number(42.0)) -- outside this crate's control, not a bug
+        // in the conversion logic here.
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event.attributes.insert("x", logit_core::Value::F64(42.0));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(out.attributes.get("x"), Some(&logit_core::Value::I64(42)));
+    }
+
+    #[test]
+    fn fractional_f64_round_trips_correctly_the_contrast_case() {
+        // Unlike a whole-number float, a fractional one has no integer representation in LuaJIT
+        // to be canonicalized into -- showing the loss above is specific to integral floats, not
+        // floats in general.
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event.attributes.insert("x", logit_core::Value::F64(42.5));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(out.attributes.get("x"), Some(&logit_core::Value::F64(42.5)));
     }
 
     #[test]
