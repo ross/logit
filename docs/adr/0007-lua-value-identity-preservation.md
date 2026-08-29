@@ -25,10 +25,12 @@ and excludes `Value::Bytes` ones, so a pass-through Lua stage that touches no re
 silently flip an attribute from "excluded from the write" to "included as a tag."
 
 This was shipped as a documented, deliberate gap in PR #6 (`v0.1-lua-engine`) for the string-branch
-half of the problem (`tmp/lua-value-type-preservation.md`); a follow-up review comment on that PR
+half of the problem; a follow-up review comment on that PR
 ([discussion_r3887008990](https://github.com/ross/logit/pull/6#discussion_r3887008990)) reproduced
 the number-branch half (`U64(42)`/`F64(42.0)` both becoming `I64(42)`) and asked that it at least be
-documented and regression-tested. This ADR covers fixing both, together.
+documented and regression-tested. This ADR covers fixing both, together. See
+[`docs/design/lua-value-type-preservation.md`](../design/lua-value-type-preservation.md) for the
+full detailed writeup this decision record summarizes.
 
 ## Decision
 `AttrsProxy::__newindex` (`crates/logit-script/src/proxy.rs`) treats an assignment as a **no-op**
@@ -88,5 +90,16 @@ thing a script can actually observe or act on through the string/number surface.
   attribute's existing key keeps that attribute's original variant, even though the script "wrote a
   new value" — defensible because content is what the script actually specified, and the variant is
   the only thing that differs from what was already there.
+- **Residual, deliberate gap:** `lua_value_matches` doesn't recurse into `Table`, so a scalar
+  variant nested inside an `Array`/`Map` isn't preserved through an identity assignment the way a
+  top-level one is — `Array([Bytes(..)])` assigned back to itself becomes `Array([Str(..)])`. The
+  container's *shape* round-trips correctly regardless (a real Lua table, not a string; unaffected
+  by and predating this decision) — only a nested element's variant is at risk. Closing this would
+  mean walking the incoming table to compare nested elements, which can trigger a script-supplied
+  `__index` and reenter the proxy while its event is still borrowed — the same
+  complexity-vs-value tradeoff that ruled out the userdata wrapper above, and with no concrete
+  reported consequence (unlike the top-level case's InfluxDB-tag divergence) to justify it yet.
+  Regression-tested (`nested_bytes_in_an_array_is_a_documented_residual_gap`,
+  `crates/logit-script/src/lib.rs`) for the same reason as the cross-key gap above.
 - No new dependency, no new userdata type, no change to what a script observes when it prints,
   concatenates, or compares an attribute — only to what variant survives an unmodified round-trip.

@@ -63,44 +63,20 @@ enough in practice to always take the string branch anyway, and share the same l
 separately maintained rule.
 
 **Variant identity survives an unmodified round-trip, via a no-op-assignment rule, not a tagged
-value.** A plain Lua string or number genuinely can't carry which `Value` variant it came from —
-`Str`, `Bytes` (when its content happens to be valid UTF-8), `Timestamp`, or an out-of-range
-`I64`/`U64` are all indistinguishable Lua strings; a safe-range `U64` and, thanks to LuaJIT's
-dual-number mode canonicalizing an integral `Number` to an `Integer`, an integral `F64`, are both
-indistinguishable Lua integers from a same-valued `I64`. Left alone, an identity round-trip through
-a script (`event.attributes.x = event.attributes.x`, or the very ordinary "read every attribute via
-`to_table()` and copy it back while tagging the event with something else") would silently change a
-value's variant even though its content never changed — a real behavioral consequence, since
-`logit-outputs::influxdb`'s tag handling treats `Bytes` and `Str` differently.
-
-The fix lives in `AttrsProxy::__newindex` (`crates/logit-script/src/proxy.rs`): before converting
-an assignment's Lua value into a new `Value`, it checks whether that Lua value is byte-for-byte (or
-number-for-number) what `value_to_lua` would have produced for the attribute's *current* content
-(`value.rs`'s `lua_value_matches`). If so, the assignment is a no-op — the stored `Value`, variant
-included, is left untouched. Anything that changes content still converts exactly as before.
-
-A tagged/userdata value wrapper (an `mlua::UserData` carrying bytes plus an origin tag) was
-considered instead and rejected: probing LuaJIT directly showed a userdata's `__eq` metamethod
-never fires when compared against a plain Lua string under Lua 5.1 semantics (both operands must be
-userdata sharing the metamethod), so `event.attributes.host == "web1"` would silently become
-`false` for a wrapped value — trading this narrow, already-scoped gap for a much more commonly hit
-one. See `docs/adr/0007-lua-value-identity-preservation.md` for the full comparison.
-
-This rule is deliberately keyed on content matching at the *same* attribute key, not on tracking a
-value's provenance across the whole script call — copying a value to a **different** key
-(`event.attributes.y = event.attributes.x`) still produces a `Value::Str`/`Value::I64`, same as
-before this fix. A script doing that is constructing what is, from Lua's perspective, a brand new
-value; recognizing it as "the same content as some other attribute, elsewhere" would need to track
-every string/number a script has read during the call and hope no ordinary new value collides with
-one, which costs more than the case is worth.
-
-**Remaining known limitation, unrelated to the above:** `Value::Array(vec![])` and
-`Value::Map(AttrMap::new())` are both just Lua's empty table `{}`, with nothing to distinguish them
-— a round-trip identity check can't help here, since there's no content difference to compare in
-the first place. `crates/logit-script/src/value.rs`'s `lua_table_to_value` picks one documented,
-tested default (an empty table decodes as `Map`) rather than solving the unsolvable — attributes
-are map-shaped and are the primary thing scripts manipulate, so that's the more natural default for
-the common case.
+value.** A plain Lua string or number genuinely can't carry which `Value` variant it came from, so
+an identity round-trip through a script (`event.attributes.x = event.attributes.x`, or the very
+ordinary "read every attribute via `to_table()` and copy it back while tagging the event with
+something else") would otherwise silently change a value's variant even though its content never
+changed — a real behavioral consequence, since `logit-outputs::influxdb`'s tag handling treats
+`Bytes` and `Str` differently. `AttrsProxy::__newindex` (`crates/logit-script/src/proxy.rs`) closes
+this by treating such an assignment as a no-op when it's byte-for-byte (or number-for-number) what
+`value_to_lua` would already produce for the attribute's current content (`value.rs`'s
+`lua_value_matches`) — the stored `Value`, variant included, is left untouched; anything that
+changes content still converts exactly as before. See
+[`lua-value-type-preservation.md`](lua-value-type-preservation.md) for the full mapping, why a
+tagged userdata wrapper was considered and rejected, and every known residual gap (cross-key
+copies, nested container elements, empty-container ambiguity) — each deliberate and
+regression-tested, not an oversight.
 
 **A criterion benchmark against plain table conversion is still outstanding** — tracked as a
 follow-up now that the proxy above exists to benchmark against a baseline. The design commits to

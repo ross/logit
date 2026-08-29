@@ -138,12 +138,20 @@ fn lua_string_repr(value: &Value) -> Option<Cow<'_, [u8]>> {
 /// unmodified round-trip through a script -- see the long comment on `value_to_lua`'s match arms
 /// for why a plain string/number can't carry that information on its own.
 ///
-/// Deliberately shallow: doesn't recurse into `Table` (an `Array`/`Map` already round-trips
-/// correctly via real Lua tables -- see `lua_to_value`'s doc comment -- and a full recursive-
-/// equality walk would cost more, on every assignment, than the rare case it would help). Must
-/// not call back into Lua (no `Table` traversal, no metamethods): `AttrsProxy::__newindex` calls
-/// this while still holding an immutable borrow of the event, and a script-supplied metatable on
-/// some unrelated table could otherwise reenter this same proxy and panic on the borrow.
+/// Deliberately shallow: doesn't recurse into `Table`. An `Array`/`Map` already round-trips
+/// correctly *as a shape* (a real Lua table, not a string -- see `lua_to_value`'s doc comment),
+/// but a scalar variant *nested inside* one is not preserved through an identity assignment the
+/// way a top-level one is -- `Array([Bytes(..)])` assigned back to itself becomes
+/// `Array([Str(..)])`, because the top-level `Table` case here always falls through to a full
+/// `lua_to_value` reconversion with no memory of what the nested elements used to be. This is a
+/// deliberate, documented, and tested scope limit
+/// (`docs/design/lua-value-type-preservation.md`'s "Known residual gaps"), not an oversight:
+/// closing it would mean walking the incoming table to compare nested elements, and that walk
+/// (`Table::get`/`pairs`) can trigger a script-supplied `__index` and reenter this same proxy --
+/// it can't run while the event's `RefCell` is still borrowed the way this check is (see
+/// `AttrsProxy::__newindex`'s comment), and no concrete reported consequence has justified the
+/// restructuring that would take yet, the same complexity-vs-value tradeoff that ruled out a
+/// tagged userdata wrapper for the top-level case (ADR 0007).
 pub(crate) fn lua_value_matches(existing: &Value, new: &LuaValue) -> bool {
     match new {
         LuaValue::Nil => matches!(existing, Value::Null),

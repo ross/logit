@@ -318,8 +318,8 @@ mod tests {
 
     // The tests below cover `AttrsProxy::__newindex`'s no-op-assignment rule (value.rs's
     // `lua_value_matches`) -- the fix for the variant-collapse gap described in
-    // `tmp/lua-value-type-preservation.md` and PR #6 review discussion_r3887008990. Before that
-    // fix, every one of these "stays X" assertions failed: an identity assignment
+    // `docs/design/lua-value-type-preservation.md` and PR #6 review discussion_r3887008990. Before
+    // that fix, every one of these "stays X" assertions failed: an identity assignment
     // (`event.attributes.x = event.attributes.x`) always turned the attribute into `Value::Str`
     // (or, for the two number-branch repros the review added, `Value::I64`), regardless of what
     // it started as.
@@ -524,9 +524,9 @@ mod tests {
 
     #[test]
     fn generic_copy_all_attributes_script_preserves_every_variant() {
-        // The motivating real-world scenario from tmp/lua-value-type-preservation.md: a script
-        // with no intention of touching a particular attribute -- here, one that just tags every
-        // event with `env` and otherwise copies attributes through via to_table(), a very
+        // The motivating real-world scenario from docs/design/lua-value-type-preservation.md: a
+        // script with no intention of touching a particular attribute -- here, one that just tags
+        // every event with `env` and otherwise copies attributes through via to_table(), a very
         // ordinary pattern for a generic enrichment stage -- must not silently change that
         // attribute's variant.
         let w = worker(
@@ -581,6 +581,40 @@ mod tests {
             Some(&logit_core::Value::Bytes(bytes::Bytes::from_static(b"web-01")))
         );
         assert_eq!(out.attributes.get("y").and_then(|v| v.as_str()), Some("web-01"));
+    }
+
+    #[test]
+    fn nested_bytes_in_an_array_is_a_documented_residual_gap() {
+        // lua_value_matches doesn't recurse into Table: an Array/Map already round-trips
+        // correctly as a *shape* (a real Lua table, not a string), but the top-level identity
+        // check has no way to tell that a Table assignment's *contents* are unchanged without
+        // walking it -- and that walk can trigger a script-supplied __index and reenter this
+        // proxy, so it isn't attempted. The whole array is reconverted via lua_to_value, which
+        // has no memory of what the nested element used to be. Asserted deliberately, as a
+        // documented contract rather than an accident -- see
+        // docs/design/lua-value-type-preservation.md's "Known residual gaps".
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.x = event.attributes.x
+                return event
+            end
+            "#,
+        );
+        let mut event = counter_event("hits", 1.0);
+        event.attributes.insert(
+            "x",
+            logit_core::Value::Array(vec![logit_core::Value::Bytes(bytes::Bytes::from_static(
+                b"web-01",
+            ))]),
+        );
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(
+            out.attributes.get("x"),
+            Some(&logit_core::Value::Array(vec![logit_core::Value::Str(
+                bytes::Bytes::from_static(b"web-01")
+            )]))
+        );
     }
 
     #[test]

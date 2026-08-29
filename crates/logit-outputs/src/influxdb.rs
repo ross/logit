@@ -450,8 +450,8 @@ mod tests {
         assert!(out.contains("path=a\\,b\\ c\\=d"), "got: {out}");
     }
 
-    /// The concrete behavioral consequence `tmp/lua-value-type-preservation.md` and PR #6 review
-    /// discussion_r3887008990 describe: `value_as_tag_string` treats `Value::Bytes` and
+    /// The concrete behavioral consequence `docs/design/lua-value-type-preservation.md` and PR #6
+    /// review discussion_r3887008990 describe: `value_as_tag_string` treats `Value::Bytes` and
     /// `Value::Str` differently (the former is excluded from tags, the latter included), so a
     /// Lua enrichment stage that carelessly changes an attribute's variant on an unmodified
     /// round-trip -- which it used to, before `logit-script`'s `AttrsProxy::__newindex` grew its
