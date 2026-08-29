@@ -99,8 +99,10 @@ impl Encoder for InfluxLineEncoder {
         // part in identity, and a second point with the same identity overwrites the first
         // rather than coexisting. Two events in the same batch that share a measurement+tag-set
         // *and* timestamp would therefore collide silently; `encode_metric_line` disambiguates
-        // them by nudging the timestamp, using this map to track what's been seen so far.
-        let mut series_seen: HashMap<String, i64> = HashMap::new();
+        // them by nudging the timestamp. This map holds, per series, the last timestamp actually
+        // emitted for it -- not just an occurrence count (see the comment at its use site for
+        // why a flat count isn't enough).
+        let mut series_last_timestamp: HashMap<String, i64> = HashMap::new();
         for event in &batch.events {
             let Payload::Metric(metric) = &event.payload else {
                 continue;
@@ -109,9 +111,13 @@ impl Encoder for InfluxLineEncoder {
             // skips rather than propagating via `?`.
             // TODO: route through a proper diagnostics facility once one exists, instead of
             // stderr -- same gap noted in logit-inputs::statsd.
-            if let Err(err) =
-                encode_metric_line(&mut buf, &batch.resource, event, metric, &mut series_seen)
-            {
+            if let Err(err) = encode_metric_line(
+                &mut buf,
+                &batch.resource,
+                event,
+                metric,
+                &mut series_last_timestamp,
+            ) {
                 eprintln!("influxdb output: {err}");
             }
         }
@@ -124,7 +130,7 @@ fn encode_metric_line(
     resource: &Resource,
     event: &Event,
     metric: &MetricRecord,
-    series_seen: &mut HashMap<String, i64>,
+    series_last_timestamp: &mut HashMap<String, i64>,
 ) -> Result<(), CodecError> {
     let fields = metric_fields(&metric.kind)?;
     if fields.is_empty() {
@@ -180,16 +186,32 @@ fn encode_metric_line(
         line.push_str(&escape_tag(&value));
     }
 
-    // Disambiguate same-series collisions within this batch (see `encode`'s comment) by nudging
-    // the timestamp 1ns per prior occurrence of this exact measurement+tag-set. This matters in
-    // practice today: `logit-inputs::statsd` assigns one timestamp to an entire datagram, and
-    // its multi-value form (`name:1:2:3|c`) expands into several otherwise-identical events, all
-    // sharing that timestamp. A 1ns perturbation is far below any input's actual timing
-    // resolution, and far simpler than guessing at how to aggregate same-series samples together
-    // -- the source protocol never specified a combining semantic for them.
-    let occurrence = series_seen.entry(line.clone()).or_insert(0);
-    let timestamp = event.timestamp + *occurrence;
-    *occurrence += 1;
+    // Disambiguate same-series collisions within this batch (see `encode`'s comment). A flat
+    // "add 1ns per prior occurrence, in arrival order" scheme is *not* enough: it only produces
+    // distinct timestamps if same-series events already arrive in non-decreasing timestamp
+    // order. Out of order -- e.g. this series' events carry timestamps 101 then 100 -- the first
+    // gets stamped 101 (0 prior occurrences) and the second gets 100+1=101 too, colliding again.
+    // Instead, track the last timestamp actually *emitted* for this series and never go at or
+    // below it: `max(last + 1, event.timestamp)`. This is monotonic per series regardless of
+    // input order, and only perturbs a timestamp when there's an actual collision to avoid --
+    // an event whose own timestamp already clears the last emitted one keeps its real value.
+    //
+    // This matters in practice today: `logit-inputs::statsd` assigns one timestamp to an entire
+    // datagram, and its multi-value form (`name:1:2:3|c`) expands into several otherwise-
+    // identical events, all sharing that timestamp -- a nanosecond-scale perturbation here is far
+    // below any input's actual timing resolution, and far simpler than guessing at how to
+    // aggregate same-series samples together, which the source protocol never specified.
+    let timestamp = match series_last_timestamp.entry(line.clone()) {
+        std::collections::hash_map::Entry::Occupied(mut last) => {
+            let next = (*last.get() + 1).max(event.timestamp);
+            *last.get_mut() = next;
+            next
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(event.timestamp);
+            event.timestamp
+        }
+    };
 
     line.push(' ');
     for (i, (key, value)) in fields.iter().enumerate() {
@@ -493,6 +515,44 @@ mod tests {
         for value in ["value=1", "value=2", "value=3"] {
             assert!(out.contains(value), "expected {value} to survive, got: {out}");
         }
+    }
+
+    #[test]
+    fn out_of_order_same_series_timestamps_still_disambiguate() {
+        // A flat "add 1ns per prior occurrence, in arrival order" scheme only produces distinct
+        // timestamps if same-series events already arrive sorted: the first event (ts=101, 0
+        // prior occurrences) gets stamped 101, and the second (ts=100, 1 prior occurrence) gets
+        // 100+1=101 too -- colliding again. This is the review's exact repro.
+        let events = vec![
+            Event {
+                timestamp: 101,
+                attributes: AttrMap::new(),
+                payload: Payload::Metric(MetricRecord {
+                    name: logit_core::interner::intern("page.views"),
+                    kind: MetricKind::Counter(1.0),
+                    unit: None,
+                }),
+            },
+            Event {
+                timestamp: 100,
+                attributes: AttrMap::new(),
+                payload: Payload::Metric(MetricRecord {
+                    name: logit_core::interner::intern("page.views"),
+                    kind: MetricKind::Counter(2.0),
+                    unit: None,
+                }),
+            },
+        ];
+
+        let out = encode(events);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "got: {out}");
+
+        let timestamps: std::collections::HashSet<&str> =
+            lines.iter().map(|l| l.rsplit(' ').next().unwrap()).collect();
+        assert_eq!(timestamps.len(), 2, "both points must get distinct timestamps: {out}");
+        assert!(out.contains("value=1"), "got: {out}");
+        assert!(out.contains("value=2"), "got: {out}");
     }
 
     #[tokio::test]
