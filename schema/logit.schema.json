@@ -215,6 +215,86 @@
           }
         },
         {
+          "description": "Turns attributes already on an event (typically merged there by `json`) into metrics on that same event. See `docs/adr/0014-kv-metrics-semantics.md` for the skip rules, the numeric coercion rules, and why there is deliberately no `tags:` field here -- tag selection is `Keep`'s job, since every metrics sink already reads `event.attributes`.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "counters": {
+              "default": [],
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/MetricSpec"
+              }
+            },
+            "distributions": {
+              "default": [],
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/MetricSpec"
+              }
+            },
+            "gauges": {
+              "default": [],
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/MetricSpec"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "kv_metrics"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Retains only the named attributes, dropping the rest -- an allowlist, not just a denylist: a new field appearing in a log format later must not be able to silently become a new tag dimension on a metrics sink. Place this *before* `aggregate` in a pipeline -- `aggregate`'s `SeriesKey` includes the whole of `event.attributes`, so pruning first is what keeps series cardinality and per-window memory bounded. An empty `fields` list is legal and means \"drop every attribute.\"",
+          "type": "object",
+          "required": [
+            "fields",
+            "type"
+          ],
+          "properties": {
+            "fields": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "keep"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Drops the named attributes, keeping the rest.",
+          "type": "object",
+          "required": [
+            "fields",
+            "type"
+          ],
+          "properties": {
+            "fields": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "remove"
+              ]
+            }
+          }
+        },
+        {
           "type": "object",
           "required": [
             "type"
@@ -292,24 +372,6 @@
               "type": "string",
               "enum": [
                 "rename"
-              ]
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "field",
-            "type"
-          ],
-          "properties": {
-            "field": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "remove"
               ]
             }
           }
@@ -470,6 +532,33 @@
           "items": {
             "type": "string"
           }
+        }
+      }
+    },
+    "MetricSpec": {
+      "description": "One `kv_metrics` entry: a metric `name`, an optional source `field`, and an optional `unit`. See `ComponentKind::KvMetrics` and `docs/adr/0014-kv-metrics-semantics.md`.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "field": {
+          "description": "The attribute to read this metric's value from. Omitted means \"+1 per event\" for a counter or \"set to 1\" for a gauge; a distribution entry with no `field` is rejected at graph-validation time (a distribution of nothing is meaningless). Names an attribute literally -- `field: http.status` means the attribute literally named `http.status`, never a `status` key nested under `http` in a `Value::Map`; nested fields are not addressable.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "unit": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     }
