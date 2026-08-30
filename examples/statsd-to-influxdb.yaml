@@ -8,7 +8,7 @@
 # built-in transform so far (docs/adr/0008-aggregation-window-semantics.md) -- `logit run` rejects
 # a config referencing any other unimplemented kind with a clear error. `token: !env
 # INFLUXDB_TOKEN` below pulls the token from the environment rather than inlining a secret in the
-# file (docs/adr/0010-env-yaml-tag.md) -- any field on any component can use `!env` the same way.
+# file (docs/adr/0011-env-yaml-tag.md) -- any field on any component can use `!env` the same way.
 components:
   statsd_in:
     type: statsd_in
