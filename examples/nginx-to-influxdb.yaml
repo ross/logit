@@ -1,0 +1,76 @@
+# The nginx reference example (docs/plans/0002-nginx-integration.md, workstream F): proves
+# syslog_in -> json -> kv_metrics -> keep -> aggregate -> influxdb_out (plus stdio_out for
+# visibility) against a real nginx (examples/nginx/), end to end in this repo's own dev stack.
+#
+# Topology:
+#
+#   nginx --syslog/UDP--> nginx_in (syslog_in)
+#                              |
+#                              v
+#                          nginx_json (json)          <- merges the JSON body into attributes
+#                              |
+#                              v
+#                          nginx_metrics (kv_metrics) <- adds metrics to the same event
+#                  +-----------+-----------+
+#                  v                       v
+#             stdio_out              trimmed (keep)   <- drops high-cardinality attrs
+#                                          |
+#                                          v
+#                                    windowed (aggregate)
+#                                          |
+#                                          v
+#                                     influx_out
+#
+# `nginx.conf`'s lean `access_json_syslog` log_format is sized to carry exactly the fields
+# `nginx_metrics` reads below -- see that file's comments and docs/known-gaps.md for what happens
+# to the one field it can't bound ($host) on a pathologically oversized Host header.
+components:
+  nginx_in:
+    type: syslog_in
+    bind: 0.0.0.0:5140
+
+  nginx_json:
+    type: json
+    sources: [nginx_in]
+
+  nginx_metrics:
+    type: kv_metrics
+    sources: [nginx_json]
+    counters:
+      - name: nginx.requests # +1 per event
+      - name: nginx.bytes_sent
+        field: body_bytes_sent
+    distributions:
+      - name: nginx.request_time
+        field: request_time
+        unit: s
+      - name: nginx.upstream_response_time
+        field: upstream_response_time # empty ("-" outside escape=json) on a non-proxied request -> silently skipped
+        unit: s
+
+  tap:
+    type: stdio_out
+    sources: [nginx_metrics]
+
+  # `keep` before `aggregate`, not after -- otherwise `aggregate`'s SeriesKey would key a series
+  # per request on every syslog.* attribute (syslog.timestamp is unique per line), exploding both
+  # cardinality and per-window memory. `host`/`request_method`/`status` are exactly the tags the
+  # verification step checks for -- nothing else, especially no syslog.* attribute, should
+  # survive.
+  trimmed:
+    type: keep
+    sources: [nginx_metrics]
+    fields: [host, request_method, status]
+
+  windowed:
+    type: aggregate
+    sources: [trimmed]
+    interval: 10s
+
+  influx_out:
+    type: influxdb_out
+    sources: [windowed]
+    url: http://influxdb:8086
+    org: logit
+    bucket: metrics
+    token: !env INFLUXDB_TOKEN
