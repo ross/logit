@@ -36,12 +36,18 @@ already built that have a known, accepted rough edge.
   matters once there's more than one running at once and stderr becomes an unattributable mess —
   and a `json` component in front of a high-volume source of malformed lines is a concrete way to
   hit that mess sooner than most, one line per event with no rate limiting.
-- **No graceful shutdown for `logit run`** — Ctrl-C falls through to the OS default (immediate
-  termination); no installed handler. Partially softened by the aggregate/flush work: a node now
-  flushes once when its inbound channel closes *normally* (`crates/logit-pipeline/src/runtime.rs`),
-  but nothing today closes it that way on its own (every listener loops forever), so in practice
-  this doesn't yet cover the Ctrl-C case — the real gap is specifically "no installed signal
-  handler," not "no drain logic at all."
+- **Closed for SIGTERM/SIGINT** ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md)) — a
+  signal handler now closes every listener's inbox normally
+  (`logit_pipeline::run_with_shutdown`, `crates/logit-pipeline/src/runtime.rs`), triggering the
+  same close-time flush a listener's own natural completion always has. Two residual gaps left
+  open by that fix, not oversights:
+  - **A datagram in flight when the signal lands is lost.** Cancelling a listener's `run` future
+    drops whatever it was mid-`recv_from`/decode on. Accepted: UDP is lossy by contract already;
+    the aggregation window (which this fix does protect) is not.
+  - **`Output` still has no close/flush hook of its own** — only `Transform`/Lua nodes with a
+    configured `flush_interval` get a close-time flush; a sink has nothing analogous to flush on
+    shutdown, because none needs one yet (`InfluxDbOutput::send` writes synchronously, nothing
+    buffered internally to lose).
 - **Fan-out/fan-in is unbuffered/uncoordinated** — the component graph (ADR 0009,
   [pipeline-graph.md](design/pipeline-graph.md)) makes arbitrary fan-out/fan-in the normal case (a
   sink shared by two branches, one listener feeding several filters), but a stalled sink backs up

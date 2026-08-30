@@ -20,24 +20,47 @@ use logit_transforms::{Aggregator, JsonParser};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Loads `path`, resolves its component graph, and runs it until the first component fails.
+/// Loads `path`, resolves its component graph, and runs it until the first component fails or a
+/// shutdown signal is received.
 ///
 /// Every listener/sink task loops forever in normal operation (a listener keeps listening, a
 /// sink keeps draining its inbox), so in the happy path this simply never returns -- matching
-/// "this is a service," not "this is a batch job." There's no graceful-shutdown handling yet (no
-/// installed Ctrl-C handler, no drain of in-flight events on exit) -- Ctrl-C falls through to the
-/// OS default (immediate termination), same as any other long-running process with no handler.
+/// "this is a service," not "this is a batch job." SIGTERM/SIGINT (Ctrl-C on non-Unix) triggers a
+/// graceful drain: every listener stops, which closes its downstream inboxes normally and
+/// triggers each node's existing close-time flush (`logit_pipeline::run_with_shutdown`,
+/// `crates/logit-pipeline/src/runtime.rs`) -- so an in-flight `aggregate` window is emitted rather
+/// than lost. A second signal before that drain finishes exits immediately (exit code 130): a
+/// wedged drain must stay killable by the same signal that started it, which matters once an
+/// unattended restart policy is the thing waiting on this process to actually exit.
 pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
     // An unset `!env` variable (a missing token, most likely) fails here, before anything starts
     // listening.
     let config = config::load(&path)?;
     let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    run_config(config, base_dir).await
+    let (graph, specs) = prepare(config, base_dir)?;
+
+    // Independent listener from the one `run_with_shutdown` races internally (below) -- multiple
+    // concurrent listeners on the same signal kind are supported and all get notified, so this
+    // doesn't compete with or consume the first one. Aborted once `run_with_shutdown` returns so
+    // it doesn't linger if shutdown never happens.
+    let kill_switch = tokio::spawn(async {
+        shutdown_signal().await;
+        shutdown_signal().await;
+        std::process::exit(130);
+    });
+
+    let result = logit_pipeline::run_with_shutdown(graph, specs, shutdown_signal()).await;
+    kill_switch.abort();
+    result
 }
 
-/// The rest of [`run_pipelines`], split out so it's callable with an in-memory `Config` directly
-/// (no real file on disk needed) -- what most tests below exercise.
-async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
+/// Resolves a config into a `Graph` plus one built `NodeSpec` per component -- the shared setup
+/// between [`run_pipelines`] and [`run_config`] (the latter used directly by tests below, which
+/// don't need shutdown wiring).
+fn prepare(
+    config: Config,
+    base_dir: PathBuf,
+) -> anyhow::Result<(graph::Graph, HashMap<String, NodeSpec>)> {
     let graph = graph::resolve(config)?;
 
     // Sorted, not raw `HashMap` iteration order: a startup failure (a missing lua_file) should be
@@ -53,6 +76,35 @@ async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
         specs.insert(id.clone(), spec);
     }
 
+    Ok((graph, specs))
+}
+
+/// Waits for one SIGTERM or SIGINT (Ctrl-C on non-Unix, where `SignalKind` doesn't exist). Each
+/// call installs its own independent listener -- see `run_pipelines`, which calls this three
+/// times (the graceful-shutdown trigger, plus twice more for the kill switch) and relies on all
+/// three being notified independently on the same signal.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate()).expect("installing a SIGTERM handler");
+        let mut interrupt = signal(SignalKind::interrupt()).expect("installing a SIGINT handler");
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Test-only: [`run_pipelines`] minus shutdown handling and the on-disk `path`, so tests can drive
+/// an in-memory `Config` directly without a signal handler racing their assertions.
+#[cfg(test)]
+async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
+    let (graph, specs) = prepare(config, base_dir)?;
     logit_pipeline::run(graph, specs).await
 }
 

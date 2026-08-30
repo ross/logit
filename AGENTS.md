@@ -45,6 +45,7 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/audit` | `cargo-deny` + `cargo-audit` |
 | `script/cibuild` | The exact sequence CI runs, in order — run this before opening a PR |
 | `script/console` | Interactive shell in the dev container, for anything not covered above |
+| `script/image [tag]` | Build the production runtime image (`Dockerfile`, not `Dockerfile.dev`) |
 
 All default to `sudo docker`; `DOCKER=docker` or `DOCKER=podman` overrides. See
 [ADR 0005](docs/adr/0005-containerized-development.md) and
