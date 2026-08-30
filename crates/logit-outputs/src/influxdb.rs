@@ -5,7 +5,7 @@
 use crate::Output;
 use bytes::Bytes;
 use logit_core::interner::resolve;
-use logit_core::{Event, EventBatch, MetricKind, MetricRecord, Payload, Resource, Value};
+use logit_core::{Event, EventBatch, MetricKind, MetricRecord, Resource, Value};
 use logit_proto::{CodecError, Encoder};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -55,8 +55,9 @@ impl Output for InfluxDbOutput {
     async fn send(&mut self, batch: EventBatch) -> anyhow::Result<()> {
         let body = self.encoder.encode(&batch)?;
         if body.is_empty() {
-            // Nothing in this batch had a line-protocol encoding (e.g. all logs/traces, or all
-            // Set metrics -- see `metric_fields` below). Not an error; nothing to write.
+            // Nothing in this batch had a line-protocol encoding (e.g. every event carried only
+            // a log or span and no metrics, or every metric was a Set -- see `metric_fields`
+            // below). Not an error; nothing to write.
             return Ok(());
         }
 
@@ -87,9 +88,11 @@ impl Output for InfluxDbOutput {
 /// Encodes an [`EventBatch`] as InfluxDB line protocol. Split out from [`InfluxDbOutput`] so the
 /// encoding logic is directly unit-testable without an HTTP server.
 ///
-/// Only [`Payload::Metric`] events have a line-protocol mapping; logs and traces are skipped
-/// (`docs/OVERVIEW.md`'s v0.1 slice is metrics-only -- there's no established convention yet for
-/// what a log line or span becomes in InfluxDB, and guessing one isn't this output's job).
+/// Only an event's `metrics` have a line-protocol mapping; its log body and span (if any) are
+/// skipped (`docs/OVERVIEW.md`'s v0.1 slice is metrics-only -- there's no established convention
+/// yet for what a log line or span becomes in InfluxDB, and guessing one isn't this output's job).
+/// An event can carry several metrics at once now (`docs/adr/0012-multi-payload-events.md`), so
+/// each one becomes its own line, sharing that event's tags.
 struct InfluxLineEncoder;
 
 impl Encoder for InfluxLineEncoder {
@@ -102,35 +105,83 @@ impl Encoder for InfluxLineEncoder {
         // them. This map holds, per series, a "next free slot" successor map covering every
         // timestamp actually allocated to it so far -- not just the most recent one (see the
         // comment at its use site for why that's not enough either, and for what the successor
-        // map buys over a plain occupied-set).
+        // map buys over a plain occupied-set). Kept at batch scope, not per-event or per-metric:
+        // that's what lets it disambiguate collisions across the whole batch, not just within
+        // one event.
         let mut series_allocated_timestamps: HashMap<String, HashMap<i64, i64>> = HashMap::new();
         for event in &batch.events {
-            let Payload::Metric(metric) = &event.payload else {
-                continue;
-            };
-            // One bad metric shouldn't drop every other metric in the batch, so this logs and
-            // skips rather than propagating via `?`.
-            // TODO: route through a proper diagnostics facility once one exists, instead of
-            // stderr -- same gap noted in logit-inputs::statsd.
-            if let Err(err) = encode_metric_line(
-                &mut buf,
-                &batch.resource,
-                event,
-                metric,
-                &mut series_allocated_timestamps,
-            ) {
-                eprintln!("influxdb output: {err}");
+            if event.metrics.is_empty() {
+                continue; // a log-only, span-only, or empty event: nothing to encode
+            }
+            // Tags come from `resource.attributes` + `event.attributes` only -- nothing
+            // metric-specific -- so they're identical for every metric on this event. Rendered
+            // once per event, not once per metric.
+            let tag_suffix = render_tag_suffix(&batch.resource, event);
+            for metric in &event.metrics {
+                // One bad metric shouldn't drop its event's other metrics, let alone the rest of
+                // the batch, so this logs and skips rather than propagating via `?`. Deliberately
+                // on the inner, per-metric loop: a `Set` or `#`-prefixed metric sharing an event
+                // with a perfectly good one must not take the good one down with it.
+                // TODO: route through a proper diagnostics facility once one exists, instead of
+                // stderr -- same gap noted in logit-inputs::statsd.
+                if let Err(err) = encode_metric_line(
+                    &mut buf,
+                    &tag_suffix,
+                    metric,
+                    event.timestamp,
+                    &mut series_allocated_timestamps,
+                ) {
+                    eprintln!("influxdb output: {err}");
+                }
             }
         }
         Ok(Bytes::from(buf.into_bytes()))
     }
 }
 
+/// The `,key=value,key=value` line-protocol tag suffix for one event: resource attributes first,
+/// event attributes overriding on key collision (an event-level tag is more specific than the
+/// batch-wide resource it came from). Depends on nothing metric-specific, so it's computed once
+/// per event and shared across every metric that event carries. Infallible by construction: a tag
+/// that can't be represented (an empty key/value, or one with an embedded newline -- line
+/// protocol has no escape for that at all) is dropped individually rather than escalated to a
+/// whole-point error.
+fn render_tag_suffix(resource: &Resource, event: &Event) -> String {
+    let mut suffix = String::new();
+    let mut tags = resource.attributes.clone();
+    for (key, value) in event.attributes.iter() {
+        tags.insert(resolve(key), value.clone());
+    }
+    for (key, value) in tags.iter() {
+        let key = resolve(key);
+        let Some(value) = value_as_tag_string(value) else {
+            continue;
+        };
+        // InfluxDB 2.x rejects an empty tag value outright, and line protocol has no escape for
+        // an embedded newline in a tag value at all -- either would previously have corrupted or
+        // rejected this whole line (and, via a since-fixed shared-buffer bug, everything after it
+        // in the batch). Drop just this one tag rather than the whole metric: the point is still
+        // meaningful without it.
+        if key.is_empty()
+            || value.is_empty()
+            || key.contains(['\n', '\r'])
+            || value.contains(['\n', '\r'])
+        {
+            continue;
+        }
+        suffix.push(',');
+        suffix.push_str(&escape_tag(key));
+        suffix.push('=');
+        suffix.push_str(&escape_tag(&value));
+    }
+    suffix
+}
+
 fn encode_metric_line(
     buf: &mut String,
-    resource: &Resource,
-    event: &Event,
+    tag_suffix: &str,
     metric: &MetricRecord,
+    timestamp: i64,
     series_allocated_timestamps: &mut HashMap<String, HashMap<i64, i64>>,
 ) -> Result<(), CodecError> {
     let fields = metric_fields(&metric.kind)?;
@@ -152,40 +203,13 @@ fn encode_metric_line(
     }
 
     // Built in a local buffer first, not `buf` directly: if a later step rejects (there are none
-    // right now, but there were -- see the tag-validation loop below, which used to write
-    // straight into `buf` and could leave a truncated, newline-less fragment behind on an
-    // invalid tag, corrupting whatever line got appended after it). Only a complete, valid line
-    // ever reaches `buf`.
+    // right now, but there were -- see `render_tag_suffix`'s doc comment for the history), only a
+    // complete, valid line ever reaches `buf`. "measurement + tags" is also the series-identity
+    // key fed to `series_allocated_timestamps` below -- the tag half is shared across an event's
+    // metrics (see `encode`), but the measurement isn't, so this string still has to be rebuilt
+    // once per metric even though `tag_suffix` itself is computed only once.
     let mut line = escape_measurement(measurement);
-
-    // Tags: resource attributes (host, service, ...) first, event attributes override on key
-    // collision -- an event-level tag is more specific than the batch-wide resource it came from.
-    let mut tags = resource.attributes.clone();
-    for (key, value) in event.attributes.iter() {
-        tags.insert(resolve(key), value.clone());
-    }
-    for (key, value) in tags.iter() {
-        let key = resolve(key);
-        let Some(value) = value_as_tag_string(value) else {
-            continue;
-        };
-        // InfluxDB 2.x rejects an empty tag value outright, and line protocol has no escape for
-        // an embedded newline in a tag value at all -- either would previously have corrupted or
-        // rejected this whole line (and, via the shared-buffer bug above, everything after it in
-        // the batch). Drop just this one tag rather than the whole metric: the point is still
-        // meaningful without it.
-        if key.is_empty()
-            || value.is_empty()
-            || key.contains(['\n', '\r'])
-            || value.contains(['\n', '\r'])
-        {
-            continue;
-        }
-        line.push(',');
-        line.push_str(&escape_tag(key));
-        line.push('=');
-        line.push_str(&escape_tag(&value));
-    }
+    line.push_str(tag_suffix);
 
     // Disambiguate same-series collisions within this batch (see `encode`'s comment).
     //
@@ -208,17 +232,26 @@ fn encode_metric_line(
     //
     // Correct *and* amortized-cheap: a per-series successor map, same idea as a union-find
     // "smallest free slot >= t" allocator with path compression. `allocate_timestamp` walks the
-    // chain of already-occupied slots starting at `event.timestamp`, and repoints every slot it
-    // visits directly at the free slot it finds -- so the next probe starting anywhere on that
-    // chain jumps straight there instead of re-walking it. A timestamp that isn't already used is
-    // still returned untouched, regardless of arrival order; only a genuine collision costs a 1ns
+    // chain of already-occupied slots starting at `timestamp`, and repoints every slot it visits
+    // directly at the free slot it finds -- so the next probe starting anywhere on that chain
+    // jumps straight there instead of re-walking it. A timestamp that isn't already used is still
+    // returned untouched, regardless of arrival order; only a genuine collision costs a 1ns
     // nudge, and repeated collisions on the same series no longer cost more than a couple of
     // lookups each once the chain has been compressed once.
+    //
+    // Needs no algorithmic change for an event carrying several metrics
+    // (docs/adr/0012-multi-payload-events.md): distinct metric names on one event produce
+    // distinct series keys (they differ by measurement) and never collide, so they keep the
+    // event's own timestamp untouched; a *repeated* metric name on one event (e.g. `kv_metrics`
+    // configured to add the same counter twice, or two aggregated series that happen to share a
+    // name) takes exactly the collision path below, one series key, `k` allocations -- the same
+    // amortized-cheap walk, byte-for-byte the same output as if those metrics had arrived as `k`
+    // separate events. `series_allocated_timestamps` staying hoisted at batch scope (`encode`,
+    // above) is what makes this true -- don't move it to per-event or per-metric scope.
     let next_free = series_allocated_timestamps.entry(line.clone()).or_default();
-    let timestamp = allocate_timestamp(next_free, event.timestamp).ok_or_else(|| {
+    let timestamp = allocate_timestamp(next_free, timestamp).ok_or_else(|| {
         CodecError::Malformed(format!(
-            "no free timestamp slot for series {line:?} near {} (i64 overflow)",
-            event.timestamp
+            "no free timestamp slot for series {line:?} near {timestamp} (i64 overflow)"
         ))
     })?;
 
@@ -372,15 +405,20 @@ mod tests {
         for (k, v) in attrs {
             attributes.insert(k, *v);
         }
-        Event {
-            timestamp: 1_700_000_000_000_000_000,
+        Event::metric(
+            1_700_000_000_000_000_000,
             attributes,
-            payload: Payload::Metric(MetricRecord {
-                name: logit_core::interner::intern(name),
-                kind,
-                unit: None,
-            }),
-        }
+            MetricRecord { name: logit_core::interner::intern(name), kind, unit: None },
+        )
+    }
+
+    /// Like `metric_event`, but with an explicit timestamp -- the leverage point for the
+    /// `allocate_timestamp` regression tests below, all of which care about the exact timestamp
+    /// a series of events shares.
+    fn counter_event_at(ts: i64, name: &str, v: f64) -> Event {
+        let mut event = metric_event(name, MetricKind::Counter(v), &[]);
+        event.timestamp = ts;
+        event
     }
 
     fn encode(events: Vec<Event>) -> String {
@@ -525,16 +563,16 @@ mod tests {
     }
 
     #[test]
-    fn non_metric_payloads_are_skipped() {
-        let log_event = Event {
-            timestamp: 0,
-            attributes: AttrMap::new(),
-            payload: Payload::Log(LogRecord {
+    fn events_with_no_metrics_are_skipped() {
+        let log_event = Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
                 message: Value::str("hello"),
                 severity: None,
                 body_format: BodyFormat::Raw,
-            }),
-        };
+            },
+        );
         assert_eq!(encode(vec![log_event]), "");
     }
 
@@ -584,15 +622,7 @@ mod tests {
         let same_ts = 1_700_000_000_000_000_000;
         let events: Vec<Event> = [1.0, 2.0, 3.0]
             .into_iter()
-            .map(|v| Event {
-                timestamp: same_ts,
-                attributes: AttrMap::new(),
-                payload: Payload::Metric(MetricRecord {
-                    name: logit_core::interner::intern("page.views"),
-                    kind: MetricKind::Counter(v),
-                    unit: None,
-                }),
-            })
+            .map(|v| counter_event_at(same_ts, "page.views", v))
             .collect();
 
         let out = encode(events);
@@ -619,24 +649,8 @@ mod tests {
         // only advancing while that exact slot is already taken by this series -- so this must
         // emit exactly 100 and 101, not 101 and 102.
         let events = vec![
-            Event {
-                timestamp: 101,
-                attributes: AttrMap::new(),
-                payload: Payload::Metric(MetricRecord {
-                    name: logit_core::interner::intern("page.views"),
-                    kind: MetricKind::Counter(1.0),
-                    unit: None,
-                }),
-            },
-            Event {
-                timestamp: 100,
-                attributes: AttrMap::new(),
-                payload: Payload::Metric(MetricRecord {
-                    name: logit_core::interner::intern("page.views"),
-                    kind: MetricKind::Counter(2.0),
-                    unit: None,
-                }),
-            },
+            counter_event_at(101, "page.views", 1.0),
+            counter_event_at(100, "page.views", 2.0),
         ];
 
         let out = encode(events);
@@ -658,17 +672,8 @@ mod tests {
         // the performance regression guard: it must stay fast. Don't shrink N to "simplify" it.
         const N: i64 = 50_000;
         let start_ts = 1_700_000_000_000_000_000;
-        let events: Vec<Event> = (0..N)
-            .map(|_| Event {
-                timestamp: start_ts,
-                attributes: AttrMap::new(),
-                payload: Payload::Metric(MetricRecord {
-                    name: logit_core::interner::intern("page.views"),
-                    kind: MetricKind::Counter(1.0),
-                    unit: None,
-                }),
-            })
-            .collect();
+        let events: Vec<Event> =
+            (0..N).map(|_| counter_event_at(start_ts, "page.views", 1.0)).collect();
 
         let out = encode(events);
         let mut timestamps: Vec<i64> =
@@ -690,15 +695,7 @@ mod tests {
         // never let one walk skip over a slot another walk is about to claim.
         let events: Vec<Event> = [100, 100, 100, 101, 101]
             .into_iter()
-            .map(|ts| Event {
-                timestamp: ts,
-                attributes: AttrMap::new(),
-                payload: Payload::Metric(MetricRecord {
-                    name: logit_core::interner::intern("page.views"),
-                    kind: MetricKind::Counter(1.0),
-                    unit: None,
-                }),
-            })
+            .map(|ts| counter_event_at(ts, "page.views", 1.0))
             .collect();
 
         let out = encode(events);
@@ -706,6 +703,102 @@ mod tests {
             out.lines().map(|l| l.rsplit(' ').next().unwrap().parse().unwrap()).collect();
         timestamps.sort_unstable();
         assert_eq!(timestamps, vec![100, 101, 102, 103, 104], "got: {out}");
+    }
+
+    /// Proves hoisting tag rendering out of the per-metric loop (`render_tag_suffix`,
+    /// `encode`'s inner loop) didn't change output: distinctly-named metrics on one event never
+    /// collide in `allocate_timestamp` (different measurements mean different series keys), so
+    /// each keeps the event's own timestamp untouched, and each still carries the event's tags.
+    #[test]
+    fn several_metrics_on_one_event_share_its_tags_and_each_get_a_line() {
+        let mut event = metric_event("requests", MetricKind::Counter(1.0), &[("env", "prod")]);
+        event.metrics.push(MetricRecord {
+            name: logit_core::interner::intern("latency"),
+            kind: MetricKind::Gauge(5.0),
+            unit: None,
+        });
+        event.metrics.push(MetricRecord {
+            name: logit_core::interner::intern("bytes"),
+            kind: MetricKind::Counter(100.0),
+            unit: None,
+        });
+
+        let out = encode(vec![event]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "one line per metric, got: {out}");
+        for line in &lines {
+            assert!(line.contains("env=prod"), "every line should share the event's tags: {line}");
+            assert!(
+                line.ends_with(" 1700000000000000000"),
+                "distinct measurements should never collide: {line}"
+            );
+        }
+    }
+
+    /// Case B from `allocate_timestamp`'s doc comment: the *same* metric name appearing twice on
+    /// one event -- a genuinely new input shape this refactor introduces (e.g. `kv_metrics`
+    /// configured to add one counter twice, or two upstream series that happen to share a name
+    /// landing on one event) -- takes exactly the collision path a repeated statsd value used to,
+    /// byte-for-byte the same allocator behavior.
+    #[test]
+    fn the_same_metric_name_twice_on_one_event_gets_distinct_timestamps() {
+        let mut event = metric_event("page.views", MetricKind::Counter(1.0), &[]);
+        event.metrics.push(MetricRecord {
+            name: logit_core::interner::intern("page.views"),
+            kind: MetricKind::Counter(2.0),
+            unit: None,
+        });
+
+        let out = encode(vec![event]);
+        assert_eq!(out.lines().count(), 2, "got: {out}");
+        assert!(out.contains("value=1 1700000000000000000"), "got: {out}");
+        assert!(out.contains("value=2 1700000000000000001"), "got: {out}");
+    }
+
+    /// Pins the error handling's move to the inner, per-metric loop (`encode`): today's
+    /// `set_metrics_are_skipped_not_fatal` and `measurement_name_starting_with_hash_is_rejected_
+    /// not_silently_dropped` use separate events and so don't actually exercise this -- a bad
+    /// metric sharing an event with a good one must not take the good one down too.
+    #[test]
+    fn a_bad_metric_skips_only_itself_not_the_rest_of_its_event() {
+        let mut event =
+            metric_event("unique.users", MetricKind::Set(logit_core::HyperLogLog::default()), &[]);
+        event.metrics.push(MetricRecord {
+            name: logit_core::interner::intern("page.views"),
+            kind: MetricKind::Counter(1.0),
+            unit: None,
+        });
+
+        let out = encode(vec![event]);
+        assert!(!out.contains("unique.users"), "got: {out}");
+        assert!(
+            out.contains("page.views value=1"),
+            "the good metric on the same event should still land: {out}"
+        );
+    }
+
+    /// The nginx shape end to end: an access-log event that a `kv_metrics`-style transform has
+    /// added a derived metric to. The metric should be written; the log body is simply ignored,
+    /// not an error.
+    #[test]
+    fn a_mixed_log_and_metric_event_writes_the_metric_and_ignores_the_log() {
+        let mut event = Event::log(
+            1_700_000_000_000_000_000,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str("GET / HTTP/1.1"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+            },
+        );
+        event.metrics.push(MetricRecord {
+            name: logit_core::interner::intern("nginx.requests"),
+            kind: MetricKind::Counter(1.0),
+            unit: None,
+        });
+
+        let out = encode(vec![event]);
+        assert_eq!(out, "nginx.requests value=1 1700000000000000000\n");
     }
 
     #[tokio::test]
