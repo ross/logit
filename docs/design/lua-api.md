@@ -27,20 +27,28 @@ end
 
 `event.attributes` is itself a second userdata sharing the same underlying event (not a copy), so
 chained access like the above works without materializing anything beyond what's read or written.
-`event.type` (a read-only string: `"log"`/`"metric"`/`"span"`) and `event:clone()` (an independent
-deep copy, needed for fan-out — see the script contract below) round out the proxy's surface for
-now. Deliberately not exposed yet: typed access to payload fields (a metric's value, a log's
-message, ...) and any `Event.new(...)`-style constructor — real API surface that deserves its own
-design pass once a concrete consumer (the built-in `aggregate` processor is the obvious one) needs
-it, rather than being guessed at ahead of that.
+Since an event can carry a log, several metrics, and a span all at once
+([ADR 0012](../adr/0012-multi-payload-events.md)), the proxy exposes presence, not a classification:
+`event.has_log` / `event.has_metrics` / `event.has_span` (read-only booleans). There is deliberately
+no `event.type` — an earlier design tried a single `"log"`/`"metric"`/`"span"` string with a
+precedence rule for the multi-payload case, and rejected it: a summary string is strictly lossy
+versus checking the specific thing a script actually cares about, and a script branching on
+`event.type == "metric"` would silently skip the metrics on a log-carrying event, exactly the shape
+a transform like `kv_metrics` produces. `event:clone()` (an independent deep copy, needed for
+fan-out — see the script contract below) rounds out the proxy's surface for now. Deliberately not
+exposed yet: typed access to record fields (a metric's value, a log's message, ...) and any
+`Event.new(...)`-style constructor — real API surface that deserves its own design pass once a
+concrete consumer (a metrics-from-attributes transform is the obvious one) needs it, rather than
+being guessed at ahead of that.
 
 No `__pairs`: it isn't available under LuaJIT. `mlua::MetaMethod::Pairs` requires Lua 5.2+, and
 LuaJIT is Lua 5.1 semantics — this was in the original version of this section and is wrong.
 `event:to_table()` is the answer instead: a real, disconnected Lua table with `timestamp`,
-`attributes`, and `type`, for anything the proxy doesn't expose directly — including full
-attribute iteration (`for k, v in pairs(event:to_table().attributes) do ... end`, native `pairs()`
-on a real table) and building new structures or logging for debugging. The cost is opt-in and
-visible at the call site rather than paid unconditionally.
+`attributes`, `has_log`, `has_metrics`, and `has_span`, for anything the proxy doesn't expose
+directly — including full attribute iteration
+(`for k, v in pairs(event:to_table().attributes) do ... end`, native `pairs()` on a real table) and
+building new structures or logging for debugging. The cost is opt-in and visible at the call site
+rather than paid unconditionally.
 
 One more thing the proxy design ran into once actually implemented: **`event.timestamp` is a Lua
 *string*, not a Lua number.** Lua's only numeric type is an IEEE-754 double, exact only up to 2^53

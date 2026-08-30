@@ -108,3 +108,18 @@ allocation, not the interning itself — not worth a second seed type for.
   an upstream transform) if the JSON object happens to use the same key. No new failure mode this
   codebase doesn't already have elsewhere (a Lua script can do the same via `event.attributes.x =
   ...`) — a config author who cares about this orders/names things to avoid it.
+
+## Amendment: "log events" means "events carrying a log"
+
+[ADR 0012](0012-multi-payload-events.md) replaces `Event`'s one-of `Payload` with independent
+`log`/`metrics`/`span` fields, so "Only `Payload::Log` events... are candidates" above no longer
+parses — that type is gone. Reworded without changing the decision: only an event whose `log` field
+is present, and whose message is `Value::Str`/`Value::Bytes`, is a candidate; an event with no log at
+all passes through untouched, exactly as a metric- or span-only event did under the old model.
+
+**An event carrying both a log and metrics (or a span) is a new, previously-unrepresentable shape,
+and behaves exactly as the additive design above already implies**: `json` only ever reads
+`log.message` and writes `attributes`, so any metrics or span already on the event ride through
+completely unaffected, whether the log half parses successfully or not. No new code path was needed
+for this — see `a_log_event_that_also_carries_a_metric_is_parsed_and_keeps_its_metric`
+(`crates/logit-transforms/src/json.rs`) for the regression test proving it.

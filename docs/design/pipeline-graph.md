@@ -257,9 +257,17 @@ express "route by condition." Two consequences worth stating rather than discove
 - **Fan-out pays a real clone cost.** Every extra consumer of a node clones the outgoing
   `EventBatch` — a deep `Vec<Event>` clone, same mechanism as today's per-output clone, now incurred
   wherever a filter fans out. A routing primitive would have avoided this by construction; having
-  ruled that out (ADR 0009), the clone is load-bearing, not incidental. `Arc<EventBatch>` with
-  copy-on-write at whichever node first mutates it is the identified future optimization — recorded
-  here as a known cost, not designed now.
+  ruled that out (ADR 0009), the clone is load-bearing, not incidental — and it's also what makes
+  branch isolation free: two branches of a fan-out never share the same `Event` value, so a mutation
+  on one is structurally invisible to the other, with nothing extra to design or maintain for that
+  guarantee (see [ADR 0012](../adr/0012-multi-payload-events.md)'s branch-isolation note, proven by
+  `crates/logit-pipeline/src/runtime.rs`'s
+  `a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch`). That same ADR also raises
+  the average cost of this clone: an event can now carry a log and several metrics at once
+  (`docs/design/data-model.md`) where before it carried exactly one payload, so there's more to copy
+  per extra branch than there used to be. `Arc<EventBatch>` with copy-on-write at whichever node
+  first mutates it is the identified future optimization — recorded here as a known cost, not
+  designed now, and more valuable to eventually build than it was before that ADR.
 
 Also worth carrying forward as an open question, not a decision: today's `send_batch` silently drops
 a send on a closed downstream (`let _ = tx.blocking_send(...)`). Under a DAG that closure should
