@@ -111,3 +111,38 @@ pipeline has more than one resource feeding it, which nothing in v0.1 does.
 - No graceful shutdown yet (Ctrl-C still falls through to the OS default), but the worker thread
   now flushes every flush-bearing stage once when its inbound channel closes normally, so a
   pipeline that reaches a clean end doesn't silently lose its last in-flight window.
+
+## Amendment: pass-through is per metric, not per event
+
+[ADR 0012](0012-multi-payload-events.md) replaces `Event`'s one-of `Payload` with independent
+`log`/`metrics`/`span` fields, so an event can now carry a log *and* metrics at once (the
+`kv_metrics` shape planned in `docs/plans/0002-nginx-integration.md`'s workstream E). This ADR's
+"Pass through, never drop" decision above was written against the one-of model, where "pass through"
+and "absorb" were mutually exclusive properties of a whole event. They no longer are.
+
+**`Aggregator::process` now absorbs metrics individually, not the event as a whole.** It takes each
+metric off `event.metrics` in turn: `Counter`/`Gauge`/`Distribution` are absorbed into window state
+exactly as before; `Set`/`Histogram`/`Summary` and any metric whose kind conflicts with an
+already-accumulating series under the same name/unit/tags are pushed back onto the event rather than
+absorbed — the same set of kinds this ADR always declined to merge, just decided per metric now
+instead of once for the whole event. `process` returns `None` only when nothing at all remains on
+the event afterward — no unabsorbed metric, no log, no span. An event carrying a log and a clean
+counter has its counter absorbed and is forwarded with only the log remaining; before this
+amendment, that same event (impossible to construct under the one-of model) would have had no
+well-defined behavior at all.
+
+A kind conflict is now reported once per offending *metric* (`eprintln!`, same known diagnostics gap
+as before), not once per event — a sibling metric on the same event that merges cleanly is still
+absorbed even when another metric on it conflicts.
+
+**This is behavior-preserving for every event shape this ADR could previously describe.** A
+metric-only event still behaves exactly as before (absorbed → `None`, or forwarded whole on a
+conflict/unmergeable kind → `Some`); a log-only or span-only event still never touches window state
+at all (the empty-metrics fast path in `Aggregator::process`). The only newly-defined behavior is for
+event shapes the one-of model made impossible to construct in the first place, so nothing this ADR
+already committed to changes.
+
+See `crates/logit-transforms/src/aggregate.rs`'s `process` for the implementation, and its test
+module for the shapes this amendment adds coverage for (a log absorbing a counter and forwarding the
+log; a mixed metric event absorbing what it can and keeping the rest; two same-series metrics on one
+event summing together; a kind conflict leaving only the conflicting metric behind).

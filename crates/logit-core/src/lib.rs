@@ -13,7 +13,7 @@ mod resource;
 mod span;
 
 pub use attrs::AttrMap;
-pub use event::{Event, EventBatch, Payload};
+pub use event::{Event, EventBatch, MetricList};
 pub use interner::Symbol;
 pub use metric::{DdSketch, HyperLogLog, MetricKind, MetricRecord};
 pub use resource::Resource;

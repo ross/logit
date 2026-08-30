@@ -7,7 +7,7 @@
 //! script-visible contract these two types implement.
 
 use crate::value::{attrmap_to_lua_table, lua_to_value, lua_value_matches, value_to_lua};
-use logit_core::{Event, Payload};
+use logit_core::Event;
 use mlua::{AnyUserData, MetaMethod, UserData, UserDataMethods, Value as LuaValue};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -40,14 +40,6 @@ impl EventProxy {
             Err(rc) => rc.borrow().clone(),
         }
     }
-
-    fn type_name(&self) -> &'static str {
-        match self.0.borrow().payload {
-            Payload::Log(_) => "log",
-            Payload::Metric(_) => "metric",
-            Payload::Span(_) => "span",
-        }
-    }
 }
 
 impl UserData for EventProxy {
@@ -65,7 +57,16 @@ impl UserData for EventProxy {
             "attributes" => {
                 Ok(LuaValue::UserData(lua.create_userdata(AttrsProxy(this.0.clone()))?))
             }
-            "type" => Ok(LuaValue::String(lua.create_string(this.type_name())?)),
+            // Presence flags, not a classification string: an event can carry a log, several
+            // metrics, and a span all at once now, so "what type is this event" has no single
+            // right answer (docs/adr/0012-multi-payload-events.md) -- a script or native
+            // component checks the specific thing it cares about instead. There is deliberately
+            // no `event.type` any more: a single summary label would be lossy at best and a
+            // silent footgun at worst (a script branching on `event.type == "metric"` would skip
+            // the metrics on a log-carrying event, exactly the shape `kv_metrics` produces).
+            "has_log" => Ok(LuaValue::Boolean(this.0.borrow().log.is_some())),
+            "has_metrics" => Ok(LuaValue::Boolean(!this.0.borrow().metrics.is_empty())),
+            "has_span" => Ok(LuaValue::Boolean(this.0.borrow().span.is_some())),
             _ => Ok(LuaValue::Nil),
         });
 
@@ -91,7 +92,7 @@ impl UserData for EventProxy {
                     this.0.borrow_mut().timestamp = ts;
                     Ok(())
                 }
-                "attributes" | "type" => {
+                "attributes" | "has_log" | "has_metrics" | "has_span" => {
                     Err(mlua::Error::RuntimeError(format!("event.{key} is read-only")))
                 }
                 other => Err(mlua::Error::RuntimeError(format!("event has no field '{other}'"))),
@@ -112,7 +113,9 @@ impl UserData for EventProxy {
             let table = lua.create_table()?;
             table.set("timestamp", event.timestamp.to_string())?; // string -- see __index above
             table.set("attributes", attrmap_to_lua_table(lua, &event.attributes)?)?;
-            table.set("type", this.type_name())?;
+            table.set("has_log", event.log.is_some())?;
+            table.set("has_metrics", !event.metrics.is_empty())?;
+            table.set("has_span", event.span.is_some())?;
             Ok(table)
         });
     }

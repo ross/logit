@@ -18,15 +18,18 @@ pub struct EventBatch {
 pub struct Event {
     pub timestamp: i64,            // unix nanos
     pub attributes: AttrMap,
-    pub payload: Payload,
-}
-
-pub enum Payload {
-    Log(LogRecord),
-    Metric(MetricRecord),
-    Span(SpanRecord),
+    pub log: Option<LogRecord>,
+    pub metrics: MetricList,       // SmallVec<[MetricRecord; 1]>
+    pub span: Option<SpanRecord>,
 }
 ```
+
+**An event is whatever it carries, not a tagged one-of** ([ADR 0012](../adr/0012-multi-payload-events.md)).
+An access log line is a log record and, once a transform like `kv_metrics` derives request/byte
+counts and latency from its fields, a source of several metrics at once — the same event, not two
+related-but-separate ones. `log`/`span` stay `Option` (an event can have at most one of each); an
+event with none of the three is legal and representable. A sink emits whatever it finds:
+`influxdb_out` writes every metric on an event and ignores its log/span.
 
 `Resource` is `Arc`-shared rather than copied onto every event — a batch typically comes from one
 socket/file/OTLP request and shares one origin.
@@ -71,7 +74,10 @@ the shape:
   size for both lookup and iteration, and gives deterministic ordering for free — which matters for
   the wire format's dictionary encoding and for reproducible tests.
 
-## Payload types
+## Record types
+
+The three record types an event can independently carry ([ADR 0012](../adr/0012-multi-payload-events.md)) —
+no longer variants of one enum, just three fields on `Event`:
 
 ```rust
 pub struct LogRecord {

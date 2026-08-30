@@ -426,16 +426,12 @@ mod tests {
     }
 
     fn counter_event(name: &str, value: f64) -> Event {
-        use logit_core::{interner::intern, AttrMap, MetricKind, MetricRecord, Payload};
-        Event {
-            timestamp: 0,
-            attributes: AttrMap::new(),
-            payload: Payload::Metric(MetricRecord {
-                name: intern(name),
-                kind: MetricKind::Counter(value),
-                unit: None,
-            }),
-        }
+        use logit_core::{interner::intern, AttrMap, MetricKind, MetricRecord};
+        Event::metric(
+            0,
+            AttrMap::new(),
+            MetricRecord { name: intern(name), kind: MetricKind::Counter(value), unit: None },
+        )
     }
 
     #[tokio::test]
@@ -583,6 +579,111 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("the batch should have reached the output before shutdown");
         assert_eq!(received.events.len(), 1);
+    }
+
+    /// A native `Transform` that mutates every event it sees by appending an extra metric --
+    /// standing in for any real transform (a Lua enrichment stage, `kv_metrics`, ...) that changes
+    /// an event on its way through one branch of a fan-out.
+    struct MutatingTransform;
+
+    impl Transform for MutatingTransform {
+        fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
+            use logit_core::{interner::intern, MetricKind, MetricRecord};
+            event.metrics.push(MetricRecord {
+                name: intern("extra"),
+                kind: MetricKind::Counter(1.0),
+                unit: None,
+            });
+            Some(event)
+        }
+    }
+
+    /// Operationalizes branch isolation (docs/adr/0012-multi-payload-events.md): `Fanout` deep-
+    /// clones an `EventBatch` for every consumer but the last, *before* any downstream node can
+    /// touch it, so a mutation one branch of a fan-out makes is never visible on a sibling
+    /// branch's copy of the same upstream event -- even now that `Event` can carry several
+    /// payloads at once. Proven against a real two-branch fan-out (one listener feeding a
+    /// mutating transform on one branch and a sink directly on the other -- exactly the "one
+    /// listener, two independently-processed downstream chains" shape ADR 0009 exists to make an
+    /// ordinary config, not an edge case), not just asserted in a design doc.
+    #[tokio::test]
+    async fn a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch() {
+        let mut components = Map::new();
+        components.insert(
+            "in".to_string(),
+            Component {
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            },
+        );
+        // `Json` is only a graph-arity placeholder here -- the runtime doesn't check that a
+        // component's `NodeSpec` implementation matches what its `ComponentKind` says, so
+        // `branch_a`'s actual behavior below comes entirely from the `MutatingTransform` NodeSpec.
+        components.insert(
+            "branch_a".to_string(),
+            Component {
+                sources: vec!["in".to_string()],
+                kind: ComponentKind::Json { skip_to_brace: false },
+            },
+        );
+        components.insert(
+            "sink_a".to_string(),
+            Component { sources: vec!["branch_a".to_string()], kind: influxdb_out() },
+        );
+        components.insert(
+            "sink_b".to_string(),
+            Component { sources: vec!["in".to_string()], kind: influxdb_out() },
+        );
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (tx_a, rx_a) = std::sync::mpsc::channel();
+        let (tx_b, rx_b) = std::sync::mpsc::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+        );
+        specs.insert("branch_a".to_string(), NodeSpec::Transform(Box::new(MutatingTransform)));
+        specs
+            .insert("sink_a".to_string(), NodeSpec::Output(Box::new(RecordingOutput { tx: tx_a })));
+        specs
+            .insert("sink_b".to_string(), NodeSpec::Output(Box::new(RecordingOutput { tx: tx_b })));
+
+        tokio::time::timeout(Duration::from_secs(5), run(g, specs))
+            .await
+            .expect("run should return once the only input finishes, not hang forever")
+            .expect("run should complete without error");
+
+        let received_a =
+            rx_a.recv_timeout(Duration::from_secs(1)).expect("sink_a should receive a batch");
+        let received_b =
+            rx_b.recv_timeout(Duration::from_secs(1)).expect("sink_b should receive a batch");
+
+        assert_eq!(
+            received_a.events[0].metrics.len(),
+            2,
+            "branch_a's own mutation should be visible on its own branch"
+        );
+        assert_eq!(
+            received_b.events[0].metrics.len(),
+            1,
+            "branch_a's mutation must not leak onto sink_b's independent copy of the same \
+             upstream event"
+        );
+    }
+
+    fn influxdb_out() -> ComponentKind {
+        ComponentKind::InfluxDbOut {
+            url: "http://localhost:8086".to_string(),
+            org: "org".to_string(),
+            bucket: "bucket".to_string(),
+            token: "TOKEN".to_string(),
+        }
     }
 
     /// A local fake `Transform`, standing in for `logit-transforms::Aggregator` -- this crate

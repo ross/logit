@@ -7,17 +7,19 @@
 //! `process`, taking the trait's default `flush_interval`/`flush`.
 
 use bytes::Bytes;
-use logit_core::{AttrMap, Event, Payload, Resource, Value};
+use logit_core::{AttrMap, Event, Resource, Value};
 use logit_pipeline::Transform;
 use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use std::fmt;
 use std::sync::Arc;
 
-/// Parses `event.attributes` out of a `Payload::Log` message. Non-log events, and log events
-/// whose message isn't a string, pass through untouched -- there's nothing to parse. A message
-/// that fails to parse (or, with `skip_to_brace` off, isn't a JSON object at all) also passes
-/// through untouched, with a diagnostic on stderr (`docs/known-gaps.md`'s `eprintln!` gap) --
-/// dropping telemetry over one malformed line is worse than a no-op.
+/// Parses `event.attributes` out of an event's log message, if it has one. An event with no log,
+/// and a log whose message isn't a string, pass through untouched -- there's nothing to parse.
+/// Any metrics/span already on the event ride through unaffected either way -- only `log.message`
+/// is read and only `attributes` is written. A message that fails to parse (or, with
+/// `skip_to_brace` off, isn't a JSON object at all) also passes through untouched, with a
+/// diagnostic on stderr (`docs/known-gaps.md`'s `eprintln!` gap) -- dropping telemetry over one
+/// malformed line is worse than a no-op.
 pub struct JsonParser {
     /// Skip everything before the first `{` and parse from there, tolerating trailing content
     /// after the object closes. Off by default: the whole line is assumed to be the JSON data,
@@ -33,7 +35,7 @@ impl JsonParser {
 
 impl Transform for JsonParser {
     fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
-        let Payload::Log(log) = &event.payload else { return Some(event) };
+        let Some(log) = &event.log else { return Some(event) };
         let raw = match &log.message {
             Value::Str(b) | Value::Bytes(b) => b,
             _ => return Some(event),
@@ -242,22 +244,19 @@ mod tests {
     use logit_core::{SpanRecord, SpanStatus};
 
     fn log_event(message: &str) -> Event {
-        Event {
-            timestamp: 0,
-            attributes: AttrMap::new(),
-            payload: Payload::Log(LogRecord {
+        Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
                 message: Value::str(message),
                 severity: None,
                 body_format: BodyFormat::Raw,
-            }),
-        }
+            },
+        )
     }
 
     fn message_of(event: &Event) -> &Value {
-        match &event.payload {
-            Payload::Log(log) => &log.message,
-            other => panic!("expected a Log payload, got {other:?}"),
-        }
+        &event.log.as_ref().expect("event should carry a log").message
     }
 
     fn default_resource() -> Arc<Resource> {
@@ -312,16 +311,12 @@ mod tests {
     fn a_metric_event_passes_through_with_attributes_untouched() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = Event {
-            timestamp: 0,
-            attributes: AttrMap::new(),
-            payload: Payload::Metric(MetricRecord {
-                name: intern("m"),
-                kind: MetricKind::Counter(1.0),
-                unit: None,
-            }),
-        };
-        let event = parser.process(&resource, event).expect("metric events pass through");
+        let event = Event::metric(
+            0,
+            AttrMap::new(),
+            MetricRecord { name: intern("m"), kind: MetricKind::Counter(1.0), unit: None },
+        );
+        let event = parser.process(&resource, event).expect("metric-only events pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -329,10 +324,10 @@ mod tests {
     fn a_span_event_passes_through_with_attributes_untouched() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = Event {
-            timestamp: 0,
-            attributes: AttrMap::new(),
-            payload: Payload::Span(SpanRecord {
+        let event = Event::span(
+            0,
+            AttrMap::new(),
+            SpanRecord {
                 trace_id: [0; 16],
                 span_id: [0; 8],
                 parent_span_id: None,
@@ -342,10 +337,29 @@ mod tests {
                 events: Vec::<SpanEvent>::new(),
                 links: Vec::new(),
                 end_timestamp: 0,
-            }),
-        };
-        let event = parser.process(&resource, event).expect("span events pass through");
+            },
+        );
+        let event = parser.process(&resource, event).expect("span-only events pass through");
         assert!(event.attributes.is_empty());
+    }
+
+    /// The genuinely new shape the multi-payload model makes possible: a log event that also
+    /// carries a metric. `json` only ever reads `log.message` and writes `attributes`, so the
+    /// metric should ride through completely untouched while the log half is parsed normally.
+    #[test]
+    fn a_log_event_that_also_carries_a_metric_is_parsed_and_keeps_its_metric() {
+        let mut parser = JsonParser::new(false);
+        let resource = default_resource();
+        let mut event = log_event(r#"{"a":1}"#);
+        event.metrics.push(MetricRecord {
+            name: intern("m"),
+            kind: MetricKind::Counter(1.0),
+            unit: None,
+        });
+        let event = parser.process(&resource, event).expect("mixed events pass through");
+        assert_eq!(attr(&event, "a"), Some(&Value::U64(1)));
+        assert_eq!(event.metrics.len(), 1, "the metric should ride through unaffected");
+        assert!(matches!(event.metrics[0].kind, MetricKind::Counter(v) if v == 1.0));
     }
 
     #[test]
@@ -442,9 +456,9 @@ mod tests {
         let original_message = message_of(&event).clone();
         let event = parser.process(&resource, event).expect("log events pass through");
         assert_eq!(message_of(&event), &original_message);
-        match &event.payload {
-            Payload::Log(log) => assert_eq!(log.body_format, BodyFormat::Raw),
-            other => panic!("expected a Log payload, got {other:?}"),
-        }
+        assert_eq!(
+            event.log.as_ref().expect("event should carry a log").body_format,
+            BodyFormat::Raw
+        );
     }
 }

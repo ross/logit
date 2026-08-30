@@ -164,18 +164,27 @@ fn events_from_table(table: mlua::Table, caller: &str) -> Result<Vec<Event>, Scr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::{interner::intern, AttrMap, MetricKind, MetricRecord, Payload};
+    use logit_core::{interner::intern, AttrMap, LogRecord, MetricKind, MetricRecord};
 
     fn counter_event(name: &str, value: f64) -> Event {
-        Event {
-            timestamp: 1_700_000_000_000_000_000,
-            attributes: AttrMap::new(),
-            payload: Payload::Metric(MetricRecord {
-                name: intern(name),
-                kind: MetricKind::Counter(value),
-                unit: None,
-            }),
-        }
+        Event::metric(
+            1_700_000_000_000_000_000,
+            AttrMap::new(),
+            MetricRecord { name: intern(name), kind: MetricKind::Counter(value), unit: None },
+        )
+    }
+
+    /// An event carrying both a log and a metric -- the shape `kv_metrics` (workstream E)
+    /// produces, and the case the `has_*` accessors exist to make legible without a lossy
+    /// summary label.
+    fn log_and_counter_event(name: &str, value: f64) -> Event {
+        let mut event = counter_event(name, value);
+        event.log = Some(LogRecord {
+            message: logit_core::Value::str("GET /"),
+            severity: None,
+            body_format: logit_core::BodyFormat::Raw,
+        });
+        event
     }
 
     fn worker(source: &str) -> ScriptWorker {
@@ -691,17 +700,79 @@ mod tests {
     }
 
     #[test]
-    fn event_type_is_readable() {
+    fn has_accessors_read_true_and_false_per_payload() {
         let w = worker(
             r#"
             function process(event)
-                event.attributes.kind = event.type
+                event.attributes.has_metrics = event.has_metrics
+                event.attributes.has_log = event.has_log
+                event.attributes.has_span = event.has_span
                 return event
             end
             "#,
         );
         let out = emitted(w.process(counter_event("hits", 1.0)).unwrap());
-        assert_eq!(out.attributes.get("kind").and_then(|v| v.as_str()), Some("metric"));
+        assert!(matches!(out.attributes.get("has_metrics"), Some(logit_core::Value::Bool(true))));
+        assert!(matches!(out.attributes.get("has_log"), Some(logit_core::Value::Bool(false))));
+        assert!(matches!(out.attributes.get("has_span"), Some(logit_core::Value::Bool(false))));
+    }
+
+    /// The headline test for the multi-payload model (docs/adr/0012-multi-payload-events.md): an
+    /// event carrying both a log and a metric reports both as present simultaneously, with no
+    /// lossy single "type" to check instead.
+    #[test]
+    fn has_metrics_and_has_log_are_both_true_on_a_mixed_event() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.both = event.has_log and event.has_metrics
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(log_and_counter_event("hits", 1.0)).unwrap());
+        assert!(matches!(out.attributes.get("both"), Some(logit_core::Value::Bool(true))));
+    }
+
+    #[test]
+    fn assigning_to_a_has_accessor_reports_it_as_read_only() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.has_log = true
+                return event
+            end
+            "#,
+        );
+        let err = match w.process(counter_event("hits", 1.0)) {
+            Err(err) => err,
+            Ok(_) => panic!("expected assigning to event.has_log to be rejected"),
+        };
+        let message = format!("{err}");
+        assert!(message.contains("read-only"), "got: {message}");
+        assert!(
+            !message.contains("no field"),
+            "should report read-only, not a nonexistent field: {message}"
+        );
+    }
+
+    /// `event.type` no longer exists (docs/adr/0012-multi-payload-events.md) -- `__index`'s
+    /// existing catch-all still returns `nil` for any unrecognized key, so a script written
+    /// against the old field silently reads `nil` (falsy) rather than erroring. Worth pinning
+    /// down explicitly: this is a silent behavior change for any pre-existing script, not a hard
+    /// error that would surface it.
+    #[test]
+    fn reading_event_dot_type_is_nil_not_an_error() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.was_nil = (event.type == nil)
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(counter_event("hits", 1.0)).unwrap());
+        assert!(matches!(out.attributes.get("was_nil"), Some(logit_core::Value::Bool(true))));
     }
 
     #[test]
@@ -835,12 +906,14 @@ mod tests {
     }
 
     #[test]
-    fn to_table_exposes_timestamp_attributes_and_type() {
+    fn to_table_exposes_timestamp_attributes_and_has_flags() {
         let w = worker(
             r#"
             function process(event)
                 local t = event:to_table()
-                event.attributes.snapshot_type = t.type
+                event.attributes.snapshot_has_metrics = t.has_metrics
+                event.attributes.snapshot_has_log = t.has_log
+                event.attributes.snapshot_has_span = t.has_span
                 event.attributes.snapshot_ts = t.timestamp -- already a string, see proxy.rs
                 event.attributes.snapshot_attr = t.attributes.existing
                 return event
@@ -851,7 +924,18 @@ mod tests {
         event.attributes.insert("existing", "value");
         let ts = event.timestamp;
         let out = emitted(w.process(event).unwrap());
-        assert_eq!(out.attributes.get("snapshot_type").and_then(|v| v.as_str()), Some("metric"));
+        assert!(matches!(
+            out.attributes.get("snapshot_has_metrics"),
+            Some(logit_core::Value::Bool(true))
+        ));
+        assert!(matches!(
+            out.attributes.get("snapshot_has_log"),
+            Some(logit_core::Value::Bool(false))
+        ));
+        assert!(matches!(
+            out.attributes.get("snapshot_has_span"),
+            Some(logit_core::Value::Bool(false))
+        ));
         assert_eq!(
             out.attributes.get("snapshot_ts").and_then(|v| v.as_str()),
             Some(ts.to_string().as_str())
