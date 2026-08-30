@@ -8,8 +8,8 @@
 //! rough edges (also `docs/known-gaps.md`).
 //!
 //! This is the *only* place a config file should be read and parsed -- `logit run`, `logit
-//! validate`, and `logit graph` all go through [`load`], so `!env` (and its unknown-tag guard,
-//! see below) can't silently stop applying on one of the three.
+//! validate`, and `logit graph` all go through [`load`] or [`load_for_graph`], so `!env` (and its
+//! unknown-tag guard, see below) can't silently stop applying on any of the three.
 
 use anyhow::Context;
 use logit_config::Config;
@@ -49,23 +49,74 @@ fn parse(
     serde_norway::from_value(value).map_err(|err| annotate(err, &substitutions))
 }
 
-/// One `!env` reference that resolved to something other than a string, recorded so a
-/// deserialization failure can point at it -- the most likely cause when a field expecting a
-/// string (a token, a URL) got a `!env`-supplied number or bool instead.
+/// What resolving and deserializing a config for `logit graph` produced.
+pub enum Loaded {
+    /// Deserialized cleanly into a full `Config` -- render normally.
+    Config(Config),
+    /// `Config` deserialization failed, but only because at least one `!env` reference stood in
+    /// for a missing variable with a `<unset:VAR>` placeholder that doesn't type-check against
+    /// whatever shape its field actually wants (a `Duration`, an `f64`, a `bool`, ...) --
+    /// `docs/known-gaps.md`. `logit graph` doesn't need a fully-typed `Config` to render
+    /// topology, so this isn't a hard failure: the caller renders off `value` directly
+    /// (`dot::render_lenient`) instead of printing nothing at all.
+    Lenient { value: Value, error: anyhow::Error },
+}
+
+/// Loads the config at `path` for `logit graph`: always [`MissingEnv::Placeholder`], and instead
+/// of failing outright when a missing variable's placeholder is the only thing standing between
+/// the resolved value and a real `Config`, degrades to [`Loaded::Lenient`] -- see its doc comment.
+/// A deserialization failure with no such placeholder involved (a genuinely malformed config,
+/// unrelated to `!env`) still propagates as a hard error, same as [`load`].
+pub fn load_for_graph(path: &Path) -> anyhow::Result<Loaded> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config file {}", path.display()))?;
+    resolve_for_graph(&raw, &|name| std::env::var(name).ok())
+        .with_context(|| format!("parsing config file {}", path.display()))
+}
+
+/// The rest of [`load_for_graph`], parameterized over the environment lookup for the same reason
+/// [`parse`] is.
+fn resolve_for_graph(
+    raw: &str,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Loaded> {
+    let value: Value = serde_norway::from_str(raw)?;
+    let mut path = Vec::new();
+    let mut substitutions = Vec::new();
+    let value = resolve(value, lookup, MissingEnv::Placeholder, &mut path, &mut substitutions)?;
+    match serde_norway::from_value::<Config>(value.clone()) {
+        Ok(config) => Ok(Loaded::Config(config)),
+        Err(err) if substitutions.iter().any(|s| s.missing) => {
+            Ok(Loaded::Lenient { value, error: annotate(err, &substitutions) })
+        }
+        Err(err) => Err(annotate(err, &substitutions)),
+    }
+}
+
+/// One `!env` reference whose resolved value might not fit the field it landed in: either it
+/// resolved (a set variable) to something other than a string, recorded so a deserialization
+/// failure can point at it -- the most likely cause when a field expecting a string (a token, a
+/// URL) got a `!env`-supplied number or bool instead; or it's a [`MissingEnv::Placeholder`]
+/// substitution standing in for an unset variable (`missing: true`), recorded so
+/// [`resolve_for_graph`] can tell "a real config bug" apart from "this placeholder just doesn't
+/// type-check, which isn't `logit graph`'s problem to fail over" (see [`Loaded::Lenient`]).
 struct Substitution {
     path: String,
     var: String,
     type_name: &'static str,
+    missing: bool,
 }
 
-/// If deserialization failed and any `!env` substitution resolved to a non-string value, append a
-/// note listing them (path, variable name, and resolved *type* -- never the value, since these
-/// are exactly the fields most likely to hold a secret).
+/// If deserialization failed and any `!env` substitution resolved to a non-string value (a *set*
+/// variable, not a missing one -- see [`Substitution::missing`]), append a note listing them
+/// (path, variable name, and resolved *type* -- never the value, since these are exactly the
+/// fields most likely to hold a secret).
 fn annotate(err: serde_norway::Error, substitutions: &[Substitution]) -> anyhow::Error {
-    if substitutions.is_empty() {
+    let culprits: Vec<&Substitution> = substitutions.iter().filter(|s| !s.missing).collect();
+    if culprits.is_empty() {
         return err.into();
     }
-    let note = substitutions
+    let note = culprits
         .iter()
         .map(|s| {
             format!("  {} (from ${}) resolved to a {}, not a string", s.path, s.var, s.type_name)
@@ -203,6 +254,7 @@ fn resolve_env_tag(
                     path: path_string(path),
                     var,
                     type_name: value_kind(&resolved),
+                    missing: false,
                 });
             }
             Ok(resolved)
@@ -216,12 +268,20 @@ fn resolve_env_tag(
                 // `logit graph` (the only caller of `Placeholder`) is documented to render
                 // *something* useful even for an otherwise-broken config -- consistent with the
                 // `eprintln!`-as-diagnostics convention elsewhere (docs/known-gaps.md), not a
-                // hard failure, but not silent either.
+                // hard failure, but not silent either. Recorded as `missing: true` so
+                // `resolve_for_graph` can tell this placeholder apart from a genuine type
+                // mismatch if it goes on to break `Config` deserialization.
                 eprintln!(
                     "warning: {}: !env references environment variable '{var}', which is not \
                      set -- substituting a placeholder",
                     path_string(path)
                 );
+                substitutions.push(Substitution {
+                    path: path_string(path),
+                    var: var.clone(),
+                    type_name: "string",
+                    missing: true,
+                });
                 Ok(Value::String(format!("<unset:{var}>")))
             }
         },
@@ -397,13 +457,45 @@ components:
         assert!(message.contains("integer"), "got: {message}");
     }
 
+    /// Regression test for the exact case a review caught: `logit graph`'s whole point is
+    /// rendering *something* even for a broken config, but a placeholder is always a string, and
+    /// `aggregate.interval` (like any `Duration`/`f64`/`bool` field) doesn't parse from one --
+    /// `Config` deserialization genuinely fails here, so `resolve_for_graph` must degrade to
+    /// `Loaded::Lenient` rather than bailing outright (see `dot::render_lenient`).
     #[test]
-    fn logit_graph_never_errors_on_a_missing_variable() {
-        let raw = "components:\n  out:\n    token: !env NOPE\n";
-        assert!(parse(raw, MissingEnv::Placeholder, &env(&[])).is_err());
-        // Fails here only because the rest of the `Config` shape is missing, not because of the
-        // unset variable -- confirmed directly:
-        let value = resolve_yaml("token: !env NOPE", &env(&[]), MissingEnv::Placeholder).unwrap();
-        assert_eq!(value["token"], Value::String("<unset:NOPE>".to_string()));
+    fn graph_degrades_to_lenient_when_a_missing_variable_breaks_a_non_string_field() {
+        let raw = "components:\n  windowed:\n    type: aggregate\n    sources: [in]\n    \
+                   interval: !env WINDOW\n";
+        match resolve_for_graph(raw, &env(&[])).expect("should degrade, not fail outright") {
+            Loaded::Lenient { value, .. } => {
+                assert_eq!(
+                    value["components"]["windowed"]["interval"],
+                    Value::String("<unset:WINDOW>".to_string())
+                );
+            }
+            Loaded::Config(_) => panic!("a placeholder can't parse as a Duration"),
+        }
+    }
+
+    #[test]
+    fn graph_returns_a_real_config_when_every_variable_is_set() {
+        let raw = "components:\n  windowed:\n    type: aggregate\n    sources: [in]\n    \
+                   interval: !env WINDOW\n";
+        match resolve_for_graph(raw, &env(&[("WINDOW", "10s")])).unwrap() {
+            Loaded::Config(config) => assert_eq!(config.components.len(), 1),
+            Loaded::Lenient { error, .. } => {
+                panic!("expected a clean Config, got Lenient: {error}")
+            }
+        }
+    }
+
+    /// A config bug unrelated to `!env` (no missing-variable placeholder involved at all) must
+    /// still fail outright, exactly like today -- `Loaded::Lenient` exists specifically to route
+    /// around a placeholder-caused failure, not to make `logit graph` swallow every deserialization
+    /// error.
+    #[test]
+    fn graph_still_fails_outright_on_a_bug_unrelated_to_env() {
+        let raw = "components:\n  in:\n    type: nonsense_kind\n";
+        assert!(resolve_for_graph(raw, &env(&[])).is_err());
     }
 }

@@ -75,3 +75,12 @@ already built that have a known, accepted rough edge.
   directly into fields (ADR 0011) rather than referencing them by name, this becomes a real leak
   the moment an unimplemented kind gains one. Fix before that happens: redact or field-list instead
   of a blanket `{:?}`.
+- **`logit graph`'s fallback rendering has two known-coarse edges** (`Loaded::Lenient`,
+  `dot::render_lenient`, `crates/logit-cli/src/config.rs` and `dot.rs`) — reached when an `!env`
+  placeholder for a missing variable doesn't type-check against its field (a `Duration`, an `f64`,
+  a `bool`; ADR 0011). First, a component whose kind fails to individually resolve renders with a
+  generic dashed box rather than its real listener/transform/sink shape -- topology (the node, its
+  edges) is still correct, only the *style* is approximate. Second, semantic validation (cycles,
+  arity, unimplemented kinds) is skipped entirely in this mode, since it needs a real `Config` that
+  doesn't exist here -- a config with both a missing-variable placeholder problem and an unrelated
+  cycle would report only the former.

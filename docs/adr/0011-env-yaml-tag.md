@@ -52,7 +52,13 @@ service, and it should catch a missing secret exactly the way `run` would. `logi
 and warns on stderr instead: it renders a config's *shape*, never its values, and its documented
 job is to render *something* useful even for a config that's otherwise broken — reading field
 values was never part of that contract, so this costs it nothing, and a missing variable alone
-never makes it exit non-zero.
+never makes it exit non-zero. That placeholder is always a string, though, so it can still fail to
+type-check against a non-string field the same way a *set* variable's non-string value can (a
+`Duration`, an `f64`, a `bool`) — `logit graph` degrades further in exactly that case
+(`Loaded::Lenient`, `crates/logit-cli/src/config.rs`): it renders topology straight off the
+resolved YAML value instead of a validated `Config`, styling only the components whose kind
+happens to still resolve; see `docs/known-gaps.md` for what that fallback doesn't get exactly
+right (component style, semantic validation).
 
 **Any tag other than `!env` is a hard error.** `serde_norway` silently drops an unrecognized tag
 on a field that isn't itself an enum, so a typo'd `!emv INFLUXDB_TOKEN` would otherwise

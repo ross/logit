@@ -56,17 +56,31 @@ fn main() -> anyhow::Result<()> {
         Command::Graph { path } => {
             // Lenient: `logit graph` renders a config's shape, not its values, and its whole
             // point is rendering *something* useful even for an otherwise-broken config -- an
-            // unset `!env` variable substitutes a placeholder (with a warning below) rather than
-            // failing outright.
-            let config = config::load(&path, config::MissingEnv::Placeholder)?;
-            // Print the DOT first, always -- then report validation problems on stderr without
-            // suppressing it. A cyclic or otherwise-broken config is exactly what this command is
-            // most useful for: a cycle is far easier to see rendered than parsed out of an error
-            // message naming two component ids (docs/design/pipeline-graph.md).
-            println!("{}", dot::render(&config));
-            if let Err(err) = pipeline::validate_semantics(config) {
-                eprintln!("warning: {err}");
-                std::process::exit(1);
+            // unset `!env` variable substitutes a placeholder (with a warning from `config::load`)
+            // rather than failing outright. That placeholder is always a string, though, so it can
+            // still fail to type-check against a non-string field (a `Duration`, an `f64`, ...) --
+            // `config::load_for_graph` degrades to `Loaded::Lenient` rather than erroring out in
+            // exactly that case, so DOT still prints even then (docs/known-gaps.md).
+            match config::load_for_graph(&path)? {
+                config::Loaded::Config(config) => {
+                    // Print the DOT first, always -- then report validation problems on stderr
+                    // without suppressing it. A cyclic or otherwise-broken config is exactly what
+                    // this command is most useful for: a cycle is far easier to see rendered than
+                    // parsed out of an error message naming two component ids
+                    // (docs/design/pipeline-graph.md).
+                    println!("{}", dot::render(&config));
+                    if let Err(err) = pipeline::validate_semantics(config) {
+                        eprintln!("warning: {err}");
+                        std::process::exit(1);
+                    }
+                }
+                config::Loaded::Lenient { value, error } => {
+                    println!("{}", dot::render_lenient(&value));
+                    eprintln!(
+                        "warning: config did not fully resolve ({error:#}) -- rendering topology \
+                         only; semantic validation skipped"
+                    );
+                }
             }
             Ok(())
         }
