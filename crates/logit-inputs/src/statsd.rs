@@ -19,11 +19,11 @@ use logit_core::{
     interner::intern, AttrMap, DdSketch, Event, EventBatch, MetricKind, MetricRecord, Payload,
     Resource,
 };
+use logit_pipeline::Fanout;
 use logit_proto::{CodecError, Decoder};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::Sender;
 
 pub struct StatsdInput {
     pub bind: String,
@@ -31,7 +31,7 @@ pub struct StatsdInput {
 
 #[async_trait::async_trait]
 impl Input for StatsdInput {
-    async fn run(&mut self, sink: Sender<EventBatch>) -> anyhow::Result<()> {
+    async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         let socket = UdpSocket::bind(&self.bind).await?;
         let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
         // The largest possible UDP payload (65535 minus the 8-byte UDP header).
@@ -41,10 +41,10 @@ impl Input for StatsdInput {
             let bytes = Bytes::copy_from_slice(&buf[..n]);
             match decoder.decode(bytes) {
                 Ok(batch) if !batch.events.is_empty() => {
-                    if sink.send(batch).await.is_err() {
-                        // Receiver gone: the pipeline is shutting down, not an input error.
-                        return Ok(());
-                    }
+                    // `Fanout::send` has no per-consumer failure signal to react to -- a closed
+                    // consumer is silently skipped (`docs/design/pipeline-graph.md`'s backpressure
+                    // section notes this as a named open question, not solved here).
+                    sink.send(batch).await;
                 }
                 Ok(_) => {} // empty datagram
                 Err(err) => {

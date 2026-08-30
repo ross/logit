@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
+mod dot;
 mod pipeline;
 
 #[derive(Parser)]
@@ -18,6 +19,8 @@ enum Command {
     Validate { path: std::path::PathBuf },
     /// Run logit with the given config file.
     Run { path: std::path::PathBuf },
+    /// Print the config's resolved component graph as graphviz DOT (docs/design/pipeline-graph.md).
+    Graph { path: std::path::PathBuf },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -31,21 +34,35 @@ fn main() -> anyhow::Result<()> {
         Command::Validate { path } => {
             let raw = std::fs::read_to_string(&path)?;
             let config: logit_config::Config = serde_norway::from_str(&raw)?;
-            // Same semantic checks `logit run` makes before spawning anything (empty
-            // pipelines/inputs/outputs, unknown or double-claimed names, unimplemented kinds) --
-            // shared so `validate` can't silently pass a config `run` would reject.
-            pipeline::validate_semantics(&config)?;
+            // Same semantic checks `logit run` makes before spawning anything (empty component
+            // graph, unknown/self-referencing sources, cycles, arity violations, unimplemented
+            // kinds) -- shared so `validate` can't silently pass a config `run` would reject.
+            pipeline::validate_semantics(config)?;
             println!("{} is valid", path.display());
             Ok(())
         }
         Command::Run { path } => {
-            // Schema/Validate stay synchronous above -- only Run needs an async runtime, so only
-            // Run pays for building one.
+            // Schema/Validate/Graph stay synchronous above -- only Run needs an async runtime, so
+            // only Run pays for building one.
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .context("building the tokio runtime")?;
             runtime.block_on(pipeline::run_pipelines(path))
+        }
+        Command::Graph { path } => {
+            let raw = std::fs::read_to_string(&path)?;
+            let config: logit_config::Config = serde_norway::from_str(&raw)?;
+            // Print the DOT first, always -- then report validation problems on stderr without
+            // suppressing it. A cyclic or otherwise-broken config is exactly what this command is
+            // most useful for: a cycle is far easier to see rendered than parsed out of an error
+            // message naming two component ids (docs/design/pipeline-graph.md).
+            println!("{}", dot::render(&config));
+            if let Err(err) = pipeline::validate_semantics(config) {
+                eprintln!("warning: {err}");
+                std::process::exit(1);
+            }
+            Ok(())
         }
     }
 }

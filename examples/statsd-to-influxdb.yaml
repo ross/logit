@@ -1,30 +1,35 @@
 # A minimal example matching the v0.1 vertical slice target (docs/OVERVIEW.md): statsd/DogStatsD
 # in, a 10s aggregation window, one enrichment script, InfluxDB 2.x out. Matches the `influxdb`
-# service seeded by compose.yaml for local testing. `aggregate` is the only implemented builtin
-# transform so far (docs/adr/0008-aggregation-window-semantics.md) -- `logit run` rejects any other
-# `builtin:` stage with a clear error.
-inputs:
+# service seeded by compose.yaml for local testing.
+#
+# Config is a flat graph of components (docs/design/pipeline-graph.md,
+# docs/adr/0009-component-graph-configuration.md): each names its own `sources`, rather than
+# sitting in a fixed inputs/transforms/outputs pipeline. `aggregate` is the only implemented
+# built-in transform so far (docs/adr/0008-aggregation-window-semantics.md) -- `logit run` rejects
+# a config referencing any other unimplemented kind with a clear error.
+components:
   statsd_in:
-    type: statsd
+    type: statsd_in
     bind: 0.0.0.0:8125
 
-outputs:
+  windowed:
+    type: aggregate
+    sources: [statsd_in]
+    interval: 10s
+
+  enrich:
+    type: lua
+    sources: [windowed]
+    script: |
+      function process(event)
+        event.attributes.env = event.attributes.env or "dev"
+        return event
+      end
+
   influx_out:
-    type: influx_db
+    type: influxdb_out
+    sources: [enrich]
     url: http://influxdb:8086
     org: logit
     bucket: metrics
     token_env: INFLUXDB_TOKEN
-
-pipelines:
-  app_metrics:
-    inputs: [statsd_in]
-    transforms:
-      - builtin: aggregate
-        interval: 10s
-      - lua: |
-          function process(event)
-            event.attributes.env = event.attributes.env or "dev"
-            return event
-          end
-    outputs: [influx_out]

@@ -1,16 +1,16 @@
 [package]
-name = "logit-inputs"
+name = "logit-pipeline"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Per-protocol listeners implementing logit-pipeline's Input trait (statsd first)."
+description = "The component graph: Input/Output/Transform traits, Fanout, graph resolution, and the node runtime."
 
 [dependencies]
 logit-core.workspace = true
-logit-pipeline.workspace = true
-logit-proto.workspace = true
+logit-config.workspace = true
+logit-script.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
-bytes.workspace = true
+thiserror.workspace = true

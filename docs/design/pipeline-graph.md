@@ -120,25 +120,30 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 
 1. At least one component.
 2. Every id appearing in any `sources` list resolves to a defined component.
-3. No self-reference (a component listing itself as a source) — a special case of 4, but worth its
+3. No self-reference (a component listing itself as a source) — a special case of 5, but worth its
    own message since it's the most common typo shape.
-4. **No cycles.** DFS with a recursion-stack set, or Kahn's algorithm falling back to "nodes remain
+4. No duplicate source within one component's `sources` list — a repeated id would otherwise push
+   the same consumer onto that source's outbound edge list twice, giving its `Fanout` two live
+   `Sender` clones into the same inbox and silently delivering every batch twice (doubling
+   telemetry, and doubling every count through an `aggregate` component) rather than being
+   rejected as the config typo it almost certainly is.
+5. **No cycles.** DFS with a recursion-stack set, or Kahn's algorithm falling back to "nodes remain
    with no zero-indegree candidate." This is the one genuinely new must-have: a cycle plus bounded
    `mpsc` channels is a deadlock, not a slow pipeline, and today's linear-pipeline shape made cycles
    structurally impossible — the graph model makes them a real config mistake to guard against.
-5. Arity per kind, per the table above — a listener with `sources`, a sink with none, a sink named as
+6. Arity per kind, per the table above — a listener with `sources`, a sink with none, a sink named as
    another component's source.
-6. Every non-sink component has ≥1 consumer — replaces today's "pipeline has no outputs" check and
+7. Every non-sink component has ≥1 consumer — replaces today's "pipeline has no outputs" check and
    catches the same silent-black-hole failure (a transform whose only consumer was renamed or
    deleted, still accumulating state or running Lua for nothing).
-7. Kind is actually implemented — the direct generalization of `require_implemented_input`/
+8. Kind is actually implemented — the direct generalization of `require_implemented_input`/
    `require_implemented_output`/`require_implemented_transform` into one check over `ComponentKind`.
-8. No zero-length `interval` on any kind that has one (`lua`, `lua_file`, `aggregate`) — unchanged
+9. No zero-length `interval` on any kind that has one (`lua`, `lua_file`, `aggregate`) — unchanged
    from `require_nonzero_interval` today.
 
-**Sink reachability from a listener needs no separate rule.** It's implied by 2 + 4 + 6: every
+**Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that
-chain is required (by 6) to have a consumer, so the chain can only terminate at a sink.
+chain is required (by 7) to have a consumer, so the chain can only terminate at a sink.
 
 **What disappears:** "input/output claimed by more than one pipeline is not yet supported" — today's
 `validate_semantics` rejects this outright because the runtime had no way to express sharing. Under
@@ -241,12 +246,19 @@ is a plausible future answer; out of scope for the initial graph implementation.
 answer to "what does this config actually do," which gets harder to eyeball by reading YAML once
 config is a graph rather than a list of linear pipelines.
 
-- Requires only that every `sources` id resolves (validation rule 2) — an edge to an undefined
-  component can't be drawn at all. Beyond that, it always prints *something*.
-- Runs the remaining validation rules (3–8) and reports any failures to stderr with a non-zero exit
-  — without suppressing the DOT output. This is deliberate: `graph` is most useful on exactly the
-  configs that fail validation, since a cycle is far easier to see rendered than to parse out of an
-  error message naming two component ids.
+- Renders unconditionally, straight off the raw `Config` rather than a resolved `Graph` — it needs
+  only that a `sources` id can be written as an edge target, which is true even when that id names
+  no defined component: graphviz auto-creates a bare node for an edge whose target was never
+  otherwise declared, so an unresolved source (rule 2) still renders as a visibly dangling edge
+  rather than blocking output. (An earlier version of this section reasoned "an edge to an
+  undefined component can't be drawn at all" and required rule 2 to pass first — that premise was
+  simply wrong once actually tried; corrected here rather than left as a stated constraint the
+  implementation quietly didn't follow.)
+- Runs the full validation (rules 2–9) after rendering and reports any failures to stderr with a
+  non-zero exit — without suppressing the DOT output. This is deliberate: `graph` is most useful on
+  exactly the configs that fail validation, since a cycle — or a typo'd source, now visibly
+  dangling — is far easier to see rendered than to parse out of an error message naming two
+  component ids.
 - Styles nodes by role (listener / transform / sink) so the shape of the data flow — where it
   enters, where it forks, where it lands — reads at a glance without cross-referencing the arity
   table.

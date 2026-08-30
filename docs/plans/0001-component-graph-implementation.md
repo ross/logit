@@ -51,18 +51,20 @@ Lives in `logit-pipeline`. No channels, no threads, no tokio — a pure function
 mirroring how `apply_transforms` was kept pure today specifically for unit-testability.
 
 - Build the inverted-edges map (`sources` → outbound consumer lists).
-- Implement the eight validation rules from the design doc in order, each with its own clear error
+- Implement the nine validation rules from the design doc in order, each with its own clear error
   message naming the offending component id(s).
 - Topological sort (reverse order for build sequencing).
 - This module is what `logit run`, `logit validate`, and `logit graph` all sit on top of — write it
   and its tests before touching any of the three CLI commands.
 
 **Test list** (port relevant cases from today's `validate_semantics` tests, add the new ones):
-unknown source reference, self-reference, two-node cycle, longer cycle, listener declaring sources,
-sink named as another component's source, transform/listener with no consumers, sink shared by two
-branches (must now be *accepted* — today's code rejects this; confirming it's accepted is the
-headline regression test for this whole change), diamond fan-out/fan-in resolves correctly,
-unimplemented-kind rejection, zero-interval rejection on each kind that has `interval`.
+unknown source reference, self-reference, duplicate source within one component's `sources` list
+(would otherwise double-deliver every batch from that source, not just a redundant edge), two-node
+cycle, longer cycle, listener declaring sources, sink named as another component's source,
+transform/listener with no consumers, sink shared by two branches (must now be *accepted* —
+today's code rejects this; confirming it's accepted is the headline regression test for this whole
+change), diamond fan-out/fan-in resolves correctly, unimplemented-kind rejection, zero-interval
+rejection on each kind that has `interval`.
 
 ## 4. Node runtime
 
@@ -95,9 +97,11 @@ In `logit-pipeline`. Per-kind node loops (design doc's "Runtime model"):
 
 - `Command::Graph { path }` in `crates/logit-cli/src/main.rs`, alongside `Schema`/`Validate`/`Run`;
   stays synchronous, no tokio runtime built.
-- DOT emitter over `graph::resolve`'s output: one node per component styled by role (listener/
-  transform/sink), one edge per `sources` entry.
-- Runs full validation (rules 3–8) after emitting DOT; reports failures to stderr, exits non-zero,
+- DOT emitter over the raw `Config`, not a resolved `Graph`: one node per component styled by role
+  (listener/transform/sink), one edge per `sources` entry — graphviz auto-creates a bare node for
+  an edge whose target isn't otherwise declared, so an unresolved source still renders as a
+  visibly dangling edge instead of blocking output.
+- Runs full validation (rules 2–9) after emitting DOT; reports failures to stderr, exits non-zero,
   **does not suppress the DOT output** — this is the point of the command on a broken config.
 - Tests: DOT output for a diamond-shaped config (one listener, two filters, shared sink) is
   well-formed and includes every expected node/edge; a cyclic config still emits complete DOT while

@@ -29,27 +29,29 @@ already built that have a known, accepted rough edge.
   any leading sign is ambiguous with a plain negative number at the wire level regardless. Relative
   gauges are explicitly rejected with a clear decode error rather than silently miscoded
   (`crates/logit-inputs/src/statsd.rs`).
-- **`eprintln!` instead of a real diagnostics facility** — statsd input, InfluxDB output, pipeline
-  orchestration's per-event script errors and per-batch output errors, and the aggregator's
-  kind-conflict reports. Cosmetic while there's one input/output/pipeline; matters once there's more
-  than one running at once and stderr becomes an unattributable mess.
+- **`eprintln!` instead of a real diagnostics facility** — statsd input, InfluxDB output, the node
+  runtime's per-event script errors and per-batch output errors, and the aggregator's kind-conflict
+  reports. Cosmetic while there's one of each component; matters once there's more than one running
+  at once and stderr becomes an unattributable mess.
 - **No graceful shutdown for `logit run`** — Ctrl-C falls through to the OS default (immediate
-  termination); no installed handler. Partially softened by the aggregate/flush work: a pipeline
-  worker now flushes every flush-bearing stage once when its inbound channel closes *normally*
-  (`crates/logit-cli/src/pipeline.rs`), but nothing today closes it that way on its own (every input
-  loops forever), so in practice this doesn't yet cover the Ctrl-C case — the real gap is
-  specifically "no installed signal handler," not "no drain logic at all."
-- **A named input/output referenced by more than one pipeline is a config-time error** — real
-  fan-out/fan-in support (one input feeding multiple pipelines, or vice versa) is a legitimate future
-  need, not yet built (`crates/logit-cli/src/pipeline.rs`'s `validate_semantics`). The proposed
-  component-graph config rework ([ADR 0009](adr/0009-component-graph-configuration.md),
-  [pipeline-graph.md](design/pipeline-graph.md)) is designed to remove this restriction natively —
-  arbitrary fan-out/fan-in is the normal case in that model, not a special case to add later.
-- **A Lua stage's `flush()` has no resource of its own at a timer tick** — unlike an `aggregate`
-  stage, which tracks its own per-resource windows, a Lua stage's flushed events are stamped with
-  whichever resource the worker most recently saw on a real batch (`crates/logit-cli/src/pipeline.rs`,
-  see [ADR 0008](adr/0008-aggregation-window-semantics.md)). Fine for every pipeline today (one input,
-  one resource); would need a real answer once a pipeline has more than one.
+  termination); no installed handler. Partially softened by the aggregate/flush work: a node now
+  flushes once when its inbound channel closes *normally* (`crates/logit-pipeline/src/runtime.rs`),
+  but nothing today closes it that way on its own (every listener loops forever), so in practice
+  this doesn't yet cover the Ctrl-C case — the real gap is specifically "no installed signal
+  handler," not "no drain logic at all."
+- **Fan-out/fan-in is unbuffered/uncoordinated** — the component graph (ADR 0009,
+  [pipeline-graph.md](design/pipeline-graph.md)) makes arbitrary fan-out/fan-in the normal case (a
+  sink shared by two branches, one listener feeding several filters), but a stalled sink backs up
+  every branch sharing an upstream with it, not just its own, and each extra consumer of a node
+  costs a full `EventBatch` clone. `Arc<EventBatch>` with copy-on-write is the identified future
+  fix; a per-edge `on_full: block | drop` policy for the backpressure question is an open one, not
+  yet designed.
+- **A Lua component's `flush()` has no resource of its own at a timer tick** — unlike an `aggregate`
+  component, which tracks its own per-resource windows, a Lua component's flushed events are
+  stamped with whichever resource it most recently saw on a real batch
+  (`crates/logit-pipeline/src/runtime.rs`, see [ADR 0008](adr/0008-aggregation-window-semantics.md)).
+  Fine for every config today (one listener, one resource); would need a real answer once a
+  component has more than one upstream resource.
 - **A criterion benchmark of the event proxy against plain table conversion is still outstanding**
   ([lua-api.md](design/lua-api.md)) — the design commits to the proxy on reasoning (avoiding a full
   table conversion per stage per event), not yet confirmed with numbers.
