@@ -46,6 +46,24 @@ pub struct Component {
     pub kind: ComponentKind,
 }
 
+/// One `kv_metrics` entry: a metric `name`, an optional source `field`, and an optional `unit`.
+/// See `ComponentKind::KvMetrics` and `docs/adr/0014-kv-metrics-semantics.md`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct MetricSpec {
+    /// The metric's measurement name. An empty name is rejected at graph-validation time --
+    /// `influxdb_out` requires a non-empty measurement to encode a metric line.
+    pub name: String,
+    /// The attribute to read this metric's value from. Omitted means "+1 per event" for a
+    /// counter or "set to 1" for a gauge; a distribution entry with no `field` is rejected at
+    /// graph-validation time (a distribution of nothing is meaningless). Names an attribute
+    /// literally -- `field: http.status` means the attribute literally named `http.status`, never
+    /// a `status` key nested under `http` in a `Value::Map`; nested fields are not addressable.
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub unit: Option<String>,
+}
+
 /// A component's kind, tagged by `type` in config. Every protocol kind is suffixed `_in`/`_out`
 /// uniformly (`docs/design/pipeline-graph.md`'s naming rationale) so a listener and a sink for the
 /// same protocol never collide on one tag value; transform kinds take no suffix, since there's
@@ -109,6 +127,31 @@ pub enum ComponentKind {
         #[serde(default)]
         skip_to_brace: bool,
     },
+    /// Turns attributes already on an event (typically merged there by `json`) into metrics on
+    /// that same event. See `docs/adr/0014-kv-metrics-semantics.md` for the skip rules, the
+    /// numeric coercion rules, and why there is deliberately no `tags:` field here -- tag
+    /// selection is `Keep`'s job, since every metrics sink already reads `event.attributes`.
+    KvMetrics {
+        #[serde(default)]
+        counters: Vec<MetricSpec>,
+        #[serde(default)]
+        gauges: Vec<MetricSpec>,
+        #[serde(default)]
+        distributions: Vec<MetricSpec>,
+    },
+    /// Retains only the named attributes, dropping the rest -- an allowlist, not just a denylist:
+    /// a new field appearing in a log format later must not be able to silently become a new
+    /// tag dimension on a metrics sink. Place this *before* `aggregate` in a pipeline --
+    /// `aggregate`'s `SeriesKey` includes the whole of `event.attributes`, so pruning first is
+    /// what keeps series cardinality and per-window memory bounded. An empty `fields` list is
+    /// legal and means "drop every attribute."
+    Keep {
+        fields: Vec<String>,
+    },
+    /// Drops the named attributes, keeping the rest.
+    Remove {
+        fields: Vec<String>,
+    },
     // The rest of the built-in native transforms -- not implemented yet (`logit-transforms`),
     // carried over as unimplemented `ComponentKind` variants so config referencing one gets a
     // clear "not implemented yet" at validation time rather than a deserialization error.
@@ -121,9 +164,6 @@ pub enum ComponentKind {
     Rename {
         from: String,
         to: String,
-    },
-    Remove {
-        field: String,
     },
     Filter {
         r#where: String,
@@ -307,6 +347,72 @@ mod tests {
         match component.kind {
             ComponentKind::Json { skip_to_brace } => assert!(skip_to_brace),
             other => panic!("expected Json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_metrics_component_round_trips_through_deserialization() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "kv_metrics", "sources": ["in"],
+                "counters": [{"name": "nginx.requests"},
+                             {"name": "nginx.bytes_sent", "field": "body_bytes_sent"}],
+                "distributions": [{"name": "nginx.request_time", "field": "request_time",
+                                    "unit": "s"}]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::KvMetrics { counters, gauges, distributions } => {
+                assert_eq!(counters.len(), 2);
+                assert_eq!(counters[0].name, "nginx.requests");
+                assert_eq!(counters[0].field, None);
+                assert_eq!(counters[1].field, Some("body_bytes_sent".to_string()));
+                assert!(gauges.is_empty());
+                assert_eq!(distributions.len(), 1);
+                assert_eq!(distributions[0].unit, Some("s".to_string()));
+            }
+            other => panic!("expected KvMetrics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_metrics_component_defaults_every_list_to_empty() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "kv_metrics", "sources": ["in"]}"#).unwrap();
+        match component.kind {
+            ComponentKind::KvMetrics { counters, gauges, distributions } => {
+                assert!(counters.is_empty());
+                assert!(gauges.is_empty());
+                assert!(distributions.is_empty());
+            }
+            other => panic!("expected KvMetrics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keep_component_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "keep", "sources": ["in"], "fields": ["status", "method"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Keep { fields } => {
+                assert_eq!(fields, vec!["status".to_string(), "method".to_string()]);
+            }
+            other => panic!("expected Keep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_component_deserializes_with_multiple_fields() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "remove", "sources": ["in"], "fields": ["client_ip", "user_agent"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Remove { fields } => {
+                assert_eq!(fields, vec!["client_ip".to_string(), "user_agent".to_string()]);
+            }
+            other => panic!("expected Remove, got {other:?}"),
         }
     }
 

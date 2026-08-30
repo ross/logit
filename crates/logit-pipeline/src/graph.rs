@@ -13,6 +13,14 @@
 //! 7. Every non-sink component has at least one consumer.
 //! 8. Kind is implemented.
 //! 9. No zero-length `interval` on a kind that has one.
+//! 10. A `kv_metrics` with counters, gauges, and distributions all empty is rejected -- it can
+//!     only ever be a no-op, the same silent-black-hole failure rule 7 exists to catch.
+//! 11. A `kv_metrics` distribution entry with no `field` is rejected -- a distribution of nothing
+//!     is meaningless (`docs/adr/0014-kv-metrics-semantics.md`).
+//! 12. A `kv_metrics` counter, gauge, or distribution entry with an empty `name` is rejected -- the
+//!     implemented `influxdb_out` sink can't encode a metric with no measurement name (Influx line
+//!     protocol requires one), so this must be caught here rather than surfacing as a runtime sink
+//!     failure the first time such an event arrives.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -46,12 +54,14 @@ pub fn role(kind: &ComponentKind) -> Role {
         | LuaFile { .. }
         | Aggregate { .. }
         | Json { .. }
+        | KvMetrics { .. }
+        | Keep { .. }
+        | Remove { .. }
         | Logfmt
         | Kv
         | Regex { .. }
         | Csv
         | Rename { .. }
-        | Remove { .. }
         | Filter { .. }
         | Sample { .. }
         | Throttle { .. }
@@ -71,6 +81,9 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::LuaFile { .. }
             | ComponentKind::Aggregate { .. }
             | ComponentKind::Json { .. }
+            | ComponentKind::KvMetrics { .. }
+            | ComponentKind::Keep { .. }
+            | ComponentKind::Remove { .. }
             | ComponentKind::InfluxDbOut { .. }
     )
 }
@@ -198,6 +211,32 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rules 10 + 11: `kv_metrics`-specific validation. Neither is a generic arity/interval check,
+    // so each gets its own loop rather than folding into rules 6/9 above.
+    for (id, component) in &components {
+        if let ComponentKind::KvMetrics { counters, gauges, distributions } = &component.kind {
+            if counters.is_empty() && gauges.is_empty() && distributions.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a kv_metrics with no counters, gauges, or distributions \
+                     configured can only ever be a no-op"
+                );
+            }
+            if distributions.iter().any(|m| m.field.is_none()) {
+                anyhow::bail!(
+                    "component '{id}': a kv_metrics distribution entry requires a 'field' -- a \
+                     distribution of nothing is meaningless"
+                );
+            }
+            if counters.iter().chain(gauges).chain(distributions).any(|m| m.name.is_empty()) {
+                anyhow::bail!(
+                    "component '{id}': a kv_metrics counter, gauge, or distribution entry \
+                     requires a non-empty 'name' -- influxdb_out cannot encode a metric with no \
+                     measurement name"
+                );
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         let Component { sources, kind } = component;
@@ -280,6 +319,14 @@ mod tests {
 
     fn json() -> ComponentKind {
         ComponentKind::Json { skip_to_brace: false }
+    }
+
+    fn metric_spec(name: &str, field: Option<&str>) -> logit_config::MetricSpec {
+        logit_config::MetricSpec {
+            name: name.to_string(),
+            field: field.map(String::from),
+            unit: None,
+        }
     }
 
     fn sink() -> ComponentKind {
@@ -433,6 +480,132 @@ mod tests {
         .expect("should resolve");
         assert_eq!(graph.components["in"].consumers.len(), 2);
         assert_eq!(graph.components["out"].sources.len(), 2);
+    }
+
+    #[test]
+    fn a_kv_metrics_with_no_lists_configured_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "derive",
+                vec!["in"],
+                ComponentKind::KvMetrics {
+                    counters: vec![],
+                    gauges: vec![],
+                    distributions: vec![],
+                },
+            ),
+            ("out", vec!["derive"], sink()),
+        ]));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_kv_metrics_distribution_with_no_field_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "derive",
+                vec!["in"],
+                ComponentKind::KvMetrics {
+                    counters: vec![],
+                    gauges: vec![],
+                    distributions: vec![metric_spec("nginx.request_time", None)],
+                },
+            ),
+            ("out", vec!["derive"], sink()),
+        ]));
+        assert!(err.contains("distribution entry requires a 'field'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_kv_metrics_counter_with_an_empty_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "derive",
+                vec!["in"],
+                ComponentKind::KvMetrics {
+                    counters: vec![metric_spec("", None)],
+                    gauges: vec![],
+                    distributions: vec![],
+                },
+            ),
+            ("out", vec!["derive"], sink()),
+        ]));
+        assert!(err.contains("non-empty 'name'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_kv_metrics_gauge_with_an_empty_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "derive",
+                vec!["in"],
+                ComponentKind::KvMetrics {
+                    counters: vec![],
+                    gauges: vec![metric_spec("", Some("status"))],
+                    distributions: vec![],
+                },
+            ),
+            ("out", vec!["derive"], sink()),
+        ]));
+        assert!(err.contains("non-empty 'name'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_kv_metrics_distribution_with_an_empty_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "derive",
+                vec!["in"],
+                ComponentKind::KvMetrics {
+                    counters: vec![],
+                    gauges: vec![],
+                    distributions: vec![metric_spec("", Some("request_time"))],
+                },
+            ),
+            ("out", vec!["derive"], sink()),
+        ]));
+        assert!(err.contains("non-empty 'name'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_kv_metrics_with_only_a_counter_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "derive",
+                vec!["in"],
+                ComponentKind::KvMetrics {
+                    counters: vec![metric_spec("nginx.requests", None)],
+                    gauges: vec![],
+                    distributions: vec![],
+                },
+            ),
+            ("out", vec!["derive"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["derive"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn keep_and_remove_resolve_as_transforms() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("keep", vec!["in"], ComponentKind::Keep { fields: vec!["status".to_string()] }),
+            (
+                "remove",
+                vec!["keep"],
+                ComponentKind::Remove { fields: vec!["client_ip".to_string()] },
+            ),
+            ("out", vec!["remove"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["keep"].role(), Role::Transform);
+        assert_eq!(graph.components["remove"].role(), Role::Transform);
     }
 
     #[test]

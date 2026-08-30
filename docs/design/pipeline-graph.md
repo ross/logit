@@ -71,7 +71,15 @@ pub enum ComponentKind {
     LuaFile { lua_file: String, interval: Option<Duration> },
     Aggregate { interval: Duration },
     Json { skip_to_brace: bool },
-    // logfmt, kv, regex, csv, rename, remove, filter, sample, throttle, dedup —
+    // Turns attributes into metrics on the same event (docs/adr/0014-kv-metrics-semantics.md).
+    // Deliberately no `tags:` field -- tag selection is `Keep`'s job.
+    KvMetrics { counters: Vec<MetricSpec>, gauges: Vec<MetricSpec>, distributions: Vec<MetricSpec> },
+    // An allowlist: retains only the named attributes. Place before `aggregate` -- its
+    // `SeriesKey` includes the whole attribute set, so pruning first bounds cardinality.
+    Keep { fields: Vec<String> },
+    // A denylist: drops the named attributes, keeping the rest.
+    Remove { fields: Vec<String> },
+    // logfmt, kv, regex, csv, rename, filter, sample, throttle, dedup —
     // as each lands in logit-transforms, same shape: a `ComponentKind` variant, no `sources`
     // opinion of its own (that lives on `Component`, uniformly).
 
@@ -166,6 +174,13 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
    `require_implemented_output`/`require_implemented_transform` into one check over `ComponentKind`.
 9. No zero-length `interval` on any kind that has one (`lua`, `lua_file`, `aggregate`) — unchanged
    from `require_nonzero_interval` today.
+10. A `kv_metrics` with `counters`, `gauges`, and `distributions` all empty is rejected — it can
+    only ever be a no-op, the same silent-black-hole failure rule 7 exists to catch.
+11. A `kv_metrics` distribution entry with no `field` is rejected — a distribution of nothing is
+    meaningless (`docs/adr/0014-kv-metrics-semantics.md`).
+12. A `kv_metrics` counter, gauge, or distribution entry with an empty `name` is rejected — the
+    implemented `influxdb_out` sink can't encode a metric with no measurement name
+    (`docs/adr/0014-kv-metrics-semantics.md`).
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that
