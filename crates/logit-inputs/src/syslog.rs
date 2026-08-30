@@ -5,7 +5,13 @@
 //! integration nothing; see `docs/known-gaps.md`.
 //!
 //! **Dialect disambiguation** happens per message, right after `<PRI>`: a leading version digit
-//! followed by a space (`1 `) means RFC 5424; anything else is parsed as RFC 3164.
+//! followed by a space (`1 `) means RFC 5424; anything else is parsed as RFC 3164. This sniff is
+//! necessarily a guess -- RFC 5424's VERSION grammar allows any of `1`-`999`, so a tag-less RFC
+//! 3164 line whose MSG happens to start with a digit and a space (`4 requests failed`) also
+//! matches it. A failed RFC 5424 parse with version `1` (the only version any real sender emits)
+//! is treated as genuinely malformed RFC 5424 and rejected as such; a failed parse with any other
+//! digit is treated as a false-positive sniff and falls back to reparsing the whole line as RFC
+//! 3164 (whose grammar is permissive enough to never itself fail) rather than dropping it.
 //!
 //! **Timestamp semantics.** Every emitted [`Event`]'s `timestamp` is *receipt* time
 //! (`now_nanos()`, once per datagram, exactly like [`crate::statsd::StatsdDecoder`]) -- never the
@@ -15,12 +21,19 @@
 //! The sender's own timestamp is not discarded -- it lands in the `syslog.timestamp` attribute
 //! (a [`Value::Timestamp`] for RFC 5424's RFC 3339 form, the raw [`Value::Str`] for RFC 3164's,
 //! which can't be resolved without guessing). See `docs/known-gaps.md` for the full writeup and
-//! the sketch of an opt-in `syslog_timestamp` transform that would make the guesswork explicit.
+//! the sketch of an opt-in `syslog_timestamp` transform that would make the guesswork explicit. A
+//! well-formed RFC 5424 TIMESTAMP that names an instant outside the representable `i64`-nanosecond
+//! range is kept as [`TimestampError::OutOfRange`] -- the event is emitted with `syslog.timestamp`
+//! omitted and a throttled diagnostic, not discarded ([`Malformed`](TimestampError::Malformed) is
+//! reserved for a TIMESTAMP that doesn't parse at all).
 //!
 //! **RFC 5424 STRUCTURED-DATA is parsed only enough to be skipped correctly** (balanced `[...]`
 //! honoring a backslash-escaped `]`) -- its contents are not merged into attributes. nginx emits
 //! none, and inventing a naming scheme for `[id@32473 k="v"]` without a consumer would be
 //! guesswork. Deliberate, marked gap; see `docs/known-gaps.md`.
+//!
+//! **A leading RFC 5424 §6.4 UTF-8 BOM (`EF BB BF`) on MSG is stripped**, not left to leak into
+//! `log.message` as U+FEFF -- it's a `MSG-UTF8` signal, not payload. nginx never emits one.
 //!
 //! **Byte validity is checked per line, not per datagram.** [`SyslogDecoder::decode`] splits the
 //! raw datagram into lines on the `\n` byte *before* any UTF-8 validation, so one line containing
@@ -153,7 +166,7 @@ impl Decoder for SyslogDecoder {
             // *not* whitespace-only content, which is real MSG data, not framing.
             if !line.is_empty() {
                 match std::str::from_utf8(&line) {
-                    Ok(text) => match parse_line(&line, text, timestamp) {
+                    Ok(text) => match parse_line(&line, text, timestamp, &mut self.diag) {
                         Ok(event) => events.push(event),
                         Err(err) => {
                             self.diag.warn_throttled("bad_line", err);
@@ -199,11 +212,17 @@ fn slice_of(bytes: &Bytes, text: &str, sub: &str) -> Bytes {
 }
 
 /// Splits `s` at the first ASCII space, returning `(token, rest)` with the space itself consumed.
-/// `rest` is `""` when there is no more space in `s` (the whole of `s` becomes the token).
+/// `rest` is an empty slice positioned at the end of `s` when there is no more space in `s` (the
+/// whole of `s` becomes the token) -- deliberately `&s[s.len()..]` rather than the literal `""`,
+/// so `rest` is always a genuine substring of `s` with a pointer inside `s`'s allocation. Callers
+/// (`parse_3164`, `parse_5424`) feed tokens straight into [`slice_of`], whose pointer-arithmetic
+/// round-trip is only sound when its `sub` argument really is a slice of the buffer it came from;
+/// the static `""` literal used to violate that silently and take the listener down (see the
+/// regression tests below).
 fn split_first_token(s: &str) -> (&str, &str) {
     match s.find(' ') {
         Some(i) => (&s[..i], &s[i + 1..]),
-        None => (s, ""),
+        None => (s, &s[s.len()..]),
     }
 }
 
@@ -225,8 +244,14 @@ fn map_severity(n: u32) -> Severity {
 /// datagram by [`SyslogDecoder::decode`]. `bytes`/`text` are that one line -- the same slice, as
 /// `Bytes` and as the `&str` view `str::from_utf8` produced from it -- passed through so every
 /// extracted field (`message`, `syslog.tag`, ...) can be sliced zero-copy out of `bytes` via
-/// [`slice_of`].
-fn parse_line(bytes: &Bytes, text: &str, recv_ts: i64) -> Result<Event, CodecError> {
+/// [`slice_of`]. `diag` is threaded down to [`parse_5424`], which uses it to report a
+/// well-formed-but-unrepresentable TIMESTAMP without failing the whole line over it.
+fn parse_line(
+    bytes: &Bytes,
+    text: &str,
+    recv_ts: i64,
+    diag: &mut Diagnostics,
+) -> Result<Event, CodecError> {
     let malformed = || CodecError::Malformed(format!("malformed syslog line: {text:?}"));
 
     if !text.starts_with('<') {
@@ -263,14 +288,46 @@ fn parse_line(bytes: &Bytes, text: &str, recv_ts: i64) -> Result<Event, CodecErr
     // RFC 3164.
     let mut chars = after_pri.char_indices();
     let is_5424_after = match (chars.next(), chars.next()) {
-        (Some((_, c0)), Some((i1, ' '))) if c0.is_ascii_digit() => Some(&after_pri[i1 + 1..]),
+        (Some((_, c0)), Some((i1, ' '))) if c0.is_ascii_digit() => Some((c0, &after_pri[i1 + 1..])),
         _ => None,
     };
 
-    if let Some(after_version) = is_5424_after {
-        parse_5424(bytes, text, after_version, facility, severity_num, severity, recv_ts)
-    } else {
-        Ok(parse_3164(bytes, text, after_pri, facility, severity_num, severity, recv_ts))
+    match is_5424_after {
+        Some((version, after_version)) => {
+            match parse_5424(
+                bytes,
+                text,
+                after_version,
+                facility,
+                severity_num,
+                severity,
+                recv_ts,
+                diag,
+            ) {
+                Ok(event) => Ok(event),
+                // The sniff above only checks "digit, then space" -- RFC 5424's VERSION is
+                // `NONZERO-DIGIT 0*2DIGIT`, so a tag-less RFC 3164 line whose MSG happens to start
+                // with a digit and a space (`4 requests failed`) also matches it. `1` is the only
+                // version any real sender emits, so a failure with that exact version is treated
+                // as a genuine, malformed RFC 5424 line -- the same skip-and-continue a bad
+                // TIMESTAMP or PRI gets, per the previous review round's fix. Any *other* digit
+                // failing is far more likely a false-positive sniff than a real, currently
+                // undefined version, so it falls back to reparsing the whole `after_pri` as RFC
+                // 3164 (whose grammar is permissive enough to never itself fail) instead of
+                // dropping the line outright.
+                Err(err) if version == '1' => Err(err),
+                Err(_) => Ok(parse_3164(
+                    bytes,
+                    text,
+                    after_pri,
+                    facility,
+                    severity_num,
+                    severity,
+                    recv_ts,
+                )),
+            }
+        }
+        None => Ok(parse_3164(bytes, text, after_pri, facility, severity_num, severity, recv_ts)),
     }
 }
 
@@ -468,6 +525,7 @@ fn parse_5424(
     severity_num: u32,
     severity: Severity,
     recv_ts: i64,
+    diag: &mut Diagnostics,
 ) -> Result<Event, CodecError> {
     let malformed = || CodecError::Malformed(format!("malformed RFC 5424 syslog line: {text:?}"));
 
@@ -485,13 +543,28 @@ fn parse_5424(
     // A nil TIMESTAMP (`-`) means "absent", same as every other nillable field -- but a non-nil
     // TIMESTAMP that fails to parse is not "absent", it's malformed input, and must take the same
     // skip-and-continue path a bad PRI does rather than silently landing on the floor with no
-    // `syslog.timestamp` attribute and no diagnostic.
+    // `syslog.timestamp` attribute and no diagnostic. A TIMESTAMP that *does* parse but names an
+    // instant outside the `i64` nanosecond range `Value::Timestamp` uses is a different condition
+    // from malformed, though: the line and every other field on it are still good, so it's kept,
+    // with `syslog.timestamp` omitted and a throttled diagnostic instead of the whole record
+    // being discarded over one unrepresentable field.
     match nil_or(ts_field) {
         None => {}
-        Some(ts) => {
-            let nanos = parse_rfc3339_to_nanos(ts).ok_or_else(malformed)?;
-            attrs.insert("syslog.timestamp", Value::Timestamp(nanos));
-        }
+        Some(ts) => match parse_rfc3339_to_nanos(ts) {
+            Ok(nanos) => {
+                attrs.insert("syslog.timestamp", Value::Timestamp(nanos));
+            }
+            Err(TimestampError::OutOfRange) => {
+                diag.warn_throttled(
+                    "timestamp_out_of_range",
+                    format_args!(
+                        "RFC 5424 TIMESTAMP {ts:?} is well-formed but names an instant outside \
+                         the representable range; keeping the event without syslog.timestamp"
+                    ),
+                );
+            }
+            Err(TimestampError::Malformed) => return Err(malformed()),
+        },
     }
     if let Some(v) = field_value(bytes, text, host_field) {
         attrs.insert("syslog.hostname", v);
@@ -512,12 +585,30 @@ fn parse_5424(
         attrs.insert("syslog.msgid", v);
     }
 
+    // RFC 5424 section 6.4: MSG may open with a UTF-8 BOM (`EF BB BF`, i.e. U+FEFF) to signal
+    // `MSG-UTF8`. It's a signal, not payload, so it's stripped rather than left to leak into
+    // `log.message` as a leading U+FEFF. Still a genuine slice of `text` (`strip_prefix` on a
+    // `&str` returns a subslice, never a copy), so `slice_of`'s "always a subset" precondition
+    // holds.
+    let msg = msg.strip_prefix('\u{FEFF}').unwrap_or(msg);
     let message = Value::Str(slice_of(bytes, text, msg));
     Ok(Event::log(
         recv_ts,
         attrs,
         LogRecord { message, severity: Some(severity), body_format: BodyFormat::Raw },
     ))
+}
+
+/// Why an RFC 3339 timestamp couldn't become a `syslog.timestamp` attribute -- kept distinct from
+/// a plain `Option`/bare error because the two cases warrant different treatment at the call
+/// site: [`Malformed`](TimestampError::Malformed) means the *line* is bad (same skip-and-continue
+/// path as a bad PRI), while [`OutOfRange`](TimestampError::OutOfRange) means the timestamp is
+/// syntactically fine but names an instant the `i64`-nanosecond [`Value::Timestamp`] can't
+/// represent -- the rest of the line is still good and should be kept, just without that one
+/// attribute.
+enum TimestampError {
+    Malformed,
+    OutOfRange,
 }
 
 /// Parses an RFC 3339 timestamp (the form RFC 5424 mandates for TIMESTAMP) into Unix nanoseconds.
@@ -528,9 +619,26 @@ fn parse_5424(
 /// precision. Rejects a calendar date that doesn't exist (`2024-02-31`, `2023-02-29`), an
 /// out-of-range offset, and a leap second (`:60`) -- RFC 5424 forbids all three, and silently
 /// normalizing or truncating them would attach a confidently-typed but wrong `syslog.timestamp`.
+/// Separately, a timestamp that parses cleanly but falls outside the representable `i64`
+/// nanosecond range (roughly 1677-09-21 to 2262-04-11) is [`TimestampError::OutOfRange`], not
+/// [`TimestampError::Malformed`] -- see that type's doc for why the distinction matters.
 /// TODO: replace with a real crate once the crate list is finalized (see `logit-config`'s
 /// hand-rolled humantime duration codec for the precedent this follows).
-fn parse_rfc3339_to_nanos(s: &str) -> Option<i64> {
+fn parse_rfc3339_to_nanos(s: &str) -> Result<i64, TimestampError> {
+    let (days, seconds_of_day, offset_seconds, nanos_frac) =
+        parse_rfc3339_components(s).ok_or(TimestampError::Malformed)?;
+    let total_seconds = days * 86_400 + seconds_of_day - offset_seconds;
+    total_seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|n| n.checked_add(nanos_frac))
+        .ok_or(TimestampError::OutOfRange)
+}
+
+/// The well-formedness half of [`parse_rfc3339_to_nanos`]: validates and decomposes `s` into
+/// `(days since the Unix epoch, seconds of day, offset in seconds, fractional nanoseconds)`,
+/// deferring the final arithmetic (and its overflow check) to the caller. Split out purely so
+/// "malformed" and "out of range" can be told apart -- see [`TimestampError`].
+fn parse_rfc3339_components(s: &str) -> Option<(i64, i64, i64, i64)> {
     let b = s.as_bytes();
     if b.len() < 20 {
         return None; // "YYYY-MM-DDTHH:MM:SSZ" is the shortest legal form.
@@ -618,8 +726,7 @@ fn parse_rfc3339_to_nanos(s: &str) -> Option<i64> {
 
     let days = days_from_civil(year, month, day);
     let seconds_of_day = hour * 3600 + minute * 60 + second;
-    let total_seconds = days * 86_400 + seconds_of_day - offset_seconds;
-    total_seconds.checked_mul(1_000_000_000)?.checked_add(nanos_frac)
+    Some((days, seconds_of_day, offset_seconds, nanos_frac))
 }
 
 /// Whether `y` is a Gregorian leap year -- divisible by 4, except century years, which must also
@@ -680,7 +787,8 @@ mod tests {
     fn parse_err(line: &str) -> CodecError {
         let bytes = Bytes::from(line.to_string());
         let text = std::str::from_utf8(&bytes).unwrap();
-        parse_line(&bytes, text, 0).expect_err("expected this line to be rejected")
+        let mut diag = Diagnostics::default();
+        parse_line(&bytes, text, 0, &mut diag).expect_err("expected this line to be rejected")
     }
 
     #[test]
@@ -746,6 +854,23 @@ mod tests {
     }
 
     #[test]
+    fn rfc3164_tag_with_no_trailing_space_and_empty_message_does_not_panic() {
+        // Regression test for the second blocker: a TAG-shaped token followed by nothing (no
+        // trailing space, so an empty MSG) used to hand `slice_of` the `&'static str` literal
+        // `split_first_token` returned for "no more space in s", rather than a real slice of the
+        // line -- pointer-arithmetic underflow, panicking the listener task on one UDP packet.
+        let event = only_event(decode("<13>nginx:"));
+        assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("nginx"));
+        assert_eq!(message_str(&event), "");
+
+        // Same hazard one token later: the empty MSG this time comes from `after2`.
+        let event = only_event(decode("<13>myhost nginx:"));
+        assert_eq!(event.attributes.get("syslog.hostname").and_then(Value::as_str), Some("myhost"));
+        assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("nginx"));
+        assert_eq!(message_str(&event), "");
+    }
+
+    #[test]
     fn rfc5424_decodes_msgid_and_timestamp_and_omits_nil_fields() {
         let event = only_event(decode(
             "<134>1 2003-10-11T22:14:15.003Z myhost app 1234 ID47 - some message",
@@ -808,6 +933,45 @@ mod tests {
     fn rfc5424_structured_data_is_skipped_including_an_escaped_bracket() {
         let event = only_event(decode(r#"<134>1 - - - - - [id@32473 k="v\]"] the message"#));
         assert_eq!(message_str(&event), "the message");
+    }
+
+    #[test]
+    fn rfc5424_timestamp_outside_the_representable_range_is_kept_without_the_attribute() {
+        // A well-formed RFC 3339 timestamp naming an instant outside the `i64` nanosecond range
+        // (roughly 1677-09-21 to 2262-04-11) used to be indistinguishable from a malformed one,
+        // discarding the whole log record rather than just the unrepresentable attribute.
+        for ts in ["2400-01-01T00:00:00Z", "1000-01-01T00:00:00Z"] {
+            let line = format!("<134>1 {ts} h a 1 - - msg");
+            let event = only_event(decode(&line));
+            assert!(
+                event.attributes.get("syslog.timestamp").is_none(),
+                "expected timestamp {ts:?} to be omitted, not attached"
+            );
+            // The rest of the line parsed fine and must still be kept.
+            assert_eq!(event.attributes.get("syslog.hostname").and_then(Value::as_str), Some("h"));
+            assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("a"));
+            assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(1)));
+            assert_eq!(message_str(&event), "msg");
+        }
+    }
+
+    #[test]
+    fn rfc5424_message_starting_with_a_bom_has_it_stripped() {
+        let line = "<134>1 - - - - - - \u{FEFF}hello";
+        let event = only_event(decode(line));
+        assert_eq!(message_str(&event), "hello");
+    }
+
+    #[test]
+    fn a_digit_led_rfc3164_message_that_fails_as_rfc5424_falls_back_instead_of_being_dropped() {
+        // "4 requests failed" sniffs as a plausible RFC 5424 VERSION ("4", a digit, then a
+        // space), but has none of RFC 5424's mandatory fields after it, so `parse_5424` fails.
+        // That failure must fall back to RFC 3164 (whose grammar tolerates all of this as an
+        // untagged, hostname-less message) rather than discarding the line.
+        let event = only_event(decode("<13>4 requests failed"));
+        assert_eq!(message_str(&event), "4 requests failed");
+        assert!(event.attributes.get("syslog.tag").is_none());
+        assert!(event.attributes.get("syslog.hostname").is_none());
     }
 
     #[test]

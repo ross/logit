@@ -115,7 +115,7 @@ already built that have a known, accepted rough edge.
   permits arbitrary octets, and `logit-core::Value` already has a `Bytes` variant for exactly this.
   `syslog_in` isolates UTF-8 validation to one line at a time (so one bad line no longer takes its
   datagram siblings down with it — see the fixed panic/data-loss bugs this gap replaced), but a line
-  whose header parses cleared while its MSG bytes aren't valid UTF-8 still fails as a malformed
+  whose header parses cleanly while its MSG bytes aren't valid UTF-8 still fails as a malformed
   line rather than being decoded with a `Value::Bytes` message. Doing better means parsing the
   ASCII header fields directly off the line's raw bytes instead of a validated `&str`, deferring
   UTF-8 validation to the MSG slice alone — a real change, not a one-line fix, and nginx's
