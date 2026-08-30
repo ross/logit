@@ -3,7 +3,7 @@
 # https://github.blog/engineering/scripts-to-rule-them-all/) -- see AGENTS.md and README.md, and
 # add new commands there, not here.
 
-.PHONY: bootstrap setup update server test lint fmt fmt-check schema audit cibuild console up down clean
+.PHONY: bootstrap setup update server test lint fmt fmt-check schema audit cibuild console image up down clean
 
 bootstrap:  ## Build the dev container image.
 	./script/bootstrap
@@ -40,6 +40,9 @@ cibuild:    ## Run the full CI-equivalent check sequence
 
 console:    ## Interactive shell in the dev container
 	./script/console
+
+image:      ## Build the production runtime image (Dockerfile, not Dockerfile.dev)
+	./script/image
 
 up:         ## Start the InfluxDB + Grafana test stack.
 	$${DOCKER:-sudo docker} compose up -d influxdb grafana

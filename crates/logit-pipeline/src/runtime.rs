@@ -13,9 +13,10 @@ use anyhow::Context;
 use logit_core::{EventBatch, Resource};
 use logit_script::{ProcessOutcome, ScriptWorker};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 /// Bounded channel capacity between two graph nodes. Small and arbitrary -- just enough to smooth
@@ -40,8 +41,36 @@ pub enum NodeSpec {
 
 /// Builds every component's inbox and `Fanout`, then spawns each as a tokio task (listeners,
 /// sinks, `Transform`-trait nodes) or a dedicated OS thread (Lua nodes), and runs until the first
-/// one fails.
-pub async fn run(graph: Graph, mut specs: HashMap<String, NodeSpec>) -> anyhow::Result<()> {
+/// one fails. No shutdown signal -- see [`run_with_shutdown`] for graceful shutdown.
+pub async fn run(graph: Graph, specs: HashMap<String, NodeSpec>) -> anyhow::Result<()> {
+    run_with_shutdown(graph, specs, std::future::pending()).await
+}
+
+/// Same as [`run`], but resolving `shutdown` closes every listener's inbound channel *normally*
+/// instead of the process just dying -- which is enough to trigger the existing close-time flush
+/// cascade (a node flushes once when its own inbox closes, `run_transform`/`run_lua` below), with
+/// no change needed to any `Input` implementation.
+///
+/// The mechanism: `Input::run` takes its `Fanout` by value, so racing `input.run(fanout)` against
+/// `shutdown` and letting `shutdown` win *drops* that future -- and with it, the last `Fanout` (and
+/// therefore the last `Sender`) into every one of that listener's downstream inboxes. Those inboxes
+/// then observe every sender gone and close, exactly as they do today when a listener returns
+/// `Ok(())` on its own (`FiniteInput` in this module's tests proves that cascade already works).
+pub async fn run_with_shutdown(
+    graph: Graph,
+    mut specs: HashMap<String, NodeSpec>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    // A `watch` (not a `oneshot`) because every listener needs its own clone of the receiver, and
+    // `watch::Receiver` is `Clone` where `oneshot::Receiver` is not. Driven from a spawned task
+    // rather than shared directly so this function doesn't need to name `shutdown`'s own type in
+    // more than one place.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_driver = tokio::spawn(async move {
+        shutdown.await;
+        let _ = shutdown_tx.send(true);
+    });
+
     let ids: Vec<String> = graph.components.keys().cloned().collect();
 
     let mut senders: HashMap<String, mpsc::Sender<EventBatch>> = HashMap::with_capacity(ids.len());
@@ -72,7 +101,7 @@ pub async fn run(graph: Graph, mut specs: HashMap<String, NodeSpec>) -> anyhow::
                 // sources, so nothing ever names it as a source and sends into it) -- nothing
                 // reads it either.
                 drop(inbox);
-                tasks.spawn(run_input(id, input, fanout));
+                tasks.spawn(run_input(id, input, fanout, shutdown_rx.clone()));
             }
             NodeSpec::Output(output) => {
                 tasks.spawn(run_output(id, output, inbox));
@@ -109,18 +138,41 @@ pub async fn run(graph: Graph, mut specs: HashMap<String, NodeSpec>) -> anyhow::
     // forever waiting on tasks that are themselves waiting on inboxes that can never close.
     drop(senders);
 
-    while let Some(result) = tasks.join_next().await {
-        result??;
+    let mut result: anyhow::Result<()> = Ok(());
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                result = Err(err);
+                break;
+            }
+            Err(join_err) => {
+                result = Err(join_err.into());
+                break;
+            }
+        }
     }
-    Ok(())
+    // Whether `shutdown` ever resolved or not (in `run`'s case, it's `pending()` and never will),
+    // this task has nothing left to do once every node has exited -- abort rather than leave it
+    // parked forever holding `shutdown_tx`.
+    shutdown_driver.abort();
+    result
 }
 
 async fn run_input(
     id: String,
     mut input: Box<dyn Input + Send>,
     fanout: Fanout,
+    mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    input.run(fanout).await.with_context(|| format!("component '{id}'"))
+    tokio::select! {
+        result = input.run(fanout) => result.with_context(|| format!("component '{id}'")),
+        // `wait_for` checks the current value before waiting on a change, so this resolves
+        // immediately if `shutdown` was already flipped before this task started racing it --
+        // unlike `changed()`, which only fires on a transition and could otherwise miss a
+        // shutdown that landed between this receiver's creation and this select.
+        _ = shutdown.wait_for(|&due| due) => Ok(()),
+    }
 }
 
 async fn run_output(
@@ -546,8 +598,7 @@ mod tests {
         }
     }
 
-    /// Operationalizes branch isolation (docs/plans/i-d-like-to-start-modular-pumpkin.md's
-    /// workstream A, decision D5 -- soon docs/adr/0012-multi-payload-events.md): `Fanout` deep-
+    /// Operationalizes branch isolation (docs/adr/0012-multi-payload-events.md): `Fanout` deep-
     /// clones an `EventBatch` for every consumer but the last, *before* any downstream node can
     /// touch it, so a mutation one branch of a fan-out makes is never visible on a sibling
     /// branch's copy of the same upstream event -- even now that `Event` can carry several
@@ -633,5 +684,137 @@ mod tests {
             bucket: "bucket".to_string(),
             token: "TOKEN".to_string(),
         }
+    }
+
+    /// A local fake `Transform`, standing in for `logit-transforms::Aggregator` -- this crate
+    /// can't depend on `logit-transforms` (`docs/design/pipeline-graph.md`'s "Crate layout": the
+    /// dependency runs the other way). Absorbs every event it's given (`process` always returns
+    /// `None`) and only ever emits them from `flush`, exactly the shape needed to prove a
+    /// shutdown-triggered close-time flush actually drains what's buffered.
+    struct WindowingTransform {
+        interval: Duration,
+        buffered: Vec<Event>,
+    }
+
+    impl Transform for WindowingTransform {
+        fn process(&mut self, _resource: &Arc<Resource>, event: Event) -> Option<Event> {
+            self.buffered.push(event);
+            None
+        }
+
+        fn flush_interval(&self) -> Option<Duration> {
+            Some(self.interval)
+        }
+
+        fn flush(&mut self, _now: i64) -> Vec<(Arc<Resource>, Vec<Event>)> {
+            if self.buffered.is_empty() {
+                return Vec::new();
+            }
+            vec![(Arc::new(Resource::default()), std::mem::take(&mut self.buffered))]
+        }
+    }
+
+    /// Like `OneShotInput`, but also signals `sent` once its one batch has been handed to
+    /// `sink.send` -- so a test can wait for "the batch is definitely enqueued downstream" before
+    /// triggering shutdown, rather than relying on timing.
+    struct SignalingInput {
+        batch: Option<EventBatch>,
+        sent: Option<oneshot::Sender<()>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Input for SignalingInput {
+        async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
+            if let Some(batch) = self.batch.take() {
+                sink.send(batch).await;
+            }
+            if let Some(tx) = self.sent.take() {
+                let _ = tx.send(());
+            }
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// The SIGTERM-mid-window proof, without any real OS signal: `run_with_shutdown`'s `shutdown`
+    /// future is driven by a plain oneshot the test controls directly. Fired only once the input
+    /// confirms its batch is enqueued (via `SignalingInput`/`sent_rx` above) -- not because the
+    /// ordering would otherwise be wrong (`mpsc::Receiver::recv` still drains whatever's already
+    /// buffered before observing every sender gone), but so this test exercises exactly the
+    /// "in-flight window, then shutdown" sequence its name promises, not "shutdown that happens to
+    /// race a send."
+    #[tokio::test]
+    async fn run_with_shutdown_flushes_an_in_flight_window_before_exiting() {
+        let mut components = Map::new();
+        components.insert(
+            "in".to_string(),
+            Component {
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            },
+        );
+        components.insert(
+            "windowed".to_string(),
+            Component {
+                sources: vec!["in".to_string()],
+                kind: ComponentKind::Aggregate { interval: Duration::from_secs(3600) },
+            },
+        );
+        components.insert(
+            "out".to_string(),
+            Component {
+                sources: vec!["windowed".to_string()],
+                kind: ComponentKind::InfluxDbOut {
+                    url: "http://localhost:8086".to_string(),
+                    org: "org".to_string(),
+                    bucket: "bucket".to_string(),
+                    token: "TOKEN".to_string(),
+                },
+            },
+        );
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+
+        let (sent_tx, sent_rx) = oneshot::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(SignalingInput { batch: Some(batch), sent: Some(sent_tx) })),
+        );
+        specs.insert(
+            "windowed".to_string(),
+            NodeSpec::Transform(Box::new(WindowingTransform {
+                interval: Duration::from_secs(3600),
+                buffered: Vec::new(),
+            })),
+        );
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(Box::new(RecordingOutput { tx: result_tx })),
+        );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let run_task = tokio::spawn(run_with_shutdown(g, specs, async move {
+            let _ = shutdown_rx.await;
+        }));
+
+        sent_rx.await.expect("input should signal its batch was enqueued");
+        shutdown_tx.send(()).expect("shutdown receiver should still be alive");
+
+        tokio::time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("run_with_shutdown should return promptly once shutdown fires")
+            .expect("task should not panic")
+            .expect("run_with_shutdown should complete without error");
+
+        let received = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the flushed window should have reached the output before exit");
+        assert_eq!(received.events.len(), 1);
     }
 }
