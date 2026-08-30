@@ -50,6 +50,8 @@ pub struct Component {
 /// See `ComponentKind::KvMetrics` and `docs/adr/0014-kv-metrics-semantics.md`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct MetricSpec {
+    /// The metric's measurement name. An empty name is rejected at graph-validation time --
+    /// `influxdb_out` requires a non-empty measurement to encode a metric line.
     pub name: String,
     /// The attribute to read this metric's value from. Omitted means "+1 per event" for a
     /// counter or "set to 1" for a gauge; a distribution entry with no `field` is rejected at

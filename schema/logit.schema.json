@@ -551,6 +551,7 @@
           ]
         },
         "name": {
+          "description": "The metric's measurement name. An empty name is rejected at graph-validation time -- `influxdb_out` requires a non-empty measurement to encode a metric line.",
           "type": "string"
         },
         "unit": {

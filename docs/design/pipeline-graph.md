@@ -178,6 +178,9 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     only ever be a no-op, the same silent-black-hole failure rule 7 exists to catch.
 11. A `kv_metrics` distribution entry with no `field` is rejected — a distribution of nothing is
     meaningless (`docs/adr/0014-kv-metrics-semantics.md`).
+12. A `kv_metrics` counter, gauge, or distribution entry with an empty `name` is rejected — the
+    implemented `influxdb_out` sink can't encode a metric with no measurement name
+    (`docs/adr/0014-kv-metrics-semantics.md`).
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

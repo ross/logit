@@ -29,6 +29,12 @@ catching this at `logit validate`/`logit run`'s validation step (`crates/logit-p
 is strictly better than a runtime no-op nobody notices — the same reasoning as rule 7's "every
 non-sink component has a consumer" catching a different silent-black-hole shape.
 
+**An empty `name` on any counter, gauge, or distribution entry is also a config error, rejected at
+graph-validation time (rule 12).** `name` becomes the measurement in every metric line the
+implemented `influxdb_out` sink writes, and Influx line protocol requires a non-empty measurement;
+an empty name reaching runtime would mean the first event to hit that entry produces a malformed
+line and a non-retryable 4xx from the sink instead of a clear error at `logit validate` time.
+
 **A missing, non-numeric, or non-finite field skips *that metric for that event* — no metric
 emitted, no error, no dropped event, and no effect on the event's other derived metrics or its log
 half.** This is deliberately the common path, not an edge case: `kv_metrics` is built to point at

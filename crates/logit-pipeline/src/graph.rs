@@ -17,6 +17,10 @@
 //!     only ever be a no-op, the same silent-black-hole failure rule 7 exists to catch.
 //! 11. A `kv_metrics` distribution entry with no `field` is rejected -- a distribution of nothing
 //!     is meaningless (`docs/adr/0014-kv-metrics-semantics.md`).
+//! 12. A `kv_metrics` counter, gauge, or distribution entry with an empty `name` is rejected -- the
+//!     implemented `influxdb_out` sink can't encode a metric with no measurement name (Influx line
+//!     protocol requires one), so this must be caught here rather than surfacing as a runtime sink
+//!     failure the first time such an event arrives.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -221,6 +225,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': a kv_metrics distribution entry requires a 'field' -- a \
                      distribution of nothing is meaningless"
+                );
+            }
+            if counters.iter().chain(gauges).chain(distributions).any(|m| m.name.is_empty()) {
+                anyhow::bail!(
+                    "component '{id}': a kv_metrics counter, gauge, or distribution entry \
+                     requires a non-empty 'name' -- influxdb_out cannot encode a metric with no \
+                     measurement name"
                 );
             }
         }
@@ -505,6 +516,60 @@ mod tests {
             ("out", vec!["derive"], sink()),
         ]));
         assert!(err.contains("distribution entry requires a 'field'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_kv_metrics_counter_with_an_empty_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "derive",
+                vec!["in"],
+                ComponentKind::KvMetrics {
+                    counters: vec![metric_spec("", None)],
+                    gauges: vec![],
+                    distributions: vec![],
+                },
+            ),
+            ("out", vec!["derive"], sink()),
+        ]));
+        assert!(err.contains("non-empty 'name'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_kv_metrics_gauge_with_an_empty_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "derive",
+                vec!["in"],
+                ComponentKind::KvMetrics {
+                    counters: vec![],
+                    gauges: vec![metric_spec("", Some("status"))],
+                    distributions: vec![],
+                },
+            ),
+            ("out", vec!["derive"], sink()),
+        ]));
+        assert!(err.contains("non-empty 'name'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_kv_metrics_distribution_with_an_empty_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "derive",
+                vec!["in"],
+                ComponentKind::KvMetrics {
+                    counters: vec![],
+                    gauges: vec![],
+                    distributions: vec![metric_spec("", Some("request_time"))],
+                },
+            ),
+            ("out", vec!["derive"], sink()),
+        ]));
+        assert!(err.contains("non-empty 'name'"), "got: {err}");
     }
 
     #[test]
