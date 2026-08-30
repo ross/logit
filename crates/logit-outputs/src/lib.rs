@@ -6,5 +6,6 @@
 //! comment for the same reasoning.
 
 pub mod influxdb;
+pub mod stdio;
 
 pub use logit_pipeline::Output;

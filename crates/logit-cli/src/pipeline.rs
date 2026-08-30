@@ -11,10 +11,11 @@
 
 use crate::config;
 use anyhow::Context;
-use logit_config::Config;
+use logit_config::{Config, StdioTarget};
 use logit_core::Diagnostics;
 use logit_inputs::statsd::StatsdInput;
 use logit_outputs::influxdb::InfluxDbOutput;
+use logit_outputs::stdio::StdioOutput;
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::NodeSpec;
 use logit_transforms::{
@@ -170,6 +171,22 @@ fn build_spec(
             InfluxDbOutput::new(url.clone(), org.clone(), bucket.clone(), token.clone())
                 .with_diagnostics(Diagnostics::new(id)),
         )),
+        StdioOut { target } => {
+            let output = match target {
+                StdioTarget::Stdout => StdioOutput::stdout(),
+                StdioTarget::Stderr => StdioOutput::stderr(),
+                // Resolved against `base_dir` (the config file's own directory), exactly as
+                // `LuaFile { lua_file, .. }` resolves its script path above -- `Path::join`
+                // leaves an already-absolute `path` untouched, so this is correct whether `path`
+                // is relative or absolute. Without it, a relative target resolves against the
+                // process's current working directory instead, which for `logit run
+                // /etc/logit/config.yaml` run from an unrelated directory silently writes
+                // somewhere other than "next to the config" (what this kind's own doc comment
+                // promises).
+                StdioTarget::Path(path) => StdioOutput::open_path(base_dir.join(path))?,
+            };
+            NodeSpec::Output(Box::new(output))
+        }
 
         other => unreachable!("graph::resolve already rejected any unimplemented kind: {other:?}"),
     })
@@ -332,6 +349,87 @@ mod tests {
             build_spec("parse", &component, Path::new("")).unwrap(),
             NodeSpec::Transform(_)
         ));
+    }
+
+    fn stdio_out_component(target: StdioTarget) -> ResolvedComponent {
+        ResolvedComponent {
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::StdioOut { target },
+        }
+    }
+
+    #[test]
+    fn build_spec_builds_a_stdio_sink_for_stdout() {
+        let component = stdio_out_component(StdioTarget::Stdout);
+        assert!(matches!(
+            build_spec("tap", &component, Path::new("")).unwrap(),
+            NodeSpec::Output(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_stdio_sink_for_stderr() {
+        let component = stdio_out_component(StdioTarget::Stderr);
+        assert!(matches!(
+            build_spec("tap", &component, Path::new("")).unwrap(),
+            NodeSpec::Output(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_stdio_sink_for_a_file_path() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("logit-build-spec-stdio-out-test-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let component = stdio_out_component(StdioTarget::Path(path.display().to_string()));
+        assert!(matches!(
+            build_spec("tap", &component, Path::new("")).unwrap(),
+            NodeSpec::Output(_)
+        ));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A *relative* `target:` path must resolve against the config file's own directory
+    /// (`base_dir`), exactly as `LuaFile`'s `lua_file` already does -- not against the process's
+    /// current working directory, which for `logit run` invoked from an unrelated directory would
+    /// silently write somewhere other than "next to the config", contradicting `StdioTarget`'s own
+    /// doc comment.
+    #[test]
+    fn build_spec_resolves_a_relative_stdio_target_against_the_config_base_dir() {
+        let base_dir = std::env::temp_dir()
+            .join(format!("logit-build-spec-stdio-base-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&base_dir).expect("base_dir should be creatable");
+        let relative = "relative-debug.log";
+        let expected_path = base_dir.join(relative);
+        let _ = std::fs::remove_file(&expected_path);
+
+        let component = stdio_out_component(StdioTarget::Path(relative.to_string()));
+        assert!(matches!(build_spec("tap", &component, &base_dir).unwrap(), NodeSpec::Output(_)));
+        assert!(
+            expected_path.exists(),
+            "expected the relative target to be created inside base_dir ({}), not the process cwd",
+            base_dir.display()
+        );
+
+        std::fs::remove_file(&expected_path).ok();
+        std::fs::remove_dir(&base_dir).ok();
+    }
+
+    #[test]
+    fn build_spec_reports_a_clear_path_naming_error_for_an_unopenable_stdio_target() {
+        // `NodeSpec` isn't `Debug` (it embeds trait objects), so `Result::expect_err` -- which
+        // needs `Debug` on the `Ok` side to format its panic message -- doesn't work here. Same
+        // reason `logit-pipeline::graph`'s tests have their own `expect_err` helper.
+        let path = std::env::temp_dir().join("logit-build-spec-no-such-dir").join("x.log");
+        let component = stdio_out_component(StdioTarget::Path(path.display().to_string()));
+        let err = match build_spec("tap", &component, Path::new("")) {
+            Ok(_) => panic!("expected build_spec to fail for an unopenable path"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:?}").contains(&path.display().to_string()), "got: {err:?}");
     }
 
     #[test]

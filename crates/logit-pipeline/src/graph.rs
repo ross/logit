@@ -66,7 +66,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Sample { .. }
         | Throttle { .. }
         | Dedup { .. } => Role::Transform,
-        InfluxDbOut { .. } | OtlpOut { .. } | LogitOut { .. } => Role::Sink,
+        InfluxDbOut { .. } | OtlpOut { .. } | LogitOut { .. } | StdioOut { .. } => Role::Sink,
     }
 }
 
@@ -85,6 +85,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Keep { .. }
             | ComponentKind::Remove { .. }
             | ComponentKind::InfluxDbOut { .. }
+            | ComponentKind::StdioOut { .. }
     )
 }
 

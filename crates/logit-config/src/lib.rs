@@ -202,6 +202,79 @@ pub enum ComponentKind {
     LogitOut {
         endpoint: String,
     },
+    /// A general-purpose, human-facing debug sink: dumps every event's details as a readable text
+    /// block to stdout (default), stderr, or a file -- the dev loop for seeing a whole pipeline's
+    /// output without standing up a real backend like InfluxDB.
+    StdioOut {
+        #[serde(default)]
+        target: StdioTarget,
+    },
+}
+
+/// Where `stdio_out` writes: config keeps this a plain scalar (`target: stdout`), not a tagged
+/// object -- `stdout` and `stderr` are matched as keywords first, and anything else is treated as
+/// a file path.
+///
+/// `Serialize`/`Deserialize`/`JsonSchema` are all hand-rolled rather than derived: a derived
+/// `#[serde(untagged)]` dispatches each candidate variant against the input's *shape*, and a
+/// fieldless (unit) variant's shape is "absent/null", not "any string that happens to match the
+/// variant's name" -- so a plain `#[derive(Deserialize)]` here would never actually match the
+/// literal string `"stdout"` against the `Stdout` variant, and every value (including `"stdout"`
+/// itself) would silently fall through to `Path`. Matching a string against the two known
+/// keywords first, `Path` as the explicit fallback, has to be written by hand instead --  and
+/// `JsonSchema` follows suit (delegating straight to `String`'s schema) rather than letting a
+/// derive describe the shape the broken derived (de)serializer *would* have accepted: every value
+/// this type actually accepts is a string, `stdout`/`stderr` included, so that's the schema ADR
+/// 0003 needs published, not an artifact of what a derive would guess from the variants.
+///
+/// A relative `Path` is resolved against the config file's own directory (`crates/logit-cli/src/
+/// pipeline.rs::build_spec`, mirroring how `LuaFile { lua_file, .. }` resolves its script path) --
+/// not the process's current working directory, so "next to the config" below is literal.
+///
+/// Two consequences worth knowing, both accepted rather than worked around:
+/// - A file literally named `stdout` (or `stderr`) next to the config is unreachable this way --
+///   write `./stdout` in config to target it instead.
+/// - A typo like `stdrr` silently becomes a file path rather than a config error. That's the price
+///   of the one-field shape; it's visible immediately in practice, since the (wrongly-named) file
+///   appears next to the config the moment an event is written.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub enum StdioTarget {
+    #[default]
+    Stdout,
+    Stderr,
+    Path(String),
+}
+
+impl Serialize for StdioTarget {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let s = match self {
+            StdioTarget::Stdout => "stdout",
+            StdioTarget::Stderr => "stderr",
+            StdioTarget::Path(path) => path.as_str(),
+        };
+        serializer.serialize_str(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for StdioTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "stdout" => StdioTarget::Stdout,
+            "stderr" => StdioTarget::Stderr,
+            _ => StdioTarget::Path(s),
+        })
+    }
+}
+
+impl JsonSchema for StdioTarget {
+    fn schema_name() -> String {
+        "StdioTarget".to_string()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        String::json_schema(generator)
+    }
 }
 
 /// Minimal `humantime`-flavored `(de)serialize` for `Duration` fields (`10s`, `1m`, ...), so
@@ -471,6 +544,34 @@ mod tests {
             }
             other => panic!("expected Lua, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stdio_out_defaults_target_to_stdout_when_omitted() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "stdio_out", "sources": ["in"]}"#).unwrap();
+        match component.kind {
+            ComponentKind::StdioOut { target } => assert_eq!(target, StdioTarget::Stdout),
+            other => panic!("expected StdioOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stdio_out_target_stdout_deserializes() {
+        let target: StdioTarget = serde_json::from_str(r#""stdout""#).unwrap();
+        assert_eq!(target, StdioTarget::Stdout);
+    }
+
+    #[test]
+    fn stdio_out_target_stderr_deserializes() {
+        let target: StdioTarget = serde_json::from_str(r#""stderr""#).unwrap();
+        assert_eq!(target, StdioTarget::Stderr);
+    }
+
+    #[test]
+    fn stdio_out_target_anything_else_is_a_path() {
+        let target: StdioTarget = serde_json::from_str(r#""/var/log/logit.log""#).unwrap();
+        assert_eq!(target, StdioTarget::Path("/var/log/logit.log".to_string()));
     }
 
     #[test]

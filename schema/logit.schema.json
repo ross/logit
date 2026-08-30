@@ -523,6 +523,29 @@
               ]
             }
           }
+        },
+        {
+          "description": "A general-purpose, human-facing debug sink: dumps every event's details as a readable text block to stdout (default), stderr, or a file -- the dev loop for seeing a whole pipeline's output without standing up a real backend like InfluxDB.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "target": {
+              "default": "stdout",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/StdioTarget"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "stdio_out"
+              ]
+            }
+          }
         }
       ],
       "properties": {
@@ -562,6 +585,9 @@
           ]
         }
       }
+    },
+    "StdioTarget": {
+      "type": "string"
     }
   }
 }
