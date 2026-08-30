@@ -151,12 +151,9 @@ impl Output for InfluxDbOutput {
                 );
             }
 
-            // Floored at 1ms: a zero-duration reqwest timeout fails immediately rather than
-            // giving this attempt any real chance, turning "budget nearly exhausted" into
-            // "budget already exhausted" a beat early.
-            let remaining = deadline.saturating_duration_since(now).max(Duration::from_millis(1));
+            let remaining = deadline.saturating_duration_since(now);
             let attempt_timeout =
-                self.request_timeout.min(self.retry.attempt_timeout).min(remaining);
+                attempt_timeout_for(self.request_timeout, self.retry.attempt_timeout, remaining);
 
             let result = self
                 .client
@@ -195,13 +192,8 @@ impl Output for InfluxDbOutput {
                     self.retry.total_budget,
                 );
             }
-            let shift = (attempt - 1).min(16); // 16 is already far past max_delay's cap
-            let backoff = self
-                .retry
-                .base_delay
-                .saturating_mul(2u32.pow(shift))
-                .min(self.retry.max_delay)
-                .min(deadline.saturating_duration_since(now));
+            let backoff =
+                backoff_for(&self.retry, attempt).min(deadline.saturating_duration_since(now));
 
             self.diag.warn(format_args!(
                 "InfluxDB write attempt {attempt} failed ({failure}), retrying in {backoff:?}"
@@ -209,6 +201,45 @@ impl Output for InfluxDbOutput {
             tokio::time::sleep(backoff).await;
         }
     }
+}
+
+/// The timeout for one attempt: the smallest of the configured request timeout
+/// ([`InfluxDbOutput::with_timeout`]), the retry policy's own `attempt_timeout`, and `remaining`
+/// (time left in the retry budget). No floor: `total_budget` is documented as a hard wall-clock
+/// ceiling, so the timeout handed to an attempt must never exceed what's actually left, even when
+/// that's zero (a pathologically tiny or already-exhausted budget on the always-attempted first
+/// try). A zero-duration reqwest timeout simply fails that attempt immediately rather than
+/// granting it borrowed time past the deadline -- an earlier version floored this at 1ms, which
+/// let an attempt run up to 1ms past `total_budget`. Split out from `send` so the "never exceeds
+/// `remaining`" invariant is directly unit-testable without a real clock.
+fn attempt_timeout_for(
+    request_timeout: Duration,
+    retry_attempt_timeout: Duration,
+    remaining: Duration,
+) -> Duration {
+    request_timeout.min(retry_attempt_timeout).min(remaining)
+}
+
+/// The backoff before retry attempt `attempt + 1`: `base_delay` doubled `attempt - 1` times via
+/// repeated `saturating_mul`, stopping early once it's already at or past `max_delay` -- correct
+/// for *any* `base_delay`/`max_delay` pair, not just `RetryPolicy::default`'s. A single
+/// `base_delay * 2u32.pow(shift)` with a fixed shift cap (this used to do that, capped at 16)
+/// silently stops growing far short of `max_delay` whenever `base_delay` is small enough that
+/// reaching `max_delay` needs more doublings than the cap allows (e.g. a 1us `base_delay` against
+/// a 1s `max_delay` needs ~20 doublings, not <=16). The loop is bounded at 128 iterations purely
+/// as a defensive guard against a huge `attempt`, not as a substitute for the real `max_delay`
+/// clamp below it -- doubling any nonzero `Duration` that many times has long since saturated or
+/// cleared `max_delay` regardless of how small `base_delay` started. Split out from `send` so it's
+/// directly unit-testable without a real clock or network.
+fn backoff_for(retry: &RetryPolicy, attempt: u32) -> Duration {
+    let mut backoff = retry.base_delay;
+    for _ in 0..attempt.saturating_sub(1).min(128) {
+        if backoff >= retry.max_delay {
+            break;
+        }
+        backoff = backoff.saturating_mul(2);
+    }
+    backoff.min(retry.max_delay)
 }
 
 /// Encodes an [`EventBatch`] as InfluxDB line protocol. Split out from [`InfluxDbOutput`] so the
@@ -977,6 +1008,81 @@ mod tests {
             "should give up within the ~300ms retry budget, not hang: took {:?}",
             start.elapsed()
         );
+    }
+
+    /// Regression test for a reviewed bug: `attempt_timeout_for` used to floor its result at 1ms,
+    /// so an attempt starting with less than 1ms of budget left (or none at all) got handed 1ms of
+    /// borrowed time -- letting `send` run up to 1ms past `RetryPolicy::total_budget`'s documented
+    /// hard ceiling. The fix is structural (a plain `.min()` chain can never exceed its smallest
+    /// input), but this pins it down directly rather than relying on the chain's shape never
+    /// regressing back to having a floor added.
+    #[test]
+    fn attempt_timeout_never_exceeds_the_remaining_budget() {
+        assert_eq!(
+            attempt_timeout_for(Duration::from_secs(10), Duration::from_secs(2), Duration::ZERO),
+            Duration::ZERO,
+            "zero budget remaining must produce a zero-duration timeout, not a 1ms floor"
+        );
+        assert_eq!(
+            attempt_timeout_for(
+                Duration::from_secs(10),
+                Duration::from_secs(2),
+                Duration::from_micros(500)
+            ),
+            Duration::from_micros(500),
+            "a sub-millisecond remainder must be respected exactly, not rounded up to 1ms"
+        );
+        // The other two inputs still win when they're the tightest constraint.
+        assert_eq!(
+            attempt_timeout_for(
+                Duration::from_millis(50),
+                Duration::from_secs(2),
+                Duration::from_secs(10)
+            ),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            attempt_timeout_for(
+                Duration::from_secs(10),
+                Duration::from_millis(50),
+                Duration::from_secs(10)
+            ),
+            Duration::from_millis(50)
+        );
+    }
+
+    /// Regression test for a reviewed bug: `backoff_for` used to compute `base_delay *
+    /// 2u32.pow(shift)` with `shift` capped at 16 regardless of `base_delay`/`max_delay`'s actual
+    /// ratio -- so a small enough `base_delay` (relative to `max_delay`) never actually reached
+    /// `max_delay` at all, plateauing far short of it instead. A 1us `base_delay` against a 1s
+    /// `max_delay` needs on the order of 20 doublings to reach the ceiling, not <=16.
+    #[test]
+    fn backoff_reaches_max_delay_even_with_a_tiny_base_delay() {
+        let retry = RetryPolicy {
+            total_budget: Duration::from_secs(60),
+            base_delay: Duration::from_micros(1),
+            max_delay: Duration::from_secs(1),
+            attempt_timeout: Duration::from_secs(1),
+        };
+        assert_eq!(
+            backoff_for(&retry, 30),
+            Duration::from_secs(1),
+            "30 doublings of 1us is far past 1s -- this must clamp to max_delay, not plateau \
+             at base_delay * 2^16 (~65ms)"
+        );
+    }
+
+    /// `backoff_for` in isolation, pinning the exact doubling sequence for a default-shaped
+    /// policy: 200ms, 400ms, 800ms, 1600ms, then clamped at max_delay (2s).
+    #[test]
+    fn backoff_doubles_per_attempt_then_clamps_at_max_delay() {
+        let retry = RetryPolicy::default();
+        assert_eq!(backoff_for(&retry, 1), Duration::from_millis(200));
+        assert_eq!(backoff_for(&retry, 2), Duration::from_millis(400));
+        assert_eq!(backoff_for(&retry, 3), Duration::from_millis(800));
+        assert_eq!(backoff_for(&retry, 4), Duration::from_millis(1600));
+        assert_eq!(backoff_for(&retry, 5), Duration::from_secs(2), "clamped at max_delay");
+        assert_eq!(backoff_for(&retry, 50), Duration::from_secs(2), "stays clamped");
     }
 
     /// A bare HTTP/1.1 server for retry tests: writes back one canned response per accepted
