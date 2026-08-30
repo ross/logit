@@ -162,7 +162,15 @@ fn build_spec(
             let output = match target {
                 StdioTarget::Stdout => StdioOutput::stdout(),
                 StdioTarget::Stderr => StdioOutput::stderr(),
-                StdioTarget::Path(path) => StdioOutput::open_path(path)?,
+                // Resolved against `base_dir` (the config file's own directory), exactly as
+                // `LuaFile { lua_file, .. }` resolves its script path above -- `Path::join`
+                // leaves an already-absolute `path` untouched, so this is correct whether `path`
+                // is relative or absolute. Without it, a relative target resolves against the
+                // process's current working directory instead, which for `logit run
+                // /etc/logit/config.yaml` run from an unrelated directory silently writes
+                // somewhere other than "next to the config" (what this kind's own doc comment
+                // promises).
+                StdioTarget::Path(path) => StdioOutput::open_path(base_dir.join(path))?,
             };
             NodeSpec::Output(Box::new(output))
         }
@@ -355,6 +363,32 @@ mod tests {
         ));
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A *relative* `target:` path must resolve against the config file's own directory
+    /// (`base_dir`), exactly as `LuaFile`'s `lua_file` already does -- not against the process's
+    /// current working directory, which for `logit run` invoked from an unrelated directory would
+    /// silently write somewhere other than "next to the config", contradicting `StdioTarget`'s own
+    /// doc comment.
+    #[test]
+    fn build_spec_resolves_a_relative_stdio_target_against_the_config_base_dir() {
+        let base_dir = std::env::temp_dir()
+            .join(format!("logit-build-spec-stdio-base-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&base_dir).expect("base_dir should be creatable");
+        let relative = "relative-debug.log";
+        let expected_path = base_dir.join(relative);
+        let _ = std::fs::remove_file(&expected_path);
+
+        let component = stdio_out_component(StdioTarget::Path(relative.to_string()));
+        assert!(matches!(build_spec("tap", &component, &base_dir).unwrap(), NodeSpec::Output(_)));
+        assert!(
+            expected_path.exists(),
+            "expected the relative target to be created inside base_dir ({}), not the process cwd",
+            base_dir.display()
+        );
+
+        std::fs::remove_file(&expected_path).ok();
+        std::fs::remove_dir(&base_dir).ok();
     }
 
     #[test]

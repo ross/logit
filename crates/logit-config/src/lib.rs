@@ -187,9 +187,13 @@ pub enum ComponentKind {
 /// this type actually accepts is a string, `stdout`/`stderr` included, so that's the schema ADR
 /// 0003 needs published, not an artifact of what a derive would guess from the variants.
 ///
+/// A relative `Path` is resolved against the config file's own directory (`crates/logit-cli/src/
+/// pipeline.rs::build_spec`, mirroring how `LuaFile { lua_file, .. }` resolves its script path) --
+/// not the process's current working directory, so "next to the config" below is literal.
+///
 /// Two consequences worth knowing, both accepted rather than worked around:
-/// - A file literally named `stdout` (or `stderr`) in the working directory is unreachable this
-///   way -- write `./stdout` in config to target it instead.
+/// - A file literally named `stdout` (or `stderr`) next to the config is unreachable this way --
+///   write `./stdout` in config to target it instead.
 /// - A typo like `stdrr` silently becomes a file path rather than a config error. That's the price
 ///   of the one-field shape; it's visible immediately in practice, since the (wrongly-named) file
 ///   appears next to the config the moment an event is written.

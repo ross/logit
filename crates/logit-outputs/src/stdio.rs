@@ -3,6 +3,15 @@
 //! anyone getting started with `logit` reaches for before standing up a real backend like
 //! InfluxDB.
 //!
+//! **This deliberately renders a readable text block, not one JSON object per event.** The
+//! original `docs/plans/0002-nginx-integration.md` sketch called for JSON before workstream A
+//! landed (`Event` carrying `log`/`metrics`/`span` independently, ADR 0012); once building this
+//! for real, a block a person can read at a glance in a terminal won -- this is a debugging/
+//! dev-loop sink for a human, not a machine-parseable export format (that's what
+//! `logit-outputs::influxdb`'s line protocol is for, and an NDJSON `Format` variant remains a
+//! reasonable future addition if a real consumer needs one). See that plan document's workstream D
+//! section (marked superseded there) and `docs/known-gaps.md` for the accepted consequences.
+//!
 //! Split the way `InfluxDbOutput`/`InfluxLineEncoder` are (`crates/logit-outputs/src/influxdb.rs`):
 //! a pure [`EventDump`] encoder (`&EventBatch` -> `String`, no file descriptor anywhere) plus the
 //! thin [`StdioOutput`] that owns the open target and writes/flushes it. Every format test below
@@ -11,16 +20,24 @@
 //! The encoder is deliberately built around a [`Format`] enum with a single variant today
 //! (`Format::Human`), and the per-value/per-metric rendering (`render_value`/`render_metric`) is
 //! kept as free functions rather than inlined into one big match -- a future user-supplied
-//! `format:` template string is explicitly designed *for* here (a `Format::Template(String)`
-//! variant plus a renderer that calls the same free functions) but not built now.
+//! `format:` template string (or an NDJSON variant) is explicitly designed *for* here (a new
+//! `Format` variant plus a renderer that calls the same free functions) but not built now.
+//!
+//! Every string rendered here -- a value, but also an attribute/map key or a metric/unit name, all
+//! of which can originate from attacker-influenced input (a syslog line, a JSON body) rather than
+//! trusted local config -- goes through [`render_quoted_str`] or [`render_key`], which escape
+//! every C0 control character (including ESC, so an embedded terminal escape/OSC sequence can't
+//! repaint or otherwise hijack the viewer's terminal) and DEL, and quote any key that isn't a
+//! plain identifier-shaped string (so a key containing a space, `=`, or newline can't be
+//! misread as extra tokens or an injected fake line).
 
 use crate::Output;
 use anyhow::Context;
 use logit_core::interner::resolve;
 use logit_core::time::format_rfc3339_utc;
 use logit_core::{
-    AttrMap, Event, EventBatch, MetricKind, MetricRecord, Severity, SpanKind, SpanRecord,
-    SpanStatus, Value,
+    AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource, Severity, SpanEvent, SpanKind,
+    SpanLink, SpanRecord, SpanStatus, Value,
 };
 use std::path::Path;
 use tokio::io::{self, AsyncWriteExt};
@@ -57,7 +74,7 @@ impl EventDump {
                     if i > 0 {
                         out.push('\n');
                     }
-                    render_event_block(&mut out, event);
+                    render_event_block(&mut out, &batch.resource, event);
                 }
                 out
             }
@@ -70,7 +87,12 @@ impl EventDump {
 /// always emits at least the timestamp line -- a completely empty event (legal under
 /// `docs/adr/0012-multi-payload-events.md`) still gets one, since silently printing nothing would
 /// be worse for a sink whose whole purpose is visibility.
-fn render_event_block(out: &mut String, event: &Event) {
+///
+/// `attrs` merges `resource`'s attributes underneath the event's own, the same precedence
+/// `logit-outputs::influxdb`'s `render_tag_suffix` uses: without this, two batches from different
+/// resources (different hosts/services) whose events otherwise match produce byte-identical debug
+/// output, defeating a big part of what a human reads this sink's output to tell apart.
+fn render_event_block(out: &mut String, resource: &Resource, event: &Event) {
     out.push_str(&format_rfc3339_utc(event.timestamp));
     if let Some(log) = &event.log {
         let severity = log.severity.map(severity_label).unwrap_or("-");
@@ -79,9 +101,13 @@ fn render_event_block(out: &mut String, event: &Event) {
     }
     out.push('\n');
 
-    if !event.attributes.is_empty() {
+    let mut attrs = resource.attributes.clone();
+    for (key, value) in event.attributes.iter() {
+        attrs.insert(resolve(key), value.clone());
+    }
+    if !attrs.is_empty() {
         out.push_str("  attrs   ");
-        render_attrs(out, &event.attributes);
+        render_attrs(out, &attrs);
         out.push('\n');
     }
 
@@ -95,6 +121,16 @@ fn render_event_block(out: &mut String, event: &Event) {
         out.push_str("  span    ");
         render_span(out, event.timestamp, span);
         out.push('\n');
+        for span_event in &span.events {
+            out.push_str("  span_event ");
+            render_span_event(out, span_event);
+            out.push('\n');
+        }
+        for link in &span.links {
+            out.push_str("  span_link ");
+            render_span_link(out, link);
+            out.push('\n');
+        }
     }
 }
 
@@ -116,7 +152,7 @@ fn render_attrs(out: &mut String, attrs: &AttrMap) {
         if i > 0 {
             out.push(' ');
         }
-        out.push_str(resolve(key));
+        render_key(out, resolve(key));
         out.push('=');
         render_value(out, value);
     }
@@ -127,7 +163,7 @@ fn render_attrs(out: &mut String, attrs: &AttrMap) {
 /// kind name followed by space-separated `field=value` pairs, matching the module doc comment's
 /// example block.
 fn render_metric(out: &mut String, metric: &MetricRecord) {
-    out.push_str(resolve(metric.name));
+    render_key(out, resolve(metric.name));
     out.push(' ');
     match &metric.kind {
         MetricKind::Counter(v) => {
@@ -169,7 +205,7 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
     }
     if let Some(unit) = metric.unit {
         out.push_str(" unit=");
-        out.push_str(resolve(unit));
+        render_key(out, resolve(unit));
     }
 }
 
@@ -197,6 +233,33 @@ fn render_span(out: &mut String, event_timestamp: i64, span: &SpanRecord) {
     // must still render *something* rather than panicking or wrapping to a nonsense huge value.
     out.push_str(&span.end_timestamp.saturating_sub(event_timestamp).to_string());
     out.push_str("ns");
+}
+
+/// `name=... at=<rfc3339> [attrs ...]` for one of a span's `events` (`SpanRecord::events`) --
+/// omitted previously, which meant two spans differing only in their annotations rendered
+/// identically.
+fn render_span_event(out: &mut String, span_event: &SpanEvent) {
+    out.push_str("name=");
+    render_value(out, &span_event.name);
+    out.push_str(" at=");
+    out.push_str(&format_rfc3339_utc(span_event.timestamp));
+    if !span_event.attributes.is_empty() {
+        out.push_str(" attrs ");
+        render_attrs(out, &span_event.attributes);
+    }
+}
+
+/// `trace_id=<hex> span_id=<hex> [attrs ...]` for one of a span's `links` (`SpanRecord::links`) --
+/// same omission as `render_span_event`, same fix.
+fn render_span_link(out: &mut String, link: &SpanLink) {
+    out.push_str("trace_id=");
+    push_hex(out, &link.trace_id);
+    out.push_str(" span_id=");
+    push_hex(out, &link.span_id);
+    if !link.attributes.is_empty() {
+        out.push_str(" attrs ");
+        render_attrs(out, &link.attributes);
+    }
 }
 
 fn push_hex(out: &mut String, bytes: &[u8]) {
@@ -258,7 +321,7 @@ fn render_value(out: &mut String, value: &Value) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                out.push_str(resolve(key));
+                render_key(out, resolve(key));
                 out.push('=');
                 render_value(out, value);
             }
@@ -267,6 +330,33 @@ fn render_value(out: &mut String, value: &Value) {
     }
 }
 
+/// Renders a map/attribute key, or a metric/unit name: bare when it's a "plain" identifier-shaped
+/// string (letters, digits, `.`, `_`, `-` -- everything every built-in producer today actually
+/// emits), quoted and escaped like any other string otherwise. Keys reaching this sink aren't
+/// necessarily trusted local config -- a `json`-parsed access-log body can hand an event an
+/// attribute keyed on arbitrary attacker-influenced text -- so a key containing a space, `=`, or
+/// newline must be quoted rather than written bare: written bare, it would either misparse
+/// visually (`a b=1` reads as two space-separated tokens) or, with an embedded newline, inject a
+/// fake extra output line.
+fn render_key(out: &mut String, key: &str) {
+    if is_plain_key(key) {
+        out.push_str(key);
+    } else {
+        render_quoted_str(out, key);
+    }
+}
+
+fn is_plain_key(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Quotes and escapes `s`. Beyond the usual `"`/`\`/`\n`/`\r`/`\t`, every other C0 control
+/// character (`0x00..=0x1F`) and DEL (`0x7F`) is escaped as `\xHH` too -- this is a human-facing
+/// *terminal* sink, and a value or key holding a raw ESC (`0x1B`) can otherwise emit a real
+/// OSC/CSI escape sequence that repaints or otherwise takes over the viewer's terminal, not just
+/// garbled text. Since a value can come from attacker-influenced input (a syslog line, a
+/// `json`-parsed body) rather than trusted local config, this has to hold for every string this
+/// sink ever writes, not just the visibly obvious ones.
 fn render_quoted_str(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
@@ -276,6 +366,9 @@ fn render_quoted_str(out: &mut String, s: &str) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
             c => out.push(c),
         }
     }
@@ -314,7 +407,10 @@ impl StdioOutput {
     /// Opens (creating if necessary) `path` in append mode, eagerly -- called from `build_spec` at
     /// config-build time, not lazily on the first `send`, so a bad path or a permissions error is a
     /// config error that fails before anything starts listening, exactly as an unset `!env`
-    /// variable or a missing `lua_file` already do.
+    /// variable or a missing `lua_file` already do. `path` is used exactly as given -- resolving a
+    /// relative `StdioTarget::Path` against the config file's directory (rather than the process's
+    /// current working directory) is `build_spec`'s job, the same way it resolves `LuaFile`'s
+    /// script path, not this constructor's.
     pub fn open_path(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let file = std::fs::OpenOptions::new()
@@ -444,6 +540,38 @@ mod tests {
     }
 
     #[test]
+    fn span_events_and_links_render_on_their_own_lines() {
+        let mut event = span_event(1_000_000_000, 1_500_000_000);
+        let mut event_attrs = AttrMap::new();
+        event_attrs.insert("retry", 1_i64);
+        let span_evt = SpanEvent {
+            timestamp: 1_200_000_000,
+            name: Value::str("retrying"),
+            attributes: event_attrs,
+        };
+        let mut link_attrs = AttrMap::new();
+        link_attrs.insert("relation", "follows_from");
+        let link = SpanLink { trace_id: [0xEF; 16], span_id: [0x12; 8], attributes: link_attrs };
+        match &mut event.span {
+            Some(span) => {
+                span.events.push(span_evt);
+                span.links.push(link);
+            }
+            None => unreachable!("span_event always builds a span"),
+        }
+
+        let out = encode(vec![event]);
+        assert!(out.contains("  span_event "), "got: {out}");
+        assert!(out.contains("name=\"retrying\""), "got: {out}");
+        assert!(out.contains("at=1970-01-01T00:00:01.200000000Z"), "got: {out}");
+        assert!(out.contains("retry=1"), "got: {out}");
+        assert!(out.contains("  span_link "), "got: {out}");
+        assert!(out.contains("trace_id=efefefefefefefefefefefefefefefef"), "got: {out}");
+        assert!(out.contains("span_id=1212121212121212"), "got: {out}");
+        assert!(out.contains(r#"relation="follows_from""#), "got: {out}");
+    }
+
+    #[test]
     fn mixed_log_and_metric_event_renders_both_sections() {
         let mut event = log_event(0, "GET /", Some(Severity::Info));
         event.metrics.push(MetricRecord {
@@ -460,6 +588,49 @@ mod tests {
     fn a_completely_empty_event_renders_just_its_timestamp_line_and_does_not_panic() {
         let out = encode(vec![Event::empty(0, AttrMap::new())]);
         assert_eq!(out, "1970-01-01T00:00:00.000000000Z\n");
+    }
+
+    /// Without merging the batch's `Resource` in, two batches from different resources whose
+    /// events otherwise match would render byte-identical output -- defeating a big part of what
+    /// a human reads a debug sink's output to tell apart. `render_tag_suffix`
+    /// (`logit-outputs::influxdb`) established the precedent this follows: resource attributes
+    /// underneath the event's own, event wins on a key collision.
+    #[test]
+    fn resource_attributes_are_included_and_the_event_overrides_on_collision() {
+        let mut resource = Resource::default();
+        resource.attributes.insert("host", "web-1");
+        resource.attributes.insert("env", "staging");
+        let mut event = Event::empty(0, AttrMap::new());
+        event.attributes.insert("env", "prod");
+        let batch = EventBatch { resource: Arc::new(resource), events: vec![event] };
+        let out = EventDump::default().encode(&batch);
+
+        assert!(out.contains(r#"host="web-1""#), "got: {out}");
+        assert!(out.contains(r#"env="prod""#), "event's own env should win over resource's: {out}");
+        assert!(!out.contains("staging"), "got: {out}");
+    }
+
+    /// Two otherwise-identical events differing only in which resource produced them must not
+    /// render identically -- the concrete regression this guards against.
+    #[test]
+    fn two_batches_from_different_resources_render_differently() {
+        let mut resource_a = Resource::default();
+        resource_a.attributes.insert("host", "web-1");
+        let mut resource_b = Resource::default();
+        resource_b.attributes.insert("host", "web-2");
+
+        let out_a = EventDump::default().encode(&EventBatch {
+            resource: Arc::new(resource_a),
+            events: vec![Event::empty(0, AttrMap::new())],
+        });
+        let out_b = EventDump::default().encode(&EventBatch {
+            resource: Arc::new(resource_b),
+            events: vec![Event::empty(0, AttrMap::new())],
+        });
+
+        assert_ne!(out_a, out_b, "different resources must produce distinguishable output");
+        assert!(out_a.contains(r#"host="web-1""#), "got: {out_a}");
+        assert!(out_b.contains(r#"host="web-2""#), "got: {out_b}");
     }
 
     #[test]
@@ -576,6 +747,32 @@ mod tests {
         event.attributes.insert("msg", Value::str("line1\nline2\t\"quoted\"\\backslash"));
         let out = encode(vec![event]);
         assert!(out.contains(r#"msg="line1\nline2\t\"quoted\"\\backslash""#), "got: {out}");
+    }
+
+    /// A raw ESC byte in a value must never reach the terminal unescaped -- a real
+    /// `\x1b[2J` (clear-screen) or other OSC/CSI sequence embedded in attacker-influenced input
+    /// (a syslog line, a `json`-parsed body) would otherwise be interpreted by the viewer's
+    /// terminal, not just displayed as text.
+    #[test]
+    fn escape_and_other_control_characters_in_a_value_are_escaped_not_emitted_raw() {
+        let mut event = Event::empty(0, AttrMap::new());
+        event.attributes.insert("payload", Value::str("clear\x1b[2Jscreen\x07bell\x00nul"));
+        let out = encode(vec![event]);
+        assert!(out.contains(r"clear\x1b[2Jscreen"), "ESC should be escaped, got: {out}");
+        assert!(out.contains(r"\x07bell"), "BEL should be escaped, got: {out}");
+        assert!(out.contains(r"\x00nul"), "NUL should be escaped, got: {out}");
+        assert!(!out.contains('\x1b'), "a raw ESC byte must never reach the output: {out:?}");
+        assert!(!out.contains('\x07'), "a raw BEL byte must never reach the output: {out:?}");
+    }
+
+    /// A key containing a space, `=`, or a newline must be quoted rather than written bare --
+    /// bare, it would either misparse visually or, with a newline, inject a fake extra line.
+    #[test]
+    fn a_key_that_is_not_a_plain_identifier_is_quoted_and_escaped() {
+        let mut event = Event::empty(0, AttrMap::new());
+        event.attributes.insert("weird key\nwith=stuff", "value");
+        let out = encode(vec![event]);
+        assert!(out.contains(r#""weird key\nwith=stuff"="value""#), "got: {out}");
     }
 
     #[test]
