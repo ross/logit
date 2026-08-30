@@ -45,20 +45,12 @@ error, rather than working. Accepted as a documented rough edge rather than solv
 coercing to a string, because the always-a-string alternative fails silently in the opposite,
 worse direction for numeric fields — see Alternatives.
 
-**Strictness depends on the command, matching what each is for.** `logit run` and `logit validate`
-error on an unset variable — `validate` is meant to be a real preflight, run before restarting a
-service, and it should catch a missing secret exactly the way `run` would. `logit graph` (docs:
-`docs/design/pipeline-graph.md`'s "`logit graph`" section) substitutes a `<unset:VAR>` placeholder
-and warns on stderr instead: it renders a config's *shape*, never its values, and its documented
-job is to render *something* useful even for a config that's otherwise broken — reading field
-values was never part of that contract, so this costs it nothing, and a missing variable alone
-never makes it exit non-zero. That placeholder is always a string, though, so it can still fail to
-type-check against a non-string field the same way a *set* variable's non-string value can (a
-`Duration`, an `f64`, a `bool`) — `logit graph` degrades further in exactly that case
-(`Loaded::Lenient`, `crates/logit-cli/src/config.rs`): it renders topology straight off the
-resolved YAML value instead of a validated `Config`, styling only the components whose kind
-happens to still resolve; see `docs/known-gaps.md` for what that fallback doesn't get exactly
-right (component style, semantic validation).
+**Every `!env` reference must resolve, unconditionally, for all three commands.** `logit run` and
+`logit validate` erroring on an unset variable is the obvious case — `validate` is meant to be a
+real preflight, run before restarting a service, and it should catch a missing secret exactly the
+way `run` would. `logit graph` errors too, even though it never reads a component's field values
+(only `sources` and `type`, to render topology and style nodes by role) — see Alternatives for why
+a lenient mode was tried and reverted.
 
 **Any tag other than `!env` is a hard error.** `serde_norway` silently drops an unrecognized tag
 on a field that isn't itself an enum, so a typo'd `!emv INFLUXDB_TOKEN` would otherwise
@@ -92,6 +84,18 @@ uniformly to all three rather than needing to be threaded through three call sit
   and every future numeric or boolean field would be unable to use `!env` at all rather than
   merely needing its variable's value quoted. Rejected as solving today's problem in a way that
   reintroduces tomorrow's.
+- **A lenient mode for `logit graph`**: substitute a placeholder string for an unset variable
+  instead of erroring, so a config missing its production secrets could still render (`logit
+  graph` never reads field values, only `sources`/`type`). Tried and reverted: the placeholder is
+  necessarily a string, which still fails to deserialize against a non-string field (a `Duration`,
+  an `f64`, a `bool`), so making this actually work required a second, independent rendering path
+  operating on the raw YAML value instead of a validated `Config` — real complexity (a `Loaded`
+  enum, a `render_lenient` that re-derives topology and best-effort node styling by hand) bought
+  for a DOT graph that, by construction, can never be complete (a component whose kind doesn't
+  resolve renders with a generic style, not its real listener/transform/sink shape) and skips
+  semantic validation entirely when triggered. Not worth it: `!env` failing loudly, in the same way
+  everywhere, is a simpler system to reason about than one command quietly meaning something
+  different from the other two.
 
 ## Consequences
 - `token_env: String` → `token: String` on `influxdb_out`, and `schema/logit.schema.json`

@@ -75,12 +75,9 @@ already built that have a known, accepted rough edge.
   directly into fields (ADR 0011) rather than referencing them by name, this becomes a real leak
   the moment an unimplemented kind gains one. Fix before that happens: redact or field-list instead
   of a blanket `{:?}`.
-- **`logit graph`'s fallback rendering has two known-coarse edges** (`Loaded::Lenient`,
-  `dot::render_lenient`, `crates/logit-cli/src/config.rs` and `dot.rs`) — reached when an `!env`
-  placeholder for a missing variable doesn't type-check against its field (a `Duration`, an `f64`,
-  a `bool`; ADR 0011). First, a component whose kind fails to individually resolve renders with a
-  generic dashed box rather than its real listener/transform/sink shape -- topology (the node, its
-  edges) is still correct, only the *style* is approximate. Second, semantic validation (cycles,
-  arity, unimplemented kinds) is skipped entirely in this mode, since it needs a real `Config` that
-  doesn't exist here -- a config with both a missing-variable placeholder problem and an unrelated
-  cycle would report only the former.
+- **`logit graph` can't render a config with any secret left unset** — every `!env` reference must
+  resolve for all three commands (ADR 0011), including `graph`, even though it only ever reads a
+  component's `sources`/`type` to render topology and style nodes by role. A lenient mode that
+  substituted a placeholder for a missing variable was tried and reverted (ADR 0011's
+  Alternatives) — visualizing a config's shape without its production secrets set needs a copy of
+  the config with dummy values filled in, not a feature of `logit graph` itself.

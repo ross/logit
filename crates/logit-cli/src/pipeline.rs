@@ -9,7 +9,7 @@
 //! implementation the runtime actually runs, which is exactly the "kind → impl" mapping this
 //! project has always kept in one place (previously `build_input`/`build_output`).
 
-use crate::config::{self, MissingEnv};
+use crate::config;
 use anyhow::Context;
 use logit_config::Config;
 use logit_inputs::statsd::StatsdInput;
@@ -28,9 +28,9 @@ use std::path::{Path, PathBuf};
 /// installed Ctrl-C handler, no drain of in-flight events on exit) -- Ctrl-C falls through to the
 /// OS default (immediate termination), same as any other long-running process with no handler.
 pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
-    // Strict: an unset `!env` variable (a missing token, most likely) fails here, before
-    // anything starts listening.
-    let config = config::load(&path, MissingEnv::Error)?;
+    // An unset `!env` variable (a missing token, most likely) fails here, before anything starts
+    // listening.
+    let config = config::load(&path)?;
     let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     run_config(config, base_dir).await
 }

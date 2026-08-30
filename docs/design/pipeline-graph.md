@@ -122,11 +122,10 @@ integer, `true` a bool; anything else, including a value that happens to look li
 sequence, stays a string) -- this is what lets `!env` work on a non-string field, at the cost of a
 secret that happens to look like a number or bool needing to be quoted at the source.
 
-`logit run` and `logit validate` fail on an unset variable; `logit graph` substitutes a
-`<unset:VAR>` placeholder and warns on stderr instead, so it keeps rendering *something* useful
-even for a config missing its production secrets (see "`logit graph`" below). Any tag other than
-`!env` is a hard error -- a typo'd tag would otherwise silently deserialize as the tag's literal
-argument string instead of failing.
+Every `!env` reference must resolve, unconditionally, for all three commands -- `logit graph`
+included, even though it never reads a component's field values (only `sources` and `type`). Any
+tag other than `!env` is a hard error too -- a typo'd tag would otherwise silently deserialize as
+the tag's literal argument string instead of failing.
 
 ## Roles come from kind, not topology
 
@@ -289,12 +288,9 @@ config is a graph rather than a list of linear pipelines.
 - Styles nodes by role (listener / transform / sink) so the shape of the data flow — where it
   enters, where it forks, where it lands — reads at a glance without cross-referencing the arity
   table.
-- Renders even when a `!env` placeholder for a missing variable doesn't type-check against its
-  field (a `Duration`, an `f64`, ...) and the config can't fully deserialize as a result
-  (`config::Loaded::Lenient`, "Environment substitution" above) — topology renders straight off
-  the raw resolved value in that case, and a component whose kind couldn't be individually
-  resolved gets a generic dashed style instead of its real role (`dot::render_lenient`;
-  `docs/known-gaps.md` for what that fallback doesn't get exactly right).
+- Still needs every `!env` reference in the config to resolve, though ("Environment substitution"
+  above) — a missing variable fails to load before `render` is ever called, same as `run`/
+  `validate`, even for a field this command never reads.
 
 Lives in `logit-cli` as a `Command::Graph` arm alongside `Schema`/`Validate`/`Run`
 (`crates/logit-cli/src/main.rs`); stays synchronous like `Schema`/`Validate` — it only needs the
