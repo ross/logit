@@ -195,11 +195,17 @@
           }
         },
         {
+          "description": "Parses a log record's message as JSON, merging the resulting key/values into the event's attributes. See `docs/adr/0010-json-parsing-into-attributes.md`.",
           "type": "object",
           "required": [
             "type"
           ],
           "properties": {
+            "skip_to_brace": {
+              "description": "Skip everything before the first `{` and parse from there -- for lines with a non-JSON prefix (`2026-08-29 INFO {\"a\":1}`). Off by default: the whole line is assumed to be the JSON data.",
+              "default": false,
+              "type": "boolean"
+            },
             "type": {
               "type": "string",
               "enum": [

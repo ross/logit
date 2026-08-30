@@ -15,7 +15,7 @@ use logit_inputs::statsd::StatsdInput;
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::NodeSpec;
-use logit_transforms::Aggregator;
+use logit_transforms::{Aggregator, JsonParser};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -82,6 +82,7 @@ fn build_spec(component: &ResolvedComponent, base_dir: &Path) -> anyhow::Result<
             NodeSpec::Lua { script, interval: *interval }
         }
         Aggregate { interval } => NodeSpec::Transform(Box::new(Aggregator::new(*interval))),
+        Json { skip_to_brace } => NodeSpec::Transform(Box::new(JsonParser::new(*skip_to_brace))),
 
         InfluxDbOut { url, org, bucket, token_env } => {
             let token = std::env::var(token_env).with_context(|| {
@@ -218,6 +219,16 @@ mod tests {
             sources: vec!["in".to_string()],
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Aggregate { interval: Duration::from_secs(10) },
+        };
+        assert!(matches!(build_spec(&component, Path::new("")).unwrap(), NodeSpec::Transform(_)));
+    }
+
+    #[test]
+    fn build_spec_builds_a_json_transform() {
+        let component = ResolvedComponent {
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Json { skip_to_brace: true },
         };
         assert!(matches!(build_spec(&component, Path::new("")).unwrap(), NodeSpec::Transform(_)));
     }
