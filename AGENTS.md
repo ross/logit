@@ -17,13 +17,17 @@ InfluxDB 2.x out, via `logit run <config>` (see [examples/statsd-to-influxdb.yam
 `script/server`). Config is a flat graph of named components (ADR 0009,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
-is now just the kind → implementation registry. `logit graph <config>` prints the resolved graph as
-graphviz DOT (`crates/logit-cli/src/dot.rs`). `aggregate` (`crates/logit-transforms`) is the only
-built-in transform implemented so far — `logit run` rejects a config referencing any other
-unimplemented kind with a clear error; see [ADR 0008](docs/adr/0008-aggregation-window-semantics.md)
-for its windowing semantics, `crates/logit-inputs/src/statsd.rs` and
-`crates/logit-outputs/src/influxdb.rs` for the listener/sink side, `crates/logit-pipeline/src/runtime.rs`
-for orchestration and the per-node flush-tick timer.
+is now just the kind → implementation registry. Config files are read and parsed exclusively
+through `logit_cli::config::load` (`crates/logit-cli/src/config.rs`), which also resolves `!env
+VAR_NAME` -- any field on any component can pull its value from the environment this way (ADR
+0010), which is why `influxdb_out`'s `token` is a plain string, not an env-specific field. `logit
+graph <config>` prints the resolved graph as graphviz DOT (`crates/logit-cli/src/dot.rs`).
+`aggregate` (`crates/logit-transforms`) is the only built-in transform implemented so far — `logit
+run` rejects a config referencing any other unimplemented kind with a clear error; see
+[ADR 0008](docs/adr/0008-aggregation-window-semantics.md) for its windowing semantics,
+`crates/logit-inputs/src/statsd.rs` and `crates/logit-outputs/src/influxdb.rs` for the
+listener/sink side, `crates/logit-pipeline/src/runtime.rs` for orchestration and the per-node
+flush-tick timer.
 
 ## Environment
 
@@ -72,6 +76,9 @@ for no real benefit here. A merge commit costs nothing extra and pushes normally
   doc section and, where relevant, what to build next — see `logit-script`, `logit-proto`, and the
   `statsd`/`influxdb` stubs. Follow that pattern for new stubs rather than silently returning a
   default.
+- **A config file is always read through `logit_cli::config::load`**, never a bare
+  `std::fs::read_to_string` + `serde_norway::from_str` — that's what resolves `!env` and rejects an
+  unknown YAML tag (ADR 0010); a call site that bypasses it silently loses both.
 
 ## Design constraints that aren't optional
 

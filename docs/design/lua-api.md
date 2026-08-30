@@ -159,7 +159,7 @@ components:
     url: http://influxdb:8086
     org: logit
     bucket: metrics
-    token_env: INFLUXDB_TOKEN
+    token: !env INFLUXDB_TOKEN
 ```
 
 A `lua`/`lua_file` component's `interval` is optional and drives that component's own `flush()` the

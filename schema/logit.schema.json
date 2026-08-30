@@ -393,7 +393,7 @@
           "required": [
             "bucket",
             "org",
-            "token_env",
+            "token",
             "type",
             "url"
           ],
@@ -404,8 +404,8 @@
             "org": {
               "type": "string"
             },
-            "token_env": {
-              "description": "Referenced, not inlined -- kept out of the schema/config-dump path deliberately.",
+            "token": {
+              "description": "A plain string field like any other -- give it `!env INFLUXDB_TOKEN` in config to pull it from the environment (`crates/logit-cli/src/config.rs`) rather than inlining it. No env-specific field of its own: `!env` works on any field on any component, so `url`/`org`/`bucket` (just as deployment-specific) can use it too.",
               "type": "string"
             },
             "type": {

@@ -35,7 +35,7 @@ components:
     url: http://influxdb:8086
     org: logit
     bucket: metrics
-    token_env: INFLUXDB_TOKEN
+    token: !env INFLUXDB_TOKEN
 ```
 
 This is the same statsd → aggregate → Lua → InfluxDB shape as today's
@@ -74,7 +74,7 @@ pub enum ComponentKind {
     // as each lands in logit-transforms, same shape: a `ComponentKind` variant, no `sources`
     // opinion of its own (that lives on `Component`, uniformly).
 
-    InfluxDbOut { url: String, org: String, bucket: String, token_env: String },
+    InfluxDbOut { url: String, org: String, bucket: String, token: String },
     OtlpOut { endpoint: String },
     LogitOut { endpoint: String },
 }
@@ -100,6 +100,32 @@ JSON Schema. Confirm `schema/logit.schema.json` still validates real configs and
 round-trips it before committing to this exact shape; if `flatten` misbehaves, the fallback is
 repeating `sources: Vec<String>` on every `ComponentKind` variant instead of factoring it onto
 `Component`.
+
+## Environment substitution
+
+`!env VAR_NAME` is a YAML tag, valid as the value of any field on any component, resolved against
+the process environment when the config is loaded (`crates/logit-cli/src/config.rs`) --
+[ADR 0010](../adr/0010-env-yaml-tag.md). It's what `influxdb_out`'s `token` above is for: rather
+than a dedicated `token_env` field (an earlier, rejected design -- see the ADR), any field that's
+secret or deployment-specific spells it the same way:
+
+```yaml
+url: !env INFLUXDB_URL
+token: !env INFLUXDB_TOKEN
+```
+
+Resolution happens on the parsed YAML tree, before serde ever sees it, so `Config`'s types carry no
+trace of it: a `!env`-tagged field looks, to serde, exactly like a field written with the
+substituted value inline. The substituted value is re-parsed as a YAML scalar (`8125` becomes an
+integer, `true` a bool; anything else, including a value that happens to look like a mapping or
+sequence, stays a string) -- this is what lets `!env` work on a non-string field, at the cost of a
+secret that happens to look like a number or bool needing to be quoted at the source.
+
+`logit run` and `logit validate` fail on an unset variable; `logit graph` substitutes a
+`<unset:VAR>` placeholder and warns on stderr instead, so it keeps rendering *something* useful
+even for a config missing its production secrets (see "`logit graph`" below). Any tag other than
+`!env` is a hard error -- a typo'd tag would otherwise silently deserialize as the tag's literal
+argument string instead of failing.
 
 ## Roles come from kind, not topology
 

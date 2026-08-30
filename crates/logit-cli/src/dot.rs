@@ -53,7 +53,7 @@ mod tests {
                     url: "u".to_string(),
                     org: "o".to_string(),
                     bucket: "b".to_string(),
-                    token_env: "T".to_string(),
+                    token: "T".to_string(),
                 },
             },
         );
@@ -78,7 +78,7 @@ mod tests {
                     url: "u".to_string(),
                     org: "o".to_string(),
                     bucket: "b".to_string(),
-                    token_env: "T".to_string(),
+                    token: "T".to_string(),
                 },
             },
         );

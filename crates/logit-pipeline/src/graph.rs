@@ -271,7 +271,7 @@ mod tests {
             url: "http://localhost:8086".to_string(),
             org: "org".to_string(),
             bucket: "bucket".to_string(),
-            token_env: "TOKEN".to_string(),
+            token: "TOKEN".to_string(),
         }
     }
 
