@@ -7,15 +7,16 @@
 //! 1. At least one component.
 //! 2. Every `sources` id resolves to a defined component.
 //! 3. No self-reference.
-//! 4. No cycles.
-//! 5. Arity per kind (listener: no sources; transform/sink: at least one).
-//! 6. Every non-sink component has at least one consumer.
-//! 7. Kind is implemented.
-//! 8. No zero-length `interval` on a kind that has one.
+//! 4. No duplicate source within one component's `sources` list.
+//! 5. No cycles.
+//! 6. Arity per kind (listener: no sources; transform/sink: at least one).
+//! 7. Every non-sink component has at least one consumer.
+//! 8. Kind is implemented.
+//! 9. No zero-length `interval` on a kind that has one.
 //!
-//! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 4 + 6: every
+//! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
-//! it is required (by 6) to have a consumer, so the chain can only terminate at a sink.
+//! it is required (by 7) to have a consumer, so the chain can only terminate at a sink.
 
 use logit_config::{Component, ComponentKind, Config};
 use std::collections::{HashMap, VecDeque};
@@ -114,14 +115,24 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         anyhow::bail!("config defines no components");
     }
 
-    // Rules 2 + 3: every source resolves, no self-reference.
+    // Rules 2 + 3 + 4: every source resolves, no self-reference, no duplicate source within one
+    // component's `sources` list. The last of these matters beyond tidiness: a duplicate would
+    // otherwise push the same consumer id into `consumers` twice below, so that source's `Fanout`
+    // would hold two live `Sender` clones pointing at the same inbox and deliver every batch to
+    // it twice -- a repeated source id would silently double telemetry (and, through an
+    // `aggregate` component, double every aggregated count) rather than being rejected as the
+    // config typo it almost certainly is.
     for (id, component) in &components {
+        let mut seen = std::collections::HashSet::with_capacity(component.sources.len());
         for source in &component.sources {
             if source == id {
                 anyhow::bail!("component '{id}' lists itself as a source");
             }
             if !components.contains_key(source) {
                 anyhow::bail!("component '{id}' references unknown source '{source}'");
+            }
+            if !seen.insert(source) {
+                anyhow::bail!("component '{id}' lists source '{source}' more than once");
             }
         }
     }
@@ -135,11 +146,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 4: cycle detection, via Kahn's algorithm -- its natural byproduct is also the
+    // Rule 5: cycle detection, via Kahn's algorithm -- its natural byproduct is also the
     // listener-first topological order `Graph::topological_order` publishes.
     let topological_order = topological_order(&components)?;
 
-    // Rule 5: arity per kind.
+    // Rule 6: arity per kind.
     for (id, component) in &components {
         match role(&component.kind) {
             Role::Listener if !component.sources.is_empty() => {
@@ -163,21 +174,21 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 6: every non-sink component needs at least one consumer.
+    // Rule 7: every non-sink component needs at least one consumer.
     for (id, component) in &components {
         if role(&component.kind) != Role::Sink && consumers.get(id).is_none_or(Vec::is_empty) {
             anyhow::bail!("component '{id}' has no consumers -- nothing reads what it produces");
         }
     }
 
-    // Rule 7: kind implemented.
+    // Rule 8: kind implemented.
     for (id, component) in &components {
         if !is_implemented(&component.kind) {
             anyhow::bail!("component '{id}': kind {:?} is not implemented yet", component.kind);
         }
     }
 
-    // Rule 8: no zero-length flush interval.
+    // Rule 9: no zero-length flush interval.
     for (id, component) in &components {
         if interval(&component.kind) == Some(Duration::ZERO) {
             anyhow::bail!(
@@ -306,6 +317,16 @@ mod tests {
     fn self_reference_is_rejected() {
         let err = expect_err(cfg(vec![("a", vec!["a"], lua())]));
         assert!(err.contains("lists itself as a source"), "got: {err}");
+    }
+
+    /// A repeated source id would otherwise push the same consumer into `consumers` twice, giving
+    /// that source's `Fanout` two live `Sender` clones pointing at the same inbox -- silently
+    /// doubling every batch delivered, not a cosmetic issue.
+    #[test]
+    fn duplicate_source_within_one_component_is_rejected() {
+        let err =
+            expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in", "in"], sink())]));
+        assert!(err.contains("lists source 'in' more than once"), "got: {err}");
     }
 
     #[test]
