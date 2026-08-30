@@ -14,9 +14,11 @@ anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 reqwest.workspace = true
+# Was dev-only; now a real dependency -- InfluxDbOutput::send's retry loop needs
+# tokio::time::{Instant, sleep} (docs/adr/0013-service-lifecycle-and-output-retry.md).
+tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
 # Only for the end-to-end regression test that a Lua enrichment stage doesn't silently change an
 # attribute's InfluxDB tag-inclusion behavior -- see
 # bytes_attribute_stays_excluded_from_tags_after_a_lua_enrichment_stage below.

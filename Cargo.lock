@@ -674,6 +674,7 @@ dependencies = [
  "anyhow",
  "clap",
  "logit-config",
+ "logit-core",
  "logit-inputs",
  "logit-outputs",
  "logit-pipeline",

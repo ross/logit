@@ -5,7 +5,7 @@
 use crate::Output;
 use bytes::Bytes;
 use logit_core::interner::resolve;
-use logit_core::{Event, EventBatch, MetricKind, MetricRecord, Resource, Value};
+use logit_core::{Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Value};
 use logit_proto::{CodecError, Encoder};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -15,6 +15,49 @@ use std::time::Duration;
 /// worker driving it -- indefinitely.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bounded retry for a transient write failure, so one InfluxDB 5xx no longer ends `logit run`
+/// outright (`docs/adr/0013-service-lifecycle-and-output-retry.md`). `total_budget` is a hard
+/// wall-clock ceiling, not an attempt count: `send` runs inline in the pipeline's drain loop
+/// (`logit_pipeline::runtime::run_output`), so an unbounded retry would stall the whole upstream
+/// path and silently drop UDP intake at the kernel socket buffer while it waited. The default
+/// (~5s) sits comfortably inside the 10s aggregation window -- long enough to ride out a blip or a
+/// single 5xx, not long enough to ride out a real outage (that needs delivery decoupled from the
+/// drain loop entirely; tracked in `docs/known-gaps.md`, deliberately out of scope here).
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// Hard ceiling on total time spent inside one `send` call, across every attempt and every
+    /// backoff sleep combined. Checked before starting each attempt and before each backoff sleep.
+    pub total_budget: Duration,
+    /// Backoff after attempt `n` is `base_delay * 2^(n-1)`, capped at `max_delay` and further
+    /// clamped to whatever's left of `total_budget`. No jitter: there's exactly one writer per
+    /// `InfluxDbOutput`, not a fleet thundering-herding a shared endpoint.
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+    /// Per-attempt request timeout while retrying. Independently clamped against
+    /// [`InfluxDbOutput::with_timeout`]'s setting and the remaining budget -- whichever is
+    /// smallest wins -- so a single stalled attempt can never consume the whole budget on its own.
+    pub attempt_timeout: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            total_budget: Duration::from_secs(5),
+            base_delay: Duration::from_millis(200),
+            max_delay: Duration::from_secs(2),
+            attempt_timeout: Duration::from_secs(2),
+        }
+    }
+}
+
+/// 429 (InfluxDB's own rate-limit response) and any 5xx are treated as transient and retried --
+/// 429 is a deliberate, narrow deviation from "a 4xx stays a hard failure" (see ADR 0013). Every
+/// other 4xx bails on the first attempt: it's a config error (a bad org/bucket/token), and
+/// retrying it would only delay a diagnosis that's already available.
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status.as_u16() == 429
+}
+
 pub struct InfluxDbOutput {
     url: String,
     org: String,
@@ -22,6 +65,12 @@ pub struct InfluxDbOutput {
     token: String,
     client: reqwest::Client,
     encoder: InfluxLineEncoder,
+    /// Tracked separately from `client` (which bakes a timeout in at build time with no way to
+    /// read it back out) so `send` can clamp each attempt's timeout against both this and
+    /// `retry.attempt_timeout` -- whichever the caller configured more tightly.
+    request_timeout: Duration,
+    retry: RetryPolicy,
+    diag: Diagnostics,
 }
 
 impl InfluxDbOutput {
@@ -32,13 +81,33 @@ impl InfluxDbOutput {
             bucket,
             token,
             client: build_client(DEFAULT_TIMEOUT),
-            encoder: InfluxLineEncoder,
+            encoder: InfluxLineEncoder::default(),
+            request_timeout: DEFAULT_TIMEOUT,
+            retry: RetryPolicy::default(),
+            diag: Diagnostics::default(),
         }
     }
 
     /// Overrides the default 10s request timeout. Rebuilds the underlying HTTP client.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.client = build_client(timeout);
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Overrides the default retry policy (see [`RetryPolicy`]'s doc comment for why the default
+    /// exists and what it does and doesn't ride out).
+    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// Attaches a component id to this output's diagnostics -- both its own (retry/backoff
+    /// reports) and its encoder's (per-metric encode failures), so both sides of one component
+    /// report under the same id.
+    pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.encoder = self.encoder.with_diagnostics(diag.clone());
+        self.diag = diag;
         self
     }
 }
@@ -61,27 +130,84 @@ impl Output for InfluxDbOutput {
             return Ok(());
         }
 
+        // Encoded once, before the retry loop: `encode` is deterministic, so re-running it on a
+        // retry would be pointless. `Bytes::clone` is a cheap refcount bump, not a copy -- one
+        // clone per attempt is fine.
         let write_url = format!("{}/api/v2/write", self.url.trim_end_matches('/'));
-        let resp = self
-            .client
-            .post(&write_url)
-            .query(&[
-                ("org", self.org.as_str()),
-                ("bucket", self.bucket.as_str()),
-                ("precision", "ns"),
-            ])
-            .header("Authorization", format!("Token {}", self.token))
-            .header("Content-Type", "text/plain; charset=utf-8")
-            .body(body)
-            .send()
-            .await?;
+        let deadline = tokio::time::Instant::now() + self.retry.total_budget;
+        let mut attempt: u32 = 0;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("InfluxDB write failed ({status}): {text}");
+        loop {
+            attempt += 1;
+            let now = tokio::time::Instant::now();
+            // Never bail before a first attempt has actually run, even if `total_budget` is
+            // pathologically tiny -- only a *retry* is gated on the deadline.
+            if attempt > 1 && now >= deadline {
+                anyhow::bail!(
+                    "InfluxDB write did not succeed within the {:?} retry budget after {} \
+                     attempt(s)",
+                    self.retry.total_budget,
+                    attempt - 1,
+                );
+            }
+
+            // Floored at 1ms: a zero-duration reqwest timeout fails immediately rather than
+            // giving this attempt any real chance, turning "budget nearly exhausted" into
+            // "budget already exhausted" a beat early.
+            let remaining = deadline.saturating_duration_since(now).max(Duration::from_millis(1));
+            let attempt_timeout =
+                self.request_timeout.min(self.retry.attempt_timeout).min(remaining);
+
+            let result = self
+                .client
+                .post(&write_url)
+                .query(&[
+                    ("org", self.org.as_str()),
+                    ("bucket", self.bucket.as_str()),
+                    ("precision", "ns"),
+                ])
+                .header("Authorization", format!("Token {}", self.token))
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .timeout(attempt_timeout)
+                .body(body.clone())
+                .send()
+                .await;
+
+            let failure = match result {
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) => {
+                    let status = resp.status();
+                    if !is_retryable_status(status) {
+                        let text = resp.text().await.unwrap_or_default();
+                        anyhow::bail!("InfluxDB write failed ({status}): {text}");
+                    }
+                    let text = resp.text().await.unwrap_or_default();
+                    format!("HTTP {status}: {text}")
+                }
+                Err(err) => err.to_string(),
+            };
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                anyhow::bail!(
+                    "InfluxDB write did not succeed within the {:?} retry budget after \
+                     {attempt} attempt(s); last error: {failure}",
+                    self.retry.total_budget,
+                );
+            }
+            let shift = (attempt - 1).min(16); // 16 is already far past max_delay's cap
+            let backoff = self
+                .retry
+                .base_delay
+                .saturating_mul(2u32.pow(shift))
+                .min(self.retry.max_delay)
+                .min(deadline.saturating_duration_since(now));
+
+            self.diag.warn(format_args!(
+                "InfluxDB write attempt {attempt} failed ({failure}), retrying in {backoff:?}"
+            ));
+            tokio::time::sleep(backoff).await;
         }
-        Ok(())
     }
 }
 
@@ -93,7 +219,17 @@ impl Output for InfluxDbOutput {
 /// yet for what a log line or span becomes in InfluxDB, and guessing one isn't this output's job).
 /// An event can carry several metrics at once now (`docs/adr/0012-multi-payload-events.md`), so
 /// each one becomes its own line, sharing that event's tags.
-struct InfluxLineEncoder;
+#[derive(Default)]
+struct InfluxLineEncoder {
+    diag: Diagnostics,
+}
+
+impl InfluxLineEncoder {
+    fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.diag = diag;
+        self
+    }
+}
 
 impl Encoder for InfluxLineEncoder {
     fn encode(&mut self, batch: &EventBatch) -> Result<Bytes, CodecError> {
@@ -122,8 +258,6 @@ impl Encoder for InfluxLineEncoder {
                 // the batch, so this logs and skips rather than propagating via `?`. Deliberately
                 // on the inner, per-metric loop: a `Set` or `#`-prefixed metric sharing an event
                 // with a perfectly good one must not take the good one down with it.
-                // TODO: route through a proper diagnostics facility once one exists, instead of
-                // stderr -- same gap noted in logit-inputs::statsd.
                 if let Err(err) = encode_metric_line(
                     &mut buf,
                     &tag_suffix,
@@ -131,7 +265,7 @@ impl Encoder for InfluxLineEncoder {
                     event.timestamp,
                     &mut series_allocated_timestamps,
                 ) {
-                    eprintln!("influxdb output: {err}");
+                    self.diag.warn_throttled("encode_error", err);
                 }
             }
         }
@@ -422,7 +556,7 @@ mod tests {
     }
 
     fn encode(events: Vec<Event>) -> String {
-        let mut encoder = InfluxLineEncoder;
+        let mut encoder = InfluxLineEncoder::default();
         let bytes = encoder.encode(&batch_with(events)).expect("encode should succeed");
         String::from_utf8(bytes.to_vec()).expect("output should be valid utf-8")
     }
@@ -536,7 +670,7 @@ mod tests {
         let mut event = metric_event("page.views", MetricKind::Counter(1.0), &[("env", "prod")]);
         event.attributes.insert("env", "prod"); // already set by metric_event; explicit for clarity
 
-        let mut encoder = InfluxLineEncoder;
+        let mut encoder = InfluxLineEncoder::default();
         let batch = EventBatch { resource: Arc::new(resource), events: vec![event] };
         let out = String::from_utf8(encoder.encode(&batch).unwrap().to_vec()).unwrap();
 
@@ -801,14 +935,20 @@ mod tests {
         assert_eq!(out, "nginx.requests value=1 1700000000000000000\n");
     }
 
+    /// A stalled connection now gets retried (a request timeout is a transport error, and
+    /// transport errors are retryable -- ADR 0013), so this pins the *budget-bounded* behavior
+    /// rather than a single 200ms timeout: give up promptly once the retry budget itself is
+    /// exhausted, never hang, and never burn anywhere near the default ~5s budget in a test.
     #[tokio::test]
-    async fn write_times_out_against_a_stalled_server() {
+    async fn write_gives_up_within_its_retry_budget_against_a_permanently_stalled_server() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        // Accepts the TCP connection (so this isn't just "connection refused") and then never
-        // responds -- the exact scenario a request timeout exists to catch.
+        // Accepts every connection (so this isn't just "connection refused") and never responds
+        // on any of them -- the exact scenario a request timeout exists to catch, now exercised
+        // across however many retry attempts fit in the budget below.
         tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
                 std::mem::forget(stream); // keep it open; a dropped socket would close cleanly
             }
         });
@@ -819,17 +959,165 @@ mod tests {
             "bucket".to_string(),
             "token".to_string(),
         )
-        .with_timeout(Duration::from_millis(200));
+        .with_timeout(Duration::from_millis(50))
+        .with_retry(RetryPolicy {
+            total_budget: Duration::from_millis(300),
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(50),
+            attempt_timeout: Duration::from_millis(50),
+        });
 
         let batch = batch_with(vec![metric_event("x", MetricKind::Counter(1.0), &[])]);
         let start = std::time::Instant::now();
         let result = output.send(batch).await;
 
-        assert!(result.is_err(), "expected the stalled write to time out, not hang or succeed");
+        assert!(result.is_err(), "expected the stalled write to eventually give up, not hang");
         assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "should have timed out at ~200ms, not hung: took {:?}",
+            start.elapsed() < Duration::from_secs(1),
+            "should give up within the ~300ms retry budget, not hang: took {:?}",
             start.elapsed()
+        );
+    }
+
+    /// A bare HTTP/1.1 server for retry tests: writes back one canned response per accepted
+    /// connection (repeating the last one past the end of the list), then closes -- matching this
+    /// file's existing no-mock-crate style (`write_gives_up_within_its_retry_budget_...` above).
+    /// `Connection: close` on every response means reqwest opens a fresh connection per request
+    /// rather than reusing one, so the returned counter is exactly the number of `send` attempts.
+    async fn canned_server(
+        responses: Vec<&'static str>,
+    ) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_task = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let i = count_task.fetch_add(1, Ordering::SeqCst);
+                let response = responses.get(i).or(responses.last()).copied().unwrap_or("");
+                let mut buf = [0u8; 8192];
+                // Drain (some of) the request so the client's write isn't left blocked on a full
+                // socket buffer; a short timeout in case a client sends nothing (shouldn't happen
+                // here, but a hung read must not wedge this server thread).
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await;
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (addr, count)
+    }
+
+    const RESP_204: &str = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+    const RESP_400: &str =
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const RESP_429: &str =
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const RESP_503: &str =
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    fn fast_retry() -> RetryPolicy {
+        RetryPolicy {
+            total_budget: Duration::from_secs(2),
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(10),
+            attempt_timeout: Duration::from_millis(500),
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_on_5xx_then_succeeds() {
+        let (addr, count) = canned_server(vec![RESP_503, RESP_503, RESP_204]).await;
+        let mut output = InfluxDbOutput::new(
+            format!("http://{addr}"),
+            "org".into(),
+            "bucket".into(),
+            "token".into(),
+        )
+        .with_retry(fast_retry());
+
+        let batch = batch_with(vec![metric_event("x", MetricKind::Counter(1.0), &[])]);
+        output.send(batch).await.expect("should eventually succeed once the 503s clear");
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "expected exactly 3 attempts: two 503s, then the 204"
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_a_429_rate_limit_response() {
+        // 429 is InfluxDB's own rate-limit response and genuinely transient -- the one deliberate
+        // deviation from "a 4xx is a hard failure" (ADR 0013).
+        let (addr, count) = canned_server(vec![RESP_429, RESP_204]).await;
+        let mut output = InfluxDbOutput::new(
+            format!("http://{addr}"),
+            "org".into(),
+            "bucket".into(),
+            "token".into(),
+        )
+        .with_retry(fast_retry());
+
+        let batch = batch_with(vec![metric_event("x", MetricKind::Counter(1.0), &[])]);
+        output.send(batch).await.expect("should succeed after the rate limit clears");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_a_4xx_other_than_429() {
+        let (addr, count) = canned_server(vec![RESP_400]).await;
+        let mut output = InfluxDbOutput::new(
+            format!("http://{addr}"),
+            "org".into(),
+            "bucket".into(),
+            "token".into(),
+        )
+        .with_retry(fast_retry());
+
+        let batch = batch_with(vec![metric_event("x", MetricKind::Counter(1.0), &[])]);
+        let result = output.send(batch).await;
+        assert!(result.is_err(), "a 400 should still fail send");
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a 4xx other than 429 must fail on the first attempt, not retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausts_the_retry_budget_and_fails_on_a_persistent_5xx() {
+        let (addr, count) = canned_server(vec![RESP_503]).await; // every attempt gets a 503
+        let mut output = InfluxDbOutput::new(
+            format!("http://{addr}"),
+            "org".to_string(),
+            "bucket".to_string(),
+            "token".to_string(),
+        )
+        .with_retry(RetryPolicy {
+            total_budget: Duration::from_millis(100),
+            base_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(20),
+            attempt_timeout: Duration::from_millis(500),
+        });
+
+        let batch = batch_with(vec![metric_event("x", MetricKind::Counter(1.0), &[])]);
+        let start = std::time::Instant::now();
+        let result = output.send(batch).await;
+
+        assert!(result.is_err(), "persistent 5xx should still fail once the budget runs out");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "should give up within the ~100ms budget, not hang: took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            count.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "expected more than one attempt inside the retry budget"
         );
     }
 }

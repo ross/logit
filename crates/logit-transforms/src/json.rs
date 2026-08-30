@@ -7,7 +7,7 @@
 //! `process`, taking the trait's default `flush_interval`/`flush`.
 
 use bytes::Bytes;
-use logit_core::{AttrMap, Event, Resource, Value};
+use logit_core::{AttrMap, Diagnostics, Event, Resource, Value};
 use logit_pipeline::Transform;
 use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use std::fmt;
@@ -18,18 +18,25 @@ use std::sync::Arc;
 /// Any metrics/span already on the event ride through unaffected either way -- only `log.message`
 /// is read and only `attributes` is written. A message that fails to parse (or, with
 /// `skip_to_brace` off, isn't a JSON object at all) also passes through untouched, with a
-/// diagnostic on stderr (`docs/known-gaps.md`'s `eprintln!` gap) -- dropping telemetry over one
-/// malformed line is worse than a no-op.
+/// count-throttled diagnostic (`Diagnostics::warn_throttled`, `docs/adr/0013-service-lifecycle-
+/// and-output-retry.md`) -- dropping telemetry over one malformed line is worse than a no-op, and
+/// a high-volume malformed source must not flood stderr one line per event either.
 pub struct JsonParser {
     /// Skip everything before the first `{` and parse from there, tolerating trailing content
     /// after the object closes. Off by default: the whole line is assumed to be the JSON data,
     /// and trailing non-whitespace after it is a parse failure.
     skip_to_brace: bool,
+    diag: Diagnostics,
 }
 
 impl JsonParser {
     pub fn new(skip_to_brace: bool) -> Self {
-        Self { skip_to_brace }
+        Self { skip_to_brace, diag: Diagnostics::default() }
+    }
+
+    pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.diag = diag;
+        self
     }
 }
 
@@ -45,7 +52,10 @@ impl Transform for JsonParser {
             match raw.iter().position(|&b| b == b'{') {
                 Some(i) => raw.slice(i..),
                 None => {
-                    eprintln!("json: no '{{' found in message, passing event through unparsed");
+                    self.diag.warn_throttled(
+                        "no_brace",
+                        "no '{' found in message, passing event through unparsed",
+                    );
                     return Some(event);
                 }
             }
@@ -65,7 +75,10 @@ impl Transform for JsonParser {
                 }
             }
             Err(err) => {
-                eprintln!("json: failed to parse message as JSON, passing event through: {err}");
+                self.diag.warn_throttled(
+                    "parse_failure",
+                    format_args!("failed to parse message as JSON, passing event through: {err}"),
+                );
             }
         }
 
