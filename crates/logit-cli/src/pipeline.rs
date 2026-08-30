@@ -14,6 +14,7 @@ use anyhow::Context;
 use logit_config::{Config, StdioTarget};
 use logit_core::Diagnostics;
 use logit_inputs::statsd::StatsdInput;
+use logit_inputs::syslog::SyslogInput;
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::stdio::StdioOutput;
 use logit_pipeline::graph::{self, ResolvedComponent};
@@ -141,6 +142,9 @@ fn build_spec(
     Ok(match &component.kind {
         StatsdIn { bind } => NodeSpec::Input(Box::new(
             StatsdInput::new(bind.clone()).with_diagnostics(Diagnostics::new(id)),
+        )),
+        SyslogIn { bind } => NodeSpec::Input(Box::new(
+            SyslogInput::new(bind.clone()).with_diagnostics(Diagnostics::new(id)),
         )),
 
         Lua { script, interval } => NodeSpec::Lua { script: script.clone(), interval: *interval },

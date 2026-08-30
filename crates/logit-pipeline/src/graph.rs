@@ -77,6 +77,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
     matches!(
         kind,
         ComponentKind::StatsdIn { .. }
+            | ComponentKind::SyslogIn { .. }
             | ComponentKind::Lua { .. }
             | ComponentKind::LuaFile { .. }
             | ComponentKind::Aggregate { .. }
@@ -425,7 +426,7 @@ mod tests {
     #[test]
     fn unimplemented_kind_is_rejected() {
         let err = expect_err(cfg(vec![
-            ("in", vec![], ComponentKind::SyslogIn { bind: "127.0.0.1:0".to_string() }),
+            ("in", vec![], ComponentKind::OtlpIn { bind: "127.0.0.1:0".to_string() }),
             ("out", vec!["in"], sink()),
         ]));
         assert!(err.contains("not implemented yet"), "got: {err}");
