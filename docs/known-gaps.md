@@ -153,3 +153,9 @@ already built that have a known, accepted rough edge.
   Being a separate, opt-in component (rather than a flag on `syslog_in`) is the point: it keeps the
   listener's contract simple and honest, and makes "we trust our senders' clocks" a visible line in
   the config graph rather than a default nobody remembers choosing.
+- **`stdio_out` has no rotation, no reopen, and no user-controlled format** — a file target is
+  opened once, in append mode, and held for the process's lifetime: an external log rotator that
+  moves the file leaves `logit` writing to the unlinked inode until restart (there is no
+  SIGHUP-reopen). The output format is fixed; a user-supplied `format:` template is designed for
+  (the encoder is built around a `Format` enum) but not implemented. Both are acceptable for a
+  debugging/dev-loop sink, which is what this is for.

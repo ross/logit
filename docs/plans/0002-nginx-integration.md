@@ -204,9 +204,21 @@ useful for this integration's dev loop and generally for anyone getting started 
 
 **Depends on:** A (needs to render `log`/`metrics`/`span` from the new `Event` shape).
 
-**Files:** `crates/logit-outputs/src/stdio.rs` — one line of JSON per event on stdout, rendering
-whatever the event carries (log body, each metric, span) together. Follow `InfluxDbOutput`'s split:
-a pure encoder, unit-tested without touching a real file descriptor.
+**Files:** `crates/logit-outputs/src/stdio.rs` — writes to stdout (default), stderr, or a file path
+(`target:`), rendering whatever the event carries (log body, each metric, span) together. Follow
+`InfluxDbOutput`'s split: a pure encoder, unit-tested without touching a real file descriptor.
+
+> **Superseded below:** the "one line of JSON per event" sketch in this section (and the matching
+> line in the test list) predates workstream A landing and was revisited once `Event` actually
+> carried `log`/`metrics`/`span` independently (ADR 0012). The settled shape — kept current here
+> rather than only in the implementing PR — is a readable, human-facing text block per event
+> (stdout/stderr/file target, structured around a `Format` enum so a future `format:` template
+> string is a new variant, not a restructuring), not JSON: this is explicitly a debugging/dev-loop
+> sink for a person reading a terminal, not a machine-parseable export format (`logit-outputs`
+> already has one purpose-built machine format, InfluxDB line protocol, and NDJSON export is a
+> reasonable future `Format` variant if a real need for one shows up — it doesn't need to be the
+> *only* format `stdio_out` ever writes). See `crates/logit-outputs/src/stdio.rs`'s module doc
+> comment and `docs/known-gaps.md` for the accepted consequences.
 
 **Registration.** This is the first new component kind this plan adds, so the four-touchpoint
 pattern is worth stating once here — workstream E's `kv_metrics`/`keep` follow the same list:
@@ -217,8 +229,9 @@ pattern is worth stating once here — workstream E's `kv_metrics`/`keep` follow
 4. `script/schema`, then commit the regenerated `schema/logit.schema.json` (`script/cibuild` fails on drift).
 
 **Test list:** encoding a log-only event, a metrics-only event, and a mixed event each produce the
-expected JSON shape; an event with none of the three (should not occur in practice, but the encoder
-shouldn't panic on it).
+expected readable block, including the batch's resource attributes and every part of a span (ids,
+kind, status, duration, and any events/links it carries); an event with none of the three (should
+not occur in practice, but the encoder shouldn't panic on it).
 
 **Done when:** `type: stdio_out` is a valid, working sink in a config.
 

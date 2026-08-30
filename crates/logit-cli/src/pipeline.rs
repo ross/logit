@@ -11,14 +11,18 @@
 
 use crate::config;
 use anyhow::Context;
-use logit_config::Config;
+use logit_config::{Config, StdioTarget};
 use logit_core::Diagnostics;
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_outputs::influxdb::InfluxDbOutput;
+use logit_outputs::stdio::StdioOutput;
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::NodeSpec;
-use logit_transforms::{Aggregator, JsonParser};
+use logit_transforms::{
+    Aggregator, JsonParser, Keep as KeepTransform, KvMetrics as KvMetricsTransform,
+    Remove as RemoveTransform,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -156,14 +160,54 @@ fn build_spec(
         Json { skip_to_brace } => NodeSpec::Transform(Box::new(
             JsonParser::new(*skip_to_brace).with_diagnostics(Diagnostics::new(id)),
         )),
+        KvMetrics { counters, gauges, distributions } => NodeSpec::Transform(Box::new(
+            KvMetricsTransform::new(
+                to_metric_specs(counters),
+                to_metric_specs(gauges),
+                to_metric_specs(distributions),
+            )
+            .with_diagnostics(Diagnostics::new(id)),
+        )),
+        Keep { fields } => NodeSpec::Transform(Box::new(KeepTransform::new(fields.clone()))),
+        Remove { fields } => NodeSpec::Transform(Box::new(RemoveTransform::new(fields.clone()))),
 
         InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(Box::new(
             InfluxDbOutput::new(url.clone(), org.clone(), bucket.clone(), token.clone())
                 .with_diagnostics(Diagnostics::new(id)),
         )),
+        StdioOut { target } => {
+            let output = match target {
+                StdioTarget::Stdout => StdioOutput::stdout(),
+                StdioTarget::Stderr => StdioOutput::stderr(),
+                // Resolved against `base_dir` (the config file's own directory), exactly as
+                // `LuaFile { lua_file, .. }` resolves its script path above -- `Path::join`
+                // leaves an already-absolute `path` untouched, so this is correct whether `path`
+                // is relative or absolute. Without it, a relative target resolves against the
+                // process's current working directory instead, which for `logit run
+                // /etc/logit/config.yaml` run from an unrelated directory silently writes
+                // somewhere other than "next to the config" (what this kind's own doc comment
+                // promises).
+                StdioTarget::Path(path) => StdioOutput::open_path(base_dir.join(path))?,
+            };
+            NodeSpec::Output(Box::new(output))
+        }
 
         other => unreachable!("graph::resolve already rejected any unimplemented kind: {other:?}"),
     })
+}
+
+/// Converts config's `MetricSpec` (`logit-config`, which `logit-transforms` deliberately doesn't
+/// depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the transform crate's own
+/// identically-shaped type.
+fn to_metric_specs(specs: &[logit_config::MetricSpec]) -> Vec<logit_transforms::MetricSpec> {
+    specs
+        .iter()
+        .map(|s| logit_transforms::MetricSpec {
+            name: s.name.clone(),
+            field: s.field.clone(),
+            unit: s.unit.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -307,6 +351,134 @@ mod tests {
         };
         assert!(matches!(
             build_spec("parse", &component, Path::new("")).unwrap(),
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    fn stdio_out_component(target: StdioTarget) -> ResolvedComponent {
+        ResolvedComponent {
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::StdioOut { target },
+        }
+    }
+
+    #[test]
+    fn build_spec_builds_a_stdio_sink_for_stdout() {
+        let component = stdio_out_component(StdioTarget::Stdout);
+        assert!(matches!(
+            build_spec("tap", &component, Path::new("")).unwrap(),
+            NodeSpec::Output(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_stdio_sink_for_stderr() {
+        let component = stdio_out_component(StdioTarget::Stderr);
+        assert!(matches!(
+            build_spec("tap", &component, Path::new("")).unwrap(),
+            NodeSpec::Output(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_stdio_sink_for_a_file_path() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("logit-build-spec-stdio-out-test-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let component = stdio_out_component(StdioTarget::Path(path.display().to_string()));
+        assert!(matches!(
+            build_spec("tap", &component, Path::new("")).unwrap(),
+            NodeSpec::Output(_)
+        ));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A *relative* `target:` path must resolve against the config file's own directory
+    /// (`base_dir`), exactly as `LuaFile`'s `lua_file` already does -- not against the process's
+    /// current working directory, which for `logit run` invoked from an unrelated directory would
+    /// silently write somewhere other than "next to the config", contradicting `StdioTarget`'s own
+    /// doc comment.
+    #[test]
+    fn build_spec_resolves_a_relative_stdio_target_against_the_config_base_dir() {
+        let base_dir = std::env::temp_dir()
+            .join(format!("logit-build-spec-stdio-base-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&base_dir).expect("base_dir should be creatable");
+        let relative = "relative-debug.log";
+        let expected_path = base_dir.join(relative);
+        let _ = std::fs::remove_file(&expected_path);
+
+        let component = stdio_out_component(StdioTarget::Path(relative.to_string()));
+        assert!(matches!(build_spec("tap", &component, &base_dir).unwrap(), NodeSpec::Output(_)));
+        assert!(
+            expected_path.exists(),
+            "expected the relative target to be created inside base_dir ({}), not the process cwd",
+            base_dir.display()
+        );
+
+        std::fs::remove_file(&expected_path).ok();
+        std::fs::remove_dir(&base_dir).ok();
+    }
+
+    #[test]
+    fn build_spec_reports_a_clear_path_naming_error_for_an_unopenable_stdio_target() {
+        // `NodeSpec` isn't `Debug` (it embeds trait objects), so `Result::expect_err` -- which
+        // needs `Debug` on the `Ok` side to format its panic message -- doesn't work here. Same
+        // reason `logit-pipeline::graph`'s tests have their own `expect_err` helper.
+        let path = std::env::temp_dir().join("logit-build-spec-no-such-dir").join("x.log");
+        let component = stdio_out_component(StdioTarget::Path(path.display().to_string()));
+        let err = match build_spec("tap", &component, Path::new("")) {
+            Ok(_) => panic!("expected build_spec to fail for an unopenable path"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:?}").contains(&path.display().to_string()), "got: {err:?}");
+    }
+
+    #[test]
+    fn build_spec_builds_a_kv_metrics_transform() {
+        let component = ResolvedComponent {
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::KvMetrics {
+                counters: vec![logit_config::MetricSpec {
+                    name: "hits".to_string(),
+                    field: None,
+                    unit: None,
+                }],
+                gauges: vec![],
+                distributions: vec![],
+            },
+        };
+        assert!(matches!(
+            build_spec("derive", &component, Path::new("")).unwrap(),
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_keep_transform() {
+        let component = ResolvedComponent {
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Keep { fields: vec!["status".to_string()] },
+        };
+        assert!(matches!(
+            build_spec("keep", &component, Path::new("")).unwrap(),
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_remove_transform() {
+        let component = ResolvedComponent {
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Remove { fields: vec!["client_ip".to_string()] },
+        };
+        assert!(matches!(
+            build_spec("remove", &component, Path::new("")).unwrap(),
             NodeSpec::Transform(_)
         ));
     }

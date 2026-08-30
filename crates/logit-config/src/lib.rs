@@ -46,6 +46,24 @@ pub struct Component {
     pub kind: ComponentKind,
 }
 
+/// One `kv_metrics` entry: a metric `name`, an optional source `field`, and an optional `unit`.
+/// See `ComponentKind::KvMetrics` and `docs/adr/0014-kv-metrics-semantics.md`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct MetricSpec {
+    /// The metric's measurement name. An empty name is rejected at graph-validation time --
+    /// `influxdb_out` requires a non-empty measurement to encode a metric line.
+    pub name: String,
+    /// The attribute to read this metric's value from. Omitted means "+1 per event" for a
+    /// counter or "set to 1" for a gauge; a distribution entry with no `field` is rejected at
+    /// graph-validation time (a distribution of nothing is meaningless). Names an attribute
+    /// literally -- `field: http.status` means the attribute literally named `http.status`, never
+    /// a `status` key nested under `http` in a `Value::Map`; nested fields are not addressable.
+    #[serde(default)]
+    pub field: Option<String>,
+    #[serde(default)]
+    pub unit: Option<String>,
+}
+
 /// A component's kind, tagged by `type` in config. Every protocol kind is suffixed `_in`/`_out`
 /// uniformly (`docs/design/pipeline-graph.md`'s naming rationale) so a listener and a sink for the
 /// same protocol never collide on one tag value; transform kinds take no suffix, since there's
@@ -109,6 +127,31 @@ pub enum ComponentKind {
         #[serde(default)]
         skip_to_brace: bool,
     },
+    /// Turns attributes already on an event (typically merged there by `json`) into metrics on
+    /// that same event. See `docs/adr/0014-kv-metrics-semantics.md` for the skip rules, the
+    /// numeric coercion rules, and why there is deliberately no `tags:` field here -- tag
+    /// selection is `Keep`'s job, since every metrics sink already reads `event.attributes`.
+    KvMetrics {
+        #[serde(default)]
+        counters: Vec<MetricSpec>,
+        #[serde(default)]
+        gauges: Vec<MetricSpec>,
+        #[serde(default)]
+        distributions: Vec<MetricSpec>,
+    },
+    /// Retains only the named attributes, dropping the rest -- an allowlist, not just a denylist:
+    /// a new field appearing in a log format later must not be able to silently become a new
+    /// tag dimension on a metrics sink. Place this *before* `aggregate` in a pipeline --
+    /// `aggregate`'s `SeriesKey` includes the whole of `event.attributes`, so pruning first is
+    /// what keeps series cardinality and per-window memory bounded. An empty `fields` list is
+    /// legal and means "drop every attribute."
+    Keep {
+        fields: Vec<String>,
+    },
+    /// Drops the named attributes, keeping the rest.
+    Remove {
+        fields: Vec<String>,
+    },
     // The rest of the built-in native transforms -- not implemented yet (`logit-transforms`),
     // carried over as unimplemented `ComponentKind` variants so config referencing one gets a
     // clear "not implemented yet" at validation time rather than a deserialization error.
@@ -121,9 +164,6 @@ pub enum ComponentKind {
     Rename {
         from: String,
         to: String,
-    },
-    Remove {
-        field: String,
     },
     Filter {
         r#where: String,
@@ -162,6 +202,79 @@ pub enum ComponentKind {
     LogitOut {
         endpoint: String,
     },
+    /// A general-purpose, human-facing debug sink: dumps every event's details as a readable text
+    /// block to stdout (default), stderr, or a file -- the dev loop for seeing a whole pipeline's
+    /// output without standing up a real backend like InfluxDB.
+    StdioOut {
+        #[serde(default)]
+        target: StdioTarget,
+    },
+}
+
+/// Where `stdio_out` writes: config keeps this a plain scalar (`target: stdout`), not a tagged
+/// object -- `stdout` and `stderr` are matched as keywords first, and anything else is treated as
+/// a file path.
+///
+/// `Serialize`/`Deserialize`/`JsonSchema` are all hand-rolled rather than derived: a derived
+/// `#[serde(untagged)]` dispatches each candidate variant against the input's *shape*, and a
+/// fieldless (unit) variant's shape is "absent/null", not "any string that happens to match the
+/// variant's name" -- so a plain `#[derive(Deserialize)]` here would never actually match the
+/// literal string `"stdout"` against the `Stdout` variant, and every value (including `"stdout"`
+/// itself) would silently fall through to `Path`. Matching a string against the two known
+/// keywords first, `Path` as the explicit fallback, has to be written by hand instead --  and
+/// `JsonSchema` follows suit (delegating straight to `String`'s schema) rather than letting a
+/// derive describe the shape the broken derived (de)serializer *would* have accepted: every value
+/// this type actually accepts is a string, `stdout`/`stderr` included, so that's the schema ADR
+/// 0003 needs published, not an artifact of what a derive would guess from the variants.
+///
+/// A relative `Path` is resolved against the config file's own directory (`crates/logit-cli/src/
+/// pipeline.rs::build_spec`, mirroring how `LuaFile { lua_file, .. }` resolves its script path) --
+/// not the process's current working directory, so "next to the config" below is literal.
+///
+/// Two consequences worth knowing, both accepted rather than worked around:
+/// - A file literally named `stdout` (or `stderr`) next to the config is unreachable this way --
+///   write `./stdout` in config to target it instead.
+/// - A typo like `stdrr` silently becomes a file path rather than a config error. That's the price
+///   of the one-field shape; it's visible immediately in practice, since the (wrongly-named) file
+///   appears next to the config the moment an event is written.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub enum StdioTarget {
+    #[default]
+    Stdout,
+    Stderr,
+    Path(String),
+}
+
+impl Serialize for StdioTarget {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let s = match self {
+            StdioTarget::Stdout => "stdout",
+            StdioTarget::Stderr => "stderr",
+            StdioTarget::Path(path) => path.as_str(),
+        };
+        serializer.serialize_str(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for StdioTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "stdout" => StdioTarget::Stdout,
+            "stderr" => StdioTarget::Stderr,
+            _ => StdioTarget::Path(s),
+        })
+    }
+}
+
+impl JsonSchema for StdioTarget {
+    fn schema_name() -> String {
+        "StdioTarget".to_string()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        String::json_schema(generator)
+    }
 }
 
 /// Minimal `humantime`-flavored `(de)serialize` for `Duration` fields (`10s`, `1m`, ...), so
@@ -311,6 +424,72 @@ mod tests {
     }
 
     #[test]
+    fn kv_metrics_component_round_trips_through_deserialization() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "kv_metrics", "sources": ["in"],
+                "counters": [{"name": "nginx.requests"},
+                             {"name": "nginx.bytes_sent", "field": "body_bytes_sent"}],
+                "distributions": [{"name": "nginx.request_time", "field": "request_time",
+                                    "unit": "s"}]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::KvMetrics { counters, gauges, distributions } => {
+                assert_eq!(counters.len(), 2);
+                assert_eq!(counters[0].name, "nginx.requests");
+                assert_eq!(counters[0].field, None);
+                assert_eq!(counters[1].field, Some("body_bytes_sent".to_string()));
+                assert!(gauges.is_empty());
+                assert_eq!(distributions.len(), 1);
+                assert_eq!(distributions[0].unit, Some("s".to_string()));
+            }
+            other => panic!("expected KvMetrics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_metrics_component_defaults_every_list_to_empty() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "kv_metrics", "sources": ["in"]}"#).unwrap();
+        match component.kind {
+            ComponentKind::KvMetrics { counters, gauges, distributions } => {
+                assert!(counters.is_empty());
+                assert!(gauges.is_empty());
+                assert!(distributions.is_empty());
+            }
+            other => panic!("expected KvMetrics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keep_component_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "keep", "sources": ["in"], "fields": ["status", "method"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Keep { fields } => {
+                assert_eq!(fields, vec!["status".to_string(), "method".to_string()]);
+            }
+            other => panic!("expected Keep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_component_deserializes_with_multiple_fields() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "remove", "sources": ["in"], "fields": ["client_ip", "user_agent"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Remove { fields } => {
+                assert_eq!(fields, vec!["client_ip".to_string(), "user_agent".to_string()]);
+            }
+            other => panic!("expected Remove, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn component_with_no_sources_defaults_to_empty() {
         let component: Component =
             serde_json::from_str(r#"{"type": "statsd_in", "bind": "0.0.0.0:8125"}"#).unwrap();
@@ -365,6 +544,34 @@ mod tests {
             }
             other => panic!("expected Lua, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stdio_out_defaults_target_to_stdout_when_omitted() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "stdio_out", "sources": ["in"]}"#).unwrap();
+        match component.kind {
+            ComponentKind::StdioOut { target } => assert_eq!(target, StdioTarget::Stdout),
+            other => panic!("expected StdioOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stdio_out_target_stdout_deserializes() {
+        let target: StdioTarget = serde_json::from_str(r#""stdout""#).unwrap();
+        assert_eq!(target, StdioTarget::Stdout);
+    }
+
+    #[test]
+    fn stdio_out_target_stderr_deserializes() {
+        let target: StdioTarget = serde_json::from_str(r#""stderr""#).unwrap();
+        assert_eq!(target, StdioTarget::Stderr);
+    }
+
+    #[test]
+    fn stdio_out_target_anything_else_is_a_path() {
+        let target: StdioTarget = serde_json::from_str(r#""/var/log/logit.log""#).unwrap();
+        assert_eq!(target, StdioTarget::Path("/var/log/logit.log".to_string()));
     }
 
     #[test]
