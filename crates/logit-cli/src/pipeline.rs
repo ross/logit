@@ -18,7 +18,10 @@ use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::stdio::StdioOutput;
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::NodeSpec;
-use logit_transforms::{Aggregator, JsonParser};
+use logit_transforms::{
+    Aggregator, JsonParser, Keep as KeepTransform, KvMetrics as KvMetricsTransform,
+    Remove as RemoveTransform,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -153,6 +156,16 @@ fn build_spec(
         Json { skip_to_brace } => NodeSpec::Transform(Box::new(
             JsonParser::new(*skip_to_brace).with_diagnostics(Diagnostics::new(id)),
         )),
+        KvMetrics { counters, gauges, distributions } => NodeSpec::Transform(Box::new(
+            KvMetricsTransform::new(
+                to_metric_specs(counters),
+                to_metric_specs(gauges),
+                to_metric_specs(distributions),
+            )
+            .with_diagnostics(Diagnostics::new(id)),
+        )),
+        Keep { fields } => NodeSpec::Transform(Box::new(KeepTransform::new(fields.clone()))),
+        Remove { fields } => NodeSpec::Transform(Box::new(RemoveTransform::new(fields.clone()))),
 
         InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(Box::new(
             InfluxDbOutput::new(url.clone(), org.clone(), bucket.clone(), token.clone())
@@ -177,6 +190,20 @@ fn build_spec(
 
         other => unreachable!("graph::resolve already rejected any unimplemented kind: {other:?}"),
     })
+}
+
+/// Converts config's `MetricSpec` (`logit-config`, which `logit-transforms` deliberately doesn't
+/// depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the transform crate's own
+/// identically-shaped type.
+fn to_metric_specs(specs: &[logit_config::MetricSpec]) -> Vec<logit_transforms::MetricSpec> {
+    specs
+        .iter()
+        .map(|s| logit_transforms::MetricSpec {
+            name: s.name.clone(),
+            field: s.field.clone(),
+            unit: s.unit.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -403,5 +430,52 @@ mod tests {
             Err(err) => err,
         };
         assert!(format!("{err:?}").contains(&path.display().to_string()), "got: {err:?}");
+    }
+
+    #[test]
+    fn build_spec_builds_a_kv_metrics_transform() {
+        let component = ResolvedComponent {
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::KvMetrics {
+                counters: vec![logit_config::MetricSpec {
+                    name: "hits".to_string(),
+                    field: None,
+                    unit: None,
+                }],
+                gauges: vec![],
+                distributions: vec![],
+            },
+        };
+        assert!(matches!(
+            build_spec("derive", &component, Path::new("")).unwrap(),
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_keep_transform() {
+        let component = ResolvedComponent {
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Keep { fields: vec!["status".to_string()] },
+        };
+        assert!(matches!(
+            build_spec("keep", &component, Path::new("")).unwrap(),
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_remove_transform() {
+        let component = ResolvedComponent {
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Remove { fields: vec!["client_ip".to_string()] },
+        };
+        assert!(matches!(
+            build_spec("remove", &component, Path::new("")).unwrap(),
+            NodeSpec::Transform(_)
+        ));
     }
 }
