@@ -22,7 +22,13 @@ services:
       # (docs/adr/0011-env-yaml-tag.md); matches the token influxdb seeds itself with below, and
       # is overridable from the host shell (`INFLUXDB_TOKEN=... script/server`).
       INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-logit-dev-token}
-    networks: [logit]
+    networks:
+      # `aliases` gives `dev` a second DNS name on the `logit` network, decoupled from the
+      # dev-only service name -- this is the name examples/nginx/nginx.conf's
+      # `access_log syslog:server=logit:5140,...` directive resolves, so it reads cleanly in
+      # config and docs alike regardless of what the actual compose service is called.
+      logit:
+        aliases: [logit]
     command: sleep infinity
 
   influxdb:
@@ -52,6 +58,24 @@ services:
       - grafana_data:/var/lib/grafana
     depends_on: [influxdb]
     networks: [logit]
+
+  # The reference nginx example (docs/plans/0002-nginx-integration.md, workstream F;
+  # examples/nginx/). Reaches `dev`'s syslog listener over the compose-internal `logit` network
+  # by its `logit` alias above -- no `ports:` entry needed for UDP 5140, since nginx never talks
+  # to it from the host.
+  nginx:
+    build:
+      context: ./examples/nginx
+    ports:
+      - "8080:80"
+    networks: [logit]
+    # nginx resolves its `syslog:server=logit:5140` target at config-load time (startup), not
+    # lazily on first write -- with no `dev` container up yet to carry the `logit` alias, nginx
+    # fails to start outright ("host not found in syslog server"), confirmed empirically. This is
+    # only a startup-order dependency, not a runtime one (UDP delivery to it afterward is
+    # fire-and-forget either way): `depends_on` just needs `dev`'s container running, not `logit
+    # run` actually listening on 5140 yet.
+    depends_on: [dev]
 
 networks:
   logit: {}

@@ -159,3 +159,31 @@ already built that have a known, accepted rough edge.
   SIGHUP-reopen). The output format is fixed; a user-supplied `format:` template is designed for
   (the encoder is built around a `Format` enum) but not implemented. Both are acceptable for a
   debugging/dev-loop sink, which is what this is for.
+- **A pathological Host header can truncate the syslog-bound JSON line -- but nginx's own header-size
+  limit turns out to make that hard to actually trigger.** The example's lean `access_json_syslog`
+  `log_format` (`examples/nginx/nginx.conf`) sizes its fixed fields well under nginx's syslog
+  message cap, but `$host` itself is unbounded and attacker-controlled behind a public IP.
+  Measuring this for real (workstream F, `docs/plans/0002-nginx-integration.md`) against nginx
+  1.31.4 turned up a more reassuring result than expected: an oversized `Host` header never reaches
+  nginx's syslog writer at all under default settings. `large_client_header_buffers` (4 8k by
+  default) rejects any request whose request line plus headers exceed ~8180 bytes with a 400
+  *before* nginx builds a log line for it -- every `Host` value nginx will actually log (measured up
+  to 8180 bytes) produced a complete, untruncated syslog datagram and parsed cleanly, contradicting
+  the assumption (based on older nginx source naming a 1024-byte `NGX_SYSLOG_MAX_STR`) that a
+  several-KB `Host` header would truncate the line. Whatever nginx's current per-datagram syslog
+  cap actually is, it sits above the request-header limit that already gates this specific vector.
+
+  That doesn't mean the failure mode isn't real, just that this particular door is closed by
+  nginx's own defaults, not by anything `logit` does. A syslog line *can* still end up truncated --
+  a larger `large_client_header_buffers`, a different unbounded field, or a different syslog client
+  entirely could all produce one -- so the pipeline's degradation was verified directly: a
+  hand-crafted, deliberately truncated syslog datagram sent straight to `syslog_in` (bypassing
+  nginx) confirmed the *documented* consequence exactly: `syslog_in` accepts the truncated-but-valid-
+  UTF-8 datagram without error; `json` fails to parse the truncated body and reports a throttled
+  `parse_failure` diagnostic (`crates/logit-transforms/src/json.rs`) while passing the event through
+  with `attributes` unchanged (only `syslog.*` metadata survives); `nginx_metrics` derives nothing
+  field-based for that event (only the fieldless `nginx.requests` counter, which always fires
+  regardless of attributes, still increments); sibling requests before and after are unaffected. No
+  nginx-side mitigation (e.g. capping `$host`'s logged length) is added here: the pipeline already
+  degrades gracefully on a truncated line by whatever means it happens, and capping a field nginx
+  itself allows up to 8KB would be solving a problem the design doesn't actually have.

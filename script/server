@@ -1,8 +1,10 @@
 #!/bin/bash
 # Usage: script/server [config-file]
-# Starts the local InfluxDB + Grafana stack and runs logit against a config file (default:
+# Starts the local InfluxDB + Grafana + nginx stack and runs logit against a config file (default:
 # examples/statsd-to-influxdb.yaml) -- the v0.1 vertical slice (statsd -> Lua -> InfluxDB, see
-# docs/OVERVIEW.md), working end to end via `logit run`.
+# docs/OVERVIEW.md), working end to end via `logit run`. Also try
+# examples/nginx-to-influxdb.yaml (docs/plans/0002-nginx-integration.md, workstream F) against the
+# nginx service started below.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
@@ -10,5 +12,13 @@ source "${SCRIPT_PATH}/common.sh"
 
 CONFIG="${1:-examples/statsd-to-influxdb.yaml}"
 
-${COMPOSE} up -d influxdb grafana
-run cargo run -p logit-cli -- run "${CONFIG}"
+# `dev` is brought up (not `run`) and `logit run` execs *into* that same long-lived container,
+# deliberately not through common.sh's `run` helper: `docker compose run` starts a fresh, separate
+# container per invocation, which does not carry the `dev` service's `networks.logit.aliases:
+# [logit]` (compose applies configured network aliases to a service's `up`-managed container, not
+# to an ad hoc `run` one) -- confirmed empirically while standing this up. nginx resolves
+# `syslog:server=logit:5140` once at startup, so `logit run` has to be listening in the container
+# that actually holds the `logit` alias, or every syslog datagram nginx sends goes to a container
+# with nothing listening on it, silently.
+${COMPOSE} up -d dev influxdb grafana nginx
+${COMPOSE} exec dev cargo run -p logit-cli -- run "${CONFIG}"
