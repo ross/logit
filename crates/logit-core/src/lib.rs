@@ -5,6 +5,7 @@
 
 pub mod diag;
 pub mod interner;
+pub mod time;
 pub mod value;
 
 mod attrs;
@@ -20,6 +21,7 @@ pub use interner::Symbol;
 pub use metric::{DdSketch, HyperLogLog, MetricKind, MetricRecord};
 pub use resource::Resource;
 pub use span::{SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus};
+pub use time::format_rfc3339_utc;
 pub use value::Value;
 
 /// A normalized, syslog-flavored log severity. Codecs map their native levels onto this.

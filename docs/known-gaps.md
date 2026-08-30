@@ -107,3 +107,9 @@ already built that have a known, accepted rough edge.
   substituted a placeholder for a missing variable was tried and reverted (ADR 0011's
   Alternatives) — visualizing a config's shape without its production secrets set needs a copy of
   the config with dummy values filled in, not a feature of `logit graph` itself.
+- **`stdio_out` has no rotation, no reopen, and no user-controlled format** — a file target is
+  opened once, in append mode, and held for the process's lifetime: an external log rotator that
+  moves the file leaves `logit` writing to the unlinked inode until restart (there is no
+  SIGHUP-reopen). The output format is fixed; a user-supplied `format:` template is designed for
+  (the encoder is built around a `Format` enum) but not implemented. Both are acceptable for a
+  debugging/dev-loop sink, which is what this is for.

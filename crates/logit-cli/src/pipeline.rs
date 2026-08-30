@@ -11,10 +11,11 @@
 
 use crate::config;
 use anyhow::Context;
-use logit_config::Config;
+use logit_config::{Config, StdioTarget};
 use logit_core::Diagnostics;
 use logit_inputs::statsd::StatsdInput;
 use logit_outputs::influxdb::InfluxDbOutput;
+use logit_outputs::stdio::StdioOutput;
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::NodeSpec;
 use logit_transforms::{Aggregator, JsonParser};
@@ -157,6 +158,14 @@ fn build_spec(
             InfluxDbOutput::new(url.clone(), org.clone(), bucket.clone(), token.clone())
                 .with_diagnostics(Diagnostics::new(id)),
         )),
+        StdioOut { target } => {
+            let output = match target {
+                StdioTarget::Stdout => StdioOutput::stdout(),
+                StdioTarget::Stderr => StdioOutput::stderr(),
+                StdioTarget::Path(path) => StdioOutput::open_path(path)?,
+            };
+            NodeSpec::Output(Box::new(output))
+        }
 
         other => unreachable!("graph::resolve already rejected any unimplemented kind: {other:?}"),
     })
@@ -305,5 +314,60 @@ mod tests {
             build_spec("parse", &component, Path::new("")).unwrap(),
             NodeSpec::Transform(_)
         ));
+    }
+
+    fn stdio_out_component(target: StdioTarget) -> ResolvedComponent {
+        ResolvedComponent {
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::StdioOut { target },
+        }
+    }
+
+    #[test]
+    fn build_spec_builds_a_stdio_sink_for_stdout() {
+        let component = stdio_out_component(StdioTarget::Stdout);
+        assert!(matches!(
+            build_spec("tap", &component, Path::new("")).unwrap(),
+            NodeSpec::Output(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_stdio_sink_for_stderr() {
+        let component = stdio_out_component(StdioTarget::Stderr);
+        assert!(matches!(
+            build_spec("tap", &component, Path::new("")).unwrap(),
+            NodeSpec::Output(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_stdio_sink_for_a_file_path() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("logit-build-spec-stdio-out-test-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let component = stdio_out_component(StdioTarget::Path(path.display().to_string()));
+        assert!(matches!(
+            build_spec("tap", &component, Path::new("")).unwrap(),
+            NodeSpec::Output(_)
+        ));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn build_spec_reports_a_clear_path_naming_error_for_an_unopenable_stdio_target() {
+        // `NodeSpec` isn't `Debug` (it embeds trait objects), so `Result::expect_err` -- which
+        // needs `Debug` on the `Ok` side to format its panic message -- doesn't work here. Same
+        // reason `logit-pipeline::graph`'s tests have their own `expect_err` helper.
+        let path = std::env::temp_dir().join("logit-build-spec-no-such-dir").join("x.log");
+        let component = stdio_out_component(StdioTarget::Path(path.display().to_string()));
+        let err = match build_spec("tap", &component, Path::new("")) {
+            Ok(_) => panic!("expected build_spec to fail for an unopenable path"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:?}").contains(&path.display().to_string()), "got: {err:?}");
     }
 }
