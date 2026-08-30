@@ -1,0 +1,18 @@
+#!/bin/bash
+# Usage: script/image [tag]
+# Builds the production runtime image (Dockerfile, not Dockerfile.dev) -- what a consumer builds
+# or pulls to actually run `logit` (docs/plans/0002-nginx-integration.md, workstream B). Tags the
+# result `logit:<tag>` (default: `local`).
+#
+# Builds directly against $DOCKER, not through the `run` helper in common.sh -- `run` executes
+# inside the dev container (or CI's equivalent image), and this needs to invoke the host's Docker
+# daemon itself, the same reasoning as common.sh's own `build_image`.
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+TAG="${1:-local}"
+
+${DOCKER} build -f Dockerfile -t "logit:${TAG}" .
+echo "Built logit:${TAG}"
