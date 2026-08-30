@@ -11,6 +11,7 @@ name = "logit"
 path = "src/main.rs"
 
 [dependencies]
+logit-core.workspace = true
 logit-config.workspace = true
 logit-pipeline.workspace = true
 logit-inputs.workspace = true

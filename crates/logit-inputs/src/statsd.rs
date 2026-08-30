@@ -16,7 +16,8 @@
 use crate::Input;
 use bytes::Bytes;
 use logit_core::{
-    interner::intern, AttrMap, DdSketch, Event, EventBatch, MetricKind, MetricRecord, Resource,
+    interner::intern, AttrMap, DdSketch, Diagnostics, Event, EventBatch, MetricKind, MetricRecord,
+    Resource,
 };
 use logit_pipeline::Fanout;
 use logit_proto::{CodecError, Decoder};
@@ -26,13 +27,28 @@ use tokio::net::UdpSocket;
 
 pub struct StatsdInput {
     pub bind: String,
+    diag: Diagnostics,
+}
+
+impl StatsdInput {
+    pub fn new(bind: impl Into<String>) -> Self {
+        Self { bind: bind.into(), diag: Diagnostics::default() }
+    }
+
+    /// Attaches a component id to this listener's diagnostics -- and to the [`StatsdDecoder`] it
+    /// constructs in `run`, so both report under the same id.
+    pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.diag = diag;
+        self
+    }
 }
 
 #[async_trait::async_trait]
 impl Input for StatsdInput {
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         let socket = UdpSocket::bind(&self.bind).await?;
-        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
+        let mut decoder =
+            StatsdDecoder::new(Arc::new(Resource::default())).with_diagnostics(self.diag.clone());
         // The largest possible UDP payload (65535 minus the 8-byte UDP header).
         let mut buf = vec![0u8; 65_507];
         loop {
@@ -48,9 +64,7 @@ impl Input for StatsdInput {
                 Ok(_) => {} // empty datagram
                 Err(err) => {
                     // A malformed line from one client shouldn't take the whole listener down.
-                    // TODO: route through a proper diagnostics facility once one exists, instead
-                    // of stderr.
-                    eprintln!("statsd: {err}");
+                    self.diag.warn_throttled("bad_datagram", err);
                 }
             }
         }
@@ -61,11 +75,17 @@ impl Input for StatsdInput {
 /// [`StatsdInput`] so the parsing logic is directly unit-testable without a socket.
 pub struct StatsdDecoder {
     resource: Arc<Resource>,
+    diag: Diagnostics,
 }
 
 impl StatsdDecoder {
     pub fn new(resource: Arc<Resource>) -> Self {
-        Self { resource }
+        Self { resource, diag: Diagnostics::default() }
+    }
+
+    pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.diag = diag;
+        self
     }
 }
 
@@ -86,9 +106,9 @@ impl Decoder for StatsdDecoder {
             // everything alongside it. Isolate per line: keep what parsed, report what didn't.
             match parse_line(line, timestamp) {
                 Ok(mut line_events) => events.append(&mut line_events),
-                // TODO: route through a proper diagnostics facility once one exists, instead of
-                // stderr -- same gap noted in StatsdInput::run.
-                Err(err) => eprintln!("statsd: {err}"),
+                Err(err) => {
+                    self.diag.warn_throttled("bad_line", err);
+                }
             }
         }
         Ok(EventBatch { resource: self.resource.clone(), events })

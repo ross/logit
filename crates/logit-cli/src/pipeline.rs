@@ -12,6 +12,7 @@
 use crate::config;
 use anyhow::Context;
 use logit_config::Config;
+use logit_core::Diagnostics;
 use logit_inputs::statsd::StatsdInput;
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_pipeline::graph::{self, ResolvedComponent};
@@ -72,7 +73,8 @@ fn prepare(
     let mut specs: HashMap<String, NodeSpec> = HashMap::with_capacity(graph.components.len());
     for id in ids {
         let component = &graph.components[id];
-        let spec = build_spec(component, &base_dir).with_context(|| format!("component '{id}'"))?;
+        let spec =
+            build_spec(id, component, &base_dir).with_context(|| format!("component '{id}'"))?;
         specs.insert(id.clone(), spec);
     }
 
@@ -121,10 +123,21 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<()> {
 /// runs. The single source of truth for which `ComponentKind`s this binary can build --
 /// `graph::resolve` already rejected every kind `is_implemented` doesn't recognize (rule 7), so
 /// the fallback arm below is unreachable in practice, not a silent gap.
-fn build_spec(component: &ResolvedComponent, base_dir: &Path) -> anyhow::Result<NodeSpec> {
+///
+/// `id` attaches a [`Diagnostics`] to every component that emits one (`docs/adr/0013-service-
+/// lifecycle-and-output-retry.md`) via each kind's own `with_diagnostics` builder -- not a
+/// constructor parameter, so none of the ~60 existing tests across these four kinds needed to
+/// change.
+fn build_spec(
+    id: &str,
+    component: &ResolvedComponent,
+    base_dir: &Path,
+) -> anyhow::Result<NodeSpec> {
     use logit_config::ComponentKind::*;
     Ok(match &component.kind {
-        StatsdIn { bind } => NodeSpec::Input(Box::new(StatsdInput { bind: bind.clone() })),
+        StatsdIn { bind } => NodeSpec::Input(Box::new(
+            StatsdInput::new(bind.clone()).with_diagnostics(Diagnostics::new(id)),
+        )),
 
         Lua { script, interval } => NodeSpec::Lua { script: script.clone(), interval: *interval },
         LuaFile { lua_file, interval } => {
@@ -133,15 +146,17 @@ fn build_spec(component: &ResolvedComponent, base_dir: &Path) -> anyhow::Result<
                 .with_context(|| format!("reading lua_file {}", script_path.display()))?;
             NodeSpec::Lua { script, interval: *interval }
         }
-        Aggregate { interval } => NodeSpec::Transform(Box::new(Aggregator::new(*interval))),
-        Json { skip_to_brace } => NodeSpec::Transform(Box::new(JsonParser::new(*skip_to_brace))),
+        Aggregate { interval } => NodeSpec::Transform(Box::new(
+            Aggregator::new(*interval).with_diagnostics(Diagnostics::new(id)),
+        )),
+        Json { skip_to_brace } => NodeSpec::Transform(Box::new(
+            JsonParser::new(*skip_to_brace).with_diagnostics(Diagnostics::new(id)),
+        )),
 
-        InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(Box::new(InfluxDbOutput::new(
-            url.clone(),
-            org.clone(),
-            bucket.clone(),
-            token.clone(),
-        ))),
+        InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(Box::new(
+            InfluxDbOutput::new(url.clone(), org.clone(), bucket.clone(), token.clone())
+                .with_diagnostics(Diagnostics::new(id)),
+        )),
 
         other => unreachable!("graph::resolve already rejected any unimplemented kind: {other:?}"),
     })
@@ -253,7 +268,10 @@ mod tests {
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Aggregate { interval: Duration::from_secs(10) },
         };
-        assert!(matches!(build_spec(&component, Path::new("")).unwrap(), NodeSpec::Transform(_)));
+        assert!(matches!(
+            build_spec("windowed", &component, Path::new("")).unwrap(),
+            NodeSpec::Transform(_)
+        ));
     }
 
     /// `token` is a plain field now (no more `token_env` indirection, no more `std::env::var`
@@ -270,7 +288,10 @@ mod tests {
                 token: "test-token".to_string(),
             },
         };
-        assert!(matches!(build_spec(&component, Path::new("")).unwrap(), NodeSpec::Output(_)));
+        assert!(matches!(
+            build_spec("out", &component, Path::new("")).unwrap(),
+            NodeSpec::Output(_)
+        ));
     }
 
     #[test]
@@ -280,6 +301,9 @@ mod tests {
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Json { skip_to_brace: true },
         };
-        assert!(matches!(build_spec(&component, Path::new("")).unwrap(), NodeSpec::Transform(_)));
+        assert!(matches!(
+            build_spec("parse", &component, Path::new("")).unwrap(),
+            NodeSpec::Transform(_)
+        ));
     }
 }

@@ -79,7 +79,11 @@ set via a `with_retry(policy)` builder (the same idiom as the existing `with_tim
 `total_budget` is **~5 seconds** — comfortably inside the 10s aggregation window, so a retrying
 output never stalls the pipeline past one window's worth of backpressure. The deadline is checked
 before starting each attempt and before each backoff sleep, so the budget is a hard ceiling
-regardless of how many attempts fit inside it.
+regardless of how many attempts fit inside it. Each attempt's own per-request timeout is
+`min(with_timeout's setting, retry.attempt_timeout, time remaining in the budget)` — `with_timeout`
+keeps its existing meaning (a hard per-request cap) rather than being silently overridden by retry's
+own pacing, and the remaining-budget clamp is what stops a single slow attempt from ever consuming
+the whole budget on its own.
 
 Retried: a transport error (including a request timeout) and any 5xx. **429 also retries** —
 InfluxDB's own rate-limit response, and genuinely transient — a deliberate narrow deviation from
@@ -154,6 +158,12 @@ bounded under typical load.
 - `crates/logit-core/src/diag.rs` (new): the shared `Diagnostics` helper. Not a `tracing`
   migration — that stays separate, deliberately deferred work; this closes specifically the
   "unattributed, unbounded stderr" hazard the plan named.
+- `StatsdInput`, `StatsdDecoder`, `Aggregator`, `JsonParser`, `InfluxDbOutput`, and its inner
+  `InfluxLineEncoder` each gain a `with_diagnostics(Diagnostics)` builder, mirroring
+  `InfluxDbOutput::with_timeout`'s existing idiom rather than changing any constructor -- these six
+  types carry ~90 existing tests between them, and the builder approach churns none of them.
+  `logit-cli` gains a direct `logit-core` dependency to construct `Diagnostics::new(id)` in
+  `build_spec`, which now takes the component's `id` as a parameter for exactly that.
 - `docs/known-gaps.md`: the "no graceful shutdown" entry closes, replaced by the two named residual
   gaps (dropped in-flight datagram, no `Output` close hook); the `eprintln!` entry narrows to "the
   `tracing` migration is still outstanding"; the output-buffering entry gains a note that bounded

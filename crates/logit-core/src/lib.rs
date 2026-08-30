@@ -3,6 +3,7 @@
 //! See `docs/design/data-model.md` for the design rationale. This crate defines the *shape*
 //! only -- no I/O, no pipeline, no protocol codecs live here.
 
+pub mod diag;
 pub mod interner;
 pub mod value;
 
@@ -13,6 +14,7 @@ mod resource;
 mod span;
 
 pub use attrs::AttrMap;
+pub use diag::Diagnostics;
 pub use event::{Event, EventBatch, MetricList};
 pub use interner::Symbol;
 pub use metric::{DdSketch, HyperLogLog, MetricKind, MetricRecord};

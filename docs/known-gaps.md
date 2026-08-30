@@ -19,23 +19,43 @@ already built that have a known, accepted rough edge.
   ([wire-protocol.md](design/wire-protocol.md)).
 - **Output buffering** (`crates/logit-proto/src/buffer.rs`) — the `Buffer` trait exists (deliberately
   defined ahead of any implementation, since retrofitting it onto call sites that assumed an
-  in-memory queue is the expensive direction); no in-memory implementation yet, no ack/retry hooks.
-  This is also where real backoff for a transient output failure belongs — today a persistent output
-  failure just ends `logit run` (see `crates/logit-cli/src/pipeline.rs`'s output task), which is the
-  right tradeoff *without* buffering (silently swallowing is worse) but not the final answer.
+  in-memory queue is the expensive direction); no in-memory implementation yet, no ack/retry hooks,
+  no at-least-once delivery. Bounded retry now exists in `InfluxDbOutput::send`
+  ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md)) — a single transient failure no
+  longer ends `logit run` outright — but that's a narrower fix than this gap: it rides out a blip or
+  one bad response within a tight (~5s) budget, not a real outage, and a persistent failure still
+  ends the process today exactly as before. `Buffer` (this entry) is what closes the rest of the
+  gap, still unimplemented.
+- **Delivery I/O is not decoupled from event processing within a node** — each component is its own
+  tokio task, but *within* one node, I/O and processing share a single sequential path: `run_output`
+  (`crates/logit-pipeline/src/runtime.rs`) awaits `Output::send` inline in its drain loop, so a slow
+  or retrying sink stops draining its own inbox for as long as `send` takes; `StatsdInput::run`
+  (`crates/logit-inputs/src/statsd.rs`) likewise interleaves `recv_from`, decode, and `Fanout::send`
+  in one loop, so downstream backpressure stops it reading its socket, and the kernel silently drops
+  datagrams with no signal anywhere in `logit` that it happened. This is why `InfluxDbOutput`'s
+  retry budget above is tight rather than generous ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md)):
+  without decoupling, every second spent retrying is a second of dropped intake. Worth exploring: a
+  bounded ring buffer (or similar) between a sink's drain loop and its actual delivery, so a sink
+  keeps accepting while a write is in flight or backing off, with retry moving behind that boundary
+  and an explicit overflow policy (`logit_proto::buffer::OverflowPolicy` already names
+  `DropOldest`/`DropNewest`/`Block`). Related to, but distinct from, the output-buffering entry
+  above: that one is about *what* to buffer and delivery guarantees; this one is about the threading
+  shape that would make buffering actually useful.
 - **Relative gauge adjustment (`+`/`-`) and sample-rate extrapolation for distributions** — the
   aggregator that would hold the needed state now exists (`crates/logit-transforms`), but the statsd
   decoder still has no representation for "this is a delta, not an absolute value" to hand it, and
   any leading sign is ambiguous with a plain negative number at the wire level regardless. Relative
   gauges are explicitly rejected with a clear decode error rather than silently miscoded
   (`crates/logit-inputs/src/statsd.rs`).
-- **`eprintln!` instead of a real diagnostics facility** — statsd input, InfluxDB output, the node
-  runtime's per-event script errors and per-batch output errors, the aggregator's kind-conflict
-  reports, and the `json` transform's parse-failure reports
-  (`docs/adr/0010-json-parsing-into-attributes.md`). Cosmetic while there's one of each component;
-  matters once there's more than one running at once and stderr becomes an unattributable mess —
-  and a `json` component in front of a high-volume source of malformed lines is a concrete way to
-  hit that mess sooner than most, one line per event with no rate limiting.
+- **`eprintln!` instead of a real diagnostics facility** — every component's diagnostic now goes
+  through `logit_core::diag::Diagnostics` ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md)),
+  which closes the two concrete hazards this entry used to name: every message is prefixed with its
+  component's id (statsd input, InfluxDB output and its encoder, the aggregator's kind-conflict
+  reports, and the `json` transform's parse-failure reports all identify which running instance
+  spoke), and a message that can fire once per event under normal operation (a malformed line, a
+  parse failure) is throttled by occurrence count rather than printed unbounded. What's still
+  missing is the real thing: severity levels, structured fields, filtering — a full `tracing`
+  migration, deliberately kept as separate, later work rather than folded into this narrower fix.
 - **Closed for SIGTERM/SIGINT** ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md)) — a
   signal handler now closes every listener's inbox normally
   (`logit_pipeline::run_with_shutdown`, `crates/logit-pipeline/src/runtime.rs`), triggering the

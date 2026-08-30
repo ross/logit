@@ -13,7 +13,7 @@
 //! "can't merge one metric" as a reason to forward the whole event untouched.
 
 use logit_core::interner::Symbol;
-use logit_core::{AttrMap, Event, MetricKind, MetricRecord, Resource, Value};
+use logit_core::{AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, Value};
 use logit_pipeline::Transform;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -26,6 +26,7 @@ use std::time::Duration;
 pub struct Aggregator {
     interval: Duration,
     groups: Vec<ResourceGroup>,
+    diag: Diagnostics,
 }
 
 struct ResourceGroup {
@@ -46,7 +47,12 @@ enum Accumulator {
 
 impl Aggregator {
     pub fn new(interval: Duration) -> Self {
-        Self { interval, groups: Vec::new() }
+        Self { interval, groups: Vec::new(), diag: Diagnostics::default() }
+    }
+
+    pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.diag = diag;
+        self
     }
 
     pub fn interval(&self) -> Duration {
@@ -125,10 +131,13 @@ impl Aggregator {
                 _ => false,
             };
             if !accumulated {
-                eprintln!(
-                    "aggregate: metric '{}' has a kind that conflicts with an already-accumulating \
-                     series under the same name/unit/tags -- forwarding it untouched",
-                    logit_core::interner::resolve(record.name)
+                self.diag.warn_throttled(
+                    "kind_conflict",
+                    format_args!(
+                        "metric '{}' has a kind that conflicts with an already-accumulating \
+                         series under the same name/unit/tags -- forwarding it untouched",
+                        logit_core::interner::resolve(record.name)
+                    ),
                 );
                 event.metrics.push(record);
             }
