@@ -107,3 +107,39 @@ already built that have a known, accepted rough edge.
   substituted a placeholder for a missing variable was tried and reverted (ADR 0011's
   Alternatives) — visualizing a config's shape without its production secrets set needs a copy of
   the config with dummy values filled in, not a feature of `logit graph` itself.
+- **syslog TCP and structured data** — `syslog_in` is UDP-only (nginx's `syslog:` writer is
+  UDP-only, so TCP buys the driving integration nothing) and skips RFC 5424 STRUCTURED-DATA rather
+  than merging it into attributes (no producer needs it yet, and a naming scheme for
+  `[id@32473 k="v"]` invented without a consumer would be guesswork). Both are additive later.
+- **A syslog event's `timestamp` is receipt time, not the sender's** — `syslog_in` stamps every
+  event with `now_nanos()` at decode and preserves the sender's own timestamp separately, as the
+  `syslog.timestamp` attribute (a `Value::Timestamp` for RFC 5424's RFC 3339 form, a raw
+  `Value::Str` for RFC 3164's). The two can diverge: by network and queueing delay always, and by an
+  arbitrary amount when the sender's clock is skewed or when messages are replayed or forwarded
+  through a relay. Everything downstream keyed on time — `aggregate`'s tumbling window, the point
+  timestamp `influxdb_out` writes — uses `event.timestamp`, so today a delayed or replayed message
+  lands in the window it *arrived* in, not the one it *happened* in.
+
+  Deriving `event.timestamp` from the sender instead was considered and deliberately not done here:
+  RFC 3164's timestamp carries no year and no timezone, so resolving it to an instant means guessing
+  both, and doing it only for RFC 5424 would give two senders on one listener different timestamp
+  semantics with nothing in the config saying so.
+
+  Worth exploring: an **optional `syslog_timestamp` transform** — a component an operator adds to a
+  flow explicitly, which replaces `event.timestamp` with a resolved `syslog.timestamp` and makes the
+  guesswork configurable rather than implicit. The pieces it would need:
+
+  - RFC 5424: parse the RFC 3339 timestamp directly; no inference needed.
+  - RFC 3164: fill in the missing year and timezone. A reasonable default is "the year that puts the
+    message closest to receipt time" (which handles a New Year's Eve rollover in both directions)
+    plus an explicit `timezone:` field defaulting to UTC — never the host's local zone, which would
+    make behavior depend on an environment variable.
+  - A bounded **sanity window** (`max_skew:`, say): a resolved timestamp further from receipt time
+    than the window is rejected and receipt time kept, with a throttled diagnostic. Without it, one
+    sender with a badly wrong clock can write points years away and quietly poison a dashboard.
+  - A skip rule matching every other transform here: no `syslog.timestamp`, or one that doesn't
+    resolve, means the event passes through with `event.timestamp` untouched — never dropped.
+
+  Being a separate, opt-in component (rather than a flag on `syslog_in`) is the point: it keeps the
+  listener's contract simple and honest, and makes "we trust our senders' clocks" a visible line in
+  the config graph rather than a default nobody remembers choosing.

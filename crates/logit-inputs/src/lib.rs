@@ -7,5 +7,6 @@
 //! concrete protocol.
 
 pub mod statsd;
+pub mod syslog;
 
 pub use logit_pipeline::Input;
