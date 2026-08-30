@@ -16,8 +16,7 @@
 use crate::Input;
 use bytes::Bytes;
 use logit_core::{
-    interner::intern, AttrMap, DdSketch, Event, EventBatch, MetricKind, MetricRecord, Payload,
-    Resource,
+    interner::intern, AttrMap, DdSketch, Event, EventBatch, MetricKind, MetricRecord, Resource,
 };
 use logit_pipeline::Fanout;
 use logit_proto::{CodecError, Decoder};
@@ -197,11 +196,11 @@ fn build_event(
         other => return Err(malformed(&format!("unknown metric type '{other}'"))),
     };
 
-    Ok(Event {
+    Ok(Event::metric(
         timestamp,
-        attributes: attributes.clone(),
-        payload: Payload::Metric(MetricRecord { name: intern(name), kind, unit: None }),
-    })
+        attributes.clone(),
+        MetricRecord { name: intern(name), kind, unit: None },
+    ))
 }
 
 /// Parses a metric value and rejects it unless finite. `f64::parse` accepts the literal text
@@ -230,10 +229,13 @@ mod tests {
 
     fn only_metric(events: Vec<Event>) -> MetricRecord {
         assert_eq!(events.len(), 1, "expected exactly one event");
-        match events.into_iter().next().unwrap().payload {
-            Payload::Metric(m) => m,
-            _ => panic!("expected a Metric payload"),
-        }
+        let mut event = events.into_iter().next().unwrap();
+        assert_eq!(event.metrics.len(), 1, "expected exactly one metric on that event");
+        // statsd is a metrics-only input: pinning this down here means a future attempt to fold
+        // a multi-value line into one multi-metric event (rather than one event per value, as
+        // today) fails loudly in this helper rather than silently changing 17 tests' meaning.
+        assert!(event.log.is_none() && event.span.is_none(), "statsd emits metric-only events");
+        event.metrics.pop().unwrap()
     }
 
     /// For asserting a specific line is rejected: `decode()` itself now isolates per-line errors
