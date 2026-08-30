@@ -11,7 +11,10 @@
 //! matches it. A failed RFC 5424 parse with version `1` (the only version any real sender emits)
 //! is treated as genuinely malformed RFC 5424 and rejected as such; a failed parse with any other
 //! digit is treated as a false-positive sniff and falls back to reparsing the whole line as RFC
-//! 3164 (whose grammar is permissive enough to never itself fail) rather than dropping it.
+//! 3164 (whose grammar is permissive enough to never itself fail) rather than dropping it, with a
+//! throttled `sniff_fallback` diagnostic -- quiet against today's traffic (the fallback only fires
+//! on a false positive), but observable the day RFC 5424 defines a version past `1` and a real
+//! sender's lines start hitting it.
 //!
 //! **Timestamp semantics.** Every emitted [`Event`]'s `timestamp` is *receipt* time
 //! (`now_nanos()`, once per datagram, exactly like [`crate::statsd::StatsdDecoder`]) -- never the
@@ -316,15 +319,30 @@ fn parse_line(
                 // 3164 (whose grammar is permissive enough to never itself fail) instead of
                 // dropping the line outright.
                 Err(err) if version == '1' => Err(err),
-                Err(_) => Ok(parse_3164(
-                    bytes,
-                    text,
-                    after_pri,
-                    facility,
-                    severity_num,
-                    severity,
-                    recv_ts,
-                )),
+                Err(err) => {
+                    // Every other skip/recover path in this decoder (a bad PRI, a bad line, a bad
+                    // TIMESTAMP, an out-of-range one) reports through `diag`; this one shouldn't
+                    // be the exception. Quiet today -- the fallback only fires on a false-positive
+                    // sniff against current traffic -- but if RFC 5424 ever defines a version past
+                    // `1`, a real sender's lines would otherwise be silently reparsed as RFC 3164
+                    // with nothing anywhere saying so.
+                    diag.warn_throttled(
+                        "sniff_fallback",
+                        format_args!(
+                            "RFC 5424 dialect sniff (version {version:?}) failed to parse \
+                             ({err}); reparsing the line as RFC 3164"
+                        ),
+                    );
+                    Ok(parse_3164(
+                        bytes,
+                        text,
+                        after_pri,
+                        facility,
+                        severity_num,
+                        severity,
+                        recv_ts,
+                    ))
+                }
             }
         }
         None => Ok(parse_3164(bytes, text, after_pri, facility, severity_num, severity, recv_ts)),
