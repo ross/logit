@@ -9,6 +9,7 @@
 //! implementation the runtime actually runs, which is exactly the "kind → impl" mapping this
 //! project has always kept in one place (previously `build_input`/`build_output`).
 
+use crate::config;
 use anyhow::Context;
 use logit_config::Config;
 use logit_inputs::statsd::StatsdInput;
@@ -27,10 +28,9 @@ use std::path::{Path, PathBuf};
 /// installed Ctrl-C handler, no drain of in-flight events on exit) -- Ctrl-C falls through to the
 /// OS default (immediate termination), same as any other long-running process with no handler.
 pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading config file {}", path.display()))?;
-    let config: Config = serde_norway::from_str(&raw)
-        .with_context(|| format!("parsing config file {}", path.display()))?;
+    // An unset `!env` variable (a missing token, most likely) fails here, before anything starts
+    // listening.
+    let config = config::load(&path)?;
     let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     run_config(config, base_dir).await
 }
@@ -40,9 +40,9 @@ pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
 async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
     let graph = graph::resolve(config)?;
 
-    // Sorted, not raw `HashMap` iteration order: a startup failure (a missing lua_file, an unset
-    // token_env) should be reproducible across runs, not depend on hash-seed-driven iteration
-    // order -- two independently-broken components should always report the same one first.
+    // Sorted, not raw `HashMap` iteration order: a startup failure (a missing lua_file) should be
+    // reproducible across runs, not depend on hash-seed-driven iteration order -- two
+    // independently-broken components should always report the same one first.
     let mut ids: Vec<&String> = graph.components.keys().collect();
     ids.sort();
 
@@ -84,19 +84,12 @@ fn build_spec(component: &ResolvedComponent, base_dir: &Path) -> anyhow::Result<
         Aggregate { interval } => NodeSpec::Transform(Box::new(Aggregator::new(*interval))),
         Json { skip_to_brace } => NodeSpec::Transform(Box::new(JsonParser::new(*skip_to_brace))),
 
-        InfluxDbOut { url, org, bucket, token_env } => {
-            let token = std::env::var(token_env).with_context(|| {
-                format!(
-                    "environment variable '{token_env}' (referenced by output config) is not set"
-                )
-            })?;
-            NodeSpec::Output(Box::new(InfluxDbOutput::new(
-                url.clone(),
-                org.clone(),
-                bucket.clone(),
-                token,
-            )))
-        }
+        InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(Box::new(InfluxDbOutput::new(
+            url.clone(),
+            org.clone(),
+            bucket.clone(),
+            token.clone(),
+        ))),
 
         other => unreachable!("graph::resolve already rejected any unimplemented kind: {other:?}"),
     })
@@ -123,7 +116,7 @@ mod tests {
                 url: "http://localhost:8086".to_string(),
                 org: "org".to_string(),
                 bucket: "bucket".to_string(),
-                token_env: "LOGIT_TEST_DEFINITELY_UNSET_TOKEN_VAR".to_string(),
+                token: "test-token".to_string(),
             },
         }
     }
@@ -182,18 +175,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_config_reports_missing_token_env_clearly() {
-        let cfg = config(vec![("in", statsd_in()), ("out", influxdb_out(vec!["in"]))]);
-        let err = run_config(cfg, PathBuf::new()).await.expect_err("expected an error");
-        // `{err}`/`to_string()` shows only the outermost `.with_context` message ("component
-        // 'out'"); `{err:?}` is anyhow's chain-printing Debug, which includes every cause.
-        assert!(
-            format!("{err:?}").contains("LOGIT_TEST_DEFINITELY_UNSET_TOKEN_VAR"),
-            "got: {err:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn run_config_reports_a_missing_lua_file_clearly() {
         let cfg = config(vec![
             ("in", statsd_in()),
@@ -221,6 +202,23 @@ mod tests {
             kind: ComponentKind::Aggregate { interval: Duration::from_secs(10) },
         };
         assert!(matches!(build_spec(&component, Path::new("")).unwrap(), NodeSpec::Transform(_)));
+    }
+
+    /// `token` is a plain field now (no more `token_env` indirection, no more `std::env::var`
+    /// here) -- an unset `!env` variable is caught earlier, at `config::load` time, not here.
+    #[test]
+    fn build_spec_builds_an_influxdb_sink() {
+        let component = ResolvedComponent {
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::InfluxDbOut {
+                url: "http://localhost:8086".to_string(),
+                org: "org".to_string(),
+                bucket: "bucket".to_string(),
+                token: "test-token".to_string(),
+            },
+        };
+        assert!(matches!(build_spec(&component, Path::new("")).unwrap(), NodeSpec::Output(_)));
     }
 
     #[test]

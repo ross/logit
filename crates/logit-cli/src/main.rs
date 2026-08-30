@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
+mod config;
 mod dot;
 mod pipeline;
 
@@ -32,8 +33,10 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Validate { path } => {
-            let raw = std::fs::read_to_string(&path)?;
-            let config: logit_config::Config = serde_norway::from_str(&raw)?;
+            // An unset `!env` variable fails here too, so `validate` is a real preflight -- run
+            // it on the host before restarting the service and it catches a missing secret
+            // before `run` would.
+            let config = config::load(&path)?;
             // Same semantic checks `logit run` makes before spawning anything (empty component
             // graph, unknown/self-referencing sources, cycles, arity violations, unimplemented
             // kinds) -- shared so `validate` can't silently pass a config `run` would reject.
@@ -51,8 +54,10 @@ fn main() -> anyhow::Result<()> {
             runtime.block_on(pipeline::run_pipelines(path))
         }
         Command::Graph { path } => {
-            let raw = std::fs::read_to_string(&path)?;
-            let config: logit_config::Config = serde_norway::from_str(&raw)?;
+            // Every `!env` reference must resolve here too, same as `run`/`validate` -- no
+            // lenient mode that renders a config's shape with its secrets left unset
+            // (docs/adr/0011-env-yaml-tag.md's Alternatives).
+            let config = config::load(&path)?;
             // Print the DOT first, always -- then report validation problems on stderr without
             // suppressing it. A cyclic or otherwise-broken config is exactly what this command is
             // most useful for: a cycle is far easier to see rendered than parsed out of an error

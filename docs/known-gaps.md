@@ -58,3 +58,26 @@ already built that have a known, accepted rough edge.
 - **A criterion benchmark of the event proxy against plain table conversion is still outstanding**
   ([lua-api.md](design/lua-api.md)) — the design commits to the proxy on reasoning (avoiding a full
   table conversion per stage per event), not yet confirmed with numbers.
+- **`!env` is invisible to `schema/logit.schema.json`** ([ADR 0011](adr/0011-env-yaml-tag.md)) —
+  resolution happens on the parsed YAML tree before serde ever sees it
+  (`crates/logit-cli/src/config.rs`), so the schema describes the substituted shape, never the tag
+  itself. A schema-aware YAML editor will flag a `!env`-tagged value it can't resolve against the
+  schema.
+- **Config deserialization errors lose line/column information** once `!env` is in the picture
+  (`crates/logit-cli/src/config.rs`) — resolving the tag requires parsing to
+  `serde_norway::Value` first and deserializing from that, and `serde_norway::from_value` carries
+  no source location the way `serde_norway::from_str` does directly on the raw file. Partly offset
+  by `!env`'s own errors naming a config path (`components.influx_out.token`) and by the note
+  appended when a substitution's resolved type likely caused the failure.
+- **`graph::is_implemented`'s error Debug-prints a whole `ComponentKind`**
+  (`"kind {:?} is not implemented yet"`, `crates/logit-pipeline/src/graph.rs`) — harmless today,
+  since no *unimplemented* kind carries a secret field, but with `!env` now used to inline secrets
+  directly into fields (ADR 0011) rather than referencing them by name, this becomes a real leak
+  the moment an unimplemented kind gains one. Fix before that happens: redact or field-list instead
+  of a blanket `{:?}`.
+- **`logit graph` can't render a config with any secret left unset** — every `!env` reference must
+  resolve for all three commands (ADR 0011), including `graph`, even though it only ever reads a
+  component's `sources`/`type` to render topology and style nodes by role. A lenient mode that
+  substituted a placeholder for a missing variable was tried and reverted (ADR 0011's
+  Alternatives) — visualizing a config's shape without its production secrets set needs a copy of
+  the config with dummy values filled in, not a feature of `logit graph` itself.

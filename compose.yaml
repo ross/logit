@@ -18,6 +18,10 @@ services:
     environment:
       CARGO_HOME: /home/dev/.cargo
       CARGO_TARGET_DIR: /work/target
+      # Read by examples/statsd-to-influxdb.yaml's `token: !env INFLUXDB_TOKEN`
+      # (docs/adr/0011-env-yaml-tag.md); matches the token influxdb seeds itself with below, and
+      # is overridable from the host shell (`INFLUXDB_TOKEN=... script/server`).
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-logit-dev-token}
     networks: [logit]
     command: sleep infinity
 

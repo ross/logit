@@ -149,8 +149,11 @@ pub enum ComponentKind {
         url: String,
         org: String,
         bucket: String,
-        /// Referenced, not inlined -- kept out of the schema/config-dump path deliberately.
-        token_env: String,
+        /// A plain string field like any other -- give it `!env INFLUXDB_TOKEN` in config to
+        /// pull it from the environment (`crates/logit-cli/src/config.rs`) rather than inlining
+        /// it. No env-specific field of its own: `!env` works on any field on any component, so
+        /// `url`/`org`/`bucket` (just as deployment-specific) can use it too.
+        token: String,
     },
     OtlpOut {
         endpoint: String,
@@ -319,7 +322,7 @@ mod tests {
     fn sink_component_deserializes() {
         let component: Component = serde_json::from_str(
             r#"{"type": "influxdb_out", "sources": ["enrich"], "url": "http://localhost:8086",
-                "org": "org", "bucket": "bucket", "token_env": "TOKEN"}"#,
+                "org": "org", "bucket": "bucket", "token": "TOKEN"}"#,
         )
         .unwrap();
         assert_eq!(component.sources, vec!["enrich".to_string()]);

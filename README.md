@@ -16,7 +16,9 @@ resolved graph as graphviz DOT. [examples/statsd-to-influxdb.yaml](examples/stat
 is a working example; `script/server` runs it against the local test stack below. `aggregate` is the
 only built-in transform implemented so far — `logit run` rejects a config referencing any other
 unimplemented kind with a clear error; see [ADR 0008](docs/adr/0008-aggregation-window-semantics.md)
-for its windowing semantics.
+for its windowing semantics. Any field on any component can pull its value from the environment
+with `!env VAR_NAME` (e.g. `token: !env INFLUXDB_TOKEN`) — see
+[ADR 0011](docs/adr/0011-env-yaml-tag.md).
 
 ## Development
 
