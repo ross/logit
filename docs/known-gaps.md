@@ -111,6 +111,16 @@ already built that have a known, accepted rough edge.
   UDP-only, so TCP buys the driving integration nothing) and skips RFC 5424 STRUCTURED-DATA rather
   than merging it into attributes (no producer needs it yet, and a naming scheme for
   `[id@32473 k="v"]` invented without a consumer would be guesswork). Both are additive later.
+- **A non-UTF-8 syslog MSG is a rejected line, not a `Value::Bytes` event** — RFC 5424's `MSG-ANY`
+  permits arbitrary octets, and `logit-core::Value` already has a `Bytes` variant for exactly this.
+  `syslog_in` isolates UTF-8 validation to one line at a time (so one bad line no longer takes its
+  datagram siblings down with it — see the fixed panic/data-loss bugs this gap replaced), but a line
+  whose header parses cleared while its MSG bytes aren't valid UTF-8 still fails as a malformed
+  line rather than being decoded with a `Value::Bytes` message. Doing better means parsing the
+  ASCII header fields directly off the line's raw bytes instead of a validated `&str`, deferring
+  UTF-8 validation to the MSG slice alone — a real change, not a one-line fix, and nginx's
+  `escape=json` access-log writer never emits invalid UTF-8 in practice, so there's no production
+  producer forcing the issue yet.
 - **A syslog event's `timestamp` is receipt time, not the sender's** — `syslog_in` stamps every
   event with `now_nanos()` at decode and preserves the sender's own timestamp separately, as the
   `syslog.timestamp` attribute (a `Value::Timestamp` for RFC 5424's RFC 3339 form, a raw

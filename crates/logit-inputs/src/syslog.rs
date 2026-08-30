@@ -22,6 +22,13 @@
 //! none, and inventing a naming scheme for `[id@32473 k="v"]` without a consumer would be
 //! guesswork. Deliberate, marked gap; see `docs/known-gaps.md`.
 //!
+//! **Byte validity is checked per line, not per datagram.** [`SyslogDecoder::decode`] splits the
+//! raw datagram into lines on the `\n` byte *before* any UTF-8 validation, so one line containing
+//! an invalid UTF-8 byte -- most plausibly inside MSG-ANY, which RFC 5424 allows to hold arbitrary
+//! octets -- is skipped and diagnosed without dropping its sibling lines. A non-UTF-8 MSG on an
+//! otherwise well-formed line is still a malformed-line rejection rather than a `Value::Bytes`
+//! emission; see `docs/known-gaps.md`.
+//!
 //! ## The RFC 3164 header
 //!
 //! nginx's `nohostname` option omits a field RFC 3164 says is mandatory, and the MSG body here is
@@ -127,24 +134,42 @@ impl SyslogDecoder {
 
 impl Decoder for SyslogDecoder {
     fn decode(&mut self, bytes: Bytes) -> Result<EventBatch, CodecError> {
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|e| CodecError::Malformed(format!("invalid utf-8: {e}")))?;
         let timestamp = now_nanos();
         let mut events = Vec::new();
         // Per line, not per datagram -- exactly `StatsdDecoder::decode`'s precedent. nginx's
         // `escape=json` guarantees no raw newline inside an access-log body, so this split is
-        // safe for the target workload.
-        for line in text.split('\n') {
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+        // safe for the target workload. Splitting happens on the raw bytes, before any UTF-8
+        // validation, so one line with an invalid UTF-8 byte can't reject its siblings -- see the
+        // module doc's "Byte validity" note.
+        let mut start = 0usize;
+        while start <= bytes.len() {
+            let nl = bytes[start..].iter().position(|&b| b == b'\n');
+            let end = start + nl.unwrap_or(bytes.len() - start);
+            let mut line = bytes.slice(start..end);
+            if line.ends_with(b"\r") {
+                line = line.slice(..line.len() - 1);
             }
-            match parse_line(&bytes, text, line, timestamp) {
-                Ok(event) => events.push(event),
-                Err(err) => {
-                    self.diag.warn_throttled("bad_line", err);
+            // Only a truly empty record (a bare newline used as a separator) is skipped here --
+            // *not* whitespace-only content, which is real MSG data, not framing.
+            if !line.is_empty() {
+                match std::str::from_utf8(&line) {
+                    Ok(text) => match parse_line(&line, text, timestamp) {
+                        Ok(event) => events.push(event),
+                        Err(err) => {
+                            self.diag.warn_throttled("bad_line", err);
+                        }
+                    },
+                    Err(e) => {
+                        self.diag.warn_throttled(
+                            "bad_line",
+                            CodecError::Malformed(format!("invalid utf-8: {e}")),
+                        );
+                    }
                 }
+            }
+            match nl {
+                Some(i) => start += i + 1,
+                None => break,
             }
         }
         Ok(EventBatch { resource: self.resource.clone(), events })
@@ -155,16 +180,17 @@ fn now_nanos() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64
 }
 
-/// Reconstructs a `Bytes` sharing the datagram's underlying allocation for `sub`, a substring
-/// derived (through ordinary `&str` slicing -- `split`, `trim`, indexing) from `text`, which in
-/// turn was parsed directly out of `bytes` via `str::from_utf8`. Because `sub` is always obtained
-/// by slicing `text` rather than by copying or reconstructing it, this pointer-arithmetic
-/// round-trip always lands inside `bytes`'s allocation -- unlike
-/// `logit-transforms::json::borrowed_str_bytes`, which guards against a non-subset because a
-/// serde_json-unescaped string can legitimately live outside the input buffer, there is no such
-/// case here, so no fallback copy is needed. See `docs/design/data-model.md`'s "`bytes::Bytes`
-/// everywhere strings and blobs appear" -- this is what keeps `message` (and every other
-/// extracted field) a zero-copy slice of the original datagram.
+/// Reconstructs a `Bytes` sharing the line's underlying allocation for `sub`, a substring derived
+/// (through ordinary `&str` slicing -- `split`, indexing) from `text`, which in turn was parsed
+/// directly out of `bytes` via `str::from_utf8`. Because `sub` is always obtained by slicing
+/// `text` rather than by copying or reconstructing it, this pointer-arithmetic round-trip always
+/// lands inside `bytes`'s allocation -- unlike `logit-transforms::json::borrowed_str_bytes`, which
+/// guards against a non-subset because a serde_json-unescaped string can legitimately live outside
+/// the input buffer, there is no such case here, so no fallback copy is needed. See
+/// `docs/design/data-model.md`'s "`bytes::Bytes` everywhere strings and blobs appear" -- this is
+/// what keeps `message` (and every other extracted field) a zero-copy slice of the original
+/// datagram, since `bytes` (the line) is itself a zero-copy `Bytes::slice` of the datagram passed
+/// into [`SyslogDecoder::decode`].
 fn slice_of(bytes: &Bytes, text: &str, sub: &str) -> Bytes {
     let text_start = text.as_ptr() as usize;
     let sub_start = sub.as_ptr() as usize;
@@ -195,16 +221,18 @@ fn map_severity(n: u32) -> Severity {
     }
 }
 
-/// Parses one non-empty, already-trimmed line. `bytes`/`text` are the whole datagram -- passed
-/// through so every extracted field (`message`, `syslog.tag`, ...) can be sliced zero-copy out of
-/// `bytes` via [`slice_of`], rather than out of `line` alone.
-fn parse_line(bytes: &Bytes, text: &str, line: &str, recv_ts: i64) -> Result<Event, CodecError> {
-    let malformed = || CodecError::Malformed(format!("malformed syslog line: {line:?}"));
+/// Parses one non-empty line, already isolated as a valid-UTF-8 `Bytes` slice of the original
+/// datagram by [`SyslogDecoder::decode`]. `bytes`/`text` are that one line -- the same slice, as
+/// `Bytes` and as the `&str` view `str::from_utf8` produced from it -- passed through so every
+/// extracted field (`message`, `syslog.tag`, ...) can be sliced zero-copy out of `bytes` via
+/// [`slice_of`].
+fn parse_line(bytes: &Bytes, text: &str, recv_ts: i64) -> Result<Event, CodecError> {
+    let malformed = || CodecError::Malformed(format!("malformed syslog line: {text:?}"));
 
-    if !line.starts_with('<') {
+    if !text.starts_with('<') {
         return Err(malformed());
     }
-    let after_lt = &line[1..];
+    let after_lt = &text[1..];
     let gt = after_lt.find('>').ok_or_else(malformed)?;
     // 1-3 digits between '<' and '>'.
     if gt == 0 || gt > 3 {
@@ -214,7 +242,17 @@ fn parse_line(bytes: &Bytes, text: &str, line: &str, recv_ts: i64) -> Result<Eve
     if !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(malformed());
     }
+    // RFC 3164 and RFC 5424 both define PRI as facility*8+severity in 0..=191, encoded with no
+    // leading zero except the literal value `0`. `<013>` and `<192>..<999>` are therefore
+    // malformed, not merely unusual: accepting them would attach an impossible facility/severity
+    // (e.g. facility 124 for `<999>`) to the event.
+    if digits.len() > 1 && digits.starts_with('0') {
+        return Err(malformed());
+    }
     let pri: u32 = digits.parse().map_err(|_| malformed())?;
+    if pri > 191 {
+        return Err(malformed());
+    }
     let after_pri = &after_lt[gt + 1..];
 
     let facility = pri / 8;
@@ -230,7 +268,7 @@ fn parse_line(bytes: &Bytes, text: &str, line: &str, recv_ts: i64) -> Result<Eve
     };
 
     if let Some(after_version) = is_5424_after {
-        parse_5424(bytes, text, line, after_version, facility, severity_num, severity, recv_ts)
+        parse_5424(bytes, text, after_version, facility, severity_num, severity, recv_ts)
     } else {
         Ok(parse_3164(bytes, text, after_pri, facility, severity_num, severity, recv_ts))
     }
@@ -283,7 +321,12 @@ fn is_tag_shaped(token: &str) -> bool {
             return false;
         }
         let pid = &body[open + 1..body.len() - 1];
-        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        // Must fit `u64` (what `syslog.pid` is stored as), not merely be all-digit -- an
+        // unauthenticated sender can otherwise put an arbitrarily long digit run in `[...]` and
+        // panic the listener at the `.parse().expect(...)` call site in `parse_3164`. A PID this
+        // large is never real, so falling through to "not TAG-shaped" (the whole token, and thus
+        // the rest of the line, is treated as an untagged message) is correct, not just safe.
+        if pid.is_empty() || pid.parse::<u64>().is_err() {
             return false;
         }
         &body[..open]
@@ -343,7 +386,7 @@ fn parse_3164(
             attrs.insert("syslog.tag", Value::Str(slice_of(bytes, text, name)));
             attrs.insert(
                 "syslog.pid",
-                Value::U64(pid_str.parse().expect("is_tag_shaped validated all-digit PID")),
+                Value::U64(pid_str.parse().expect("is_tag_shaped validated the PID fits u64")),
             );
         } else {
             attrs.insert("syslog.tag", Value::Str(slice_of(bytes, text, tag_body)));
@@ -420,14 +463,13 @@ fn skip_structured_data(s: &str) -> Option<usize> {
 fn parse_5424(
     bytes: &Bytes,
     text: &str,
-    line: &str,
     after_version: &str,
     facility: u32,
     severity_num: u32,
     severity: Severity,
     recv_ts: i64,
 ) -> Result<Event, CodecError> {
-    let malformed = || CodecError::Malformed(format!("malformed RFC 5424 syslog line: {line:?}"));
+    let malformed = || CodecError::Malformed(format!("malformed RFC 5424 syslog line: {text:?}"));
 
     let (ts_field, rest) = split_first_token(after_version);
     let (host_field, rest) = split_first_token(rest);
@@ -440,8 +482,16 @@ fn parse_5424(
     let mut attrs = AttrMap::new();
     attrs.insert("syslog.facility", Value::U64(facility as u64));
     attrs.insert("syslog.severity", Value::U64(severity_num as u64));
-    if let Some(nanos) = nil_or(ts_field).and_then(parse_rfc3339_to_nanos) {
-        attrs.insert("syslog.timestamp", Value::Timestamp(nanos));
+    // A nil TIMESTAMP (`-`) means "absent", same as every other nillable field -- but a non-nil
+    // TIMESTAMP that fails to parse is not "absent", it's malformed input, and must take the same
+    // skip-and-continue path a bad PRI does rather than silently landing on the floor with no
+    // `syslog.timestamp` attribute and no diagnostic.
+    match nil_or(ts_field) {
+        None => {}
+        Some(ts) => {
+            let nanos = parse_rfc3339_to_nanos(ts).ok_or_else(malformed)?;
+            attrs.insert("syslog.timestamp", Value::Timestamp(nanos));
+        }
     }
     if let Some(v) = field_value(bytes, text, host_field) {
         attrs.insert("syslog.hostname", v);
@@ -473,8 +523,11 @@ fn parse_5424(
 /// Parses an RFC 3339 timestamp (the form RFC 5424 mandates for TIMESTAMP) into Unix nanoseconds.
 /// Self-contained here rather than shared through `logit-core` -- this has exactly one caller, and
 /// pulling in a date/time crate for it is an ADR-scale decision (`AGENTS.md`) that doesn't belong
-/// inside one input's PR. Accepts a `Z` or `+HH:MM`/`-HH:MM` offset and an optional fractional
-/// seconds component of any digit count (padded/truncated to nanosecond precision).
+/// inside one input's PR. Accepts an uppercase `Z` or `+HH:MM`/`-HH:MM` offset and an optional
+/// 1-6 digit fractional seconds component (RFC 5424's `TIME-SECFRAC`), padded to nanosecond
+/// precision. Rejects a calendar date that doesn't exist (`2024-02-31`, `2023-02-29`), an
+/// out-of-range offset, and a leap second (`:60`) -- RFC 5424 forbids all three, and silently
+/// normalizing or truncating them would attach a confidently-typed but wrong `syslog.timestamp`.
 /// TODO: replace with a real crate once the crate list is finalized (see `logit-config`'s
 /// hand-rolled humantime duration codec for the precedent this follows).
 fn parse_rfc3339_to_nanos(s: &str) -> Option<i64> {
@@ -496,7 +549,8 @@ fn parse_rfc3339_to_nanos(s: &str) -> Option<i64> {
         return None;
     }
     let day = digits(8, 2)?;
-    if !matches!(b[10], b'T' | b't') {
+    // RFC 5424 (unlike RFC 3339 itself) requires uppercase `T` and `Z`.
+    if b[10] != b'T' {
         return None;
     }
     let hour = digits(11, 2)?;
@@ -517,7 +571,9 @@ fn parse_rfc3339_to_nanos(s: &str) -> Option<i64> {
         while b.get(idx).is_some_and(u8::is_ascii_digit) {
             idx += 1;
         }
-        if idx == frac_start {
+        let frac_len = idx - frac_start;
+        // RFC 5424's `TIME-SECFRAC` is `"." 1*6DIGIT` -- at least one digit, at most six.
+        if !(1..=6).contains(&frac_len) {
             return None;
         }
         let frac = &s[frac_start..idx];
@@ -529,7 +585,7 @@ fn parse_rfc3339_to_nanos(s: &str) -> Option<i64> {
     }
 
     let offset_seconds: i64 = match b.get(idx) {
-        Some(b'Z') | Some(b'z') => {
+        Some(b'Z') => {
             idx += 1;
             0
         }
@@ -540,6 +596,9 @@ fn parse_rfc3339_to_nanos(s: &str) -> Option<i64> {
                 return None;
             }
             let om = digits(idx + 4, 2)?;
+            if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+                return None;
+            }
             idx += 6;
             sign * (oh * 3600 + om * 60)
         }
@@ -548,12 +607,12 @@ fn parse_rfc3339_to_nanos(s: &str) -> Option<i64> {
     if idx != b.len() {
         return None; // trailing garbage
     }
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
+    // RFC 5424 forbids leap seconds outright (unlike RFC 3339, which allows `:60`) -- `second`
+    // is checked against 0..=59, not 0..=60.
+    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    if day < 1 || day > days_in_month(year, month) {
         return None;
     }
 
@@ -561,6 +620,29 @@ fn parse_rfc3339_to_nanos(s: &str) -> Option<i64> {
     let seconds_of_day = hour * 3600 + minute * 60 + second;
     let total_seconds = days * 86_400 + seconds_of_day - offset_seconds;
     total_seconds.checked_mul(1_000_000_000)?.checked_add(nanos_frac)
+}
+
+/// Whether `y` is a Gregorian leap year -- divisible by 4, except century years, which must also
+/// be divisible by 400 (so 2000 is a leap year, 1900 and 2100 are not).
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Days in `month` (1-12) of `y`, honoring [`is_leap_year`] for February. `month` is assumed
+/// already range-checked by the caller to 1..=12.
+fn days_in_month(y: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(y) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
 }
 
 /// Howard Hinnant's `days_from_civil` -- proleptic Gregorian, correct for any year (including
@@ -598,7 +680,7 @@ mod tests {
     fn parse_err(line: &str) -> CodecError {
         let bytes = Bytes::from(line.to_string());
         let text = std::str::from_utf8(&bytes).unwrap();
-        parse_line(&bytes, text, line, 0).expect_err("expected this line to be rejected")
+        parse_line(&bytes, text, 0).expect_err("expected this line to be rejected")
     }
 
     #[test]
@@ -651,6 +733,19 @@ mod tests {
     }
 
     #[test]
+    fn rfc3164_tag_with_a_pid_that_overflows_u64_does_not_panic() {
+        // Regression test for the blocker: a PID this long used to reach a bare
+        // `.parse().expect(...)` and panic the listener task on one crafted UDP packet.
+        let line = "<13>tag[99999999999999999999]: hello";
+        let event = only_event(decode(line));
+        // The oversized PID makes the whole token fail `is_tag_shaped`, so there's no tag/pid --
+        // the untouched remainder becomes the message, rather than the line being dropped.
+        assert!(event.attributes.get("syslog.tag").is_none());
+        assert!(event.attributes.get("syslog.pid").is_none());
+        assert_eq!(message_str(&event), "tag[99999999999999999999]: hello");
+    }
+
+    #[test]
     fn rfc5424_decodes_msgid_and_timestamp_and_omits_nil_fields() {
         let event = only_event(decode(
             "<134>1 2003-10-11T22:14:15.003Z myhost app 1234 ID47 - some message",
@@ -675,6 +770,41 @@ mod tests {
     }
 
     #[test]
+    fn rfc5424_invalid_timestamp_is_rejected_rather_than_treated_as_absent() {
+        for ts in [
+            "2024-02-31T00:00:00Z",         // February has no 31st day
+            "2023-02-29T00:00:00Z",         // 2023 is not a leap year
+            "2024-13-01T00:00:00Z",         // month 13
+            "2024-01-01T00:00:00+99:99",    // offset hour/minute both out of range
+            "2024-01-01T23:59:60Z",         // RFC 5424 forbids leap seconds
+            "2024-01-01t00:00:00z",         // lowercase t/z
+            "2024-01-01T00:00:00.1234567Z", // 7 fractional digits, RFC 5424 allows at most 6
+        ] {
+            let line = format!("<134>1 {ts} - - - - - msg");
+            assert!(
+                matches!(parse_err(&line), CodecError::Malformed(_)),
+                "expected timestamp {ts:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rfc5424_valid_timestamps_at_the_edges_are_accepted() {
+        // 2024 is a leap year: Feb 29 is valid; six fractional digits is the RFC 5424 maximum;
+        // an explicit numeric offset is legal alongside `Z`.
+        for ts in
+            ["2024-02-29T00:00:00Z", "2024-01-01T00:00:00.123456Z", "2024-01-01T00:00:00+23:59"]
+        {
+            let line = format!("<134>1 {ts} - - - - - msg");
+            let event = only_event(decode(&line));
+            assert!(
+                event.attributes.get("syslog.timestamp").is_some(),
+                "expected timestamp {ts:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
     fn rfc5424_structured_data_is_skipped_including_an_escaped_bracket() {
         let event = only_event(decode(r#"<134>1 - - - - - [id@32473 k="v\]"] the message"#));
         assert_eq!(message_str(&event), "the message");
@@ -691,11 +821,57 @@ mod tests {
     }
 
     #[test]
+    fn pri_out_of_range_or_with_a_leading_zero_is_rejected() {
+        for line in ["<192>msg", "<999>msg", "<013>msg", "<00>msg"] {
+            assert!(
+                matches!(parse_err(line), CodecError::Malformed(_)),
+                "expected {line:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn pri_at_the_boundary_of_the_valid_range_is_accepted() {
+        let event = only_event(decode("<191>msg"));
+        assert_eq!(event.attributes.get("syslog.facility"), Some(&Value::U64(191 / 8)));
+        // "<0>" is the one legal single-digit-zero PRI -- not a rejected leading zero.
+        let event = only_event(decode("<0>msg"));
+        assert_eq!(event.attributes.get("syslog.facility"), Some(&Value::U64(0)));
+    }
+
+    #[test]
     fn multi_line_datagram_with_one_bad_line_still_emits_the_good_ones() {
         let events = decode("<13>a\nnot a syslog line\n<13>b");
         assert_eq!(events.len(), 2);
         assert_eq!(message_str(&events[0]), "a");
         assert_eq!(message_str(&events[1]), "b");
+    }
+
+    #[test]
+    fn multi_line_datagram_with_an_invalid_utf8_line_still_emits_the_good_ones() {
+        // Regression test: a whole-datagram `str::from_utf8` used to reject every line in the
+        // packet as soon as any single byte anywhere was invalid UTF-8.
+        let mut datagram = Vec::new();
+        datagram.extend_from_slice(b"<13>a\n");
+        datagram.extend_from_slice(&[0xff, 0xfe]); // not valid UTF-8, no `<PRI>` either
+        datagram.push(b'\n');
+        datagram.extend_from_slice(b"<13>b");
+        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
+        let events = decoder.decode(Bytes::from(datagram)).expect("decode should succeed").events;
+        assert_eq!(events.len(), 2);
+        assert_eq!(message_str(&events[0]), "a");
+        assert_eq!(message_str(&events[1]), "b");
+    }
+
+    #[test]
+    fn message_whitespace_is_preserved_not_trimmed() {
+        // Regression test: `.trim()` on the whole line used to eat trailing MSG spaces and
+        // collapse an all-whitespace MSG into an (incorrectly) skipped "blank line".
+        let event = only_event(decode("<13>tag: value  "));
+        assert_eq!(message_str(&event), "value  ");
+
+        let event = only_event(decode("<13>tag:    "));
+        assert_eq!(message_str(&event), "   ");
     }
 
     #[test]
