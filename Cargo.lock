@@ -766,8 +766,11 @@ dependencies = [
 name = "logit-transforms"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "logit-core",
  "logit-pipeline",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 

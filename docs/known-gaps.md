@@ -30,9 +30,12 @@ already built that have a known, accepted rough edge.
   gauges are explicitly rejected with a clear decode error rather than silently miscoded
   (`crates/logit-inputs/src/statsd.rs`).
 - **`eprintln!` instead of a real diagnostics facility** — statsd input, InfluxDB output, the node
-  runtime's per-event script errors and per-batch output errors, and the aggregator's kind-conflict
-  reports. Cosmetic while there's one of each component; matters once there's more than one running
-  at once and stderr becomes an unattributable mess.
+  runtime's per-event script errors and per-batch output errors, the aggregator's kind-conflict
+  reports, and the `json` transform's parse-failure reports
+  (`docs/adr/0010-json-parsing-into-attributes.md`). Cosmetic while there's one of each component;
+  matters once there's more than one running at once and stderr becomes an unattributable mess —
+  and a `json` component in front of a high-volume source of malformed lines is a concrete way to
+  hit that mess sooner than most, one line per event with no rate limiting.
 - **No graceful shutdown for `logit run`** — Ctrl-C falls through to the OS default (immediate
   termination); no installed handler. Partially softened by the aggregate/flush work: a node now
   flushes once when its inbound channel closes *normally* (`crates/logit-pipeline/src/runtime.rs`),
@@ -55,7 +58,7 @@ already built that have a known, accepted rough edge.
 - **A criterion benchmark of the event proxy against plain table conversion is still outstanding**
   ([lua-api.md](design/lua-api.md)) — the design commits to the proxy on reasoning (avoiding a full
   table conversion per stage per event), not yet confirmed with numbers.
-- **`!env` is invisible to `schema/logit.schema.json`** ([ADR 0010](adr/0010-env-yaml-tag.md)) —
+- **`!env` is invisible to `schema/logit.schema.json`** ([ADR 0011](adr/0011-env-yaml-tag.md)) —
   resolution happens on the parsed YAML tree before serde ever sees it
   (`crates/logit-cli/src/config.rs`), so the schema describes the substituted shape, never the tag
   itself. A schema-aware YAML editor will flag a `!env`-tagged value it can't resolve against the
@@ -69,6 +72,6 @@ already built that have a known, accepted rough edge.
 - **`graph::is_implemented`'s error Debug-prints a whole `ComponentKind`**
   (`"kind {:?} is not implemented yet"`, `crates/logit-pipeline/src/graph.rs`) — harmless today,
   since no *unimplemented* kind carries a secret field, but with `!env` now used to inline secrets
-  directly into fields (ADR 0010) rather than referencing them by name, this becomes a real leak
+  directly into fields (ADR 0011) rather than referencing them by name, this becomes a real leak
   the moment an unimplemented kind gains one. Fix before that happens: redact or field-list instead
   of a blanket `{:?}`.

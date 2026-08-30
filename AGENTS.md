@@ -20,11 +20,12 @@ InfluxDB 2.x out, via `logit run <config>` (see [examples/statsd-to-influxdb.yam
 is now just the kind → implementation registry. Config files are read and parsed exclusively
 through `logit_cli::config::load` (`crates/logit-cli/src/config.rs`), which also resolves `!env
 VAR_NAME` -- any field on any component can pull its value from the environment this way (ADR
-0010), which is why `influxdb_out`'s `token` is a plain string, not an env-specific field. `logit
+0011), which is why `influxdb_out`'s `token` is a plain string, not an env-specific field. `logit
 graph <config>` prints the resolved graph as graphviz DOT (`crates/logit-cli/src/dot.rs`).
-`aggregate` (`crates/logit-transforms`) is the only built-in transform implemented so far — `logit
-run` rejects a config referencing any other unimplemented kind with a clear error; see
-[ADR 0008](docs/adr/0008-aggregation-window-semantics.md) for its windowing semantics,
+`aggregate` and `json` (`crates/logit-transforms`) are the built-in transforms implemented so far —
+`logit run` rejects a config referencing any other unimplemented kind with a clear error; see
+[ADR 0008](docs/adr/0008-aggregation-window-semantics.md) for `aggregate`'s windowing semantics,
+[ADR 0010](docs/adr/0010-json-parsing-into-attributes.md) for `json`'s parsing semantics,
 `crates/logit-inputs/src/statsd.rs` and `crates/logit-outputs/src/influxdb.rs` for the
 listener/sink side, `crates/logit-pipeline/src/runtime.rs` for orchestration and the per-node
 flush-tick timer.
@@ -78,7 +79,7 @@ for no real benefit here. A merge commit costs nothing extra and pushes normally
   default.
 - **A config file is always read through `logit_cli::config::load`**, never a bare
   `std::fs::read_to_string` + `serde_norway::from_str` — that's what resolves `!env` and rejects an
-  unknown YAML tag (ADR 0010); a call site that bypasses it silently loses both.
+  unknown YAML tag (ADR 0011); a call site that bypasses it silently loses both.
 
 ## Design constraints that aren't optional
 

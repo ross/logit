@@ -18,7 +18,7 @@ only built-in transform implemented so far — `logit run` rejects a config refe
 unimplemented kind with a clear error; see [ADR 0008](docs/adr/0008-aggregation-window-semantics.md)
 for its windowing semantics. Any field on any component can pull its value from the environment
 with `!env VAR_NAME` (e.g. `token: !env INFLUXDB_TOKEN`) — see
-[ADR 0010](docs/adr/0010-env-yaml-tag.md).
+[ADR 0011](docs/adr/0011-env-yaml-tag.md).
 
 ## Development
 
@@ -72,7 +72,7 @@ crates/
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution, the node runtime
   logit-inputs      per-protocol listeners; statsd
   logit-outputs     per-protocol sinks; InfluxDB
-  logit-transforms  built-in native transform components; aggregate
+  logit-transforms  built-in native transform components; aggregate, json
   logit-cli         the `logit` binary
 docs/
   OVERVIEW.md       project scope, ~1 page

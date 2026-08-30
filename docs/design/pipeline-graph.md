@@ -70,7 +70,8 @@ pub enum ComponentKind {
     Lua { script: String, interval: Option<Duration> },
     LuaFile { lua_file: String, interval: Option<Duration> },
     Aggregate { interval: Duration },
-    // json, logfmt, kv, regex, csv, rename, remove, filter, sample, throttle, dedup —
+    Json { skip_to_brace: bool },
+    // logfmt, kv, regex, csv, rename, remove, filter, sample, throttle, dedup —
     // as each lands in logit-transforms, same shape: a `ComponentKind` variant, no `sources`
     // opinion of its own (that lives on `Component`, uniformly).
 
@@ -105,7 +106,7 @@ repeating `sources: Vec<String>` on every `ComponentKind` variant instead of fac
 
 `!env VAR_NAME` is a YAML tag, valid as the value of any field on any component, resolved against
 the process environment when the config is loaded (`crates/logit-cli/src/config.rs`) --
-[ADR 0010](../adr/0010-env-yaml-tag.md). It's what `influxdb_out`'s `token` above is for: rather
+[ADR 0011](../adr/0011-env-yaml-tag.md). It's what `influxdb_out`'s `token` above is for: rather
 than a dedicated `token_env` field (an earlier, rejected design -- see the ADR), any field that's
 secret or deployment-specific spells it the same way:
 

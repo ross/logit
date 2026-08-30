@@ -1,4 +1,4 @@
-# 0010 — Secrets in config: a general `!env` YAML tag, not per-field `*_env` indirection
+# 0011 — Secrets in config: a general `!env` YAML tag, not per-field `*_env` indirection
 
 ## Status
 Accepted
