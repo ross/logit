@@ -45,7 +45,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         Lua { .. }
         | LuaFile { .. }
         | Aggregate { .. }
-        | Json
+        | Json { .. }
         | Logfmt
         | Kv
         | Regex { .. }
@@ -70,6 +70,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Lua { .. }
             | ComponentKind::LuaFile { .. }
             | ComponentKind::Aggregate { .. }
+            | ComponentKind::Json { .. }
             | ComponentKind::InfluxDbOut { .. }
     )
 }
@@ -277,6 +278,10 @@ mod tests {
         ComponentKind::Lua { script: "".to_string(), interval: None }
     }
 
+    fn json() -> ComponentKind {
+        ComponentKind::Json { skip_to_brace: false }
+    }
+
     fn sink() -> ComponentKind {
         ComponentKind::InfluxDbOut {
             url: "http://localhost:8086".to_string(),
@@ -376,6 +381,17 @@ mod tests {
             ("out", vec!["in"], sink()),
         ]));
         assert!(err.contains("not implemented yet"), "got: {err}");
+    }
+
+    #[test]
+    fn a_json_component_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("parse", vec!["in"], json()),
+            ("out", vec!["parse"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["parse"].role(), Role::Transform);
     }
 
     #[test]

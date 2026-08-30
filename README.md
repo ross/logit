@@ -70,7 +70,7 @@ crates/
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution, the node runtime
   logit-inputs      per-protocol listeners; statsd
   logit-outputs     per-protocol sinks; InfluxDB
-  logit-transforms  built-in native transform components; aggregate
+  logit-transforms  built-in native transform components; aggregate, json
   logit-cli         the `logit` binary
 docs/
   OVERVIEW.md       project scope, ~1 page

@@ -70,7 +70,8 @@ pub enum ComponentKind {
     Lua { script: String, interval: Option<Duration> },
     LuaFile { lua_file: String, interval: Option<Duration> },
     Aggregate { interval: Duration },
-    // json, logfmt, kv, regex, csv, rename, remove, filter, sample, throttle, dedup —
+    Json { skip_to_brace: bool },
+    // logfmt, kv, regex, csv, rename, remove, filter, sample, throttle, dedup —
     // as each lands in logit-transforms, same shape: a `ComponentKind` variant, no `sources`
     // opinion of its own (that lives on `Component`, uniformly).
 

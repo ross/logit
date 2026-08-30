@@ -18,10 +18,11 @@ InfluxDB 2.x out, via `logit run <config>` (see [examples/statsd-to-influxdb.yam
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. `logit graph <config>` prints the resolved graph as
-graphviz DOT (`crates/logit-cli/src/dot.rs`). `aggregate` (`crates/logit-transforms`) is the only
-built-in transform implemented so far — `logit run` rejects a config referencing any other
+graphviz DOT (`crates/logit-cli/src/dot.rs`). `aggregate` and `json` (`crates/logit-transforms`) are
+the built-in transforms implemented so far — `logit run` rejects a config referencing any other
 unimplemented kind with a clear error; see [ADR 0008](docs/adr/0008-aggregation-window-semantics.md)
-for its windowing semantics, `crates/logit-inputs/src/statsd.rs` and
+for `aggregate`'s windowing semantics, [ADR 0010](docs/adr/0010-json-parsing-into-attributes.md) for
+`json`'s parsing semantics, `crates/logit-inputs/src/statsd.rs` and
 `crates/logit-outputs/src/influxdb.rs` for the listener/sink side, `crates/logit-pipeline/src/runtime.rs`
 for orchestration and the per-node flush-tick timer.
 

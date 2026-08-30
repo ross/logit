@@ -30,9 +30,12 @@ already built that have a known, accepted rough edge.
   gauges are explicitly rejected with a clear decode error rather than silently miscoded
   (`crates/logit-inputs/src/statsd.rs`).
 - **`eprintln!` instead of a real diagnostics facility** — statsd input, InfluxDB output, the node
-  runtime's per-event script errors and per-batch output errors, and the aggregator's kind-conflict
-  reports. Cosmetic while there's one of each component; matters once there's more than one running
-  at once and stderr becomes an unattributable mess.
+  runtime's per-event script errors and per-batch output errors, the aggregator's kind-conflict
+  reports, and the `json` transform's parse-failure reports
+  (`docs/adr/0010-json-parsing-into-attributes.md`). Cosmetic while there's one of each component;
+  matters once there's more than one running at once and stderr becomes an unattributable mess —
+  and a `json` component in front of a high-volume source of malformed lines is a concrete way to
+  hit that mess sooner than most, one line per event with no rate limiting.
 - **No graceful shutdown for `logit run`** — Ctrl-C falls through to the OS default (immediate
   termination); no installed handler. Partially softened by the aggregate/flush work: a node now
   flushes once when its inbound channel closes *normally* (`crates/logit-pipeline/src/runtime.rs`),

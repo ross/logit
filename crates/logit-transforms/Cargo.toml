@@ -10,3 +10,6 @@ description = "Built-in native transform stages (no Lua VM involved) -- aggregat
 logit-core.workspace = true
 logit-pipeline.workspace = true
 thiserror.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true

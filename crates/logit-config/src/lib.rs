@@ -100,10 +100,18 @@ pub enum ComponentKind {
         #[schemars(with = "String")]
         interval: Duration,
     },
+    /// Parses a log record's message as JSON, merging the resulting key/values into the event's
+    /// attributes. See `docs/adr/0010-json-parsing-into-attributes.md`.
+    Json {
+        /// Skip everything before the first `{` and parse from there -- for lines with a
+        /// non-JSON prefix (`2026-08-29 INFO {"a":1}`). Off by default: the whole line is
+        /// assumed to be the JSON data.
+        #[serde(default)]
+        skip_to_brace: bool,
+    },
     // The rest of the built-in native transforms -- not implemented yet (`logit-transforms`),
     // carried over as unimplemented `ComponentKind` variants so config referencing one gets a
     // clear "not implemented yet" at validation time rather than a deserialization error.
-    Json,
     Logfmt,
     Kv,
     Regex {
@@ -275,6 +283,27 @@ mod tests {
         match component.kind {
             ComponentKind::Aggregate { interval } => assert_eq!(interval, Duration::from_secs(10)),
             other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_component_without_skip_to_brace_defaults_to_false() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "json", "sources": ["in"]}"#).unwrap();
+        match component.kind {
+            ComponentKind::Json { skip_to_brace } => assert!(!skip_to_brace),
+            other => panic!("expected Json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_component_with_skip_to_brace_deserializes() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "json", "sources": ["in"], "skip_to_brace": true}"#)
+                .unwrap();
+        match component.kind {
+            ComponentKind::Json { skip_to_brace } => assert!(skip_to_brace),
+            other => panic!("expected Json, got {other:?}"),
         }
     }
 
