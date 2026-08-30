@@ -101,6 +101,14 @@ pub async fn run(graph: Graph, mut specs: HashMap<String, NodeSpec>) -> anyhow::
         }
     }
 
+    // Every consumer's `Fanout` already holds its own clone of the `Sender`s it needs -- this
+    // map's own clones are construction-only scaffolding. Left alive, they'd each be one extra
+    // outstanding `Sender` on every channel for the rest of `run`, so a channel would never
+    // observe every real sender dropped and close -- the shutdown cascade (an inbox closing,
+    // triggering that node's close-time flush and exit) could never fire, and `run` would hang
+    // forever waiting on tasks that are themselves waiting on inboxes that can never close.
+    drop(senders);
+
     while let Some(result) = tasks.join_next().await {
         result??;
     }
@@ -451,5 +459,77 @@ mod tests {
             received.events[0].attributes.get("tagged").and_then(|v| v.as_str()),
             Some("yes")
         );
+    }
+
+    /// Unlike `OneShotInput` above (which idles forever after sending, to keep the graph alive
+    /// for that test's assertion), this returns as soon as it's sent its one batch -- a real
+    /// listener that has genuinely finished.
+    struct FiniteInput {
+        batch: Option<EventBatch>,
+    }
+
+    #[async_trait::async_trait]
+    impl Input for FiniteInput {
+        async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
+            if let Some(batch) = self.batch.take() {
+                sink.send(batch).await;
+            }
+            Ok(())
+        }
+    }
+
+    /// Regression test: `run`'s internal `senders` map used to keep one extra `Sender` clone
+    /// alive, for every channel, for `run`'s entire lifetime -- so a downstream inbox could never
+    /// observe every real sender dropped and close, the shutdown cascade could never fire, and
+    /// `run` hung forever even after its only input had genuinely finished.
+    #[tokio::test]
+    async fn run_returns_once_the_only_input_finishes_instead_of_hanging() {
+        let mut components = Map::new();
+        components.insert(
+            "in".to_string(),
+            Component {
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            },
+        );
+        components.insert(
+            "out".to_string(),
+            Component {
+                sources: vec!["in".to_string()],
+                kind: ComponentKind::InfluxDbOut {
+                    url: "http://localhost:8086".to_string(),
+                    org: "org".to_string(),
+                    bucket: "bucket".to_string(),
+                    token: "TOKEN".to_string(),
+                },
+            },
+        );
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+        );
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(Box::new(RecordingOutput { tx: result_tx })),
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), run(g, specs))
+            .await
+            .expect("run should return once the only input finishes, not hang forever")
+            .expect("run should complete without error");
+
+        let received = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the batch should have reached the output before shutdown");
+        assert_eq!(received.events.len(), 1);
     }
 }
