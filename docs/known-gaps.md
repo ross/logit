@@ -75,15 +75,71 @@ already built that have a known, accepted rough edge.
   costs a full `EventBatch` clone. `Arc<EventBatch>` with copy-on-write is the identified future
   fix; a per-edge `on_full: block | drop` policy for the backpressure question is an open one, not
   yet designed.
+
+  Now measured ([memory.md](design/memory.md)): that clone is 4 allocations and a 792-byte memcpy
+  per event per extra branch, 272 ns — about 10% of the 2.61 µs it takes to ingest a line, and
+  roughly 1/16th of what encoding one event for InfluxDB costs. So the copy-on-write change is
+  still worth making (it's strictly no worse anywhere, and frees every read-only sink branch
+  entirely), but it is *not* the pipeline's main cost, which is what this entry previously implied.
+  The encoder is.
 - **A Lua component's `flush()` has no resource of its own at a timer tick** — unlike an `aggregate`
   component, which tracks its own per-resource windows, a Lua component's flushed events are
   stamped with whichever resource it most recently saw on a real batch
   (`crates/logit-pipeline/src/runtime.rs`, see [ADR 0008](adr/0008-aggregation-window-semantics.md)).
   Fine for every config today (one listener, one resource); would need a real answer once a
   component has more than one upstream resource.
-- **A criterion benchmark of the event proxy against plain table conversion is still outstanding**
-  ([lua-api.md](design/lua-api.md)) — the design commits to the proxy on reasoning (avoiding a full
-  table conversion per stage per event), not yet confirmed with numbers.
+- ~~**A benchmark of the event proxy against plain table conversion is still outstanding**~~ —
+  **closed.** Measured in `crates/logit-bench/benches/pipeline.rs` (`lua::proxy` vs
+  `lua::to_table`): 1.51 µs/event through the proxy against 2.63 µs for `to_table`, ~1.7× in the
+  proxy's favour, widening for scripts that read few attributes. The design commitment in
+  [lua-api.md](design/lua-api.md) stands, now with a number behind it. What the same measurement
+  did turn up is that the boundary costs 21 allocations per event (a `_G` lookup of `process` per
+  event, a fresh `AttrsProxy` userdata per attribute access, a Rust `String` per metamethod key) —
+  recorded in [memory.md](design/memory.md)'s recommendations, not yet fixed.
+- **The attribute/metric-name interner is unbounded, and a *lookup* grows it**
+  (`crates/logit-core/src/interner.rs`, `attrs.rs`) — `lasso::ThreadedRodeo` never evicts and never
+  frees, so every distinct string ever interned is retained for the life of the process. Several
+  strings reaching it come straight off the network: statsd metric names and DogStatsD tag keys
+  (`crates/logit-inputs/src/statsd.rs`), and JSON object keys from log bodies
+  (`crates/logit-transforms/src/json.rs`). One client emitting `orders.<uuid>:1|c` grows the table
+  without bound until the process is OOM-killed, with nothing reporting it.
+
+  `AttrMap::get` makes this worse than it needs to be: it calls `intern`, so a lookup that *misses*
+  still permanently adds its key. `kv_metrics` calling `attributes.get(field)` on an event lacking
+  that field is an ordinary path (nginx's `$upstream_response_time` is empty on a non-proxied
+  request), and it grows a process-global table. `lasso` has a non-interning `get()`; a lookup
+  should use it, and a key not in the table can't be on any event anyway.
+
+  This is the hardest thing in the tree to retrofit — `Symbol` is `Copy` and `resolve` *panics* on
+  an unknown symbol, so `AttrMap`, `MetricRecord`, `SeriesKey`, the Lua proxy, and the planned wire
+  dictionary are all written against "symbols are eternal." The cheap half (non-interning lookup,
+  an exposed `len()`, a throttled threshold warning) is fixable now; the representation question
+  (a bounded table with an inline-string fallback, or narrowing what may be interned at all) needs
+  its own ADR, and needs it before a public-facing listener ships. See
+  [memory.md](design/memory.md)'s interner section for the full threat model.
+- **`statsd_in` copies tag values instead of slicing them** (`crates/logit-inputs/src/statsd.rs`) —
+  it builds attribute values with `attributes.insert(k, v)` on a `&str`, which routes through
+  `Value::str` → `Bytes::from(String)`, copying bytes already present in the datagram buffer; the
+  subsequent `attributes.clone()` in `build_event` then promotes each to a shared `Bytes`,
+  allocating again. Two allocations per tag, where `syslog_in`'s `slice_of` achieves zero. Measured
+  at 8 allocations per statsd line against 1 per syslog line
+  ([memory.md](design/memory.md)); `crates/logit-bench`'s
+  `statsd_tag_values_are_copied_not_sliced` pins the current behavior so it can't be assumed away.
+  The fix is to give `statsd.rs` the same pointer-arithmetic slicing `syslog.rs` already has.
+- **`influxdb_out`'s line encoder allocates ~180 times per event**
+  (`crates/logit-outputs/src/influxdb.rs`) — the largest single cost in the pipeline, roughly twice
+  what ingesting an event costs end to end. `escape_tag`/`escape_measurement` each build four
+  intermediate `String`s via chained `.replace()` whether or not anything needs escaping;
+  `metric_fields` returns a `Vec<(String, String)>` with a `format!` per name and a `to_string()`
+  per value; the series map is keyed by a fresh `line.clone()` on every call rather than only on
+  insert. All fixable within that one file (`Cow<str>` escaping, a reused line buffer, `raw_entry`)
+  with no change to the event model. See [memory.md](design/memory.md).
+- **Channel depth is bounded in batches, not bytes or events**
+  (`CHANNEL_CAPACITY`, `crates/logit-pipeline/src/runtime.rs`) — 64 batches per edge, with
+  unbounded batch size. A 65 KB syslog datagram can decode to hundreds of events, so one edge can
+  hold tens of megabytes with nothing in the config saying so, and total in-flight memory scales
+  with edge count. Bounded in practice today only because datagram size caps batch size; becomes
+  real with a TCP or file-tail input, where nothing caps how many events one read produces.
 - **`!env` is invisible to `schema/logit.schema.json`** ([ADR 0011](adr/0011-env-yaml-tag.md)) —
   resolution happens on the parsed YAML tree before serde ever sees it
   (`crates/logit-cli/src/config.rs`), so the schema describes the substituted shape, never the tag

@@ -34,6 +34,7 @@ who reaches for `make` out of habit.
 | `script/setup` | One-time setup for a fresh checkout: bootstrap + start the local test stack. |
 | `script/update` | Run after pulling changes: rebuild the dev image, refresh the test stack. |
 | `script/test` | `cargo nextest run --workspace` |
+| `script/bench [filter]` | Throughput and allocation benchmarks ([docs/design/memory.md](docs/design/memory.md)) |
 | `script/lint` | `cargo clippy`, warnings denied |
 | `script/format [--check]` | `cargo fmt` |
 | `script/schema` | Regenerate `schema/logit.schema.json` from the config types |
@@ -74,9 +75,10 @@ crates/
   logit-outputs     per-protocol sinks; InfluxDB
   logit-transforms  built-in native transform components; aggregate, json
   logit-cli         the `logit` binary
+  logit-bench       dev-only: allocation-count tests and throughput benchmarks
 docs/
   OVERVIEW.md       project scope, ~1 page
   adr/              architecture decision records
-  design/           the event model, Lua API, pipeline component graph, and wire protocol design docs
+  design/           the event model, Lua API, pipeline component graph, wire protocol, and memory design docs
   plans/            staged implementation plans for larger, multi-session pieces of work
 ```

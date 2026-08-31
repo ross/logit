@@ -5,6 +5,19 @@ mod config;
 mod dot;
 mod pipeline;
 
+/// jemalloc rather than the platform default (glibc malloc on this project's `debian:bookworm-slim`
+/// runtime image) -- see `docs/adr/0015-jemalloc-global-allocator.md` and
+/// `docs/design/memory.md`. `logit` is exactly the workload glibc's arena model handles worst: a
+/// long-lived, multi-threaded process churning small short-lived allocations forever, where RSS
+/// drifts upward for days without the working set growing.
+///
+/// Behind a default-on feature so both allocators stay measurable -- `--no-default-features` builds
+/// against the system allocator, which is what makes "is jemalloc actually helping here?" a
+/// question with an answer rather than an assumption.
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser)]
 #[command(name = "logit", version, about = "A logging, metrics, and tracing multiplexer.")]
 struct Cli {

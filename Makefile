@@ -3,7 +3,7 @@
 # https://github.blog/engineering/scripts-to-rule-them-all/) -- see AGENTS.md and README.md, and
 # add new commands there, not here.
 
-.PHONY: bootstrap setup update server test lint fmt fmt-check schema audit cibuild console image up down clean
+.PHONY: bootstrap setup update server test bench lint fmt fmt-check schema audit cibuild console image up down clean
 
 bootstrap:  ## Build the dev container image.
 	./script/bootstrap
@@ -19,6 +19,9 @@ server:     ## Run logit against the local test stack.
 
 test:       ## cargo nextest run --workspace
 	./script/test
+
+bench:      ## Throughput + allocation benchmarks (docs/design/memory.md)
+	./script/bench
 
 lint:       ## cargo clippy, warnings denied
 	./script/lint

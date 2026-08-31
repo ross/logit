@@ -42,6 +42,7 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/lint` | `cargo clippy --workspace --all-targets -- -D warnings` |
 | `script/format [--check]` | `cargo fmt --all` |
 | `script/schema` | Regenerate `schema/logit.schema.json` — run after any `logit-config` type change, and commit the result |
+| `script/bench [filter]` | `cargo bench -p logit-bench` — throughput + per-benchmark allocation counts. Not part of `cibuild` |
 | `script/audit` | `cargo-deny` + `cargo-audit` |
 | `script/cibuild` | The exact sequence CI runs, in order — run this before opening a PR |
 | `script/console` | Interactive shell in the dev container, for anything not covered above |
@@ -102,7 +103,15 @@ not a style preference:
   it with a non-mergeable implementation to get `Set` aggregation working faster.
 - **The wire encoding (`rkyv` vs. hand-rolled) is an open, benchmark-gated decision** — see
   `docs/design/wire-protocol.md`. Don't pick one in passing while implementing something else;
-  benchmark it and record the outcome as an ADR.
+  benchmark it and record the outcome as an ADR. `crates/logit-bench` is the harness to do it in.
+- **Memory behavior is measured, not assumed** — `docs/design/memory.md` records what every
+  pipeline stage allocates and what `Event` costs to move, and both are enforced by tests:
+  `crates/logit-core/tests/type_sizes.rs` asserts exact `size_of`s, and
+  `crates/logit-bench/tests/allocations.rs` asserts exact allocation counts per stage. They're
+  exact equality on purpose. **When one fails, that's the test working** — decide whether the
+  change is worth it, then update the constant *and* `docs/design/memory.md`'s table in the same
+  commit. Don't relax an assertion to a `<=` bound to make it pass; that removes the only thing
+  stopping `Event` from quietly growing.
 
 ## Where things live
 
@@ -117,6 +126,7 @@ crates/
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target)
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
+  logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
 ```
 
 `logit-inputs`/`logit-outputs`/`logit-transforms` depend on `logit-pipeline` for their trait, not

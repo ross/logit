@@ -34,6 +34,14 @@ event with none of the three is legal and representable. A sink emits whatever i
 `Resource` is `Arc`-shared rather than copied onto every event — a batch typically comes from one
 socket/file/OTLP request and shares one origin.
 
+**`Event` is 792 bytes**, and that size is paid unconditionally — a statsd counter with three tags
+costs exactly as much to move as a fully-populated nginx access log, because `AttrMap`'s inline
+capacity and `MetricKind`'s inlined `DDSketch` are reserved whether or not they're used. Since an
+event is moved by value on every hop between nodes and deep-cloned once per extra fan-out consumer,
+that number is a throughput property. [memory.md](memory.md) breaks it down term by term, measures
+what each pipeline stage allocates, and lists what could be reclaimed;
+`crates/logit-core/tests/type_sizes.rs` asserts it so it can't drift silently.
+
 ## Values
 
 ```rust
@@ -47,7 +55,7 @@ pub enum Value {
     Str(bytes::Bytes),   // UTF-8, validated at construction
     Timestamp(i64),      // unix nanos
     Array(Vec<Value>),
-    Map(AttrMap),
+    Map(Box<AttrMap>),   // boxed: an unboxed AttrMap here would make Value infinitely sized
 }
 ```
 
@@ -58,6 +66,11 @@ designing it twice would mean keeping two conversions in sync forever.
 buffer should end up as a zero-copy slice of that buffer, not a fresh allocation. `Bytes` is
 cheaply `Clone`-able (refcounted) and cheaply sliced, which both the parsing path and the Lua proxy
 depend on.
+
+Measured, `syslog_in` and `json` keep that promise (decoding a line costs one allocation regardless
+of how many fields it yields) and `statsd_in` does not (it copies each tag value out of the
+datagram instead of slicing it). See [memory.md](memory.md)'s zero-copy section — both facts are
+pinned by tests, not left to inspection.
 
 ## Attributes: interned keys, small-map storage
 

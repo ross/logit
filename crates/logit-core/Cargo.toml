@@ -13,3 +13,7 @@ lasso = { version = "0.7", features = ["multi-threaded"] }
 sketches-ddsketch.workspace = true
 
 [dev-dependencies]
+# `tests/type_sizes.rs` asserts `size_of::<bytes::Bytes>()` directly -- it's the term that sets
+# `Value`'s size, so the assertion is more legible naming it than hiding it behind `Value`.
+# An integration test can't reach a crate's ordinary dependencies, hence the restatement here.
+bytes.workspace = true

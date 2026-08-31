@@ -54,8 +54,13 @@ Two real candidates, deliberately left open pending a prototype rather than comm
   maintaining the encoder/decoder by hand instead of deriving it.
 
 Prototype both against representative batches (mixed logs/metrics/spans, realistic cardinality),
-benchmark encode/decode throughput and allocation count with `criterion`, and record the decision as
-an ADR once it's made — weighted toward the schema-evolution story, since a wire protocol that can't
+benchmark encode/decode throughput and allocation count, and record the decision as an ADR once
+it's made. **The harness for this now exists**: `crates/logit-bench` (`script/bench`) holds
+representative fixtures and reports per-benchmark allocation counts alongside timings via `divan` —
+which is what this section originally named `criterion` for, chosen instead because it reports
+allocation counts natively, and allocation count is the number that matters most here. Add the
+encoding prototypes as benches there rather than standing up a second harness; see
+[memory.md](memory.md) for how to read its output — weighted toward the schema-evolution story, since a wire protocol that can't
 tolerate mixed versions in the field is a much bigger operational problem than a few percent of
 throughput.
 

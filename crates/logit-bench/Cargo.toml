@@ -1,0 +1,30 @@
+[package]
+name = "logit-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Allocation measurement and throughput benchmarks for logit. Dev-only; ships in nothing."
+
+# This crate exists because no other one can hold these measurements: `logit-pipeline` deliberately
+# doesn't depend on any concrete input/transform/output (`docs/design/pipeline-graph.md`'s crate
+# layout), so the only place an end-to-end `syslog_in -> json -> kv_metrics -> keep -> aggregate ->
+# influxdb_out` measurement can live is a crate that depends on all of them. See
+# `docs/design/memory.md`.
+
+[dependencies]
+logit-core.workspace = true
+logit-pipeline.workspace = true
+logit-inputs.workspace = true
+logit-outputs.workspace = true
+logit-transforms.workspace = true
+logit-script.workspace = true
+logit-proto.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+divan = "0.1"
+
+[[bench]]
+name = "pipeline"
+harness = false

@@ -250,8 +250,11 @@ fn backoff_for(retry: &RetryPolicy, attempt: u32) -> Duration {
 /// yet for what a log line or span becomes in InfluxDB, and guessing one isn't this output's job).
 /// An event can carry several metrics at once now (`docs/adr/0012-multi-payload-events.md`), so
 /// each one becomes its own line, sharing that event's tags.
+/// Public only so `logit-bench` can measure encoding in isolation, the same reason this is split
+/// out from [`InfluxDbOutput`] at all -- `docs/design/memory.md` quotes a per-point allocation
+/// count that has to come from calling this directly, with no HTTP server in the picture.
 #[derive(Default)]
-struct InfluxLineEncoder {
+pub struct InfluxLineEncoder {
     diag: Diagnostics,
 }
 
