@@ -87,14 +87,16 @@ fn syslog_decode_100_lines() {
     assert_eq!(stats.reallocs, 5, "the events Vec grows 4 -> 8 -> 16 -> 32 -> 64 -> 128");
 }
 
-/// Eight allocations for one line, against syslog's one -- and the gap is entirely
-/// tag handling. `statsd.rs` builds attribute values with `attributes.insert(k, v)` on a `&str`,
-/// which goes through `impl From<&str> for Value` -> `Value::str` -> `Bytes::from(String)`: a
-/// fresh copy of bytes that are already sitting in the datagram buffer. Then `build_event`'s
-/// `attributes.clone()` promotes each of those to a shared `Bytes`, allocating a second time.
+/// Two allocations for one line, down from eight: `statsd.rs`'s tag values are now sliced out of
+/// the datagram with the same `slice_of` pointer-arithmetic `syslog.rs` uses, instead of going
+/// through `impl From<&str> for Value` -> `Bytes::from(String)` (a fresh copy) and then a second
+/// copy when `build_event`'s `attributes.clone()` promoted it to a shared `Bytes`.
 ///
-/// Three tags, two allocations each, plus one `Vec<Event>` per line and one for the batch. See
-/// [`statsd_tag_values_are_copied_not_sliced`] for the same finding stated structurally.
+/// What's left, unlike syslog's single `Vec<Event>`: statsd's multi-value grammar
+/// (`name:1:2:3|c`) means `parse_line` collects one line's events into its own `Vec` before
+/// `decode` appends them into the batch's `Vec`, so this is one allocation per line plus one for
+/// the batch rather than syslog's one total. See
+/// [`statsd_tag_values_share_the_datagram_allocation`] for the same finding stated structurally.
 #[test]
 fn statsd_decode_one_line() {
     let mut decoder = fixtures::statsd_decoder();
@@ -103,7 +105,7 @@ fn statsd_decode_one_line() {
 
     let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
     assert_eq!(batch.events.len(), 1);
-    expect_allocs("statsd_in: decode 1 line", stats, 8);
+    expect_allocs("statsd_in: decode 1 line", stats, 2);
 }
 
 /// The logs-only workload `docs/design/memory.md` §0 names as unmeasured: a plain-text syslog
@@ -133,9 +135,16 @@ fn syslog_decode_one_logs_only_line() {
 
 /// `json.rs`'s `ValueSeed` deserializes straight into `Value` -- no intermediate
 /// `serde_json::Value` tree -- and keeps unescaped strings as zero-copy slices of the message
-/// buffer. What's left is the intermediate `AttrMap` it builds (so a malformed object can't leave
-/// attributes half-populated) plus the merge into the event, which pushes the attribute count from
-/// 4 to 10 and spills `AttrMap` off its 8-entry inline capacity.
+/// buffer. The intermediate is still there -- a malformed object can't leave attributes
+/// half-populated, so the parsed pairs are built up separately from `event.attributes` and only
+/// merged in on full success -- but it's now a scratch `Vec<(Symbol, Value)>` held on `JsonParser`
+/// and cleared per call (mirroring `InfluxLineEncoder`'s reused buffers) rather than a fresh
+/// `AttrMap` from `deserialize`, and object keys are interned straight off the deserializer
+/// (`KeySeed`) instead of passing through an owned `String` first. That was where 6 of the
+/// original 7 allocations were -- one per JSON key -- not the intermediate map itself, which fits
+/// `AttrMap`'s 8-entry inline capacity for this fixture's 6 fields regardless. What's left is the
+/// one allocation from `event.attributes` itself spilling its inline capacity once the merge pushes
+/// the count from 4 to 10.
 #[test]
 fn json_parse_one_event() {
     let mut json = fixtures::json_parser();
@@ -152,7 +161,7 @@ fn json_parse_one_event() {
     let event = decode_one();
     let (event, stats) = measure(|| json.process(&resource, event).expect("json forwards"));
     assert_eq!(event.attributes.len(), 10, "6 JSON fields plus 4 syslog.* attributes");
-    expect_allocs("json: parse + merge 1 event", stats, 7);
+    expect_allocs("json: parse + merge 1 event", stats, 1);
 }
 
 /// The wide-JSON workload `docs/design/memory.md` §0 names as unmeasured: 28 flat top-level
@@ -387,11 +396,16 @@ fn influx_encode_100_events() {
     expect_allocs("influxdb_out: encode 100 events", stats, 30);
 }
 
-/// ~18 allocations per event. That used to be an order of magnitude *better* than the InfluxDB
-/// encoder; now it's the worse of the two by a wide margin, because `influxdb_out` was reworked to
-/// format into reused buffers and this one still `format!`s per rendered value. The same treatment
-/// would apply almost unchanged -- but this is a debug sink for humans reading a terminal, not a
-/// throughput path, so it's recorded rather than done.
+/// Down from 1801 (~18/event) to 101 (~1/event), via the same treatment `influxdb_out` got
+/// (`docs/design/memory.md`): merge-join the resource and event attribute maps instead of cloning
+/// and re-inserting one, and format numbers straight into the output buffer via `write!` instead
+/// of a `format!`/`to_string()` per rendered value. The remaining allocation is one
+/// `format_rfc3339_utc` call per event (`logit_core::time`, out of this encoder's scope) plus one
+/// for the output `String`'s own first growth -- `influxdb_out` still comes out ahead at ~0.3
+/// allocations/event, since it also reuses its per-line buffers across events, which this encoder
+/// doesn't need (every `render_*` function here already writes straight into the one buffer this
+/// returns; see `EventDump::encode`'s doc comment for why there's no equivalent scratch state left
+/// to hoist onto the struct).
 #[test]
 fn stdio_encode_100_events() {
     let dump = EventDump::new(Format::Human);
@@ -400,7 +414,7 @@ fn stdio_encode_100_events() {
 
     let (text, stats) = measure(|| dump.encode(&batch));
     assert!(!text.is_empty());
-    expect_allocs("stdio_out: encode 100 events", stats, 1801);
+    expect_allocs("stdio_out: encode 100 events", stats, 101);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -434,7 +448,7 @@ fn lua_process_one_event() {
 /// for the reference config. Excludes the output encoders, which run once per flush window rather
 /// than once per event, and excludes fan-out, which the config's `tap` branch adds.
 ///
-/// 11 = 1 (decode) + 7 (json) + 3 (kv_metrics) + 0 (keep) + 0 (aggregate).
+/// 5 = 1 (decode) + 1 (json) + 3 (kv_metrics) + 0 (keep) + 0 (aggregate).
 #[test]
 fn full_chain_one_line() {
     let resource = fixtures::resource();
@@ -461,7 +475,7 @@ fn full_chain_one_line() {
         run!();
     }
     let (_, stats) = measure(|| run!());
-    expect_allocs("full chain: 1 access-log line", stats, 11);
+    expect_allocs("full chain: 1 access-log line", stats, 5);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -489,15 +503,12 @@ fn syslog_fields_share_the_datagram_allocation() {
     assert!(points_into(&datagram, tag), "syslog.tag should slice the datagram too");
 }
 
-/// The counterexample, pinned so it can't be quietly assumed away: statsd tag values are *copied*
-/// out of the datagram, not sliced. This is the structural cause of
-/// [`statsd_decode_one_line`]'s eight allocations, and the fix is to give `statsd.rs` the
-/// `slice_of` treatment `syslog.rs` already has.
-///
-/// Asserted as a currently-true fact about the code, not as desirable behavior -- when someone
-/// fixes it, this test should start failing and be replaced by the positive assertion above.
+/// The zero-copy claim for statsd, stated structurally: every DogStatsD tag value points *into*
+/// the datagram buffer it was decoded from, same as [`syslog_fields_share_the_datagram_allocation`]
+/// above. `statsd.rs`'s `slice_of` is what makes this true -- if it regresses back to copying tag
+/// values into a fresh `Bytes`, this is the test that catches it.
 #[test]
-fn statsd_tag_values_are_copied_not_sliced() {
+fn statsd_tag_values_share_the_datagram_allocation() {
     let datagram = fixtures::statsd_datagram(1);
     let mut decoder = fixtures::statsd_decoder();
     let batch = decoder.decode(datagram.clone()).expect("should decode");
@@ -506,11 +517,7 @@ fn statsd_tag_values_are_copied_not_sliced() {
     let env = event.attributes.get("env").expect("the env tag");
     let Value::Str(env) = env else { panic!("the tag value should be a Str") };
     assert_eq!(env.as_ref(), b"prod");
-    assert!(
-        !points_into(&datagram, env),
-        "this documents a known gap: if statsd tag values now slice the datagram, that's an \
-         improvement -- flip this to `points_into` and update docs/design/memory.md"
-    );
+    assert!(points_into(&datagram, env), "env tag value should slice the datagram, not copy it");
 }
 
 /// `StatsdInput::run`/`SyslogInput::run` copy each datagram out of the reusable 64 KB receive

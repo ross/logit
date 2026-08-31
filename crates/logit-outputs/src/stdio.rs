@@ -39,6 +39,11 @@ use logit_core::{
     AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource, Severity, SpanEvent, SpanKind,
     SpanLink, SpanRecord, SpanStatus, Value,
 };
+use std::cmp::Ordering;
+// `std::fmt::Write`, for `write!` into a `String` -- formatting straight into the output buffer
+// instead of building an intermediate `String` per number via `to_string()`/`format!`
+// (`docs/design/memory.md`), the same reason `logit-outputs::influxdb` uses it.
+use std::fmt::Write;
 use std::path::Path;
 use tokio::io::{self, AsyncWriteExt};
 
@@ -66,6 +71,19 @@ impl EventDump {
     /// panics -- a debug sink's whole job is staying up when everything else is falling over, so
     /// even a `Set` metric (no real encoding yet, see `logit_core::HyperLogLog`) or a
     /// non-finite/absurd numeric value renders *something* rather than erroring.
+    ///
+    /// Deliberately still `&self`, with no scratch buffers held on [`EventDump`] the way
+    /// `InfluxLineEncoder` holds `line`/`fields`/`tag_suffix`/`scratch` (`docs/design/memory.md`).
+    /// Those exist because that encoder builds a line into a *separate* buffer before committing
+    /// it (so a later rejection can't leave a half-written line in the output) and formats a
+    /// non-string tag value into its own scratch space before borrowing it back out. Every
+    /// `render_*` function below writes straight into `out` -- the same buffer this returns --
+    /// with no intermediate buffer at any point, so there is nothing left to hoist onto the
+    /// struct; the fix here was removing the per-event `AttrMap` clone (see
+    /// [`render_merged_attrs`]) and the per-value `format!`/`to_string()` calls, not adding
+    /// reusable state. `out` itself is still a fresh `String` per call, exactly as
+    /// `InfluxLineEncoder::encode`'s `buf` is -- see that function's doc comment for why the
+    /// per-batch output buffer is left as is.
     pub fn encode(&self, batch: &EventBatch) -> String {
         match self.format {
             Format::Human => {
@@ -96,18 +114,16 @@ fn render_event_block(out: &mut String, resource: &Resource, event: &Event) {
     out.push_str(&format_rfc3339_utc(event.timestamp));
     if let Some(log) = &event.log {
         let severity = log.severity.map(severity_label).unwrap_or("-");
-        out.push_str(&format!(" log[{severity}] "));
+        out.push_str(" log[");
+        out.push_str(severity);
+        out.push_str("] ");
         render_value(out, &log.message);
     }
     out.push('\n');
 
-    let mut attrs = resource.attributes.clone();
-    for (key, value) in event.attributes.iter() {
-        attrs.insert(resolve(key), value.clone());
-    }
-    if !attrs.is_empty() {
+    if !resource.attributes.is_empty() || !event.attributes.is_empty() {
         out.push_str("  attrs   ");
-        render_attrs(out, &attrs);
+        render_merged_attrs(out, &resource.attributes, &event.attributes);
         out.push('\n');
     }
 
@@ -158,6 +174,49 @@ fn render_attrs(out: &mut String, attrs: &AttrMap) {
     }
 }
 
+/// Renders `resource`'s attributes merged with `event`'s as space-separated `key=value` pairs,
+/// the event's value winning on a key collision -- see [`render_event_block`]'s doc comment for
+/// why the merge happens at all.
+///
+/// **Merge-joined rather than combined by cloning `resource`'s `AttrMap` and inserting `event`'s
+/// over the top.** Both already iterate in sorted-`Symbol` order (`AttrMap::iter`'s doc comment),
+/// so walking them in lockstep and preferring the event's value on an equal key produces exactly
+/// the same sequence the clone-and-insert did -- without copying an `AttrMap` per event, and
+/// without the `resolve` -> `intern` round trip re-inserting every key required. Mirrors
+/// `logit-outputs::influxdb`'s `render_tag_suffix`, which fixed the same pattern there first.
+fn render_merged_attrs(out: &mut String, resource: &AttrMap, event: &AttrMap) {
+    let mut resource_attrs = resource.iter().peekable();
+    let mut event_attrs = event.iter().peekable();
+    let mut first = true;
+
+    loop {
+        let next =
+            match (resource_attrs.peek().map(|(k, _)| *k), event_attrs.peek().map(|(k, _)| *k)) {
+                (Some(r), Some(e)) => match r.cmp(&e) {
+                    Ordering::Less => resource_attrs.next(),
+                    Ordering::Greater => event_attrs.next(),
+                    // Same key on both: the event's value wins, and the resource's is discarded.
+                    Ordering::Equal => {
+                        resource_attrs.next();
+                        event_attrs.next()
+                    }
+                },
+                (Some(_), None) => resource_attrs.next(),
+                (None, Some(_)) => event_attrs.next(),
+                (None, None) => break,
+            };
+        let Some((key, value)) = next else { break };
+
+        if !first {
+            out.push(' ');
+        }
+        first = false;
+        render_key(out, resolve(key));
+        out.push('=');
+        render_value(out, value);
+    }
+}
+
 /// `<name> <kind-specific fields>`, plus a trailing ` unit=<unit>` when the metric has one.
 /// Single-valued kinds (`counter`/`gauge`) render as `kind=value`; multi-field kinds render the
 /// kind name followed by space-separated `field=value` pairs, matching the module doc comment's
@@ -168,31 +227,31 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
     match &metric.kind {
         MetricKind::Counter(v) => {
             out.push_str("counter=");
-            out.push_str(&v.to_string());
+            let _ = write!(out, "{v}");
         }
         MetricKind::Gauge(v) => {
             out.push_str("gauge=");
-            out.push_str(&v.to_string());
+            let _ = write!(out, "{v}");
         }
         MetricKind::Distribution(sketch) => {
             out.push_str("distribution count=");
-            out.push_str(&sketch.count().to_string());
+            let _ = write!(out, "{}", sketch.count());
             for q in [0.5, 0.9, 0.99] {
                 if let Some(v) = sketch.quantile(q) {
-                    out.push_str(&format!(" p{}={v}", (q * 100.0).round() as u32));
+                    let _ = write!(out, " p{}={v}", (q * 100.0).round() as u32);
                 }
             }
         }
         MetricKind::Histogram { buckets } => {
             out.push_str("histogram");
             for (bound, count) in buckets {
-                out.push_str(&format!(" bucket_{bound}={count}"));
+                let _ = write!(out, " bucket_{bound}={count}");
             }
         }
         MetricKind::Summary { quantiles } => {
             out.push_str("summary");
             for (q, v) in quantiles {
-                out.push_str(&format!(" q{q}={v}"));
+                let _ = write!(out, " q{q}={v}");
             }
         }
         MetricKind::Set(_) => {
@@ -231,7 +290,7 @@ fn render_span(out: &mut String, event_timestamp: i64, span: &SpanRecord) {
     out.push_str(" duration=");
     // `saturating_sub`: a span with a corrupt/out-of-order `end_timestamp` before its own start
     // must still render *something* rather than panicking or wrapping to a nonsense huge value.
-    out.push_str(&span.end_timestamp.saturating_sub(event_timestamp).to_string());
+    let _ = write!(out, "{}", span.end_timestamp.saturating_sub(event_timestamp));
     out.push_str("ns");
 }
 
@@ -264,7 +323,7 @@ fn render_span_link(out: &mut String, link: &SpanLink) {
 
 fn push_hex(out: &mut String, bytes: &[u8]) {
     for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+        let _ = write!(out, "{b:02x}");
     }
 }
 
@@ -293,11 +352,21 @@ fn span_status_label(status: SpanStatus) -> &'static str {
 fn render_value(out: &mut String, value: &Value) {
     match value {
         Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(&b.to_string()),
-        Value::I64(i) => out.push_str(&i.to_string()),
-        Value::U64(u) => out.push_str(&u.to_string()),
-        Value::F64(f) => out.push_str(&f.to_string()),
-        Value::Bytes(b) => out.push_str(&format!("<{} bytes>", b.len())),
+        Value::Bool(b) => {
+            let _ = write!(out, "{b}");
+        }
+        Value::I64(i) => {
+            let _ = write!(out, "{i}");
+        }
+        Value::U64(u) => {
+            let _ = write!(out, "{u}");
+        }
+        Value::F64(f) => {
+            let _ = write!(out, "{f}");
+        }
+        Value::Bytes(b) => {
+            let _ = write!(out, "<{} bytes>", b.len());
+        }
         Value::Str(s) => {
             // `Value::Str` is constructed only from valid UTF-8 (see its own doc comment and
             // `Value::as_str`), so this cannot panic.
@@ -357,22 +426,41 @@ fn is_plain_key(s: &str) -> bool {
 /// garbled text. Since a value can come from attacker-influenced input (a syslog line, a
 /// `json`-parsed body) rather than trusted local config, this has to hold for every string this
 /// sink ever writes, not just the visibly obvious ones.
+///
+/// Copies runs of characters that need no escaping directly into `out` with one `push_str`,
+/// rather than pushing one character at a time -- the same `push_escaped` shape
+/// `logit-outputs::influxdb` uses (`docs/design/memory.md`). Every character this escapes is
+/// ASCII (a C0 control, DEL, or one of `"`/`\`/newline/CR/tab), so the byte offset `find` returns
+/// is always exactly one character wide, never a UTF-8 continuation byte.
 fn render_quoted_str(out: &mut String, s: &str) {
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                out.push_str(&format!("\\x{:02x}", c as u32));
-            }
-            c => out.push(c),
+    let mut rest = s;
+    while let Some(i) = rest.find(needs_str_escape) {
+        out.push_str(&rest[..i]);
+        push_escaped_char(out, rest.as_bytes()[i]);
+        rest = &rest[i + 1..];
+    }
+    out.push_str(rest);
+    out.push('"');
+}
+
+fn needs_str_escape(c: char) -> bool {
+    matches!(c, '"' | '\\' | '\n' | '\r' | '\t') || (c as u32) < 0x20 || c as u32 == 0x7f
+}
+
+/// Escapes the one byte `needs_str_escape` matched. `write!`'s `\xHH` fallback formats straight
+/// into `out` -- no intermediate `String` the way `format!` would build one.
+fn push_escaped_char(out: &mut String, b: u8) {
+    match b {
+        b'"' => out.push_str("\\\""),
+        b'\\' => out.push_str("\\\\"),
+        b'\n' => out.push_str("\\n"),
+        b'\r' => out.push_str("\\r"),
+        b'\t' => out.push_str("\\t"),
+        _ => {
+            let _ = write!(out, "\\x{b:02x}");
         }
     }
-    out.push('"');
 }
 
 /// The open sink `StdioOutput` writes to. An enum over the three concrete `tokio` I/O types rather
