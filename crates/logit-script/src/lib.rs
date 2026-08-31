@@ -93,8 +93,17 @@ pub enum ProcessOutcome {
 
 impl ScriptWorker {
     /// Loads a script's source and sandboxes it (see [`sandbox_libs`]). Fails at load time if the
-    /// source doesn't parse/execute, or doesn't define a `process` function -- a config error
-    /// should surface immediately, not at the first event that happens to flow through.
+    /// source doesn't parse/execute, doesn't define a `process` function, or defines a `flush`
+    /// global that isn't a function (or `nil`) -- a config error should surface immediately, not
+    /// at the first event, or first flush tick, that happens to flow through.
+    ///
+    /// `process`/`flush` are resolved to `RegistryKey`s exactly once, here, rather than looked up
+    /// from `_G` on every call (see the field doc comments) -- one consequence worth being
+    /// explicit about (and written down in `docs/design/lua-api.md`): a script that reassigns
+    /// `_G.process`/`_G.flush` after this point has no effect on what actually runs. Reassigning
+    /// either mid-run isn't a documented or tested pattern to begin with, so this is very unlikely
+    /// to be a real behavior change for anything that exists, but it is a real narrowing of what
+    /// this boundary guarantees.
     pub fn new(source: &str) -> Result<Self, ScriptError> {
         let lua = Lua::new_with(sandbox_libs(), LuaOptions::new())?;
         remove_unsandboxed_base_globals(&lua)?;
@@ -104,10 +113,17 @@ impl ScriptWorker {
             _ => return Err(ScriptError::MissingProcess),
         };
         let process = lua.create_registry_value(process_fn)?;
-        let flush = match lua.globals().get::<_, LuaValue>("flush")? {
-            LuaValue::Function(f) => Some(lua.create_registry_value(f)?),
-            _ => None,
-        };
+        // `Option<mlua::Function>::from_lua` maps a `nil` global to `None` (no `flush` at all --
+        // the stateless-processor case) and, for anything else, delegates to
+        // `Function::from_lua` -- which errors clearly (`error converting Lua <type> to
+        // function`) rather than silently treating a mistyped global (e.g. `flush = 5`, plausible
+        // from a copy-paste or a renamed variable) the same as "absent." That distinction matters
+        // more here than it would for a plain lookup: a script that thinks it flushes but doesn't
+        // would silently lose events at every flush tick with the eager-resolution approach below
+        // instead of erroring at load time the way the equivalent mistake on `process` already
+        // does via `MissingProcess`.
+        let flush_fn: Option<mlua::Function> = lua.globals().get("flush")?;
+        let flush = flush_fn.map(|f| lua.create_registry_value(f)).transpose()?;
         Ok(Self { lua, process, flush, _not_send_sync: PhantomData })
     }
 
@@ -115,7 +131,8 @@ impl ScriptWorker {
     /// proxy-vs-table-conversion tradeoff [`EventProxy`] exists to avoid.
     pub fn process(&self, event: Event) -> Result<ProcessOutcome, ScriptError> {
         let process: mlua::Function = self.lua.registry_value(&self.process)?;
-        let result: LuaValue = process.call(EventProxy::new(event))?;
+        let result: LuaValue =
+            process.call(EventProxy::new(event)).map_err(proxy::clarify_destructed_handle_use)?;
         Ok(match result {
             LuaValue::Nil => ProcessOutcome::Drop,
             LuaValue::UserData(ud) => {
@@ -140,7 +157,7 @@ impl ScriptWorker {
             return Ok(Vec::new());
         };
         let flush: mlua::Function = self.lua.registry_value(flush_key)?;
-        let result: LuaValue = flush.call(())?;
+        let result: LuaValue = flush.call(()).map_err(proxy::clarify_destructed_handle_use)?;
         Ok(match result {
             LuaValue::Nil => Vec::new(),
             LuaValue::Table(table) => events_from_table(&self.lua, table, "flush")?,
@@ -900,6 +917,48 @@ mod tests {
     }
 
     #[test]
+    fn stashing_and_returning_event_attributes_fails_clearly_on_later_use() {
+        // The same failure class as the test above, discovered from a different place: caching
+        // `event.attributes` means the `AttrsProxy` handle stashed here is destructed too, once
+        // `into_inner` releases it as part of returning `event` from process() -- not just the
+        // `EventProxy` handle `take_event` catches directly. The review's exact repro: stash
+        // `event.attributes` (not `event` itself) in a Lua local, return the event, then read the
+        // stash from flush(). Before this fix, this failed with mlua's raw
+        // "a destructed callback or destructed userdata method was called" instead of this
+        // crate's own wording.
+        let w = worker(
+            r#"
+            local pending_attrs = nil
+            function process(event)
+                pending_attrs = event.attributes
+                return event
+            end
+            function flush()
+                pending_attrs.env = "prod"
+                return {}
+            end
+            "#,
+        );
+        emitted(w.process(counter_event("hits", 1.0)).unwrap());
+        let err = match w.flush() {
+            Ok(_) => panic!("expected flush() to fail: pending_attrs should already be destructed"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("already returned") || err.contains("consumed"),
+            "expected this crate's own clear error, not mlua's raw one: {err}"
+        );
+        assert!(
+            err.contains("attributes"),
+            "expected the error to call out event.attributes specifically: {err}"
+        );
+        assert!(
+            !err.contains("destructed"),
+            "expected this crate's own wording, not mlua's \"destructed\" terminology: {err}"
+        );
+    }
+
+    #[test]
     fn cloning_before_stashing_avoids_the_alias_problem() {
         // The documented workaround for the pattern above: stash an independent clone, not the
         // live alias, so returning the original doesn't invalidate the stashed copy.
@@ -982,6 +1041,20 @@ mod tests {
     #[test]
     fn syntax_error_is_rejected_at_load_time() {
         assert!(matches!(expect_err("this is not lua ("), ScriptError::Lua(_)));
+    }
+
+    /// `process`/`flush` are now resolved once at load time (a cached `RegistryKey`, not a fresh
+    /// `_G` lookup per call -- see `ScriptWorker::new`), which means a `flush` global that exists
+    /// but isn't a function (a plausible copy-paste or renamed-variable mistake, e.g. `flush = 5`)
+    /// must be rejected right here, the same way a missing `process` already is -- not resolved as
+    /// "no flush" and then silently emit nothing at every flush tick forever. The eager-resolution
+    /// review's exact repro.
+    #[test]
+    fn flush_bound_to_a_non_function_value_is_rejected_at_load_time() {
+        assert!(matches!(
+            expect_err("function process(event) return event end\nflush = 5"),
+            ScriptError::Lua(_)
+        ));
     }
 
     #[test]

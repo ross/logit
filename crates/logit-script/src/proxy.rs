@@ -17,13 +17,17 @@ use std::rc::Rc;
 /// Wraps one [`Event`] for the duration of a `process()`/`flush()` call -- and possibly longer, if
 /// a script stashes it in a global or upvalue.
 ///
-/// **Contract: an event handle is consumed once it's returned from `process()` or included in a
-/// `flush()` table.** Don't keep using a Lua variable referencing an event after handing it back
-/// that way -- it stops working (see [`take_event`]'s doc comment for exactly why: a Lua userdata
-/// is a reference type, so a stashed alias and the returned value can be the *same* underlying
-/// box, and extracting one invalidates the other). If a script genuinely needs to both emit an
-/// event now and keep something for later (e.g. a stateful `flush()` re-emitting it), stash
-/// `event:clone()` -- an independent copy -- rather than `event` itself.
+/// **Contract: an event handle -- and its `event.attributes` handle -- is consumed once the event
+/// is returned from `process()` or included in a `flush()` table.** Don't keep using a Lua
+/// variable referencing either after handing the event back that way -- both stop working (see
+/// [`take_event`]'s doc comment for exactly why: a Lua userdata is a reference type, so a stashed
+/// alias and the returned value can be the *same* underlying box, and extracting one invalidates
+/// the other; `event.attributes` is cached per event -- see the `attrs` field below -- so the same
+/// is true of a `local a = event.attributes` stashed alongside it). Touching either past that
+/// point fails clearly, via [`clarify_destructed_handle_use`], rather than with mlua's generic
+/// destructed-userdata wording. If a script genuinely needs to both emit an event now and keep
+/// something for later (e.g. a stateful `flush()` re-emitting it), stash `event:clone()` -- an
+/// independent copy -- rather than `event` (or `event.attributes`) itself.
 pub struct EventProxy {
     event: Rc<RefCell<Event>>,
     /// The `event.attributes` sub-proxy, created lazily on the first access and cached rather
@@ -269,4 +273,49 @@ pub(crate) fn take_event(lua: &Lua, ud: AnyUserData) -> mlua::Result<Event> {
         )),
         Err(other) => Err(other),
     }
+}
+
+/// Rewrites an error caused by a *script* touching an already-destructed `EventProxy`/`AttrsProxy`
+/// handle into this crate's own clear wording -- the same "handle consumed once returned" message
+/// [`take_event`] already gives for the one case it can see directly (a destructed `EventProxy`
+/// it's the one taking). Passed through unchanged if it isn't that.
+///
+/// This exists because caching `event.attributes` (see [`EventProxy::attrs_userdata`] and
+/// [`EventProxy::into_inner`]) opens the same failure class on an `AttrsProxy` handle that already
+/// existed for `EventProxy` itself: a script that does `local a = event.attributes`, returns its
+/// event (destructing the cached `AttrsProxy` as part of that), and then touches `a` again from
+/// `flush()` now hits a destructed userdata -- exactly the stash-then-reuse mistake
+/// `take_event`'s message already explains for the event handle itself, just discovered from a
+/// different place.
+///
+/// `take_event` catches its case by matching `Err(mlua::Error::UserDataDestructed)` returned
+/// directly from its own `AnyUserData::take` call -- a Rust-side operation. This case is
+/// different: the destructed access happens *inside a running script* (`flush()`'s own body reads
+/// or writes through `a`), so it's mlua's metamethod dispatch, not our code, that discovers the
+/// problem -- Lua swaps a destructed userdata's metatable out for one whose every metamethod
+/// raises `mlua::Error::CallbackDestructed` unconditionally, without ever reaching `AttrsProxy`'s
+/// own `__index`/`__newindex` closures above. That error then crosses back into Rust wrapped in
+/// one or more layers of `mlua::Error::CallbackError` (mlua's mechanism for propagating a Lua-side
+/// error, plus a traceback, back through a `Function::call`) by the time `ScriptWorker::process`/
+/// `flush` see it -- so the only place this can be caught and clarified is here, wrapping the
+/// whole `process.call(...)`/`flush.call(())`, not inside any one metamethod.
+pub(crate) fn clarify_destructed_handle_use(err: mlua::Error) -> mlua::Error {
+    fn is_destructed_handle_use(err: &mlua::Error) -> bool {
+        match err {
+            mlua::Error::CallbackDestructed => true,
+            mlua::Error::CallbackError { cause, .. } => is_destructed_handle_use(cause),
+            _ => false,
+        }
+    }
+    if is_destructed_handle_use(&err) {
+        return mlua::Error::RuntimeError(
+            "this event, or its attributes (event.attributes), was already returned/emitted \
+             elsewhere and can no longer be used -- an event handle, and the attributes handle \
+             obtained from event.attributes, are both consumed once the event is returned from \
+             process() or included in a flush() table; use event:clone() before returning if you \
+             need to keep using either afterward"
+                .to_string(),
+        );
+    }
+    err
 }
