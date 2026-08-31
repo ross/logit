@@ -94,8 +94,9 @@ into one tagged enum creates real collisions — `Otlp { bind }` (a listener) an
 (a sink) can't both be `type: otlp` in an internally-tagged enum, and the same is true of the two
 `Logit` variants. Suffixing *every* protocol kind uniformly, not just the two that collide today,
 keeps the rule predictable as more protocols gain a second side (`syslog_out`, once syslog egress
-exists, say). Transform kinds — `lua`, `lua_file`, `aggregate`, and future native transforms — take
-no suffix; there's only ever one direction for a transform to be.
+exists, say). Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`,
+`remove`, and any future native transform — take no suffix; there's only ever one direction for a
+transform to be.
 
 **`interval` stays a per-kind optional field, unchanged from today.** `lua`/`lua_file` already carry
 an optional flush interval (`docs/adr/0008-aggregation-window-semantics.md`); `aggregate` requires
@@ -140,8 +141,8 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `syslog_in`, `otlp_in`, `file_tail`, `logit_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, future native transforms) | ≥1 required | required (≥1 consumer) |
-| Sink (`influxdb_out`, `otlp_out`, `logit_out`) | ≥1 required | must not be |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`, `remove`) | ≥1 required | required (≥1 consumer) |
+| Sink (`influxdb_out`, `stdio_out`, `otlp_out`, `logit_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
 considered and rejected (ADR 0009): a typo'd source reference would silently turn a real sink into

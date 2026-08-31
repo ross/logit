@@ -12,9 +12,15 @@ protocol — those four design docs are load-bearing; don't improvise around the
 them first. Check [docs/known-gaps.md](docs/known-gaps.md) before "fixing" something that looks
 broken — it's likely a documented, deliberate gap, not an oversight.
 
-**Current state:** v0.1 is complete — statsd in, a 10s `aggregate` window, a Lua enrichment stage,
-InfluxDB 2.x out, via `logit run <config>` (see [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml),
-`script/server`). Config is a flat graph of named components (ADR 0009,
+**Current state:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a
+Lua enrichment stage, InfluxDB 2.x out, via `logit run <config>` (see
+[examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml), `script/server`). Since then,
+`syslog_in` and `stdio_out` (`crates/logit-inputs`/`crates/logit-outputs`) and `json`, `kv_metrics`,
+`keep`, and `remove` (`crates/logit-transforms`) have all landed as real, implemented
+`ComponentKind`s — [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises all
+of them together against a real nginx (`examples/nginx/`), and
+[docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside
+the dev stack. Config is a flat graph of named components (ADR 0009,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively
@@ -22,13 +28,14 @@ through `logit_cli::config::load` (`crates/logit-cli/src/config.rs`), which also
 VAR_NAME` -- any field on any component can pull its value from the environment this way (ADR
 0011), which is why `influxdb_out`'s `token` is a plain string, not an env-specific field. `logit
 graph <config>` prints the resolved graph as graphviz DOT (`crates/logit-cli/src/dot.rs`).
-`aggregate` and `json` (`crates/logit-transforms`) are the built-in transforms implemented so far —
 `logit run` rejects a config referencing any other unimplemented kind with a clear error; see
 [ADR 0008](docs/adr/0008-aggregation-window-semantics.md) for `aggregate`'s windowing semantics,
 [ADR 0010](docs/adr/0010-json-parsing-into-attributes.md) for `json`'s parsing semantics,
-`crates/logit-inputs/src/statsd.rs` and `crates/logit-outputs/src/influxdb.rs` for the
-listener/sink side, `crates/logit-pipeline/src/runtime.rs` for orchestration and the per-node
-flush-tick timer.
+[ADR 0014](docs/adr/0014-kv-metrics-semantics.md) for `kv_metrics`'/`keep`'s semantics,
+[ADR 0013](docs/adr/0013-service-lifecycle-and-output-retry.md) for signal-driven shutdown and
+`influxdb_out`'s bounded output retry, `crates/logit-inputs/src/statsd.rs` and
+`crates/logit-outputs/src/influxdb.rs` for the listener/sink side, `crates/logit-pipeline/src/runtime.rs`
+for orchestration and the per-node flush-tick timer.
 
 ## Environment
 
@@ -122,9 +129,9 @@ crates/
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
-  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target)
-  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target)
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target)
+  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog
+  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
 ```

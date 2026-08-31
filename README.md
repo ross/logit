@@ -8,17 +8,23 @@ the internal event model, the Lua scripting API, the pipeline component graph, a
 protocol, and [docs/known-gaps.md](docs/known-gaps.md) for already-identified rough edges in what's
 built so far.
 
-**Status:** v0.1 is complete — statsd in, a 10s `aggregate` window, a Lua enrichment stage, InfluxDB
-2.x out, via `logit run <config>`. Config is a flat graph of named components, each declaring its
-own `sources` ([ADR 0009](docs/adr/0009-component-graph-configuration.md),
+**Status:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a Lua
+enrichment stage, InfluxDB 2.x out, via `logit run <config>`. Since then, `syslog_in` (RFC 3164/5424
+over UDP) and `stdio_out` have joined statsd/InfluxDB as implemented protocols, and `json`,
+`kv_metrics`, `keep`, and `remove` have joined `aggregate` as implemented native transforms — `logit
+run` rejects a config referencing any other unimplemented kind with a clear error. Config is a flat
+graph of named components, each declaring its own `sources` ([ADR 0009](docs/adr/0009-component-graph-configuration.md),
 [docs/design/pipeline-graph.md](docs/design/pipeline-graph.md)) — `logit graph <config>` prints the
 resolved graph as graphviz DOT. [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml)
-is a working example; `script/server` runs it against the local test stack below. `aggregate` is the
-only built-in transform implemented so far — `logit run` rejects a config referencing any other
-unimplemented kind with a clear error; see [ADR 0008](docs/adr/0008-aggregation-window-semantics.md)
-for its windowing semantics. Any field on any component can pull its value from the environment
-with `!env VAR_NAME` (e.g. `token: !env INFLUXDB_TOKEN`) — see
-[ADR 0011](docs/adr/0011-env-yaml-tag.md).
+is the original v0.1 example; [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml)
+is a fuller one exercising the newer components against a real nginx (see
+[docs/deploying.md](docs/deploying.md) for its nginx-side recipe) — `script/server [config]` runs
+either against the local test stack below. See [ADR 0008](docs/adr/0008-aggregation-window-semantics.md)
+for `aggregate`'s windowing semantics. Any field on any component can pull its value from the
+environment with `!env VAR_NAME` (e.g. `token: !env INFLUXDB_TOKEN`) — see
+[ADR 0011](docs/adr/0011-env-yaml-tag.md). For deploying `logit` outside this repo's dev stack —
+getting the image, running it, `logit validate` as a preflight, signal/restart behavior — see
+[docs/deploying.md](docs/deploying.md).
 
 ## Development
 
@@ -71,9 +77,9 @@ crates/
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution, the node runtime
-  logit-inputs      per-protocol listeners; statsd
-  logit-outputs     per-protocol sinks; InfluxDB
-  logit-transforms  built-in native transform components; aggregate, json
+  logit-inputs      per-protocol listeners; statsd, syslog
+  logit-outputs     per-protocol sinks; InfluxDB, stdio
+  logit-transforms  built-in native transform components; aggregate, json, kv_metrics, keep, remove
   logit-cli         the `logit` binary
   logit-bench       dev-only: allocation-count tests and throughput benchmarks
 docs/
