@@ -166,17 +166,16 @@ fn json_parse_one_event() {
 
 /// The wide-JSON workload `docs/design/memory.md` §0 names as unmeasured: 28 flat top-level
 /// fields (`fixtures::WIDE_JSON_SYSLOG_LINE`, modeled on pino's default output shape) against the
-/// nginx fixture's 6. This corrects a guess `docs/design/memory.md`'s item 5 made from the nginx
-/// number alone: `json`'s allocation cost is **not** dominated by the two `AttrMap`
-/// builds/spills (the intermediate map and the merge) -- it's dominated by
-/// `collect_attrmap`'s `map.next_key::<String>()?`, which allocates one `String` per JSON object
-/// key regardless of value type. 30 allocations for 28 keys is 28 key `String`s plus exactly the
-/// same two spills [`json_parse_one_event`] pays (one on the intermediate `AttrMap` past 8
-/// entries, one on the merge into the event's, which starts at 4 and passes 8 on the fifth JSON
-/// key) -- so unlike the nginx measurement suggested, this cost scales close to linearly with
-/// field count, and a checkpoint-and-rollback fix (item 5's proposal) would leave the dominant
-/// term untouched; a non-allocating key lookup (closer to what `AttrMap::get` needs per item 3)
-/// would matter more here than the intermediate-map rework would.
+/// nginx fixture's 6.
+///
+/// **This test was originally written against the pre-item-5 `json.rs`**, where 28 keys cost 30
+/// allocations -- dominated by `collect_attrmap`'s `map.next_key::<String>()?`, which allocated
+/// one `String` per JSON object key regardless of value type, scaling close to linearly with
+/// field count. Item 5's rework (`crates/logit-transforms/src/json.rs`) replaced exactly that
+/// mechanism: keys are now interned straight off the deserializer (`KeySeed`/`KeyVisitor`) instead
+/// of collected into an owned `String` first. The result generalizes past the case item 5 was
+/// measured against: 28 keys now costs the same **1** allocation [`json_parse_one_event`] measures
+/// for 6, confirming the per-key cost is actually gone, not just reduced for a small field count.
 #[test]
 fn json_parse_wide_json_event() {
     let mut json = fixtures::json_parser();
@@ -193,7 +192,7 @@ fn json_parse_wide_json_event() {
     let event = decode_one();
     let (event, stats) = measure(|| json.process(&resource, event).expect("json forwards"));
     assert_eq!(event.attributes.len(), 32, "28 JSON fields plus 4 syslog.* attributes");
-    expect_allocs("json: parse + merge 1 wide-JSON event", stats, 30);
+    expect_allocs("json: parse + merge 1 wide-JSON event", stats, 1);
 }
 
 /// Four metrics attached: one `MetricList` spill (past its single inline slot) and one `bins` Vec
