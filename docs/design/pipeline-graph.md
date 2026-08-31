@@ -286,12 +286,12 @@ express "route by condition." Two consequences worth stating rather than discove
   designed now, and more valuable to eventually build than it was before that ADR.
 
   **Now measured** ([memory.md](memory.md)): 4 allocations and a 792-byte memcpy per event per
-  extra branch, 272 ns — about 10% of the 2.61 µs it takes to ingest a line, and roughly a
-  sixteenth of what encoding one event for InfluxDB costs. So "load-bearing" is right, but the
-  emphasis above overstates it relative to everything else: the output encoder, not fan-out, is
-  where this pipeline's cost actually sits. The copy-on-write change is still worth making — it's
-  strictly no worse anywhere, and a read-only consumer (every sink) would pay none of it — just not
-  first.
+  extra branch, 232 ns — about 11% of the 2.07 µs it takes to ingest a line. When first measured
+  that was dwarfed by the InfluxDB encoder, which cost sixteen times as much per event; now that
+  the encoder has been reworked (0.3 allocations per event, `docs/design/memory.md`), fan-out is
+  back to being one of the larger remaining costs. So "load-bearing" is right, and the copy-on-write
+  change is worth making: it's strictly no worse anywhere, and a read-only consumer — every sink —
+  would pay none of it.
 
 Also worth carrying forward as an open question, not a decision: today's `send_batch` silently drops
 a send on a closed downstream (`let _ = tx.blocking_send(...)`). Under a DAG that closure should

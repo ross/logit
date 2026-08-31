@@ -7,7 +7,11 @@ use bytes::Bytes;
 use logit_core::interner::resolve;
 use logit_core::{Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Value};
 use logit_proto::{CodecError, Encoder};
+use std::cmp::Ordering;
 use std::collections::HashMap;
+// `std::fmt::Write`, for `write!` into a `String` -- formatting straight into the output buffer
+// instead of building an intermediate `String` per number (`docs/design/memory.md`).
+use std::fmt::Write;
 use std::time::Duration;
 
 /// `reqwest` has no request timeout by default. Without one, a server that accepts the TCP
@@ -253,9 +257,34 @@ fn backoff_for(retry: &RetryPolicy, attempt: u32) -> Duration {
 /// Public only so `logit-bench` can measure encoding in isolation, the same reason this is split
 /// out from [`InfluxDbOutput`] at all -- `docs/design/memory.md` quotes a per-point allocation
 /// count that has to come from calling this directly, with no HTTP server in the picture.
+/// Reusable buffers, and the batch-scoped series map, live on the encoder rather than being
+/// allocated per call, per event, or per line. Encoding is the single largest allocation cost in
+/// the pipeline (`docs/design/memory.md`), and almost all of it was short-lived `String`s built
+/// and dropped inside one line's encoding. `encode` clears each of these at the point its scope
+/// begins, so reuse changes nothing about the bytes produced -- only how often the allocator is
+/// asked for them. `Default` still gives an encoder with everything empty.
 #[derive(Default)]
 pub struct InfluxLineEncoder {
     diag: Diagnostics,
+    /// The `,key=value` tag suffix for the event being encoded. Batch-scoped buffer, event-scoped
+    /// contents: rebuilt once per event and shared across that event's metrics.
+    tag_suffix: String,
+    /// One complete line, assembled before being committed to the output (see
+    /// [`encode_metric_line`] for why a line is built separately rather than appended in place).
+    line: String,
+    /// The `k=v,k=v` field set for the line being assembled.
+    fields: String,
+    /// Scratch space for rendering one non-string tag value. A `Value::Str` tag is borrowed
+    /// directly and never touches this.
+    scratch: String,
+    /// Scratch for [`allocate_timestamp`]'s path-compression walk. Reused because a fresh
+    /// `Vec::new()` allocates the moment the walk visits anything, i.e. on every timestamp
+    /// collision -- and a statsd multi-value datagram collides on essentially every line.
+    visited: Vec<i64>,
+    /// Per-series "next free timestamp slot" successor maps -- see [`encode_metric_line`]'s
+    /// comment for what this is for. Cleared at the start of every `encode`, which keeps it
+    /// batch-scoped exactly as before while letting the maps' allocations survive across batches.
+    series: HashMap<String, HashMap<i64, i64>>,
 }
 
 impl InfluxLineEncoder {
@@ -272,13 +301,13 @@ impl Encoder for InfluxLineEncoder {
         // part in identity, and a second point with the same identity overwrites the first
         // rather than coexisting. Two events in the same batch that share a measurement+tag-set
         // *and* timestamp would therefore collide silently; `encode_metric_line` disambiguates
-        // them. This map holds, per series, a "next free slot" successor map covering every
+        // them. `self.series` holds, per series, a "next free slot" successor map covering every
         // timestamp actually allocated to it so far -- not just the most recent one (see the
         // comment at its use site for why that's not enough either, and for what the successor
-        // map buys over a plain occupied-set). Kept at batch scope, not per-event or per-metric:
-        // that's what lets it disambiguate collisions across the whole batch, not just within
-        // one event.
-        let mut series_allocated_timestamps: HashMap<String, HashMap<i64, i64>> = HashMap::new();
+        // map buys over a plain occupied-set). Cleared here, so it stays batch-scoped -- not
+        // per-event or per-metric: that's what lets it disambiguate collisions across the whole
+        // batch. It lives on the encoder only so its allocations outlive one call.
+        self.series.clear();
         for event in &batch.events {
             if event.metrics.is_empty() {
                 continue; // a log-only, span-only, or empty event: nothing to encode
@@ -286,18 +315,25 @@ impl Encoder for InfluxLineEncoder {
             // Tags come from `resource.attributes` + `event.attributes` only -- nothing
             // metric-specific -- so they're identical for every metric on this event. Rendered
             // once per event, not once per metric.
-            let tag_suffix = render_tag_suffix(&batch.resource, event);
+            render_tag_suffix(&mut self.tag_suffix, &mut self.scratch, &batch.resource, event);
             for metric in &event.metrics {
                 // One bad metric shouldn't drop its event's other metrics, let alone the rest of
                 // the batch, so this logs and skips rather than propagating via `?`. Deliberately
                 // on the inner, per-metric loop: a `Set` or `#`-prefixed metric sharing an event
                 // with a perfectly good one must not take the good one down with it.
+                //
+                // The buffers are passed as separate `&mut` arguments rather than reached through
+                // `self` inside the callee: they're disjoint fields, which the borrow checker
+                // accepts here and would not through a `&mut self` method.
                 if let Err(err) = encode_metric_line(
                     &mut buf,
-                    &tag_suffix,
+                    &mut self.line,
+                    &mut self.fields,
+                    &self.tag_suffix,
                     metric,
                     event.timestamp,
-                    &mut series_allocated_timestamps,
+                    &mut self.series,
+                    &mut self.visited,
                 ) {
                     self.diag.warn_throttled("encode_error", err);
                 }
@@ -307,22 +343,49 @@ impl Encoder for InfluxLineEncoder {
     }
 }
 
-/// The `,key=value,key=value` line-protocol tag suffix for one event: resource attributes first,
-/// event attributes overriding on key collision (an event-level tag is more specific than the
-/// batch-wide resource it came from). Depends on nothing metric-specific, so it's computed once
-/// per event and shared across every metric that event carries. Infallible by construction: a tag
-/// that can't be represented (an empty key/value, or one with an embedded newline -- line
-/// protocol has no escape for that at all) is dropped individually rather than escalated to a
-/// whole-point error.
-fn render_tag_suffix(resource: &Resource, event: &Event) -> String {
-    let mut suffix = String::new();
-    let mut tags = resource.attributes.clone();
-    for (key, value) in event.attributes.iter() {
-        tags.insert(resolve(key), value.clone());
-    }
-    for (key, value) in tags.iter() {
+/// Renders the `,key=value,key=value` line-protocol tag suffix for one event into `suffix`
+/// (cleared first): resource attributes first, event attributes overriding on key collision (an
+/// event-level tag is more specific than the batch-wide resource it came from). Depends on nothing
+/// metric-specific, so it's computed once per event and shared across every metric that event
+/// carries. Infallible by construction: a tag that can't be represented (an empty key/value, or
+/// one with an embedded newline -- line protocol has no escape for that at all) is dropped
+/// individually rather than escalated to a whole-point error.
+///
+/// The two attribute maps are **merge-joined** rather than combined by cloning the resource's map
+/// and inserting the event's over the top. Both iterate in sorted-`Symbol` order (`AttrMap::iter`),
+/// so walking them in lockstep and preferring the event's value on an equal key produces exactly
+/// the same sequence the clone-and-insert did -- without copying an `AttrMap` per event, and
+/// without the `resolve` -> `intern` round trip that re-inserting every key required.
+fn render_tag_suffix(
+    suffix: &mut String,
+    scratch: &mut String,
+    resource: &Resource,
+    event: &Event,
+) {
+    suffix.clear();
+    let mut resource_attrs = resource.attributes.iter().peekable();
+    let mut event_attrs = event.attributes.iter().peekable();
+
+    loop {
+        let next =
+            match (resource_attrs.peek().map(|(k, _)| *k), event_attrs.peek().map(|(k, _)| *k)) {
+                (Some(r), Some(e)) => match r.cmp(&e) {
+                    Ordering::Less => resource_attrs.next(),
+                    Ordering::Greater => event_attrs.next(),
+                    // Same key on both: the event's value wins, and the resource's is discarded.
+                    Ordering::Equal => {
+                        resource_attrs.next();
+                        event_attrs.next()
+                    }
+                },
+                (Some(_), None) => resource_attrs.next(),
+                (None, Some(_)) => event_attrs.next(),
+                (None, None) => break,
+            };
+        let Some((key, value)) = next else { break };
+
         let key = resolve(key);
-        let Some(value) = value_as_tag_string(value) else {
+        let Some(value) = tag_value(scratch, value) else {
             continue;
         };
         // InfluxDB 2.x rejects an empty tag value outright, and line protocol has no escape for
@@ -338,23 +401,27 @@ fn render_tag_suffix(resource: &Resource, event: &Event) -> String {
             continue;
         }
         suffix.push(',');
-        suffix.push_str(&escape_tag(key));
+        push_escaped_tag(suffix, key);
         suffix.push('=');
-        suffix.push_str(&escape_tag(&value));
+        push_escaped_tag(suffix, value);
     }
-    suffix
 }
 
+/// One metric's line, appended to `buf`. `line` and `fields` are caller-owned scratch buffers,
+/// cleared here -- see [`InfluxLineEncoder`]'s fields for why they're not local.
+#[allow(clippy::too_many_arguments)]
 fn encode_metric_line(
     buf: &mut String,
+    line: &mut String,
+    fields: &mut String,
     tag_suffix: &str,
     metric: &MetricRecord,
     timestamp: i64,
     series_allocated_timestamps: &mut HashMap<String, HashMap<i64, i64>>,
+    visited: &mut Vec<i64>,
 ) -> Result<(), CodecError> {
-    let fields = metric_fields(&metric.kind)?;
-    if fields.is_empty() {
-        // Every field was non-finite (see `format_float`) or otherwise unrepresentable -- an
+    if !render_fields(fields, &metric.kind)? {
+        // Every field was non-finite (see `push_float`) or otherwise unrepresentable -- an
         // empty line is invalid line protocol, so skip rather than write one.
         return Ok(());
     }
@@ -370,15 +437,18 @@ fn encode_metric_line(
         )));
     }
 
-    // Built in a local buffer first, not `buf` directly: if a later step rejects (there are none
-    // right now, but there were -- see `render_tag_suffix`'s doc comment for the history), only a
-    // complete, valid line ever reaches `buf`. "measurement + tags" is also the series-identity
-    // key fed to `series_allocated_timestamps` below -- the tag half is shared across an event's
-    // metrics (see `encode`), but the measurement isn't, so this string still has to be rebuilt
-    // once per metric even though `tag_suffix` itself is computed only once.
-    let mut line = escape_measurement(measurement);
+    // Built in a separate buffer first, not `buf` directly: if a later step rejects (there are
+    // none right now, but there were -- see `render_tag_suffix`'s doc comment for the history),
+    // only a complete, valid line ever reaches `buf`. "measurement + tags" is also the
+    // series-identity key fed to `series_allocated_timestamps` below -- the tag half is shared
+    // across an event's metrics (see `encode`), but the measurement isn't, so this prefix still
+    // has to be rebuilt once per metric even though `tag_suffix` itself is computed only once.
+    line.clear();
+    push_escaped_measurement(line, measurement);
     line.push_str(tag_suffix);
-
+    // Where the series-identity prefix ends. Everything appended past this point (fields, the
+    // timestamp) is not part of the series key.
+    let series_key_len = line.len();
     // Disambiguate same-series collisions within this batch (see `encode`'s comment).
     //
     // Three schemes were tried before this one:
@@ -416,10 +486,22 @@ fn encode_metric_line(
     // amortized-cheap walk, byte-for-byte the same output as if those metrics had arrived as `k`
     // separate events. `series_allocated_timestamps` staying hoisted at batch scope (`encode`,
     // above) is what makes this true -- don't move it to per-event or per-metric scope.
-    let next_free = series_allocated_timestamps.entry(line.clone()).or_default();
-    let timestamp = allocate_timestamp(next_free, timestamp).ok_or_else(|| {
+    // Looked up before inserting, so the common path -- a series already seen in this batch --
+    // costs one extra hash instead of one `String` allocation for a key that is then thrown away.
+    // (`entry` would need the key up front, and `get_mut`-then-`insert` can't share one borrow
+    // without polonius.) The key is the prefix of `line` computed above, borrowed for the lookup
+    // and only cloned when it turns out to be new.
+    let series_key = &line[..series_key_len];
+    if !series_allocated_timestamps.contains_key(series_key) {
+        series_allocated_timestamps.insert(series_key.to_string(), HashMap::new());
+    }
+    let next_free = series_allocated_timestamps
+        .get_mut(&line[..series_key_len])
+        .expect("just inserted if it was missing");
+    let timestamp = allocate_timestamp(next_free, visited, timestamp).ok_or_else(|| {
+        let series = &line[..series_key_len];
         CodecError::Malformed(format!(
-            "no free timestamp slot for series {line:?} near {timestamp} (i64 overflow)"
+            "no free timestamp slot for series {series:?} near {timestamp} (i64 overflow)"
         ))
     })?;
 
@@ -430,18 +512,11 @@ fn encode_metric_line(
     // aggregate same-series samples together, which the source protocol never specified.
 
     line.push(' ');
-    for (i, (key, value)) in fields.iter().enumerate() {
-        if i > 0 {
-            line.push(',');
-        }
-        line.push_str(&escape_tag(key));
-        line.push('=');
-        line.push_str(value);
-    }
+    line.push_str(fields);
     line.push(' ');
-    line.push_str(&timestamp.to_string());
+    push_i64(line, timestamp);
 
-    buf.push_str(&line);
+    buf.push_str(line);
     buf.push('\n');
     Ok(())
 }
@@ -465,8 +540,12 @@ fn encode_metric_line(
 /// self-loop. `i64::MAX` nanoseconds is the year 2262, so in practice this only ever fires for a
 /// series with over 2^63 timestamps already allocated at or after `requested` -- not reachable
 /// from any real batch.
-fn allocate_timestamp(next_free: &mut HashMap<i64, i64>, requested: i64) -> Option<i64> {
-    let mut visited = Vec::new();
+fn allocate_timestamp(
+    next_free: &mut HashMap<i64, i64>,
+    visited: &mut Vec<i64>,
+    requested: i64,
+) -> Option<i64> {
+    visited.clear();
     let mut cur = requested;
     while let Some(&next) = next_free.get(&cur) {
         visited.push(cur);
@@ -476,73 +555,130 @@ fn allocate_timestamp(next_free: &mut HashMap<i64, i64>, requested: i64) -> Opti
     // directly at its successor so the next walk through any of them stops immediately.
     let successor = cur.checked_add(1)?;
     next_free.insert(cur, successor);
-    for slot in visited {
+    for slot in visited.drain(..) {
         next_free.insert(slot, successor);
     }
     Some(cur)
 }
 
-/// The line-protocol field set for one metric. `Counter`/`Gauge` are a single `value` field;
-/// `Distribution` writes `count` (as an unsigned integer -- see [`format_uint`]) plus a few fixed
-/// percentiles (meaningful today even for the single-sample sketches `logit-inputs::statsd`
-/// currently produces -- p50/p90/p99 of one sample are all just that sample). `Histogram` maps
-/// its buckets onto fields directly; `Summary` maps its quantiles onto fields keyed by the raw
-/// quantile value rather than a rounded percentage, since rounding isn't collision-free (0.991
-/// and 0.994 would both round to "p99" and overwrite each other within one line's field set).
-/// `Set` has no encoding yet: it needs a real `HyperLogLog` (`logit_core::metric::HyperLogLog` is
-/// still a stub), so this returns an error rather than inventing a meaningless one.
-fn metric_fields(kind: &MetricKind) -> Result<Vec<(String, String)>, CodecError> {
+/// Renders one metric's line-protocol field set as `k=v,k=v` into `out` (cleared first), returning
+/// whether anything was written. `false` means every field was unrepresentable, which makes the
+/// whole point unwritable -- an empty field set is invalid line protocol.
+///
+/// `Counter`/`Gauge` are a single `value` field; `Distribution` writes `count` (as an unsigned
+/// integer -- see [`push_uint`]) plus a few fixed quantiles; `Histogram` maps its buckets onto
+/// fields directly; `Summary` maps its quantiles onto fields keyed by the raw quantile value
+/// rather than a rounded percentage, since rounding isn't collision-free (0.991 and 0.994 would
+/// both round to "p99" and overwrite each other within one line's field set). `Set` has no
+/// encoding yet: it needs a real `HyperLogLog` (`logit_core::metric::HyperLogLog` is still a
+/// stub), so this returns an error rather than inventing a meaningless one.
+///
+/// **Field names are written unescaped, and that is not a shortcut.** Every name this can produce
+/// is either a literal (`value`, `count`) or built purely out of formatted numbers
+/// (`p50`, `bucket_1.5`, `q0.99`), and no `f64`/`u32` rendering can contain a backslash, comma,
+/// equals, or space -- so the escaping the previous version applied was provably a no-op, and the
+/// output is byte-for-byte what it was. A future field name derived from anything user-supplied
+/// would have to go back through [`push_escaped_tag`].
+fn render_fields(out: &mut String, kind: &MetricKind) -> Result<bool, CodecError> {
+    out.clear();
+
     match kind {
         MetricKind::Counter(v) | MetricKind::Gauge(v) => {
-            Ok(format_float(*v).map(|v| vec![("value".to_string(), v)]).unwrap_or_default())
+            if v.is_finite() {
+                out.push_str("value=");
+                push_float(out, *v);
+            }
         }
         MetricKind::Distribution(sketch) => {
-            let mut fields = vec![("count".to_string(), format_uint(sketch.count() as u64))];
+            // Unconditional, so a Distribution always has at least one field.
+            out.push_str("count=");
+            push_uint(out, sketch.count() as u64);
             for q in [0.5, 0.9, 0.99] {
-                if let Some(v) = sketch.quantile(q).and_then(format_float) {
-                    fields.push((format!("p{}", (q * 100.0).round() as u32), v));
+                if let Some(v) = sketch.quantile(q).filter(|v| v.is_finite()) {
+                    let percentile = (q * 100.0).round() as u32;
+                    let _ = write!(out, ",p{percentile}=");
+                    push_float(out, v);
                 }
             }
-            Ok(fields)
         }
-        MetricKind::Histogram { buckets } => Ok(buckets
-            .iter()
-            .filter_map(|(bound, count)| {
-                format_float(*bound).map(|b| (format!("bucket_{b}"), format_uint(*count)))
-            })
-            .collect()),
-        MetricKind::Summary { quantiles } => Ok(quantiles
-            .iter()
-            .filter_map(|(q, v)| format_float(*v).map(|v| (format!("q{q}"), v)))
-            .collect()),
+        MetricKind::Histogram { buckets } => {
+            for (bound, count) in buckets {
+                if bound.is_finite() {
+                    separator(out);
+                    let _ = write!(out, "bucket_{bound}=");
+                    push_uint(out, *count);
+                }
+            }
+        }
+        MetricKind::Summary { quantiles } => {
+            for (q, v) in quantiles {
+                if v.is_finite() {
+                    separator(out);
+                    let _ = write!(out, "q{q}=");
+                    push_float(out, *v);
+                }
+            }
+        }
         MetricKind::Set(_) => {
-            Err(CodecError::Malformed("Set metrics have no line-protocol encoding yet".to_string()))
+            return Err(CodecError::Malformed(
+                "Set metrics have no line-protocol encoding yet".to_string(),
+            ))
         }
+    }
+    Ok(!out.is_empty())
+}
+
+/// Comma between field entries, for the two kinds whose field count isn't known up front. Keyed
+/// off "has anything been written yet" rather than a loop index, because entries are skipped for
+/// non-finite values and an index would put a leading comma on a line whose first bucket was
+/// skipped.
+fn separator(out: &mut String) {
+    if !out.is_empty() {
+        out.push(',');
     }
 }
 
-/// Line protocol has no representation for non-finite floats; guard here rather than writing
-/// `value=NaN` and letting InfluxDB reject the whole write. (A client can produce this today --
-/// statsd's `f64::parse` accepts the literal text "NaN"/"inf" -- so this isn't a purely
-/// theoretical guard.)
-fn format_float(v: f64) -> Option<String> {
-    v.is_finite().then(|| v.to_string())
+/// Line protocol has no representation for non-finite floats. Every caller guards with
+/// `is_finite` before reaching this (writing `value=NaN` would have InfluxDB reject the whole
+/// write); a client can produce one today -- statsd's `f64::parse` accepts the literal text
+/// "NaN"/"inf" -- so that guard isn't theoretical.
+///
+/// `write!` rather than `to_string()`: identical output (`to_string` is `format!("{}")`), no
+/// intermediate allocation.
+fn push_float(out: &mut String, v: f64) {
+    debug_assert!(v.is_finite(), "callers must reject non-finite values before formatting");
+    let _ = write!(out, "{v}");
 }
 
 /// Line-protocol unsigned-integer field (the `u` suffix, InfluxDB 2.x). Without it, a bare number
 /// is parsed as `f64` by default, which loses integer semantics and, above 2^53, exactness --
 /// real concerns for a count that legitimately grows past that in a long-running series.
-fn format_uint(v: u64) -> String {
-    format!("{v}u")
+fn push_uint(out: &mut String, v: u64) {
+    let _ = write!(out, "{v}u");
 }
 
-fn value_as_tag_string(v: &Value) -> Option<String> {
+fn push_i64(out: &mut String, v: i64) {
+    let _ = write!(out, "{v}");
+}
+
+/// One tag value as a `&str`, or `None` for a `Value` with no sensible plain-text tag
+/// representation. A `Value::Str` is borrowed straight out of the attribute (no copy, since it's
+/// already UTF-8 `Bytes`); everything else is formatted into `scratch`, which is cleared first and
+/// reused across tags.
+fn tag_value<'a>(scratch: &'a mut String, v: &'a Value) -> Option<&'a str> {
     match v {
-        Value::Bool(b) => Some(b.to_string()),
-        Value::I64(i) => Some(i.to_string()),
-        Value::U64(u) => Some(u.to_string()),
-        Value::F64(f) => Some(f.to_string()),
-        Value::Str(s) => std::str::from_utf8(s).ok().map(str::to_string),
+        Value::Str(s) => std::str::from_utf8(s).ok(),
+        Value::Bool(_) | Value::I64(_) | Value::U64(_) | Value::F64(_) => {
+            scratch.clear();
+            let _ = match v {
+                Value::Bool(b) => write!(scratch, "{b}"),
+                Value::I64(i) => write!(scratch, "{i}"),
+                Value::U64(u) => write!(scratch, "{u}"),
+                Value::F64(f) => write!(scratch, "{f}"),
+                _ => unreachable!("guarded by the outer match arm"),
+            };
+            Some(scratch.as_str())
+        }
         // Null, Bytes, Timestamp, Array, and Map have no sensible plain-text tag representation.
         Value::Null | Value::Bytes(_) | Value::Timestamp(_) | Value::Array(_) | Value::Map(_) => {
             None
@@ -550,12 +686,36 @@ fn value_as_tag_string(v: &Value) -> Option<String> {
     }
 }
 
-fn escape_measurement(s: &str) -> String {
-    s.replace('\\', "\\\\").replace(',', "\\,").replace(' ', "\\ ")
+/// Appends `s` with line protocol's measurement escaping (`\`, `,`, and space).
+///
+/// Written straight into `out` rather than returned as a new `String`: the previous chained
+/// `.replace()` form allocated once per replacement -- three or four `String`s per measurement or
+/// tag -- *whether or not anything actually needed escaping*, which was the single biggest
+/// contributor to this encoder's allocation count (`docs/design/memory.md`). The common case here
+/// copies one contiguous run and allocates nothing.
+fn push_escaped_measurement(out: &mut String, s: &str) {
+    push_escaped(out, s, &['\\', ',', ' ']);
 }
 
-fn escape_tag(s: &str) -> String {
-    s.replace('\\', "\\\\").replace(',', "\\,").replace('=', "\\=").replace(' ', "\\ ")
+/// As [`push_escaped_measurement`], for tag keys, tag values, and field keys, which additionally
+/// escape `=`.
+fn push_escaped_tag(out: &mut String, s: &str) {
+    push_escaped(out, s, &['\\', ',', '=', ' ']);
+}
+
+/// Appends `s` to `out`, prefixing each of `needs_escape` with a backslash. Copies in runs between
+/// escapes rather than character by character, so an unescaped string is one `push_str`.
+fn push_escaped(out: &mut String, s: &str, needs_escape: &[char]) {
+    let mut rest = s;
+    while let Some(i) = rest.find(needs_escape) {
+        out.push_str(&rest[..i]);
+        out.push('\\');
+        // The matched character, which `find` guarantees is one of `needs_escape` and therefore
+        // one byte of ASCII.
+        out.push_str(&rest[i..i + 1]);
+        rest = &rest[i + 1..];
+    }
+    out.push_str(rest);
 }
 
 #[cfg(test)]
