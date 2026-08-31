@@ -266,15 +266,16 @@ fn clone_one_statsd_event() {
 // Outputs
 // ---------------------------------------------------------------------------------------------
 
-/// **The dominant cost in the whole pipeline**: ~180 allocations per event, against 11 to ingest
-/// one. Each of the event's four metrics becomes a line costing ~45 allocations, from
-/// `escape_tag`/`escape_measurement` building four intermediate `String`s apiece via chained
-/// `.replace()` (whether or not anything needs escaping), a `Vec<(String, String)>` of fields with
-/// a `format!` per name and a `to_string()` per value, and a `line.clone()` used as a `HashMap`
-/// key on every call rather than only on insert.
+/// Was the dominant cost in the whole pipeline at ~180 allocations per event -- more than ingest
+/// and fan-out combined -- and is now 0.3, after the encoder was reworked to escape and format
+/// straight into reused buffers instead of building a `String` per tag, per field name, per field
+/// value, and per line. See `docs/design/memory.md`.
 ///
-/// This is where an optimization pass should start, and none of it needs any change to the event
-/// model -- see `docs/design/memory.md`'s recommendations.
+/// What's left is genuinely per-batch rather than per-event: one `Bytes` for the finished body,
+/// one `String` key per *distinct* series on its first sighting, and the growth of the per-series
+/// timestamp maps. Nothing here scales with event count any more, which is the property worth
+/// keeping -- if this number starts tracking the batch size again, something has regressed to
+/// per-line allocation.
 #[test]
 fn influx_encode_100_events() {
     let mut encoder = InfluxLineEncoder::default();
@@ -283,12 +284,14 @@ fn influx_encode_100_events() {
 
     let (body, stats) = measure(|| encoder.encode(&batch).expect("should encode"));
     assert!(!body.is_empty());
-    expect_allocs("influxdb_out: encode 100 events", stats, 18024);
+    expect_allocs("influxdb_out: encode 100 events", stats, 30);
 }
 
-/// ~18 allocations per event -- an order of magnitude better than the InfluxDB encoder, mostly
-/// because it appends into one shared buffer instead of building per-line `String`s. Still a debug
-/// sink, so this matters less; recorded for contrast.
+/// ~18 allocations per event. That used to be an order of magnitude *better* than the InfluxDB
+/// encoder; now it's the worse of the two by a wide margin, because `influxdb_out` was reworked to
+/// format into reused buffers and this one still `format!`s per rendered value. The same treatment
+/// would apply almost unchanged -- but this is a debug sink for humans reading a terminal, not a
+/// throughput path, so it's recorded rather than done.
 #[test]
 fn stdio_encode_100_events() {
     let dump = EventDump::new(Format::Human);

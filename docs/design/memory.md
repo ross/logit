@@ -104,49 +104,67 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `Event::clone` (nginx shape) | **4** | what each extra fan-out branch costs |
 | `Event::clone` (statsd shape) | **0** | fits entirely inline |
 | `stdio_out` encode 100 events | **1801** | ~18/event |
-| `influxdb_out` encode 100 events | **18024** | **~180/event** |
+| `influxdb_out` encode 100 events | **30** | ~0.3/event — see below |
 
 And the corresponding times:
 
 | Stage | fastest | per event |
 |---|---:|---:|
-| `syslog_in` decode, 100 lines | 28.9 µs | 289 ns |
-| `statsd_in` decode, 100 lines | 43.6 µs | 436 ns |
-| `json` | 748 ns | 748 ns |
-| `kv_metrics` | 304 ns | 304 ns |
-| `keep` | 404 ns | 404 ns |
-| `aggregate` absorb | 721 ns | 721 ns |
-| **full ingest chain** | **2.61 µs** | ~383k lines/s/core |
-| `Event::clone` (nginx / statsd / distribution) | 272 / 99 / 63 ns | |
-| `stdio_out` encode, 100 events | 236 µs | 2.36 µs |
-| `influxdb_out` encode, 100 events | 496 µs | **4.96 µs** |
+| `syslog_in` decode, 100 lines | 22.3 µs | 223 ns |
+| `statsd_in` decode, 100 lines | 34.7 µs | 347 ns |
+| `json` | 584 ns | 584 ns |
+| `kv_metrics` | 250 ns | 250 ns |
+| `keep` | 323 ns | 323 ns |
+| `aggregate` absorb | 561 ns | 561 ns |
+| **full ingest chain** | **2.07 µs** | ~484k lines/s/core |
+| `Event::clone` (nginx / statsd / distribution) | 232 / 85 / 52 ns | |
+| `stdio_out` encode, 100 events | 188 µs | 1.88 µs |
+| `influxdb_out` encode, 100 events | 153 µs | 1.53 µs |
 
-### The headline result: the bottleneck is the output encoder, not the event model
+> Every row above comes from **one** `script/bench` run, deliberately: an earlier run of the same
+> benchmarks on a busier machine was uniformly ~20% slower (`json` 748 ns, `keep` 404 ns, the full
+> chain 2.61 µs), so mixing rows across runs would invent differences that aren't there. Compare
+> rows within the table freely; treat absolute values as this machine on this day.
 
-**Encoding one event for InfluxDB costs ~180 allocations and 4.96 µs — roughly twice what
-ingesting it costs (11 allocations, 2.61 µs), and sixteen times what cloning it for an extra
-fan-out branch costs.** That was not the expected answer.
-[known-gaps.md](../known-gaps.md) has been carrying `Arc<EventBatch>` copy-on-write as *the*
-identified fix for pipeline cost, and [pipeline-graph.md](pipeline-graph.md) calls the fan-out
-clone "a real cost." Both are true, and both are second-order next to this.
+### The headline result: the output encoder *was* the bottleneck, and has been fixed
 
-The cost is entirely in how lines are built, not in anything about the data model:
+As first measured, encoding one event for InfluxDB cost **~180 allocations and 4.96 µs** — roughly
+twice what ingesting it cost end to end, and sixteen times what cloning it for an extra fan-out
+branch cost. That was not the expected answer. [known-gaps.md](../known-gaps.md) had been carrying
+`Arc<EventBatch>` copy-on-write as *the* identified fix for pipeline cost, and
+[pipeline-graph.md](pipeline-graph.md) called the fan-out clone "load-bearing." Both were true, and
+both were second-order next to the encoder.
 
-- `escape_tag` and `escape_measurement` build **four intermediate `String`s each** via chained
-  `.replace()`, on every tag of every point, whether or not any character needs escaping.
-- `metric_fields` returns a `Vec<(String, String)>`, with a `format!` per field name and a
+None of it was about the data model. It was all in how lines were built:
+
+- `escape_tag`/`escape_measurement` built **four intermediate `String`s each** via chained
+  `.replace()`, on every tag of every point, whether or not any character needed escaping.
+- `metric_fields` returned a `Vec<(String, String)>`, with a `format!` per field name and a
   `to_string()` per value.
-- The series-identity `HashMap` is keyed by `line.clone()` — a fresh `String` allocated on every
-  call, not just on insert.
-- `render_tag_suffix` clones the resource `AttrMap` and re-inserts every event attribute into it,
-  per event.
+- The series-identity `HashMap` was keyed by `line.clone()` — a fresh `String` on every call, not
+  just on insert.
+- `render_tag_suffix` cloned the resource `AttrMap` and re-inserted every event attribute into it,
+  per event, paying a `resolve` → `intern` round trip per key.
+- `allocate_timestamp` built a fresh `Vec` for its path-compression walk, allocating on every
+  timestamp collision — and a statsd multi-value datagram collides on essentially every line.
 
-None of that needs the event model to change. `escape_*` returning `Cow<str>` (or writing straight
-into the output buffer), a reused line buffer, and `raw_entry` for the series map would take the
-large majority of it. **This is where an optimization pass should start.**
+**Now 30 allocations per 100-event batch, from 18,024 — a 600× reduction, and 2.6× faster** (1.53 µs
+per event against 4.96 µs, adjusted for the ~20% run-to-run shift the note above describes).
+`influxdb_out` is now *faster* than the `stdio_out` debug sink, where it used to be 2.1× slower.
+The changes were mechanical and stayed inside `influxdb.rs`: escape and format straight into reused
+buffers held on the encoder, merge-join the resource and event attribute maps instead of cloning
+and re-inserting, borrow the series key for the lookup and only allocate it on a miss, and reuse
+the path-compression scratch buffer.
 
-For contrast, `stdio_out` costs ~18 allocations per event doing a comparable amount of formatting —
-because it appends into one shared buffer instead of building per-line `String`s.
+What's left is per-*batch*, not per-event: one `Bytes` for the finished body, one `String` key per
+distinct series on first sighting, and growth of the per-series timestamp maps. Nothing scales with
+event count any more, which is the property to protect —
+`crates/logit-bench`'s `influx_encode_100_events` will catch it if that stops being true.
+
+**With that gone, the ingest chain is the cost again**: 11 allocations and 2.07 µs to take one
+access-log line from datagram to aggregated window, against 0.3 allocations and 1.53 µs to encode
+it. `json` is now the single most allocation-hungry stage at 7, and `Event::clone`'s 4 per extra
+fan-out branch is no longer dwarfed by anything. The recommendations in §8 are ordered accordingly.
 
 ### Zero-copy: where it holds, where it doesn't
 
@@ -410,38 +428,46 @@ costs end to end is a separate question needing a load generator, not a microben
 
 Ranked by measured value, not by how interesting they are.
 
+### Done
+
+1. ~~**Fix the InfluxDB encoder's allocation churn.**~~ **Done** — 18,024 allocations per 100-event
+   batch to 30, and 2.6× faster (§2). This was the single largest cost in the pipeline; it is now
+   smaller than ingest.
+
 ### Now — contained, no design decision required
 
-1. **Fix the InfluxDB encoder's allocation churn.** ~180 allocations/event, the single largest cost
-   in the pipeline. `escape_tag`/`escape_measurement` returning `Cow<str>`, one reused line buffer,
-   and a `raw_entry` series map. No effect on any other component.
-2. **Make `AttrMap::get` non-interning.** A one-line change that drops a hash and a concurrent-map
-   probe from every attribute lookup on the hot path. Also closes a theoretical growth path, though
-   every production call site is config- or script-keyed today, so that half is defence in depth
-   rather than a live bug (§4).
+2. **`Box` the `DdSketch` and `SpanRecord`; enable smallvec's `union`.** Takes `Event` from 792
+   bytes toward ~300 with no representational change (§1). Now the highest-value item: it makes
+   every node hop, every batch, and every fan-out clone cheaper at once, and nothing depends on it.
 3. **Give `statsd_in` the `slice_of` treatment.** Removes 6 of its 8 allocations per line and
-   restores the zero-copy property the data model claims.
-4. **`Box` the `DdSketch` and `SpanRecord`; enable smallvec's `union`.** Takes `Event` from 792
-   bytes toward ~300 with no representational change.
+   restores the zero-copy property the data model claims (§2).
+4. **Make `AttrMap::get` non-interning.** Drops a hash and a concurrent-map probe from every
+   attribute lookup on the hot path. Also closes a theoretical growth path, though every production
+   call site is config- or script-keyed today, so that half is defence in depth rather than a live
+   bug (§4).
+5. **Trim `json`'s 7 allocations** — now the most allocation-hungry single stage. Most of it is the
+   intermediate `AttrMap` built so a malformed object can't half-populate the event's attributes,
+   plus the spill when the merged set passes 8 entries. The intermediate is load-bearing for
+   correctness, so this needs a checkpoint-and-rollback or a reusable scratch map rather than just
+   deleting it — more design than items 2-4, less than anything below.
 
 ### Next — worth an ADR each
 
-5. **`Arc<EventBatch>` copy-on-write on channels.** Strictly no worse anywhere; frees every
-   read-only fan-out branch. Second-order next to item 1, which is worth saying out loud given
-   this was previously assumed to be the main event.
-6. **`Transform::process(&mut Event) -> bool`.** Removes a 792-byte memcpy per node hop. Gets more
+6. **`Arc<EventBatch>` copy-on-write on channels.** Strictly no worse anywhere; frees every
+   read-only fan-out branch. Relatively more significant now that the encoder no longer dominates:
+   4 allocations and a 792-byte memcpy per event per extra branch, against 11 allocations to ingest
+   one.
+7. **`Transform::process(&mut Event) -> bool`.** Removes a 792-byte memcpy per node hop. Gets more
    expensive to decide with every transform that lands, so decide it early even if it's applied
    late.
-7. **~~Bound the interner~~ — accepted as-is, see §4.** Listeners are private, so the namespace is
-   user-controlled; the metric store and `logit`'s own aggregation window both fail earlier and
-   harder under the same abuse. Revisit only if a listener stops being private.
-8. **`AttrMap` accessors keyed by `Symbol`,** eliminating the `resolve → intern` round trips in
-   `json`, `keep`, and both encoders.
+8. **`AttrMap` accessors keyed by `Symbol`,** eliminating the `resolve` → `intern` round trips still
+   left in `json`, `keep`, and `stdio_out`. (`influxdb_out`'s are gone — the merge-join in
+   `render_tag_suffix` removed them.)
 
 ### Later — needs a reason first
 
 9. **Re-pick `AttrMap`'s inline capacity** from a measured distribution of real attribute counts.
-   8 is currently wrong in both directions: statsd carries 0–4, the nginx path carries 10 and
+   8 is currently wrong in both directions: statsd carries 0-4, the nginx path carries 10 and
    spills anyway while still paying the full 384 bytes.
 10. **Byte-aware channel bounds** (§5), before a TCP or file-tail input makes batch size unbounded
     in practice.
@@ -449,6 +475,13 @@ Ranked by measured value, not by how interesting they are.
     `_G` lookup per event, cache the `AttrsProxy` userdata instead of building one per attribute
     access, take `mlua::String` rather than `String` in the metamethods. Worth doing when a Lua
     stage is actually on a hot path.
+12. **Give `stdio_out` the same treatment `influxdb_out` just got** — at ~18 allocations per event
+    it is now the more wasteful of the two encoders by a wide margin, and the fix is nearly the
+    same. Deliberately last: it's a debug sink for a human reading a terminal, not a throughput
+    path.
+13. **~~Bound the interner~~ — accepted as-is, see §4.** Listeners are private, so the namespace is
+    user-controlled; the metric store and `logit`'s own aggregation window both fail earlier and
+    harder under the same abuse. Revisit only if a listener stops being private.
 
 ### Settled by this work
 

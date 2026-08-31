@@ -133,14 +133,20 @@ already built that have a known, accepted rough edge.
   ([memory.md](design/memory.md)); `crates/logit-bench`'s
   `statsd_tag_values_are_copied_not_sliced` pins the current behavior so it can't be assumed away.
   The fix is to give `statsd.rs` the same pointer-arithmetic slicing `syslog.rs` already has.
-- **`influxdb_out`'s line encoder allocates ~180 times per event**
-  (`crates/logit-outputs/src/influxdb.rs`) — the largest single cost in the pipeline, roughly twice
-  what ingesting an event costs end to end. `escape_tag`/`escape_measurement` each build four
-  intermediate `String`s via chained `.replace()` whether or not anything needs escaping;
-  `metric_fields` returns a `Vec<(String, String)>` with a `format!` per name and a `to_string()`
-  per value; the series map is keyed by a fresh `line.clone()` on every call rather than only on
-  insert. All fixable within that one file (`Cow<str>` escaping, a reused line buffer, `raw_entry`)
-  with no change to the event model. See [memory.md](design/memory.md).
+- ~~**`influxdb_out`'s line encoder allocates ~180 times per event**~~ — **closed.** Was the largest
+  single cost in the pipeline, roughly twice what ingesting an event cost end to end. Now 30
+  allocations per 100-event batch (from 18,024) and 2.6× faster, by escaping and formatting
+  straight into buffers reused on the encoder, merge-joining the resource and event attribute maps
+  instead of cloning and re-inserting, borrowing the series key for its lookup and allocating it
+  only on a miss, and reusing `allocate_timestamp`'s path-compression scratch. Output is
+  byte-for-byte unchanged, which the existing format tests pin. What remains is per-batch rather
+  than per-event; `crates/logit-bench`'s `influx_encode_100_events` guards that.
+
+  Left open deliberately: **`stdio_out` still allocates ~18 times per event**
+  (`crates/logit-outputs/src/stdio.rs`), which now makes it the more wasteful of the two encoders by
+  a wide margin. The same treatment applies almost unchanged, but it's a debug sink for a human
+  reading a terminal rather than a throughput path, so it's recorded rather than done. See
+  [memory.md](design/memory.md)'s recommendations.
 - **Channel depth is bounded in batches, not bytes or events**
   (`CHANNEL_CAPACITY`, `crates/logit-pipeline/src/runtime.rs`) — 64 batches per edge, with
   unbounded batch size. A 65 KB syslog datagram can decode to hundreds of events, so one edge can
