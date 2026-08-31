@@ -7,7 +7,8 @@
 //! `process`, taking the trait's default `flush_interval`/`flush`.
 
 use bytes::Bytes;
-use logit_core::{AttrMap, Diagnostics, Event, Resource, Value};
+use logit_core::interner::{intern, resolve};
+use logit_core::{AttrMap, Diagnostics, Event, Resource, Symbol, Value};
 use logit_pipeline::Transform;
 use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use std::fmt;
@@ -27,11 +28,20 @@ pub struct JsonParser {
     /// and trailing non-whitespace after it is a parse failure.
     skip_to_brace: bool,
     diag: Diagnostics,
+    /// Scratch buffer the top-level object's key/value pairs are parsed into, reused across
+    /// events instead of a fresh `AttrMap` built by `deserialize` on every call (mirroring
+    /// `InfluxLineEncoder`'s reused buffers, `crates/logit-outputs/src/influxdb.rs` -- same idea,
+    /// applied to the parsed pairs instead of a `String`). Cleared at the start of every `process`
+    /// (see the comment there for why the *intermediate* still has to exist at all). A nested
+    /// object still becomes its own freshly-allocated `AttrMap` (`Value::Map`, via
+    /// `collect_attrmap`) -- only the top-level result, which is merged into `event.attributes`
+    /// and thrown away, is worth reusing.
+    scratch: Vec<(Symbol, Value)>,
 }
 
 impl JsonParser {
     pub fn new(skip_to_brace: bool) -> Self {
-        Self { skip_to_brace, diag: Diagnostics::default() }
+        Self { skip_to_brace, diag: Diagnostics::default(), scratch: Vec::new() }
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
@@ -63,18 +73,37 @@ impl Transform for JsonParser {
             raw.clone()
         };
 
-        // Built up separately and only merged into `event.attributes` on full success -- a
+        // Parsed into `self.scratch`, cleared here, rather than a fresh `AttrMap` -- but still
+        // built up separately from `event.attributes` and only merged in on full success: a
         // failure partway through a malformed object must leave the event's existing attributes
-        // untouched, not half-populated.
-        let parsed =
-            if self.skip_to_brace { parse_object_prefix(&body) } else { parse_object(&body) };
+        // untouched, not half-populated. `scratch` reaching `Ok` is what gates the merge below;
+        // reusing its storage across calls doesn't change that contract, since a fresh
+        // `self.scratch.clear()` at the top of the very next call throws away anything a failed
+        // parse left behind.
+        self.scratch.clear();
+        let parsed = if self.skip_to_brace {
+            parse_object_prefix(&body, &mut self.scratch)
+        } else {
+            parse_object(&body, &mut self.scratch)
+        };
         match parsed {
-            Ok(attrs) => {
-                for (key, value) in attrs.iter() {
-                    event.attributes.insert(logit_core::interner::resolve(key), value.clone());
+            Ok(()) => {
+                // Moved out of `scratch`, not cloned: `scratch` is the sole owner of each `Value`
+                // here and is about to be emptied anyway, so there's nothing left for a clone to
+                // preserve. Still a `resolve` -> `intern` round trip per key -- `AttrMap::insert`
+                // takes `&str`, not `Symbol` -- which a `Symbol`-keyed insert would remove; left
+                // as a follow-up (see PR description) rather than adding one to
+                // `logit-core::attrs` here, since another workstream is already changing
+                // `AttrMap::get`'s interning in that file.
+                for (key, value) in self.scratch.drain(..) {
+                    event.attributes.insert(resolve(key), value);
                 }
             }
             Err(err) => {
+                // Only ever holds a partial object here; drop it promptly rather than letting it
+                // sit until the next `process` call clears it, since every `Value::Str` in it may
+                // still be a slice of this event's message buffer (see `borrowed_str_bytes`).
+                self.scratch.clear();
                 self.diag.warn_throttled(
                     "parse_failure",
                     format_args!("failed to parse message as JSON, passing event through: {err}"),
@@ -86,21 +115,24 @@ impl Transform for JsonParser {
     }
 }
 
-/// Parses `json` as a single JSON object, requiring the whole buffer be consumed (only trailing
-/// whitespace allowed) -- the default-mode contract: "the whole line is the JSON data."
-fn parse_object(json: &Bytes) -> Result<AttrMap, serde_json::Error> {
+/// Parses `json` as a single JSON object into `out`, requiring the whole buffer be consumed (only
+/// trailing whitespace allowed) -- the default-mode contract: "the whole line is the JSON data."
+fn parse_object(json: &Bytes, out: &mut Vec<(Symbol, Value)>) -> Result<(), serde_json::Error> {
     let mut de = serde_json::Deserializer::from_slice(json);
-    let attrs = AttrMapSeed { base: json }.deserialize(&mut de)?;
+    TopLevelSeed { base: json, out }.deserialize(&mut de)?;
     de.end()?;
-    Ok(attrs)
+    Ok(())
 }
 
-/// Parses the first complete JSON object out of `json`, ignoring anything after it -- the
-/// `skip_to_brace`-mode contract: "start parsing here," which is what makes a line like
+/// Parses the first complete JSON object out of `json` into `out`, ignoring anything after it --
+/// the `skip_to_brace`-mode contract: "start parsing here," which is what makes a line like
 /// `INFO {"a":1} took=3ms` work at all.
-fn parse_object_prefix(json: &Bytes) -> Result<AttrMap, serde_json::Error> {
+fn parse_object_prefix(
+    json: &Bytes,
+    out: &mut Vec<(Symbol, Value)>,
+) -> Result<(), serde_json::Error> {
     let mut de = serde_json::Deserializer::from_slice(json);
-    AttrMapSeed { base: json }.deserialize(&mut de)
+    TopLevelSeed { base: json, out }.deserialize(&mut de)
 }
 
 /// Reconstructs a `Bytes` sharing `base`'s underlying allocation for a `&str` serde_json reported
@@ -204,47 +236,102 @@ impl<'de> Visitor<'de> for ValueVisitor<'_> {
 
 /// The top-level seed: requires the parsed value be a JSON *object*, so a bare scalar or array at
 /// the top level is a parse error by construction (there are no key/values to merge) rather than
-/// a post-hoc check after a successful-but-useless parse.
-struct AttrMapSeed<'b> {
+/// a post-hoc check after a successful-but-useless parse. Unlike a nested object
+/// ([`ValueVisitor::visit_map`], via [`collect_attrmap`]), the top-level result is never stored on
+/// an `Event` -- it's merged into `event.attributes` and discarded -- so it's collected straight
+/// into the caller's reused `Vec` instead of a freshly-allocated `AttrMap`.
+struct TopLevelSeed<'b, 'o> {
     base: &'b Bytes,
+    out: &'o mut Vec<(Symbol, Value)>,
 }
 
-impl<'de> DeserializeSeed<'de> for AttrMapSeed<'_> {
-    type Value = AttrMap;
+impl<'de> DeserializeSeed<'de> for TopLevelSeed<'_, '_> {
+    type Value = ();
 
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<AttrMap, D::Error> {
-        deserializer.deserialize_map(AttrMapVisitor { base: self.base })
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_map(TopLevelVisitor { base: self.base, out: self.out })
     }
 }
 
-struct AttrMapVisitor<'b> {
+struct TopLevelVisitor<'b, 'o> {
     base: &'b Bytes,
+    out: &'o mut Vec<(Symbol, Value)>,
 }
 
-impl<'de> Visitor<'de> for AttrMapVisitor<'_> {
-    type Value = AttrMap;
+impl<'de> Visitor<'de> for TopLevelVisitor<'_, '_> {
+    type Value = ();
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "a JSON object")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<AttrMap, A::Error> {
-        collect_attrmap(map, self.base)
+    // No last-writer-wins bookkeeping needed here, unlike `collect_attrmap`: a duplicate key
+    // within this object just pushes twice, and merging into `event.attributes` in push order
+    // (see `JsonParser::process`) makes the later push win, since `AttrMap::insert` overwrites an
+    // existing key rather than adding a second entry -- the same outcome, reached without a
+    // binary search per key on a buffer that's thrown away right after.
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key_seed(KeySeed)? {
+            let value = map.next_value_seed(ValueSeed { base: self.base })?;
+            self.out.push((key, value));
+        }
+        Ok(())
     }
 }
 
-/// Shared by [`ValueVisitor::visit_map`] (a nested object) and [`AttrMapVisitor::visit_map`] (the
-/// top level) -- one definition of "walk a JSON object's entries into an `AttrMap`". Keys go
-/// through plain `String` deserialization rather than a borrowing seed like values: `AttrMap`
-/// interns every key on insert regardless, so a zero-copy key would only save a `String`
-/// allocation, not the interning itself -- not worth a second seed type for.
+/// Deserializes a JSON object key straight to its interned [`Symbol`], rather than the owned
+/// `String` `next_key::<String>()` would otherwise allocate for every key regardless of whether it
+/// needed unescaping. `AttrMap` interns every key on insert anyway, so nothing about the interning
+/// itself changes -- this only removes the `String` that used to exist solely to be interned and
+/// then dropped. Measured: this is where most of `json`'s allocations were (`docs/design/
+/// memory.md`), not the intermediate map itself.
+struct KeySeed;
+
+impl<'de> DeserializeSeed<'de> for KeySeed {
+    type Value = Symbol;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Symbol, D::Error> {
+        deserializer.deserialize_str(KeyVisitor)
+    }
+}
+
+struct KeyVisitor;
+
+impl<'de> Visitor<'de> for KeyVisitor {
+    type Value = Symbol;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "a string")
+    }
+
+    // The unescaped case: borrowed straight from the input, never materialized as an owned
+    // `String` at all.
+    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Symbol, E> {
+        Ok(intern(v))
+    }
+
+    // The escaped case: `v` lives in serde_json's own scratch buffer, not `self.base` -- but
+    // `intern` only needs it long enough to hash and copy (on a never-before-seen key) or look up
+    // (on a repeat), so still no `String` of our own.
+    fn visit_str<E>(self, v: &str) -> Result<Symbol, E> {
+        Ok(intern(v))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Symbol, E> {
+        Ok(intern(&v))
+    }
+}
+
+/// Used by [`ValueVisitor::visit_map`] to walk a *nested* JSON object's entries into an owned,
+/// independent `AttrMap` (`Value::Map`) -- unlike the top level, which goes through
+/// [`TopLevelVisitor`] instead and skips building an `AttrMap` at all (see its doc comment).
 fn collect_attrmap<'de, A: MapAccess<'de>>(mut map: A, base: &Bytes) -> Result<AttrMap, A::Error> {
     let mut attrs = AttrMap::new();
-    while let Some(key) = map.next_key::<String>()? {
+    while let Some(key) = map.next_key_seed(KeySeed)? {
         let value = map.next_value_seed(ValueSeed { base })?;
         // Last-writer-wins on a duplicate key within one object -- plain `AttrMap::insert`
         // semantics, same as a parsed key overwriting a pre-existing attribute of the same name.
-        attrs.insert(&key, value);
+        attrs.insert(resolve(key), value);
     }
     Ok(attrs)
 }

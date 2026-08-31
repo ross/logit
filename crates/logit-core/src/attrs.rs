@@ -5,7 +5,7 @@
 //! wire format's dictionary encoding and reproducible tests both depend on. See
 //! `docs/design/data-model.md`.
 
-use crate::interner::{intern, Symbol};
+use crate::interner::{intern, lookup, Symbol};
 use crate::value::Value;
 use smallvec::SmallVec;
 
@@ -20,7 +20,11 @@ impl AttrMap {
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
-        let key = intern(key);
+        // `lookup`, not `intern`: a key that was never interned can't be in this map either
+        // (interning is monotonic and global), so a miss here returns `None` without growing the
+        // process-wide interner table for an attribute this event doesn't carry. See
+        // `docs/design/memory.md` §4.
+        let key = lookup(key)?;
         self.0.binary_search_by_key(&key, |(k, _)| *k).ok().map(|i| &self.0[i].1)
     }
 
@@ -33,7 +37,8 @@ impl AttrMap {
     }
 
     pub fn remove(&mut self, key: &str) -> Option<Value> {
-        let key = intern(key);
+        // Same reasoning as `get`: a key never interned was never inserted, so it can't be present.
+        let key = lookup(key)?;
         self.0.binary_search_by_key(&key, |(k, _)| *k).ok().map(|i| self.0.remove(i).1)
     }
 
@@ -58,5 +63,55 @@ impl FromIterator<(&'static str, Value)> for AttrMap {
             map.insert(k, v);
         }
         map
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interner;
+
+    #[test]
+    fn get_present_key_returns_the_value() {
+        let mut map = AttrMap::new();
+        map.insert("host", "web-1");
+        assert_eq!(map.get("host"), Some(&Value::from("web-1")));
+    }
+
+    #[test]
+    fn get_absent_key_returns_none() {
+        let map = AttrMap::new();
+        assert_eq!(map.get("does-not-exist"), None);
+    }
+
+    #[test]
+    fn remove_present_key_returns_the_value_and_removes_it() {
+        let mut map = AttrMap::new();
+        map.insert("host", "web-1");
+        assert_eq!(map.remove("host"), Some(Value::from("web-1")));
+        assert_eq!(map.get("host"), None);
+    }
+
+    #[test]
+    fn remove_absent_key_returns_none() {
+        let mut map = AttrMap::new();
+        assert_eq!(map.remove("does-not-exist"), None);
+    }
+
+    /// Pins the fix this module exists for: `get`/`remove` on a key that was never interned must
+    /// not intern it just to find out it's absent. `nextest` runs each test in its own process
+    /// (see `docs/design/memory.md` §7), so `interner::len()` here reflects only this test.
+    #[test]
+    fn getting_an_absent_key_does_not_grow_the_interner() {
+        let map = AttrMap::new();
+        let never_interned_elsewhere = "attrmap_absent_key_probe_xyzzy";
+
+        let before = interner::len();
+        assert_eq!(map.get(never_interned_elsewhere), None);
+        assert_eq!(interner::len(), before, "a missed `get` must not intern the key");
+
+        let mut map = map;
+        assert_eq!(map.remove(never_interned_elsewhere), None);
+        assert_eq!(interner::len(), before, "a missed `remove` must not intern the key");
     }
 }
