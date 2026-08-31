@@ -296,11 +296,16 @@ fn influx_encode_100_events() {
     expect_allocs("influxdb_out: encode 100 events", stats, 30);
 }
 
-/// ~18 allocations per event. That used to be an order of magnitude *better* than the InfluxDB
-/// encoder; now it's the worse of the two by a wide margin, because `influxdb_out` was reworked to
-/// format into reused buffers and this one still `format!`s per rendered value. The same treatment
-/// would apply almost unchanged -- but this is a debug sink for humans reading a terminal, not a
-/// throughput path, so it's recorded rather than done.
+/// Down from 1801 (~18/event) to 101 (~1/event), via the same treatment `influxdb_out` got
+/// (`docs/design/memory.md`): merge-join the resource and event attribute maps instead of cloning
+/// and re-inserting one, and format numbers straight into the output buffer via `write!` instead
+/// of a `format!`/`to_string()` per rendered value. The remaining allocation is one
+/// `format_rfc3339_utc` call per event (`logit_core::time`, out of this encoder's scope) plus one
+/// for the output `String`'s own first growth -- `influxdb_out` still comes out ahead at ~0.3
+/// allocations/event, since it also reuses its per-line buffers across events, which this encoder
+/// doesn't need (every `render_*` function here already writes straight into the one buffer this
+/// returns; see `EventDump::encode`'s doc comment for why there's no equivalent scratch state left
+/// to hoist onto the struct).
 #[test]
 fn stdio_encode_100_events() {
     let dump = EventDump::new(Format::Human);
@@ -309,7 +314,7 @@ fn stdio_encode_100_events() {
 
     let (text, stats) = measure(|| dump.encode(&batch));
     assert!(!text.is_empty());
-    expect_allocs("stdio_out: encode 100 events", stats, 1801);
+    expect_allocs("stdio_out: encode 100 events", stats, 101);
 }
 
 // ---------------------------------------------------------------------------------------------
