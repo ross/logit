@@ -239,41 +239,53 @@ expensive to make with every transform that lands.
 compares and sorts `u32`s, `SeriesKey` hashes them, and the planned wire format's dictionary
 encoding ([wire-protocol.md](wire-protocol.md)) is backed by the same table.
 
-**`ThreadedRodeo` never evicts and never frees.** Every distinct string ever interned is retained
-for the life of the process. That is fine for a bounded key space and is a genuine problem for an
-unbounded one — and several strings reaching it come straight off the network:
+**`ThreadedRodeo` never evicts and never frees.** Every *distinct* string ever interned is
+retained for the life of the process, at a measured **~94-124 bytes each** (for a 40-character
+name -- roughly 2.4x the string's own length, the rest being map and index overhead).
 
-- statsd metric names (`statsd.rs`), fully client-controlled.
-- DogStatsD tag keys (`statsd.rs`), likewise.
-- JSON object keys from log bodies (`json.rs`) — bounded for a fixed `log_format`, unbounded for
-  any producer that puts an id in a key.
+Two facts bound how much that matters, and they're worth stating before the risk:
 
-**Worse: `AttrMap::get` interns.** A lookup that *misses* still permanently adds its key to the
-table. `kv_metrics` calling `attributes.get(field)` on an event that lacks that field is a normal,
-expected path (nginx's `$upstream_response_time` is empty on non-proxied requests), and it grows a
-process-global table. `lasso` has a non-interning `get()`; a lookup should use it. A key that isn't
-in the table can't be on any event, so returning `None` without inserting is not just cheaper, it's
-more correct.
+- **Re-interning a string the table already holds allocates nothing.** Measured: zero allocations
+  for 1000 repeat interns (`re_interning_an_existing_string_is_free`). A pipeline whose keys and
+  metric names come from a fixed schema reaches steady state and stays flat forever. For its
+  intended use, this design is not just acceptable, it's free.
+- **Only keys and metric names are interned. Values are not.** `AttrMap::insert` interns the key
+  and stores the value as a `Value::Str(Bytes)`. This matters more than it sounds: the
+  high-cardinality dimension in telemetry is almost always the *value* side -- host, request id,
+  user agent, URL path, trace id -- and none of it touches the interner. The classic cardinality
+  explosion is not an interner problem here.
 
-### Threat model
+So the exposure is narrow and specific: **a string that is real, is used in key or metric-name
+position, and never repeats.** In practice that is one thing above all --
 
-A single client emitting `orders.<uuid>:1|c` grows the interner without bound, with no eviction, no
-limit, and nothing that reports it. RSS climbs until the process is OOM-killed. `Spur` is a `u32`,
-so the hard ceiling is ~4 billion strings — memory runs out first, by a wide margin.
+- **statsd metric names** (`intern(name)` in `statsd.rs`'s `build_event`), which are
+  client-controlled and where putting an id in the name is a well-worn anti-pattern:
+  `user.<id>.logins`, `deploys.<sha>`, `orders.<order_id>.latency`. One such client is enough.
+- Secondarily, **JSON object keys** from log bodies (`json.rs`) when a producer puts data in key
+  position (`{"req_a1b2c3": {...}}`), and **DogStatsD tag keys** for the same reason. Both are
+  schema-shaped in normal use and unbounded only when abused.
 
-### Why this is the hardest thing here to retrofit
+At ~94 bytes each, a million distinct metric names is ~94 MB retained with no way to reclaim it,
+and nothing anywhere reporting that it happened.
 
-`Symbol` is `Copy`, and `interner::resolve` **panics** on an unknown symbol. Every component in the
-tree is written against the assumption that symbols are eternal and always resolvable. Changing the
-representation later means touching `AttrMap`, `MetricRecord`, `SeriesKey`, the Lua proxy, and the
-wire format's dictionary — the exact "expensive to change once components depend on it" shape this
-pass exists to find.
+### What is *not* the risk: failed lookups
 
-**Recommended now** (cheap, no representation change): make `AttrMap::get` use a non-interning
-lookup; expose `interner::len()`; warn on a throttled threshold. **Recommended before a
-public-facing listener ships:** an ADR choosing between a bounded table with an inline-string
-fallback for overflow, and narrowing what is allowed to be interned at all. Not a decision to make
-in passing.
+`AttrMap::get` interns rather than doing a lookup-only probe, so in principle a miss adds a key no
+event carries. In practice this is not a growth path. There are exactly three production `get` call
+sites in the tree:
+
+- `kv_metrics.rs` (twice), keyed by `m.field` -- a **config** string, fixed at startup. Hit or
+  miss, it's interned once and never again.
+- `proxy.rs`'s `AttrsProxy::__index`, keyed by whatever a Lua script indexes -- normally a literal
+  in the script, so also a bounded set. Unbounded only for a script that builds keys out of event
+  data, which is unusual and is trusted config besides.
+
+So `AttrMap::get`'s interning is a **CPU** problem, not a memory one: it pays a hash plus a
+concurrent-map probe on the hot path for a lookup that could be cheaper, and `lasso`'s
+non-interning `get()` would avoid it. Worth fixing, but as an efficiency cleanup and a
+defence-in-depth tightening -- not as the memory fix this section is really about. (An earlier
+draft of this document had that backwards.)
+
 
 ### The other unbounded structure
 
@@ -371,8 +383,10 @@ Ranked by measured value, not by how interesting they are.
 1. **Fix the InfluxDB encoder's allocation churn.** ~180 allocations/event, the single largest cost
    in the pipeline. `escape_tag`/`escape_measurement` returning `Cow<str>`, one reused line buffer,
    and a `raw_entry` series map. No effect on any other component.
-2. **Make `AttrMap::get` non-interning.** A one-line change that closes an unbounded-growth path
-   reachable from ordinary input.
+2. **Make `AttrMap::get` non-interning.** A one-line change that drops a hash and a concurrent-map
+   probe from every attribute lookup on the hot path. Also closes a theoretical growth path, though
+   every production call site is config- or script-keyed today, so that half is defence in depth
+   rather than a live bug (§4).
 3. **Give `statsd_in` the `slice_of` treatment.** Removes 6 of its 8 allocations per line and
    restores the zero-copy property the data model claims.
 4. **`Box` the `DdSketch` and `SpanRecord`; enable smallvec's `union`.** Takes `Event` from 792
@@ -387,7 +401,9 @@ Ranked by measured value, not by how interesting they are.
    expensive to decide with every transform that lands, so decide it early even if it's applied
    late.
 7. **Bound the interner, or narrow what may enter it.** The one item here that is genuinely hard to
-   retrofit. Needs a decision before a public-facing listener ships.
+   retrofit, and the narrowest in scope: the live exposure is statsd metric names arriving from an
+   untrusted client, at ~94 bytes retained per distinct name, forever (§4). Needs a decision before
+   a public-facing statsd listener ships; a private one behind a trusted fleet can wait.
 8. **`AttrMap` accessors keyed by `Symbol`,** eliminating the `resolve → intern` round trips in
    `json`, `keep`, and both encoders.
 

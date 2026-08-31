@@ -437,3 +437,30 @@ fn points_into(haystack: &bytes::Bytes, needle: &bytes::Bytes) -> bool {
     let start = needle.as_ptr() as usize;
     start >= base && start + needle.len() <= base + haystack.len()
 }
+
+// ---------------------------------------------------------------------------------------------
+// Interning
+// ---------------------------------------------------------------------------------------------
+
+/// The property that makes interning the right call for a bounded key space, and the reason
+/// `AttrMap::get`'s interning is a CPU problem rather than a memory one: re-interning a string the
+/// table already holds allocates **nothing**. A pipeline whose keys and metric names come from a
+/// fixed schema reaches steady state and stays there.
+///
+/// The corollary is what `docs/design/memory.md`'s interner section is about: the table only grows
+/// for a *distinct* string, so the exposure is names that are real but never repeat -- not lookups
+/// that miss.
+#[test]
+fn re_interning_an_existing_string_is_free() {
+    let names: Vec<String> = (0..1000).map(|i| format!("steady.state.metric.{i}")).collect();
+    for name in &names {
+        logit_core::interner::intern(name);
+    }
+
+    let (_, stats) = measure(|| {
+        for name in &names {
+            logit_core::interner::intern(name);
+        }
+    });
+    expect_allocs("interner: re-intern 1000 known names", stats, 0);
+}

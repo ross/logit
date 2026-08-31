@@ -96,27 +96,33 @@ already built that have a known, accepted rough edge.
   did turn up is that the boundary costs 21 allocations per event (a `_G` lookup of `process` per
   event, a fresh `AttrsProxy` userdata per attribute access, a Rust `String` per metamethod key) —
   recorded in [memory.md](design/memory.md)'s recommendations, not yet fixed.
-- **The attribute/metric-name interner is unbounded, and a *lookup* grows it**
-  (`crates/logit-core/src/interner.rs`, `attrs.rs`) — `lasso::ThreadedRodeo` never evicts and never
-  frees, so every distinct string ever interned is retained for the life of the process. Several
-  strings reaching it come straight off the network: statsd metric names and DogStatsD tag keys
-  (`crates/logit-inputs/src/statsd.rs`), and JSON object keys from log bodies
-  (`crates/logit-transforms/src/json.rs`). One client emitting `orders.<uuid>:1|c` grows the table
-  without bound until the process is OOM-killed, with nothing reporting it.
+- **The attribute/metric-name interner never frees, so a high-cardinality *metric name* grows it
+  without bound** (`crates/logit-core/src/interner.rs`) — `lasso::ThreadedRodeo` has no eviction, so
+  every distinct string ever interned is retained for the life of the process at a measured ~94-124
+  bytes each. A million distinct names is ~94 MB that nothing can reclaim and nothing reports.
 
-  `AttrMap::get` makes this worse than it needs to be: it calls `intern`, so a lookup that *misses*
-  still permanently adds its key. `kv_metrics` calling `attributes.get(field)` on an event lacking
-  that field is an ordinary path (nginx's `$upstream_response_time` is empty on a non-proxied
-  request), and it grows a process-global table. `lasso` has a non-interning `get()`; a lookup
-  should use it, and a key not in the table can't be on any event anyway.
+  The exposure is narrower than it first looks, and the bounds are worth stating: re-interning a
+  string the table already holds allocates **nothing** (measured), so a fixed schema reaches steady
+  state and stays flat; and **only keys and metric names are interned, never values** — so the
+  usual telemetry cardinality explosion (host, request id, user agent, path) doesn't touch the
+  interner at all. What's left is a string that is real, sits in key or metric-name position, and
+  never repeats. In practice that means **statsd metric names** (`crates/logit-inputs/src/statsd.rs`),
+  which are client-controlled and where embedding an id in the name (`user.<id>.logins`,
+  `deploys.<sha>`) is a well-worn anti-pattern. Secondarily, JSON object keys from a producer that
+  puts data in key position, and DogStatsD tag keys, for the same reason.
 
-  This is the hardest thing in the tree to retrofit — `Symbol` is `Copy` and `resolve` *panics* on
-  an unknown symbol, so `AttrMap`, `MetricRecord`, `SeriesKey`, the Lua proxy, and the planned wire
-  dictionary are all written against "symbols are eternal." The cheap half (non-interning lookup,
-  an exposed `len()`, a throttled threshold warning) is fixable now; the representation question
-  (a bounded table with an inline-string fallback, or narrowing what may be interned at all) needs
-  its own ADR, and needs it before a public-facing listener ships. See
-  [memory.md](design/memory.md)'s interner section for the full threat model.
+  Hard to retrofit: `Symbol` is `Copy` and `resolve` *panics* on an unknown symbol, so `AttrMap`,
+  `MetricRecord`, `SeriesKey`, the Lua proxy, and the planned wire dictionary are all written
+  against "symbols are eternal." The representation question (a bounded table with an inline-string
+  fallback, or narrowing what may be interned at all) needs its own ADR, and needs it before a
+  public-facing statsd listener ships. Cheap mitigation available now: expose `interner::len()` and
+  warn past a threshold, so the failure is at least visible.
+
+  Separately, **`AttrMap::get` interns rather than probing** (`attrs.rs`), so a lookup that misses
+  adds its key. All three production call sites are keyed by config strings or Lua literals — a
+  bounded set — so this is a wasted hash plus concurrent-map probe on the hot path (a CPU cost)
+  rather than a growth path. `lasso` has a non-interning `get()`. See
+  [memory.md](design/memory.md)'s interner section for the full accounting.
 - **`statsd_in` copies tag values instead of slicing them** (`crates/logit-inputs/src/statsd.rs`) —
   it builds attribute values with `attributes.insert(k, v)` on a `&str`, which routes through
   `Value::str` → `Bytes::from(String)`, copying bytes already present in the datagram buffer; the
