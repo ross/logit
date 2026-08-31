@@ -28,6 +28,36 @@ here in the same commit.
 > stages against each other, not as absolute throughput ceilings. Allocation counts are exact and
 > machine-independent.
 
+## 0. What these measurements can and can't tell you
+
+**Read this before acting on anything below.** Every allocation number in this document comes from
+one event shape: the `examples/nginx-to-influxdb.yaml` reference pipeline, whose events carry a log
+body *and* several derived metrics, with ~10 attributes. That was the right place to start — it's a
+real config, exercising five components end to end — but it is **one point in a space `logit` is
+explicitly meant to cover**:
+
+| Workload | Carries | Wasted per event today |
+|---|---|---:|
+| Logs only (syslog, file tail → forward) | attributes + `log` | 336 B (`MetricList` + `SpanRecord`) |
+| Metrics only (statsd, collectd, scrape → aggregate) | attributes + 1 metric | 184 B, plus ~176 of `MetricList` a `Counter` can't use |
+| Traces only (OTLP → forward) | attributes + `span` | 248 B (`LogRecord` + `MetricList`) |
+| Mixed (the nginx shape — **the only one measured**) | all three | least of any shape |
+
+Two consequences that matter for how much weight to put on §8:
+
+- **Everything in §1 (sizing) applies to every workload**, because `Event`'s 792 bytes are paid on
+  every hop whatever the event carries. Every shape above wastes 180-340 bytes on payloads it never
+  holds. That argument doesn't depend on the fixture at all.
+- **Several specific *fixes* are workload-dependent, and one flips sign** depending on the mix. A
+  change that is free for a logs-only pipeline can cost a metrics-only one an allocation per event.
+  §8 marks which is which; don't read the ordering as settled for a workload the fixtures don't
+  cover.
+
+`crates/logit-bench/src/fixtures.rs` has no logs-only fixture and **no span fixture at all**, so
+nothing here has measured the span path. Broadening that matrix — small synthetic inputs and
+directly-constructed events, no external services — is the prerequisite for settling the items §8
+flags as workload-dependent.
+
 ## 1. The event model's footprint
 
 ```
@@ -70,18 +100,39 @@ pays 176, because `DDSketch` (two `Store`s and a `Config`) is inlined into the e
 
 ### What could be reclaimed
 
-Not done — this pass measures rather than optimizes — but sized here so the trade is visible:
+Not done — this pass measures rather than optimizes. Sized here so the trade is visible, **and the
+trades are not all in the same direction** (see §0):
 
-| Change | Saves | Cost |
-|---|---:|---|
-| `Box` the `DdSketch` in `MetricKind::Distribution` | ~168 B/event | one indirection on distribution metrics only |
-| `Box` `SpanRecord` (`Option<Box<_>>` is 8 B) | 128 B/event | one indirection on spans only |
-| smallvec's `union` feature | 16 B/event | none — it's a feature flag |
-| Re-pick `AttrMap`'s inline capacity | up to 192 B/event | more spills on wide events |
+| Change | Saves | Real cost | Verdict |
+|---|---:|---|---|
+| smallvec's `union` feature | 16 B | none — it's a feature flag | safe everywhere |
+| `Box` `SpanRecord` (`Option<Box<_>>` is 8 B) | 128 B | +1 alloc per event **that carries a span** | free for logs/metrics; unmeasured for traces |
+| `Box` the `DdSketch` in `MetricKind::Distribution` | ~168 B | +1 alloc per **distribution metric created** | wins for logs/traces, loses for distribution-heavy metrics |
+| Re-pick `AttrMap`'s inline capacity | up to 192 B | spills for events in the new gap | depends on the attribute-count distribution |
 
-Together these take `Event` from 792 bytes to roughly 300, without changing what it can represent.
-The distribution and span boxes are nearly free: both variants are rare, and both already cost a
-heap allocation of their own when present.
+All four together take `Event` from 792 bytes to roughly 290. The first two are worth taking on
+their own merits; the last two need evidence the fixtures don't currently provide.
+
+**`Box`ing the `DdSketch` is not free, and an earlier draft of this document said it was.** The
+reasoning was that a sketch "already allocates" — it doesn't, at construction.
+`sketches_ddsketch`'s `Store::new` starts with `Vec::new()`, and the bins are allocated on the
+first `add`. The measurement confirms it: `kv_metrics` costs 3 allocations for 4 metrics, which is
+one `MetricList` spill plus exactly **one** bins `Vec` per distribution. Boxing makes that two. In
+a `kv_metrics` or statsd-timing pipeline, distributions are the common case, not the rare one — so
+this trades 168 bytes per event for an extra allocation per distribution, and which side wins
+depends entirely on the workload.
+
+**`AttrMap`'s inline capacity is the largest single term (384 B) and the easiest to get wrong.**
+Dropping 8 → 4 saves 192 bytes and looks free against the two shapes measured — statsd carries 0-4
+tags (still inline), the nginx path carries 10 (spills either way). But **a plain syslog pipeline
+with no JSON parsing carries 4-6 attributes**, which is inline at 8 and spilling at 4: that change
+would add an allocation per event to an entire workload class the fixtures don't cover. The real
+input is a distribution of attribute counts across representative shapes, which doesn't exist yet.
+
+Worth noting while re-picking it: a `SmallVec` that has spilled still occupies its full inline
+footprint, so for a consistently-wide workload a plain `Vec` (24 B plus one allocation) is strictly
+better than a `SmallVec` that always spills. "Smaller inline capacity" and "no inline capacity" are
+both on the table; the distribution decides.
 
 ## 2. Where the allocations are
 
@@ -424,62 +475,101 @@ rather than driving the tokio runtime and the channels between nodes. Anything m
 channel hop would report allocation numbers that are quietly wrong. What a full multi-node graph
 costs end to end is a separate question needing a load generator, not a microbenchmark.
 
+### Fixtures: synthetic inputs, no external services
+
+**Nothing in the test or bench suite may depend on a running nginx, InfluxDB, or any other
+service.** Today it doesn't: `fixtures.rs` holds `const` wire-format literals, the components are
+called directly, and even `influxdb_out`'s retry tests bind an in-process `TcpListener` on
+`127.0.0.1:0` rather than talking to a real server. Keep it that way — fixtures that stand up
+services get slow, flaky, and large very quickly, and they stop being runnable in CI.
+
+The pattern for a new shape, in order of preference:
+
+1. **A `const` byte literal** for anything with a wire format, one representative record plus a
+   `count` multiplier for volume (as `nginx_syslog_datagram(n)` does) — not a recorded corpus.
+2. **Directly-constructed `Event`s** where no input codec exists yet to record from. `SpanRecord`
+   is the current example: there is no OTLP input, so a span fixture has to be built in Rust. When
+   a decoder lands, a captured payload can replace it.
+
+Synthetic doesn't mean guessed. A literal should carry **provenance** — which software and config
+produced this shape, and when it was last checked against the real thing. `NGINX_SYSLOG_LINE` was
+derived from `examples/nginx/nginx.conf`'s `access_json_syslog` format and confirmed against a live
+nginx run (the emitted `syslog.facility=23`/`severity=6` match its `<190>` priority exactly). A
+one-off exploration against real software is the right way to *inform* a fixture; the fixture is
+what gets committed.
+
 ## 8. Recommendations
 
-Ranked by measured value, not by how interesting they are.
+Ordered by **how much the evidence supports them**, not by the raw nginx numbers — see §0 for why
+those differ. An item that helps every workload with no tradeoff outranks a bigger saving that
+might regress a workload the fixtures don't cover.
 
 ### Done
 
 1. ~~**Fix the InfluxDB encoder's allocation churn.**~~ **Done** — 18,024 allocations per 100-event
-   batch to 30, and 2.6× faster (§2). This was the single largest cost in the pipeline; it is now
-   smaller than ingest.
+   batch to 30, and 2.6× faster (§2). Was the single largest cost in the pipeline; now smaller than
+   ingest. Workload-independent: it helps any config with an `influxdb_out`.
 
-### Now — contained, no design decision required
+### Safe regardless of workload mix
 
-2. **`Box` the `DdSketch` and `SpanRecord`; enable smallvec's `union`.** Takes `Event` from 792
-   bytes toward ~300 with no representational change (§1). Now the highest-value item: it makes
-   every node hop, every batch, and every fan-out clone cheaper at once, and nothing depends on it.
-3. **Give `statsd_in` the `slice_of` treatment.** Removes 6 of its 8 allocations per line and
-   restores the zero-copy property the data model claims (§2).
-4. **Make `AttrMap::get` non-interning.** Drops a hash and a concurrent-map probe from every
-   attribute lookup on the hot path. Also closes a theoretical growth path, though every production
-   call site is config- or script-keyed today, so that half is defence in depth rather than a live
-   bug (§4).
-5. **Trim `json`'s 7 allocations** — now the most allocation-hungry single stage. Most of it is the
-   intermediate `AttrMap` built so a malformed object can't half-populate the event's attributes,
-   plus the spill when the merged set passes 8 entries. The intermediate is load-bearing for
-   correctness, so this needs a checkpoint-and-rollback or a reusable scratch map rather than just
-   deleting it — more design than items 2-4, less than anything below.
+No tradeoff to measure — each is a strict improvement for every shape in §0's table.
 
-### Next — worth an ADR each
+2. **Enable smallvec's `union` feature.** 16 bytes off every `Event` for a one-line feature flag.
+3. **Make `AttrMap::get` non-interning.** Drops a hash and a concurrent-map probe from every
+   attribute lookup on the hot path, in every component that reads an attribute. Also closes a
+   theoretical interner growth path, though every production call site is config- or script-keyed
+   today, so that half is defence in depth rather than a live bug (§4).
+4. **`Arc<EventBatch>` copy-on-write on channels** (§3). Strictly no worse anywhere; frees every
+   read-only fan-out branch. Ranks higher than it did on nginx evidence alone, for two reasons: it
+   is entirely payload-shape-independent, and it is worth *most* to the workload least represented
+   in the fixtures — a `SpanRecord` holds `Vec<SpanEvent>`/`Vec<SpanLink>` and each `SpanEvent`
+   carries its own 400-byte `AttrMap`, so span-bearing events are far more expensive to deep-clone
+   than anything measured here. Needs an ADR, not because it's contentious but because it changes a
+   trait-adjacent contract.
+5. **Trim `json`'s 7 allocations** — the most allocation-hungry single stage, and broader than its
+   nginx origin suggests: JSON-bodied log lines are common to most log-oriented pipelines, not a
+   quirk of this one. Most of it is the intermediate `AttrMap` built so a malformed object can't
+   half-populate the event, plus the spill when the merged set passes 8 entries. The intermediate is
+   load-bearing for correctness, so this wants a checkpoint-and-rollback or a reusable scratch map
+   rather than deletion.
+6. **Give `statsd_in` the `slice_of` treatment.** Removes 6 of its 8 allocations per line and
+   restores the zero-copy property the data model claims (§2). Strictly an improvement; narrower
+   reach than the items above only because it helps statsd inputs specifically.
 
-6. **`Arc<EventBatch>` copy-on-write on channels.** Strictly no worse anywhere; frees every
-   read-only fan-out branch. Relatively more significant now that the encoder no longer dominates:
-   4 allocations and a 792-byte memcpy per event per extra branch, against 11 allocations to ingest
-   one.
-7. **`Transform::process(&mut Event) -> bool`.** Removes a 792-byte memcpy per node hop. Gets more
-   expensive to decide with every transform that lands, so decide it early even if it's applied
-   late.
-8. **`AttrMap` accessors keyed by `Symbol`,** eliminating the `resolve` → `intern` round trips still
-   left in `json`, `keep`, and `stdio_out`. (`influxdb_out`'s are gone — the merge-join in
-   `render_tag_suffix` removed them.)
+### Blocked on a broader fixture matrix
+
+Each of these could regress a workload the current fixtures can't see. §0 describes what's missing;
+the prerequisite is small synthetic inputs and directly-constructed events covering logs-only,
+wide-JSON logs, metrics-only, distribution-heavy metrics, and spans — **no external services**.
+
+7. **`Box` `SpanRecord`.** 128 bytes off every event, free for logs-only and metrics-only. Needs a
+   span fixture to confirm the cost for a tracing pipeline is what it looks like (one allocation on
+   an event that already allocates for its span's `events`/`links`).
+8. **`Box` the `DdSketch`.** 168 bytes off every event, but +1 allocation per distribution created
+   — a win for logs and traces, a loss for distribution-heavy metrics. Needs both shapes measured
+   before it can be decided at all (§1).
+9. **Re-pick `AttrMap`'s inline capacity.** The largest single term at 384 bytes, and the easiest
+   to get wrong: 8 → 4 looks free against the measured shapes and would add an allocation per event
+   to a plain-syslog pipeline. Needs an attribute-count distribution across shapes, and should
+   consider dropping inline storage entirely for consistently-wide workloads (§1).
 
 ### Later — needs a reason first
 
-9. **Re-pick `AttrMap`'s inline capacity** from a measured distribution of real attribute counts.
-   8 is currently wrong in both directions: statsd carries 0-4, the nginx path carries 10 and
-   spills anyway while still paying the full 384 bytes.
-10. **Byte-aware channel bounds** (§5), before a TCP or file-tail input makes batch size unbounded
+10. **`Transform::process(&mut Event) -> bool`.** Removes a 792-byte memcpy per node hop. Gets more
+    expensive to decide with every transform that lands, so decide it early even if applied late.
+11. **`AttrMap` accessors keyed by `Symbol`,** eliminating the `resolve` → `intern` round trips
+    still left in `json`, `keep`, and `stdio_out`. (`influxdb_out`'s are gone — the merge-join in
+    `render_tag_suffix` removed them.)
+12. **Byte-aware channel bounds** (§5), before a TCP or file-tail input makes batch size unbounded
     in practice.
-11. **Reduce the Lua boundary's 21 allocations/event** — cache the `process` function instead of a
+13. **Reduce the Lua boundary's 21 allocations/event** — cache the `process` function instead of a
     `_G` lookup per event, cache the `AttrsProxy` userdata instead of building one per attribute
     access, take `mlua::String` rather than `String` in the metamethods. Worth doing when a Lua
     stage is actually on a hot path.
-12. **Give `stdio_out` the same treatment `influxdb_out` just got** — at ~18 allocations per event
-    it is now the more wasteful of the two encoders by a wide margin, and the fix is nearly the
-    same. Deliberately last: it's a debug sink for a human reading a terminal, not a throughput
-    path.
-13. **~~Bound the interner~~ — accepted as-is, see §4.** Listeners are private, so the namespace is
+14. **Give `stdio_out` the same treatment `influxdb_out` just got** — at ~18 allocations per event
+    it is now the more wasteful of the two encoders, and the fix is nearly the same. Deliberately
+    low: it's a debug sink for a human reading a terminal, not a throughput path.
+15. **~~Bound the interner~~ — accepted as-is, see §4.** Listeners are private, so the namespace is
     user-controlled; the metric store and `logit`'s own aggregation window both fail earlier and
     harder under the same abuse. Revisit only if a listener stops being private.
 
@@ -494,7 +584,11 @@ The design decision in [lua-api.md](lua-api.md) stands, now with a number behind
 ## Open questions
 
 - **What is the real attribute-count distribution** across the inputs `logit` will actually see?
-  Every `AttrMap` sizing argument here is reasoning from two examples.
+  Every `AttrMap` sizing argument here reasons from two examples, and §1 shows that's not enough to
+  decide even the direction of the change. The largest single term in `Event` is blocked on this.
+- **What do the unmeasured workload shapes actually cost?** Logs-only, wide-JSON logs,
+  distribution-heavy metrics, and traces are all in scope (§0) and none are in the fixtures. Three
+  of §8's sizing items can't be settled until they are, and the span path has no coverage at all.
 - **Does jemalloc actually flatten RSS for this workload?** Partly answered. A short soak of the
   reference config against the real nginx stack — 60,000 requests through
   `syslog_in → json → kv_metrics → {stdio_out, keep → aggregate → influxdb_out}` — held RSS at
@@ -504,5 +598,8 @@ The design decision in [lua-api.md](lua-api.md) stands, now with a number behind
   the drift ADR 0015 is really about takes days, not minutes, to show up. The escape hatch exists
   so that comparison stays one build away.
 - **Is there a compact `Event` representation** worth having — one that doesn't reserve span and
-  sketch space on a bare log line — or is boxing the rare variants (item 4) enough? Worth revisiting
-  only if item 4's numbers turn out not to be.
+  sketch space on a bare log line? Boxing the rare variants (§8 items 7-8) is the cheap answer, but
+  it only pays where the variant really is rare, and "rare" is workload-dependent: a sketch is the
+  common case in a statsd-timing pipeline and absent entirely from a logs-only one. If the broader
+  fixtures show no single boxing choice wins across shapes, that's the signal this needs a
+  representational answer rather than a tuning one.
