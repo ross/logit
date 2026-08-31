@@ -87,14 +87,16 @@ fn syslog_decode_100_lines() {
     assert_eq!(stats.reallocs, 5, "the events Vec grows 4 -> 8 -> 16 -> 32 -> 64 -> 128");
 }
 
-/// Eight allocations for one line, against syslog's one -- and the gap is entirely
-/// tag handling. `statsd.rs` builds attribute values with `attributes.insert(k, v)` on a `&str`,
-/// which goes through `impl From<&str> for Value` -> `Value::str` -> `Bytes::from(String)`: a
-/// fresh copy of bytes that are already sitting in the datagram buffer. Then `build_event`'s
-/// `attributes.clone()` promotes each of those to a shared `Bytes`, allocating a second time.
+/// Two allocations for one line, down from eight: `statsd.rs`'s tag values are now sliced out of
+/// the datagram with the same `slice_of` pointer-arithmetic `syslog.rs` uses, instead of going
+/// through `impl From<&str> for Value` -> `Bytes::from(String)` (a fresh copy) and then a second
+/// copy when `build_event`'s `attributes.clone()` promoted it to a shared `Bytes`.
 ///
-/// Three tags, two allocations each, plus one `Vec<Event>` per line and one for the batch. See
-/// [`statsd_tag_values_are_copied_not_sliced`] for the same finding stated structurally.
+/// What's left, unlike syslog's single `Vec<Event>`: statsd's multi-value grammar
+/// (`name:1:2:3|c`) means `parse_line` collects one line's events into its own `Vec` before
+/// `decode` appends them into the batch's `Vec`, so this is one allocation per line plus one for
+/// the batch rather than syslog's one total. See
+/// [`statsd_tag_values_share_the_datagram_allocation`] for the same finding stated structurally.
 #[test]
 fn statsd_decode_one_line() {
     let mut decoder = fixtures::statsd_decoder();
@@ -103,7 +105,7 @@ fn statsd_decode_one_line() {
 
     let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
     assert_eq!(batch.events.len(), 1);
-    expect_allocs("statsd_in: decode 1 line", stats, 8);
+    expect_allocs("statsd_in: decode 1 line", stats, 2);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -396,15 +398,12 @@ fn syslog_fields_share_the_datagram_allocation() {
     assert!(points_into(&datagram, tag), "syslog.tag should slice the datagram too");
 }
 
-/// The counterexample, pinned so it can't be quietly assumed away: statsd tag values are *copied*
-/// out of the datagram, not sliced. This is the structural cause of
-/// [`statsd_decode_one_line`]'s eight allocations, and the fix is to give `statsd.rs` the
-/// `slice_of` treatment `syslog.rs` already has.
-///
-/// Asserted as a currently-true fact about the code, not as desirable behavior -- when someone
-/// fixes it, this test should start failing and be replaced by the positive assertion above.
+/// The zero-copy claim for statsd, stated structurally: every DogStatsD tag value points *into*
+/// the datagram buffer it was decoded from, same as [`syslog_fields_share_the_datagram_allocation`]
+/// above. `statsd.rs`'s `slice_of` is what makes this true -- if it regresses back to copying tag
+/// values into a fresh `Bytes`, this is the test that catches it.
 #[test]
-fn statsd_tag_values_are_copied_not_sliced() {
+fn statsd_tag_values_share_the_datagram_allocation() {
     let datagram = fixtures::statsd_datagram(1);
     let mut decoder = fixtures::statsd_decoder();
     let batch = decoder.decode(datagram.clone()).expect("should decode");
@@ -413,11 +412,7 @@ fn statsd_tag_values_are_copied_not_sliced() {
     let env = event.attributes.get("env").expect("the env tag");
     let Value::Str(env) = env else { panic!("the tag value should be a Str") };
     assert_eq!(env.as_ref(), b"prod");
-    assert!(
-        !points_into(&datagram, env),
-        "this documents a known gap: if statsd tag values now slice the datagram, that's an \
-         improvement -- flip this to `points_into` and update docs/design/memory.md"
-    );
+    assert!(points_into(&datagram, env), "env tag value should slice the datagram, not copy it");
 }
 
 /// `StatsdInput::run`/`SyslogInput::run` copy each datagram out of the reusable 64 KB receive
