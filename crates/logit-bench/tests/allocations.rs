@@ -339,14 +339,19 @@ fn clone_distribution_heavy_event() {
 /// each a heap allocation on clone regardless of contents -- that's the 2 allocations measured.
 /// What's notably *not* here: every `AttrMap` involved (the event's own 4 attributes, each
 /// `SpanEvent`'s 2, the link's 1) is small enough to stay inside `AttrMap`'s 8-slot inline
-/// capacity, so none of them spills to the heap on clone. That's the number
-/// `docs/design/memory.md`'s item 4 (`Arc<EventBatch>` copy-on-write) and item 7 (`Box`
-/// `SpanRecord`) were both reasoning about without a measurement: item 4 called a span-bearing
-/// event "far more expensive to deep-clone than anything measured here" -- true relative to the
-/// nginx shape's 4, but driven by the two `Vec`s existing at all, not by their contents, and
-/// smaller than a span carrying wider per-event/per-link attribute sets would cost. `Box`ing
-/// `SpanRecord` (item 7) would add exactly one allocation on top of these 2, confirming the "one
-/// allocation on an event that already allocates for its span's events/links" framing.
+/// capacity, so none of them spills to the heap on clone.
+///
+/// **This is cheaper to clone than the nginx shape, not more expensive** -- 2 allocations (1320
+/// bytes) against `clone_one_event`'s 4 (3552 bytes). That's the opposite of what a first read of
+/// `docs/design/memory.md`'s item 4 ("far more expensive to deep-clone than anything measured
+/// here") suggests, and the reason is exactly the inline-attribute point above: this fixture is
+/// narrow enough on attribute count everywhere that nothing about it spills. It does **not** show
+/// spans are cheap in general -- a span whose `SpanEvent`s/`SpanLink`s (or the span itself)
+/// carried more than 8 attributes each would spill those maps on clone just as the nginx event's
+/// 10 attributes do, costing more accordingly; this measurement only speaks to the narrow shape
+/// this fixture actually builds. What does generalize regardless of attribute width is the fixed
+/// cost of the two `Vec`s existing at all: `Box`ing `SpanRecord` (item 7) would add exactly one
+/// more allocation on top of whatever a given span shape's total turns out to be.
 #[test]
 fn clone_span_event() {
     let event = fixtures::span_event();
