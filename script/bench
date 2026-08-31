@@ -1,0 +1,18 @@
+#!/bin/bash
+# Usage: script/bench [divan args...]
+# Throughput benchmarks over the reference nginx pipeline (crates/logit-bench). Reports timing
+# alongside per-benchmark allocation counts, via divan's AllocProfiler.
+#
+# Deliberately NOT part of script/cibuild: wall-clock benchmarking on a shared CI runner measures
+# the runner. The allocation counts that must hold every build are ordinary assertions in
+# crates/logit-bench/tests/allocations.rs, run by script/test.
+#
+# See docs/design/memory.md for what these numbers mean and which recommendations they support.
+#   script/bench                       # everything
+#   script/bench syslog_decode         # just the benches whose path contains this
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+run cargo bench -p logit-bench -- "$@"

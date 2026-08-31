@@ -10,6 +10,7 @@ members = [
     "crates/logit-outputs",
     "crates/logit-transforms",
     "crates/logit-cli",
+    "crates/logit-bench",
 ]
 
 [workspace.package]
@@ -27,6 +28,7 @@ logit-pipeline = { path = "crates/logit-pipeline" }
 logit-inputs = { path = "crates/logit-inputs" }
 logit-outputs = { path = "crates/logit-outputs" }
 logit-transforms = { path = "crates/logit-transforms" }
+logit-bench = { path = "crates/logit-bench" }
 
 bytes = "1"
 smallvec = "1"

@@ -1,0 +1,119 @@
+//! Byte-size assertions for the event model.
+//!
+//! `Event` is moved by value on every hop between pipeline nodes and deep-cloned once per extra
+//! fan-out consumer (`logit-pipeline`'s `Fanout`), so its size is a throughput property, not a
+//! curiosity -- see `docs/design/memory.md` for the full accounting and for what each of these
+//! numbers is made of.
+//!
+//! These are exact-equality assertions on purpose. A `<=` bound would silently absorb the thing
+//! this test exists to catch: a field added to `Event` (or to any type it inlines) quietly adding
+//! hundreds of bytes to every event in flight. When one of these fails, that's the test working --
+//! decide whether the growth is worth it, update the number, and update `docs/design/memory.md`'s
+//! table in the same commit.
+//!
+//! Sizes are architecture-dependent (`Bytes`, `Vec`, and `SmallVec` are all pointer-sized), so
+//! every assertion is gated on a 64-bit target rather than asserting something false on a 32-bit
+//! one.
+
+#![cfg(target_pointer_width = "64")]
+
+use logit_core::{
+    AttrMap, Event, LogRecord, MetricKind, MetricList, MetricRecord, Resource, SpanRecord, Symbol,
+    Value,
+};
+use std::mem::{size_of, size_of_val};
+
+/// The interned-key type. `lasso::Spur` is a `NonZeroU32`, which is what makes `Option<Symbol>`
+/// (on `MetricRecord::unit`) free rather than a padded 8 bytes.
+#[test]
+fn symbol_is_a_niche_optimized_u32() {
+    assert_eq!(size_of::<Symbol>(), 4);
+    assert_eq!(size_of::<Option<Symbol>>(), 4, "Spur's NonZero niche should absorb the None case");
+}
+
+/// `Value`'s size is set by its largest variant, `Bytes` (4 words: ptr, len, data, vtable), plus a
+/// discriminant rounded up to `Bytes`'s 8-byte alignment. `Map` is boxed specifically to keep it
+/// from being the largest variant (`value.rs`), and `Array`'s `Vec` is 3 words.
+#[test]
+fn value_is_bytes_plus_a_discriminant_word() {
+    assert_eq!(size_of::<bytes::Bytes>(), 32);
+    assert_eq!(size_of::<Value>(), 40);
+}
+
+/// The dominant term in `Event`. `AttrMap` is a `SmallVec<[(Symbol, Value); 8]>`, and a `SmallVec`
+/// occupies its inline footprint **whether or not it has spilled to the heap** -- the inline array
+/// and the heap `(ptr, cap)` share one union-or-enum slot sized by the larger of the two. So an
+/// event with 13 attributes pays both a heap allocation *and* this full inline footprint.
+///
+/// `(Symbol, Value)` is 48 bytes, not 44: `Value` is 8-byte aligned, so the 4-byte `Symbol` is
+/// followed by 4 bytes of padding.
+#[test]
+fn attr_map_pays_its_inline_capacity_whether_or_not_it_spills() {
+    assert_eq!(size_of::<(Symbol, Value)>(), 48);
+    assert_eq!(size_of::<AttrMap>(), 400);
+
+    // Not a size assertion, but the claim the comment above rests on: spilling doesn't shrink it.
+    let mut spilled = AttrMap::new();
+    for i in 0..32 {
+        spilled.insert(&format!("k{i}"), Value::I64(i));
+    }
+    assert_eq!(size_of_val(&spilled), size_of::<AttrMap>());
+}
+
+/// `MetricKind` inlines a whole `sketches_ddsketch::DDSketch` in its `Distribution` variant (two
+/// `Store`s, each a `Vec` plus bookkeeping), which makes every `MetricRecord` pay for a sketch it
+/// almost never holds. Boxing that one variant is the single cheapest size win available; see
+/// `docs/design/memory.md`.
+#[test]
+fn metric_kind_is_sized_by_the_inlined_ddsketch() {
+    assert_eq!(
+        size_of::<MetricKind>(),
+        176,
+        "almost entirely the `Distribution` variant's inlined DDSketch: two `Store`s (a Vec plus \
+         bookkeeping each) and a Config. Counter/Gauge need 8 bytes and pay 176."
+    );
+    assert_eq!(
+        size_of::<MetricRecord>(),
+        184,
+        "MetricKind + a Symbol + a niche-free Option<Symbol>"
+    );
+    assert_eq!(
+        size_of::<MetricList>(),
+        200,
+        "SmallVec<[MetricRecord; 1]>: the inline record, plus 16 bytes of capacity-and-\
+         discriminant overhead (smallvec's `union` feature would save 8 of those)"
+    );
+}
+
+#[test]
+fn record_types() {
+    assert_eq!(size_of::<LogRecord>(), 48);
+    assert_eq!(size_of::<SpanRecord>(), 136);
+    assert_eq!(size_of::<Resource>(), size_of::<AttrMap>());
+
+    // Both `Option`s are free: `Severity` and `SpanKind` are small field-less enums, so their
+    // spare discriminants absorb the `None` case. Worth asserting rather than assuming -- adding
+    // a 256-variant enum to either record would silently cost `Event` another 8 bytes.
+    assert_eq!(size_of::<Option<LogRecord>>(), size_of::<LogRecord>());
+    assert_eq!(size_of::<Option<SpanRecord>>(), size_of::<SpanRecord>());
+}
+
+/// The number that matters: what one event costs to move between two pipeline nodes, and to deep-
+/// clone for each extra fan-out consumer. `docs/design/memory.md` breaks this down term by term
+/// and lists what could be reclaimed.
+///
+/// Note what this means for the cheap cases: a bare log line with two attributes and a statsd
+/// counter with three tags both cost this same 792 bytes to move, because `AttrMap`'s inline
+/// capacity and `MetricKind`'s inlined sketch are paid unconditionally.
+#[test]
+fn event_size() {
+    assert_eq!(size_of::<Event>(), 792);
+
+    // The breakdown, asserted so it can't drift out of sync with the total above.
+    let sum = size_of::<i64>()
+        + size_of::<AttrMap>()
+        + size_of::<Option<LogRecord>>()
+        + size_of::<MetricList>()
+        + size_of::<Option<SpanRecord>>();
+    assert_eq!(sum, size_of::<Event>(), "Event should have no padding beyond its fields");
+}

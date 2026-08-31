@@ -285,6 +285,14 @@ express "route by condition." Two consequences worth stating rather than discove
   first mutates it is the identified future optimization — recorded here as a known cost, not
   designed now, and more valuable to eventually build than it was before that ADR.
 
+  **Now measured** ([memory.md](memory.md)): 4 allocations and a 792-byte memcpy per event per
+  extra branch, 272 ns — about 10% of the 2.61 µs it takes to ingest a line, and roughly a
+  sixteenth of what encoding one event for InfluxDB costs. So "load-bearing" is right, but the
+  emphasis above overstates it relative to everything else: the output encoder, not fan-out, is
+  where this pipeline's cost actually sits. The copy-on-write change is still worth making — it's
+  strictly no worse anywhere, and a read-only consumer (every sink) would pay none of it — just not
+  first.
+
 Also worth carrying forward as an open question, not a decision: today's `send_batch` silently drops
 a send on a closed downstream (`let _ = tx.blocking_send(...)`). Under a DAG that closure should
 really propagate as a shutdown signal rather than vanish. A per-edge `on_full: block | drop` policy

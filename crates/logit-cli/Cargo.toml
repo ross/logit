@@ -10,6 +10,13 @@ description = "The logit binary."
 name = "logit"
 path = "src/main.rs"
 
+[features]
+default = ["jemalloc"]
+# See `main.rs`'s `#[global_allocator]` and docs/adr/0015-jemalloc-global-allocator.md. Opt-out
+# rather than opt-in so the shipped binary gets it by default, but a build can still fall back to
+# the system allocator to measure the difference (or on a target jemalloc doesn't support).
+jemalloc = ["dep:tikv-jemallocator"]
+
 [dependencies]
 logit-core.workspace = true
 logit-config.workspace = true
@@ -22,3 +29,4 @@ serde_json.workspace = true
 serde_norway.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+tikv-jemallocator = { version = "0.6", optional = true }
