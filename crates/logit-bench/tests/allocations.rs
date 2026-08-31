@@ -106,6 +106,27 @@ fn statsd_decode_one_line() {
     expect_allocs("statsd_in: decode 1 line", stats, 8);
 }
 
+/// The logs-only workload `docs/design/memory.md` §0 names as unmeasured: a plain-text syslog
+/// line with no JSON body anywhere in the pipeline (`fixtures::SSHD_SYSLOG_LINE`). Same zero-copy
+/// decode as [`syslog_decode_one_line`] -- one allocation for the `Vec<Event>`, nothing per
+/// field, for the same reason. What's new is the attribute count: six
+/// (`syslog.facility`/`severity`/`timestamp`/`hostname`/`tag`/`pid`), the top of the "4-6
+/// attributes" range §1 estimates for this workload -- comfortably inside `AttrMap`'s 8-slot
+/// inline capacity, unlike the nginx shape (10 attributes) which spills. That's the concrete data
+/// point `docs/design/memory.md`'s item 9 (re-picking `AttrMap`'s inline capacity) was missing
+/// for a plain-syslog pipeline specifically.
+#[test]
+fn syslog_decode_one_logs_only_line() {
+    let mut decoder = fixtures::syslog_decoder();
+    let datagram = fixtures::logs_only_syslog_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.events[0].attributes.len(), 6, "facility/severity/timestamp/hostname/tag/pid");
+    expect_allocs("syslog_in: decode 1 logs-only line", stats, 1);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Transforms
 // ---------------------------------------------------------------------------------------------
@@ -132,6 +153,38 @@ fn json_parse_one_event() {
     let (event, stats) = measure(|| json.process(&resource, event).expect("json forwards"));
     assert_eq!(event.attributes.len(), 10, "6 JSON fields plus 4 syslog.* attributes");
     expect_allocs("json: parse + merge 1 event", stats, 7);
+}
+
+/// The wide-JSON workload `docs/design/memory.md` §0 names as unmeasured: 28 flat top-level
+/// fields (`fixtures::WIDE_JSON_SYSLOG_LINE`, modeled on pino's default output shape) against the
+/// nginx fixture's 6. This corrects a guess `docs/design/memory.md`'s item 5 made from the nginx
+/// number alone: `json`'s allocation cost is **not** dominated by the two `AttrMap`
+/// builds/spills (the intermediate map and the merge) -- it's dominated by
+/// `collect_attrmap`'s `map.next_key::<String>()?`, which allocates one `String` per JSON object
+/// key regardless of value type. 30 allocations for 28 keys is 28 key `String`s plus exactly the
+/// same two spills [`json_parse_one_event`] pays (one on the intermediate `AttrMap` past 8
+/// entries, one on the merge into the event's, which starts at 4 and passes 8 on the fifth JSON
+/// key) -- so unlike the nginx measurement suggested, this cost scales close to linearly with
+/// field count, and a checkpoint-and-rollback fix (item 5's proposal) would leave the dominant
+/// term untouched; a non-allocating key lookup (closer to what `AttrMap::get` needs per item 3)
+/// would matter more here than the intermediate-map rework would.
+#[test]
+fn json_parse_wide_json_event() {
+    let mut json = fixtures::json_parser();
+    let resource = fixtures::resource();
+    let mut decoder = fixtures::syslog_decoder();
+    let datagram = fixtures::wide_json_syslog_datagram(1);
+    let mut decode_one = || {
+        decoder.decode(datagram.clone()).expect("should decode").events.pop().expect("one event")
+    };
+
+    let warm = decode_one();
+    drop(json.process(&resource, warm));
+
+    let event = decode_one();
+    let (event, stats) = measure(|| json.process(&resource, event).expect("json forwards"));
+    assert_eq!(event.attributes.len(), 32, "28 JSON fields plus 4 syslog.* attributes");
+    expect_allocs("json: parse + merge 1 wide-JSON event", stats, 30);
 }
 
 /// Four metrics attached: one `MetricList` spill (past its single inline slot) and one `bins` Vec
@@ -260,6 +313,48 @@ fn clone_one_statsd_event() {
 
     let (_, stats) = measure(|| event.clone());
     expect_allocs("Event::clone (statsd shape)", stats, 0);
+}
+
+/// Cloning [`fixtures::distribution_heavy_event`] -- five *distinct* `MetricKind::Distribution`
+/// metrics, against the nginx shape's two. `clone_one_event` above costs 4 allocations for 2
+/// distributions (a spilled `AttrMap`, a spilled `MetricList`, and a `bins` Vec per sketch); this
+/// fixture's three attributes stay inline (no `AttrMap` spill), so the difference isolates what
+/// distribution *count* costs on its own: one `MetricList` spill (past its single inline slot)
+/// plus one `bins` Vec per sketch. This is exactly the number `docs/design/memory.md`'s item 8
+/// (`Box` the `DdSketch`) was missing -- boxing turns every one of these `bins`-Vec clones into an
+/// *additional* allocation, which is the "distribution-heavy metrics" side of that trade the doc
+/// flags as unmeasured.
+#[test]
+fn clone_distribution_heavy_event() {
+    let event = fixtures::distribution_heavy_event();
+    drop(event.clone());
+
+    let (clone, stats) = measure(|| event.clone());
+    assert_eq!(clone.metrics.len(), 5);
+    expect_allocs("Event::clone (distribution-heavy shape)", stats, 6);
+}
+
+/// Cloning [`fixtures::span_event`] -- the one payload shape with no coverage at all before this
+/// change. `SpanRecord` holds a `Vec<SpanEvent>` (2 entries here) and a `Vec<SpanLink>` (1 entry),
+/// each a heap allocation on clone regardless of contents -- that's the 2 allocations measured.
+/// What's notably *not* here: every `AttrMap` involved (the event's own 4 attributes, each
+/// `SpanEvent`'s 2, the link's 1) is small enough to stay inside `AttrMap`'s 8-slot inline
+/// capacity, so none of them spills to the heap on clone. That's the number
+/// `docs/design/memory.md`'s item 4 (`Arc<EventBatch>` copy-on-write) and item 7 (`Box`
+/// `SpanRecord`) were both reasoning about without a measurement: item 4 called a span-bearing
+/// event "far more expensive to deep-clone than anything measured here" -- true relative to the
+/// nginx shape's 4, but driven by the two `Vec`s existing at all, not by their contents, and
+/// smaller than a span carrying wider per-event/per-link attribute sets would cost. `Box`ing
+/// `SpanRecord` (item 7) would add exactly one allocation on top of these 2, confirming the "one
+/// allocation on an event that already allocates for its span's events/links" framing.
+#[test]
+fn clone_span_event() {
+    let event = fixtures::span_event();
+    drop(event.clone());
+
+    let (clone, stats) = measure(|| event.clone());
+    assert!(clone.span.is_some());
+    expect_allocs("Event::clone (span shape)", stats, 2);
 }
 
 // ---------------------------------------------------------------------------------------------

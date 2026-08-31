@@ -7,9 +7,20 @@
 //! chosen to flatter the numbers: `syslog_in -> json -> kv_metrics -> keep -> aggregate ->
 //! influxdb_out`, with the same metric specs and the same `keep` list. A measurement of a workload
 //! nobody runs isn't worth recording.
+//!
+//! That reference pipeline is one point in the workload space, though -- `docs/design/memory.md`
+//! §0 ("What these measurements can and can't tell you") is explicit that it's a *mixed* shape
+//! (log + metrics + attributes) and that several sizing decisions in §8 are blocked on seeing
+//! logs-only, wide-JSON, distribution-heavy-metrics, and span shapes too. The fixtures below add
+//! exactly those, following the same two rules as everything above: a `const` wire-format literal
+//! plus a `count` multiplier where a decoder already exists to feed, and a directly-constructed
+//! `Event`/`SpanRecord` where none does (`docs/design/memory.md`'s "Fixtures" section).
 
 use bytes::Bytes;
-use logit_core::{AttrMap, DdSketch, Event, EventBatch, MetricKind, MetricRecord, Resource};
+use logit_core::{
+    AttrMap, DdSketch, Event, EventBatch, MetricKind, MetricRecord, Resource, SpanEvent, SpanKind,
+    SpanLink, SpanRecord, SpanStatus, Value,
+};
 use logit_inputs::statsd::StatsdDecoder;
 use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
@@ -180,3 +191,180 @@ function process(event)
   return event
 end
 "#;
+
+// -------------------------------------------------------------------------------------------
+// Logs-only: a plain-text syslog line with no JSON body at all
+// -------------------------------------------------------------------------------------------
+
+/// A plain-text syslog line with no JSON body -- the logs-only workload `docs/design/memory.md`
+/// §0 names as unmeasured: attributes plus a `log`, no `json` transform anywhere in the pipeline.
+///
+/// RFC 3164, modeled on the header shape RFC 3164 §5.4's own canonical example uses (`<34>` =
+/// facility `auth`(4), severity `crit`(2)), updated to a realistic modern line: an sshd
+/// authentication failure the way rsyslog would forward it, with **both** hostname and
+/// `tag[pid]:` present. That's deliberately unlike [`NGINX_SYSLOG_LINE`]'s `nohostname` shape --
+/// this exercises `parse_3164`'s *other* header branch (`syslog.rs`'s
+/// `rfc3164_with_hostname_decodes_message_severity_and_attributes` test covers the same shape),
+/// and yields six attributes (`syslog.facility`/`severity`/`timestamp`/`hostname`/`tag`/`pid`),
+/// the top of the "4-6 attributes" range `docs/design/memory.md` §1 estimates for a plain syslog
+/// pipeline.
+///
+/// No live syslogd was captured for this -- it's derived from reading `syslog.rs`'s decoder and
+/// its own tests, which `docs/design/memory.md`'s "Fixtures" section calls an honest provenance
+/// in its own right, not a substitute for one.
+pub const SSHD_SYSLOG_LINE: &str = "<34>Aug 31 06:52:01 auth-edge-3 sshd[8843]: Failed password \
+     for invalid user admin from 203.0.113.7 port 54321 ssh2";
+
+/// `count` copies of [`SSHD_SYSLOG_LINE`] newline-separated -- the logs-only counterpart to
+/// [`nginx_syslog_datagram`].
+pub fn logs_only_syslog_datagram(count: usize) -> Bytes {
+    join_lines(SSHD_SYSLOG_LINE, count)
+}
+
+// -------------------------------------------------------------------------------------------
+// Wide JSON: a flat log line with 25-30 fields, well past AttrMap's inline capacity
+// -------------------------------------------------------------------------------------------
+
+/// A wide, flat (non-nested) JSON log line -- still `syslog_in -> json`, but 28 top-level fields
+/// against [`NGINX_SYSLOG_LINE`]'s six, to stress `AttrMap`'s spill past its 8-entry inline
+/// capacity harder than the reference fixture does.
+///
+/// Modeled on pino's (a widely used Node.js structured-logging library) documented default
+/// fields (`level`, `time`, `pid`, `hostname`, `msg`), extended with the request/timing/trace/
+/// deployment-metadata fields a typical Express+pino service adds per request log -- this is the
+/// realistic shape a verbose structured logger produces, not an invented `field1..field30`. No
+/// live pino process was captured for this; it's derived from pino's documented default output
+/// shape plus the request-logging fields its ecosystem (`pino-http` and similar) commonly adds,
+/// per the same honest-provenance standard [`SSHD_SYSLOG_LINE`] uses.
+///
+/// Wrapped in the same `nohostname`/tagged RFC 3164 envelope as [`NGINX_SYSLOG_LINE`] (facility
+/// `local0`(16), severity `info`(6) -- `<134>`), so decoding it yields four `syslog.*` attributes
+/// plus these 28 JSON fields once `json` merges them.
+pub const WIDE_JSON_SYSLOG_LINE: &str = concat!(
+    "<134>Aug 31 06:52:01 orders_api: ",
+    r#"{"level":30,"time":1725091200123,"pid":4821,"#,
+    r#""hostname":"api-7c9f8d6b5-abcde","name":"orders-api","#,
+    r#""req_id":"c3f7a1e2-9b44-4f0a-8c2d-11f2a9d40abc","method":"POST","#,
+    r#""url":"/api/v1/orders","statusCode":201,"responseTime":18.4,"#,
+    r#""userId":"u_9f21c8","#,
+    r#""userAgent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36","#,
+    r#""remoteAddress":"198.51.100.23","remotePort":54871,"#,
+    r#""referer":"https://shop.example.com/cart","contentLength":842,"#,
+    r#""protocol":"HTTP/1.1","sessionId":"sess_4471bd","#,
+    r#""traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"00f067aa0ba902b7","#,
+    r#""service":"orders-api","environment":"production","version":"3.4.1","#,
+    r#""region":"us-east-1","cluster":"prod-1","pod":"orders-api-7c9f8d6b5-abcde","#,
+    r#""container":"orders-api","msg":"request completed"}"#
+);
+
+/// `count` copies of [`WIDE_JSON_SYSLOG_LINE`] newline-separated.
+pub fn wide_json_syslog_datagram(count: usize) -> Bytes {
+    join_lines(WIDE_JSON_SYSLOG_LINE, count)
+}
+
+// -------------------------------------------------------------------------------------------
+// Distribution-heavy metrics: several distinct MetricKind::Distribution values on one event
+// -------------------------------------------------------------------------------------------
+
+/// A metrics-only event carrying five *distinct* distributions -- the shape a request handler
+/// instrumented with several named timers produces, e.g. a DogStatsD client's `ms`/`h`/`d` types
+/// (`statsd.rs`'s module docs) firing once per internal operation timed within one request
+/// (a cache lookup, a DB query, an external API call, ...), or a multi-histogram Prometheus-style
+/// scrape reporting several distributions at once. Every existing metrics fixture before this one
+/// carried at most a single distribution; `docs/design/memory.md` §1 is explicit that "`Box`ing
+/// the `DdSketch`" trades 168 bytes/event for +1 allocation *per distribution created* and "wins
+/// for logs/traces, loses for distribution-heavy metrics" -- this fixture is the distribution-
+/// heavy side of that trade, which nothing in the tree measured before.
+///
+/// Directly constructed, not decoded from a wire literal: real statsd emits one metric per
+/// datagram line, so "one event, several distinct distributions" is a post-collection shape no
+/// existing decoder produces on its own -- the same reasoning `docs/design/memory.md`'s Fixtures
+/// section gives for building a [`SpanRecord`] fixture by hand.
+pub fn distribution_heavy_event() -> Event {
+    let mut attrs = AttrMap::new();
+    attrs.insert("service", "orders-api");
+    attrs.insert("env", "prod");
+    attrs.insert("region", "us-east-1");
+
+    let mut event = Event::empty(0, attrs);
+    for (name, value) in [
+        ("http.request.duration", 42.5),
+        ("db.query.duration", 8.3),
+        ("cache.lookup.duration", 0.7),
+        ("external_api.call.duration", 120.4),
+        ("queue.wait.duration", 3.1),
+    ] {
+        let mut sketch = DdSketch::new();
+        sketch.add(value);
+        event.metrics.push(MetricRecord {
+            name: logit_core::interner::intern(name),
+            kind: MetricKind::Distribution(sketch),
+            unit: Some(logit_core::interner::intern("ms")),
+        });
+    }
+    event
+}
+
+// -------------------------------------------------------------------------------------------
+// Spans: the one payload shape with no fixture at all before this change
+// -------------------------------------------------------------------------------------------
+
+/// A directly-constructed span, wrapped as `Event::span(...)` -- the payload shape
+/// `docs/design/memory.md` §0 calls out as having **no fixture at all**: "nothing here has
+/// measured the span path." There is no OTLP input in this codebase yet (`AGENTS.md`), so this
+/// follows `docs/design/memory.md`'s Fixtures pattern #2 -- built by hand against
+/// `crates/logit-core/src/span.rs`'s exact shape, to be replaced by a captured payload once a
+/// span decoder lands.
+///
+/// Modeled on a typical server span for one HTTP request: a parent span (an upstream caller),
+/// two [`SpanEvent`]s (a cache miss, then a slow query -- the shape an OTLP `AddEvent` call
+/// produces), and one [`SpanLink`] to a related trace (e.g. the batch job that triggered this
+/// request), so it exercises every field `SpanRecord` has -- including the two `Vec`s and their
+/// per-event `AttrMap`s that `docs/design/memory.md`'s item 4 says make a span-bearing event "far
+/// more expensive to deep-clone than anything measured" in the reference pipeline.
+pub fn span_event() -> Event {
+    let mut attrs = AttrMap::new();
+    attrs.insert("service.name", "orders-api");
+    attrs.insert("http.method", "POST");
+    attrs.insert("http.route", "/api/v1/orders");
+    attrs.insert("http.status_code", Value::U64(201));
+
+    let mut cache_miss_attrs = AttrMap::new();
+    cache_miss_attrs.insert("cache.key", "orders:12345");
+    cache_miss_attrs.insert("cache.hit", Value::Bool(false));
+
+    let mut slow_query_attrs = AttrMap::new();
+    slow_query_attrs.insert("db.statement", "INSERT INTO orders (...) VALUES (...)");
+    slow_query_attrs.insert("db.duration_ms", Value::F64(41.2));
+
+    let mut link_attrs = AttrMap::new();
+    link_attrs.insert("link.reason", "triggered_by_batch_job");
+
+    let record = SpanRecord {
+        trace_id: [0xAB; 16],
+        span_id: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+        parent_span_id: Some([0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]),
+        name: Value::str("POST /api/v1/orders"),
+        kind: SpanKind::Server,
+        status: SpanStatus::Ok,
+        events: vec![
+            SpanEvent {
+                timestamp: 1_725_091_200_050_000_000,
+                name: Value::str("cache.miss"),
+                attributes: cache_miss_attrs,
+            },
+            SpanEvent {
+                timestamp: 1_725_091_200_070_000_000,
+                name: Value::str("db.slow_query"),
+                attributes: slow_query_attrs,
+            },
+        ],
+        links: vec![SpanLink {
+            trace_id: [0xCD; 16],
+            span_id: [0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27],
+            attributes: link_attrs,
+        }],
+        end_timestamp: 1_725_091_200_090_000_000,
+    };
+    Event::span(1_725_091_200_000_000_000, attrs, record)
+}
