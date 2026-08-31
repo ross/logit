@@ -73,8 +73,9 @@ pub async fn run_with_shutdown(
 
     let ids: Vec<String> = graph.components.keys().cloned().collect();
 
-    let mut senders: HashMap<String, mpsc::Sender<EventBatch>> = HashMap::with_capacity(ids.len());
-    let mut inboxes: HashMap<String, mpsc::Receiver<EventBatch>> =
+    let mut senders: HashMap<String, mpsc::Sender<Arc<EventBatch>>> =
+        HashMap::with_capacity(ids.len());
+    let mut inboxes: HashMap<String, mpsc::Receiver<Arc<EventBatch>>> =
         HashMap::with_capacity(ids.len());
     for id in &ids {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -178,9 +179,10 @@ async fn run_input(
 async fn run_output(
     id: String,
     mut output: Box<dyn Output + Send>,
-    mut inbox: mpsc::Receiver<EventBatch>,
+    mut inbox: mpsc::Receiver<Arc<EventBatch>>,
 ) -> anyhow::Result<()> {
     while let Some(batch) = inbox.recv().await {
+        let batch = unwrap_batch(batch);
         output.send(batch).await.with_context(|| format!("component '{id}'"))?;
     }
     Ok(())
@@ -192,7 +194,7 @@ async fn run_output(
 /// indirection, since it's already running inside the async runtime.
 async fn run_transform(
     mut transform: Box<dyn Transform + Send>,
-    mut inbox: mpsc::Receiver<EventBatch>,
+    mut inbox: mpsc::Receiver<Arc<EventBatch>>,
     fanout: Fanout,
 ) -> anyhow::Result<()> {
     let mut next_flush =
@@ -235,6 +237,7 @@ async fn run_transform(
             }
             return Ok(());
         };
+        let batch = unwrap_batch(batch);
 
         let mut out = Vec::with_capacity(batch.events.len());
         for event in batch.events {
@@ -264,7 +267,7 @@ fn run_lua(
     script: String,
     configured_interval: Option<Duration>,
     ready_tx: oneshot::Sender<Result<(), String>>,
-    mut inbox: mpsc::Receiver<EventBatch>,
+    mut inbox: mpsc::Receiver<Arc<EventBatch>>,
     fanout: Fanout,
     runtime: tokio::runtime::Handle,
 ) {
@@ -323,6 +326,7 @@ fn run_lua(
             }
             return;
         };
+        let batch = unwrap_batch(batch);
         last_resource = batch.resource.clone();
 
         let mut out = Vec::with_capacity(batch.events.len());
@@ -338,6 +342,21 @@ fn run_lua(
             fanout.send_blocking(EventBatch { resource: batch.resource, events: out });
         }
     }
+}
+
+/// Unwraps the `Arc` a batch travels the channel wrapped in back to an owned `EventBatch`, right
+/// before handing it to `Output::send`/a `Transform`/`ScriptWorker::process` -- none of which know
+/// or need to know that channels carry `Arc<EventBatch>`
+/// (`docs/adr/0016-arc-eventbatch-copy-on-write.md`).
+///
+/// `try_unwrap` succeeds with no clone whenever this is the only remaining strong reference: the
+/// common single-consumer-per-edge case, and also whichever fan-out branch consumes last (that one
+/// got the `Arc` moved by `Fanout::send`, not cloned). It falls back to a real deep clone only when
+/// a sibling branch still holds its own reference to the same batch -- exactly the case that needs
+/// an independent copy so a mutation on one branch can't be observed on another
+/// (`a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` below pins this).
+fn unwrap_batch(batch: Arc<EventBatch>) -> EventBatch {
+    Arc::try_unwrap(batch).unwrap_or_else(|shared| (*shared).clone())
 }
 
 fn now_unix_nanos() -> i64 {
