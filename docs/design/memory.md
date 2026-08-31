@@ -232,7 +232,7 @@ hop and one `Vec` allocation per batch per node. Nothing is lost — the trait a
 more than one event per input. Both changes deserve their own ADR; the signature one gets more
 expensive to make with every transform that lands.
 
-## 4. Interning: the bargain, and the risk
+## 4. Interning: the bargain, and its bounds
 
 `logit_core::interner` maps every attribute key and metric name through a process-global
 `lasso::ThreadedRodeo` to a 4-byte `Symbol`. This pays for itself several times over: `AttrMap`
@@ -267,6 +267,38 @@ position, and never repeats.** In practice that is one thing above all --
 
 At ~94 bytes each, a million distinct metric names is ~94 MB retained with no way to reclaim it,
 and nothing anywhere reporting that it happened.
+
+### Accepted, with the premise written down
+
+**No work is planned here, deliberately.** The reasoning, so it can be re-checked rather than
+re-litigated:
+
+- **Listeners are private.** `logit`'s deployment shapes — sidecar, host agent, central aggregator
+  fed by other `logit` nodes ([OVERVIEW.md](../OVERVIEW.md)) — all put the listener inside a trust
+  boundary. The metric namespace is therefore *user*-controlled, not attacker-controlled. That is
+  the load-bearing assumption; everything below follows from it.
+- **A user can still name metrics badly**, but embedding an id in a metric name is a well-known
+  anti-pattern with well-known consequences, and designing to accommodate it is not this project's
+  job.
+- **`logit` is not what breaks first, or even second.** The metric store goes long before: a
+  million distinct measurement names is a million-plus series, which is squarely where InfluxDB's
+  index falls over, against 94 MB here. And `logit`'s *own* first failure under the same abuse
+  isn't the interner either — `aggregate`'s window holds a `SeriesKey` (408 bytes, almost entirely
+  its `AttrMap`) plus an `Accumulator` (184) per series, so roughly **600 bytes per series per
+  window** against the interner's ~94 bytes once. That one already has a documented mitigation
+  (`keep` in front of `aggregate`, §4's closing note), and it would bite ~6× harder and sooner.
+
+**What would change the calculus:** a listener that stops being private — a public or
+multi-tenant ingest endpoint, or a hosted aggregator taking traffic from parties the operator
+doesn't control. If that ever ships, revisit this section first, because the retrofit is expensive:
+`Symbol` is `Copy` and `resolve` *panics* on an unknown symbol, so `AttrMap`, `MetricRecord`,
+`SeriesKey`, the Lua proxy, and the planned wire dictionary are all written against "symbols are
+eternal."
+
+If a diagnostics facility lands anyway (the `tracing` migration in
+[known-gaps.md](../known-gaps.md)), an `interner::len()` gauge is nearly free to expose at that
+point and would make this observable instead of silent. Worth doing *then*, not worth a change of
+its own now.
 
 ### What is *not* the risk: failed lookups
 
@@ -400,10 +432,9 @@ Ranked by measured value, not by how interesting they are.
 6. **`Transform::process(&mut Event) -> bool`.** Removes a 792-byte memcpy per node hop. Gets more
    expensive to decide with every transform that lands, so decide it early even if it's applied
    late.
-7. **Bound the interner, or narrow what may enter it.** The one item here that is genuinely hard to
-   retrofit, and the narrowest in scope: the live exposure is statsd metric names arriving from an
-   untrusted client, at ~94 bytes retained per distinct name, forever (§4). Needs a decision before
-   a public-facing statsd listener ships; a private one behind a trusted fleet can wait.
+7. **~~Bound the interner~~ — accepted as-is, see §4.** Listeners are private, so the namespace is
+   user-controlled; the metric store and `logit`'s own aggregation window both fail earlier and
+   harder under the same abuse. Revisit only if a listener stops being private.
 8. **`AttrMap` accessors keyed by `Symbol`,** eliminating the `resolve → intern` round trips in
    `json`, `keep`, and both encoders.
 
