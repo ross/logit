@@ -12,12 +12,19 @@
 //! see the note on [`HyperLogLog`](logit_core::HyperLogLog)). Multiple `:`-separated values share
 //! one type/sample-rate/tags and become one [`Event`] each. A datagram may contain multiple
 //! newline-separated lines.
+//!
+//! **DogStatsD tag values are zero-copy slices of the datagram**, exactly like every field
+//! [`crate::syslog`] extracts: `slice_of` reconstructs each tag value's `Bytes` by pointer
+//! arithmetic back into the datagram passed to [`StatsdDecoder::decode`], rather than going
+//! through `impl From<&str> for Value` (`Bytes::from(String)`, a fresh copy). Tag *keys* and the
+//! metric name don't need this treatment -- both only ever reach [`logit_core::interner::intern`],
+//! which hashes/copies into its own table regardless of where the `&str` it's given points.
 
 use crate::Input;
 use bytes::Bytes;
 use logit_core::{
     interner::intern, AttrMap, DdSketch, Diagnostics, Event, EventBatch, MetricKind, MetricRecord,
-    Resource,
+    Resource, Value,
 };
 use logit_pipeline::Fanout;
 use logit_proto::{CodecError, Decoder};
@@ -104,7 +111,7 @@ impl Decoder for StatsdDecoder {
             // datagram -- StatsD clients routinely pack several independent metrics into one
             // packet, so treating the datagram as atomic would let a single bad line take down
             // everything alongside it. Isolate per line: keep what parsed, report what didn't.
-            match parse_line(line, timestamp) {
+            match parse_line(&bytes, text, line, timestamp) {
                 Ok(mut line_events) => events.append(&mut line_events),
                 Err(err) => {
                     self.diag.warn_throttled("bad_line", err);
@@ -119,7 +126,32 @@ fn now_nanos() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64
 }
 
-fn parse_line(line: &str, timestamp: i64) -> Result<Vec<Event>, CodecError> {
+/// Reconstructs a `Bytes` sharing the datagram's underlying allocation for `sub`, a substring
+/// derived (through ordinary `&str` slicing -- `split`, `split_once`, `trim_end_matches`/`trim`,
+/// indexing) from `text`, which in turn was parsed directly out of `bytes` via `str::from_utf8`.
+/// Mirrors `syslog.rs`'s `slice_of` exactly; see that function's doc comment for the full
+/// reasoning. The short version: because `sub` is always obtained by slicing `text` rather than by
+/// copying or reconstructing it, the pointer-arithmetic round-trip always lands inside `bytes`'s
+/// allocation. Unlike `logit-transforms::json::borrowed_str_bytes`, there is no fallback copy here
+/// -- a DogStatsD tag value is never unescaped, so there's no case where `sub` could legitimately
+/// live outside `bytes`.
+fn slice_of(bytes: &Bytes, text: &str, sub: &str) -> Bytes {
+    let text_start = text.as_ptr() as usize;
+    let sub_start = sub.as_ptr() as usize;
+    let start = sub_start - text_start;
+    bytes.slice(start..start + sub.len())
+}
+
+/// `bytes`/`text` are the *whole datagram* -- the same `Bytes` (and its `&str` view) passed into
+/// [`StatsdDecoder::decode`] -- threaded down so [`slice_of`] can reconstruct each tag value as a
+/// zero-copy slice of it. `line` is one line of that datagram (already isolated by `decode`, and
+/// itself a genuine `&str` slice of `text`), used for parsing and error messages.
+fn parse_line(
+    bytes: &Bytes,
+    text: &str,
+    line: &str,
+    timestamp: i64,
+) -> Result<Vec<Event>, CodecError> {
     let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
 
     let (name, rest) = line.split_once(':').ok_or_else(malformed)?;
@@ -147,8 +179,12 @@ fn parse_line(line: &str, timestamp: i64) -> Result<Vec<Event>, CodecError> {
         } else if let Some(tags) = extra.strip_prefix('#') {
             for tag in tags.split(',').filter(|t| !t.is_empty()) {
                 match tag.split_once(':') {
-                    Some((k, v)) => attributes.insert(k, v),
-                    // A valueless tag (`#urgent`) marks presence, not a key/value pair.
+                    // `v` is a genuine `&str` slice of `text` (`split_once` on `tags`, itself
+                    // sliced out of `line`/`text`), so `slice_of` shares the datagram's
+                    // allocation instead of `Value::from(&str)`'s `Bytes::from(String)` copy.
+                    Some((k, v)) => attributes.insert(k, Value::Str(slice_of(bytes, text, v))),
+                    // A valueless tag (`#urgent`) marks presence, not a key/value pair -- not a
+                    // string value, so there's nothing to slice.
                     None => attributes.insert(tag, true),
                 }
             }
@@ -216,6 +252,10 @@ fn build_event(
         other => return Err(malformed(&format!("unknown metric type '{other}'"))),
     };
 
+    // Cheap for the multi-value form (`name:1:2:3|c`), where this runs once per shared value:
+    // every `Value::Str` in `attributes` is already a slice of the datagram's one shared
+    // allocation (see `slice_of`), so cloning the map is a `SmallVec` memcpy plus a refcount
+    // bump per tag, not a fresh copy of the tag bytes.
     Ok(Event::metric(
         timestamp,
         attributes.clone(),
@@ -263,7 +303,9 @@ mod tests {
     /// `malformed_line_does_not_drop_other_valid_metrics_in_same_datagram` below), so it no
     /// longer surfaces one. `parse_line` is where that rejection actually happens.
     fn parse_err(line: &str) -> CodecError {
-        parse_line(line, 0).expect_err("expected this line to be rejected")
+        let bytes = Bytes::from(line.to_string());
+        let text = std::str::from_utf8(&bytes).unwrap();
+        parse_line(&bytes, text, text, 0).expect_err("expected this line to be rejected")
     }
 
     #[test]
@@ -375,6 +417,31 @@ mod tests {
         for event in &events {
             assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
         }
+    }
+
+    #[test]
+    fn dogstatsd_tag_value_is_a_zero_copy_slice_of_the_datagram() {
+        // Structural companion to `syslog.rs`'s `emitted_message_is_a_zero_copy_slice_of_the_datagram`
+        // -- pins the property this module's `slice_of` exists for, not just its resulting value.
+        let datagram = Bytes::from("page.views:1|c|#env:prod".to_string());
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
+        let event = only_metric_event(decoder.decode(datagram.clone()).unwrap().events);
+        let tag = event.attributes.get("env").expect("env tag");
+        let logit_core::Value::Str(tag) = tag else { panic!("expected Value::Str, got {tag:?}") };
+
+        let base_start = datagram.as_ptr() as usize;
+        let base_end = base_start + datagram.len();
+        let tag_start = tag.as_ptr() as usize;
+        let tag_end = tag_start + tag.len();
+        assert!(
+            tag_start >= base_start && tag_end <= base_end,
+            "tag value should be a slice of the original datagram, not a copy"
+        );
+    }
+
+    fn only_metric_event(events: Vec<Event>) -> Event {
+        assert_eq!(events.len(), 1, "expected exactly one event");
+        events.into_iter().next().unwrap()
     }
 
     #[test]
