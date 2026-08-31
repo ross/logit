@@ -119,6 +119,17 @@ not a style preference:
   change is worth it, then update the constant *and* `docs/design/memory.md`'s table in the same
   commit. Don't relax an assertion to a `<=` bound to make it pass; that removes the only thing
   stopping `Event` from quietly growing.
+- **Benchmark and test fixtures never depend on a running service.** No nginx, no InfluxDB, no
+  container — `crates/logit-bench/src/fixtures.rs` holds `const` wire-format literals and
+  directly-constructed events, and components are called directly rather than through the runtime
+  (`docs/design/memory.md`'s "Fixtures" section has the pattern, including why a literal should
+  carry provenance). Standing up a service against real software to *inform* a fixture is fine and
+  encouraged; committing a fixture that needs one is not.
+- **Don't generalize a measurement from one event shape.** `Event` carries any combination of log,
+  metrics, and span, and `logit` targets logs-only, metrics-only, traces-only, and mixed pipelines
+  alike (`docs/OVERVIEW.md`). The current fixtures cover one mixed shape, so several sizing
+  decisions are explicitly blocked on broader coverage — see `docs/design/memory.md` §0 and §8
+  before acting on a number from it.
 
 ## Where things live
 
