@@ -310,9 +310,11 @@ fn stdio_encode_100_events() {
 // ---------------------------------------------------------------------------------------------
 
 /// One round trip across the Rust/Lua boundary for a script that reads one attribute and writes
-/// one: an `Rc<RefCell<Event>>` and an mlua userdata per event, a *fresh* `AttrsProxy` userdata
-/// per `event.attributes` access, a Rust `String` per metamethod key, a `_G` lookup of `process`
-/// per event, and a `Box` on the way out.
+/// one: an `Rc<RefCell<Event>>` and an mlua userdata per event, plus a `Box` on the way out. Down
+/// from 21 (`docs/design/memory.md` §8, item 13): `process` is now a cached `RegistryKey` (no `_G`
+/// lookup per call), `event.attributes` returns the same cached `AttrsProxy` userdata on every
+/// access instead of a fresh one, and both metamethods take `mlua::String` instead of an owned
+/// Rust `String`, so a metamethod key access no longer allocates at all.
 ///
 /// This is the number `docs/known-gaps.md` has been carrying as an unbenchmarked assumption. It
 /// does not invalidate the proxy design -- see `lua::to_table` in `benches/pipeline.rs` for the
@@ -325,7 +327,7 @@ fn lua_process_one_event() {
     let event = fixtures::nginx_event();
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
     assert!(matches!(outcome, ProcessOutcome::Emit(_)));
-    expect_allocs("lua: process 1 event", stats, 21);
+    expect_allocs("lua: process 1 event", stats, 9);
 }
 
 // ---------------------------------------------------------------------------------------------

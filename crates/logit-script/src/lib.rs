@@ -9,7 +9,7 @@
 //! worker thread.
 
 use logit_core::Event;
-use mlua::{Lua, LuaOptions, StdLib, Value as LuaValue};
+use mlua::{Lua, LuaOptions, RegistryKey, StdLib, Value as LuaValue};
 use std::marker::PhantomData;
 
 mod proxy;
@@ -66,6 +66,15 @@ fn remove_unsandboxed_base_globals(lua: &Lua) -> mlua::Result<()> {
 /// one worker. Not `Send`/`Sync` (via the `PhantomData<*const ()>` marker) -- see the module docs.
 pub struct ScriptWorker {
     lua: Lua,
+    /// `RegistryKey`s for this script's `process`/`flush` functions, resolved once here rather
+    /// than looked up from `_G` on every `process`/`flush` call (`docs/design/memory.md` §8).
+    /// `mlua::Function<'lua>` is tied to a borrow of `self.lua`, so it can't be stored directly
+    /// as a field of a struct that outlives any one call -- a `RegistryKey` is `mlua`'s `'static`
+    /// handle for exactly this "hold a Lua value across calls" case, redeemed via
+    /// `Lua::registry_value` whenever a call needs the real `Function` back. `flush` is
+    /// `Option`al because a script may not define one at all (the stateless-processor case).
+    process: RegistryKey,
+    flush: Option<RegistryKey>,
     _not_send_sync: PhantomData<*const ()>,
 }
 
@@ -90,24 +99,30 @@ impl ScriptWorker {
         let lua = Lua::new_with(sandbox_libs(), LuaOptions::new())?;
         remove_unsandboxed_base_globals(&lua)?;
         lua.load(source).exec()?;
-        let has_process =
-            matches!(lua.globals().get::<_, LuaValue>("process")?, LuaValue::Function(_));
-        if !has_process {
-            return Err(ScriptError::MissingProcess);
-        }
-        Ok(Self { lua, _not_send_sync: PhantomData })
+        let process_fn = match lua.globals().get::<_, LuaValue>("process")? {
+            LuaValue::Function(f) => f,
+            _ => return Err(ScriptError::MissingProcess),
+        };
+        let process = lua.create_registry_value(process_fn)?;
+        let flush = match lua.globals().get::<_, LuaValue>("flush")? {
+            LuaValue::Function(f) => Some(lua.create_registry_value(f)?),
+            _ => None,
+        };
+        Ok(Self { lua, process, flush, _not_send_sync: PhantomData })
     }
 
     /// Runs this worker's `process(event)` once. See `docs/design/lua-api.md` for the
     /// proxy-vs-table-conversion tradeoff [`EventProxy`] exists to avoid.
     pub fn process(&self, event: Event) -> Result<ProcessOutcome, ScriptError> {
-        let process: mlua::Function = self.lua.globals().get("process")?;
+        let process: mlua::Function = self.lua.registry_value(&self.process)?;
         let result: LuaValue = process.call(EventProxy::new(event))?;
         Ok(match result {
             LuaValue::Nil => ProcessOutcome::Drop,
-            LuaValue::UserData(ud) => ProcessOutcome::Emit(Box::new(proxy::take_event(ud)?)),
+            LuaValue::UserData(ud) => {
+                ProcessOutcome::Emit(Box::new(proxy::take_event(&self.lua, ud)?))
+            }
             LuaValue::Table(table) => {
-                ProcessOutcome::EmitMany(events_from_table(table, "process")?)
+                ProcessOutcome::EmitMany(events_from_table(&self.lua, table, "process")?)
             }
             other => {
                 return Err(ScriptError::Lua(mlua::Error::RuntimeError(format!(
@@ -121,14 +136,14 @@ impl ScriptWorker {
     /// Runs this worker's `flush()`, if the script defines one (the stateful-processor contract,
     /// e.g. the built-in `aggregate` transform). Returns an empty `Vec` if the script has none.
     pub fn flush(&self) -> Result<Vec<Event>, ScriptError> {
-        let flush: Option<mlua::Function> = self.lua.globals().get("flush")?;
-        let Some(flush) = flush else {
+        let Some(flush_key) = self.flush.as_ref() else {
             return Ok(Vec::new());
         };
+        let flush: mlua::Function = self.lua.registry_value(flush_key)?;
         let result: LuaValue = flush.call(())?;
         Ok(match result {
             LuaValue::Nil => Vec::new(),
-            LuaValue::Table(table) => events_from_table(table, "flush")?,
+            LuaValue::Table(table) => events_from_table(&self.lua, table, "flush")?,
             other => {
                 return Err(ScriptError::Lua(mlua::Error::RuntimeError(format!(
                     "flush() must return nil or a table of events, got {}",
@@ -148,7 +163,11 @@ impl ScriptWorker {
 /// `EmitMany([])` (`sequence_values` finds index 1 missing and stops immediately), dropping the
 /// event with no indication anything was wrong instead of reporting the malformed return value.
 /// An empty table is a valid (empty) sequence -- equivalent to returning nothing.
-fn events_from_table(table: mlua::Table, caller: &str) -> Result<Vec<Event>, ScriptError> {
+fn events_from_table(
+    lua: &Lua,
+    table: mlua::Table,
+    caller: &str,
+) -> Result<Vec<Event>, ScriptError> {
     let Some(len) = value::validated_sequence_len(&table)? else {
         return Err(ScriptError::Lua(mlua::Error::RuntimeError(format!(
             "{caller}() must return a contiguous array-like table of events (found non-sequence keys)"
@@ -156,7 +175,7 @@ fn events_from_table(table: mlua::Table, caller: &str) -> Result<Vec<Event>, Scr
     };
     let mut events = Vec::with_capacity(len);
     for i in 1..=len {
-        events.push(proxy::take_event(table.get(i)?)?);
+        events.push(proxy::take_event(lua, table.get(i)?)?);
     }
     Ok(events)
 }
