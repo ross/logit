@@ -7,6 +7,7 @@
 //! doesn't actually need dependency ordering: a `Fanout` is just cloned `Sender`s into inboxes
 //! that already exist by construction, regardless of which node gets spawned first.
 
+use crate::fanout::Delivered;
 use crate::graph::Graph;
 use crate::{Fanout, Input, Output, Transform};
 use anyhow::Context;
@@ -73,10 +74,8 @@ pub async fn run_with_shutdown(
 
     let ids: Vec<String> = graph.components.keys().cloned().collect();
 
-    let mut senders: HashMap<String, mpsc::Sender<Arc<EventBatch>>> =
-        HashMap::with_capacity(ids.len());
-    let mut inboxes: HashMap<String, mpsc::Receiver<Arc<EventBatch>>> =
-        HashMap::with_capacity(ids.len());
+    let mut senders: HashMap<String, mpsc::Sender<Delivered>> = HashMap::with_capacity(ids.len());
+    let mut inboxes: HashMap<String, mpsc::Receiver<Delivered>> = HashMap::with_capacity(ids.len());
     for id in &ids {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         senders.insert(id.clone(), tx);
@@ -179,7 +178,7 @@ async fn run_input(
 async fn run_output(
     id: String,
     mut output: Box<dyn Output + Send>,
-    mut inbox: mpsc::Receiver<Arc<EventBatch>>,
+    mut inbox: mpsc::Receiver<Delivered>,
 ) -> anyhow::Result<()> {
     while let Some(batch) = inbox.recv().await {
         let batch = unwrap_batch(batch);
@@ -194,7 +193,7 @@ async fn run_output(
 /// indirection, since it's already running inside the async runtime.
 async fn run_transform(
     mut transform: Box<dyn Transform + Send>,
-    mut inbox: mpsc::Receiver<Arc<EventBatch>>,
+    mut inbox: mpsc::Receiver<Delivered>,
     fanout: Fanout,
 ) -> anyhow::Result<()> {
     let mut next_flush =
@@ -267,7 +266,7 @@ fn run_lua(
     script: String,
     configured_interval: Option<Duration>,
     ready_tx: oneshot::Sender<Result<(), String>>,
-    mut inbox: mpsc::Receiver<Arc<EventBatch>>,
+    mut inbox: mpsc::Receiver<Delivered>,
     fanout: Fanout,
     runtime: tokio::runtime::Handle,
 ) {
@@ -344,19 +343,27 @@ fn run_lua(
     }
 }
 
-/// Unwraps the `Arc` a batch travels the channel wrapped in back to an owned `EventBatch`, right
-/// before handing it to `Output::send`/a `Transform`/`ScriptWorker::process` -- none of which know
-/// or need to know that channels carry `Arc<EventBatch>`
+/// Turns the channel payload back into an owned `EventBatch`, right before handing it to
+/// `Output::send`/a `Transform`/`ScriptWorker::process` -- none of which know or need to know that
+/// channels carry [`Delivered`] rather than a bare `EventBatch`
 /// (`docs/adr/0016-arc-eventbatch-copy-on-write.md`).
 ///
-/// `try_unwrap` succeeds with no clone whenever this is the only remaining strong reference: the
-/// common single-consumer-per-edge case, and also whichever fan-out branch consumes last (that one
-/// got the `Arc` moved by `Fanout::send`, not cloned). It falls back to a real deep clone only when
-/// a sibling branch still holds its own reference to the same batch -- exactly the case that needs
-/// an independent copy so a mutation on one branch can't be observed on another
+/// `Delivered::Owned` (a single-consumer edge) is already the owned batch: no `Arc` was ever
+/// involved, so this is free. `Delivered::Shared` (a real fan-out) unwraps via `Arc::try_unwrap`,
+/// which succeeds with no clone whenever this is the only remaining strong reference -- in
+/// practice, whichever branch happens to drop its own reference last at runtime. That is a
+/// best-effort saving over always cloning, not a guarantee that exactly one branch pays nothing:
+/// nothing about `Fanout::send` privileges one branch's handle over another's, and two branches
+/// racing to unwrap concurrently can both still observe a strong count above 1 and both fall back
+/// to cloning. Either way, a sibling branch's copy is always independent before it can be mutated
 /// (`a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` below pins this).
-fn unwrap_batch(batch: Arc<EventBatch>) -> EventBatch {
-    Arc::try_unwrap(batch).unwrap_or_else(|shared| (*shared).clone())
+fn unwrap_batch(batch: Delivered) -> EventBatch {
+    match batch {
+        Delivered::Owned(batch) => batch,
+        Delivered::Shared(shared) => {
+            Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
+        }
+    }
 }
 
 fn now_unix_nanos() -> i64 {
@@ -617,10 +624,14 @@ mod tests {
         }
     }
 
-    /// Operationalizes branch isolation (docs/adr/0012-multi-payload-events.md): `Fanout` deep-
-    /// clones an `EventBatch` for every consumer but the last, *before* any downstream node can
-    /// touch it, so a mutation one branch of a fan-out makes is never visible on a sibling
-    /// branch's copy of the same upstream event -- even now that `Event` can carry several
+    /// Operationalizes branch isolation (docs/adr/0012-multi-payload-events.md). Since
+    /// docs/adr/0016-arc-eventbatch-copy-on-write.md, `Fanout` no longer deep-clones eagerly at
+    /// send time -- a real fan-out hands every branch its own `Delivered::Shared` handle onto one
+    /// `Arc`, and the clone (if any) happens lazily, at `unwrap_batch`, right before a branch's own
+    /// node can touch the batch at all. Whichever branch doesn't win `Arc::try_unwrap` gets a real,
+    /// independent deep clone at that point, so no branch ever mutates a batch another branch still
+    /// holds a handle to -- a mutation one branch of a fan-out makes is still never visible on a
+    /// sibling branch's copy of the same upstream event, even now that `Event` can carry several
     /// payloads at once. Proven against a real two-branch fan-out (one listener feeding a
     /// mutating transform on one branch and a sink directly on the other -- exactly the "one
     /// listener, two independently-processed downstream chains" shape ADR 0009 exists to make an
@@ -835,5 +846,70 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("the flushed window should have reached the output before exit");
         assert_eq!(received.events.len(), 1);
+    }
+
+    /// The property `unwrap_batch` (and the whole `Arc<EventBatch>` design,
+    /// docs/adr/0016-arc-eventbatch-copy-on-write.md) rests on for a single-consumer edge: `Fanout`
+    /// with exactly one consumer never touches an `Arc` at all, so what arrives at the other end is
+    /// `Delivered::Owned` -- proving the fast path (item 1 of the PR #33 review) actually takes,
+    /// not just that the code happens to also be correct if it didn't.
+    #[tokio::test]
+    async fn a_single_consumer_fanout_delivers_the_batch_owned_with_no_arc_involved() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]);
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+
+        fanout.send(batch).await;
+
+        let received = rx.recv().await.expect("should receive");
+        assert!(
+            matches!(received, Delivered::Owned(_)),
+            "a single-consumer edge should never wrap the batch in an Arc"
+        );
+    }
+
+    /// The property `Arc::try_unwrap` at each consumption point actually depends on: a real
+    /// fan-out's `Arc` reaches strong count 1 -- and so becomes unwrappable with no clone -- only
+    /// once every sibling handle has been dropped. Demonstrated deterministically (no concurrent
+    /// consumers racing each other) rather than asserted as a property of the design, since the PR
+    /// review that asked for this test found that race is real: two branches unwrapping
+    /// concurrently can both still observe strong count 2 and both fall back to cloning. This test
+    /// pins the mechanics `unwrap_batch`'s fallback correctly handles either way, not the timing.
+    #[tokio::test]
+    async fn a_shared_batchs_arc_is_uniquely_held_only_once_every_sibling_handle_is_dropped() {
+        let (tx_a, mut rx_a) = mpsc::channel(1);
+        let (tx_b, mut rx_b) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx_a, tx_b]);
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+
+        fanout.send(batch).await;
+
+        let Delivered::Shared(shared_a) = rx_a.recv().await.expect("a should receive") else {
+            panic!("a fan-out of two consumers should share, not own")
+        };
+        let Delivered::Shared(shared_b) = rx_b.recv().await.expect("b should receive") else {
+            panic!("a fan-out of two consumers should share, not own")
+        };
+
+        assert_eq!(Arc::strong_count(&shared_a), 2, "both branches still hold their own handle");
+
+        drop(shared_b);
+
+        assert_eq!(
+            Arc::strong_count(&shared_a),
+            1,
+            "once the sibling branch drops its handle, this one is uniquely held"
+        );
+        assert!(
+            Arc::try_unwrap(shared_a).is_ok(),
+            "try_unwrap should now succeed with no clone -- this is the property the whole \
+             design rests on"
+        );
     }
 }

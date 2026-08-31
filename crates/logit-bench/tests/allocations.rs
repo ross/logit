@@ -19,12 +19,13 @@
 
 use logit_bench::alloc::{measure, CountingAlloc, Stats};
 use logit_bench::fixtures;
-use logit_core::Value;
+use logit_core::{EventBatch, Value};
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::stdio::{EventDump, Format};
-use logit_pipeline::Transform;
+use logit_pipeline::{Delivered, Fanout, Transform};
 use logit_proto::{Decoder, Encoder};
 use logit_script::{ProcessOutcome, ScriptWorker};
+use std::sync::Arc;
 
 /// Installed for this test binary only -- no other crate's tests pay the counting overhead.
 #[global_allocator]
@@ -260,6 +261,111 @@ fn clone_one_statsd_event() {
 
     let (_, stats) = measure(|| event.clone());
     expect_allocs("Event::clone (statsd shape)", stats, 0);
+}
+
+/// The number behind PR #33's review item 1: `Fanout::send` now takes a fast path for a
+/// single-consumer edge (`docs/adr/0016-arc-eventbatch-copy-on-write.md`) -- no `Arc` at all, the
+/// batch moves through as `Delivered::Owned`. This is the common case (every listener's first hop,
+/// and every interior edge of a linear chain like the v0.1 reference config's three
+/// single-consumer edges), so it needs to cost nothing, not just less than a deep clone.
+///
+/// Runs on a `current_thread` runtime built outside the measured region -- `CountingAlloc`'s
+/// counters are thread-local (see `logit_bench::alloc`'s module doc), so this has to stay on one
+/// thread for the count to mean anything, and a `current_thread` runtime never spawns worker
+/// threads to begin with. Warmed once first, same as every other measurement in this file.
+#[test]
+fn fanout_send_one_consumer_costs_nothing() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let fanout = Fanout::new(vec![tx]);
+
+    let warm = fixtures::nginx_batch(1);
+    rt.block_on(async {
+        fanout.send(warm).await;
+        drop(unwrap_delivered(rx.recv().await.expect("should receive")));
+    });
+
+    let batch = fixtures::nginx_batch(1);
+    let (received, stats) = measure(|| {
+        rt.block_on(async {
+            fanout.send(batch).await;
+            unwrap_delivered(rx.recv().await.expect("should receive"))
+        })
+    });
+    assert_eq!(received.events.len(), 1);
+    expect_allocs("fanout: send + receive, 1 consumer", stats, 0);
+}
+
+/// The other half of the same story, measured honestly rather than assumed: a real fan-out (two
+/// consumers here) still costs *one* branch a full `EventBatch` deep clone -- one `Vec<Event>`
+/// allocation plus the 4 allocations [`clone_one_event`] measures for the one nginx-shaped event
+/// inside it, so 5 -- exactly like the pre-`Arc<EventBatch>` code's "clone all but the last
+/// consumer" did for this same two-branch shape. The other branch, once its sibling has already
+/// dropped its handle, costs nothing. **The difference from before this PR is `Arc::new`'s one
+/// extra allocation, not a reduction** -- so the total here (6) is one *more* than the equivalent
+/// pre-`Arc` code would have paid (5), not less. Compare [`fanout_send_one_consumer_costs_nothing`],
+/// which really is a strict improvement; this test exists so that claim isn't quietly assumed to
+/// extend to real fan-outs too, when the numbers say otherwise under the current no-trait-change
+/// design (`docs/adr/0016-arc-eventbatch-copy-on-write.md`'s "What this change actually saves"
+/// section). Six is still far short of two fully independent copies (10, i.e. this same 5 paid by
+/// *both* branches, which is what a naive per-`Event` `Arc` or a design with no sharing at all would
+/// cost), so isolation is not getting more expensive as fan-out width grows -- it just isn't getting
+/// cheaper than the code this PR replaces, either.
+///
+/// Unwraps branch "a" while branch "b" still holds its handle, then "b" last, to pin the
+/// deterministic case rather than the timing-dependent one -- `unwrap_batch`'s doc comment
+/// (`runtime.rs`) explains why concurrent unwrapping on a real multi-thread runtime can cost *more*
+/// than this best case (more than one branch failing to unwrap for free), never less.
+#[test]
+fn fanout_send_two_consumers_costs_one_clone_plus_one_arc() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(1);
+    let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(1);
+    let fanout = Fanout::new(vec![tx_a, tx_b]);
+
+    let warm = fixtures::nginx_batch(1);
+    rt.block_on(async {
+        fanout.send(warm).await;
+        let a = rx_a.recv().await.expect("a should receive");
+        let b = rx_b.recv().await.expect("b should receive");
+        drop(unwrap_delivered(a));
+        drop(unwrap_delivered(b));
+    });
+
+    let batch = fixtures::nginx_batch(1);
+    let ((a, b), stats) = measure(|| {
+        rt.block_on(async {
+            fanout.send(batch).await;
+            let delivered_a = rx_a.recv().await.expect("a should receive");
+            let delivered_b = rx_b.recv().await.expect("b should receive");
+            // `a` unwraps first, while `b`'s handle is still alive -- forces `a`'s clone. `b`
+            // unwraps last, with nothing left holding the `Arc` -- free.
+            (unwrap_delivered(delivered_a), unwrap_delivered(delivered_b))
+        })
+    });
+    assert_eq!(a.events.len(), 1);
+    assert_eq!(b.events.len(), 1);
+    // 1 (Arc::new, once per send) + 5 (one EventBatch deep clone: 1 for the Vec<Event>, 4 for the
+    // one nginx-shaped Event inside it, matching clone_one_event) + 0 (the other branch, free).
+    // The pre-Arc code paid 5 for this same shape (the clone, with the other branch's move costing
+    // nothing) -- so this is 1 *more*, not less; see the doc comment above.
+    expect_allocs(
+        "fanout: send + receive, 2 consumers (1 clones, 1 free, +1 for the Arc)",
+        stats,
+        6,
+    );
+}
+
+/// The same unwrap `runtime.rs`'s `unwrap_batch` does, duplicated here rather than exposed from
+/// `logit-pipeline` just for this test -- `Delivered`'s two variants and what to do with each are
+/// already public (`docs/adr/0016-arc-eventbatch-copy-on-write.md`).
+fn unwrap_delivered(delivered: Delivered) -> EventBatch {
+    match delivered {
+        Delivered::Owned(batch) => batch,
+        Delivered::Shared(shared) => {
+            Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -24,6 +24,7 @@ bytes.workspace = true
 
 [dev-dependencies]
 divan = "0.1"
+tokio.workspace = true
 
 [[bench]]
 name = "pipeline"
