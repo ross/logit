@@ -114,9 +114,16 @@ fn statsd_decode_one_line() {
 
 /// `json.rs`'s `ValueSeed` deserializes straight into `Value` -- no intermediate
 /// `serde_json::Value` tree -- and keeps unescaped strings as zero-copy slices of the message
-/// buffer. What's left is the intermediate `AttrMap` it builds (so a malformed object can't leave
-/// attributes half-populated) plus the merge into the event, which pushes the attribute count from
-/// 4 to 10 and spills `AttrMap` off its 8-entry inline capacity.
+/// buffer. The intermediate is still there -- a malformed object can't leave attributes
+/// half-populated, so the parsed pairs are built up separately from `event.attributes` and only
+/// merged in on full success -- but it's now a scratch `Vec<(Symbol, Value)>` held on `JsonParser`
+/// and cleared per call (mirroring `InfluxLineEncoder`'s reused buffers) rather than a fresh
+/// `AttrMap` from `deserialize`, and object keys are interned straight off the deserializer
+/// (`KeySeed`) instead of passing through an owned `String` first. That was where 6 of the
+/// original 7 allocations were -- one per JSON key -- not the intermediate map itself, which fits
+/// `AttrMap`'s 8-entry inline capacity for this fixture's 6 fields regardless. What's left is the
+/// one allocation from `event.attributes` itself spilling its inline capacity once the merge pushes
+/// the count from 4 to 10.
 #[test]
 fn json_parse_one_event() {
     let mut json = fixtures::json_parser();
@@ -133,7 +140,7 @@ fn json_parse_one_event() {
     let event = decode_one();
     let (event, stats) = measure(|| json.process(&resource, event).expect("json forwards"));
     assert_eq!(event.attributes.len(), 10, "6 JSON fields plus 4 syslog.* attributes");
-    expect_allocs("json: parse + merge 1 event", stats, 7);
+    expect_allocs("json: parse + merge 1 event", stats, 1);
 }
 
 /// Four metrics attached: one `MetricList` spill (past its single inline slot) and one `bins` Vec
@@ -336,7 +343,7 @@ fn lua_process_one_event() {
 /// for the reference config. Excludes the output encoders, which run once per flush window rather
 /// than once per event, and excludes fan-out, which the config's `tap` branch adds.
 ///
-/// 11 = 1 (decode) + 7 (json) + 3 (kv_metrics) + 0 (keep) + 0 (aggregate).
+/// 5 = 1 (decode) + 1 (json) + 3 (kv_metrics) + 0 (keep) + 0 (aggregate).
 #[test]
 fn full_chain_one_line() {
     let resource = fixtures::resource();
@@ -363,7 +370,7 @@ fn full_chain_one_line() {
         run!();
     }
     let (_, stats) = measure(|| run!());
-    expect_allocs("full chain: 1 access-log line", stats, 11);
+    expect_allocs("full chain: 1 access-log line", stats, 5);
 }
 
 // ---------------------------------------------------------------------------------------------
