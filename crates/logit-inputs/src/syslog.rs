@@ -75,7 +75,8 @@
 use crate::Input;
 use bytes::Bytes;
 use logit_core::{
-    AttrMap, BodyFormat, Diagnostics, Event, EventBatch, LogRecord, Resource, Severity, Value,
+    AttrMap, BodyFormat, Diagnostics, Event, EventBatch, LogRecord, Resource, Severity, Telemetry,
+    Value,
 };
 use logit_pipeline::Fanout;
 use logit_proto::{CodecError, Decoder};
@@ -86,17 +87,27 @@ use tokio::net::UdpSocket;
 pub struct SyslogInput {
     pub bind: String,
     diag: Diagnostics,
+    /// Component-specific detail beyond the runtime's uniform layer-2 metrics (`docs/design/
+    /// internal-telemetry.md`'s "layer 3") -- how many datagrams and bytes actually arrived on
+    /// the wire, mirroring `StatsdInput`'s own worked example.
+    telemetry: Telemetry,
 }
 
 impl SyslogInput {
     pub fn new(bind: impl Into<String>) -> Self {
-        Self { bind: bind.into(), diag: Diagnostics::default() }
+        Self { bind: bind.into(), diag: Diagnostics::default(), telemetry: Telemetry::default() }
     }
 
     /// Attaches a component id to this listener's diagnostics -- and to the [`SyslogDecoder`] it
     /// constructs in `run`, so both report under the same id.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
+        self
+    }
+
+    /// Attaches a telemetry handle -- see the `telemetry` field's doc comment.
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
         self
     }
 }
@@ -112,6 +123,8 @@ impl Input for SyslogInput {
         let mut buf = vec![0u8; 65_507];
         loop {
             let (n, _peer) = socket.recv_from(&mut buf).await?;
+            self.telemetry.count("logit.input.datagrams", 1.0, &[]);
+            self.telemetry.count("logit.input.datagram.bytes", n as f64, &[]);
             let bytes = Bytes::copy_from_slice(&buf[..n]);
             match decoder.decode(bytes) {
                 Ok(batch) if !batch.events.is_empty() => {
