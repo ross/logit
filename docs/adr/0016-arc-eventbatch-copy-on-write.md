@@ -236,14 +236,29 @@ touch this case; it isn't an `Output` case. Left as-is: the same reasoning round
 widening *those* traits to something reference-based would remove their ability to mutate or
 consume the event at all.
 
-**A real fix for the mixed case's raciness exists and is deliberately not taken here**: making
-`Fanout` aware of which of its consumers are borrowing (`Output`) versus owning
-(`Transform`/`ScriptWorker`) at construction time, so it could give owning consumers an
-unconditional direct clone (bypassing `Arc`/`try_unwrap` entirely) while sharing the `Arc` only
-among borrowing consumers — turning the mixed case into a fixed, deterministic 6 (`main`+1,
-always, no race) instead of today's 1-or-6. That needs threading node-kind information from
-`runtime.rs` down into `Fanout::new`'s construction, a real scope expansion past what this ADR
-covers. Recorded as a candidate future direction, not decided here — see Alternatives.
+**A fix for the mixed case's raciness was sketched and is deliberately not taken here — and it's
+narrower than it first looks.** For exactly one `Output` and one owning consumer, making `Fanout`
+aware of which is which and giving the owning one an unconditional direct clone (bypassing
+`Arc`/`try_unwrap` entirely) while sharing the `Arc` only with the `Output` side would turn 1-or-6
+into a fixed 6 (`main`+1, always, no race) — trading away the chance at 1 for predictability. That
+part generalizes cleanly.
+
+**It does not generalize cleanly to more than one consumer on either side, worked through directly
+rather than assumed.** With M borrowing and K owning consumers sharing one fan-out (M, K ≥ 1), the
+"aware" design's own cost depends on a further, undetermined choice — do the K owning consumers
+each get an unconditional direct clone (no sharing among them), or share a *second*, dedicated
+`Arc` and race each other the way an all-owning fan-out already does today? For M=2, K=2, the first
+costs `1 + K×5 = 11`; the second costs more (`1 + 5 + 1 + (K-1)×5 = 12` — the second `Arc::new` to
+set up the owning group's own race outweighs what racing them saves). Meanwhile *today's* actual
+design, racy as it is, has a wider reachable range for that same shape than either — from 6 (if
+every `Output` branch happens to finish before either owning branch attempts its unwrap, reducing
+to the pure two-owning-consumer race) up to 11 (if any `Output` is still pending throughout). So an
+"aware" fix doesn't strictly dominate what exists today once either group has more than one member:
+it fixes the *worst* case as the *guaranteed* case, foreclosing the chance of landing on today's
+best case (6) in exchange for never landing on today's worst case being a surprise. Whether that
+trade is worth it — and which internal strategy for the owning group to use — needs its own design
+work informed by real consumer-kind distributions across shipped configs, not a two-line addendum
+here. Recorded as an open problem, not a specified fix — see Alternatives.
 
 ## Alternatives
 
@@ -284,13 +299,19 @@ covers. Recorded as a candidate future direction, not decided here — see Alter
   mixed shape specifically, on scheduling this ADR doesn't govern.
 - **Make `Fanout` aware of which consumers are borrowing (`Output`) vs. owning
   (`Transform`/`ScriptWorker`) at construction time**, so it can give owning consumers a direct,
-  unconditional clone while sharing the `Arc` only among borrowing ones. This would turn the mixed
-  case's current 1-or-6 raciness into a fixed, deterministic 6 (always one worse than `main`, never
-  better, but never a surprise either) — trading away the chance at landing on 1 for predictability.
-  Not taken here: it needs threading node-kind information from `runtime.rs` down into
-  `Fanout::new`'s construction, a real scope expansion past correcting this ADR's claims to match
-  what's measured. Left as a candidate for whoever picks up the mixed case's raciness next, not
-  decided one way or the other by this ADR.
+  unconditional clone while sharing the `Arc` only among borrowing ones. Clean for exactly one
+  consumer of each kind: turns 1-or-6 into a fixed 6, trading the chance at 1 for predictability.
+  **Does not clearly generalize once either group has more than one member** — worked through
+  directly for M=2 borrowing/K=2 owning: an "aware" fix's own cost depends on an unresolved choice
+  (direct clone per owning consumer, `1 + 5K = 11`; or a second dedicated `Arc` for the owning group
+  to race over, `12` — worse, since that `Arc::new` costs more than the race saves), and *today's*
+  actual (racy) design already reaches as low as 6 for that same shape when every `Output` branch
+  happens to finish first. So an "aware" fix would fix the current *worst* case as the *guaranteed*
+  one, not strictly beat what exists — whether that trade is worth it isn't decided by the 2-and-2
+  case alone. Not taken here, and not fully specified even as a direction: it needs threading
+  node-kind information from `runtime.rs` down into `Fanout::new`'s construction *and* a real design
+  pass on the >2-consumer case, a scope expansion well past correcting this ADR's claims to match
+  what's measured. Left as an open problem for whoever picks this up next, not a specified fix.
 
 ## Consequences
 
