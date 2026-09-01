@@ -261,11 +261,16 @@ input is less constrained than a Rust call site's:**
   to, since `count` and `gauge` on the same key silently convert one into the other. Rejected with
   a clear Lua error naming the reserved namespace, not a silent collision.
 
-Also worth knowing, since a Lua tag key is script-chosen rather than fixed at a Rust call site: a
-tag named `component`, `kind`, or `role` can never override a point's real identity, no matter what
-a script passes — `ComponentBuffer::drain` (`crates/logit-core/src/telemetry.rs`) inserts a
-point's tags first and its real identity last, so identity always wins on a collision. This is a
-framework-level guarantee, not something the Lua binding has to enforce itself.
+Also worth knowing, since a Lua tag key is script-chosen rather than fixed at a Rust call site:
+`component`, `kind`, and `role` are reserved for a point's own identity and can never become part
+of a tag, at two levels. `PointKey::new` (`crates/logit-core/src/telemetry.rs`) filters a reserved
+key out *before* a point's cardinality key is built — not just at drain time — because overwriting
+the label alone would still leave two differently-tagged calls (`{kind = "a"}` vs. `{kind = "b"}`)
+occupying two distinct, wasted key slots that drain to externally indistinguishable points instead
+of coalescing into one. That's a framework-level guarantee, holding for any caller. The Lua binding
+additionally *rejects* a reserved tag key outright (`crates/logit-script/src/telemetry.rs`) rather
+than silently relying on that filter — a script that set one probably meant something by it, so a
+clear error surfaces the mistake instead of a silent no-op.
 
 ## Adding a new internal metric
 

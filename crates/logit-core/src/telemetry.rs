@@ -43,6 +43,25 @@ pub type Tag = (&'static str, &'static str);
 /// its own overflow.
 const MAX_KEYS_PER_COMPONENT: usize = 1024;
 
+/// Tag keys reserved for a point's own component identity (`ComponentBuffer::base_attrs`) --
+/// never allowed to become part of a point's cardinality key. Without this, two calls tagged
+/// `("kind", "a")` and `("kind", "b")` would occupy two distinct keys here (correctly, from
+/// `PointKey`'s point of view: they really are different tag sets) but both drain with the *same*
+/// real `kind` -- overwriting a caller-supplied `kind` at drain time (below) stops one from
+/// spoofing the other's identity, but does nothing about the two of them wasting a slot in the
+/// bounded key space each and emitting two externally indistinguishable points instead of one
+/// coalesced count. Filtering here, before a key is ever constructed, is what actually restores
+/// coalescing -- drain-time overwriting alone only fixes the label, not the accounting.
+const RESERVED_TAG_KEYS: [&str; 3] = ["component", "kind", "role"];
+
+/// Whether `key` is reserved for a point's own component identity -- see [`RESERVED_TAG_KEYS`].
+/// Public so a caller-facing binding (`crates/logit-script/src/telemetry.rs`) can reject a
+/// reserved key with a clear error at the point a script actually used it, rather than only
+/// discovering the same filter silently applied once a point reaches this buffer.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    RESERVED_TAG_KEYS.contains(&key)
+}
+
 #[derive(Clone, Debug)]
 enum Pending {
     Count(f64),
@@ -54,13 +73,15 @@ enum Pending {
 struct PointKey {
     name: &'static str,
     /// Sorted so a caller's tag order never creates a spurious second key for what's really the
-    /// same point.
+    /// same point. Never contains a [`RESERVED_TAG_KEYS`] entry -- filtered out in [`PointKey::new`]
+    /// before this is built, not just overwritten cosmetically later.
     tags: SmallVec<[Tag; 4]>,
 }
 
 impl PointKey {
     fn new(name: &'static str, tags: &[Tag]) -> Self {
-        let mut tags: SmallVec<[Tag; 4]> = tags.iter().copied().collect();
+        let mut tags: SmallVec<[Tag; 4]> =
+            tags.iter().copied().filter(|(k, _)| !is_reserved_tag_key(k)).collect();
         tags.sort_unstable();
         Self { name, tags }
     }
@@ -232,12 +253,12 @@ impl ComponentBuffer {
 
         let mut events = Vec::with_capacity(points.len() + usize::from(dropped > 0));
         for (key, pending) in points {
-            // Tags first, identity (`component`/`kind`/`role`) last -- `AttrMap::insert` overwrites
-            // on a key collision, so inserting identity last guarantees a caller-supplied tag can
-            // never relabel which component a point is attributed to. A Rust call site never picks
-            // a tag key named `component`/`kind`/`role` by convention, but a Lua script's tag keys
-            // aren't constrained that way (`crates/logit-script/src/telemetry.rs`) -- this is the
-            // one place that has to hold regardless of where a tag came from.
+            // `key.tags` never holds a reserved key at all (filtered out in `PointKey::new`, so a
+            // caller-supplied `kind` tag couldn't fragment cardinality against the real one even
+            // before reaching here). Identity is still inserted last, as defense in depth: if that
+            // filter were ever bypassed, `AttrMap::insert`'s overwrite-on-collision behavior means
+            // identity would still win, so a caller-supplied tag still could not relabel which
+            // component a point is attributed to.
             let mut attrs = AttrMap::new();
             for (k, v) in &key.tags {
                 attrs.insert(k, *v);
@@ -461,6 +482,30 @@ mod tests {
         assert_eq!(attrs.get("component").and_then(|v| v.as_str()), Some("real_id"));
         assert_eq!(attrs.get("kind").and_then(|v| v.as_str()), Some("lua"));
         assert_eq!(attrs.get("role").and_then(|v| v.as_str()), Some("transform"));
+    }
+
+    /// The gap overwriting identity at drain time alone left open: two counts tagged with
+    /// *different* values under a reserved key must still coalesce into one point, not occupy two
+    /// separate (and, once identity is overwritten, externally indistinguishable) cardinality
+    /// slots. Proven by checking there is exactly one drained event summing both counts, not just
+    /// that the identity attributes come out right.
+    #[test]
+    fn reserved_tags_with_different_values_still_coalesce_into_one_point() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("real_id", "lua", "transform");
+        telemetry.count("m", 1.0, &[("kind", "a")]);
+        telemetry.count("m", 2.0, &[("kind", "b")]);
+
+        let events = registry.drain(0);
+        assert_eq!(
+            events.len(),
+            1,
+            "both calls should coalesce into one point, not fragment into two"
+        );
+        match &events[0].metrics[0].kind {
+            MetricKind::Counter(v) => assert_eq!(*v, 3.0),
+            other => panic!("expected Counter, got {other:?}"),
+        }
     }
 
     #[test]
