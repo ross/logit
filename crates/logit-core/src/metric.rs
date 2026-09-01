@@ -16,23 +16,7 @@ pub enum MetricKind {
     Counter(f64),
     Gauge(f64),
     Set(HyperLogLog),
-    /// Boxed (`docs/design/memory.md` §8 item 10): an unboxed `DDSketch` made every `MetricKind`
-    /// 176 bytes, whatever kind it actually held -- a `Counter` needing 8 bytes paid for the
-    /// `Distribution` variant's sketch anyway, since an enum is sized by its largest variant.
-    /// Boxing shrinks `MetricKind` to 32 bytes (its next-largest variant, `Histogram`/`Summary`'s
-    /// `Vec`, plus a discriminant) -- a broader win than the byte count alone suggests, since
-    /// `MetricRecord`/`MetricList` shrink the same way `Event` does, for *every* metric, not just
-    /// distributions: a plain statsd counter pays this too, at zero added allocation cost, because
-    /// it never constructs a `Distribution` in the first place. The cost lands only on a metric
-    /// that actually *is* one: +1 allocation on construction (`DdSketch::new()` itself doesn't
-    /// allocate; the `Box::new` around it does) and +1 on `Clone` (cloning a `Box<T>` deep-clones
-    /// the boxed value). Measured both a single-distribution shape (the logs/traces "wins" case,
-    /// `logit-bench`'s `distribution_event` fixture: construction 1 -> 2 allocations, clone 1 -> 2)
-    /// and a five-distribution shape (the "loses" case, `distribution_heavy_event`: construction
-    /// 9 -> 14, clone 6 -> 11) before deciding to box it -- see the PR this landed in for the full
-    /// reasoning on why the broader, unconditional win was judged worth the bounded per-distribution
-    /// cost even for the heavier shape.
-    Distribution(Box<DdSketch>),
+    Distribution(DdSketch),
     /// Fixed-bucket histogram, e.g. a Prometheus-style scrape input.
     Histogram {
         buckets: Vec<(f64, u64)>,

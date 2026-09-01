@@ -217,7 +217,7 @@ impl Accumulator {
         match self {
             Accumulator::Counter(sum) => MetricKind::Counter(sum),
             Accumulator::Gauge { value, .. } => MetricKind::Gauge(value),
-            Accumulator::Distribution(sketch) => MetricKind::Distribution(Box::new(sketch)),
+            Accumulator::Distribution(sketch) => MetricKind::Distribution(sketch),
         }
     }
 }
@@ -426,10 +426,7 @@ mod tests {
         for v in [10.0, 20.0, 30.0, 40.0, 50.0] {
             let mut sketch = logit_core::DdSketch::new();
             sketch.add(v);
-            agg.process(
-                &resource,
-                metric_event("latency", MetricKind::Distribution(Box::new(sketch)), 0),
-            );
+            agg.process(&resource, metric_event("latency", MetricKind::Distribution(sketch), 0));
         }
 
         let (_, events) = &agg.flush(100)[0];

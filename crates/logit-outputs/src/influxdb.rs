@@ -772,8 +772,7 @@ mod tests {
     fn distribution_line_has_integer_count_and_percentiles() {
         let mut sketch = logit_core::DdSketch::new();
         sketch.add(120.0);
-        let out =
-            encode(vec![metric_event("latency", MetricKind::Distribution(Box::new(sketch)), &[])]);
+        let out = encode(vec![metric_event("latency", MetricKind::Distribution(sketch), &[])]);
         assert!(
             out.starts_with("latency count=1u,"),
             "count should be an unsigned int field: {out}"

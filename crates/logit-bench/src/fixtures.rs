@@ -174,7 +174,7 @@ pub fn distribution_event() -> Event {
         AttrMap::new(),
         MetricRecord {
             name: logit_core::interner::intern("nginx.request_time"),
-            kind: MetricKind::Distribution(Box::new(sketch)),
+            kind: MetricKind::Distribution(sketch),
             unit: Some(logit_core::interner::intern("s")),
         },
     )
@@ -298,7 +298,7 @@ pub fn distribution_heavy_event() -> Event {
         sketch.add(value);
         event.metrics.push(MetricRecord {
             name: logit_core::interner::intern(name),
-            kind: MetricKind::Distribution(Box::new(sketch)),
+            kind: MetricKind::Distribution(sketch),
             unit: Some(logit_core::interner::intern("ms")),
         });
     }

@@ -196,11 +196,9 @@ fn json_parse_wide_json_event() {
     expect_allocs("json: parse + merge 1 wide-JSON event", stats, 1);
 }
 
-/// Four metrics attached: one `MetricList` spill (past its single inline slot) and, for each of
-/// the two single-sample `DDSketch` distributions, one `bins` Vec (from `DdSketch::add`) plus one
-/// `Box::new` (from boxing `MetricKind::Distribution`, `docs/design/memory.md` §8 item 10) -- 2
-/// allocations per distribution, not 1. That's 1 (spill) + 2*2 (distributions) = 5, up from 3
-/// before item 10 boxed the sketch.
+/// Four metrics attached: one `MetricList` spill (past its single inline slot) and one `bins` Vec
+/// for each of the two single-sample `DDSketch` distributions. That is the cost of describing two
+/// `f64`s -- see `docs/design/memory.md` on `MetricKind::Distribution`.
 #[test]
 fn kv_metrics_one_event() {
     let mut kv = fixtures::kv_metrics();
@@ -218,7 +216,7 @@ fn kv_metrics_one_event() {
 
     let (event, stats) = measure(|| kv.process(&resource, event).expect("kv_metrics forwards"));
     assert_eq!(event.metrics.len(), 4);
-    expect_allocs("kv_metrics: derive 4 metrics", stats, 5);
+    expect_allocs("kv_metrics: derive 4 metrics", stats, 3);
 }
 
 /// Free, in allocation terms: `filtered` rebuilds the map, but three surviving attributes fit
@@ -278,10 +276,6 @@ fn aggregate_absorb_without_keep() {
     expect_allocs("aggregate: absorb 1 event (no keep)", stats, 4);
 }
 
-/// Flushing builds one `Event::metric` per series: 2 counters (free) and 2 distributions, each of
-/// which now costs one `Box::new` on the way out of `Accumulator::into_kind` (`docs/design/
-/// memory.md` §8 item 10) -- 2 allocations up from 0 here (the merged sketch itself was already
-/// built incrementally by `absorb`, not at flush time), for 4 total, up from 2 before item 10.
 #[test]
 fn aggregate_flush_100_series() {
     let resource = fixtures::resource();
@@ -295,7 +289,7 @@ fn aggregate_flush_100_series() {
     let (flushed, stats) = measure(|| agg.flush(1_000_000_000));
     let series: usize = flushed.iter().map(|(_, events)| events.len()).sum();
     assert_eq!(series, 4, "one series per metric name -- keep bounds the tag set");
-    expect_allocs("aggregate: flush 4 series", stats, 4);
+    expect_allocs("aggregate: flush 4 series", stats, 2);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -303,10 +297,8 @@ fn aggregate_flush_100_series() {
 // ---------------------------------------------------------------------------------------------
 
 /// What each extra fan-out consumer costs per event: `Fanout::send` deep-clones the batch for
-/// every consumer but the last. Six allocations (the spilled `AttrMap`, the spilled `MetricList`,
-/// and -- per each of the two `Distribution` metrics -- a `bins` Vec clone plus a `Box<DdSketch>`
-/// clone, the latter added by `docs/design/memory.md` §8 item 10) plus a 504-byte memcpy, per
-/// event, per extra branch. Was 4 before item 10 boxed the sketch.
+/// every consumer but the last. Four allocations (the spilled `AttrMap`, the spilled `MetricList`,
+/// and a `bins` Vec per sketch) plus a 792-byte memcpy, per event, per extra branch.
 ///
 /// The `Arc<EventBatch>` copy-on-write change in `docs/design/memory.md` is aimed at exactly this:
 /// a branch that only reads -- every sink -- would pay none of it.
@@ -317,11 +309,11 @@ fn clone_one_event() {
 
     let (clone, stats) = measure(|| event.clone());
     assert_eq!(clone.metrics.len(), 4);
-    expect_allocs("Event::clone (nginx shape)", stats, 6);
+    expect_allocs("Event::clone (nginx shape)", stats, 4);
 }
 
 /// The cheap end of the range: a statsd counter with three tags and one metric fits entirely
-/// within `Event`'s inline capacity, so cloning it is a pure 504-byte memcpy. Same 504 bytes as
+/// within `Event`'s inline capacity, so cloning it is a pure 792-byte memcpy. Same 792 bytes as
 /// the nginx event above -- that size is paid unconditionally, whatever the event carries.
 #[test]
 fn clone_one_statsd_event() {
@@ -367,20 +359,19 @@ fn fanout_send_one_consumer_costs_nothing() {
 
 /// The other half of the same story, measured honestly rather than assumed: a real fan-out (two
 /// consumers here) still costs *one* branch a full `EventBatch` deep clone -- one `Vec<Event>`
-/// allocation plus the 6 allocations [`clone_one_event`] measures for the one nginx-shaped event
-/// inside it (was 4 before `docs/design/memory.md` §8 item 10 boxed `MetricKind::Distribution`'s
-/// sketch), so 7 -- exactly like the pre-`Arc<EventBatch>` code's "clone all but the last
+/// allocation plus the 4 allocations [`clone_one_event`] measures for the one nginx-shaped event
+/// inside it, so 5 -- exactly like the pre-`Arc<EventBatch>` code's "clone all but the last
 /// consumer" did for this same two-branch shape. The other branch, once its sibling has already
-/// dropped its handle, costs nothing. **The difference from before the `Arc<EventBatch>` PR is
-/// `Arc::new`'s one extra allocation, not a reduction** -- so the total here (8) is one *more* than
-/// the equivalent pre-`Arc` code would have paid for this same event shape (7), not less. Compare
-/// [`fanout_send_one_consumer_costs_nothing`], which really is a strict improvement; this test
-/// exists so that claim isn't quietly assumed to extend to real fan-outs too, when the numbers say
-/// otherwise under the current no-trait-change design (`docs/adr/0016-arc-eventbatch-copy-on-write.md`'s
-/// "What this change actually saves" section). Eight is still far short of two fully independent
-/// copies (14, i.e. this same 7 paid by *both* branches, which is what a naive per-`Event` `Arc`
-/// or a design with no sharing at all would cost), so isolation is not getting more expensive as
-/// fan-out width grows -- it just isn't getting cheaper than the code this PR replaces, either.
+/// dropped its handle, costs nothing. **The difference from before this PR is `Arc::new`'s one
+/// extra allocation, not a reduction** -- so the total here (6) is one *more* than the equivalent
+/// pre-`Arc` code would have paid (5), not less. Compare [`fanout_send_one_consumer_costs_nothing`],
+/// which really is a strict improvement; this test exists so that claim isn't quietly assumed to
+/// extend to real fan-outs too, when the numbers say otherwise under the current no-trait-change
+/// design (`docs/adr/0016-arc-eventbatch-copy-on-write.md`'s "What this change actually saves"
+/// section). Six is still far short of two fully independent copies (10, i.e. this same 5 paid by
+/// *both* branches, which is what a naive per-`Event` `Arc` or a design with no sharing at all would
+/// cost), so isolation is not getting more expensive as fan-out width grows -- it just isn't getting
+/// cheaper than the code this PR replaces, either.
 ///
 /// Unwraps branch "a" while branch "b" still holds its handle, then "b" last, to pin the
 /// deterministic case rather than the timing-dependent one -- `unwrap_batch`'s doc comment
@@ -415,14 +406,14 @@ fn fanout_send_two_consumers_costs_one_clone_plus_one_arc() {
     });
     assert_eq!(a.events.len(), 1);
     assert_eq!(b.events.len(), 1);
-    // 1 (Arc::new, once per send) + 7 (one EventBatch deep clone: 1 for the Vec<Event>, 6 for the
+    // 1 (Arc::new, once per send) + 5 (one EventBatch deep clone: 1 for the Vec<Event>, 4 for the
     // one nginx-shaped Event inside it, matching clone_one_event) + 0 (the other branch, free).
-    // The pre-Arc code paid 7 for this same shape (the clone, with the other branch's move costing
+    // The pre-Arc code paid 5 for this same shape (the clone, with the other branch's move costing
     // nothing) -- so this is 1 *more*, not less; see the doc comment above.
     expect_allocs(
         "fanout: send + receive, 2 consumers (1 clones, 1 free, +1 for the Arc)",
         stats,
-        8,
+        6,
     );
 }
 
@@ -542,21 +533,18 @@ fn fanout_send_mixed_output_and_transform_consumers() {
     });
     assert_eq!(out_len, 1);
     assert_eq!(xform_len, 1);
-    // 1 (Arc::new, once per send) + 7 (the Transform branch's forced deep clone: 1 for the
-    // Vec<Event>, 6 for the one nginx-shaped Event inside it, matching clone_one_event -- was 4
-    // before `docs/design/memory.md` §8 item 10 boxed the sketch) + 0 (the Output branch, which
-    // never unwraps or clones at all). Same total as the all-Transform 2-consumer case measured
-    // above -- this is the "Output hasn't finished yet" outcome, not the only reachable one; see
+    // 1 (Arc::new, once per send) + 5 (the Transform branch's forced deep clone: 1 for the
+    // Vec<Event>, 4 for the one nginx-shaped Event inside it) + 0 (the Output branch, which never
+    // unwraps or clones at all). Same total as the all-Transform 2-consumer case measured above --
+    // this is the "Output hasn't finished yet" outcome, not the only reachable one; see
     // `fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first` below for the
-    // other. Against `main` as it stood before PR #33 (`docs/adr/0016-arc-eventbatch-copy-on-write.md`):
-    // a flat, unconditional cost for any 2-consumer fan-out regardless of kind (5 for this event
-    // shape at the time, now 7 with items 9-10's boxing) -- so this specific outcome is 1
-    // allocation worse than that baseline, same as the all-Transform case, though (unlike that
-    // case) it's not the only place this shape can land.
+    // other. Against `main` (pre-PR): a flat, unconditional 5 for any 2-consumer fan-out regardless
+    // of kind -- so this specific outcome is 1 allocation worse than `main`, same as the
+    // all-Transform case, though (unlike that case) it's not the only place this shape can land.
     expect_allocs(
         "fanout: send + receive, 1 Output + 1 Transform, Output not yet finished (racy outcome A)",
         stats,
-        8,
+        6,
     );
 }
 
@@ -573,11 +561,9 @@ fn fanout_send_mixed_output_and_transform_consumers() {
 /// already returned from `output.send` and moved on) *before* the `Transform` side ever calls
 /// `unwrap_batch` -- the mirror image of the ordering the test above pins.
 ///
-/// **The two tests together are the honest picture for this shape: 1 or 8 (was 1 or 6 before
-/// `docs/design/memory.md` §8 item 10 boxed `MetricKind::Distribution`'s sketch), decided by real
-/// scheduling, never anything in between** (there's no path to landing on the flat 5 `main` paid
-/// before PR #33, since `Arc::new` is always paid the moment there are 2+ consumers). Whether this
-/// design is a net win,
+/// **The two tests together are the honest picture for this shape: 1 or 6, decided by real
+/// scheduling, never anything in between** (there's no path to landing on `main`'s flat 5, since
+/// `Arc::new` is always paid the moment there are 2+ consumers). Whether this design is a net win,
 /// a wash, or a regression for a given deployment depends on how its `Output` implementations and
 /// `Transform`/Lua stages actually get scheduled relative to each other -- not something a fixed
 /// allocation count can answer on its own.
@@ -626,57 +612,15 @@ fn fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first()
     );
 }
 
-/// Building [`fixtures::distribution_event`] -- one distribution, the logs/traces-shaped "wins"
-/// case `docs/design/memory.md` §8 item 10 argues for. Before boxing `MetricKind::Distribution`'s
-/// sketch: 1 allocation (the `bins` Vec `DdSketch::add` creates on its first sample --
-/// `DDSketch::new()` itself doesn't allocate). After: 2 -- the `Box::new` `MetricKind::Distribution`
-/// now needs, on top of the same `bins` Vec. This is the "construction cost" half of item 10's
-/// single-distribution side; [`clone_one_distribution_event`] below is the clone half.
-#[test]
-fn construct_one_distribution_event() {
-    drop(fixtures::distribution_event());
-    let (event, stats) = measure(fixtures::distribution_event);
-    assert_eq!(event.metrics.len(), 1);
-    expect_allocs("construct distribution_event (1 distribution)", stats, 2);
-}
-
-/// Cloning [`fixtures::distribution_event`] -- the single-distribution case. Before boxing: 1
-/// allocation (cloning the `bins` Vec). After: 2 -- cloning a `Box<T>` deep-clones the boxed
-/// value, so the `Box` itself is now a second allocation on top of the `bins` Vec clone. Same
-/// `+1` [`construct_one_distribution_event`] shows for construction.
-#[test]
-fn clone_one_distribution_event() {
-    let event = fixtures::distribution_event();
-    drop(event.clone());
-    let (clone, stats) = measure(|| event.clone());
-    assert_eq!(clone.metrics.len(), 1);
-    expect_allocs("Event::clone (1 distribution)", stats, 2);
-}
-
-/// Building [`fixtures::distribution_heavy_event`] -- five *distinct* `MetricKind::Distribution`
-/// metrics, the "loses" case item 10 weighs against the single-distribution "wins" case above:
-/// every distribution actually created pays the same `+1` `Box::new`, so it scales with
-/// distribution count, not event count. Before boxing: 9 allocations (3 attributes stay inline;
-/// one `MetricList` spill past its single inline slot, growing 1 -> 2 -> 4 -> 8 over 5 pushes,
-/// hence 2 reallocs; one `bins` Vec per sketch). After: 14 -- the same 9 plus one `Box::new` per
-/// of the 5 distributions.
-#[test]
-fn construct_distribution_heavy_event() {
-    drop(fixtures::distribution_heavy_event());
-    let (event, stats) = measure(fixtures::distribution_heavy_event);
-    assert_eq!(event.metrics.len(), 5);
-    expect_allocs("construct distribution_heavy_event (5 distributions)", stats, 14);
-}
-
 /// Cloning [`fixtures::distribution_heavy_event`] -- five *distinct* `MetricKind::Distribution`
-/// metrics, against the nginx shape's two. `clone_one_event` above costs 6 allocations for 2
-/// distributions (a spilled `AttrMap`, a spilled `MetricList`, and -- per distribution -- a
-/// `bins` Vec clone plus a `Box<DdSketch>` clone); this fixture's three attributes stay inline (no
-/// `AttrMap` spill), so the difference isolates what distribution *count* costs on its own: one
-/// `MetricList` spill (past its single inline slot) plus 2 allocations per sketch (the `bins` Vec
-/// clone and the `Box` clone). Before boxing this was 6 (1 spill + 1 `bins` Vec per sketch); after,
-/// 11 (1 spill + 2 per sketch) -- exactly the "distribution-heavy metrics" side of item 10's trade
-/// that `docs/design/memory.md` flagged as needing this fixture to measure.
+/// metrics, against the nginx shape's two. `clone_one_event` above costs 4 allocations for 2
+/// distributions (a spilled `AttrMap`, a spilled `MetricList`, and a `bins` Vec per sketch); this
+/// fixture's three attributes stay inline (no `AttrMap` spill), so the difference isolates what
+/// distribution *count* costs on its own: one `MetricList` spill (past its single inline slot)
+/// plus one `bins` Vec per sketch. This is exactly the number `docs/design/memory.md`'s item 8
+/// (`Box` the `DdSketch`) was missing -- boxing turns every one of these `bins`-Vec clones into an
+/// *additional* allocation, which is the "distribution-heavy metrics" side of that trade the doc
+/// flags as unmeasured.
 #[test]
 fn clone_distribution_heavy_event() {
     let event = fixtures::distribution_heavy_event();
@@ -684,7 +628,7 @@ fn clone_distribution_heavy_event() {
 
     let (clone, stats) = measure(|| event.clone());
     assert_eq!(clone.metrics.len(), 5);
-    expect_allocs("Event::clone (distribution-heavy shape)", stats, 11);
+    expect_allocs("Event::clone (distribution-heavy shape)", stats, 6);
 }
 
 /// Building [`fixtures::span_event`] from scratch: every `Value::str`/`AttrMap::insert` call the
@@ -825,9 +769,7 @@ fn lua_process_one_event() {
 /// for the reference config. Excludes the output encoders, which run once per flush window rather
 /// than once per event, and excludes fan-out, which the config's `tap` branch adds.
 ///
-/// 7 = 1 (decode) + 1 (json) + 5 (kv_metrics) + 0 (keep) + 0 (aggregate). `kv_metrics` is 5, not
-/// 3, since `docs/design/memory.md` §8 item 10 boxed `MetricKind::Distribution`'s sketch, adding
-/// one `Box::new` per distribution on top of the `bins` Vec each already paid.
+/// 5 = 1 (decode) + 1 (json) + 3 (kv_metrics) + 0 (keep) + 0 (aggregate).
 #[test]
 fn full_chain_one_line() {
     let resource = fixtures::resource();
@@ -854,7 +796,7 @@ fn full_chain_one_line() {
         run!();
     }
     let (_, stats) = measure(|| run!());
-    expect_allocs("full chain: 1 access-log line", stats, 7);
+    expect_allocs("full chain: 1 access-log line", stats, 5);
 }
 
 // ---------------------------------------------------------------------------------------------
