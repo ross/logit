@@ -1,0 +1,176 @@
+# A self-contained stack for trying `logit`: no Rust toolchain, no script/*, no knowledge of this
+# repo beyond `docker compose up`. See demo/README.md.
+#
+# This is deliberately separate from the repo root's compose.yaml, which is the contributor dev
+# stack (bind-mounted source, `script/server`, `cargo run` inside a long-lived container). This
+# stack instead builds and runs the production image (../Dockerfile) -- what a real user gets.
+services:
+  influxdb:
+    image: docker.io/library/influxdb:2
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: logit
+      DOCKER_INFLUXDB_INIT_PASSWORD: logit-demo-password
+      DOCKER_INFLUXDB_INIT_ORG: logit
+      DOCKER_INFLUXDB_INIT_BUCKET: metrics
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: logit-demo-token
+    healthcheck:
+      test: ["CMD-SHELL", "influx ping || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    networks: [demo]
+
+  grafana:
+    image: docker.io/grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    volumes:
+      # Provisioning config vs. the dashboard JSON files it points at are two separate mounts --
+      # Grafana's `dashboards` provider reads `options.path` from wherever the config says, which
+      # is not under `provisioning/` itself.
+      - ./grafana/provisioning:/etc/grafana/provisioning:z,ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:z,ro
+      - grafana_data:/var/lib/grafana
+    networks: [demo]
+
+  # Log backend -- up and provisioned in Grafana, but nothing reaches it through `logit` yet
+  # (`syslog_out` doesn't exist). The `alloy` service below feeds it directly from the `writer`
+  # in the meantime, so the Loki half of the demo isn't just an empty datasource. See
+  # demo/README.md's "What isn't wired yet" section.
+  loki:
+    image: docker.io/grafana/loki:3.7.7
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    healthcheck:
+      # Loki's image is distroless -- no shell, no curl/wget, so this is the native probe
+      # (backported to 3.6.5+), not the classic `wget --spider` healthcheck you'll see elsewhere.
+      test: ["CMD", "loki", "-health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:z,ro
+      # A named volume, not a bind mount: the image runs as a fixed non-root UID and can't create
+      # directories inside a root-owned bind mount (and this sidesteps rootless-podman UID
+      # remapping too, same reasoning as root compose.yaml's `:z` comment, one step further).
+      - loki_data:/loki
+    networks: [demo]
+
+  # Trace backend -- up and provisioned, fully empty until `otlp_out` exists *and* something
+  # emits spans (see demo/logit.yaml's commented-out `trace_out`).
+  tempo:
+    # Pinned to 2.10.x, not the current 3.0.x: Tempo 3.0 removed the legacy ingester write path
+    # and reworked config wholesale (docs/plans/0003-demo-stack.md). 2.10's monolithic mode is
+    # the well-trodden config below.
+    image: docker.io/grafana/tempo:2.10.8
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:z,ro
+      - tempo_data:/var/tempo
+    ports:
+      - "4317:4317" # OTLP/gRPC
+      - "4318:4318" # OTLP/HTTP
+    networks: [demo]
+
+  # syslog -> Loki shim (demo/alloy/config.alloy). Loki has no syslog receiver of its own, and
+  # promtail (the historical answer) is EOL -- Alloy is the current, supported path. Scaffolding
+  # for `syslog_out`: once that lands, `logit` can point straight at this listener.
+  alloy:
+    image: docker.io/grafana/alloy:v1.19.2
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    depends_on:
+      loki:
+        condition: service_healthy
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:z,ro
+      - alloy_data:/var/lib/alloy/data
+    networks: [demo]
+
+  logit:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["run", "/config.yaml"]
+    depends_on:
+      # influxdb_out retries transient failures (ADR 0013), but there's no reason to spend the
+      # demo's first several seconds visibly doing that.
+      influxdb:
+        condition: service_healthy
+    volumes:
+      - ./logit.yaml:/config.yaml:ro
+    environment:
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-logit-demo-token}
+    networks:
+      demo:
+        aliases: [logit]
+
+  # Synthetic access-log traffic -- the same RFC 3164 + JSON-body shape
+  # crates/logit-bench/src/fixtures.rs measures (NGINX_SYSLOG_LINE), so this exercises a workload
+  # someone actually runs, not a made-up one.
+  #
+  # UDP is fire-and-forget, so `logit` (or `alloy`) not being bound yet just loses lines silently
+  # rather than failing -- `depends_on: service_started` is the honest limit here, there's no way
+  # to know a UDP listener is actually bound short of a manual probe (docs/deploying.md's
+  # "ordering rule").
+  #
+  # Also writes straight to `alloy` (in addition to `logit`), purely so the Loki half of the demo
+  # has data before `syslog_out` exists -- delete that second write once `log_out` in
+  # demo/logit.yaml is real.
+  writer:
+    image: docker.io/library/debian:13-slim
+    depends_on:
+      logit:
+        condition: service_started
+      alloy:
+        condition: service_started
+    restart: unless-stopped
+    networks: [demo]
+    command:
+      - bash
+      - -c
+      - |
+        set -u
+        methods=(GET GET GET GET POST PUT DELETE)
+        paths=(/ /login /api/items /api/items/42 /static/app.js /health)
+        codes=(200 200 200 200 201 204 301 404 500)
+        i=0
+        while :; do
+          i=$$((i + 1))
+          m=$${methods[$$((RANDOM % $${#methods[@]}))]}
+          p=$${paths[$$((RANDOM % $${#paths[@]}))]}
+          c=$${codes[$$((RANDOM % $${#codes[@]}))]}
+          bytes=$$((RANDOM % 20000 + 200))
+          dur=$$(printf '0.%03d' $$((RANDOM % 1000)))
+          ts=$$(date '+%b %e %H:%M:%S')
+          body="{\"request_method\":\"$$m\",\"path\":\"$$p\",\"status\":$$c,\"body_bytes_sent\":$$bytes,\"request_time\":$$dur,\"host\":\"demo.local\",\"request_id\":\"$$i\"}"
+          line="<134>$$ts demo-writer demoapp: $$body"
+          printf '%s' "$$line" > /dev/udp/logit/5140 2>/dev/null || true
+          printf '%s' "$$line" > /dev/udp/alloy/5141 2>/dev/null || true
+          sleep 0.5
+        done
+
+networks:
+  demo: {}
+
+volumes:
+  influxdb_data: {}
+  grafana_data: {}
+  loki_data: {}
+  tempo_data: {}
+  alloy_data: {}

@@ -1,0 +1,42 @@
+// syslog -> Loki shim (docs/plans/0003-demo-stack.md). Loki has no syslog receiver of its own,
+// and promtail (the historical answer) is EOL -- Alloy's `loki.source.syslog` is the current,
+// supported path. Scaffolding for `syslog_out`: once that ComponentKind exists, `logit` can
+// point straight at the listener below instead of `demo/compose.yaml`'s `writer` writing here
+// directly.
+loki.source.syslog "demo" {
+  listener {
+    address                         = "0.0.0.0:5141"
+    protocol                        = "udp"
+    syslog_format                   = "rfc3164" // matches syslog_in's own format (RFC 3164 only)
+    rfc3164_default_to_current_year = true
+    labels = {
+      job      = "demo",
+      protocol = "udp",
+    }
+  }
+
+  // Alloy strips every `__`-prefixed label (including `__syslog_*`) before forwarding -- without
+  // this, Loki would see no stream label from the syslog headers at all. Kept short: every label
+  // here is a Loki stream, so only the low-cardinality header fields are promoted.
+  relabel_rules = loki.relabel.syslog_headers.rules
+  forward_to    = [loki.write.demo.receiver]
+}
+
+loki.relabel "syslog_headers" {
+  forward_to = []
+
+  rule {
+    source_labels = ["__syslog_message_hostname"]
+    target_label  = "host"
+  }
+  rule {
+    source_labels = ["__syslog_message_app_name"]
+    target_label  = "app"
+  }
+}
+
+loki.write "demo" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

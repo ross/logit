@@ -8,6 +8,17 @@ the internal event model, the Lua scripting API, the pipeline component graph, a
 protocol, and [docs/known-gaps.md](docs/known-gaps.md) for already-identified rough edges in what's
 built so far.
 
+## Try it
+
+```sh
+cd demo && docker compose up --build
+```
+
+Stands up `logit` plus InfluxDB and Grafana (with a working dashboard already provisioned), and
+feeds it synthetic traffic — no Rust toolchain, no clone-and-build, nothing else in this repo
+required. Loki and Tempo come up too, provisioned and ready for the logs and traces `logit` can't
+send yet — see [demo/README.md](demo/README.md) for what's flowing and what isn't.
+
 **Status:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a Lua
 enrichment stage, InfluxDB 2.x out, via `logit run <config>`. Since then, `syslog_in` (RFC 3164/5424
 over UDP) and `stdio_out` have joined statsd/InfluxDB as implemented protocols, and `json`,
@@ -15,11 +26,12 @@ over UDP) and `stdio_out` have joined statsd/InfluxDB as implemented protocols, 
 run` rejects a config referencing any other unimplemented kind with a clear error. Config is a flat
 graph of named components, each declaring its own `sources` ([ADR 0009](docs/adr/0009-component-graph-configuration.md),
 [docs/design/pipeline-graph.md](docs/design/pipeline-graph.md)) — `logit graph <config>` prints the
-resolved graph as graphviz DOT. [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml)
-is the original v0.1 example; [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml)
-is a fuller one exercising the newer components against a real nginx (see
-[docs/deploying.md](docs/deploying.md) for its nginx-side recipe) — `script/server [config]` runs
-either against the local test stack below. See [ADR 0008](docs/adr/0008-aggregation-window-semantics.md)
+resolved graph as graphviz DOT. To see it running, use [demo/](demo/README.md) (above) rather than
+building from source — [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml) and
+[examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) are contributor-facing fixtures
+`script/server [config]` runs against the local dev stack below (the latter against a real nginx,
+see [docs/deploying.md](docs/deploying.md) for its nginx-side recipe). See
+[ADR 0008](docs/adr/0008-aggregation-window-semantics.md)
 for `aggregate`'s windowing semantics. Any field on any component can pull its value from the
 environment with `!env VAR_NAME` (e.g. `token: !env INFLUXDB_TOKEN`) — see
 [ADR 0011](docs/adr/0011-env-yaml-tag.md). For deploying `logit` outside this repo's dev stack —
@@ -44,10 +56,12 @@ who reaches for `make` out of habit.
 | `script/lint` | `cargo clippy`, warnings denied |
 | `script/format [--check]` | `cargo fmt` |
 | `script/schema` | Regenerate `schema/logit.schema.json` from the config types |
+| `script/validate` | `logit validate` over every shipped config (`demo/`, `examples/`) |
 | `script/audit` | Supply-chain checks (`cargo-deny`, `cargo-audit`) |
 | `script/cibuild` | The full check sequence CI runs — the real preflight check |
 | `script/console` | Interactive shell in the dev container |
 | `script/server [config]` | Start the test stack and run `logit` against a config file |
+| `script/demo [compose args]` | Run the self-contained demo stack ([demo/](demo/README.md)) — the release image, not the dev container |
 
 All of these use `sudo docker` by default. Override with `DOCKER=docker script/...` if your
 account is in the `docker` group (`sudo usermod -aG docker $USER`, then re-login removes the need
