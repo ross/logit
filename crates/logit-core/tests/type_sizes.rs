@@ -50,7 +50,13 @@ fn value_is_bytes_plus_a_discriminant_word() {
 #[test]
 fn attr_map_pays_its_inline_capacity_whether_or_not_it_spills() {
     assert_eq!(size_of::<(Symbol, Value)>(), 48);
-    assert_eq!(size_of::<AttrMap>(), 400);
+    assert_eq!(
+        size_of::<AttrMap>(),
+        392,
+        "8 * 48 inline + 8 of smallvec overhead, now that the `union` feature (workspace \
+         Cargo.toml) shares the discriminant with the inline/heap union instead of paying for \
+         it separately"
+    );
 
     // Not a size assertion, but the claim the comment above rests on: spilling doesn't shrink it.
     let mut spilled = AttrMap::new();
@@ -79,9 +85,10 @@ fn metric_kind_is_sized_by_the_inlined_ddsketch() {
     );
     assert_eq!(
         size_of::<MetricList>(),
-        200,
-        "SmallVec<[MetricRecord; 1]>: the inline record, plus 16 bytes of capacity-and-\
-         discriminant overhead (smallvec's `union` feature would save 8 of those)"
+        192,
+        "SmallVec<[MetricRecord; 1]>: the inline record, plus 8 bytes of capacity-and-\
+         discriminant overhead (smallvec's `union` feature, enabled workspace-wide in \
+         Cargo.toml, saved the other 8)"
     );
 }
 
@@ -107,7 +114,7 @@ fn record_types() {
 /// capacity and `MetricKind`'s inlined sketch are paid unconditionally.
 #[test]
 fn event_size() {
-    assert_eq!(size_of::<Event>(), 792);
+    assert_eq!(size_of::<Event>(), 776, "792 minus the 16 bytes smallvec's `union` feature saves");
 
     // The breakdown, asserted so it can't drift out of sync with the total above.
     let sum = size_of::<i64>()
