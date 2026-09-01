@@ -286,12 +286,17 @@ express "route by condition." Two consequences worth stating rather than discove
   designed now, and more valuable to eventually build than it was before that ADR.
 
   **Now measured** ([memory.md](memory.md)): 4 allocations and a 792-byte memcpy per event per
-  extra branch, 232 ns — about 11% of the 2.07 µs it takes to ingest a line. When first measured
+  extra branch, 228 ns — about 11% of the ~2.08 µs it takes to ingest a line. When first measured
   that was dwarfed by the InfluxDB encoder, which cost sixteen times as much per event; now that
-  the encoder has been reworked (0.3 allocations per event, `docs/design/memory.md`), fan-out is
-  back to being one of the larger remaining costs. So "load-bearing" is right, and the copy-on-write
-  change is worth making: it's strictly no worse anywhere, and a read-only consumer — every sink —
-  would pay none of it.
+  the encoder has been reworked (~0.3 allocations per event, `docs/design/memory.md`), fan-out is
+  back to being one of the larger remaining costs. So "load-bearing" is right.
+
+  **A copy-on-write implementation exists** (`docs/adr/0016-arc-eventbatch-copy-on-write.md`, held
+  pending review), and it's turned out more subtle than "strictly no worse anywhere" assumed: the
+  single-consumer case genuinely becomes free, but a real fan-out currently costs *one allocation
+  more* than the clone it replaces, not less — closing that needs a further change
+  (`Output::send(&EventBatch)`, being explored now). See `docs/design/memory.md` §3 for the full,
+  still-unsettled account.
 
 Also worth carrying forward as an open question, not a decision: today's `send_batch` silently drops
 a send on a closed downstream (`let _ = tx.blocking_send(...)`). Under a DAG that closure should
