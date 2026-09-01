@@ -199,9 +199,11 @@ Worked examples, one per shipped component:
   `logit.transform.resource.groups`, sampled at the top of `flush` before it drains its own state
   — the peak-of-window series count, which is the visible signal for the cardinality blow-up
   `crate::keep`'s own module doc already warns `aggregate` is exposed to.
-- `kv_metrics` (`crates/logit-transforms/src/kv_metrics.rs`): `logit.transform.derived{kind}` /
-  `.derived.skipped{kind}` — makes the documented silent-skip path (a missing or non-numeric
-  field, deliberately never a diagnostic) visible as a rate instead of invisible.
+- `kv_metrics` (`crates/logit-transforms/src/kv_metrics.rs`): `logit.transform.derived{metric_
+  kind}` / `.derived.skipped{metric_kind}` — makes the documented silent-skip path (a missing or
+  non-numeric field, deliberately never a diagnostic) visible as a rate instead of invisible.
+  `metric_kind`, not `kind` — `kind` is reserved for a point's own component-kind identity (see
+  below), and this is the first component to actually need a tag that would have collided with it.
 - `keep`/`remove` (`crates/logit-transforms/src/keep.rs`): `logit.transform.attributes.kept` /
   `.dropped` — the other half of `aggregate`'s cardinality story: how much `keep` is actually
   suppressing before events reach it. No `Diagnostics` on either (pure attribute filtering has
@@ -243,6 +245,27 @@ of this same warning.
 
 No `timing()` for scripts: the sandboxed stdlib exposes no clock (`table`/`string`/`math` only),
 so there's no way for a script to produce a duration to hand it.
+
+**Two more boundaries [`crates/logit-script/src/telemetry.rs`] holds, both because a script's
+input is less constrained than a Rust call site's:**
+
+- **Checked before anything else, on every call: `Telemetry::is_enabled()`.** Reading a Lua
+  argument, converting it, and interning it are all real work — a disabled handle (no `internal`
+  component configured) has to skip every bit of that, not just the eventual `Telemetry::count`
+  call, or a pipeline with telemetry "off" would still permanently intern whatever a script passes
+  it. This is what makes the zero-cost-when-disabled guarantee hold all the way to the Lua
+  boundary, not just at the Rust one.
+- **The `logit.` prefix is reserved.** A `(name, tags)` key in a component's buffer carries no
+  notion of which caller wrote to it — a script calling `telemetry.count("logit.component.
+  events.received", 1)` would coalesce into (and corrupt) the exact key the runtime itself writes
+  to, since `count` and `gauge` on the same key silently convert one into the other. Rejected with
+  a clear Lua error naming the reserved namespace, not a silent collision.
+
+Also worth knowing, since a Lua tag key is script-chosen rather than fixed at a Rust call site: a
+tag named `component`, `kind`, or `role` can never override a point's real identity, no matter what
+a script passes — `ComponentBuffer::drain` (`crates/logit-core/src/telemetry.rs`) inserts a
+point's tags first and its real identity last, so identity always wins on a collision. This is a
+framework-level guarantee, not something the Lua binding has to enforce itself.
 
 ## Adding a new internal metric
 

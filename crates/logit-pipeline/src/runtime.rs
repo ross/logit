@@ -363,6 +363,14 @@ fn run_lua(
         let timer = telemetry.timer("logit.component.flush.duration");
         let result = worker.flush();
         drop(timer);
+        // Sampled here too, not only after a batch (below) -- `ScriptWorker::used_memory`'s own
+        // doc comment names accumulation *across `flush()` calls* as exactly the leak shape this
+        // metric exists to catch. A script whose only growth happens in `flush()` (nothing new
+        // arriving on the inbox between ticks) would otherwise leave `logit.script.vm.memory`
+        // frozen or absent for as long as the input stays idle -- the metric would go silent right
+        // when it matters. Sampled unconditionally, including the empty and error outcomes below:
+        // the VM's memory doesn't care whether `flush()` had anything to emit.
+        telemetry.gauge("logit.script.vm.memory", worker.used_memory() as f64, &[]);
         match result {
             Ok(events) if !events.is_empty() => {
                 telemetry.count("logit.component.flush.events", events.len() as f64, &[]);
@@ -1245,5 +1253,87 @@ mod tests {
             })
         });
         assert!(vm_memory.is_some_and(|v| v > 0.0), "a loaded Lua VM should report nonzero memory");
+    }
+
+    /// A stateful script whose only growth happens inside `flush()` (nothing new arriving on the
+    /// inbox between ticks) must not leave `logit.script.vm.memory` frozen or absent -- that's
+    /// exactly the leak shape `ScriptWorker::used_memory`'s own doc comment names. Proven with no
+    /// batch ever sent at all: `FiniteInput { batch: None }` finishes immediately, closing this
+    /// Lua node's inbox and triggering the same close-time flush a real flush-interval tick would
+    /// (`next_flush.is_some()` is all that's required, regardless of whether a deadline actually
+    /// elapsed) -- so if `flush_now` didn't sample memory, this test would see no gauge at all.
+    #[tokio::test]
+    async fn a_flush_with_no_batch_ever_received_still_records_vm_memory() {
+        let mut components = Map::new();
+        components.insert(
+            "in".to_string(),
+            Component {
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            },
+        );
+        components.insert(
+            "windowed".to_string(),
+            Component {
+                sources: vec!["in".to_string()],
+                kind: ComponentKind::Lua {
+                    script: "function process(event) return event end".to_string(),
+                    interval: Some(Duration::from_secs(3600)),
+                },
+            },
+        );
+        components.insert(
+            "out".to_string(),
+            Component { sources: vec!["windowed".to_string()], kind: influxdb_out() },
+        );
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert("in".to_string(), NodeSpec::Input(Box::new(FiniteInput { batch: None })));
+        specs.insert(
+            "windowed".to_string(),
+            NodeSpec::Lua {
+                script: "function process(event) return event end".to_string(),
+                interval: Some(Duration::from_secs(3600)),
+            },
+        );
+        let (result_tx, _result_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(Box::new(RecordingOutput { tx: result_tx })),
+        );
+
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = ["in", "windowed", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+        )
+        .await
+        .expect("should not hang")
+        .expect("should complete without error");
+
+        let events = registry.drain(0);
+        let vm_memory = events.iter().find_map(|e| {
+            if e.attributes.get("component").and_then(|v| v.as_str()) != Some("windowed") {
+                return None;
+            }
+            e.metrics.iter().find_map(|m| match &m.kind {
+                MetricKind::Gauge(v)
+                    if logit_core::interner::resolve(m.name) == "logit.script.vm.memory" =>
+                {
+                    Some(*v)
+                }
+                _ => None,
+            })
+        });
+        assert!(
+            vm_memory.is_some_and(|v| v > 0.0),
+            "the close-time flush should have sampled VM memory even with no batch ever received"
+        );
     }
 }

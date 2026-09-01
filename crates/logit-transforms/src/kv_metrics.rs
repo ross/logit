@@ -91,11 +91,13 @@ impl Transform for KvMetrics {
     /// then distributions) -- never replacing what's already there, and never dropping the event:
     /// this always returns `Some`. `log`/`span`/`attributes`/`timestamp` are untouched.
     ///
-    /// Records `logit.transform.derived{kind}`/`.derived.skipped{kind}` for every configured
-    /// metric, whether or not `metric_value`/`numeric` below actually produced a value -- the
-    /// skipped-vs-derived ratio is the visible signal for the documented silent-skip path (a
-    /// missing field, a non-numeric value) this transform deliberately never turns into a
-    /// diagnostic (`docs/design/internal-telemetry.md`).
+    /// Records `logit.transform.derived{metric_kind}`/`.derived.skipped{metric_kind}` for every
+    /// configured metric, whether or not `metric_value`/`numeric` below actually produced a value
+    /// -- the skipped-vs-derived ratio is the visible signal for the documented silent-skip path
+    /// (a missing field, a non-numeric value) this transform deliberately never turns into a
+    /// diagnostic (`docs/design/internal-telemetry.md`). Tagged `metric_kind`, not `kind` -- `kind`
+    /// is reserved for a point's own component-kind identity
+    /// (`crates/logit-core/src/telemetry.rs::ComponentBuffer::drain`).
     fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
         for m in &self.counters {
             if let Some(value) = metric_value(m, &event.attributes) {
@@ -104,12 +106,12 @@ impl Transform for KvMetrics {
                     kind: MetricKind::Counter(value),
                     unit: m.unit,
                 });
-                self.telemetry.count("logit.transform.derived", 1.0, &[("kind", "counter")]);
+                self.telemetry.count("logit.transform.derived", 1.0, &[("metric_kind", "counter")]);
             } else {
                 self.telemetry.count(
                     "logit.transform.derived.skipped",
                     1.0,
-                    &[("kind", "counter")],
+                    &[("metric_kind", "counter")],
                 );
             }
         }
@@ -120,9 +122,13 @@ impl Transform for KvMetrics {
                     kind: MetricKind::Gauge(value),
                     unit: m.unit,
                 });
-                self.telemetry.count("logit.transform.derived", 1.0, &[("kind", "gauge")]);
+                self.telemetry.count("logit.transform.derived", 1.0, &[("metric_kind", "gauge")]);
             } else {
-                self.telemetry.count("logit.transform.derived.skipped", 1.0, &[("kind", "gauge")]);
+                self.telemetry.count(
+                    "logit.transform.derived.skipped",
+                    1.0,
+                    &[("metric_kind", "gauge")],
+                );
             }
         }
         for m in &self.distributions {
@@ -149,12 +155,16 @@ impl Transform for KvMetrics {
                     kind: MetricKind::Distribution(sketch),
                     unit: m.unit,
                 });
-                self.telemetry.count("logit.transform.derived", 1.0, &[("kind", "distribution")]);
+                self.telemetry.count(
+                    "logit.transform.derived",
+                    1.0,
+                    &[("metric_kind", "distribution")],
+                );
             } else {
                 self.telemetry.count(
                     "logit.transform.derived.skipped",
                     1.0,
-                    &[("kind", "distribution")],
+                    &[("metric_kind", "distribution")],
                 );
             }
         }
@@ -443,7 +453,7 @@ mod tests {
     // would make every assertion after the first see an already-emptied registry.
     fn derived_count(events: &[Event], name: &str, kind: &str) -> Option<f64> {
         events.iter().find_map(|e| {
-            if e.attributes.get("kind").and_then(|v| v.as_str()) != Some(kind) {
+            if e.attributes.get("metric_kind").and_then(|v| v.as_str()) != Some(kind) {
                 return None;
             }
             e.metrics.iter().find_map(|m| match &m.kind {

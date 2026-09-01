@@ -232,10 +232,19 @@ impl ComponentBuffer {
 
         let mut events = Vec::with_capacity(points.len() + usize::from(dropped > 0));
         for (key, pending) in points {
-            let mut attrs = self.base_attrs();
+            // Tags first, identity (`component`/`kind`/`role`) last -- `AttrMap::insert` overwrites
+            // on a key collision, so inserting identity last guarantees a caller-supplied tag can
+            // never relabel which component a point is attributed to. A Rust call site never picks
+            // a tag key named `component`/`kind`/`role` by convention, but a Lua script's tag keys
+            // aren't constrained that way (`crates/logit-script/src/telemetry.rs`) -- this is the
+            // one place that has to hold regardless of where a tag came from.
+            let mut attrs = AttrMap::new();
             for (k, v) in &key.tags {
                 attrs.insert(k, *v);
             }
+            attrs.insert("component", self.id.as_str());
+            attrs.insert("kind", self.kind);
+            attrs.insert("role", self.role);
             let kind = match pending {
                 Pending::Count(v) => MetricKind::Counter(v),
                 Pending::Gauge(v) => MetricKind::Gauge(v),
@@ -430,6 +439,28 @@ mod tests {
         assert_eq!(attrs.get("component").and_then(|v| v.as_str()), Some("my_id"));
         assert_eq!(attrs.get("kind").and_then(|v| v.as_str()), Some("statsd_in"));
         assert_eq!(attrs.get("role").and_then(|v| v.as_str()), Some("listener"));
+    }
+
+    /// A caller-supplied tag can never relabel which component a point is attributed to -- a real
+    /// risk once a tag key is chosen by something less constrained than this codebase's own
+    /// `&'static str` call sites (a Lua script, `crates/logit-script/src/telemetry.rs`). Proven
+    /// directly against `Telemetry::count`, not just against the Lua binding, since the guarantee
+    /// belongs to `ComponentBuffer::drain` regardless of who supplied the tag.
+    #[test]
+    fn a_tag_named_component_kind_or_role_cannot_override_the_real_identity() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("real_id", "lua", "transform");
+        telemetry.count(
+            "m",
+            1.0,
+            &[("component", "spoofed"), ("kind", "spoofed"), ("role", "spoofed")],
+        );
+
+        let events = registry.drain(0);
+        let attrs = &events[0].attributes;
+        assert_eq!(attrs.get("component").and_then(|v| v.as_str()), Some("real_id"));
+        assert_eq!(attrs.get("kind").and_then(|v| v.as_str()), Some("lua"));
+        assert_eq!(attrs.get("role").and_then(|v| v.as_str()), Some("transform"));
     }
 
     #[test]

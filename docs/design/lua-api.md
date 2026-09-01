@@ -174,6 +174,13 @@ is the script author's responsibility, not something the type system checks for 
 does for the Rust call sites `internal-telemetry.md` documents. See
 [ADR 0019](../adr/0019-lua-authored-telemetry-cardinality.md) for the full reasoning.
 
+**Metric names starting with `logit.` are reserved** for `logit`'s own internal metrics
+(`docs/design/internal-telemetry.md`) -- `telemetry.count("logit.component.events.received", 1)`
+is a clear call-time error, not a silent merge into the runtime's own counter. Pick a name outside
+that namespace for anything script-specific. A tag named `component`, `kind`, or `role` is safe to
+use, if pointless -- it can never override which component a point is really attributed to, no
+matter what a script passes.
+
 ## Config shape
 
 A Lua transform is one component in the pipeline's component graph
