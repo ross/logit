@@ -291,48 +291,81 @@ What is shared today:
 - **String and blob data** — `Bytes`, refcounted; a clone is an atomic increment.
 - **Attribute keys and metric names** — interned to a 4-byte `Symbol` (see §4).
 
-What is copied: **everything else, per fan-out branch**, in the code shipped today.
-`Fanout::send` deep-clones the whole `EventBatch` for every consumer but the last. For the nginx
-shape that is 4 allocations plus a 792-byte memcpy per event per extra branch — 228 ns, about 11%
-of the ingest chain.
-
-That clone is not incidental; it is what makes branch isolation free. Two branches of a fan-out
-never share an `Event`, so a mutation on one is structurally invisible to the other, with nothing
-to design or maintain for that guarantee. `runtime.rs`'s
+What is copied, and when, is no longer a flat rule — it depends on fan-out shape (below). What never
+changes regardless: a mutation on one branch of a fan-out is structurally invisible to a sibling
+branch, with nothing extra to design or maintain for that guarantee. `runtime.rs`'s
 `a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` is the test that pins it, and
-it's the thing any change here must never regress.
+it's the thing every change described below was built to never regress — including through three
+rounds of correcting an initial performance claim, per that section.
 
-### The `Arc<EventBatch>` copy-on-write change — in progress, more subtle than first assumed
+For scale: the deep clone this section used to describe unconditionally (4 allocations, a 792-byte
+memcpy per event per extra branch, 228 ns, ~11% of the ingest chain) is still exactly what a
+mutating branch pays when it has to.
+
+### The `Arc<EventBatch>` copy-on-write change — done, and genuinely more subtle than first assumed
 
 The design this section originally recommended: put `Arc<EventBatch>` on the channels, and have
-each consumer do `Arc::try_unwrap(batch).unwrap_or_else(|shared| (*shared).clone())`. An
-implementation exists (`docs/adr/0016-arc-eventbatch-copy-on-write.md`, PR #33, held pending
-review) and it surfaced something this section didn't originally price in.
+each consumer do `Arc::try_unwrap(batch).unwrap_or_else(|shared| (*shared).clone())`. Landed in
+three rounds (`docs/adr/0016-arc-eventbatch-copy-on-write.md`, PR #33) — worth reading in full for
+how much the initial "strictly no worse anywhere" framing had to be corrected against real
+measurement. The honest result, by fan-out shape:
 
-**What's confirmed to actually work**: a single-consumer edge — the common case, and every shipped
-listener's first hop — becomes genuinely free. A first version of the implementation put `Arc::new`
-on every send unconditionally, which regressed exactly this case (an edge that used to move the
-batch for free now paid one allocation for nothing); a `Delivered::Owned | Delivered::Shared(Arc<_>)`
-fast path fixes that, measured at zero additional allocations
-(`fanout_send_one_consumer_costs_nothing`).
+| Fan-out shape (2 consumers) | Allocations | vs. `main`'s flat 5 |
+|---|---:|---|
+| Single consumer (any kind) | **0** | strictly better |
+| Both `Output` | **1** | strictly better |
+| One `Output`, one `Transform`/Lua | **1 or 6** | scheduling-dependent, either direction |
+| Both `Transform`/Lua-style, no `Output` | **6** | 1 worse, always |
 
-**What does *not* work yet, measured**: a real fan-out (2+ consumers) does not cost less than the
-code it replaces — it costs **one allocation more**, deterministically, and possibly more still
-under genuine concurrent scheduling (two branches' `try_unwrap` calls can both observe a strong
-count above 1 and both fall back to cloning). The reason: `Transform::process`/`ScriptWorker::process`
-still need an *owned* `Event`, and `Output::send` still takes an *owned* `EventBatch` — so every
-consumer, read-only or not, must materialize its own copy on receipt, which means giving up
-whatever sharing the `Arc` offered exactly when it would have paid off. The "every read-only branch
-pays one atomic, not a clone" saving this section originally claimed needs `Output::send` to take
-`&EventBatch` instead — a real trait change, deliberately out of scope for the first pass, **now
-being explored as a follow-up now that it's safe to touch** (both `Output` implementers just landed
-their own allocation reworks). Whether that closes the gap is not yet known; this section will be
-updated once it is.
+**What's unconditionally better**: a single-consumer edge — the common case, every shipped
+listener's first hop, and every interior edge of a linear chain — costs nothing, via a
+`Delivered::Owned | Delivered::Shared(Arc<_>)` payload that skips the `Arc` entirely when there's
+only one consumer. This fixed a regression the first draft introduced (wrapping in `Arc`
+unconditionally, which cost a single-consumer edge one allocation for nothing). An all-`Output`
+fan-out also becomes unconditionally free past the one `Arc::new`: `Output::send` was changed to
+take `&EventBatch` instead of an owned one (round two), so a read-only sink branch never calls
+`Arc::try_unwrap` at all — it just borrows through the `Arc`, regardless of how many sibling
+branches still hold their own handle. This *is* the "every read-only branch pays one atomic, not a
+clone" saving originally claimed, delivered — for this shape.
 
-Two things that don't change regardless of how the `Output::send` question resolves:
+**What's genuinely racy, not deterministic in either direction**: a fan-out with one `Output`
+branch and one mutating (`Transform`/`ScriptWorker`) branch — the actually-common shape, matching
+the nginx reference config's `tap`/`trimmed` split — costs **1 or 6**, decided by real tokio
+scheduling, never something in between and never `main`'s flat 5. `run_output` drops its own `Arc`
+handle the instant `output.send()` returns, before its next receive; whether the mutating sibling's
+`unwrap_batch` call finds that handle already gone (free, cost 1) or still alive (clone, cost 6)
+depends on which finishes first — genuinely reachable both ways, confirmed by two tests that
+manually pin each ordering (`fanout_send_mixed_output_and_transform_consumers[_when_output_finishes_first]`).
+In production, `Output::send` typically does real I/O, measurably slower than a `Transform`'s local
+processing, so 6 is the likelier practical outcome — but that's an expectation about typical
+latencies, not something the design guarantees.
 
-- **`Transform::process` does not have to change** for the `Arc` plumbing itself — the
-  wrap/unwrap boundary sits entirely inside `logit-pipeline`, so no downstream crate needed edits.
+**What doesn't close at all**: a fan-out with no `Output` branch — two `Transform`s, or a
+`Transform` and a Lua stage, sharing one node. Both sides need to mutate, so neither can borrow;
+this is exactly round one's `1 + (N-1) × clone`, deterministically 6 for two consumers — one
+allocation worse than `main`, with no racy path to anything better, since nothing in this shape
+ever finishes without competing for the free unwrap. Closing it would need widening
+`Transform`/`ScriptWorker` past what they need to do their job (mutate/consume an owned `Event`),
+which isn't on the table.
+
+**A fix for the racy case's raciness was sketched and deliberately not taken — and it's narrower
+than it first looks.** For exactly one consumer of each kind, making `Fanout` aware of which is
+which and giving the mutating one an unconditional direct clone (bypassing `Arc` entirely) would
+turn 1-or-6 into a fixed 6 — trading the chance at 1 for predictability. That does **not**
+generalize past two consumers: worked through directly for 2 borrowing + 2 owning, the "aware"
+design's own cost turns on an unresolved internal choice (direct clone per owning consumer costs
+11; a second dedicated `Arc` for the owning group to race over costs 12, worse, since that second
+`Arc::new` outweighs what the race saves) — while *today's* racy design already reaches as low as 6
+for that same shape, whenever every `Output` branch happens to finish first. So an aware fix would
+fix the current *worst* case as the *guaranteed* one, not strictly dominate what exists, once
+either group grows past one member. Left as an open design problem, not a specified direction — see
+the ADR's Alternatives for the full working.
+
+Two things that didn't change through any of this:
+
+- **`Transform::process` never had to change** for the `Arc` plumbing itself — the wrap/unwrap
+  boundary sits entirely inside `logit-pipeline`. `Output::send`'s signature did change
+  (`&EventBatch`, not owned), the one trait-level change this design needed.
 - Granularity: putting the `Arc` around the *batch*, not each `Event`, costs one atomic per batch
   rather than one allocation and one atomic *per event* — worse than what it replaces for the
   single-consumer case. Prior art for the batch-level choice: Vector's `LogEvent` is an
@@ -579,17 +612,14 @@ might regress a workload the fixtures don't cover.
    `flush` global that exists but isn't a function is now a load-time error — matching
    `process`'s existing `MissingProcess` — instead of being silently treated as "no `flush()`" and
    quietly losing every flush tick's events forever.
-
-### In progress
-
-7. **`Arc<EventBatch>` copy-on-write on channels** (§3) — implementation exists
-   (`docs/adr/0016-arc-eventbatch-copy-on-write.md`, held pending review), and it's more subtle
-   than this recommendation originally assumed. Confirmed: the single-consumer case (most edges in
-   the shipped config) becomes genuinely free. Not yet confirmed: the fan-out case, which currently
-   costs *one allocation more* than the code it replaces, because `Output::send` still takes an
-   owned `EventBatch`. A follow-up changing that signature is what would close the gap; it's being
-   explored now that it's safe to touch (both `Output` implementers just landed their own allocation
-   reworks, items 1 and 5 above). See §3 for the full account.
+7. ~~**`Arc<EventBatch>` copy-on-write on channels.**~~ **Done, with real caveats** (§3) — landed
+   over three rounds (`docs/adr/0016-arc-eventbatch-copy-on-write.md`), each correcting an
+   overclaim the previous one made. Single-consumer edges and all-`Output` fan-outs are
+   unconditionally better (0 and 1 allocations respectively, both strict wins). A fan-out mixing
+   one `Output` branch with one mutating branch is genuinely racy — 1 or 6, decided by scheduling,
+   never `main`'s flat 5 either way. A fan-out with no `Output` branch at all doesn't improve —
+   still 6, one worse than `main`, deterministically. Read §3 in full before citing a single number
+   from this item; which one applies depends entirely on fan-out shape.
 
 ### Blocked on a broader fixture matrix — now unblocked for measurement, not yet decided
 
@@ -615,7 +645,8 @@ evidence.
 
 11. **`Transform::process(&mut Event) -> bool`.** Removes a 792-byte memcpy per node hop. Gets more
     expensive to decide with every transform that lands, so decide it early even if applied late.
-    Touches `runtime.rs`, so sequence after item 7 above settles, not concurrently with it.
+    Touches `runtime.rs`, the same file item 7's three rounds just settled — a fresh reason to
+    check `unwrap_batch`'s current shape before starting, not a blocker any more.
 12. **`AttrMap` accessors keyed by `Symbol`,** eliminating the remaining `resolve` → `intern` round
     trips. Narrower than it used to be: `influxdb_out`'s and `stdio_out`'s are both gone now (both
     encoders merge-join instead of clone-and-reinsert). What's left is `json`'s final merge into

@@ -71,23 +71,20 @@ already built that have a known, accepted rough edge.
 - **Fan-out/fan-in is unbuffered/uncoordinated** — the component graph (ADR 0009,
   [pipeline-graph.md](design/pipeline-graph.md)) makes arbitrary fan-out/fan-in the normal case (a
   sink shared by two branches, one listener feeding several filters), but a stalled sink backs up
-  every branch sharing an upstream with it, not just its own, and each extra consumer of a node
-  costs a full `EventBatch` clone. A per-edge `on_full: block | drop` policy for the backpressure
-  question is an open one, not yet designed.
+  every branch sharing an upstream with it, not just its own. A per-edge `on_full: block | drop`
+  policy for the backpressure question is an open one, not yet designed — unaffected by the
+  allocation work below, which is about the clone cost, not the backpressure semantics.
 
-  Measured ([memory.md](design/memory.md)): that clone is 4 allocations and a 792-byte memcpy per
-  event per extra branch, 228 ns — about 11% of the ~2.08 µs it takes to ingest a line, and a
-  fraction of what encoding one event used to cost before that got fixed. So it's not the
-  pipeline's main cost.
-
-  **`Arc<EventBatch>` copy-on-write is in progress** (`docs/adr/0016-arc-eventbatch-copy-on-write.md`,
-  held pending review) and turned out more subtle than "the identified future fix" implied: the
-  single-consumer case (most edges in the shipped config) is now genuinely free, but a real
-  fan-out currently costs *one allocation more* than the clone it replaces, because
-  `Transform`/`ScriptWorker`/`Output` all still need an owned copy on receipt. Closing that needs
-  `Output::send` to take `&EventBatch` instead of an owned one — a further trait change, being
-  explored now that it's safe to touch. See [memory.md](design/memory.md) §3 for the full account;
-  this entry will close once that's settled either way.
+  ~~Each extra consumer of a node costs a full `EventBatch` clone.~~ **Closed, with a real residual
+  gap.** `Arc<EventBatch>` copy-on-write landed (`docs/adr/0016-arc-eventbatch-copy-on-write.md`,
+  three rounds, each correcting an overclaim the last one made — worth reading for that alone). A
+  single-consumer edge (most edges in the shipped config) and an all-`Output` fan-out are both now
+  unconditionally free or near-free (0 and 1 allocations). What's left, exactly as measured, not as
+  originally hoped: a fan-out mixing one `Output` branch with one mutating branch costs 1 *or* 6
+  allocations depending on real scheduling, never a fixed number; a fan-out with no `Output` branch
+  at all still costs a full clone (6, one worse than the original code), with no path to
+  improvement under the current design. See [memory.md](design/memory.md) §3 for the complete,
+  shape-by-shape account — there is no single number for "what fan-out costs now."
 - **A Lua component's `flush()` has no resource of its own at a timer tick** — unlike an `aggregate`
   component, which tracks its own per-resource windows, a Lua component's flushed events are
   stamped with whichever resource it most recently saw on a real batch

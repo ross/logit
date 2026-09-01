@@ -270,33 +270,27 @@ express "route by condition." Two consequences worth stating rather than discove
 - **Backpressure crosses branches.** A stalled sink backs up through every branch sharing an
   upstream with it, not just its own path — this is correct bounded-channel behavior, but it means
   one slow destination can head-of-line-block telemetry destined for an unrelated, healthy one.
-- **Fan-out pays a real clone cost.** Every extra consumer of a node clones the outgoing
-  `EventBatch` — a deep `Vec<Event>` clone, same mechanism as today's per-output clone, now incurred
-  wherever a filter fans out. A routing primitive would have avoided this by construction; having
-  ruled that out (ADR 0009), the clone is load-bearing, not incidental — and it's also what makes
-  branch isolation free: two branches of a fan-out never share the same `Event` value, so a mutation
-  on one is structurally invisible to the other, with nothing extra to design or maintain for that
-  guarantee (see [ADR 0012](../adr/0012-multi-payload-events.md)'s branch-isolation note, proven by
-  `crates/logit-pipeline/src/runtime.rs`'s
-  `a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch`). That same ADR also raises
-  the average cost of this clone: an event can now carry a log and several metrics at once
-  (`docs/design/data-model.md`) where before it carried exactly one payload, so there's more to copy
-  per extra branch than there used to be. `Arc<EventBatch>` with copy-on-write at whichever node
-  first mutates it is the identified future optimization — recorded here as a known cost, not
-  designed now, and more valuable to eventually build than it was before that ADR.
+- **Fan-out used to pay a flat clone cost; it now depends on shape.** Originally: every extra
+  consumer of a node cloned the outgoing `EventBatch` — a deep `Vec<Event>` clone, incurred
+  unconditionally wherever a filter fanned out. A routing primitive would have avoided this by
+  construction; having ruled that out (ADR 0009), the clone was load-bearing, not incidental — and
+  it's also what makes branch isolation free: two branches of a fan-out never share the same
+  `Event` value, so a mutation on one is structurally invisible to the other, with nothing extra to
+  design or maintain for that guarantee (see [ADR 0012](../adr/0012-multi-payload-events.md)'s
+  branch-isolation note, proven by `crates/logit-pipeline/src/runtime.rs`'s
+  `a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` — a test three rounds of
+  the fix below never touched, only its doc comment).
 
-  **Now measured** ([memory.md](memory.md)): 4 allocations and a 792-byte memcpy per event per
-  extra branch, 228 ns — about 11% of the ~2.08 µs it takes to ingest a line. When first measured
-  that was dwarfed by the InfluxDB encoder, which cost sixteen times as much per event; now that
-  the encoder has been reworked (~0.3 allocations per event, `docs/design/memory.md`), fan-out is
-  back to being one of the larger remaining costs. So "load-bearing" is right.
-
-  **A copy-on-write implementation exists** (`docs/adr/0016-arc-eventbatch-copy-on-write.md`, held
-  pending review), and it's turned out more subtle than "strictly no worse anywhere" assumed: the
-  single-consumer case genuinely becomes free, but a real fan-out currently costs *one allocation
-  more* than the clone it replaces, not less — closing that needs a further change
-  (`Output::send(&EventBatch)`, being explored now). See `docs/design/memory.md` §3 for the full,
-  still-unsettled account.
+  **`Arc<EventBatch>` copy-on-write landed** (`docs/adr/0016-arc-eventbatch-copy-on-write.md`),
+  after three rounds of measurement correcting an increasingly specific overclaim each time — worth
+  reading end to end for that alone. The settled, shape-dependent result: a single-consumer edge
+  (most edges in the shipped config) and an all-`Output` fan-out are both now unconditionally free
+  or near-free. A fan-out mixing an `Output` branch with a mutating branch is genuinely racy — 1 or
+  6 allocations, decided by real scheduling, never a fixed number. A fan-out with no `Output`
+  branch at all still pays the full clone (6, one allocation worse than the pre-`Arc` code), with
+  no path to improvement under the current design. "Load-bearing" was right, but there is no single
+  number for "the fan-out cost" any more — see `docs/design/memory.md` §3 for the complete,
+  shape-by-shape account.
 
 Also worth carrying forward as an open question, not a decision: today's `send_batch` silently drops
 a send on a closed downstream (`let _ = tx.blocking_send(...)`). Under a DAG that closure should
