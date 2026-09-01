@@ -21,4 +21,4 @@ pub use output::Output;
 pub use runtime::{
     process_batch, run, run_with_shutdown, run_with_telemetry, send_batch, unwrap_batch, NodeSpec,
 };
-pub use transform::Transform;
+pub use transform::{FlushOutput, FlushedEvent, Transform};

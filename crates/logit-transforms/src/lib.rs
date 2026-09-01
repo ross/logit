@@ -90,7 +90,7 @@ mod chained_pipeline_test {
         let (_, events) = &flushed[0];
         assert_eq!(events.len(), 3, "three distinct series -- nothing else");
 
-        for series_event in events {
+        for (series_event, _links) in events {
             let tags: Vec<&str> = series_event.attributes.iter().map(|(k, _)| resolve(k)).collect();
             assert_eq!(
                 tags,
