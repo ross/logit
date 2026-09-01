@@ -280,29 +280,47 @@ async fn run_transform(
             return Ok(());
         };
         let batch = unwrap_batch(batch);
-        telemetry.count("logit.component.batches.received", 1.0, &[]);
-        telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
+        if let Some(out) = process_batch(&mut *transform, batch, &telemetry) {
+            fanout.send(out).await;
+        }
+    }
+}
 
-        let process_timer = telemetry.timer("logit.component.process.duration");
-        let mut out = Vec::with_capacity(batch.events.len());
-        let mut absorbed: u64 = 0;
-        for event in batch.events {
-            match transform.process(&batch.resource, event) {
-                Some(event) => out.push(event),
-                None => absorbed += 1,
-            }
+/// The per-batch body of `run_transform`'s loop above: telemetry accounting plus feeding every
+/// event through `Transform::process`, collecting what survives. Factored out (rather than left
+/// inline) so `crates/logit-bench/tests/allocations.rs` can measure the real code path directly,
+/// instead of a hand-written replica -- the same "call it directly" approach
+/// `docs/design/memory.md` §7 already uses for every other stage, applied to the node runtime for
+/// the first time. `run_transform` is the only caller in this crate; `pub` is for the bench.
+pub fn process_batch(
+    transform: &mut (dyn Transform + Send),
+    batch: EventBatch,
+    telemetry: &Telemetry,
+) -> Option<EventBatch> {
+    telemetry.count("logit.component.batches.received", 1.0, &[]);
+    telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
+
+    let process_timer = telemetry.timer("logit.component.process.duration");
+    let mut out = Vec::with_capacity(batch.events.len());
+    let mut absorbed: u64 = 0;
+    for event in batch.events {
+        match transform.process(&batch.resource, event) {
+            Some(event) => out.push(event),
+            None => absorbed += 1,
         }
-        drop(process_timer);
-        if absorbed > 0 {
-            telemetry.count(
-                "logit.component.events.dropped",
-                absorbed as f64,
-                &[("reason", "absorbed")],
-            );
-        }
-        if !out.is_empty() {
-            fanout.send(EventBatch { resource: batch.resource, events: out }).await;
-        }
+    }
+    drop(process_timer);
+    if absorbed > 0 {
+        telemetry.count(
+            "logit.component.events.dropped",
+            absorbed as f64,
+            &[("reason", "absorbed")],
+        );
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(EventBatch { resource: batch.resource, events: out })
     }
 }
 
@@ -476,7 +494,10 @@ fn run_lua(
 /// see `fanout_send_mixed_output_and_transform_consumers`, same file). Either outcome keeps
 /// isolation intact: a sibling branch's copy is always independent before it can be mutated
 /// (`a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` below pins this).
-fn unwrap_batch(batch: Delivered) -> EventBatch {
+///
+/// `pub` (rather than crate-private) for `crates/logit-bench/tests/allocations.rs`, which needs
+/// to measure this allocation-relevant path directly rather than reconstruct it.
+pub fn unwrap_batch(batch: Delivered) -> EventBatch {
     match batch {
         Delivered::Owned(batch) => batch,
         Delivered::Shared(shared) => {

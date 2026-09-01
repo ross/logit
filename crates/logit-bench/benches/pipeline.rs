@@ -194,3 +194,72 @@ fn full_chain(bencher: Bencher) {
         }
     });
 }
+
+/// The node-runtime paths `tests/allocations.rs`'s "Runtime" section pins by exact allocation
+/// count -- this module is their throughput/wall-clock view.
+///
+/// `fanout_send_one_consumer`/`fanout_send_two_consumers` are the one deliberate exception to
+/// this file's module doc above ("every bench calls decoders, transforms, and encoders directly
+/// rather than driving the tokio runtime and the channels between nodes"): they *do* cross a
+/// `tokio::sync::mpsc` channel. That's still safe to read the allocation column on, because
+/// neither bench ever calls `tokio::spawn` -- both drive a `current_thread` runtime with
+/// `block_on`, which runs the whole `send`/`recv` exchange on the one OS thread Divan's
+/// `AllocProfiler` is already watching (the calling thread), never handing anything to a worker
+/// thread it doesn't. `tests/allocations.rs`'s own `fanout_send_one_consumer_costs_nothing` and
+/// `fanout_send_two_consumers_costs_one_clone_plus_one_arc` use the identical construction and
+/// are the numbers to cross-check this module's allocation column against.
+mod runtime {
+    use super::*;
+    use logit_core::{EventBatch, Telemetry};
+    use logit_pipeline::{process_batch, unwrap_batch, Delivered, Fanout};
+
+    /// `run_transform`'s per-batch body (`logit_pipeline::process_batch`), with no channel or
+    /// runtime involved at all -- a plain synchronous call, so both of this bench's columns are
+    /// trustworthy the same way every other bench above it is.
+    #[divan::bench]
+    fn process_batch_through_keep(bencher: Bencher) {
+        let mut keep = fixtures::keep();
+        let telemetry = Telemetry::default();
+        bencher
+            .with_inputs(|| fixtures::nginx_batch(1))
+            .bench_local_values(|batch| process_batch(&mut keep, batch, &telemetry));
+    }
+
+    /// One consumer -- the common case (every listener's first hop, every interior edge of a
+    /// linear chain) -- costing nothing, per `tests/allocations.rs`'s
+    /// `fanout_send_one_consumer_costs_nothing`.
+    #[divan::bench]
+    fn fanout_send_one_consumer(bencher: Bencher) {
+        let rt =
+            tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]);
+        bencher.with_inputs(|| fixtures::nginx_batch(1)).bench_local_values(|batch| {
+            rt.block_on(async {
+                fanout.send(batch).await;
+                unwrap_batch(rx.recv().await.expect("should receive"))
+            })
+        });
+    }
+
+    /// A real fan-out: one branch clones (`Arc::try_unwrap` fails, `unwrap_batch` falls back), the
+    /// other doesn't -- see `tests/allocations.rs`'s
+    /// `fanout_send_two_consumers_costs_one_clone_plus_one_arc` for the exact accounting this
+    /// bench's allocation column should match.
+    #[divan::bench]
+    fn fanout_send_two_consumers(bencher: Bencher) {
+        let rt =
+            tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(1);
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx_a, tx_b]);
+        bencher.with_inputs(|| fixtures::nginx_batch(1)).bench_local_values(|batch: EventBatch| {
+            rt.block_on(async {
+                fanout.send(batch).await;
+                let a: Delivered = rx_a.recv().await.expect("a should receive");
+                let b: Delivered = rx_b.recv().await.expect("b should receive");
+                (unwrap_batch(a), unwrap_batch(b))
+            })
+        });
+    }
+}

@@ -19,10 +19,10 @@
 
 use logit_bench::alloc::{measure, CountingAlloc, Stats};
 use logit_bench::fixtures;
-use logit_core::{EventBatch, Value};
+use logit_core::{EventBatch, Registry, Telemetry, Value};
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::stdio::{EventDump, Format};
-use logit_pipeline::{Delivered, Fanout, Transform};
+use logit_pipeline::{process_batch, unwrap_batch, Delivered, Fanout, Transform};
 use logit_proto::{Decoder, Encoder};
 use logit_script::{ProcessOutcome, ScriptWorker};
 use std::sync::Arc;
@@ -657,6 +657,137 @@ fn clone_span_event() {
     let (clone, stats) = measure(|| event.clone());
     assert!(clone.span.is_some());
     expect_allocs("Event::clone (span shape)", stats, 2);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Runtime
+// ---------------------------------------------------------------------------------------------
+//
+// Everything above this section calls a decoder/transform/encoder directly, or drives `Fanout`
+// alone -- never `logit-pipeline::runtime`'s node loops themselves. That's a real gap, not a
+// stylistic choice: `run_transform`/`run_output` are private `async fn`s, and PR #37
+// (`docs/design/internal-telemetry.md`) added telemetry accounting to both without this file
+// gaining any coverage of what that accounting costs. `run_transform`'s per-batch body is now
+// exported as `logit_pipeline::process_batch` (a synchronous fn -- no channel hop, no runtime
+// needed) specifically so it can be measured here directly, the same "call the real thing" rule
+// `docs/design/memory.md` §7 already applies to every stage above. `unwrap_batch` is exported for
+// the same reason.
+
+/// The per-batch body with telemetry disabled (`Telemetry::default()`, what every component has
+/// with no `internal` component configured) -- everything above `keep`'s own cost
+/// (`keep_one_event`, 0) is `process_batch`'s `Vec::with_capacity(batch.events.len())` for `out`.
+#[test]
+fn process_batch_through_keep() {
+    let mut keep = fixtures::keep();
+    let telemetry = Telemetry::default();
+    let warm = fixtures::nginx_batch(1);
+    drop(process_batch(&mut keep, warm, &telemetry));
+
+    let batch = fixtures::nginx_batch(1);
+    let (out, stats) = measure(|| process_batch(&mut keep, batch, &telemetry));
+    let out = out.expect("keep forwards events, never fully absorbs");
+    assert_eq!(out.events.len(), 1);
+    expect_allocs("runtime: process_batch through keep, telemetry disabled", stats, 1);
+}
+
+/// The other outcome `process_batch` can produce: every event absorbed, nothing forwarded.
+/// `fixtures::statsd_event` is metrics-only (`clone_one_statsd_event` above), which is what lets
+/// `Aggregator::process` return `None` for it (`logit-transforms`'
+/// `a_metric_only_event_fully_absorbed_returns_none`) rather than forwarding a log/span half.
+///
+/// **The single allocation still costs the same 1** as the forwarding case above --
+/// `Vec::with_capacity(batch.events.len())` is built before any event is processed, so a batch
+/// that turns out to be *entirely* absorbed still pays for (and immediately drops) a `Vec` it
+/// never pushes into. Worth revisiting if a metrics-heavy `internal`-fed pipeline (mostly-absorbed
+/// batches, by construction) turns out to make this a real cost in practice -- not fixed here,
+/// since this file's job is to measure, not to optimize speculatively.
+#[test]
+fn process_batch_fully_absorbed() {
+    let mut agg = fixtures::aggregator();
+    let resource = fixtures::resource();
+    let telemetry = Telemetry::default();
+    let warm = EventBatch { resource: resource.clone(), events: vec![fixtures::statsd_event()] };
+    drop(process_batch(&mut agg, warm, &telemetry));
+
+    let batch = EventBatch { resource, events: vec![fixtures::statsd_event()] };
+    let (out, stats) = measure(|| process_batch(&mut agg, batch, &telemetry));
+    assert!(out.is_none(), "a batch with nothing left to forward should not be forwarded");
+    expect_allocs("runtime: process_batch, fully absorbed (aggregate)", stats, 1);
+}
+
+/// What live telemetry costs on top of the disabled path above -- the number PR #37 never
+/// measured, since `crates/logit-pipeline/src/fanout.rs`'s own tests prove `Fanout::send`'s
+/// telemetry calls are free but nothing exercised `process_batch`'s (`count`/`timer` around the
+/// per-event loop) until this test. Built the same way `fanout.rs`'s own telemetry tests are:
+/// a real `Registry`, not a mock.
+///
+/// **Measured, not assumed: this costs exactly what the disabled path costs** -- both this test
+/// and `process_batch_through_keep` above assert 1, the same single `Vec::with_capacity`
+/// allocation. `count`/`timer` write into the component's pre-allocated `ComponentBuffer`
+/// (`docs/design/internal-telemetry.md`); turning `internal` on in a config does not add a single
+/// allocation to `process_batch` itself.
+#[test]
+fn process_batch_with_live_telemetry() {
+    let mut keep = fixtures::keep();
+    let registry = Registry::new();
+    let telemetry = registry.telemetry_for("keep", "keep", "transform");
+    let warm = fixtures::nginx_batch(1);
+    drop(process_batch(&mut keep, warm, &telemetry));
+
+    let batch = fixtures::nginx_batch(1);
+    let (out, stats) = measure(|| process_batch(&mut keep, batch, &telemetry));
+    let out = out.expect("keep forwards events, never fully absorbs");
+    assert_eq!(out.events.len(), 1);
+    expect_allocs("runtime: process_batch through keep, telemetry live", stats, 1);
+}
+
+/// `unwrap_batch`'s free path: `Delivered::Owned` is already the owned `EventBatch` -- no `Arc`
+/// was ever involved (a single-consumer edge, `Fanout::send`'s common case), so this is a plain
+/// match with nothing to allocate.
+#[test]
+fn unwrap_batch_owned() {
+    let batch = fixtures::nginx_batch(1);
+    let (out, stats) = measure(|| unwrap_batch(Delivered::Owned(batch)));
+    assert_eq!(out.events.len(), 1);
+    expect_allocs("runtime: unwrap_batch, Delivered::Owned", stats, 0);
+}
+
+/// `unwrap_batch`'s other free path: a real fan-out's `Arc`, but this handle is the only one left
+/// (every sibling branch already dropped its own) -- `Arc::try_unwrap` succeeds with no clone,
+/// same property `a_shared_batchs_arc_is_uniquely_held_only_once_every_sibling_handle_is_dropped`
+/// (`runtime.rs`) pins at the `Fanout` level, measured here at the unwrap itself.
+#[test]
+fn unwrap_batch_shared_sole_reference() {
+    let batch = fixtures::nginx_batch(1);
+    let shared = Arc::new(batch);
+    let (out, stats) = measure(|| unwrap_batch(Delivered::Shared(shared)));
+    assert_eq!(out.events.len(), 1);
+    expect_allocs("runtime: unwrap_batch, Delivered::Shared, sole reference", stats, 0);
+}
+
+/// The documented racy fallback: a sibling branch still holds its own handle to the same `Arc`
+/// when this one unwraps, so `Arc::try_unwrap` fails and `unwrap_batch` falls back to a full
+/// `EventBatch::clone` -- 1 allocation for the cloned `Vec<Event>` plus `clone_one_event`'s 4 for
+/// the one nginx-shaped `Event` inside it, matching the per-branch cost
+/// `fanout_send_two_consumers_costs_one_clone_plus_one_arc` measures at the `Fanout::send` level
+/// (that test's 6 is this 5 plus the one `Arc::new` per send, which happens outside this measured
+/// region).
+#[test]
+fn unwrap_batch_shared_contended() {
+    let warm_shared = Arc::new(fixtures::nginx_batch(1));
+    let warm_sibling = warm_shared.clone(); // held across the call below, forcing the fallback
+    drop(unwrap_batch(Delivered::Shared(warm_shared)));
+    drop(warm_sibling);
+
+    let shared = Arc::new(fixtures::nginx_batch(1));
+    let _sibling = shared.clone(); // kept alive across the measured call, forcing the fallback
+    let (out, stats) = measure(|| unwrap_batch(Delivered::Shared(shared)));
+    assert_eq!(out.events.len(), 1);
+    expect_allocs(
+        "runtime: unwrap_batch, Delivered::Shared, contended (falls back to clone)",
+        stats,
+        5,
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

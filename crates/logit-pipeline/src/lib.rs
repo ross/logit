@@ -18,5 +18,7 @@ pub mod transform;
 pub use fanout::{Delivered, Fanout};
 pub use input::Input;
 pub use output::Output;
-pub use runtime::{run, run_with_shutdown, run_with_telemetry, NodeSpec};
+pub use runtime::{
+    process_batch, run, run_with_shutdown, run_with_telemetry, unwrap_batch, NodeSpec,
+};
 pub use transform::Transform;

@@ -274,6 +274,49 @@ the single most allocation-hungry ingest-side stage at 3, and `Event::clone`'s 4
 branch is comparable to or larger than any individual ingest stage. The recommendations in §8 are
 ordered accordingly.
 
+### Runtime: the node loops, not just the components they call
+
+Every row above measures a decoder, transform, or encoder called directly. Nothing above measured
+what `crates/logit-pipeline/src/runtime.rs`'s node loops (`run_transform`/`run_output`) add on top
+— a gap `internal` telemetry's own PR (`docs/design/internal-telemetry.md`) opened without closing,
+since it instrumented both loops and added no coverage of what that instrumentation costs. Closed
+here: `run_transform`'s per-batch body is exported as `process_batch` (a plain synchronous
+function — no channel, no runtime) specifically so it, and `unwrap_batch`, can be measured directly
+in `crates/logit-bench/tests/allocations.rs`'s "Runtime" section, the same as everything above.
+
+| Path | allocs | Notes |
+|---|---:|---|
+| `process_batch` through `keep`, telemetry disabled | **1** | `Vec::with_capacity(batch.events.len())` for `out` — this is the whole cost |
+| `process_batch`, fully absorbed (`aggregate`) | **1** | the same `Vec`, built before any event is processed, thrown away unused when nothing survives |
+| `process_batch` through `keep`, telemetry **live** | **1** | identical to disabled — `count`/`timer` write into a pre-allocated `ComponentBuffer`, no allocation of their own |
+| `unwrap_batch` (`Delivered::Owned`) | **0** | no `Arc` was ever involved |
+| `unwrap_batch` (`Delivered::Shared`, sole reference) | **0** | `Arc::try_unwrap` succeeds |
+| `unwrap_batch` (`Delivered::Shared`, contended) | **5** | falls back to `EventBatch::clone` — 1 for the `Vec<Event>` + `Event::clone`'s 4 (nginx shape) |
+
+The one finding worth calling out: **turning `internal` on costs nothing extra on this path.**
+`process_batch_with_live_telemetry` (a real `Registry`-backed handle) and
+`process_batch_through_keep` (the disabled default) both measure exactly 1 — the same single `Vec`
+allocation either way. `Fanout::send`'s telemetry was already known to be free
+(`docs/design/internal-telemetry.md`'s own tests); this closes the other half of the runtime.
+
+`crates/logit-bench/benches/pipeline.rs`'s `runtime` module gives the wall-clock view of the same
+paths, including `Fanout::send`+`recv` across a real `tokio::sync::mpsc` channel — safe to trust on
+*both* columns (timing and allocations) despite the channel hop, because it drives a
+**current-thread** runtime with no `tokio::spawn` anywhere in the loop, so the exchange never
+leaves the one OS thread Divan's `AllocProfiler` is watching. Measured this way:
+
+| Path | fastest | allocs |
+|---|---:|---:|
+| `process_batch` through `keep` | 360 ns | 1 |
+| `Fanout::send`+`recv`, 1 consumer | 190 ns | 0 |
+| `Fanout::send`+`recv`, 2 consumers | 458 ns | 6 (1 `Arc::new` + the 5-allocation clone above) |
+
+This is a real, present-day open question, not a closed one: whether trace context on `Delivered`
+(the change `docs/known-gaps.md`'s internal-spans entry gates on measured evidence, per
+[ADR 0017](../adr/0017-minimize-allocations-over-event-size.md)) is worth its cost is exactly what
+this new coverage exists to let someone answer, on these numbers, without first having to build the
+measurement.
+
 ### Zero-copy: where it holds
 
 [data-model.md](data-model.md) commits to "`bytes::Bytes` everywhere strings and blobs appear," so
@@ -580,10 +623,18 @@ runner measures the runner. divan's `AllocProfiler` reports allocation counts al
 the two layers cross-check each other.
 
 One constraint worth knowing before adding benches: divan's `AllocProfiler` only counts allocations
-on threads it controls, so every bench here calls decoders, transforms, and encoders **directly**
-rather than driving the tokio runtime and the channels between nodes. Anything measured across a
-channel hop would report allocation numbers that are quietly wrong. What a full multi-node graph
-costs end to end is a separate question needing a load generator, not a microbenchmark.
+on threads it controls. Almost every bench here sidesteps the question entirely by calling
+decoders, transforms, and encoders **directly**, never touching the tokio runtime or the channels
+between nodes. The one deliberate exception is `pipeline.rs`'s `runtime` module, which *does* drive
+`Fanout::send`/`recv` across a real channel — safely, because it never calls `tokio::spawn`: a
+`current_thread` runtime's `block_on` runs everything on the calling thread, the one thread Divan is
+already watching, so nothing is handed to a worker thread it can't see. The constraint that actually
+matters is **no cross-thread hop** (a `tokio::spawn`, a multi-thread runtime, a real OS thread), not
+"no channel" — `crates/logit-bench/tests/allocations.rs`'s own `fanout_send_*`/`unwrap_batch_*`
+tests (thread-local `CountingAlloc`, same reasoning) independently confirm the same numbers this
+module reports. What a full multi-node graph costs end to end, spread across the real worker
+threads and OS threads `run_with_shutdown` actually spawns, is still a separate question needing a
+load generator, not a microbenchmark.
 
 ### Fixtures: synthetic inputs, no external services
 

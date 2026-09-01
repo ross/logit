@@ -289,6 +289,12 @@ already built that have a known, accepted rough edge.
     [ADR 0017](adr/0017-minimize-allocations-over-event-size.md) says must be decided on its own
     measured evidence, not folded into a metrics change. `internal`'s name (not `internal_metrics`)
     deliberately leaves room for this without a rename.
+
+    The measured evidence that gate asks for didn't exist until now, separately from the decision
+    itself: `crates/logit-bench/tests/allocations.rs`/`benches/pipeline.rs`'s node-runtime coverage
+    (`docs/design/memory.md`'s "Runtime" section) closes the gap where nothing measured what
+    `run_transform`/`run_output`/`Fanout::send` themselves cost — a prerequisite for costing a
+    `Delivered` change honestly, not the costing itself.
   - **Internal logs** — routing `Diagnostics`' stderr output into the graph as `LogRecord` events
     is the natural next layer, and what the still-deferred `tracing` migration (above) should build
     on rather than duplicate.
