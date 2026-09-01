@@ -322,6 +322,40 @@ already built that have a known, accepted rough edge.
   (`logit.internal.points.dropped{reason="cardinality"}`), never silent, but the cap itself is a
   fixed constant, not configurable — revisit if a legitimate component ever needs more than 1024
   distinct points between drains.
+- **Lua-authored telemetry (`crates/logit-script/src/telemetry.rs`,
+  [ADR 0019](adr/0019-lua-authored-telemetry-cardinality.md)) trades the type-system cardinality
+  guarantee the rest of `internal-telemetry.md` relies on for a convention-enforced one** — a
+  script's metric name/tag value is round-tripped through the process interner rather than
+  required to be a Rust `&'static str`, so nothing stops a script from building one out of per-event
+  data and leaking the interner one entry at a time. Accepted for the same reason the interner's
+  own never-evicting design is accepted (above): bounded in the intended, documented use (a fixed
+  literal in the script's own source), and the fix if it ever isn't (a bounded per-`ScriptWorker`
+  cache instead of the process-wide interner) is recorded as a considered-and-deferred alternative
+  in the ADR, not undesigned.
+- **The internal-telemetry component survey (`docs/design/internal-telemetry.md`'s worked-examples
+  list) found several more candidates not built yet** — real, but each needs more than a
+  `telemetry.count(...)` call:
+  - **Process-level facts beyond what `internal` already samples** — `logit.process.memory.*` via
+    jemalloc heap stats needs a new `tikv-jemalloc-ctl` dependency, and cross-crate plumbing since
+    `crates/logit-inputs` (where `internal` lives) doesn't depend on `crates/logit-cli` (where the
+    `jemalloc` feature is, `docs/adr/0015-jemalloc-global-allocator.md`). `logit.process.threads`/
+    `.fds`/`.cpu.seconds` would need Linux-specific `/proc` parsing. Candidate names:
+    `logit.process.memory.allocated`/`.resident`, `.threads`, `.fds`, `.cpu.seconds`.
+  - **`json`'s parse-outcome counts** — its two real failure modes (`no_brace`, `parse_failure`)
+    already ride the `Diagnostics` bridge for free (`logit.component.diagnostics{key=...}`), so a
+    dedicated metric would mostly restate what's already visible.
+  - **`logit-proto`'s buffer/frame metrics** — both `buffer.rs` and `frame.rs` are still stubs (see
+    the entries above), nothing to instrument until an implementation exists. Candidate names,
+    pre-committed so whoever builds it doesn't have to re-derive them: `logit.buffer.depth`,
+    `logit.buffer.events.dropped{reason="overflow_oldest"|"overflow_newest"}`,
+    `logit.buffer.push.blocked.duration`, `logit.proto.frames{direction,codec,compression}`,
+    `logit.proto.frame.bytes`, `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated"}`.
+  - **Lua per-call latency, error classification, flush-tick-empty tracking** — a per-event
+    `ScriptWorker::process` timing distribution would isolate one pathological event from a big
+    batch (today's `logit.component.process.duration` is whole-batch), but costs a clock read per
+    event; `ScriptError`'s `MissingProcess`/`Lua(...)`/malformed-return cases collapse into one
+    `errors{reason="process"}` today, when a script-bug class (a malformed `flush()` return) is a
+    different signal than a runtime error. Each is real; none was a default yes.
 - **Every `Output::send` call allocates a boxed future, on every batch, for every sink, unrelated
   to telemetry or anything else in this file's other entries.** `Output` is `#[async_trait]`
   (`crates/logit-pipeline/src/output.rs`); the macro desugars `async fn send` into a fn returning

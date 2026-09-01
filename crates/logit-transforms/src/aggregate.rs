@@ -13,7 +13,9 @@
 //! "can't merge one metric" as a reason to forward the whole event untouched.
 
 use logit_core::interner::Symbol;
-use logit_core::{AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, Value};
+use logit_core::{
+    AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, Telemetry, Value,
+};
 use logit_pipeline::Transform;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -27,6 +29,7 @@ pub struct Aggregator {
     interval: Duration,
     groups: Vec<ResourceGroup>,
     diag: Diagnostics,
+    telemetry: Telemetry,
 }
 
 struct ResourceGroup {
@@ -47,11 +50,23 @@ enum Accumulator {
 
 impl Aggregator {
     pub fn new(interval: Duration) -> Self {
-        Self { interval, groups: Vec::new(), diag: Diagnostics::default() }
+        Self {
+            interval,
+            groups: Vec::new(),
+            diag: Diagnostics::default(),
+            telemetry: Telemetry::default(),
+        }
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
+        self
+    }
+
+    /// Attaches a telemetry handle -- see `flush`'s `logit.transform.series.active`/
+    /// `.resource.groups` gauges.
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
         self
     }
 
@@ -163,6 +178,16 @@ impl Aggregator {
     /// becoming one emitted event stamped with `now`. Resets all state -- the next window starts
     /// empty, per the tumbling design in ADR 0008.
     pub fn flush(&mut self, now: i64) -> Vec<(Arc<Resource>, Vec<Event>)> {
+        // Sampled before `drain` consumes `self.groups` -- the peak-of-window value, at the one
+        // point this aggregator already visits every series it holds. `aggregate`'s own
+        // `SeriesKey` includes an event's whole attribute set (this module's doc comment), so an
+        // un-pruned high-cardinality attribute reaching it shows up here first -- see
+        // `docs/design/internal-telemetry.md` and `crate::keep`'s own module doc, which already
+        // warns about exactly this failure mode.
+        let active_series: usize = self.groups.iter().map(|g| g.series.len()).sum();
+        self.telemetry.gauge("logit.transform.series.active", active_series as f64, &[]);
+        self.telemetry.gauge("logit.transform.resource.groups", self.groups.len() as f64, &[]);
+
         self.groups
             .drain(..)
             .filter(|g| !g.series.is_empty())
@@ -694,5 +719,69 @@ mod tests {
         let (_, events) = &agg.flush(100)[0];
         assert_eq!(events.len(), 1);
         assert_eq!(counter_value(kind_of(&events[0])), 2.0, "both counters should have merged");
+    }
+
+    // Takes already-drained `events`, not a `&Registry` -- `Registry::drain` is consuming (it
+    // empties every buffer via `mem::take`), so calling it once per assertion in the same test
+    // would make every assertion after the first see an already-emptied registry.
+    fn gauge_value(events: &[Event], name: &str) -> Option<f64> {
+        events.iter().find_map(|e| {
+            e.metrics.iter().find_map(|m| match &m.kind {
+                MetricKind::Gauge(v) if logit_core::interner::resolve(m.name) == name => Some(*v),
+                _ => None,
+            })
+        })
+    }
+
+    #[test]
+    fn flush_records_active_series_and_resource_group_counts() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_telemetry(telemetry);
+        let resource = default_resource();
+
+        agg.process(&resource, metric_event("a", MetricKind::Counter(1.0), 0));
+        agg.process(&resource, metric_event("b", MetricKind::Counter(1.0), 0));
+        agg.flush(100);
+
+        let events = registry.drain(0);
+        assert_eq!(gauge_value(&events, "logit.transform.series.active"), Some(2.0));
+        assert_eq!(gauge_value(&events, "logit.transform.resource.groups"), Some(1.0));
+    }
+
+    #[test]
+    fn flush_with_nothing_accumulated_records_zero_series_and_zero_groups() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_telemetry(telemetry);
+
+        agg.flush(100);
+
+        let events = registry.drain(0);
+        assert_eq!(gauge_value(&events, "logit.transform.series.active"), Some(0.0));
+        assert_eq!(gauge_value(&events, "logit.transform.resource.groups"), Some(0.0));
+    }
+
+    #[test]
+    fn flush_sums_series_across_multiple_resource_groups() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_telemetry(telemetry);
+
+        let mut resource_a = logit_core::AttrMap::new();
+        resource_a.insert("host", "a");
+        let resource_a = Arc::new(Resource { attributes: resource_a });
+        let mut resource_b = logit_core::AttrMap::new();
+        resource_b.insert("host", "b");
+        let resource_b = Arc::new(Resource { attributes: resource_b });
+
+        agg.process(&resource_a, metric_event("a", MetricKind::Counter(1.0), 0));
+        agg.process(&resource_b, metric_event("b", MetricKind::Counter(1.0), 0));
+        agg.process(&resource_b, metric_event("c", MetricKind::Counter(1.0), 0));
+        agg.flush(100);
+
+        let events = registry.drain(0);
+        assert_eq!(gauge_value(&events, "logit.transform.series.active"), Some(3.0));
+        assert_eq!(gauge_value(&events, "logit.transform.resource.groups"), Some(2.0));
     }
 }

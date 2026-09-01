@@ -8,11 +8,12 @@
 //! rather than relying on a convention nobody checks. The pipeline runs one [`ScriptWorker`] per
 //! worker thread.
 
-use logit_core::Event;
+use logit_core::{Event, Telemetry};
 use mlua::{Lua, LuaOptions, RegistryKey, StdLib, Value as LuaValue};
 use std::marker::PhantomData;
 
 mod proxy;
+mod telemetry;
 mod value;
 
 pub use proxy::EventProxy;
@@ -125,6 +126,27 @@ impl ScriptWorker {
         let flush_fn: Option<mlua::Function> = lua.globals().get("flush")?;
         let flush = flush_fn.map(|f| lua.create_registry_value(f)).transpose()?;
         Ok(Self { lua, process, flush, _not_send_sync: PhantomData })
+    }
+
+    /// Installs a `telemetry` global so `process()`/`flush()` can emit their own metrics -- a
+    /// builder rather than a `new()` parameter, mirroring `with_diagnostics`/`with_timeout`/
+    /// `with_retry` everywhere else in this framework, specifically so this doesn't touch any of
+    /// this crate's existing `ScriptWorker::new(script)` call sites. Safe to call after `new`
+    /// returns (rather than needing to happen before the script's own top-level code runs): Lua
+    /// resolves a global lookup inside a function body at call time, not at the point the
+    /// function was defined, so a script's `process`/`flush` sees `telemetry` correctly regardless
+    /// of exactly when between `new` and the first call this was installed. See
+    /// `crate::telemetry` and `docs/design/lua-api.md`.
+    pub fn with_telemetry(self, telemetry: Telemetry) -> Result<Self, ScriptError> {
+        telemetry::install(&self.lua, telemetry)?;
+        Ok(self)
+    }
+
+    /// Bytes currently in use by this worker's Lua VM -- the strongest single signal a stateful
+    /// script is leaking state (e.g. accumulating something across `flush()` calls) has, since
+    /// nothing else in the process can see inside the VM. Wraps `mlua::Lua::used_memory`.
+    pub fn used_memory(&self) -> usize {
+        self.lua.used_memory()
     }
 
     /// Runs this worker's `process(event)` once. See `docs/design/lua-api.md` for the
@@ -1173,5 +1195,36 @@ mod tests {
     fn flush_is_a_noop_when_the_script_defines_none() {
         let w = worker("function process(event) return event end");
         assert_eq!(w.flush().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn with_telemetry_lets_process_emit_its_own_metric() {
+        use logit_core::Registry;
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("script", "lua", "transform");
+        let w = ScriptWorker::new(
+            r#"
+            function process(event)
+                telemetry.count("orders.total", 1)
+                return event
+            end
+            "#,
+        )
+        .expect("script should load")
+        .with_telemetry(telemetry)
+        .expect("installing telemetry should not fail");
+
+        w.process(counter_event("hits", 1.0)).unwrap();
+
+        let events = registry.drain(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(logit_core::interner::resolve(events[0].metrics[0].name), "orders.total");
+    }
+
+    #[test]
+    fn used_memory_reports_a_positive_byte_count() {
+        let w = worker("function process(event) return event end");
+        assert!(w.used_memory() > 0, "a loaded Lua VM should already have some memory in use");
     }
 }
