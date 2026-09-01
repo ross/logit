@@ -63,11 +63,11 @@ items 7-9 in §8; it doesn't by itself settle the *sizing* decisions those items
 ## 1. The event model's footprint
 
 ```
-Event                                       792 bytes
+Event                                       776 bytes
 ├── timestamp: i64                            8
-├── attributes: AttrMap                      400   ← SmallVec<[(Symbol, Value); 8]>
+├── attributes: AttrMap                      392   ← SmallVec<[(Symbol, Value); 8]>
 ├── log: Option<LogRecord>                    48
-├── metrics: MetricList                      200   ← SmallVec<[MetricRecord; 1]>
+├── metrics: MetricList                      192   ← SmallVec<[MetricRecord; 1]>
 └── span: Option<SpanRecord>                 136
 ```
 
@@ -78,10 +78,10 @@ with the constituent parts:
 | `Symbol` (`lasso::Spur`) | 4 | `NonZeroU32`; `Option<Symbol>` is also 4 |
 | `Value` | 40 | sized by `Bytes` (4 words) plus an aligned discriminant |
 | `(Symbol, Value)` | 48 | 4 bytes of padding after `Symbol` |
-| `AttrMap` | 400 | 8 × 48 inline, + 16 of smallvec overhead |
+| `AttrMap` | 392 | 8 × 48 inline, + 8 of smallvec overhead (`union` feature, below) |
 | `MetricKind` | 176 | almost entirely the inlined `DDSketch` |
 | `MetricRecord` | 184 | `MetricKind` + name + unit |
-| `MetricList` | 200 | 1 × 184 inline + 16 |
+| `MetricList` | 192 | 1 × 184 inline + 8 |
 | `LogRecord` | 48 | `Option<LogRecord>` is also 48 — `Severity`'s niche absorbs `None` |
 | `SpanRecord` | 136 | `Option<SpanRecord>` is also 136 — `SpanKind`'s niche absorbs `None` |
 
@@ -89,58 +89,92 @@ with the constituent parts:
 
 **A `SmallVec` costs its inline capacity whether or not it has spilled.** The inline array and the
 heap `(ptr, cap)` pair share one slot, sized by the larger. So an event with 13 attributes pays a
-heap allocation *and* the full 400 bytes. Inline capacity 8 is therefore not "free up to 8" — it is
+heap allocation *and* the full 392 bytes. Inline capacity 8 is therefore not "free up to 8" — it is
 384 bytes on every event, forever, and the reference nginx pipeline spills past it anyway.
 
-**A statsd counter costs the same 792 bytes as a fully-populated nginx access log.** `Event` has no
+**A statsd counter costs the same 776 bytes as a fully-populated nginx access log.** `Event` has no
 compact representation for the common case; the space for attributes, a sketch, and a span is
 reserved unconditionally. That is the price of "an event is whatever it carries"
 ([ADR 0012](../adr/0012-multi-payload-events.md)) implemented with inline storage.
 
 **`MetricKind::Distribution` sets the size of every metric.** A `Counter(f64)` needs 8 bytes and
-pays 176, because `DDSketch` (two `Store`s and a `Config`) is inlined into the enum.
+pays 176, because `DDSketch` (two `Store`s and a `Config`) is inlined into the enum — deliberately,
+per [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md): boxing it would save 144 bytes
+here but cost an allocation on every distribution metric actually constructed or cloned, and
+distributions are a shipping, commonly-populated feature (`kv_metrics`, statsd's `ms`/`h`/`d`), not
+a rare one — see below.
 
-### What could be reclaimed
+### What was reclaimed, and what was deliberately not
 
-Not done — this pass measures rather than optimizes. Sized here so the trade is visible, **and the
-trades are not all in the same direction** (see §0):
+Sized here so the trade is visible, and the trades are not all in the same direction (see §0):
 
-| Change | Saves | Real cost | Verdict |
+| Change | Saves | Real cost | Outcome |
 |---|---:|---|---|
-| smallvec's `union` feature | 16 B | none — it's a feature flag | safe everywhere |
-| `Box` `SpanRecord` (`Option<Box<_>>` is 8 B) | 128 B | +1 alloc per event **that carries a span** | free for logs/metrics; cheap for traces too (§0's span fixture) |
-| `Box` the `DdSketch` in `MetricKind::Distribution` | ~168 B | +1 alloc per **distribution metric created** | wins for logs/traces, loses for distribution-heavy metrics |
-| Re-pick `AttrMap`'s inline capacity | up to 192 B | spills for events in the new gap | depends on the attribute-count distribution |
+| smallvec's `union` feature | 16 B | none — it's a feature flag | **done** — applied, no tradeoff |
+| `Box` `SpanRecord` | 128 B | +1 alloc per event that carries a span | **not done** — see below |
+| `Box` the `DdSketch` in `MetricKind::Distribution` | ~168 B | +1 alloc per distribution metric created | **not done** — see below |
+| Re-pick `AttrMap`'s inline capacity | up to 192 B | more spills, or (if increased) more bytes | **deferred** — see below |
 
-All four together take `Event` from 792 bytes to roughly 290. The first two are worth taking on
-their own merits; the last two now have real evidence (below, and in §8) but still need the sizing
-pass itself to decide, not just numbers to weigh.
+Only the `union` feature landed; `Event` is 792 → 776 bytes from that alone. The other two boxing
+changes were measured, implemented, and then **reverted** — worth explaining why, since the numbers
+alone would suggest taking them.
 
-**`Box`ing the `DdSketch` is not free, and an earlier draft of this document said it was.** The
-reasoning was that a sketch "already allocates" — it doesn't, at construction.
+**Both boxing changes trade `Event`'s size for allocation count, and this project now has a stated
+priority for that exact conflict: minimize allocations, not size**
+([ADR 0017](../adr/0017-minimize-allocations-over-event-size.md)). `logit`'s deployments are not
+constrained by the in-flight footprint at stake here (hundreds of bytes per event); a heap
+allocation is the more expensive resource by a wide margin at this scale — copying a few hundred
+extra bytes is close to free, while an allocation does real, measurable work even on a fast path.
+So a trade that adds allocations to save bytes goes the wrong way by default, unless the payload in
+question is genuinely rare in its intended workload.
+
+Neither is. **`Box`ing the `DdSketch` is not free, and an earlier draft of this document said it
+was** — the reasoning was that a sketch "already allocates," but it doesn't, at construction;
 `sketches_ddsketch`'s `Store::new` starts with `Vec::new()`, and the bins are allocated on the
-first `add`. The measurement confirms it: `kv_metrics` costs 3 allocations for 4 metrics, which is
-one `MetricList` spill plus exactly **one** bins `Vec` per distribution. Boxing makes that two. In
-a `kv_metrics` or statsd-timing pipeline, distributions are the common case, not the rare one — so
-this trades 168 bytes per event for an extra allocation per distribution, and which side wins
-depends entirely on the workload.
+first `add`. Measured: `kv_metrics` costs 3 allocations for 4 metrics (one `MetricList` spill plus
+one bins `Vec` per distribution); boxing made that 5, and on the project's own reference config —
+which carries 2 distributions per event — the headline ingest number this document tracks went
+from 5 to 7 allocations per line. That's not a rare-workload edge case; it's the flagship config.
+**`Box`ing `SpanRecord`** was reverted for the same reason applied consistently rather than
+selectively: no OTLP (or other span-producing) input exists yet, but per ADR 0017 that's a `v0.1`
+gap, not a property of the workload — a trace-focused deployment will populate `span` on most
+events the same way the nginx config already populates `metrics` with distributions, once that
+input exists. Treating spans as safe to box because nothing constructs one *yet* would just be
+deferring the same mistake to whenever that input lands.
 
-**`AttrMap`'s inline capacity is the largest single term (384 B), and now-measured evidence
-argues against shrinking it, not for it.** Four shapes are measured today: statsd (0-4 attributes,
-inline either way), the nginx mixed shape (10, spills at both 8 and 4), a plain logs-only syslog
-line (6 -- `syslog_decode_one_logs_only_line` -- inline at capacity 8, would spill at 4), and a
-wide-JSON log line (32 -- spills regardless of 8 or 4). So among everything measured so far,
-**dropping to 4 only ever costs an allocation (the logs-only case) and never saves one** (the wide
-shape spills either way, and the narrow shapes already fit at 8). That flips the concern this
-section raised speculatively before real numbers existed: shrinking capacity isn't a live
-recommendation until a shape narrower than 4 attributes turns up, which nothing measured is.
+**`AttrMap`'s inline capacity is the largest single term (384 B), and is left exactly as it is —
+deliberately deferred, not decided.** Four shapes are measured: statsd (0-4 attributes, inline
+either way), the nginx mixed shape (10, spills at both 8 and 4), a plain logs-only syslog line (6,
+inline at capacity 8, would spill at 4), and a wide-JSON log line (32, spills regardless of 8 or
+4). That's enough to say **shrinking to 4 has no measured upside** — it only ever costs an
+allocation (the logs-only case) and never saves one. It is *not* enough to decide the opposite
+question — whether to *increase* capacity to reduce spills on wider shapes — because that decision
+needs a real distribution of attribute counts across production traffic, which four synthetic
+fixtures can gesture at but not substitute for. Recorded as an open knob rather than pushed to a
+guess in either direction: see §8.
 
-Worth noting while re-picking it: a `SmallVec` that has spilled still occupies its full inline
-footprint, so for a consistently-wide workload a plain `Vec` (24 B plus one allocation) is strictly
-better than a `SmallVec` that always spills -- the wide-JSON shape (32 attributes, one allocation
-either way) is exactly this case, and gets nothing from *either* inline size. "Smaller inline
-capacity" is off the table on current evidence; "no inline capacity, for the wide case specifically"
-is still worth a look.
+**`MetricList`'s inline capacity (currently 1 — `SmallVec<[MetricRecord; 1]>`) is the same open
+question, never yet asked.** Any event with 2+ metrics spills — which includes the nginx reference
+config's event (4 metrics) unconditionally, and `kv_metrics` configurations generally, by design.
+Worth noting a real interaction with the `DdSketch` decision above: `MetricRecord` is 184 bytes
+with the sketch inlined (per ADR 0017), so widening `MetricList`'s capacity is considerably more
+expensive in bytes per additional slot than it would have been if the sketch had stayed boxed (40
+bytes/slot). The two decisions aren't independent of each other. Also recorded as an open knob,
+same reasoning as `AttrMap`'s: real per-event metric-count data is needed before picking a number,
+not more synthetic-fixture measurement. See §8.
+
+**Both inline capacities are compile-time constants** — `SmallVec<[T; N]>`'s `N` is a const array
+length, monomorphized into the type, with no runtime equivalent. There is no way to tune this per
+deployment without either recompiling for a specific workload's shape or moving to a design with
+no compile-time-fixed inline capacity at all. Whatever gets picked has to serve every workload this
+binary ships to.
+
+Worth noting on the topic of alternatives to inlining at all: a `SmallVec` that has spilled still
+occupies its full inline footprint, so for a consistently-wide workload a plain `Vec` (24 B plus
+one allocation) is strictly better than a `SmallVec` that always spills — the wide-JSON shape (32
+attributes, one allocation either way under either type) is exactly this case. Worth keeping in
+mind for whoever eventually does have the real-world data to make this call: "wider inline
+capacity" and "no inline capacity for this field" are both on the table, not just "which number."
 
 ## 2. Where the allocations are
 
@@ -375,7 +409,7 @@ A second, separable change: `Transform::process(&mut self, &Arc<Resource>, &mut 
 plus `Vec::retain_mut` in `run_transform` would remove one full 792-byte `Event` memcpy per node
 hop and one `Vec` allocation per batch per node. Nothing is lost — the trait already can't emit
 more than one event per input. Deserves its own ADR; gets more expensive to make with every
-transform that lands (§8 item 11).
+transform that lands (§8 item 14).
 
 ## 4. Interning: the bargain, and its bounds
 
@@ -620,58 +654,74 @@ might regress a workload the fixtures don't cover.
    never `main`'s flat 5 either way. A fan-out with no `Output` branch at all doesn't improve —
    still 6, one worse than `main`, deterministically. Read §3 in full before citing a single number
    from this item; which one applies depends entirely on fan-out shape.
+8. ~~**Re-pick `AttrMap`'s inline capacity — down.**~~ **Decided: don't shrink** (§1). Dropping
+   capacity 8 → 4 only ever costs an allocation across every shape measured, never saves one.
+   Whether to go the *other* direction (increase it) is a separate, still-open question — see the
+   new "Deferred" bucket below.
+9. ~~**`Box` `SpanRecord`.**~~ **Decided: don't box** (§1,
+   [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md)). Measured first (construction
+   11 → 12 allocations, clone 2 → 3, for the span fixture) before implementing and then reverting:
+   the 128-byte saving trades against an allocation cost that a trace-focused deployment would pay
+   on most events once a span-producing input exists — evaluated against that eventual workload,
+   not against `v0.1`'s current lack of one, per the new policy.
+10. ~~**`Box` the `DdSketch`.**~~ **Decided: don't box** (§1, ADR 0017). Measured both the
+    single-distribution and distribution-heavy fixtures before implementing and then reverting:
+    boxing saved 144 bytes but cost the project's own reference config a real allocation increase
+    (full ingest chain 5 → 7) — distributions are a shipping, commonly-populated feature, not the
+    rare case the byte saving alone would suggest trading for.
+11. ~~**Enable smallvec's `union` feature.**~~ **Done** — 16 bytes off every `Event`, no tradeoff,
+    exactly as predicted. `Event`: 792 → 776 bytes.
 
-### Blocked on a broader fixture matrix — now unblocked for measurement, not yet decided
+### Deferred — needs real production data, not more synthetic measurement
 
-The fixture matrix these needed now exists (§0): logs-only, wide-JSON, distribution-heavy, and span
-shapes are all measured. What's missing is the sizing pass itself — deciding what to do with that
-evidence.
+Both of these are the same shape of question `AttrMap`'s "should we shrink it" already had an
+answer for (item 8): a `SmallVec` inline-capacity choice, compile-time-fixed, that trades bytes
+against allocations depending on how wide events actually are in practice. Four synthetic fixtures
+were enough to rule out shrinking `AttrMap`; they are not enough to pick a number for either of
+these, because that needs a real distribution of attribute/metric counts across production
+traffic, which doesn't exist yet and can't be synthesized honestly.
 
-8. **Re-pick `AttrMap`'s inline capacity — now measured, and the evidence argues against shrinking
-   it.** Among all four shapes now measured (statsd 0-4, nginx 10, logs-only 6, wide-JSON 32),
-   dropping capacity 8 → 4 would only ever cost an allocation (the logs-only case, currently free
-   at 8) and never save one (the wide shape spills at 8 either way). See §1 for the full argument —
-   this recommendation has effectively inverted from "investigate shrinking it" to "current
-   evidence says don't, until a narrower shape than 4 attributes turns up."
-9. **`Box` `SpanRecord`.** 128 bytes off every event, free for logs-only and metrics-only. The span
-   fixture confirms `Event::clone` for a span is already cheap (2 allocations, everything else
-   inline) — still needs the sizing pass itself to decide whether boxing is worth taking.
-10. **`Box` the `DdSketch`.** 168 bytes off every event, but +1 allocation per distribution
-    created. The distribution-heavy fixture (5 metrics) now gives this a real "loses" case to
-    weigh (`Event::clone` there is 6 allocations, one per sketch) against the logs/traces "wins"
-    case — still needs the sizing pass to decide, not just the numbers to weigh.
+12. **`AttrMap`'s inline capacity, increased rather than shrunk.** Would reduce spills on wider
+    shapes (the nginx config's 10 attributes, wide-JSON's 32), at the cost of a larger `AttrMap` —
+    and therefore `Event` — for every event, paid whether or not the wider shape is common in a
+    given deployment. Not a guess to make without the data.
+13. **`MetricList`'s inline capacity (currently 1).** Any event with 2+ metrics spills — always
+    true for the nginx reference config (4 metrics) and for `kv_metrics` configurations generally,
+    by design. Note the interaction with item 10 above: with `DdSketch` staying inlined,
+    `MetricRecord` is 184 bytes, so widening this capacity costs considerably more per additional
+    slot than it would have if the sketch had been boxed — the two decisions aren't independent.
 
 ### Later — needs a reason first
 
-11. **`Transform::process(&mut Event) -> bool`.** Removes a 792-byte memcpy per node hop. Gets more
+14. **`Transform::process(&mut Event) -> bool`.** Removes a 792-byte memcpy per node hop. Gets more
     expensive to decide with every transform that lands, so decide it early even if applied late.
     Touches `runtime.rs`, the same file item 7's three rounds just settled — a fresh reason to
     check `unwrap_batch`'s current shape before starting, not a blocker any more.
-12. **`AttrMap` accessors keyed by `Symbol`,** eliminating the remaining `resolve` → `intern` round
+15. **`AttrMap` accessors keyed by `Symbol`,** eliminating the remaining `resolve` → `intern` round
     trips. Narrower than it used to be: `influxdb_out`'s and `stdio_out`'s are both gone now (both
     encoders merge-join instead of clone-and-reinsert). What's left is `json`'s final merge into
     `event.attributes` (the per-key intern step itself is already gone; only the map insertion
     still takes `&str`) and `keep`'s rebuild.
-13. **Byte-aware channel bounds** (§5), before a TCP or file-tail input makes batch size unbounded
+16. **Byte-aware channel bounds** (§5), before a TCP or file-tail input makes batch size unbounded
     in practice.
-14. **Enable smallvec's `union` feature.** 16 bytes off every `Event` for a one-line feature flag.
-    Bundled with items 8-10 above as one sizing pass rather than done alone, since all four touch
-    the same `Event`/`MetricKind`/`SpanRecord` definitions.
-15. **~~Bound the interner~~ — accepted as-is, see §4.** Listeners are private, so the namespace is
+17. **~~Bound the interner~~ — accepted as-is, see §4.** Listeners are private, so the namespace is
     user-controlled; the metric store and `logit`'s own aggregation window both fail earlier and
     harder under the same abuse. Revisit only if a listener stops being private.
 
 ## Open questions
 
-- **What is the real attribute-count distribution** across the inputs `logit` will actually see?
-  Partly answered: four representative shapes are now measured (statsd 0-4, nginx 10, logs-only 6,
-  wide-JSON 32), enough to show shrinking `AttrMap`'s inline capacity has no measured upside (§1,
-  §8 item 8). Still missing: real production telemetry to confirm these synthetic shapes are
-  actually representative, not just plausible.
-- **What do the unmeasured workload shapes actually cost?** Answered for allocation/clone cost:
-  logs-only, wide-JSON, distribution-heavy metrics, and spans are all now fixtured and measured
-  (§0, §2). Not yet answered: the *sizing* decisions those numbers feed (§8 items 8-10) still need
-  the pass itself, which hasn't run.
+- **What is the real attribute/metric-count distribution** across the inputs `logit` will
+  actually see? Partly answered: four representative shapes are now measured (statsd 0-4, nginx
+  10, logs-only 6, wide-JSON 32), enough to rule out shrinking `AttrMap`'s inline capacity (§1, §8
+  item 8) but not enough to decide whether to *increase* it, or to pick `MetricList`'s (§8 items
+  12-13). That needs real production telemetry, not more synthetic fixtures — recorded as
+  deliberately deferred rather than guessed, per the direction settled when `DdSketch`/`SpanRecord`
+  were measured and then not boxed for the same reason (§1, [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md)).
+- **What do the unmeasured workload shapes actually cost?** Answered, for allocation and clone
+  cost: logs-only, wide-JSON, distribution-heavy metrics, and spans are all fixtured and measured
+  (§0, §2), and that evidence is what drove §8 items 8-10's decisions (one confirmed-unchanged, two
+  measured-then-reverted). The two capacity questions above are what's left open, and they need a
+  different kind of evidence than this pass can generate on its own.
 - **Does jemalloc actually flatten RSS for this workload?** Partly answered. A short soak of the
   reference config against the real nginx stack — 60,000 requests through
   `syslog_in → json → kv_metrics → {stdio_out, keep → aggregate → influxdb_out}` — held RSS at
