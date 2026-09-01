@@ -302,6 +302,9 @@ draft actually established:
 | `send_batch` through a no-op `Output`, telemetry disabled | **1** | `#[async_trait]` boxing its future (below) — nothing to do with telemetry |
 | `send_batch`, telemetry live, **steady state** | **1** | same 1 as disabled — telemetry adds nothing on top of the box |
 | `send_batch`, **first call after an `internal` drain** | **3** | the box (1) + the same `HashMap`/`DdSketch` rebuild as `process_batch`'s (2) |
+| `send_batch` through a **failing** `Output`, telemetry disabled | **4** | the box (1) + `anyhow!(..)` constructing the error (1) + `.with_context(..)` (2: the `format!` message, and wrapping into a new boxed `anyhow::Error` node) — see below |
+| `send_batch`, failing, telemetry live, **first failure** (success keys already warm) | **5** | the failure baseline (4) + 1 — `logit.component.errors` is a brand-new 4th map key, which can grow the buffer even though the first 3 already fit |
+| `send_batch`, **failing**, first call after an `internal` drain | **7** | not simply 4 + 3 — a map absorbing 4 fresh keys (not 3) in one call can need more than one growth step; measured, not derived |
 
 **Two findings, not one, once the first draft's claim was checked properly:**
 
@@ -326,7 +329,21 @@ future** — confirmed by measuring a direct call (no `dyn Output`, no vtable) a
 Output` call `send_batch` actually makes; both cost exactly 1 (16 bytes), so this is `async_trait`'s
 boxing, not dynamic dispatch. A real, previously unmeasured, per-batch cost on every output sink in
 production, unrelated to telemetry or to this section's `internal-spans` question — worth its own
-follow-up, not fixed here.
+follow-up, not fixed here. (`docs/known-gaps.md`'s entry for this originally suggested a
+hand-written `Pin<Box<dyn Future<...>>>` method as a workaround — wrong, corrected in review: that
+return type requires the identical allocation to construct, whether a macro or a person wrote the
+method, since the box *is* how a `dyn Trait` object returns a future of unknown, implementer-varying
+size. A real fix means giving up `dyn Output` for the call — enum dispatch over the closed set of
+concrete `Output` kinds, or a per-node generic runtime — not a differently-spelled boxed future.)
+
+**A fourth finding, from a second round of review: every `send_batch` test above used a
+`NoopOutput` that always succeeds, so none of them exercised `logit.component.errors` or
+`result.with_context(...)`'s error-only work — a distinct allocation shape, not just a bigger
+version of the success number.** Closed with `FailingOutput` (always `Err`) and three more tests,
+the three failure rows in the table above. The failure baseline (4) is fully decomposed, not just
+measured as one opaque number: `anyhow::anyhow!(..)` alone costs 1, and `.with_context(..)` alone
+(given an already-built error) costs 2 more — `1 (async_trait box) + 1 (anyhow!) + 2
+(.with_context) = 4`, confirmed against the isolated pieces, not asserted from the total alone.
 
 `crates/logit-bench/benches/pipeline.rs`'s `runtime` module gives the wall-clock view of the same
 paths, including `Fanout::send`+`recv` across a real `tokio::sync::mpsc` channel and `send_batch`
@@ -341,6 +358,7 @@ channel hop and the trait-object call, because both drive a **current-thread** r
 | `Fanout::send`+`recv`, 1 consumer | 190 ns | 0 |
 | `Fanout::send`+`recv`, 2 consumers | 458 ns | 6 (1 `Arc::new` + the 5-allocation clone above) |
 | `send_batch` through a no-op `Output` | 189 ns | 1 (the `async_trait` box) |
+| `send_batch` through a **failing** `Output` | 238 ns | 4 (matches the disabled-telemetry failure row above exactly) |
 
 ### Costing internal spans: the `Delivered` trade, measured
 

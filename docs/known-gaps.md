@@ -368,7 +368,17 @@ already built that have a known, accepted rough edge.
   that exercise was looking for). `Input::run` and `Transform`'s Lua-adjacent paths don't have this
   problem the same way (`Input::run` is called once per process; `Transform`/`ScriptWorker` aren't
   `#[async_trait]` at all), so this is specific to the output side, on the hottest possible
-  schedule (once per batch, every sink, every pipeline). Not fixed here: the options (a
-  hand-written `Pin<Box<dyn Future>>` impl bypassing the macro, or waiting on stable support for
-  `dyn`-safe async fn in traits) are both real work with no forcing function yet — this entry is
-  that forcing function, for whenever the output path's allocation cost becomes worth chasing.
+  schedule (once per batch, every sink, every pipeline). Not fixed here — and **a hand-written
+  method returning `Pin<Box<dyn Future<...>>>` would not fix it either**, an earlier version of
+  this entry's own suggestion, corrected in review: that return type requires exactly the same
+  heap allocation to construct, whether a macro or a person wrote the method, because the box
+  *is* the mechanism a `dyn Trait` object uses to return a future of unknown, implementer-varying
+  size — not an artifact of `async_trait`'s codegen specifically. A real fix means giving up `dyn
+  Output` for this call: either enum dispatch over the small, closed set of concrete `Output`
+  kinds this project ships (`StdioOutput`/`InfluxDbOutput`/...), matched rather than boxed, so
+  each variant's `async fn` compiles to its own real, unboxed future; or making the runtime
+  generic per node over a concrete `Output` type, which loses the config-driven dynamic
+  construction (`Box<dyn Output + Send>` built from a running config, `crates/logit-cli/src/pipeline.rs`)
+  the pipeline currently relies on. Real work either way, with no forcing function yet — this
+  entry is that forcing function, for whenever the output path's allocation cost becomes worth
+  chasing.

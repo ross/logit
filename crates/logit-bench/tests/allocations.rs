@@ -843,6 +843,110 @@ impl logit_pipeline::Output for NoopOutput {
     }
 }
 
+/// Always fails, so `send_batch`'s error path -- the `logit.component.errors` counter and
+/// `result.with_context(...)`'s error-only work -- is exercised at all. Found missing in review:
+/// every test above this point uses `NoopOutput`, which always succeeds.
+struct FailingOutput;
+
+#[async_trait::async_trait]
+impl logit_pipeline::Output for FailingOutput {
+    async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("simulated output failure"))
+    }
+}
+
+/// `send_batch`'s failure path, telemetry disabled -- the direct counterpart to
+/// `send_batch_through_a_noop_output_disabled_telemetry`, closing the gap found in the second
+/// round of review: every prior `send_batch` test used `NoopOutput`, which always succeeds, so
+/// none of them ever exercised `logit.component.errors` or `result.with_context(...)`'s
+/// error-only work.
+///
+/// **4, not 1 -- fully decomposed, not just asserted:** the `async_trait` box (1, same as
+/// success) plus `anyhow::anyhow!(...)` constructing `FailingOutput`'s error (1, confirmed in
+/// isolation) plus `.with_context(|| format!(...))` (2: the `format!` itself, and wrapping the
+/// original error and the new context into one boxed `anyhow::Error` node -- confirmed in
+/// isolation too, both parts require a real `anyhow::Context`, not just a closure that never
+/// runs). `1 + 1 + 2 = 4`, matching what's measured below exactly.
+#[test]
+fn send_batch_through_a_failing_output_disabled_telemetry() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let mut output = FailingOutput;
+    let telemetry = Telemetry::default();
+    let warm = Delivered::Owned(fixtures::nginx_batch(1));
+    rt.block_on(async {
+        drop(send_batch("out", &mut output, &warm, &telemetry).await);
+    });
+
+    let delivered = Delivered::Owned(fixtures::nginx_batch(1));
+    let (result, stats) = measure(|| {
+        rt.block_on(async { send_batch("out", &mut output, &delivered, &telemetry).await })
+    });
+    assert!(result.is_err(), "FailingOutput should make send_batch itself report an error");
+    expect_allocs("runtime: send_batch through a failing Output, telemetry disabled", stats, 4);
+}
+
+/// `send_batch`'s failure path with live telemetry, steady state for the three success-path keys
+/// (warmed with a real success first) but the *first* failure this component has seen -- so
+/// `logit.component.errors` is a brand-new fourth key, not an update to an existing one. One more
+/// allocation than the disabled baseline above (5, not 4): inserting a 4th key can grow the
+/// `ComponentBuffer`'s map even though the first 3 already fit, the same `HashMap`-growth
+/// mechanism `send_batch_first_call_after_a_drain` already relies on, just triggered by key count
+/// growing rather than by `mem::take` emptying the map outright.
+#[test]
+fn send_batch_through_a_failing_output_telemetry_live() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let mut succeeding = NoopOutput;
+    let mut failing = FailingOutput;
+    let registry = Registry::new();
+    let telemetry = registry.telemetry_for("out", "stdio_out", "sink");
+    let warm = Delivered::Owned(fixtures::nginx_batch(1));
+    rt.block_on(async {
+        // A real success first, so batches.received/events.received/send.duration are already
+        // resident -- only `errors` is new when the measured call below fails.
+        send_batch("out", &mut succeeding, &warm, &telemetry)
+            .await
+            .expect("noop output never errors");
+    });
+
+    let delivered = Delivered::Owned(fixtures::nginx_batch(1));
+    let (result, stats) = measure(|| {
+        rt.block_on(async { send_batch("out", &mut failing, &delivered, &telemetry).await })
+    });
+    assert!(result.is_err());
+    expect_allocs(
+        "runtime: send_batch through a failing Output, telemetry live, first failure",
+        stats,
+        5,
+    );
+}
+
+/// The compounding case: the first call after an `internal` drain, and that call fails. Every
+/// key `send_batch` touches is a fresh insert this time (`batches.received`, `events.received`,
+/// `send.duration`, *and* `errors` -- four, not the three `send_batch_first_call_after_a_drain`
+/// covers for a successful send), on top of the same `anyhow!`/`.with_context()` cost the
+/// disabled test above pins. 7 total: not simply `4 (failure) + 3 (post-drain success)`, because
+/// a map absorbing a 4th fresh key in one call can need more than one growth step -- this is
+/// measured, not derived, for exactly that reason.
+#[test]
+fn send_batch_failing_first_call_after_a_drain() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let mut output = FailingOutput;
+    let registry = Registry::new();
+    let telemetry = registry.telemetry_for("out", "stdio_out", "sink");
+    let warm = Delivered::Owned(fixtures::nginx_batch(1));
+    rt.block_on(async {
+        drop(send_batch("out", &mut output, &warm, &telemetry).await);
+    });
+    registry.drain(0); // what `internal`'s tick does: empties the ComponentBuffer's map
+
+    let delivered = Delivered::Owned(fixtures::nginx_batch(1));
+    let (result, stats) = measure(|| {
+        rt.block_on(async { send_batch("out", &mut output, &delivered, &telemetry).await })
+    });
+    assert!(result.is_err());
+    expect_allocs("runtime: send_batch, failing, first call after an internal drain", stats, 7);
+}
+
 /// `run_output`'s per-batch body, `logit_pipeline::send_batch`, with telemetry disabled -- the
 /// direct counterpart to `process_batch_through_keep` above, closing the coverage gap found in
 /// review: the first draft of this section measured `process_batch`/`unwrap_batch` but never

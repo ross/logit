@@ -296,4 +296,31 @@ mod runtime {
             },
         );
     }
+
+    /// Always fails, matching `tests/allocations.rs`'s own -- the throughput counterpart to
+    /// `send_batch_through_a_failing_output_disabled_telemetry`, added alongside it in the second
+    /// round of review (every `send_batch` bench before this one only ever succeeded).
+    struct FailingOutput;
+
+    #[async_trait::async_trait]
+    impl logit_pipeline::Output for FailingOutput {
+        async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("simulated output failure"))
+        }
+    }
+
+    #[divan::bench]
+    fn send_batch_through_a_failing_output(bencher: Bencher) {
+        let rt =
+            tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+        let mut output = FailingOutput;
+        let telemetry = Telemetry::default();
+        bencher.with_inputs(|| Delivered::Owned(fixtures::nginx_batch(1))).bench_local_values(
+            |delivered| {
+                rt.block_on(async {
+                    drop(send_batch("out", &mut output, &delivered, &telemetry).await)
+                })
+            },
+        );
+    }
 }
