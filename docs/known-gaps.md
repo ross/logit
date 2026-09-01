@@ -284,30 +284,43 @@ already built that have a known, accepted rough edge.
   [ADR 0018](adr/0018-internal-telemetry-as-pipeline-events.md)) covers metrics only** — the
   framework (the `internal` component, the per-component buffer, the emit API) is built to extend,
   but three extensions are deliberately not part of this first cut:
-  - **Internal spans** — tracing one batch's path through the graph needs trace/span context
-    carried on `Delivered` (`crates/logit-pipeline/src/fanout.rs`), a hot-path type change that
-    [ADR 0017](adr/0017-minimize-allocations-over-event-size.md) says must be decided on its own
-    measured evidence, not folded into a metrics change. `internal`'s name (not `internal_metrics`)
-    deliberately leaves room for this without a rename.
+  - **Internal spans — the propagation substrate is built; nothing emits a `SpanRecord` yet.**
+    `internal`'s name (not `internal_metrics`) deliberately leaves room for this without a rename.
+    History: `crates/logit-bench/tests/allocations.rs`/`benches/pipeline.rs`'s node-runtime
+    coverage closed the gap where nothing measured what `run_transform`/`run_output`/`Fanout::send`
+    themselves cost (including the *first* call after every `internal` drain,
+    `ComponentBuffer::drain`'s `mem::take` re-populating the buffer rather than updating it — a
+    real, recurring cost the first pass at this measurement missed); a throwaway `TraceContext`
+    prototype on `Delivered` was built, measured against that coverage per
+    [ADR 0017](adr/0017-minimize-allocations-over-event-size.md)'s gate, and reverted — zero
+    allocation change, `size_of::<Delivered>()` 32 → 56, no attributable throughput regression.
+    See `docs/design/memory.md`'s "Runtime" and "Costing internal spans" sections for that account.
 
-    The measured evidence that gate asks for now exists, separately from the decision itself:
-    `crates/logit-bench/tests/allocations.rs`/`benches/pipeline.rs`'s node-runtime coverage closed
-    the gap where nothing measured what `run_transform` (`process_batch`), `run_output`
-    (`send_batch`), and `Fanout::send` themselves cost — including, after a first pass missed it in
-    review, the *first* call after every `internal` drain (`ComponentBuffer::drain`'s `mem::take`
-    means that call re-populates the buffer rather than updating it, at a real, recurring cost
-    above the steady-state number a first look at this measured) — and a 24-byte `TraceContext`
-    prototype on `Delivered` was built, measured against that coverage, and reverted: zero
-    allocation change across every existing exact-equality assertion at the time, `size_of::<Delivered>()`
-    32 → 56, no attributable throughput regression once run-to-run noise is accounted for. See
-    `docs/design/memory.md`'s "Runtime" and "Costing internal spans" sections for the full account,
-    including the one caveat: the `Delivered` prototype predates the post-drain/`run_output`
-    corrections above, so its "no allocation change" claim was checked against the coverage that
-    existed at the time, not re-verified against the corrected, wider one. **Evidence, not a
-    decision** — what's still unmeasured is propagating an *inherited* context (reading a batch's
-    own parent rather than always minting a root), which touches `run_transform`/`run_output`
-    themselves and is the actual shape a real feature needs; that, and the decision itself, are the
-    follow-up this de-risks.
+    **On that evidence, [ADR 0020](adr/0020-trace-context-propagation-on-delivered.md) built it for
+    real** — `Delivered` permanently carries a `TraceContext`, and the two node kinds with an
+    unambiguous parent propagate a real one: `Transform::process`/`ScriptWorker::process` (the
+    non-flush path, one incoming batch per emission) via `Fanout::send_with_context`, and
+    `run_output` (already borrows the incoming `Delivered` without unwrapping, so nothing further
+    to wire — see `docs/design/pipeline-graph.md`'s "Trace context propagation" section for the
+    full per-node-kind table). Every listener and every flush-driven emission still mints a fresh
+    root, unchanged from the prototype's behavior — not an oversight, see below.
+
+    **What's still open, in order:**
+    1. **`Transform::flush`/Lua's `flush()`** — an *n*-to-1 relationship (however many batches were
+       absorbed since the last tick), with no single correct parent. `SpanRecord.links` already
+       exists in the data model for this shape; building it means new bounded state on
+       `Aggregator`'s `Accumulator` and a cardinality question of its own. Real work, deliberately
+       not done in ADR 0020 — picking an arbitrary contributing batch as "the" parent was
+       considered and rejected there (silently wrong is worse than visibly incomplete).
+    2. **Nothing turns a (context, node, batch) tuple into a real `SpanRecord`-carrying `Event`
+       yet.** Propagation alone is unobservable outside `logit-pipeline` today — `Output::send`
+       still takes `&EventBatch`, not `&Delivered`. This is the piece analogous to how `internal`'s
+       `ComponentBuffer`/drain mechanism turns counters into events
+       (`docs/design/internal-telemetry.md`); routing through the same `internal` component is the
+       expected shape, per ADR 0018.
+    3. **Sampling** — span volume would be a different shape than metric volume once emission
+       exists (potentially one span per node-visit per batch); `internal` will likely need its own
+       knob for this, separate from its drain `interval`.
   - **Internal logs** — routing `Diagnostics`' stderr output into the graph as `LogRecord` events
     is the natural next layer, and what the still-deferred `tracing` migration (above) should build
     on rather than duplicate.

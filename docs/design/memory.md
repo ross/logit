@@ -417,6 +417,15 @@ what it produces, rather than always minting a fresh root) touches `run_transfor
 themselves, not just `Fanout`/`Delivered` -- a materially bigger change than the type-and-copy cost
 measured here, and the actual shape a real internal-spans feature would need.
 
+**Decided and built, on this evidence:** [ADR 0020](../adr/0020-trace-context-propagation-on-delivered.md)
+took the measurements above as its basis and implemented real propagation for the two node kinds
+with an unambiguous parent (`Transform::process`/`ScriptWorker::process`'s non-flush path, and
+`run_output`, which needed no new wiring at all). Every allocation-count assertion from before that
+change held exactly, re-confirmed against the real implementation, not just the reverted prototype
+-- see `docs/design/pipeline-graph.md`'s "Trace context propagation" section for the resulting
+per-node-kind account, and `docs/known-gaps.md`'s internal-spans entry for what's still open
+(flush's *n*-to-1 problem, `SpanRecord` emission, sampling).
+
 ### Zero-copy: where it holds
 
 [data-model.md](data-model.md) commits to "`bytes::Bytes` everywhere strings and blobs appear," so

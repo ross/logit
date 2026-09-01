@@ -238,8 +238,8 @@ pub async fn send_batch(
     telemetry: &Telemetry,
 ) -> anyhow::Result<()> {
     let batch: &EventBatch = match delivered {
-        Delivered::Owned(batch) => batch,
-        Delivered::Shared(shared) => shared,
+        Delivered::Owned(batch, _ctx) => batch,
+        Delivered::Shared(shared, _ctx) => shared,
     };
     telemetry.count("logit.component.batches.received", 1.0, &[]);
     telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
@@ -295,9 +295,15 @@ async fn run_transform(
             }
             return Ok(());
         };
+        // Read before `unwrap_batch` consumes `batch` -- this call's entire emission (whatever
+        // survives `process_batch`, however many events it started from) traces back to this one
+        // incoming batch, so it's the unambiguous parent (`TraceContext`'s own doc comment,
+        // `crates/logit-pipeline/src/fanout.rs`). `run_flush` below has no such single parent and
+        // deliberately doesn't do this.
+        let parent = batch.context();
         let batch = unwrap_batch(batch);
         if let Some(out) = process_batch(&mut *transform, batch, &telemetry) {
-            fanout.send(out).await;
+            fanout.send_with_context(out, parent).await;
         }
     }
 }
@@ -344,6 +350,13 @@ pub fn process_batch(
 /// Timed as one call even when it yields several `(resource, events)` groups -- `flush`'s own
 /// per-resource windowing (`docs/adr/0008-aggregation-window-semantics.md`) is internal to the
 /// transform, not something this timing needs to break out further.
+///
+/// **Sends via plain `fanout.send` (a fresh trace root), not `send_with_context`.** A flushed
+/// batch is built from however many incoming batches `Transform::process` absorbed since the last
+/// tick -- an *n*-to-1 relationship, not the 1-to-1 the non-flush path (`process_batch`'s caller,
+/// above) propagates a real parent for. `TraceContext`'s own doc comment
+/// (`crates/logit-pipeline/src/fanout.rs`) and `docs/known-gaps.md`'s internal-spans entry both
+/// track this as a deliberate, open gap -- not something this function is wrong to skip.
 async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, telemetry: &Telemetry) {
     let timer = telemetry.timer("logit.component.flush.duration");
     let flushed = transform.flush(now_unix_nanos());
@@ -393,6 +406,13 @@ fn run_lua(
     let mut next_flush = configured_interval.map(|interval| tokio::time::Instant::now() + interval);
     let mut last_resource = Arc::new(Resource::default());
 
+    // Sends via plain `fanout.send_blocking` below (a fresh trace root), same reasoning as
+    // `run_flush`'s own doc comment above: a Lua `flush()`'s emission has no single incoming
+    // batch to call its parent -- worse than `Transform::flush`, even, since there's no
+    // accumulator here at all to eventually attribute it to (`docs/known-gaps.md`'s
+    // internal-spans entry, and the existing resource-stamping gap this same imprecision already
+    // has: `last_resource` above is the identical shape of approximation, just for `Resource`
+    // instead of `TraceContext`).
     let flush_now = |worker: &ScriptWorker, resource: &Arc<Resource>, fanout: &Fanout| {
         let timer = telemetry.timer("logit.component.flush.duration");
         let result = worker.flush();
@@ -450,6 +470,11 @@ fn run_lua(
             }
             return;
         };
+        // Read before `unwrap_batch` consumes `batch` -- same reasoning as `run_transform`'s
+        // non-flush path (`crates/logit-pipeline/src/fanout.rs`'s `TraceContext` doc comment):
+        // this call's entire emission traces back to this one incoming batch. `flush_now` above
+        // has no such single parent and deliberately doesn't do this.
+        let parent = batch.context();
         let batch = unwrap_batch(batch);
         last_resource = batch.resource.clone();
         telemetry.count("logit.component.batches.received", 1.0, &[]);
@@ -496,7 +521,10 @@ fn run_lua(
             telemetry.count("logit.component.errors", errors as f64, &[("reason", "process")]);
         }
         if !out.is_empty() {
-            fanout.send_blocking(EventBatch { resource: batch.resource, events: out });
+            fanout.send_blocking_with_context(
+                EventBatch { resource: batch.resource, events: out },
+                parent,
+            );
         }
     }
 }
@@ -536,10 +564,16 @@ fn run_lua(
 ///
 /// `pub` (rather than crate-private) for `crates/logit-bench/tests/allocations.rs`, which needs
 /// to measure this allocation-relevant path directly rather than reconstruct it.
+///
+/// Discards `batch`'s `TraceContext` -- call [`Delivered::context`] first if the caller needs it
+/// as a parent for whatever it goes on to emit (`run_transform`/`run_lua`'s non-flush paths do).
+/// Kept out of this function's own return type deliberately: every existing caller before
+/// propagation landed just wanted the `EventBatch`, and `context()` costs nothing extra to call
+/// separately (it's a `Copy` read, not a consuming one).
 pub fn unwrap_batch(batch: Delivered) -> EventBatch {
     match batch {
-        Delivered::Owned(batch) => batch,
-        Delivered::Shared(shared) => {
+        Delivered::Owned(batch, _ctx) => batch,
+        Delivered::Shared(shared, _ctx) => {
             Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
         }
     }
@@ -576,6 +610,7 @@ fn advance_flush_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fanout::TraceContext;
     use crate::graph;
     use logit_config::{Component, ComponentKind, Config};
     use logit_core::{Event, MetricKind, Registry};
@@ -1048,7 +1083,7 @@ mod tests {
 
         let received = rx.recv().await.expect("should receive");
         assert!(
-            matches!(received, Delivered::Owned(_)),
+            matches!(received, Delivered::Owned(_, _)),
             "a single-consumer edge should never wrap the batch in an Arc"
         );
     }
@@ -1072,10 +1107,10 @@ mod tests {
 
         fanout.send(batch).await;
 
-        let Delivered::Shared(shared_a) = rx_a.recv().await.expect("a should receive") else {
+        let Delivered::Shared(shared_a, _ctx) = rx_a.recv().await.expect("a should receive") else {
             panic!("a fan-out of two consumers should share, not own")
         };
-        let Delivered::Shared(shared_b) = rx_b.recv().await.expect("b should receive") else {
+        let Delivered::Shared(shared_b, _ctx) = rx_b.recv().await.expect("b should receive") else {
             panic!("a fan-out of two consumers should share, not own")
         };
 
@@ -1372,5 +1407,79 @@ mod tests {
             vm_memory.is_some_and(|v| v > 0.0),
             "the close-time flush should have sampled VM memory even with no batch ever received"
         );
+    }
+
+    /// `run_transform`'s non-flush path (`MutatingTransform`, which always returns `Some`) reads
+    /// the incoming batch's `TraceContext` and sends its own emission as a
+    /// [`TraceContext::child`] of it -- the propagation this PR's "Inherited context" follow-up
+    /// implements for the two straightforward node kinds. Tests `run_transform` directly (a
+    /// private fn in this module, not through the full graph) because nothing surfaces a
+    /// propagated context past this crate yet: `Output::send` still takes `&EventBatch`, not
+    /// `&Delivered`, so an end-to-end test through `run` has nowhere to observe it -- see
+    /// `docs/design/pipeline-graph.md`'s "Trace context propagation" section.
+    #[tokio::test]
+    async fn run_transform_propagates_the_incoming_context_as_a_child() {
+        let (in_tx, in_rx) = mpsc::channel(1);
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![out_tx]);
+        let transform: Box<dyn Transform + Send> = Box::new(MutatingTransform);
+
+        let parent = TraceContext::new_root();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+        in_tx.send(Delivered::Owned(batch, parent)).await.expect("inbox should accept");
+        drop(in_tx); // close the inbox so run_transform returns once it's drained
+
+        run_transform(transform, in_rx, fanout, Telemetry::default())
+            .await
+            .expect("should complete without error");
+
+        let received = out_rx.recv().await.expect("should receive").context();
+        assert_eq!(
+            received.trace_id, parent.trace_id,
+            "the emitted batch should stay on the same trace as the one that produced it"
+        );
+        assert_ne!(
+            received.span_id, parent.span_id,
+            "the emission is its own hop -- it should mint a fresh span id, not reuse the parent's"
+        );
+    }
+
+    /// The other half of the same story: `run_transform`'s flush path (`WindowingTransform`,
+    /// which only ever emits from `flush`, never `process`) has no single incoming batch to
+    /// attribute a close-time flush to -- deliberately mints a fresh root rather than picking one
+    /// of however many batches it absorbed, per `TraceContext`'s own doc comment
+    /// (`crates/logit-pipeline/src/fanout.rs`) and `docs/known-gaps.md`'s internal-spans entry.
+    /// Two absorbed batches on two different traces prove the point directly: neither survives
+    /// into the flushed context.
+    #[tokio::test]
+    async fn run_transform_flush_mints_a_fresh_root_not_either_absorbed_batchs_context() {
+        let (in_tx, in_rx) = mpsc::channel(2);
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![out_tx]);
+        let transform: Box<dyn Transform + Send> = Box::new(WindowingTransform {
+            interval: Duration::from_secs(3600),
+            buffered: Vec::new(),
+        });
+
+        let ctx_a = TraceContext::new_root();
+        let ctx_b = TraceContext::new_root();
+        let batch = || EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+        in_tx.send(Delivered::Owned(batch(), ctx_a)).await.expect("inbox should accept");
+        in_tx.send(Delivered::Owned(batch(), ctx_b)).await.expect("inbox should accept");
+        drop(in_tx); // close the inbox -- triggers the close-time flush that emits both, absorbed
+
+        run_transform(transform, in_rx, fanout, Telemetry::default())
+            .await
+            .expect("should complete without error");
+
+        let flushed = out_rx.recv().await.expect("the close-time flush should emit").context();
+        assert_ne!(flushed.trace_id, ctx_a.trace_id);
+        assert_ne!(flushed.trace_id, ctx_b.trace_id);
     }
 }

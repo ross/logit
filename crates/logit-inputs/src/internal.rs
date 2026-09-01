@@ -120,8 +120,8 @@ mod tests {
 
         let delivered = rx.try_recv().expect("should have sent a batch");
         let batch = match delivered {
-            logit_pipeline::Delivered::Owned(batch) => batch,
-            logit_pipeline::Delivered::Shared(shared) => (*shared).clone(),
+            logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
+            logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
         };
         assert_eq!(batch.events.len(), 1);
         assert_eq!(
@@ -145,8 +145,8 @@ mod tests {
 
         let delivered = rx.try_recv().expect("should have sent a batch");
         let batch = match delivered {
-            logit_pipeline::Delivered::Owned(batch) => batch,
-            logit_pipeline::Delivered::Shared(shared) => (*shared).clone(),
+            logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
+            logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
         };
         let names: Vec<&str> = batch
             .events
@@ -176,8 +176,8 @@ mod tests {
         let mut found = false;
         while let Ok(delivered) = rx.try_recv() {
             let batch = match delivered {
-                logit_pipeline::Delivered::Owned(batch) => batch,
-                logit_pipeline::Delivered::Shared(shared) => (*shared).clone(),
+                logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
+                logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
             };
             for event in &batch.events {
                 for metric in &event.metrics {

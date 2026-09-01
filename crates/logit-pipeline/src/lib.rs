@@ -15,7 +15,7 @@ pub mod output;
 pub mod runtime;
 pub mod transform;
 
-pub use fanout::{Delivered, Fanout};
+pub use fanout::{Delivered, Fanout, TraceContext};
 pub use input::Input;
 pub use output::Output;
 pub use runtime::{

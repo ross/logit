@@ -16,10 +16,93 @@
 //! `ScriptWorker::process` need to mutate or consume an owned `Event`. (A listener's own inbox is
 //! never fed at all -- arity rules out a `sources` entry pointing at one -- so `Input` never
 //! receives a `Delivered` either way.)
+//!
+//! Every `Delivered` also carries a [`TraceContext`] -- the internal-spans propagation this PR's
+//! costing exercise (`docs/known-gaps.md`) measured and reverted before deciding to build for
+//! real. See [`TraceContext`]'s own doc comment for the propagation model, and
+//! `docs/design/pipeline-graph.md`'s "Trace context propagation" section for the account of which
+//! node kinds propagate a real parent today and which still mint a root.
 
 use logit_core::{EventBatch, Telemetry};
+use std::cell::Cell;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// One batch's place in a trace: which trace it belongs to, and which span produced it. Copy, no
+/// allocation -- 24 bytes, carried on every [`Delivered`] regardless of whether anything downstream
+/// ever turns it into a real span.
+///
+/// **Propagation model:** `trace_id` is set once, at a trace's true origin, and never changes
+/// again as a batch moves through the graph -- every hop's emitted batch keeps its parent's
+/// `trace_id`. `span_id` changes at *every* hop: [`TraceContext::child`] keeps `trace_id` and mints
+/// a fresh `span_id`, so a hop's own `span_id` is what the *next* hop's span would record as its
+/// `parent_span_id`, once something actually builds a `SpanRecord` from this (not done yet -- see
+/// the module doc above).
+///
+/// **Not every node can produce a `child` today.** A node with exactly one incoming batch per
+/// emission (a listener producing its first batch, `Transform::process`/`ScriptWorker::process`'s
+/// per-batch loop) has one unambiguous parent, and does. A node whose emission is built from
+/// however many upstream batches contributed since the last tick (`Transform::flush`, Lua's
+/// timer-driven `flush()`) has no single correct parent -- an *n*-to-1 relationship, not 1-to-1 --
+/// and still mints a fresh [`TraceContext::new_root`] rather than picking one arbitrarily.
+/// `docs/known-gaps.md`'s internal-spans entry tracks this as the open half.
+/// `Default` is the all-zero context -- a placeholder for tests/benches that construct a
+/// `Delivered` directly and don't care what it carries, never used by `Fanout` itself (which
+/// always calls [`TraceContext::new_root`] or [`TraceContext::child`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TraceContext {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+}
+
+impl TraceContext {
+    /// A fresh, unrelated context: both `trace_id` and `span_id` newly minted. Used at a trace's
+    /// true origin (a listener's own batches -- `Input::run` never receives a `Delivered`, so it
+    /// has no parent to inherit) and, for now, at every flush-driven emission (see this type's own
+    /// doc comment for why that's a deliberate, tracked gap rather than an oversight).
+    pub fn new_root() -> Self {
+        TraceContext { trace_id: next_id_bytes(), span_id: next_id_bytes() }
+    }
+
+    /// A context for whatever this node emits as a direct, unambiguous result of processing one
+    /// incoming batch carrying `self` -- same `trace_id`, a fresh `span_id`. See this type's own
+    /// doc comment for which node kinds can call this today.
+    pub fn child(&self) -> Self {
+        TraceContext { trace_id: self.trace_id, span_id: next_id_bytes() }
+    }
+}
+
+/// A per-thread SplitMix64, good enough to mint distinct trace/span ids without a new `rand`
+/// dependency or `tracing::span::Id` (a `Registry` recycles those after a span closes, so they're
+/// not a safe source of identity here -- two spans minutes apart could share one). Not
+/// security-relevant: `logit`'s listeners are private by deployment shape
+/// (`docs/OVERVIEW.md`), the same premise `docs/known-gaps.md`'s interner entry leans on, and a
+/// trace id is not a capability.
+fn next_id_bytes<const N: usize>() -> [u8; N] {
+    thread_local! {
+        static STATE: Cell<u64> = const { Cell::new(0x9E37_79B9_7F4A_7C15) };
+    }
+    let mut out = [0u8; N];
+    let mut filled = 0;
+    while filled < N {
+        let mut z = STATE.with(|c| {
+            let z = c.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+            c.set(z);
+            z
+        });
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        for b in z.to_le_bytes() {
+            if filled >= N {
+                break;
+            }
+            out[filled] = b;
+            filled += 1;
+        }
+    }
+    out
+}
 
 /// What travels one graph edge. `Fanout::send`/`send_blocking` pick the variant per send based on
 /// how many consumers that `Fanout` has -- a property of the edge, not of the batch itself.
@@ -28,13 +111,27 @@ pub enum Delivered {
     /// allocated at all. The common case -- every listener's first hop, and every interior edge of
     /// a linear chain (the v0.1 reference config's `statsd_in -> aggregate -> lua -> influxdb_out`
     /// among them).
-    Owned(EventBatch),
+    Owned(EventBatch, TraceContext),
     /// This edge's `Fanout` had more than one consumer: every one of them holds a handle to the
     /// same `Arc`-wrapped batch. Which handle (if any) gets to reclaim the batch without cloning is
     /// decided at the consuming end, by which one happens to be dropped last at runtime -- there is
     /// no privileged branch, and under concurrent consumption more than one can end up cloning; see
     /// `runtime.rs`'s `unwrap_batch`.
-    Shared(Arc<EventBatch>),
+    Shared(Arc<EventBatch>, TraceContext),
+}
+
+impl Delivered {
+    /// This batch's `TraceContext`, borrowed -- read this *before* `unwrap_batch` consumes the
+    /// `Delivered`, to use as the parent for whatever the consuming node emits
+    /// (`TraceContext::child`). Deliberately not part of `unwrap_batch`'s own return type: that
+    /// would force every existing caller (most of which don't propagate anything, and never will
+    /// -- a sink, a flush) to thread a value through it doesn't use.
+    pub fn context(&self) -> TraceContext {
+        match self {
+            Delivered::Owned(_, ctx) => *ctx,
+            Delivered::Shared(_, ctx) => *ctx,
+        }
+    }
 }
 
 /// A node's outbound edges. Fan-in (multiple sources feeding one component) is free -- it's just
@@ -71,36 +168,50 @@ impl Fanout {
         self.consumers.is_empty()
     }
 
-    /// Sends `batch` to every consumer. A closed consumer is silently skipped -- see
-    /// `docs/design/pipeline-graph.md`'s backpressure section: propagating a closed downstream as
-    /// a real shutdown signal is a named open question, not solved here -- but it's no longer
-    /// silent to telemetry: a closed-consumer send counts toward
-    /// `logit.component.events.dropped{reason="closed_consumer"}`.
+    /// Sends `batch` as a new trace root -- see [`Fanout::send_with_context`] for everything
+    /// about delivery mechanics; this is the right call for a node with no single incoming batch
+    /// to inherit a parent context from (every listener; a flush-driven emission, deliberately,
+    /// per [`TraceContext`]'s own doc comment).
+    pub async fn send(&self, batch: EventBatch) {
+        self.send_with_context(batch, TraceContext::new_root()).await
+    }
+
+    /// Sends `batch` to every consumer, as a [`TraceContext::child`] of `parent` -- the right call
+    /// for a node that has exactly one incoming batch to attribute this emission to
+    /// (`Transform::process`/`ScriptWorker::process`'s per-batch loop; not `Transform::flush`,
+    /// which has no single parent to propagate, per [`TraceContext`]'s own doc comment).
+    ///
+    /// A closed consumer is silently skipped -- see `docs/design/pipeline-graph.md`'s backpressure
+    /// section: propagating a closed downstream as a real shutdown signal is a named open
+    /// question, not solved here -- but it's no longer silent to telemetry: a closed-consumer send
+    /// counts toward `logit.component.events.dropped{reason="closed_consumer"}`.
     ///
     /// Exactly one consumer: `batch` moves through as [`Delivered::Owned`], no `Arc` involved at
     /// all -- this is what keeps a linear chain (no fan-out anywhere on it) free of this change's
     /// cost entirely. More than one consumer: wraps `batch` in an `Arc` once, then clones the `Arc`
     /// (a refcount bump, not a deep clone) for every consumer but the last, which gets it moved --
     /// saving one atomic increment/decrement pair, not a structural privilege (see
-    /// [`Delivered::Shared`]'s doc comment).
-    pub async fn send(&self, batch: EventBatch) {
+    /// [`Delivered::Shared`]'s doc comment). Every consumer gets the *same* child context -- one
+    /// batch forking into several downstream branches is still one emission, not several.
+    pub async fn send_with_context(&self, batch: EventBatch, parent: TraceContext) {
         let Some((last, rest)) = self.consumers.split_last() else { return };
         let n = batch.events.len();
         self.record_send(n);
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
+        let ctx = parent.child();
         if rest.is_empty() {
-            if last.send(Delivered::Owned(batch)).await.is_err() {
+            if last.send(Delivered::Owned(batch, ctx)).await.is_err() {
                 self.record_dropped_on_close(n);
             }
             return;
         }
         let batch = Arc::new(batch);
         for tx in rest {
-            if tx.send(Delivered::Shared(batch.clone())).await.is_err() {
+            if tx.send(Delivered::Shared(batch.clone(), ctx)).await.is_err() {
                 self.record_dropped_on_close(n);
             }
         }
-        if last.send(Delivered::Shared(batch)).await.is_err() {
+        if last.send(Delivered::Shared(batch, ctx)).await.is_err() {
             self.record_dropped_on_close(n);
         }
         drop(timer);
@@ -110,23 +221,30 @@ impl Fanout {
     /// thread rather than as a tokio task (a Lua node -- see
     /// `docs/design/pipeline-graph.md`'s "Thread model" section).
     pub fn send_blocking(&self, batch: EventBatch) {
+        self.send_blocking_with_context(batch, TraceContext::new_root())
+    }
+
+    /// The `blocking_send` equivalent of [`Fanout::send_with_context`] -- see that method for the
+    /// propagation contract.
+    pub fn send_blocking_with_context(&self, batch: EventBatch, parent: TraceContext) {
         let Some((last, rest)) = self.consumers.split_last() else { return };
         let n = batch.events.len();
         self.record_send(n);
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
+        let ctx = parent.child();
         if rest.is_empty() {
-            if last.blocking_send(Delivered::Owned(batch)).is_err() {
+            if last.blocking_send(Delivered::Owned(batch, ctx)).is_err() {
                 self.record_dropped_on_close(n);
             }
             return;
         }
         let batch = Arc::new(batch);
         for tx in rest {
-            if tx.blocking_send(Delivered::Shared(batch.clone())).is_err() {
+            if tx.blocking_send(Delivered::Shared(batch.clone(), ctx)).is_err() {
                 self.record_dropped_on_close(n);
             }
         }
-        if last.blocking_send(Delivered::Shared(batch)).is_err() {
+        if last.blocking_send(Delivered::Shared(batch, ctx)).is_err() {
             self.record_dropped_on_close(n);
         }
         drop(timer);
@@ -156,18 +274,40 @@ mod tests {
     use super::*;
     use logit_core::{AttrMap, MetricKind, Registry, Resource};
 
-    /// `Delivered` had no size assertion at all before the internal-spans costing exercise
-    /// (`docs/known-gaps.md`'s internal-spans entry) went looking for one -- added regardless of
-    /// that exercise's outcome (a prototype `TraceContext` field was measured and reverted; see
-    /// `docs/design/memory.md`'s "Costing internal spans" section for the numbers), because it's
-    /// the guard that should have existed either way. `Owned`'s `EventBatch` (32 bytes: an
-    /// `Arc<Resource>` pointer plus a `Vec<Event>`) is the larger variant, and it fits with no
-    /// separate discriminant byte -- the `Vec`'s non-null pointer gives the compiler a niche to
+    /// `Delivered`'s size, pinned exactly, the same reasoning `crates/logit-core/tests/type_sizes.rs`
+    /// applies to `Event`: a `<=` bound would absorb exactly what this exists to catch. 56, not 32
+    /// -- `TraceContext` (24 bytes: `trace_id` + `span_id`) is now a real, permanent field on every
+    /// variant, not the measured-then-reverted prototype `docs/known-gaps.md`'s internal-spans
+    /// entry originally costed it as (`docs/design/memory.md`'s "Costing internal spans" section
+    /// has that history). `Owned`'s `EventBatch` (32 bytes: an `Arc<Resource>` pointer plus a
+    /// `Vec<Event>`) plus `TraceContext` (24) is the larger variant at 56, and it still fits with
+    /// no separate discriminant byte -- the `Vec`'s non-null pointer gives the compiler a niche to
     /// fold the tag into for free, the same trick that makes `Option<SpanRecord>` cost nothing
     /// over `SpanRecord` (`crates/logit-core/tests/type_sizes.rs`).
     #[test]
-    fn delivered_is_32_bytes_no_wider_than_its_larger_variant() {
-        assert_eq!(std::mem::size_of::<Delivered>(), 32);
+    fn delivered_is_56_bytes_no_wider_than_its_larger_variant() {
+        assert_eq!(std::mem::size_of::<Delivered>(), 56);
+    }
+
+    /// `TraceContext::child` keeps `trace_id`, mints a fresh `span_id` -- the propagation contract
+    /// every `send_with_context`/`send_blocking_with_context` call relies on.
+    #[test]
+    fn child_context_keeps_the_trace_id_and_mints_a_fresh_span_id() {
+        let root = TraceContext::new_root();
+        let child = root.child();
+        assert_eq!(child.trace_id, root.trace_id);
+        assert_ne!(child.span_id, root.span_id);
+    }
+
+    /// Two independently-minted roots should (overwhelmingly likely) differ in both halves --
+    /// not a proof of uniqueness, just a smoke test that `next_id_bytes` isn't returning a
+    /// constant.
+    #[test]
+    fn two_roots_are_not_the_same_context() {
+        let a = TraceContext::new_root();
+        let b = TraceContext::new_root();
+        assert_ne!(a.trace_id, b.trace_id);
+        assert_ne!(a.span_id, b.span_id);
     }
 
     fn batch(n: usize) -> EventBatch {
@@ -249,5 +389,53 @@ mod tests {
             Some(4.0),
             "every event in the batch should count as dropped, not just the batch"
         );
+    }
+
+    /// `send` (no explicit parent) mints a fresh root every call -- the behavior every listener
+    /// and every flush-driven emission relies on.
+    #[tokio::test]
+    async fn send_mints_a_new_root_every_call() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let fanout = Fanout::new(vec![tx]);
+
+        fanout.send(batch(1)).await;
+        fanout.send(batch(1)).await;
+
+        let first = rx.recv().await.expect("should receive").context();
+        let second = rx.recv().await.expect("should receive").context();
+        assert_ne!(first.trace_id, second.trace_id, "unrelated sends should get unrelated traces");
+    }
+
+    /// `send_with_context` keeps the parent's `trace_id` and mints a fresh `span_id` -- the
+    /// propagation contract `run_transform`/`run_lua`'s non-flush paths rely on
+    /// (`crates/logit-pipeline/src/runtime.rs`).
+    #[tokio::test]
+    async fn send_with_context_propagates_the_trace_id_as_a_child_of_the_parent() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]);
+        let parent = TraceContext::new_root();
+
+        fanout.send_with_context(batch(1), parent).await;
+
+        let received = rx.recv().await.expect("should receive").context();
+        assert_eq!(received.trace_id, parent.trace_id);
+        assert_ne!(received.span_id, parent.span_id, "each hop mints its own span id");
+    }
+
+    /// A real fan-out: every branch should see the *same* child context -- one batch forking into
+    /// several downstream consumers is still one emission, not several unrelated ones.
+    #[tokio::test]
+    async fn send_with_context_gives_every_fan_out_branch_the_same_child_context() {
+        let (tx_a, mut rx_a) = mpsc::channel(1);
+        let (tx_b, mut rx_b) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx_a, tx_b]);
+        let parent = TraceContext::new_root();
+
+        fanout.send_with_context(batch(1), parent).await;
+
+        let a = rx_a.recv().await.expect("a should receive").context();
+        let b = rx_b.recv().await.expect("b should receive").context();
+        assert_eq!(a, b, "both branches of one fan-out should carry the identical child context");
+        assert_eq!(a.trace_id, parent.trace_id);
     }
 }
