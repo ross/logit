@@ -41,7 +41,7 @@ explicitly meant to cover**:
 | Logs only (syslog, file tail → forward) | attributes + `log` | 336 B (`MetricList` + `SpanRecord`) |
 | Metrics only (statsd, collectd, scrape → aggregate) | attributes + 1 metric | 184 B, plus ~176 of `MetricList` a `Counter` can't use |
 | Traces only (OTLP → forward) | attributes + `span` | 248 B (`LogRecord` + `MetricList`) |
-| Mixed (the nginx shape — **the only one measured**) | all three | least of any shape |
+| Mixed (the nginx shape — the first one measured) | all three | least of any shape |
 
 Two consequences that matter for how much weight to put on §8:
 
@@ -53,10 +53,12 @@ Two consequences that matter for how much weight to put on §8:
   §8 marks which is which; don't read the ordering as settled for a workload the fixtures don't
   cover.
 
-`crates/logit-bench/src/fixtures.rs` has no logs-only fixture and **no span fixture at all**, so
-nothing here has measured the span path. Broadening that matrix — small synthetic inputs and
-directly-constructed events, no external services — is the prerequisite for settling the items §8
-flags as workload-dependent.
+**Update: the fixture matrix has been broadened.** `crates/logit-bench/src/fixtures.rs` now
+has a logs-only syslog fixture, a wide-JSON log fixture (28 flat fields), a distribution-heavy
+metrics fixture (5 distinct `Distribution` metrics on one event), and a directly-constructed span
+fixture — closing the gap this section used to describe. That unblocks the *measurement* half of
+items 7-9 in §8; it doesn't by itself settle the *sizing* decisions those items still need to make
+(a follow-up pass, still pending). See §1 and §8 for what the new numbers already show.
 
 ## 1. The event model's footprint
 
@@ -106,12 +108,13 @@ trades are not all in the same direction** (see §0):
 | Change | Saves | Real cost | Verdict |
 |---|---:|---|---|
 | smallvec's `union` feature | 16 B | none — it's a feature flag | safe everywhere |
-| `Box` `SpanRecord` (`Option<Box<_>>` is 8 B) | 128 B | +1 alloc per event **that carries a span** | free for logs/metrics; unmeasured for traces |
+| `Box` `SpanRecord` (`Option<Box<_>>` is 8 B) | 128 B | +1 alloc per event **that carries a span** | free for logs/metrics; cheap for traces too (§0's span fixture) |
 | `Box` the `DdSketch` in `MetricKind::Distribution` | ~168 B | +1 alloc per **distribution metric created** | wins for logs/traces, loses for distribution-heavy metrics |
 | Re-pick `AttrMap`'s inline capacity | up to 192 B | spills for events in the new gap | depends on the attribute-count distribution |
 
 All four together take `Event` from 792 bytes to roughly 290. The first two are worth taking on
-their own merits; the last two need evidence the fixtures don't currently provide.
+their own merits; the last two now have real evidence (below, and in §8) but still need the sizing
+pass itself to decide, not just numbers to weigh.
 
 **`Box`ing the `DdSketch` is not free, and an earlier draft of this document said it was.** The
 reasoning was that a sketch "already allocates" — it doesn't, at construction.
@@ -122,17 +125,22 @@ a `kv_metrics` or statsd-timing pipeline, distributions are the common case, not
 this trades 168 bytes per event for an extra allocation per distribution, and which side wins
 depends entirely on the workload.
 
-**`AttrMap`'s inline capacity is the largest single term (384 B) and the easiest to get wrong.**
-Dropping 8 → 4 saves 192 bytes and looks free against the two shapes measured — statsd carries 0-4
-tags (still inline), the nginx path carries 10 (spills either way). But **a plain syslog pipeline
-with no JSON parsing carries 4-6 attributes**, which is inline at 8 and spilling at 4: that change
-would add an allocation per event to an entire workload class the fixtures don't cover. The real
-input is a distribution of attribute counts across representative shapes, which doesn't exist yet.
+**`AttrMap`'s inline capacity is the largest single term (384 B), and now-measured evidence
+argues against shrinking it, not for it.** Four shapes are measured today: statsd (0-4 attributes,
+inline either way), the nginx mixed shape (10, spills at both 8 and 4), a plain logs-only syslog
+line (6 -- `syslog_decode_one_logs_only_line` -- inline at capacity 8, would spill at 4), and a
+wide-JSON log line (32 -- spills regardless of 8 or 4). So among everything measured so far,
+**dropping to 4 only ever costs an allocation (the logs-only case) and never saves one** (the wide
+shape spills either way, and the narrow shapes already fit at 8). That flips the concern this
+section raised speculatively before real numbers existed: shrinking capacity isn't a live
+recommendation until a shape narrower than 4 attributes turns up, which nothing measured is.
 
 Worth noting while re-picking it: a `SmallVec` that has spilled still occupies its full inline
 footprint, so for a consistently-wide workload a plain `Vec` (24 B plus one allocation) is strictly
-better than a `SmallVec` that always spills. "Smaller inline capacity" and "no inline capacity" are
-both on the table; the distribution decides.
+better than a `SmallVec` that always spills -- the wide-JSON shape (32 attributes, one allocation
+either way) is exactly this case, and gets nothing from *either* inline size. "Smaller inline
+capacity" is off the table on current evidence; "no inline capacity, for the wide case specifically"
+is still worth a look.
 
 ## 2. Where the allocations are
 
@@ -144,38 +152,44 @@ line — `crates/logit-bench/tests/allocations.rs`.
 |---|---:|---|
 | `syslog_in` decode 1 line | **1** | just the `Vec<Event>`; every field slices the datagram |
 | `syslog_in` decode 100 lines | **1** | + 5 reallocs from `Vec` growth |
-| `statsd_in` decode 1 line | **8** | see below — tag values are copied, not sliced |
-| `json` parse + merge | **7** | intermediate `AttrMap`, then the merge spills the event's |
+| `syslog_in` decode 1 logs-only line | **1** | plain-text message, no JSON -- same zero-copy shape |
+| `statsd_in` decode 1 line | **2** | fixed -- see below, tag values now slice the datagram too |
+| `json` parse + merge (nginx shape) | **1** | fixed -- see below, was 7 |
+| `json` parse + merge (wide-JSON, 28 keys) | **1** | same fix, confirmed to generalize past a small field count |
 | `kv_metrics` derive 4 metrics | **3** | `MetricList` spill + one `bins` Vec per sketch |
 | `keep` filter to 3 attrs | **0** | 3 attributes fit inline |
 | `aggregate` absorb (after `keep`) | **0** | `SeriesKey` clone stays inline |
 | `aggregate` absorb (no `keep`) | **4** | one per metric — the map no longer fits inline |
 | `aggregate` flush 4 series | **2** | |
-| **full ingest chain, 1 line** | **11** | decode → aggregate |
+| **full ingest chain, 1 line** | **5** | decode → aggregate; was 11 before `json`'s fix |
 | `Event::clone` (nginx shape) | **4** | what each extra fan-out branch costs |
 | `Event::clone` (statsd shape) | **0** | fits entirely inline |
-| `stdio_out` encode 100 events | **1801** | ~18/event |
+| `Event::clone` (distribution-heavy, 5 metrics) | **6** | 1 `MetricList` spill + 1 `bins` Vec per sketch |
+| `Event::clone` (span shape) | **2** | 1 per `Vec` (`events`, `links`) -- every `AttrMap` here stays inline |
+| `stdio_out` encode 100 events | **101** | ~1/event -- fixed, see below, was 1801 |
 | `influxdb_out` encode 100 events | **30** | ~0.3/event — see below |
 
 And the corresponding times:
 
 | Stage | fastest | per event |
 |---|---:|---:|
-| `syslog_in` decode, 100 lines | 22.3 µs | 223 ns |
-| `statsd_in` decode, 100 lines | 34.7 µs | 347 ns |
-| `json` | 584 ns | 584 ns |
-| `kv_metrics` | 250 ns | 250 ns |
-| `keep` | 323 ns | 323 ns |
-| `aggregate` absorb | 561 ns | 561 ns |
-| **full ingest chain** | **2.07 µs** | ~484k lines/s/core |
-| `Event::clone` (nginx / statsd / distribution) | 232 / 85 / 52 ns | |
-| `stdio_out` encode, 100 events | 188 µs | 1.88 µs |
-| `influxdb_out` encode, 100 events | 153 µs | 1.53 µs |
+| `syslog_in` decode, 100 lines | 23.1 µs | 231 ns |
+| `statsd_in` decode, 100 lines | 33.2 µs | 332 ns |
+| `json` | 535 ns | 535 ns |
+| `kv_metrics` | 256 ns | 256 ns |
+| `keep` | 339 ns | 339 ns |
+| `aggregate` absorb | 581 ns | 581 ns |
+| **full ingest chain** | **2.08 µs** | ~481k lines/s/core |
+| `Event::clone` (nginx / statsd / distribution) | 228 / 87 / 51 ns | |
+| `stdio_out` encode, 100 events | 124 µs | 1.24 µs |
+| `influxdb_out` encode, 100 events | 159 µs | 1.59 µs |
+| `lua` (proxy / `to_table`) | 1.07 / 2.02 µs | |
 
-> Every row above comes from **one** `script/bench` run, deliberately: an earlier run of the same
-> benchmarks on a busier machine was uniformly ~20% slower (`json` 748 ns, `keep` 404 ns, the full
-> chain 2.61 µs), so mixing rows across runs would invent differences that aren't there. Compare
-> rows within the table freely; treat absolute values as this machine on this day.
+> Every row above comes from **one** `script/bench` run, deliberately: runs on a busier machine have
+> come out uniformly ~20% slower across every unchanged benchmark, so mixing rows across runs would
+> invent differences that aren't there. Compare rows within the table freely; treat absolute values
+> as this machine on this day. This table was refreshed once, in one sitting, after landing the
+> `json`/`statsd_in`/`stdio_out`/Lua-boundary fixes below -- every row reflects the current code.
 
 ### The headline result: the output encoder *was* the bottleneck, and has been fixed
 
@@ -199,46 +213,60 @@ None of it was about the data model. It was all in how lines were built:
 - `allocate_timestamp` built a fresh `Vec` for its path-compression walk, allocating on every
   timestamp collision — and a statsd multi-value datagram collides on essentially every line.
 
-**Now 30 allocations per 100-event batch, from 18,024 — a 600× reduction, and 2.6× faster** (1.53 µs
-per event against 4.96 µs, adjusted for the ~20% run-to-run shift the note above describes).
-`influxdb_out` is now *faster* than the `stdio_out` debug sink, where it used to be 2.1× slower.
-The changes were mechanical and stayed inside `influxdb.rs`: escape and format straight into reused
-buffers held on the encoder, merge-join the resource and event attribute maps instead of cloning
-and re-inserting, borrow the series key for the lookup and only allocate it on a miss, and reuse
-the path-compression scratch buffer.
+**Now 30 allocations per 100-event batch, from 18,024 — a 600× reduction.** The changes were
+mechanical and stayed inside `influxdb.rs`: escape and format straight into reused buffers held on
+the encoder, merge-join the resource and event attribute maps instead of cloning and re-inserting,
+borrow the series key for the lookup and only allocate it on a miss, and reuse the path-compression
+scratch buffer. `stdio_out` got the identical treatment shortly after (§2's table, item 5 in §8):
+1801 → 101 allocations per 100 events, ~18×.
 
-What's left is per-*batch*, not per-event: one `Bytes` for the finished body, one `String` key per
-distinct series on first sighting, and growth of the per-series timestamp maps. Nothing scales with
-event count any more, which is the property to protect —
-`crates/logit-bench`'s `influx_encode_100_events` will catch it if that stops being true.
+What's left in both is per-*batch*, not per-event: `influxdb_out` keeps one `Bytes` for the finished
+body, one `String` key per distinct series on first sighting, and growth of the per-series
+timestamp maps; `stdio_out`'s residual 101 is almost entirely one `format_rfc3339_utc` call per
+event, outside this file's scope. Neither scales with event count any more, which is the property
+to protect — `influx_encode_100_events`/`stdio_encode_100_events` will catch it if that stops being
+true.
 
-**With that gone, the ingest chain is the cost again**: 11 allocations and 2.07 µs to take one
-access-log line from datagram to aggregated window, against 0.3 allocations and 1.53 µs to encode
-it. `json` is now the single most allocation-hungry stage at 7, and `Event::clone`'s 4 per extra
-fan-out branch is no longer dwarfed by anything. The recommendations in §8 are ordered accordingly.
+On allocation count the two are no longer close (30 vs. 101), but **wall-clock is closer, and not
+always in the direction the allocation count would suggest**: in the run §2's table comes from,
+`stdio_out` (1.24 µs/event) actually edged out `influxdb_out` (1.59 µs/event) despite allocating
+~3.4× more — a reminder that allocation count and wall-clock time are related, not interchangeable,
+and this doc tracks both for exactly that reason. Don't read either single run as a settled ranking
+between the two encoders.
 
-### Zero-copy: where it holds, where it doesn't
+**With the encoder no longer dominant, the ingest chain is the cost again — and it dropped too**:
+`json`'s own fix (item 4) took the full ingest chain from 11 allocations to 5. `kv_metrics` is now
+the single most allocation-hungry ingest-side stage at 3, and `Event::clone`'s 4 per extra fan-out
+branch is comparable to or larger than any individual ingest stage. The recommendations in §8 are
+ordered accordingly.
+
+### Zero-copy: where it holds
 
 [data-model.md](data-model.md) commits to "`bytes::Bytes` everywhere strings and blobs appear," so
 that a field parsed out of a socket read buffer is a refcounted slice of that buffer rather than a
-fresh allocation. Measured, that commitment is **kept by `syslog_in` and broken by `statsd_in`**.
+fresh allocation. Measured, that commitment is **now kept by both inputs** — it used to be broken
+by `statsd_in`, fixed since (item 3).
 
-`syslog_in` is the exemplar. `slice_of` reconstructs a `Bytes` for each extracted field by pointer
-arithmetic back into the datagram, so decoding a line costs exactly one allocation (the `Vec`) no
-matter how many fields it yields. `crates/logit-bench`'s `syslog_fields_share_the_datagram_allocation`
-asserts this structurally, not just by count. `json` continues it: `ValueSeed` deserializes
-straight into `Value` with no intermediate `serde_json::Value` tree, and `borrowed_str_bytes` keeps
-an unescaped string a slice of the message buffer (falling back to a copy only for a string serde
-had to unescape, which genuinely lives elsewhere).
+`syslog_in` is the exemplar, and was the reference implementation for `statsd_in`'s fix. `slice_of`
+reconstructs a `Bytes` for each extracted field by pointer arithmetic back into the datagram, so
+decoding a line costs exactly one allocation (the `Vec`) no matter how many fields it yields.
+`crates/logit-bench`'s `syslog_fields_share_the_datagram_allocation` asserts this structurally, not
+just by count. `json` continues it: `ValueSeed` deserializes straight into `Value` with no
+intermediate `serde_json::Value` tree, and `borrowed_str_bytes` keeps an unescaped string a slice of
+the message buffer (falling back to a copy only for a string serde had to unescape, which genuinely
+lives elsewhere).
 
-`statsd_in` does not. It builds attribute values with `attributes.insert(k, v)` on a `&str`, which
-goes through `impl From<&str> for Value` → `Value::str` → `Bytes::from(String)` — a fresh copy of
-bytes already sitting in the datagram. Then `build_event`'s `attributes.clone()` promotes each to a
-shared `Bytes`, allocating again. **Two allocations per tag**, which is six of the eight in that
-row above; the other two are a `Vec<Event>` per line plus one for the batch. The fix is to give
-`statsd.rs` the `slice_of` treatment `syslog.rs` already has.
-`statsd_tag_values_are_copied_not_sliced` pins this as a currently-true fact so it can't be
-assumed away; when someone fixes it, that test should fail and be inverted.
+`statsd_in` used to build attribute values with `attributes.insert(k, v)` on a `&str`, which went
+through `impl From<&str> for Value` → `Value::str` → `Bytes::from(String)` — a fresh copy of bytes
+already sitting in the datagram — and then `build_event`'s `attributes.clone()` promoted each to a
+shared `Bytes`, copying a second time. That was six of the eight allocations in the pre-fix row.
+Now it uses the same `slice_of` pointer-arithmetic reconstruction `syslog.rs` does, and
+`crates/logit-bench`'s `statsd_tag_values_share_the_datagram_allocation` asserts it structurally,
+the same way the syslog test does — it replaced the old
+`statsd_tag_values_are_copied_not_sliced`, exactly as that test's own doc comment said would happen
+once someone fixed it. The 2 remaining allocations are a `Vec<Event>` per line plus one for the
+batch, the same irreducible pair `syslog_in` has, just split across two `Vec`s due to a grammar
+difference (statsd's multi-value form).
 
 ### Retention: what pins what
 
@@ -263,43 +291,91 @@ What is shared today:
 - **String and blob data** — `Bytes`, refcounted; a clone is an atomic increment.
 - **Attribute keys and metric names** — interned to a 4-byte `Symbol` (see §4).
 
-What is copied: **everything else, per fan-out branch**. `Fanout::send` deep-clones the whole
-`EventBatch` for every consumer but the last. For the nginx shape that is 4 allocations plus a
-792-byte memcpy per event per extra branch — 272 ns, about 10% of the ingest chain.
+What is copied, and when, is no longer a flat rule — it depends on fan-out shape (below). What never
+changes regardless: a mutation on one branch of a fan-out is structurally invisible to a sibling
+branch, with nothing extra to design or maintain for that guarantee. `runtime.rs`'s
+`a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` is the test that pins it, and
+it's the thing every change described below was built to never regress — including through three
+rounds of correcting an initial performance claim, per that section.
 
-That clone is not incidental; it is what makes branch isolation free. Two branches of a fan-out
-never share an `Event`, so a mutation on one is structurally invisible to the other, with nothing
-to design or maintain for that guarantee. `runtime.rs`'s
-`a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` is the test that pins it.
+For scale: the deep clone this section used to describe unconditionally (4 allocations, a 792-byte
+memcpy per event per extra branch, 228 ns, ~11% of the ingest chain) is still exactly what a
+mutating branch pays when it has to.
 
-### The `Arc<EventBatch>` copy-on-write change
+### The `Arc<EventBatch>` copy-on-write change — done, and genuinely more subtle than first assumed
 
-Recommended, not implemented. Put `Arc<EventBatch>` on the channels and have each consumer do:
+The design this section originally recommended: put `Arc<EventBatch>` on the channels, and have
+each consumer do `Arc::try_unwrap(batch).unwrap_or_else(|shared| (*shared).clone())`. Landed in
+three rounds (`docs/adr/0016-arc-eventbatch-copy-on-write.md`, PR #33) — worth reading in full for
+how much the initial "strictly no worse anywhere" framing had to be corrected against real
+measurement. The honest result, by fan-out shape:
 
-```rust
-let batch = Arc::try_unwrap(batch).unwrap_or_else(|shared| (*shared).clone());
-```
+| Fan-out shape (2 consumers) | Allocations | vs. `main`'s flat 5 |
+|---|---:|---|
+| Single consumer (any kind) | **0** | strictly better |
+| Both `Output` | **1** | strictly better |
+| One `Output`, one `Transform`/Lua | **1 or 6** | scheduling-dependent, either direction |
+| Both `Transform`/Lua-style, no `Output` | **6** | 1 worse, always |
 
-The properties that make this the right shape:
+**What's unconditionally better**: a single-consumer edge — the common case, every shipped
+listener's first hop, and every interior edge of a linear chain — costs nothing, via a
+`Delivered::Owned | Delivered::Shared(Arc<_>)` payload that skips the `Arc` entirely when there's
+only one consumer. This fixed a regression the first draft introduced (wrapping in `Arc`
+unconditionally, which cost a single-consumer edge one allocation for nothing). An all-`Output`
+fan-out also becomes unconditionally free past the one `Arc::new`: `Output::send` was changed to
+take `&EventBatch` instead of an owned one (round two), so a read-only sink branch never calls
+`Arc::try_unwrap` at all — it just borrows through the `Arc`, regardless of how many sibling
+branches still hold their own handle. This *is* the "every read-only branch pays one atomic, not a
+clone" saving originally claimed, delivered — for this shape.
 
-- **A single-consumer edge — the common case — becomes free.** `try_unwrap` succeeds when nobody
-  else holds a reference, handing back the owned batch with no copy at all.
-- **A read-only consumer on a fan-out branch stops copying entirely.** Every sink is read-only:
-  both encoders take `&EventBatch`. In the reference config, the `tap`/`trimmed` fan-out would go
-  from one full batch clone to one atomic increment.
-- **A mutating branch pays exactly what it pays today.** There is no case where this is worse.
-- **`Transform::process` does not have to change**, so no component is touched.
-- Prior art: Vector's `LogEvent` is an `Arc<Inner>` with copy-on-write for the same reason.
+**What's genuinely racy, not deterministic in either direction**: a fan-out with one `Output`
+branch and one mutating (`Transform`/`ScriptWorker`) branch — the actually-common shape, matching
+the nginx reference config's `tap`/`trimmed` split — costs **1 or 6**, decided by real tokio
+scheduling, never something in between and never `main`'s flat 5. `run_output` drops its own `Arc`
+handle the instant `output.send()` returns, before its next receive; whether the mutating sibling's
+`unwrap_batch` call finds that handle already gone (free, cost 1) or still alive (clone, cost 6)
+depends on which finishes first — genuinely reachable both ways, confirmed by two tests that
+manually pin each ordering (`fanout_send_mixed_output_and_transform_consumers[_when_output_finishes_first]`).
+In production, `Output::send` typically does real I/O, measurably slower than a `Transform`'s local
+processing, so 6 is the likelier practical outcome — but that's an expectation about typical
+latencies, not something the design guarantees.
 
-Granularity matters here. Putting the `Arc` around the *batch* costs one atomic per batch. Putting
-it around each `Event` would cost an allocation and an atomic *per event* — worse than what it
-replaces for the single-consumer case. Don't do that.
+**What doesn't close at all**: a fan-out with no `Output` branch — two `Transform`s, or a
+`Transform` and a Lua stage, sharing one node. Both sides need to mutate, so neither can borrow;
+this is exactly round one's `1 + (N-1) × clone`, deterministically 6 for two consumers — one
+allocation worse than `main`, with no racy path to anything better, since nothing in this shape
+ever finishes without competing for the free unwrap. Closing it would need widening
+`Transform`/`ScriptWorker` past what they need to do their job (mutate/consume an owned `Event`),
+which isn't on the table.
+
+**A fix for the racy case's raciness was sketched and deliberately not taken — and it's narrower
+than it first looks.** For exactly one consumer of each kind, making `Fanout` aware of which is
+which and giving the mutating one an unconditional direct clone (bypassing `Arc` entirely) would
+turn 1-or-6 into a fixed 6 — trading the chance at 1 for predictability. That does **not**
+generalize past two consumers: worked through directly for 2 borrowing + 2 owning, the "aware"
+design's own cost turns on an unresolved internal choice (direct clone per owning consumer costs
+11; a second dedicated `Arc` for the owning group to race over costs 12, worse, since that second
+`Arc::new` outweighs what the race saves) — while *today's* racy design already reaches as low as 6
+for that same shape, whenever every `Output` branch happens to finish first. So an aware fix would
+fix the current *worst* case as the *guaranteed* one, not strictly dominate what exists, once
+either group grows past one member. Left as an open design problem, not a specified direction — see
+the ADR's Alternatives for the full working.
+
+Two things that didn't change through any of this:
+
+- **`Transform::process` never had to change** for the `Arc` plumbing itself — the wrap/unwrap
+  boundary sits entirely inside `logit-pipeline`. `Output::send`'s signature did change
+  (`&EventBatch`, not owned), the one trait-level change this design needed.
+- Granularity: putting the `Arc` around the *batch*, not each `Event`, costs one atomic per batch
+  rather than one allocation and one atomic *per event* — worse than what it replaces for the
+  single-consumer case. Prior art for the batch-level choice: Vector's `LogEvent` is an
+  `Arc<Inner>` with copy-on-write for the same reason.
 
 A second, separable change: `Transform::process(&mut self, &Arc<Resource>, &mut Event) -> bool`
 plus `Vec::retain_mut` in `run_transform` would remove one full 792-byte `Event` memcpy per node
 hop and one `Vec` allocation per batch per node. Nothing is lost — the trait already can't emit
-more than one event per input. Both changes deserve their own ADR; the signature one gets more
-expensive to make with every transform that lands.
+more than one event per input. Deserves its own ADR; gets more expensive to make with every
+transform that lands (§8 item 11).
 
 ## 4. Interning: the bargain, and its bounds
 
@@ -364,16 +440,16 @@ doesn't control. If that ever ships, revisit this section first, because the ret
 `SeriesKey`, the Lua proxy, and the planned wire dictionary are all written against "symbols are
 eternal."
 
-If a diagnostics facility lands anyway (the `tracing` migration in
-[known-gaps.md](../known-gaps.md)), an `interner::len()` gauge is nearly free to expose at that
-point and would make this observable instead of silent. Worth doing *then*, not worth a change of
-its own now.
+`interner::len()` now exists (added alongside the `AttrMap::get` fix below, to let a test
+assert directly that a miss doesn't grow the table) — if a diagnostics facility lands (the
+`tracing` migration in [known-gaps.md](../known-gaps.md)), wiring it into a gauge is now a small
+addition rather than a new one.
 
-### What is *not* the risk: failed lookups
+### What was *not* the risk: failed lookups — fixed anyway
 
-`AttrMap::get` interns rather than doing a lookup-only probe, so in principle a miss adds a key no
-event carries. In practice this is not a growth path. There are exactly three production `get` call
-sites in the tree:
+`AttrMap::get` used to intern rather than do a lookup-only probe, so in principle a miss added a
+key no event carries. In practice this was never a growth path. There were exactly three
+production `get` call sites in the tree:
 
 - `kv_metrics.rs` (twice), keyed by `m.field` -- a **config** string, fixed at startup. Hit or
   miss, it's interned once and never again.
@@ -381,11 +457,11 @@ sites in the tree:
   in the script, so also a bounded set. Unbounded only for a script that builds keys out of event
   data, which is unusual and is trusted config besides.
 
-So `AttrMap::get`'s interning is a **CPU** problem, not a memory one: it pays a hash plus a
-concurrent-map probe on the hot path for a lookup that could be cheaper, and `lasso`'s
-non-interning `get()` would avoid it. Worth fixing, but as an efficiency cleanup and a
-defence-in-depth tightening -- not as the memory fix this section is really about. (An earlier
-draft of this document had that backwards.)
+So `AttrMap::get`'s interning was always a **CPU** problem, not a memory one -- a hash plus a
+concurrent-map probe on the hot path for a lookup that could be cheaper. Fixed regardless (§8 item
+3): `AttrMap::get`/`remove` now use `interner::lookup`, a non-interning probe, falling through to
+the existing `binary_search_by_key` only on a hit. Pure efficiency win, no behavior change --
+`insert` still calls `intern`, since it may legitimately need to mint a new symbol.
 
 
 ### The other unbounded structure
@@ -507,88 +583,95 @@ might regress a workload the fixtures don't cover.
 ### Done
 
 1. ~~**Fix the InfluxDB encoder's allocation churn.**~~ **Done** — 18,024 allocations per 100-event
-   batch to 30, and 2.6× faster (§2). Was the single largest cost in the pipeline; now smaller than
-   ingest. Workload-independent: it helps any config with an `influxdb_out`.
+   batch to 30 (§2). Was the single largest cost in the pipeline; now smaller than ingest.
+   Workload-independent: it helps any config with an `influxdb_out`.
+2. ~~**Make `AttrMap::get` non-interning.**~~ **Done** — `AttrMap::get`/`remove` now probe via
+   `interner::lookup` instead of `intern`, closing both the CPU cost and the theoretical growth
+   path in one change (§4). Also added `interner::len()` as a side effect, needed to test the fix.
+3. ~~**Give `statsd_in` the `slice_of` treatment.**~~ **Done** — 8 → 2 allocations per line (§2's
+   zero-copy section). `statsd_in` now keeps the same zero-copy promise `syslog_in` always has.
+4. ~~**Trim `json`'s allocations.**~~ **Done, further than scoped** — 7 → 1 for the nginx shape,
+   confirmed to hold at 1 for a 28-field wide-JSON line too (§2). The original plan was a
+   checkpoint-and-rollback scheme over the intermediate `AttrMap`; measuring first showed the real
+   cost was `collect_attrmap`'s per-key owned `String` allocation (`next_key::<String>()`), not the
+   intermediate map itself — so the actual fix interns keys straight off the deserializer instead.
+   Worth internalizing: the guess this section made from the nginx number alone (properly
+   caveated at the time as a guess) was wrong about the mechanism, and measuring the fix against a
+   wider shape is what caught that.
+5. ~~**Give `stdio_out` the same treatment `influxdb_out` got.**~~ **Done** — 1801 → 101
+   allocations per 100 events, ~18× (§2). Merge-joins the resource/event attribute maps the same
+   way `influxdb_out` does, and formats straight into reused buffers instead of `format!` per
+   value.
+6. ~~**Reduce the Lua boundary's allocations.**~~ **Done** — 21 → 9 per event round trip. Caching
+   `process`/`flush` (via `mlua::RegistryKey`, resolved once at load rather than looked up from
+   `_G` per call), caching the `AttrsProxy` userdata per event instead of rebuilding it per
+   attribute access, and taking `mlua::String` instead of an owned `String` in both metamethods.
+   Two real edge cases came out of review and were closed rather than left as caveats: a script
+   that stashes `event.attributes` across a return boundary now fails loudly (in this crate's own
+   voice, not mlua's raw error) instead of silently working with a disconnected copy, and a
+   `flush` global that exists but isn't a function is now a load-time error — matching
+   `process`'s existing `MissingProcess` — instead of being silently treated as "no `flush()`" and
+   quietly losing every flush tick's events forever.
+7. ~~**`Arc<EventBatch>` copy-on-write on channels.**~~ **Done, with real caveats** (§3) — landed
+   over three rounds (`docs/adr/0016-arc-eventbatch-copy-on-write.md`), each correcting an
+   overclaim the previous one made. Single-consumer edges and all-`Output` fan-outs are
+   unconditionally better (0 and 1 allocations respectively, both strict wins). A fan-out mixing
+   one `Output` branch with one mutating branch is genuinely racy — 1 or 6, decided by scheduling,
+   never `main`'s flat 5 either way. A fan-out with no `Output` branch at all doesn't improve —
+   still 6, one worse than `main`, deterministically. Read §3 in full before citing a single number
+   from this item; which one applies depends entirely on fan-out shape.
 
-### Safe regardless of workload mix
+### Blocked on a broader fixture matrix — now unblocked for measurement, not yet decided
 
-No tradeoff to measure — each is a strict improvement for every shape in §0's table.
+The fixture matrix these needed now exists (§0): logs-only, wide-JSON, distribution-heavy, and span
+shapes are all measured. What's missing is the sizing pass itself — deciding what to do with that
+evidence.
 
-2. **Enable smallvec's `union` feature.** 16 bytes off every `Event` for a one-line feature flag.
-3. **Make `AttrMap::get` non-interning.** Drops a hash and a concurrent-map probe from every
-   attribute lookup on the hot path, in every component that reads an attribute. Also closes a
-   theoretical interner growth path, though every production call site is config- or script-keyed
-   today, so that half is defence in depth rather than a live bug (§4).
-4. **`Arc<EventBatch>` copy-on-write on channels** (§3). Strictly no worse anywhere; frees every
-   read-only fan-out branch. Ranks higher than it did on nginx evidence alone, for two reasons: it
-   is entirely payload-shape-independent, and it is worth *most* to the workload least represented
-   in the fixtures — a `SpanRecord` holds `Vec<SpanEvent>`/`Vec<SpanLink>` and each `SpanEvent`
-   carries its own 400-byte `AttrMap`, so span-bearing events are far more expensive to deep-clone
-   than anything measured here. Needs an ADR, not because it's contentious but because it changes a
-   trait-adjacent contract.
-5. **Trim `json`'s 7 allocations** — the most allocation-hungry single stage, and broader than its
-   nginx origin suggests: JSON-bodied log lines are common to most log-oriented pipelines, not a
-   quirk of this one. Most of it is the intermediate `AttrMap` built so a malformed object can't
-   half-populate the event, plus the spill when the merged set passes 8 entries. The intermediate is
-   load-bearing for correctness, so this wants a checkpoint-and-rollback or a reusable scratch map
-   rather than deletion.
-6. **Give `statsd_in` the `slice_of` treatment.** Removes 6 of its 8 allocations per line and
-   restores the zero-copy property the data model claims (§2). Strictly an improvement; narrower
-   reach than the items above only because it helps statsd inputs specifically.
-
-### Blocked on a broader fixture matrix
-
-Each of these could regress a workload the current fixtures can't see. §0 describes what's missing;
-the prerequisite is small synthetic inputs and directly-constructed events covering logs-only,
-wide-JSON logs, metrics-only, distribution-heavy metrics, and spans — **no external services**.
-
-7. **`Box` `SpanRecord`.** 128 bytes off every event, free for logs-only and metrics-only. Needs a
-   span fixture to confirm the cost for a tracing pipeline is what it looks like (one allocation on
-   an event that already allocates for its span's `events`/`links`).
-8. **`Box` the `DdSketch`.** 168 bytes off every event, but +1 allocation per distribution created
-   — a win for logs and traces, a loss for distribution-heavy metrics. Needs both shapes measured
-   before it can be decided at all (§1).
-9. **Re-pick `AttrMap`'s inline capacity.** The largest single term at 384 bytes, and the easiest
-   to get wrong: 8 → 4 looks free against the measured shapes and would add an allocation per event
-   to a plain-syslog pipeline. Needs an attribute-count distribution across shapes, and should
-   consider dropping inline storage entirely for consistently-wide workloads (§1).
+8. **Re-pick `AttrMap`'s inline capacity — now measured, and the evidence argues against shrinking
+   it.** Among all four shapes now measured (statsd 0-4, nginx 10, logs-only 6, wide-JSON 32),
+   dropping capacity 8 → 4 would only ever cost an allocation (the logs-only case, currently free
+   at 8) and never save one (the wide shape spills at 8 either way). See §1 for the full argument —
+   this recommendation has effectively inverted from "investigate shrinking it" to "current
+   evidence says don't, until a narrower shape than 4 attributes turns up."
+9. **`Box` `SpanRecord`.** 128 bytes off every event, free for logs-only and metrics-only. The span
+   fixture confirms `Event::clone` for a span is already cheap (2 allocations, everything else
+   inline) — still needs the sizing pass itself to decide whether boxing is worth taking.
+10. **`Box` the `DdSketch`.** 168 bytes off every event, but +1 allocation per distribution
+    created. The distribution-heavy fixture (5 metrics) now gives this a real "loses" case to
+    weigh (`Event::clone` there is 6 allocations, one per sketch) against the logs/traces "wins"
+    case — still needs the sizing pass to decide, not just the numbers to weigh.
 
 ### Later — needs a reason first
 
-10. **`Transform::process(&mut Event) -> bool`.** Removes a 792-byte memcpy per node hop. Gets more
+11. **`Transform::process(&mut Event) -> bool`.** Removes a 792-byte memcpy per node hop. Gets more
     expensive to decide with every transform that lands, so decide it early even if applied late.
-11. **`AttrMap` accessors keyed by `Symbol`,** eliminating the `resolve` → `intern` round trips
-    still left in `json`, `keep`, and `stdio_out`. (`influxdb_out`'s are gone — the merge-join in
-    `render_tag_suffix` removed them.)
-12. **Byte-aware channel bounds** (§5), before a TCP or file-tail input makes batch size unbounded
+    Touches `runtime.rs`, the same file item 7's three rounds just settled — a fresh reason to
+    check `unwrap_batch`'s current shape before starting, not a blocker any more.
+12. **`AttrMap` accessors keyed by `Symbol`,** eliminating the remaining `resolve` → `intern` round
+    trips. Narrower than it used to be: `influxdb_out`'s and `stdio_out`'s are both gone now (both
+    encoders merge-join instead of clone-and-reinsert). What's left is `json`'s final merge into
+    `event.attributes` (the per-key intern step itself is already gone; only the map insertion
+    still takes `&str`) and `keep`'s rebuild.
+13. **Byte-aware channel bounds** (§5), before a TCP or file-tail input makes batch size unbounded
     in practice.
-13. **Reduce the Lua boundary's 21 allocations/event** — cache the `process` function instead of a
-    `_G` lookup per event, cache the `AttrsProxy` userdata instead of building one per attribute
-    access, take `mlua::String` rather than `String` in the metamethods. Worth doing when a Lua
-    stage is actually on a hot path.
-14. **Give `stdio_out` the same treatment `influxdb_out` just got** — at ~18 allocations per event
-    it is now the more wasteful of the two encoders, and the fix is nearly the same. Deliberately
-    low: it's a debug sink for a human reading a terminal, not a throughput path.
+14. **Enable smallvec's `union` feature.** 16 bytes off every `Event` for a one-line feature flag.
+    Bundled with items 8-10 above as one sizing pass rather than done alone, since all four touch
+    the same `Event`/`MetricKind`/`SpanRecord` definitions.
 15. **~~Bound the interner~~ — accepted as-is, see §4.** Listeners are private, so the namespace is
     user-controlled; the metric store and `logit`'s own aggregation window both fail earlier and
     harder under the same abuse. Revisit only if a listener stops being private.
 
-### Settled by this work
-
-[known-gaps.md](../known-gaps.md) recorded that the event proxy was chosen over full table
-conversion on reasoning alone, with a benchmark outstanding. Measured: **1.51 µs/event through the
-proxy against 2.63 µs for `to_table`** — the proxy is ~1.7× faster, and the gap widens for scripts
-that touch few attributes, since `to_table` converts everything whether the script reads it or not.
-The design decision in [lua-api.md](lua-api.md) stands, now with a number behind it.
-
 ## Open questions
 
 - **What is the real attribute-count distribution** across the inputs `logit` will actually see?
-  Every `AttrMap` sizing argument here reasons from two examples, and §1 shows that's not enough to
-  decide even the direction of the change. The largest single term in `Event` is blocked on this.
-- **What do the unmeasured workload shapes actually cost?** Logs-only, wide-JSON logs,
-  distribution-heavy metrics, and traces are all in scope (§0) and none are in the fixtures. Three
-  of §8's sizing items can't be settled until they are, and the span path has no coverage at all.
+  Partly answered: four representative shapes are now measured (statsd 0-4, nginx 10, logs-only 6,
+  wide-JSON 32), enough to show shrinking `AttrMap`'s inline capacity has no measured upside (§1,
+  §8 item 8). Still missing: real production telemetry to confirm these synthetic shapes are
+  actually representative, not just plausible.
+- **What do the unmeasured workload shapes actually cost?** Answered for allocation/clone cost:
+  logs-only, wide-JSON, distribution-heavy metrics, and spans are all now fixtured and measured
+  (§0, §2). Not yet answered: the *sizing* decisions those numbers feed (§8 items 8-10) still need
+  the pass itself, which hasn't run.
 - **Does jemalloc actually flatten RSS for this workload?** Partly answered. A short soak of the
   reference config against the real nginx stack — 60,000 requests through
   `syslog_in → json → kv_metrics → {stdio_out, keep → aggregate → influxdb_out}` — held RSS at
@@ -598,7 +681,7 @@ The design decision in [lua-api.md](lua-api.md) stands, now with a number behind
   the drift ADR 0015 is really about takes days, not minutes, to show up. The escape hatch exists
   so that comparison stays one build away.
 - **Is there a compact `Event` representation** worth having — one that doesn't reserve span and
-  sketch space on a bare log line? Boxing the rare variants (§8 items 7-8) is the cheap answer, but
+  sketch space on a bare log line? Boxing the rare variants (§8 items 9-10) is the cheap answer, but
   it only pays where the variant really is rare, and "rare" is workload-dependent: a sketch is the
   common case in a statsd-timing pipeline and absent entirely from a logs-only one. If the broader
   fixtures show no single boxing choice wins across shapes, that's the signal this needs a

@@ -71,17 +71,20 @@ already built that have a known, accepted rough edge.
 - **Fan-out/fan-in is unbuffered/uncoordinated** — the component graph (ADR 0009,
   [pipeline-graph.md](design/pipeline-graph.md)) makes arbitrary fan-out/fan-in the normal case (a
   sink shared by two branches, one listener feeding several filters), but a stalled sink backs up
-  every branch sharing an upstream with it, not just its own, and each extra consumer of a node
-  costs a full `EventBatch` clone. `Arc<EventBatch>` with copy-on-write is the identified future
-  fix; a per-edge `on_full: block | drop` policy for the backpressure question is an open one, not
-  yet designed.
+  every branch sharing an upstream with it, not just its own. A per-edge `on_full: block | drop`
+  policy for the backpressure question is an open one, not yet designed — unaffected by the
+  allocation work below, which is about the clone cost, not the backpressure semantics.
 
-  Now measured ([memory.md](design/memory.md)): that clone is 4 allocations and a 792-byte memcpy
-  per event per extra branch, 272 ns — about 10% of the 2.61 µs it takes to ingest a line, and
-  roughly 1/16th of what encoding one event for InfluxDB costs. So the copy-on-write change is
-  still worth making (it's strictly no worse anywhere, and frees every read-only sink branch
-  entirely), but it is *not* the pipeline's main cost, which is what this entry previously implied.
-  The encoder is.
+  ~~Each extra consumer of a node costs a full `EventBatch` clone.~~ **Closed, with a real residual
+  gap.** `Arc<EventBatch>` copy-on-write landed (`docs/adr/0016-arc-eventbatch-copy-on-write.md`,
+  three rounds, each correcting an overclaim the last one made — worth reading for that alone). A
+  single-consumer edge (most edges in the shipped config) and an all-`Output` fan-out are both now
+  unconditionally free or near-free (0 and 1 allocations). What's left, exactly as measured, not as
+  originally hoped: a fan-out mixing one `Output` branch with one mutating branch costs 1 *or* 6
+  allocations depending on real scheduling, never a fixed number; a fan-out with no `Output` branch
+  at all still costs a full clone (6, one worse than the original code), with no path to
+  improvement under the current design. See [memory.md](design/memory.md) §3 for the complete,
+  shape-by-shape account — there is no single number for "what fan-out costs now."
 - **A Lua component's `flush()` has no resource of its own at a timer tick** — unlike an `aggregate`
   component, which tracks its own per-resource windows, a Lua component's flushed events are
   stamped with whichever resource it most recently saw on a real batch
@@ -90,12 +93,22 @@ already built that have a known, accepted rough edge.
   component has more than one upstream resource.
 - ~~**A benchmark of the event proxy against plain table conversion is still outstanding**~~ —
   **closed.** Measured in `crates/logit-bench/benches/pipeline.rs` (`lua::proxy` vs
-  `lua::to_table`): 1.51 µs/event through the proxy against 2.63 µs for `to_table`, ~1.7× in the
-  proxy's favour, widening for scripts that read few attributes. The design commitment in
-  [lua-api.md](design/lua-api.md) stands, now with a number behind it. What the same measurement
-  did turn up is that the boundary costs 21 allocations per event (a `_G` lookup of `process` per
-  event, a fresh `AttrsProxy` userdata per attribute access, a Rust `String` per metamethod key) —
-  recorded in [memory.md](design/memory.md)'s recommendations, not yet fixed.
+  `lua::to_table`): the proxy is faster, widening in its favour for scripts that read few
+  attributes, since `to_table` converts everything regardless. The design commitment in
+  [lua-api.md](design/lua-api.md) stands, now with a number behind it.
+
+  What the same measurement turned up — the boundary costing 21 allocations per event (a `_G`
+  lookup of `process` per event, a fresh `AttrsProxy` userdata per attribute access, a Rust
+  `String` per metamethod key) — is **also now closed**: 21 → 9, via caching `process`/`flush` as
+  an `mlua::RegistryKey` (resolved once at load, not looked up from `_G` per call), caching the
+  `AttrsProxy` userdata per event instead of rebuilding it per access, and taking `mlua::String`
+  instead of an owned `String` in both metamethods. Two edge cases the caching opened were closed
+  rather than left as caveats: a script that stashes `event.attributes` past the point its event is
+  returned now fails loudly in this crate's own voice (not mlua's raw error), and a `flush` global
+  that exists but isn't a function is now a load-time error, matching `process`'s existing
+  `MissingProcess` treatment, instead of silently behaving as "no `flush()`" forever. Both are
+  documented in [lua-api.md](design/lua-api.md); see [memory.md](design/memory.md)'s recommendations
+  for the full write-up.
 - **The attribute/metric-name interner never frees** (`crates/logit-core/src/interner.rs`) —
   `lasso::ThreadedRodeo` has no eviction, so every distinct string ever interned is retained for the
   life of the process, at a measured ~94-124 bytes each.
@@ -120,19 +133,21 @@ already built that have a known, accepted rough edge.
   free at that point and would make this observable rather than silent. See
   [memory.md](design/memory.md)'s interner section.
 
-  Separately and unrelated to growth: **`AttrMap::get` interns rather than probing** (`attrs.rs`).
-  All three production call sites are keyed by config strings or Lua literals — a bounded set — so
-  this is a wasted hash plus concurrent-map probe on the hot path, an efficiency cleanup rather than
-  a leak. `lasso` has a non-interning `get()`.
-- **`statsd_in` copies tag values instead of slicing them** (`crates/logit-inputs/src/statsd.rs`) —
-  it builds attribute values with `attributes.insert(k, v)` on a `&str`, which routes through
-  `Value::str` → `Bytes::from(String)`, copying bytes already present in the datagram buffer; the
-  subsequent `attributes.clone()` in `build_event` then promotes each to a shared `Bytes`,
-  allocating again. Two allocations per tag, where `syslog_in`'s `slice_of` achieves zero. Measured
-  at 8 allocations per statsd line against 1 per syslog line
-  ([memory.md](design/memory.md)); `crates/logit-bench`'s
-  `statsd_tag_values_are_copied_not_sliced` pins the current behavior so it can't be assumed away.
-  The fix is to give `statsd.rs` the same pointer-arithmetic slicing `syslog.rs` already has.
+  Separately and unrelated to growth: **`AttrMap::get` used to intern rather than probe**
+  (`attrs.rs`) — fixed. All three production call sites were keyed by config strings or Lua
+  literals (a bounded set), so this was a wasted hash plus concurrent-map probe on the hot path,
+  not a leak, but it's gone now regardless: `get`/`remove` use `interner::lookup`, a non-interning
+  probe, falling through to the existing search only on a hit.
+- ~~**`statsd_in` copies tag values instead of slicing them**~~ — **closed.** It used to build
+  attribute values with `attributes.insert(k, v)` on a `&str`, routing through
+  `Value::str` → `Bytes::from(String)` (copying bytes already in the datagram buffer), then
+  `build_event`'s `attributes.clone()` promoted each to a shared `Bytes`, copying a second time.
+  Now uses the same pointer-arithmetic `slice_of` reconstruction `syslog.rs` already had: 8
+  allocations per line down to 2, the same irreducible pair `syslog_in` pays (one `Vec<Event>` per
+  line, one for the batch, split across two `Vec`s here due to statsd's multi-value grammar).
+  `crates/logit-bench`'s `statsd_tag_values_share_the_datagram_allocation` (formerly
+  `statsd_tag_values_are_copied_not_sliced`, inverted exactly as that test's own doc comment said
+  it would be) asserts the zero-copy property structurally now. See [memory.md](design/memory.md).
 - ~~**`influxdb_out`'s line encoder allocates ~180 times per event**~~ — **closed.** Was the largest
   single cost in the pipeline, roughly twice what ingesting an event cost end to end. Now 30
   allocations per 100-event batch (from 18,024) and 2.6× faster, by escaping and formatting
@@ -142,10 +157,10 @@ already built that have a known, accepted rough edge.
   byte-for-byte unchanged, which the existing format tests pin. What remains is per-batch rather
   than per-event; `crates/logit-bench`'s `influx_encode_100_events` guards that.
 
-  Left open deliberately: **`stdio_out` still allocates ~18 times per event**
-  (`crates/logit-outputs/src/stdio.rs`), which now makes it the more wasteful of the two encoders by
-  a wide margin. The same treatment applies almost unchanged, but it's a debug sink for a human
-  reading a terminal rather than a throughput path, so it's recorded rather than done. See
+  **`stdio_out` got the same treatment shortly after** (`crates/logit-outputs/src/stdio.rs`):
+  ~18 allocations per event down to ~1 (1801 → 101 per 100 events), via the identical merge-join
+  and reused-buffer mechanism. It had briefly become the more wasteful of the two encoders once
+  `influxdb_out` was fixed first; both are now in the same range. See
   [memory.md](design/memory.md)'s recommendations.
 - **Channel depth is bounded in batches, not bytes or events**
   (`CHANNEL_CAPACITY`, `crates/logit-pipeline/src/runtime.rs`) — 64 batches per edge, with

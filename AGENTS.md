@@ -127,9 +127,10 @@ not a style preference:
   encouraged; committing a fixture that needs one is not.
 - **Don't generalize a measurement from one event shape.** `Event` carries any combination of log,
   metrics, and span, and `logit` targets logs-only, metrics-only, traces-only, and mixed pipelines
-  alike (`docs/OVERVIEW.md`). The current fixtures cover one mixed shape, so several sizing
-  decisions are explicitly blocked on broader coverage — see `docs/design/memory.md` §0 and §8
-  before acting on a number from it.
+  alike (`docs/OVERVIEW.md`). The fixtures now cover logs-only, wide-JSON, distribution-heavy, and
+  span shapes alongside the original mixed one, but that closes the *measurement* gap, not the
+  sizing *decisions* those numbers feed — see `docs/design/memory.md` §0 and §8 before treating any
+  one number as settled across workloads.
 
 ## Where things live
 
