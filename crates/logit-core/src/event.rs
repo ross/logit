@@ -29,7 +29,16 @@ pub struct Event {
     pub attributes: AttrMap,
     pub log: Option<LogRecord>,
     pub metrics: MetricList,
-    pub span: Option<SpanRecord>,
+    /// Boxed (`docs/design/memory.md` §8 item 9): `SpanRecord` is 136 bytes, and inlining it
+    /// directly here would mean every log- and metric-only event -- the common case in every
+    /// measured workload -- pays that unconditionally. Boxing costs one extra allocation on
+    /// construction and one more on `Clone` for an event that actually carries a span (measured:
+    /// construction 11 -> 12 allocations, clone 2 -> 3, for `logit-bench`'s `span_event` fixture),
+    /// against 128 bytes saved on every event that doesn't. Worth it: nothing about a span-free
+    /// event's cost changes, and the events that do carry one were already paying two `Vec`
+    /// allocations (`events`, `links`) on clone, so one more is a small relative addition, not a
+    /// new order of magnitude.
+    pub span: Option<Box<SpanRecord>>,
 }
 
 impl Event {
@@ -53,7 +62,13 @@ impl Event {
 
     /// An event carrying a span and nothing else.
     pub fn span(timestamp: i64, attributes: AttrMap, record: SpanRecord) -> Self {
-        Event { timestamp, attributes, log: None, metrics: MetricList::new(), span: Some(record) }
+        Event {
+            timestamp,
+            attributes,
+            log: None,
+            metrics: MetricList::new(),
+            span: Some(Box::new(record)),
+        }
     }
 
     /// An event carrying no payload at all -- legal and representable, unlike under the old

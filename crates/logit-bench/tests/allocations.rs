@@ -631,24 +631,38 @@ fn clone_distribution_heavy_event() {
     expect_allocs("Event::clone (distribution-heavy shape)", stats, 6);
 }
 
-/// Cloning [`fixtures::span_event`] -- the one payload shape with no coverage at all before this
-/// change. `SpanRecord` holds a `Vec<SpanEvent>` (2 entries here) and a `Vec<SpanLink>` (1 entry),
-/// each a heap allocation on clone regardless of contents -- that's the 2 allocations measured.
-/// What's notably *not* here: every `AttrMap` involved (the event's own 4 attributes, each
-/// `SpanEvent`'s 2, the link's 1) is small enough to stay inside `AttrMap`'s 8-slot inline
-/// capacity, so none of them spills to the heap on clone.
+/// Building [`fixtures::span_event`] from scratch: every `Value::str`/`AttrMap::insert` call the
+/// fixture makes, plus (since `docs/design/memory.md` §8 item 9 boxed `SpanRecord`) the one
+/// `Box::new` `Event::span` now does. Measured before boxing: 11. This is the "construction cost"
+/// half of item 9's trade -- the other half is [`clone_span_event`], below.
+#[test]
+fn construct_span_event() {
+    drop(fixtures::span_event()); // warm: intern every string this fixture uses
+    let (event, stats) = measure(fixtures::span_event);
+    assert!(event.span.is_some());
+    expect_allocs("construct span_event (Event::span, boxes SpanRecord)", stats, 12);
+}
+
+/// Cloning [`fixtures::span_event`] -- the one payload shape with no coverage at all before the
+/// fixture-matrix pass that added it. `SpanRecord` holds a `Vec<SpanEvent>` (2 entries here) and a
+/// `Vec<SpanLink>` (1 entry), each a heap allocation on clone regardless of contents; boxing
+/// `SpanRecord` itself (`docs/design/memory.md` §8 item 9) adds a third, since cloning a
+/// `Box<T>` deep-clones the boxed value. What's notably *not* here: every `AttrMap` involved (the
+/// event's own 4 attributes, each `SpanEvent`'s 2, the link's 1) is small enough to stay inside
+/// `AttrMap`'s 8-slot inline capacity, so none of them spills to the heap on clone.
 ///
-/// **This is cheaper to clone than the nginx shape, not more expensive** -- 2 allocations (1320
-/// bytes) against `clone_one_event`'s 4 (3552 bytes). That's the opposite of what a first read of
-/// `docs/design/memory.md`'s item 4 ("far more expensive to deep-clone than anything measured
-/// here") suggests, and the reason is exactly the inline-attribute point above: this fixture is
-/// narrow enough on attribute count everywhere that nothing about it spills. It does **not** show
-/// spans are cheap in general -- a span whose `SpanEvent`s/`SpanLink`s (or the span itself)
-/// carried more than 8 attributes each would spill those maps on clone just as the nginx event's
-/// 10 attributes do, costing more accordingly; this measurement only speaks to the narrow shape
-/// this fixture actually builds. What does generalize regardless of attribute width is the fixed
-/// cost of the two `Vec`s existing at all: `Box`ing `SpanRecord` (item 7) would add exactly one
-/// more allocation on top of whatever a given span shape's total turns out to be.
+/// **This is still cheaper to clone than the nginx shape** -- 3 allocations against
+/// `clone_one_event`'s 4. That's the opposite of what a first read of `docs/design/memory.md`'s
+/// item 4 ("far more expensive to deep-clone than anything measured here") suggests, and the
+/// reason is exactly the inline-attribute point above: this fixture is narrow enough on attribute
+/// count everywhere that nothing about it spills. It does **not** show spans are cheap in general
+/// -- a span whose `SpanEvent`s/`SpanLink`s (or the span itself) carried more than 8 attributes
+/// each would spill those maps on clone just as the nginx event's 10 attributes do, costing more
+/// accordingly; this measurement only speaks to the narrow shape this fixture actually builds.
+///
+/// Before boxing `SpanRecord` this was 2 allocations (1320 bytes); boxing adds exactly one more
+/// (measured, not assumed) -- the same `+1` [`construct_span_event`] shows for construction, since
+/// both are "one more heap object exists now."
 #[test]
 fn clone_span_event() {
     let event = fixtures::span_event();
@@ -656,7 +670,7 @@ fn clone_span_event() {
 
     let (clone, stats) = measure(|| event.clone());
     assert!(clone.span.is_some());
-    expect_allocs("Event::clone (span shape)", stats, 2);
+    expect_allocs("Event::clone (span shape)", stats, 3);
 }
 
 // ---------------------------------------------------------------------------------------------

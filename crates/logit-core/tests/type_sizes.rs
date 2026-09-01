@@ -98,11 +98,21 @@ fn record_types() {
     assert_eq!(size_of::<SpanRecord>(), 136);
     assert_eq!(size_of::<Resource>(), size_of::<AttrMap>());
 
-    // Both `Option`s are free: `Severity` and `SpanKind` are small field-less enums, so their
-    // spare discriminants absorb the `None` case. Worth asserting rather than assuming -- adding
-    // a 256-variant enum to either record would silently cost `Event` another 8 bytes.
+    // `LogRecord` is free: `Severity` is a small field-less enum, so its spare discriminant
+    // absorbs the `None` case. Worth asserting rather than assuming -- adding a 256-variant enum
+    // would silently cost `Event` another 8 bytes.
     assert_eq!(size_of::<Option<LogRecord>>(), size_of::<LogRecord>());
-    assert_eq!(size_of::<Option<SpanRecord>>(), size_of::<SpanRecord>());
+
+    // `SpanRecord` itself is unchanged (136 bytes) -- what changed (`docs/design/memory.md` §8
+    // item 9) is that `Event` no longer inlines it directly. `Box<SpanRecord>`'s pointer niche
+    // absorbs `None` the same way `Symbol`'s and `Severity`'s do, so `Option<Box<SpanRecord>>` is
+    // exactly a pointer, not a pointer plus a discriminant.
+    assert_eq!(size_of::<Box<SpanRecord>>(), 8);
+    assert_eq!(
+        size_of::<Option<Box<SpanRecord>>>(),
+        8,
+        "Box's NonNull niche should absorb the None case"
+    );
 }
 
 /// The number that matters: what one event costs to move between two pipeline nodes, and to deep-
@@ -110,17 +120,23 @@ fn record_types() {
 /// and lists what could be reclaimed.
 ///
 /// Note what this means for the cheap cases: a bare log line with two attributes and a statsd
-/// counter with three tags both cost this same 792 bytes to move, because `AttrMap`'s inline
-/// capacity and `MetricKind`'s inlined sketch are paid unconditionally.
+/// counter with three tags both cost this same 648 bytes to move, because `AttrMap`'s inline
+/// capacity and `MetricKind`'s inlined sketch are paid unconditionally -- neither carries a span,
+/// and boxing `SpanRecord` (item 9) is exactly why that no longer costs them 136 bytes apiece.
 #[test]
 fn event_size() {
-    assert_eq!(size_of::<Event>(), 776, "792 minus the 16 bytes smallvec's `union` feature saves");
+    assert_eq!(
+        size_of::<Event>(),
+        648,
+        "776 minus the 128 bytes boxing SpanRecord saves (136 -> 8, `docs/design/memory.md` §8 \
+         item 9)"
+    );
 
     // The breakdown, asserted so it can't drift out of sync with the total above.
     let sum = size_of::<i64>()
         + size_of::<AttrMap>()
         + size_of::<Option<LogRecord>>()
         + size_of::<MetricList>()
-        + size_of::<Option<SpanRecord>>();
+        + size_of::<Option<Box<SpanRecord>>>();
     assert_eq!(sum, size_of::<Event>(), "Event should have no padding beyond its fields");
 }
