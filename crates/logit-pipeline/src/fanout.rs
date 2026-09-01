@@ -156,6 +156,20 @@ mod tests {
     use super::*;
     use logit_core::{AttrMap, MetricKind, Registry, Resource};
 
+    /// `Delivered` had no size assertion at all before the internal-spans costing exercise
+    /// (`docs/known-gaps.md`'s internal-spans entry) went looking for one -- added regardless of
+    /// that exercise's outcome (a prototype `TraceContext` field was measured and reverted; see
+    /// `docs/design/memory.md`'s "Costing internal spans" section for the numbers), because it's
+    /// the guard that should have existed either way. `Owned`'s `EventBatch` (32 bytes: an
+    /// `Arc<Resource>` pointer plus a `Vec<Event>`) is the larger variant, and it fits with no
+    /// separate discriminant byte -- the `Vec`'s non-null pointer gives the compiler a niche to
+    /// fold the tag into for free, the same trick that makes `Option<SpanRecord>` cost nothing
+    /// over `SpanRecord` (`crates/logit-core/tests/type_sizes.rs`).
+    #[test]
+    fn delivered_is_32_bytes_no_wider_than_its_larger_variant() {
+        assert_eq!(std::mem::size_of::<Delivered>(), 32);
+    }
+
     fn batch(n: usize) -> EventBatch {
         EventBatch {
             resource: Arc::new(Resource::default()),

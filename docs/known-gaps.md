@@ -290,11 +290,17 @@ already built that have a known, accepted rough edge.
     measured evidence, not folded into a metrics change. `internal`'s name (not `internal_metrics`)
     deliberately leaves room for this without a rename.
 
-    The measured evidence that gate asks for didn't exist until now, separately from the decision
-    itself: `crates/logit-bench/tests/allocations.rs`/`benches/pipeline.rs`'s node-runtime coverage
-    (`docs/design/memory.md`'s "Runtime" section) closes the gap where nothing measured what
-    `run_transform`/`run_output`/`Fanout::send` themselves cost — a prerequisite for costing a
-    `Delivered` change honestly, not the costing itself.
+    The measured evidence that gate asks for now exists, separately from the decision itself:
+    `crates/logit-bench/tests/allocations.rs`/`benches/pipeline.rs`'s node-runtime coverage closed
+    the gap where nothing measured what `run_transform`/`run_output`/`Fanout::send` themselves
+    cost, and a 24-byte `TraceContext` prototype on `Delivered` was built, measured against that
+    coverage, and reverted — zero allocation change across every existing exact-equality
+    assertion, `size_of::<Delivered>()` 32 → 56, no attributable throughput regression once
+    run-to-run noise is accounted for. See `docs/design/memory.md`'s "Costing internal spans"
+    section for the full account. **Evidence, not a decision** — what's still unmeasured is
+    propagating an *inherited* context (reading a batch's own parent rather than always minting a
+    root), which touches `run_transform`/`run_output` themselves and is the actual shape a real
+    feature needs; that, and the decision itself, are the follow-up this de-risks.
   - **Internal logs** — routing `Diagnostics`' stderr output into the graph as `LogRecord` events
     is the natural next layer, and what the still-deferred `tracing` migration (above) should build
     on rather than duplicate.

@@ -311,11 +311,54 @@ leaves the one OS thread Divan's `AllocProfiler` is watching. Measured this way:
 | `Fanout::send`+`recv`, 1 consumer | 190 ns | 0 |
 | `Fanout::send`+`recv`, 2 consumers | 458 ns | 6 (1 `Arc::new` + the 5-allocation clone above) |
 
-This is a real, present-day open question, not a closed one: whether trace context on `Delivered`
-(the change `docs/known-gaps.md`'s internal-spans entry gates on measured evidence, per
-[ADR 0017](../adr/0017-minimize-allocations-over-event-size.md)) is worth its cost is exactly what
-this new coverage exists to let someone answer, on these numbers, without first having to build the
-measurement.
+### Costing internal spans: the `Delivered` trade, measured
+
+`docs/known-gaps.md`'s internal-spans entry gates carrying trace context on `Delivered` on measured
+evidence, per [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md). The coverage above
+is what made that measurement possible; this is the measurement itself. **Not a decision** -- ADR
+0017 asks for evidence before the trade is decided, and this is that evidence, recorded so the
+decision (its own ADR, when someone takes it) doesn't have to re-derive it.
+
+**The prototype.** A 24-byte `TraceContext { trace_id: [u8; 16], span_id: [u8; 8] }` added to both
+`Delivered` variants (`Owned(EventBatch, TraceContext)`, `Shared(Arc<EventBatch>, TraceContext)`),
+minted fresh per `Fanout::send`/`send_blocking` call via a thread-local SplitMix64 (no allocation,
+no new dependency -- and deliberately not `tracing::span::Id`, which a `Registry` recycles after a
+span closes, making it unsafe as a source of identity here). No parent propagation, no `run_output`
+plumbing beyond the match arms `Delivered`'s extra field requires -- this measures the type change's
+cost, not a working span feature. Built, measured, and reverted in full; every file it touched is
+back to this table's pre-existing state except the one line below.
+
+**Size: `size_of::<Delivered>()` goes from 32 to 56 -- exactly `TraceContext`'s 24 bytes, no padding
+overhead.** This is a per-*batch* cost, on the channel payload, not a per-event one: contrast with
+`Event`'s 776 bytes, where ADR 0017 already settled that a much smaller per-event size cost is
+worth avoiding an allocation. `Delivered` isn't `Event` -- this is a different type, on a different
+part of the pipeline, at a different multiplier (one per batch, not one per event within it), so
+0017's conclusion doesn't transfer here by default; it's cited for contrast, not as the answer.
+
+**Allocations: zero change, across every existing exact-equality assertion.** Every
+`fanout_send_*` constant in `crates/logit-bench/tests/allocations.rs` (0 / 6 / 1, including the
+mixed-consumer cases) and every "Runtime" constant above held exactly, with the prototype in place
+-- confirmed by the full `script/cibuild` suite passing unmodified, not just spot-checked. This is
+the expected result stated plainly: copying 24 bytes into an already-allocated enum payload doesn't
+touch the allocator.
+
+**Throughput: no attributable regression, but only once run-to-run noise is accounted for.** A
+naive before/after comparison showed all three `runtime` benches (`fanout_send_one_consumer`,
+`fanout_send_two_consumers`, `process_batch_through_keep`) slower by a uniform ~40-50% with the
+prototype in place -- which would be a real finding, except `process_batch_through_keep` never
+touches `Delivered`/`Fanout` at all and moved by almost exactly the same percentage as the two that
+do. That's this doc's own "runs on a busier machine come out uniformly ~20% slower" caveat (§2)
+firing, not a cost of the change -- confirmed by re-running the *unmodified* prototype benches a
+second time, which reproduced the original (pre-prototype) numbers almost exactly. Comparing
+benchmark timings across separate `script/bench` invocations remains unreliable, as already
+documented; a same-session, back-to-back comparison (not done here) is what a real decision should
+use if the allocation numbers above ever turn out not to be the deciding factor on their own.
+
+**What's left unmeasured, deliberately, because it needs a different kind of prototype:**
+propagating an *inherited* context (reading a batch's own incoming `Delivered` as the parent for
+what it produces, rather than always minting a fresh root) touches `run_transform`/`run_output`
+themselves, not just `Fanout`/`Delivered` -- a materially bigger change than the type-and-copy cost
+measured here, and the actual shape a real internal-spans feature would need.
 
 ### Zero-copy: where it holds
 
