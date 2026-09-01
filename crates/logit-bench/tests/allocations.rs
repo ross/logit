@@ -421,9 +421,28 @@ fn stdio_encode_100_events() {
 // ---------------------------------------------------------------------------------------------
 
 /// One round trip across the Rust/Lua boundary for a script that reads one attribute and writes
-/// one: an `Rc<RefCell<Event>>` and an mlua userdata per event, a *fresh* `AttrsProxy` userdata
-/// per `event.attributes` access, a Rust `String` per metamethod key, a `_G` lookup of `process`
-/// per event, and a `Box` on the way out.
+/// one. Down from 21 (`docs/design/memory.md` §8, item 13) via three independent fixes: `process`
+/// is a cached `RegistryKey` instead of a `_G` lookup per call, `event.attributes` returns the
+/// same cached `AttrsProxy` userdata on every access instead of a fresh one, and both metamethods
+/// take `mlua::String` instead of an owned Rust `String` (no metamethod-key allocation at all).
+///
+/// The 9 that remain, measured directly rather than assumed (by comparing this script against
+/// narrower ones isolating each piece -- a passthrough with no `.attributes` touch at all, a
+/// `nil`-returning script to isolate the final `Box`, a read-only access, a write-only access, and
+/// two reads against an already-cached proxy):
+///
+/// - **4** for any call at all, win or lose: the `Rc<RefCell<Event>>` and the `EventProxy`
+///   userdata itself account for 2 of those; the other 2 are inside mlua/LuaJIT's own per-call
+///   bookkeeping (reference-table and GC upkeep as objects from the *previous* call become
+///   collectible), not attributable to a specific line in this crate.
+/// - **+1** for the `Box` on the way out (`ProcessOutcome::Emit`) -- confirmed by comparing
+///   against a script that returns `nil` instead, which skips it and lands at 4.
+/// - **+3** for creating and caching the `AttrsProxy` on the *first* `event.attributes` access of
+///   an event, whether that access reads or writes -- a second access against the same
+///   already-cached proxy costs nothing more (measured directly: two reads still total 8, the
+///   same as one).
+/// - **+1** for the one attribute write this fixture's script actually makes, from
+///   `lua_to_value` allocating a `Bytes` to hold the new `"prod"` string.
 ///
 /// This is the number `docs/known-gaps.md` has been carrying as an unbenchmarked assumption. It
 /// does not invalidate the proxy design -- see `lua::to_table` in `benches/pipeline.rs` for the
@@ -436,7 +455,7 @@ fn lua_process_one_event() {
     let event = fixtures::nginx_event();
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
     assert!(matches!(outcome, ProcessOutcome::Emit(_)));
-    expect_allocs("lua: process 1 event", stats, 21);
+    expect_allocs("lua: process 1 event", stats, 9);
 }
 
 // ---------------------------------------------------------------------------------------------
