@@ -321,11 +321,10 @@ pub fn distribution_heavy_event() -> Event {
 /// produces), and one [`SpanLink`] to a related trace (e.g. the batch job that triggered this
 /// request), so it exercises every field `SpanRecord` has. Deliberately narrow on attribute count,
 /// though: the event's own 4 attributes and each `SpanEvent`/`SpanLink`'s 1-2 all stay well inside
-/// `AttrMap`'s 8-slot inline capacity, so cloning this fixture (`clone_span_event`, 3 allocations
-/// now that `SpanRecord` is boxed -- `docs/design/memory.md` §8 item 9 -- 2 before that) is
-/// actually *cheaper* than the nginx shape's 4 -- the cost here is only the two `Vec`s (`events`,
-/// `links`) existing at all plus the one `Box`, not any spilled attribute map. That's a finding
-/// about *this* shape, not spans in general: a span whose events/links each carried more than 8
+/// `AttrMap`'s 8-slot inline capacity, so cloning this fixture (`clone_span_event`, 2 allocations)
+/// is actually *cheaper* than the nginx shape's 4 -- the cost here is only the two `Vec`s
+/// (`events`, `links`) existing at all, not any spilled attribute map. That's a finding about
+/// *this* shape, not spans in general: a span whose events/links each carried more than 8
 /// attributes would spill those maps just as the nginx event's 10 attributes do, and cost more to
 /// clone accordingly.
 pub fn span_event() -> Event {

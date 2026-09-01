@@ -363,7 +363,7 @@ mod tests {
         let resource = default_resource();
         let mut event = event_with_attrs(&[("a", Value::U64(1))]);
         event.timestamp = 12345;
-        event.span = Some(Box::new(SpanRecord {
+        event.span = Some(SpanRecord {
             trace_id: [1; 16],
             span_id: [2; 8],
             parent_span_id: None,
@@ -373,7 +373,7 @@ mod tests {
             events: Vec::<SpanEvent>::new(),
             links: Vec::new(),
             end_timestamp: 0,
-        }));
+        });
         let original_attrs = event.attributes.clone();
         let original_log = event.log.clone();
 
