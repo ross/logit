@@ -93,6 +93,20 @@ pub enum ComponentKind {
     LogitIn {
         bind: String,
     },
+    /// `logit` talking about itself: drains every component's buffered self-telemetry points on
+    /// `interval` and emits them as ordinary events into the graph, same as any other listener.
+    /// Named for the source, not the signal it emits today -- free to grow logs and spans later
+    /// without a rename. See `docs/design/internal-telemetry.md` and
+    /// `docs/adr/0018-internal-telemetry-as-pipeline-events.md`.
+    Internal {
+        /// Both the drain cadence for every component's buffered points and the sampling tick for
+        /// this component's own process-level gauges (interner size, uptime). Should divide
+        /// evenly into any downstream `aggregate` interval, or the two windows beat against each
+        /// other.
+        #[serde(with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        interval: Duration,
+    },
 
     /// Inline Lua source (a YAML block scalar in practice). See `docs/design/lua-api.md`.
     Lua {
@@ -399,6 +413,17 @@ mod tests {
         match component.kind {
             ComponentKind::Aggregate { interval } => assert_eq!(interval, Duration::from_secs(10)),
             other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn internal_component_with_interval_deserializes() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "internal", "interval": "10s"}"#).unwrap();
+        assert!(component.sources.is_empty());
+        match component.kind {
+            ComponentKind::Internal { interval } => assert_eq!(interval, Duration::from_secs(10)),
+            other => panic!("expected Internal, got {other:?}"),
         }
     }
 

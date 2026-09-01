@@ -7,10 +7,10 @@ Guidance for AI coding agents working in this repo. Humans: see [README.md](READ
 `logit` is a logging/metrics/tracing multiplexer written in Rust, with user transforms in
 LuaJIT. Read [docs/OVERVIEW.md](docs/OVERVIEW.md) first (~1 page) for scope and positioning, then
 [docs/adr/](docs/adr) for *why* the stack is what it is, then [docs/design/](docs/design) for the
-internal event model, the Lua scripting API, the pipeline component graph, and the native wire
-protocol — those four design docs are load-bearing; don't improvise around them without reading
-them first. Check [docs/known-gaps.md](docs/known-gaps.md) before "fixing" something that looks
-broken — it's likely a documented, deliberate gap, not an oversight.
+internal event model, the Lua scripting API, the pipeline component graph, the native wire
+protocol, and internal telemetry — those five design docs are load-bearing; don't improvise around
+them without reading them first. Check [docs/known-gaps.md](docs/known-gaps.md) before "fixing"
+something that looks broken — it's likely a documented, deliberate gap, not an oversight.
 
 **Current state:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a
 Lua enrichment stage, InfluxDB 2.x out, via `logit run <config>` (see
@@ -35,7 +35,12 @@ graph <config>` prints the resolved graph as graphviz DOT (`crates/logit-cli/src
 [ADR 0013](docs/adr/0013-service-lifecycle-and-output-retry.md) for signal-driven shutdown and
 `influxdb_out`'s bounded output retry, `crates/logit-inputs/src/statsd.rs` and
 `crates/logit-outputs/src/influxdb.rs` for the listener/sink side, `crates/logit-pipeline/src/runtime.rs`
-for orchestration and the per-node flush-tick timer.
+for orchestration and the per-node flush-tick timer. `internal` (`crates/logit-inputs/src/internal.rs`)
+is `logit` observing itself — a listener like any other, draining `logit_core::telemetry`'s
+per-component buffers into ordinary events on its own `interval`; see
+[ADR 0018](docs/adr/0018-internal-telemetry-as-pipeline-events.md) and
+[internal-telemetry.md](docs/design/internal-telemetry.md) for the framework, and
+[examples/internal-telemetry.yaml](examples/internal-telemetry.yaml) for a runnable config.
 
 ## Environment
 
@@ -136,12 +141,12 @@ not a style preference:
 
 ```
 crates/
-  logit-core        internal event model: Event, Value, Resource, metric kinds, interner
+  logit-core        internal event model: Event, Value, Resource, metric kinds, interner, self-telemetry
   logit-config      YAML config types + generated JSON Schema
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
-  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog
+  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, internal (self-telemetry)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`

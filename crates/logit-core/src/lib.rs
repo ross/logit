@@ -5,6 +5,7 @@
 
 pub mod diag;
 pub mod interner;
+pub mod telemetry;
 pub mod time;
 pub mod value;
 
@@ -21,6 +22,7 @@ pub use interner::Symbol;
 pub use metric::{DdSketch, HyperLogLog, MetricKind, MetricRecord};
 pub use resource::Resource;
 pub use span::{SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus};
+pub use telemetry::{Registry, Tag, Telemetry};
 pub use time::format_rfc3339_utc;
 pub use value::Value;
 

@@ -123,6 +123,26 @@
           }
         },
         {
+          "description": "`logit` talking about itself: drains every component's buffered self-telemetry points on `interval` and emits them as ordinary events into the graph, same as any other listener. Named for the source, not the signal it emits today -- free to grow logs and spans later without a rename. See `docs/design/internal-telemetry.md` and `docs/adr/0018-internal-telemetry-as-pipeline-events.md`.",
+          "type": "object",
+          "required": [
+            "interval",
+            "type"
+          ],
+          "properties": {
+            "interval": {
+              "description": "Both the drain cadence for every component's buffered points and the sampling tick for this component's own process-level gauges (interner size, uptime). Should divide evenly into any downstream `aggregate` interval, or the two windows beat against each other.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "internal"
+              ]
+            }
+          }
+        },
+        {
           "description": "Inline Lua source (a YAML block scalar in practice). See `docs/design/lua-api.md`.",
           "type": "object",
           "required": [

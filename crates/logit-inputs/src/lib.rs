@@ -6,6 +6,7 @@
 //! for the trait, not the other way around, so the pipeline runtime never has to know about any
 //! concrete protocol.
 
+pub mod internal;
 pub mod statsd;
 pub mod syslog;
 

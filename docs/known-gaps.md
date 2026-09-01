@@ -56,6 +56,10 @@ already built that have a known, accepted rough edge.
   parse failure) is throttled by occurrence count rather than printed unbounded. What's still
   missing is the real thing: severity levels, structured fields, filtering — a full `tracing`
   migration, deliberately kept as separate, later work rather than folded into this narrower fix.
+  `Diagnostics` now also mirrors every `warn_throttled` occurrence (not just the throttled subset
+  that reaches stderr) into a `logit.component.diagnostics{key}` counter when telemetry is live
+  ([internal-telemetry.md](design/internal-telemetry.md)) — a partial, additive answer to "where do
+  these actually go," not a substitute for the `tracing` migration itself.
 - **Closed for SIGTERM/SIGINT** ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md)) — a
   signal handler now closes every listener's inbox normally
   (`logit_pipeline::run_with_shutdown`, `crates/logit-pipeline/src/runtime.rs`), triggering the
@@ -129,9 +133,14 @@ already built that have a known, accepted rough edge.
   private — a public or multi-tenant ingest endpoint, a hosted aggregator — revisit this. The
   retrofit is expensive: `Symbol` is `Copy` and `resolve` *panics* on an unknown symbol, so
   `AttrMap`, `MetricRecord`, `SeriesKey`, the Lua proxy, and the planned wire dictionary all assume
-  symbols are eternal. If the `tracing` migration lands anyway, an `interner::len()` gauge is nearly
-  free at that point and would make this observable rather than silent. See
-  [memory.md](design/memory.md)'s interner section.
+  symbols are eternal. See [memory.md](design/memory.md)'s interner section.
+
+  ~~If the `tracing` migration lands anyway, an `interner::len()` gauge is nearly free at that
+  point and would make this observable rather than silent.~~ **Closed, ahead of that migration.**
+  `internal`'s process-level gauges (`logit.process.interner.strings`,
+  [internal-telemetry.md](design/internal-telemetry.md)) sample `interner::len()` on every drain
+  tick — growth is now observable by attaching any sink to `internal`, no `tracing` migration
+  required first.
 
   Separately and unrelated to growth: **`AttrMap::get` used to intern rather than probe**
   (`attrs.rs`) — fixed. All three production call sites were keyed by config strings or Lua
@@ -271,3 +280,26 @@ already built that have a known, accepted rough edge.
   nginx-side mitigation (e.g. capping `$host`'s logged length) is added here: the pipeline already
   degrades gracefully on a truncated line by whatever means it happens, and capping a field nginx
   itself allows up to 8KB would be solving a problem the design doesn't actually have.
+- **Internal telemetry ([internal-telemetry.md](design/internal-telemetry.md),
+  [ADR 0018](adr/0018-internal-telemetry-as-pipeline-events.md)) covers metrics only** — the
+  framework (the `internal` component, the per-component buffer, the emit API) is built to extend,
+  but three extensions are deliberately not part of this first cut:
+  - **Internal spans** — tracing one batch's path through the graph needs trace/span context
+    carried on `Delivered` (`crates/logit-pipeline/src/fanout.rs`), a hot-path type change that
+    [ADR 0017](adr/0017-minimize-allocations-over-event-size.md) says must be decided on its own
+    measured evidence, not folded into a metrics change. `internal`'s name (not `internal_metrics`)
+    deliberately leaves room for this without a rename.
+  - **Internal logs** — routing `Diagnostics`' stderr output into the graph as `LogRecord` events
+    is the natural next layer, and what the still-deferred `tracing` migration (above) should build
+    on rather than duplicate.
+  - **`host_metrics`** — facts about the machine itself (CPU, disks, NICs) are a different kind of
+    source than `internal`: read from the OS rather than from `logit`'s own counters, need their
+    own config, and can fail in ways an in-process atomic read never does. A separate component
+    kind when it lands, not a field on `internal`.
+- **A component's internal-telemetry buffer caps distinct `(name, tags)` keys at 1024**
+  (`MAX_KEYS_PER_COMPONENT`, `crates/logit-core/src/telemetry.rs`) — bounds a component that
+  ignores the tag-cardinality convention (`&'static str` values only) rather than letting it grow
+  the process-wide interner unbounded. A dropped key is counted
+  (`logit.internal.points.dropped{reason="cardinality"}`), never silent, but the cap itself is a
+  fixed constant, not configurable — revisit if a legitimate component ever needs more than 1024
+  distinct points between drains.
