@@ -114,6 +114,54 @@
           "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"logit.process.interner.strings\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> last()"
         }
       ]
+    },
+    {
+      "id": 8,
+      "type": "logs",
+      "title": "Loki: raw demo traffic ({job=\"demo\"})",
+      "description": "The writer's lines as delivered through the syslog -> Alloy -> Loki shim (demo/alloy/config.alloy) -- scaffolding for `syslog_out`, not `logit` writing to Loki directly. See demo/README.md's \"What isn't wired yet\".",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "{job=\"demo\"}",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Loki: lines/sec, by host (LogQL count_over_time)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum by (host) (count_over_time({job=\"demo\"}[$__interval]))",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Loki: 5xx lines/sec (LogQL | json filter)",
+      "description": "LogQL parsing the JSON message body itself, not just matching stream labels -- `| json` extracts `status` from each line, then filters on it.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum(count_over_time({job=\"demo\"} | json | status >= 500 [$__interval]))",
+          "queryType": "range"
+        }
+      ]
     }
   ]
 }
