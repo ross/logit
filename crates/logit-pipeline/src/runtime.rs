@@ -369,10 +369,23 @@ fn run_lua(
 /// best-effort saving over always cloning, not a guarantee that exactly one branch pays nothing:
 /// nothing about `Fanout::send` privileges one branch's handle over another's, and two branches
 /// racing to unwrap concurrently can both still observe a strong count above 1 and both fall back
-/// to cloning. An `Output` sibling on the same fan-out makes this *worse* in practice, not better:
-/// it holds its own handle for as long as its `send` takes (real I/O), so a `Transform`/Lua
-/// sibling's unwrap here will reliably find that handle still alive and clone, not just sometimes.
-/// Either way, a sibling branch's copy is always independent before it can be mutated
+/// to cloning.
+///
+/// **An `Output` sibling on the same fan-out doesn't change this into a guarantee either way --
+/// it's still genuinely racy, just against a different clock.** `run_output` (above) drops its own
+/// `Delivered` the moment `output.send` returns, immediately before its next `inbox.recv().await`
+/// -- it does not hold the handle for the rest of its loop, and it never itself calls
+/// `try_unwrap`. So whether *this* function's unwrap succeeds for a `Transform`/Lua sibling comes
+/// down to real tokio scheduling: whichever happens first, `Output`'s task completing its `send`
+/// and dropping its handle, or this call actually running. If `Output` finishes first, this
+/// succeeds for free (1 allocation total for the whole fan-out send -- see
+/// `fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first`,
+/// `crates/logit-bench/tests/allocations.rs`); if `Output` is still mid-`send` (plausible, even
+/// likely, since `Output::send` typically does real I/O against a network or file, which tends to
+/// be slower than a `Transform`'s local processing), this fails and clones (`Delivered::Owned`
+/// and `Delivered::Shared`'s handling is the same as it would be with no `Output` sibling at all --
+/// see `fanout_send_mixed_output_and_transform_consumers`, same file). Either outcome keeps
+/// isolation intact: a sibling branch's copy is always independent before it can be mutated
 /// (`a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` below pins this).
 fn unwrap_batch(batch: Delivered) -> EventBatch {
     match batch {

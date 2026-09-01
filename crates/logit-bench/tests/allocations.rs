@@ -485,17 +485,21 @@ fn fanout_send_two_output_consumers_costs_only_the_arc() {
 /// The actually-common shape (the nginx reference config's `tap` (`stdio_out`)/`trimmed`
 /// (`keep` -> `aggregate` -> ...) split): one `Output` branch and one `Transform`/`ScriptWorker`
 /// branch off the same fan-out. The `Output` branch costs nothing, as above -- it only ever
-/// borrows. The `Transform` branch still needs an owned `Event` to mutate, so it goes through
-/// `unwrap_batch` exactly as before this round of changes.
+/// borrows, and never itself calls `Arc::try_unwrap`. The `Transform` branch still needs an owned
+/// `Event` to mutate, so it goes through `unwrap_batch` exactly as before this round of changes.
 ///
-/// **This isn't just "sometimes the Output branch is the lucky one now" -- it's structural.**
-/// `Output::send` never calls `Arc::try_unwrap` at all, so it never even competes for the free
-/// unwrap; it holds its `Arc` handle for as long as its own `send` takes (real I/O, in production --
-/// not the near-instant window the old design's race depended on) and only drops it once that
-/// finishes. So in practice the `Transform` branch's `unwrap_batch` call almost always finds a live
-/// sibling and clones, deterministically, not just when timing happens to go against it. Simulated
-/// here by unwrapping the `Transform` side *first*, while the `Output` side's `Delivered` is still
-/// held (unread) -- exactly the ordering a real `output.send().await` still in flight produces.
+/// **This is one of the two reachable outcomes for this shape, not the only one -- genuinely racy,
+/// not deterministic.** `run_output`'s loop (`runtime.rs`) drops its own `Delivered` the moment
+/// `output.send` returns, immediately before its next receive -- it does *not* hold the handle for
+/// the rest of its loop. So whether the `Transform` branch's unwrap here succeeds for free or falls
+/// back to a clone comes down to real tokio scheduling: whichever happens first, `Output`
+/// completing its `send` and dropping its handle, or the `Transform` branch's `unwrap_batch` call
+/// actually running. This test pins the case where `Transform` runs first (`Output`'s handle still
+/// alive) by unwrapping the `Transform` side before the `Output` side is ever touched --
+/// [`fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first`] below pins the
+/// other reachable outcome, where `Output` finishes first. In production, `Output::send` typically
+/// performs real I/O (network, file), which tends to be slower than a `Transform`'s local
+/// processing -- so *this* outcome is the likelier one in practice, not the only possible one.
 #[test]
 fn fanout_send_mixed_output_and_transform_consumers() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -531,13 +535,80 @@ fn fanout_send_mixed_output_and_transform_consumers() {
     assert_eq!(xform_len, 1);
     // 1 (Arc::new, once per send) + 5 (the Transform branch's forced deep clone: 1 for the
     // Vec<Event>, 4 for the one nginx-shaped Event inside it) + 0 (the Output branch, which never
-    // unwraps or clones at all). Same total as the all-Transform 2-consumer case measured above,
-    // but now concentrated entirely on the branch that actually needs an owned copy -- the Output
-    // branch's share of that cost is gone, not just occasionally skipped.
+    // unwraps or clones at all). Same total as the all-Transform 2-consumer case measured above --
+    // this is the "Output hasn't finished yet" outcome, not the only reachable one; see
+    // `fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first` below for the
+    // other. Against `main` (pre-PR): a flat, unconditional 5 for any 2-consumer fan-out regardless
+    // of kind -- so this specific outcome is 1 allocation worse than `main`, same as the
+    // all-Transform case, though (unlike that case) it's not the only place this shape can land.
     expect_allocs(
-        "fanout: send + receive, 1 Output (free) + 1 Transform (clones) consumer",
+        "fanout: send + receive, 1 Output + 1 Transform, Output not yet finished (racy outcome A)",
         stats,
         6,
+    );
+}
+
+/// The *other* reachable outcome for the same mixed shape as
+/// [`fanout_send_mixed_output_and_transform_consumers`] above, not a hypothetical: if `Output`'s
+/// task happens to complete its `send` and drop its `Delivered` handle *before* the `Transform`
+/// branch's `unwrap_batch` call runs -- plausible whenever `Output::send` is fast, local, or simply
+/// wins the scheduling race -- `Arc::try_unwrap` finds itself the sole remaining reference and
+/// succeeds for free. Total cost collapses to just the one `Arc::new` per send, the same number
+/// [`fanout_send_two_output_consumers_costs_only_the_arc`] measures for two `Output` consumers,
+/// because at that point neither branch has paid anything beyond the `Arc` itself.
+///
+/// Simulated by dropping the `Output` side's `Delivered` (standing in for `run_output` having
+/// already returned from `output.send` and moved on) *before* the `Transform` side ever calls
+/// `unwrap_batch` -- the mirror image of the ordering the test above pins.
+///
+/// **The two tests together are the honest picture for this shape: 1 or 6, decided by real
+/// scheduling, never anything in between** (there's no path to landing on `main`'s flat 5, since
+/// `Arc::new` is always paid the moment there are 2+ consumers). Whether this design is a net win,
+/// a wash, or a regression for a given deployment depends on how its `Output` implementations and
+/// `Transform`/Lua stages actually get scheduled relative to each other -- not something a fixed
+/// allocation count can answer on its own.
+#[test]
+fn fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let (tx_out, mut rx_out) = tokio::sync::mpsc::channel(1);
+    let (tx_xform, mut rx_xform) = tokio::sync::mpsc::channel(1);
+    let fanout = Fanout::new(vec![tx_out, tx_xform]);
+
+    let warm = fixtures::nginx_batch(1);
+    rt.block_on(async {
+        fanout.send(warm).await;
+        let out = rx_out.recv().await.expect("output branch should receive");
+        let xform = rx_xform.recv().await.expect("transform branch should receive");
+        drop(out);
+        drop(unwrap_delivered(xform));
+    });
+
+    let batch = fixtures::nginx_batch(1);
+    let ((out_len, xform_len), stats) = measure(|| {
+        rt.block_on(async {
+            fanout.send(batch).await;
+            let out = rx_out.recv().await.expect("output branch should receive");
+            let xform = rx_xform.recv().await.expect("transform branch should receive");
+            // The Output branch finishes and drops its handle first -- matching `run_output`
+            // having already returned from `output.send` and moved past this batch entirely --
+            // *before* the Transform branch ever attempts its unwrap.
+            let out_len = borrow_delivered(&out).events.len();
+            drop(out);
+            let xform_batch = unwrap_delivered(xform);
+            (out_len, xform_batch.events.len())
+        })
+    });
+    assert_eq!(out_len, 1);
+    assert_eq!(xform_len, 1);
+    // 1 (Arc::new, once per send) + 0 (the Transform branch's try_unwrap now succeeds, since the
+    // Output branch already dropped its handle) + 0 (the Output branch, as always). Against
+    // `main`'s flat, unconditional 5 for this shape, this outcome is a real, substantial
+    // improvement -- the other reachable outcome (the test above) is 1 allocation worse than
+    // `main`. Which one a given run lands on is decided by scheduling, not by this design.
+    expect_allocs(
+        "fanout: send + receive, 1 Output + 1 Transform, Output finished first (racy outcome B)",
+        stats,
+        1,
     );
 }
 

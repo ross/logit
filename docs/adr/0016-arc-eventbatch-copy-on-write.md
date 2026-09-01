@@ -183,43 +183,67 @@ async fn run_output(/* ... */) -> anyhow::Result<()> {
 need an owned `Event` to mutate or consume, so they still call `unwrap_batch` exactly as in round
 one.
 
-Measured (`crates/logit-bench/tests/allocations.rs`), for a 1-event nginx-shaped batch:
+Measured (`crates/logit-bench/tests/allocations.rs`), for a 1-event nginx-shaped batch, against
+`main`'s (pre-PR) flat, unconditional **5** allocations for *any* 2-consumer fan-out regardless of
+consumer kind:
 
-| Fan-out shape (2 consumers) | Allocations |
-|---|---:|
-| Both `Output` (`fanout_send_two_output_consumers_costs_only_the_arc`) | **1** (just `Arc::new`) |
-| One `Output`, one `Transform` (`fanout_send_mixed_output_and_transform_consumers`) | **6** (1 `Arc::new` + the `Transform` branch's 5-allocation clone) |
-| Both `Transform`-style, no `Output` at all (round one's number, unchanged) | 6 |
+| Fan-out shape (2 consumers) | Allocations | vs. `main`'s flat 5 |
+|---|---:|---|
+| Both `Output` (`fanout_send_two_output_consumers_costs_only_the_arc`) | **1** | strictly better |
+| One `Output`, one `Transform` — `Transform` unwraps while `Output`'s handle is still alive (`fanout_send_mixed_output_and_transform_consumers`) | **6** | 1 worse |
+| One `Output`, one `Transform` — `Output` finishes and drops first (`fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first`) | **1** | strictly better |
+| Both `Transform`-style, no `Output` at all (round one's number, unchanged) | 6 | 1 worse |
 
-**This genuinely closes the gap for an all-`Output` fan-out.** Neither branch ever calls
-`Arc::try_unwrap`, so there's no race to win or lose — `Output::send` doesn't compete for the free
-unwrap at all, it just borrows. This *is* the "every read-only branch pays one atomic, never a
+**This genuinely closes the gap for an all-`Output` fan-out, unconditionally.** Neither branch ever
+calls `Arc::try_unwrap`, so there's no race to win or lose — `Output::send` doesn't compete for the
+free unwrap at all, it just borrows. This *is* the "every read-only branch pays one atomic, never a
 clone" saving `docs/design/memory.md` §8 item 4 originally recommended, delivered, measured at
-exactly 1 allocation regardless of how many `Output` branches share the fan-out (a third or fourth
-`Output` sink adds nothing to that number — verify by extending either test's consumer list).
+exactly 1 allocation regardless of how many `Output` branches share the fan-out.
 
 **For the mixed case — the actually-common shape, matching the nginx reference config's
-`tap`/`trimmed` split — the saving is structural, not a lucky roll of the dice this time.** The
-total (6) is the same as round one's all-`Transform` number, but now all of it lands on the branch
-that actually needs an owned copy and none of it lands on the `Output` branch, deterministically.
-The reason: `Output::send` never calls `try_unwrap`, so it holds its `Arc` handle for as long as
-its own `send` takes — real I/O, in production, not the near-instant unwrap-on-receipt window round
-one's race depended on — and only drops it once that finishes. A sibling `Transform`'s
-`unwrap_batch` call therefore reliably finds a live `Output` sibling and clones, not just when
-timing happens to go against it. The practical consequence: **a fan-out with any number of
-`Output` branches and exactly one mutating branch costs the same total (one `Arc::new` plus one
-clone) no matter how many `Output` branches there are**, since none of them ever compete for or
-need the free unwrap. That is strictly better than the pre-`Arc` code, which paid a full clone for
-every consumer but the last regardless of what kind of consumer it was.
+`tap`/`trimmed` split — the result is genuinely bimodal, not a fixed number in either direction.**
+An earlier version of this section claimed the `Transform` branch "reliably" or "deterministically"
+clones here; that overclaimed. `run_output`'s loop (`runtime.rs`) drops its own `Delivered` the
+moment `output.send` returns, immediately before its next receive — it does not hold the `Arc`
+handle for the rest of its loop, and it never itself calls `try_unwrap`. So whether the `Transform`
+branch's `unwrap_batch` call succeeds for free comes down to real tokio scheduling: whichever
+happens first, `Output` completing its `send` and dropping its handle, or the `Transform` branch's
+unwrap actually running. Both orderings are reachable and both are measured above — 6 if `Transform`
+gets there first (`Output`'s handle still alive, forcing a clone), 1 if `Output` finishes first
+(nothing left to contend with, `try_unwrap` succeeds free). **There is no path to landing on
+`main`'s flat 5 either way** — `Arc::new` is paid unconditionally the moment there are 2+ consumers
+— so the reachable range is 1 or 6, never in between.
+
+In production, `Output::send` typically performs real I/O (a network write, a file append), which
+tends to be measurably slower than a `Transform`'s local, in-process work — so 6 (one allocation
+worse than `main`) is the *likelier* practical outcome for this shape, not the *only* one. A fast or
+local `Output` implementation, or a `Transform` doing enough work before its own unwrap that
+`Output` finishes first, could just as easily land on 1. **This means the mixed case is not a
+strict improvement over `main`, and not reliably worse either — it's genuinely racy**, and this ADR
+does not claim to know, or control, which outcome a given deployment gets. What *is* structural,
+not racy: `Output` itself never pays anything beyond its share of the one `Arc::new` in either
+outcome, and a mutating branch's copy is always independent before it can be mutated regardless of
+which path `try_unwrap` took (`a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch`).
 
 **What still doesn't close: a fan-out where more than one branch needs an owned copy** (two
 `Transform`s, or a `Transform` and a Lua stage, off one node, with no `Output` involved). Neither
-side of that fan-out can borrow, so it's exactly round one's `1 + (N - 1) × clone` — one allocation
-worse than the pre-`Arc` code, still. `Output::send(&EventBatch)` doesn't touch this case; it isn't
-an `Output` case. Left as-is: the same reasoning round one's "Alternatives" gave for wrapping each
-`Event` individually still applies (`Transform::process`/`ScriptWorker::process` genuinely need
-ownership to do their job), and widening *those* traits to something reference-based would remove
-their ability to mutate or consume the event at all.
+side of that fan-out can borrow, so it's exactly round one's `1 + (N - 1) × clone`, deterministically
+— one allocation worse than the pre-`Arc` code, with no racy path to anything better, since nothing
+in this shape ever finishes without competing for the unwrap. `Output::send(&EventBatch)` doesn't
+touch this case; it isn't an `Output` case. Left as-is: the same reasoning round one's
+"Alternatives" gave for wrapping each `Event` individually still applies
+(`Transform::process`/`ScriptWorker::process` genuinely need ownership to do their job), and
+widening *those* traits to something reference-based would remove their ability to mutate or
+consume the event at all.
+
+**A real fix for the mixed case's raciness exists and is deliberately not taken here**: making
+`Fanout` aware of which of its consumers are borrowing (`Output`) versus owning
+(`Transform`/`ScriptWorker`) at construction time, so it could give owning consumers an
+unconditional direct clone (bypassing `Arc`/`try_unwrap` entirely) while sharing the `Arc` only
+among borrowing consumers — turning the mixed case into a fixed, deterministic 6 (`main`+1,
+always, no race) instead of today's 1-or-6. That needs threading node-kind information from
+`runtime.rs` down into `Fanout::new`'s construction, a real scope expansion past what this ADR
+covers. Recorded as a candidate future direction, not decided here — see Alternatives.
 
 ## Alternatives
 
@@ -247,16 +271,26 @@ their ability to mutate or consume the event at all.
   history (why it was rejected the first time) rather than removed, since the reasoning was sound
   for round one's scope at the time.
 - **Do nothing.** Leaves the pre-`Arc` code in place: an unconditional clone for every consumer but
-  the last, on every send, listener-to-sink or fan-out alike. Round one's measurements left this a
+  the last, on every send, listener-to-sink or fan-out alike — a flat, predictable 5 allocations for
+  any 2-consumer fan-out, regardless of consumer kind. Round one's measurements left this a
   genuinely open question — without the `Output::send(&EventBatch)` change, doing nothing was at
   least as cheap, and for a genuine fan-out one allocation *cheaper*, than what round one shipped.
-  Round two settles it: for any fan-out with at least one `Output` branch (every sink, in every
-  config shape measured, including the common `tap`/`trimmed` mixed case), this design now beats
-  doing nothing outright — 1 allocation instead of a full clone per non-`Output` consumer for an
-  all-`Output` fan-out, and the same total but concentrated correctly for a mixed one. Doing nothing
-  is still cheaper only for the narrower case round two doesn't touch: a fan-out with no `Output`
-  branch at all (two `Transform`s, or a `Transform` and Lua, sharing one node) — there, this design
-  still costs one allocation more than the pre-`Arc` code, and nothing proposed here changes that.
+  Round two changes the comparison but doesn't settle it outright: an all-`Output` fan-out now
+  strictly beats doing nothing (1 versus 5), and a fan-out with no `Output` branch at all is still
+  strictly worse than doing nothing (6 versus 5, deterministically). The mixed case sits on neither
+  side reliably — it's 1 (better than doing nothing) or 6 (worse), decided by scheduling neither
+  this design nor "do nothing" controls. So "does this beat doing nothing" no longer has one answer
+  across configs; it depends on the fan-out shapes a given deployment actually has, and, for the
+  mixed shape specifically, on scheduling this ADR doesn't govern.
+- **Make `Fanout` aware of which consumers are borrowing (`Output`) vs. owning
+  (`Transform`/`ScriptWorker`) at construction time**, so it can give owning consumers a direct,
+  unconditional clone while sharing the `Arc` only among borrowing ones. This would turn the mixed
+  case's current 1-or-6 raciness into a fixed, deterministic 6 (always one worse than `main`, never
+  better, but never a surprise either) — trading away the chance at landing on 1 for predictability.
+  Not taken here: it needs threading node-kind information from `runtime.rs` down into
+  `Fanout::new`'s construction, a real scope expansion past correcting this ADR's claims to match
+  what's measured. Left as a candidate for whoever picks up the mixed case's raciness next, not
+  decided one way or the other by this ADR.
 
 ## Consequences
 
@@ -274,11 +308,18 @@ their ability to mutate or consume the event at all.
   one atomic, never a clone" saving `docs/design/memory.md` §8 item 4 originally recommended,
   delivered — round one's design alone didn't get here; `Output::send(&EventBatch)` (round two,
   above) is what closes it.
-- **A mixed fan-out (`Output` branches plus exactly one mutating `Transform`/Lua branch) costs the
-  same total as if there were no `Output` branches at all, but none of that cost falls on the
-  `Output` side, deterministically** — measured at `fanout_send_mixed_output_and_transform_consumers`
-  (6 allocations: 1 `Arc::new` + 1 clone, all attributable to the mutating branch). This is the
-  nginx reference config's `tap`/`trimmed` shape.
+- **A mixed fan-out (`Output` branches plus exactly one mutating `Transform`/Lua branch) — the
+  nginx reference config's `tap`/`trimmed` shape — lands on 1 or 6 allocations, decided by real
+  scheduling, not a fixed number.** 6 if the mutating branch's `unwrap_batch` call runs before
+  `Output` finishes its `send` and drops its handle (`fanout_send_mixed_output_and_transform_consumers`
+  — the same total as an all-mutating fan-out, but concentrated on the mutating branch, none of it
+  on `Output`); 1 if `Output` finishes first
+  (`fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first` — just the
+  `Arc::new`, nothing else, since nothing is left to contend with). `Output::send` never competes
+  for the free unwrap either way (it never calls `try_unwrap`), but *when* the mutating branch's own
+  unwrap runs relative to `Output` completing is scheduling, which this design doesn't control. An
+  earlier version of this ADR called this outcome "deterministic" or something `Output` "reliably"
+  forces — that overclaimed; corrected here.
 - **A fan-out with no `Output` branch at all (two `Transform`s, or a `Transform` and Lua, sharing
   one node) still costs one allocation more than the pre-`Arc` code, deterministically, and possibly
   more under genuine concurrency** — unchanged from round one
@@ -287,13 +328,15 @@ their ability to mutate or consume the event at all.
   before, via the `try_unwrap` fallback, in every shape above.
 - `a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` remains the correctness
   guard for all of this: it must keep passing, unweakened, for any future change that touches
-  `Fanout`, `Output`, or the node runtime's receive loops — confirmed unmodified through both rounds.
+  `Fanout`, `Output`, or the node runtime's receive loops — confirmed unmodified through every
+  round, including this one, which is docs/tests only and changes no behavior.
   `a_single_consumer_fanout_delivers_the_batch_owned_with_no_arc_involved` and
   `a_shared_batchs_arc_is_uniquely_held_only_once_every_sibling_handle_is_dropped`
   (`crates/logit-pipeline/src/runtime.rs`) guard the two mechanisms this design rests on;
-  `crates/logit-bench/tests/allocations.rs`'s four `fanout_send_*` tests put real allocation counts
-  on every shape above.
+  `crates/logit-bench/tests/allocations.rs`'s five `fanout_send_*` tests put real allocation counts
+  on every shape above, including both reachable outcomes of the mixed one.
 - `docs/design/memory.md` §8 item 4 and `docs/known-gaps.md`'s fan-out entry recommended this fix
   expecting a fan-out-side saving. Round one found `Delivered` alone didn't deliver it for any
-  shape measured; round two shows it now does, for every shape with at least one `Output` branch —
-  worth reflecting `memory.md`/`known-gaps.md`'s framing to match, separately, outside this ADR.
+  shape measured; round two shows it now does for an all-`Output` fan-out unconditionally, and
+  *can* for a mixed one depending on scheduling this design doesn't control — worth reflecting
+  `memory.md`/`known-gaps.md`'s framing to match precisely, separately, outside this ADR.
