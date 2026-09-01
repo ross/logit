@@ -292,15 +292,22 @@ already built that have a known, accepted rough edge.
 
     The measured evidence that gate asks for now exists, separately from the decision itself:
     `crates/logit-bench/tests/allocations.rs`/`benches/pipeline.rs`'s node-runtime coverage closed
-    the gap where nothing measured what `run_transform`/`run_output`/`Fanout::send` themselves
-    cost, and a 24-byte `TraceContext` prototype on `Delivered` was built, measured against that
-    coverage, and reverted — zero allocation change across every existing exact-equality
-    assertion, `size_of::<Delivered>()` 32 → 56, no attributable throughput regression once
-    run-to-run noise is accounted for. See `docs/design/memory.md`'s "Costing internal spans"
-    section for the full account. **Evidence, not a decision** — what's still unmeasured is
-    propagating an *inherited* context (reading a batch's own parent rather than always minting a
-    root), which touches `run_transform`/`run_output` themselves and is the actual shape a real
-    feature needs; that, and the decision itself, are the follow-up this de-risks.
+    the gap where nothing measured what `run_transform` (`process_batch`), `run_output`
+    (`send_batch`), and `Fanout::send` themselves cost — including, after a first pass missed it in
+    review, the *first* call after every `internal` drain (`ComponentBuffer::drain`'s `mem::take`
+    means that call re-populates the buffer rather than updating it, at a real, recurring cost
+    above the steady-state number a first look at this measured) — and a 24-byte `TraceContext`
+    prototype on `Delivered` was built, measured against that coverage, and reverted: zero
+    allocation change across every existing exact-equality assertion at the time, `size_of::<Delivered>()`
+    32 → 56, no attributable throughput regression once run-to-run noise is accounted for. See
+    `docs/design/memory.md`'s "Runtime" and "Costing internal spans" sections for the full account,
+    including the one caveat: the `Delivered` prototype predates the post-drain/`run_output`
+    corrections above, so its "no allocation change" claim was checked against the coverage that
+    existed at the time, not re-verified against the corrected, wider one. **Evidence, not a
+    decision** — what's still unmeasured is propagating an *inherited* context (reading a batch's
+    own parent rather than always minting a root), which touches `run_transform`/`run_output`
+    themselves and is the actual shape a real feature needs; that, and the decision itself, are the
+    follow-up this de-risks.
   - **Internal logs** — routing `Diagnostics`' stderr output into the graph as `LogRecord` events
     is the natural next layer, and what the still-deferred `tracing` migration (above) should build
     on rather than duplicate.
@@ -315,3 +322,19 @@ already built that have a known, accepted rough edge.
   (`logit.internal.points.dropped{reason="cardinality"}`), never silent, but the cap itself is a
   fixed constant, not configurable — revisit if a legitimate component ever needs more than 1024
   distinct points between drains.
+- **Every `Output::send` call allocates a boxed future, on every batch, for every sink, unrelated
+  to telemetry or anything else in this file's other entries.** `Output` is `#[async_trait]`
+  (`crates/logit-pipeline/src/output.rs`); the macro desugars `async fn send` into a fn returning
+  `Pin<Box<dyn Future<...>>>`, so calling it — through `&mut dyn Output`, the shape `run_output`
+  actually has, or even on a concrete type directly — heap-allocates its future every time.
+  Measured at 1 allocation (16 bytes) per call, confirmed identical whether the call goes through a
+  trait object or not (`crates/logit-bench/tests/allocations.rs`'s
+  `send_batch_through_a_noop_output_disabled_telemetry`, found while adding `run_output` allocation
+  coverage for the internal-spans costing exercise above — a coincidental discovery, not something
+  that exercise was looking for). `Input::run` and `Transform`'s Lua-adjacent paths don't have this
+  problem the same way (`Input::run` is called once per process; `Transform`/`ScriptWorker` aren't
+  `#[async_trait]` at all), so this is specific to the output side, on the hottest possible
+  schedule (once per batch, every sink, every pipeline). Not fixed here: the options (a
+  hand-written `Pin<Box<dyn Future>>` impl bypassing the macro, or waiting on stable support for
+  `dyn`-safe async fn in traits) are both real work with no forcing function yet — this entry is
+  that forcing function, for whenever the output path's allocation cost becomes worth chasing.

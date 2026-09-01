@@ -219,22 +219,38 @@ async fn run_output(
     telemetry: Telemetry,
 ) -> anyhow::Result<()> {
     while let Some(delivered) = inbox.recv().await {
-        let batch: &EventBatch = match &delivered {
-            Delivered::Owned(batch) => batch,
-            Delivered::Shared(shared) => shared,
-        };
-        telemetry.count("logit.component.batches.received", 1.0, &[]);
-        telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
-
-        let timer = telemetry.timer("logit.component.send.duration");
-        let result = output.send(batch).await;
-        drop(timer);
-        if result.is_err() {
-            telemetry.count("logit.component.errors", 1.0, &[]);
-        }
-        result.with_context(|| format!("component '{id}'"))?;
+        send_batch(&id, &mut *output, &delivered, &telemetry).await?;
     }
     Ok(())
+}
+
+/// The per-batch body of `run_output`'s loop above: telemetry accounting plus one `Output::send`
+/// call. Factored out (rather than left inline) for the same reason [`process_batch`] below is --
+/// so it can be measured directly in `crates/logit-bench/tests/allocations.rs`/`benches/pipeline.rs`,
+/// with no channel or the rest of the node runtime involved. Unlike `process_batch` this stays
+/// `async`, because `Output::send` itself is; call it from a `current_thread` runtime with no
+/// `tokio::spawn` to keep it measurable the same way `fanout.rs`'s own tests already are.
+/// `run_output` is the only caller in this crate; `pub` is for the bench/test.
+pub async fn send_batch(
+    id: &str,
+    output: &mut (dyn Output + Send),
+    delivered: &Delivered,
+    telemetry: &Telemetry,
+) -> anyhow::Result<()> {
+    let batch: &EventBatch = match delivered {
+        Delivered::Owned(batch) => batch,
+        Delivered::Shared(shared) => shared,
+    };
+    telemetry.count("logit.component.batches.received", 1.0, &[]);
+    telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
+
+    let timer = telemetry.timer("logit.component.send.duration");
+    let result = output.send(batch).await;
+    drop(timer);
+    if result.is_err() {
+        telemetry.count("logit.component.errors", 1.0, &[]);
+    }
+    result.with_context(|| format!("component '{id}'"))
 }
 
 /// A `Transform`-trait node's loop: races its inbox against its own flush deadline (if it has

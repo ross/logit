@@ -22,7 +22,7 @@ use logit_bench::fixtures;
 use logit_core::{EventBatch, Registry, Telemetry, Value};
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::stdio::{EventDump, Format};
-use logit_pipeline::{process_batch, unwrap_batch, Delivered, Fanout, Transform};
+use logit_pipeline::{process_batch, send_batch, unwrap_batch, Delivered, Fanout, Transform};
 use logit_proto::{Decoder, Encoder};
 use logit_script::{ProcessOutcome, ScriptWorker};
 use std::sync::Arc;
@@ -669,9 +669,21 @@ fn clone_span_event() {
 // (`docs/design/internal-telemetry.md`) added telemetry accounting to both without this file
 // gaining any coverage of what that accounting costs. `run_transform`'s per-batch body is now
 // exported as `logit_pipeline::process_batch` (a synchronous fn -- no channel hop, no runtime
-// needed) specifically so it can be measured here directly, the same "call the real thing" rule
-// `docs/design/memory.md` §7 already applies to every stage above. `unwrap_batch` is exported for
-// the same reason.
+// needed), and `run_output`'s as `logit_pipeline::send_batch` (async, since `Output::send` is, but
+// still callable with no channel via a `current_thread` runtime -- see `fanout_send_one_consumer`
+// et al. above for why that's still safe to count allocations across), specifically so both can be
+// measured here directly, the same "call the real thing" rule `docs/design/memory.md` §7 already
+// applies to every stage above. `unwrap_batch` is exported for the same reason.
+//
+// **A second, sharper gap this section closes, found in review of the first draft: "telemetry
+// live" below only ever measured a component buffer already warmed with the same keys.** In
+// production, `internal`'s every tick calls `Registry::drain`, and `ComponentBuffer::drain`
+// (`crates/logit-core/src/telemetry.rs`) `mem::take`s the whole `points` map -- so the *next*
+// `count`/`timer` call for each key is a fresh insert into an empty map, not an update to an
+// existing entry, and costs more than the steady-state number the first draft's tests measured.
+// Both states are covered below, for both `process_batch` and `send_batch`: "telemetry live"
+// (steady state, matching every occurrence between two drains) and "first call after a drain"
+// (once per drain interval, forever, for as long as `internal` runs).
 
 /// The per-batch body with telemetry disabled (`Telemetry::default()`, what every component has
 /// with no `internal` component configured) -- everything above `keep`'s own cost
@@ -715,17 +727,19 @@ fn process_batch_fully_absorbed() {
     expect_allocs("runtime: process_batch, fully absorbed (aggregate)", stats, 1);
 }
 
-/// What live telemetry costs on top of the disabled path above -- the number PR #37 never
-/// measured, since `crates/logit-pipeline/src/fanout.rs`'s own tests prove `Fanout::send`'s
-/// telemetry calls are free but nothing exercised `process_batch`'s (`count`/`timer` around the
-/// per-event loop) until this test. Built the same way `fanout.rs`'s own telemetry tests are:
-/// a real `Registry`, not a mock.
+/// What live telemetry costs on top of the disabled path above, in **steady state** -- every
+/// `count`/`timer` call here updates a `(name, tags)` key already resident in the component
+/// buffer from the warm-up, exactly like every occurrence between two `internal` drains in
+/// production (`ComponentBuffer::upsert`'s `get_mut` branch, `crates/logit-core/src/telemetry.rs`).
+/// The *other* case -- the first call after a drain, where every key is a fresh insert -- is
+/// measured separately below (`process_batch_first_call_after_a_drain`); this test's own claim is
+/// narrower than the first draft's was, on review.
 ///
-/// **Measured, not assumed: this costs exactly what the disabled path costs** -- both this test
-/// and `process_batch_through_keep` above assert 1, the same single `Vec::with_capacity`
-/// allocation. `count`/`timer` write into the component's pre-allocated `ComponentBuffer`
-/// (`docs/design/internal-telemetry.md`); turning `internal` on in a config does not add a single
-/// allocation to `process_batch` itself.
+/// **Measured, not assumed: in this steady state, it costs exactly what the disabled path costs**
+/// -- both this test and `process_batch_through_keep` above assert 1, the same single
+/// `Vec::with_capacity` allocation. `count`/`timer` update an existing map entry in place
+/// (`docs/design/internal-telemetry.md`); an `internal`-fed pipeline's steady-state cost between
+/// drains is not distinguishable from `internal` being off at all.
 #[test]
 fn process_batch_with_live_telemetry() {
     let mut keep = fixtures::keep();
@@ -738,7 +752,33 @@ fn process_batch_with_live_telemetry() {
     let (out, stats) = measure(|| process_batch(&mut keep, batch, &telemetry));
     let out = out.expect("keep forwards events, never fully absorbs");
     assert_eq!(out.events.len(), 1);
-    expect_allocs("runtime: process_batch through keep, telemetry live", stats, 1);
+    expect_allocs("runtime: process_batch through keep, telemetry live (steady state)", stats, 1);
+}
+
+/// The case steady state above doesn't cover, found in review: `internal`'s every tick calls
+/// `Registry::drain`, which `mem::take`s the component buffer's whole map
+/// (`ComponentBuffer::drain`) -- so the *first* `process_batch` call after each drain re-inserts
+/// all three of its keys (`batches.received`, `events.received`, `process.duration`) into a map
+/// that was just emptied, rather than updating existing entries. Three allocations, not one: the
+/// map's backing table (first insert into an empty `HashMap` after `mem::take` reset it to no
+/// capacity) plus the fresh `DdSketch` `process.duration`'s `Timer` creates on `Drop` (a `Pending`
+/// this key has no prior value to merge into). This is not a one-time cost -- it recurs once per
+/// `internal` drain interval, for as long as `internal` runs, which is why it needs its own
+/// assertion rather than being folded into (or assumed equal to) the steady-state number above.
+#[test]
+fn process_batch_first_call_after_a_drain() {
+    let mut keep = fixtures::keep();
+    let registry = Registry::new();
+    let telemetry = registry.telemetry_for("keep", "keep", "transform");
+    let warm = fixtures::nginx_batch(1);
+    drop(process_batch(&mut keep, warm, &telemetry));
+    registry.drain(0); // what `internal`'s tick does: empties the ComponentBuffer's map
+
+    let batch = fixtures::nginx_batch(1);
+    let (out, stats) = measure(|| process_batch(&mut keep, batch, &telemetry));
+    let out = out.expect("keep forwards events, never fully absorbs");
+    assert_eq!(out.events.len(), 1);
+    expect_allocs("runtime: process_batch, first call after an internal drain", stats, 3);
 }
 
 /// `unwrap_batch`'s free path: `Delivered::Owned` is already the owned `EventBatch` -- no `Arc`
@@ -788,6 +828,122 @@ fn unwrap_batch_shared_contended() {
         stats,
         5,
     );
+}
+
+/// A no-op `Output`, so `send_batch`'s own accounting (the two receive counters, the
+/// `send.duration` timer, the error counter) is what's measured here, not any real sink's
+/// encode/write cost -- `crates/logit-outputs`' own encoders already have their own coverage
+/// above (`mod encode`, `crates/logit-bench/benches/pipeline.rs`).
+struct NoopOutput;
+
+#[async_trait::async_trait]
+impl logit_pipeline::Output for NoopOutput {
+    async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// `run_output`'s per-batch body, `logit_pipeline::send_batch`, with telemetry disabled -- the
+/// direct counterpart to `process_batch_through_keep` above, closing the coverage gap found in
+/// review: the first draft of this section measured `process_batch`/`unwrap_batch` but never
+/// `run_output`'s own loop, despite `docs/known-gaps.md` claiming that gap closed for all three of
+/// `run_transform`/`run_output`/`Fanout::send`.
+///
+/// **This baseline is 1, not 0 -- and telemetry has nothing to do with it.** `Output` is
+/// `#[async_trait]` (`crates/logit-pipeline/src/output.rs`); the macro desugars `async fn send`
+/// into a fn returning `Pin<Box<dyn Future<...>>>`, so *every* call to `output.send(..).await`
+/// heap-allocates its future -- confirmed by measuring `NoopOutput::send` called directly (no
+/// `dyn Output`, no vtable) alongside the `dyn Output` call this test actually makes: both cost
+/// exactly 1 (16 bytes), so this is `async_trait`'s boxing, not dynamic dispatch and not this PR's
+/// `Delivered`/telemetry work. A real, previously unmeasured, per-batch cost on every output sink
+/// in production -- worth its own follow-up (a hand-written `Pin<Box<dyn Future>>` impl, or
+/// waiting on stable `dyn`-safe async fn in traits), out of scope here.
+#[test]
+fn send_batch_through_a_noop_output_disabled_telemetry() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let mut output = NoopOutput;
+    let telemetry = Telemetry::default();
+    let warm = Delivered::Owned(fixtures::nginx_batch(1));
+    rt.block_on(async {
+        send_batch("out", &mut output, &warm, &telemetry).await.expect("noop output never errors")
+    });
+
+    let delivered = Delivered::Owned(fixtures::nginx_batch(1));
+    let (_, stats) = measure(|| {
+        rt.block_on(async {
+            send_batch("out", &mut output, &delivered, &telemetry)
+                .await
+                .expect("noop output never errors")
+        })
+    });
+    expect_allocs("runtime: send_batch through a no-op Output, telemetry disabled", stats, 1);
+}
+
+/// `send_batch` with live telemetry, steady state -- the `send_batch` counterpart to
+/// `process_batch_with_live_telemetry` above. Same three keys' shape (two counters, one timing),
+/// same steady-state claim, same narrower scope: this is the cost *between* `internal` drains, not
+/// the first call after one (see `send_batch_first_call_after_a_drain` below).
+///
+/// **Same 1 as the disabled baseline above -- telemetry itself still adds nothing in steady
+/// state**, the `async_trait` box is the entire cost either way. (A reallocation can show up here
+/// depending on which `DdSketch` bucket a given run's elapsed time lands in -- expected and
+/// harmless: `expect_allocs` asserts `allocs`, not `reallocs`, for exactly this kind of
+/// timing-dependent noise; see this file's own module doc.)
+#[test]
+fn send_batch_through_a_noop_output_telemetry_live() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let mut output = NoopOutput;
+    let registry = Registry::new();
+    let telemetry = registry.telemetry_for("out", "stdio_out", "sink");
+    let warm = Delivered::Owned(fixtures::nginx_batch(1));
+    rt.block_on(async {
+        send_batch("out", &mut output, &warm, &telemetry).await.expect("noop output never errors")
+    });
+
+    let delivered = Delivered::Owned(fixtures::nginx_batch(1));
+    let (_, stats) = measure(|| {
+        rt.block_on(async {
+            send_batch("out", &mut output, &delivered, &telemetry)
+                .await
+                .expect("noop output never errors")
+        })
+    });
+    expect_allocs(
+        "runtime: send_batch through a no-op Output, telemetry live (steady state)",
+        stats,
+        1,
+    );
+}
+
+/// `send_batch`'s counterpart to `process_batch_first_call_after_a_drain` -- the same
+/// `mem::take`-empties-the-map effect, recurring once per `internal` drain interval, on
+/// `send_batch`'s own three keys (`batches.received`, `events.received`, `send.duration`). Three
+/// allocations here too, but composed differently than `process_batch`'s: the `async_trait` box
+/// (1, present on every call regardless of telemetry, per the disabled test above) plus the
+/// `HashMap`'s backing table (1, first insert since `mem::take` reset it) plus the fresh `DdSketch`
+/// `send.duration`'s `Timer` creates on `Drop` (1) -- where `process_batch`'s 3 is instead its own
+/// `Vec::with_capacity` (1) plus the same map-table and sketch costs.
+#[test]
+fn send_batch_first_call_after_a_drain() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let mut output = NoopOutput;
+    let registry = Registry::new();
+    let telemetry = registry.telemetry_for("out", "stdio_out", "sink");
+    let warm = Delivered::Owned(fixtures::nginx_batch(1));
+    rt.block_on(async {
+        send_batch("out", &mut output, &warm, &telemetry).await.expect("noop output never errors")
+    });
+    registry.drain(0); // what `internal`'s tick does: empties the ComponentBuffer's map
+
+    let delivered = Delivered::Owned(fixtures::nginx_batch(1));
+    let (_, stats) = measure(|| {
+        rt.block_on(async {
+            send_batch("out", &mut output, &delivered, &telemetry)
+                .await
+                .expect("noop output never errors")
+        })
+    });
+    expect_allocs("runtime: send_batch, first call after an internal drain", stats, 3);
 }
 
 // ---------------------------------------------------------------------------------------------
