@@ -243,7 +243,7 @@ fn build_event(
             // clients, but a gap nonetheless.
             let mut sketch = DdSketch::new();
             sketch.add(value);
-            MetricKind::Distribution(sketch)
+            MetricKind::Distribution(Box::new(sketch))
         }
         "s" => {
             // See the note on `HyperLogLog` in logit-core::metric: not implemented yet.

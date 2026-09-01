@@ -731,7 +731,8 @@ mod tests {
     fn distribution_renders_count_and_percentiles() {
         let mut sketch = DdSketch::new();
         sketch.add(120.0);
-        let out = encode(vec![metric_event(0, "latency", MetricKind::Distribution(sketch))]);
+        let out =
+            encode(vec![metric_event(0, "latency", MetricKind::Distribution(Box::new(sketch)))]);
         assert!(out.contains("distribution count=1"), "got: {out}");
         assert!(out.contains("p50="), "got: {out}");
         assert!(out.contains("p90="), "got: {out}");

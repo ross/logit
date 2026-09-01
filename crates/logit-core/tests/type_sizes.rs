@@ -70,22 +70,28 @@ fn attr_map_pays_its_inline_capacity_whether_or_not_it_spills() {
 /// `Store`s, each a `Vec` plus bookkeeping), which makes every `MetricRecord` pay for a sketch it
 /// almost never holds. Boxing that one variant is the single cheapest size win available; see
 /// `docs/design/memory.md`.
+/// `MetricKind::Distribution` now boxes its `DdSketch` (`docs/design/memory.md` §8 item 10), so
+/// `MetricKind`'s size is set by its largest *remaining* inline variant instead --
+/// `Histogram`/`Summary`'s `Vec` (24 bytes) plus an 8-byte discriminant, not the roughly 8 bytes
+/// `Counter`/`Gauge`/`Distribution(Box<_>)` alone would need. Boxing the sketch therefore saves
+/// 144 bytes here (176 -> 32), more than `docs/design/memory.md`'s original "~168 B" estimate,
+/// which assumed the next-largest variant was negligible rather than a 24-byte `Vec`.
 #[test]
 fn metric_kind_is_sized_by_the_inlined_ddsketch() {
     assert_eq!(
         size_of::<MetricKind>(),
-        176,
-        "almost entirely the `Distribution` variant's inlined DDSketch: two `Store`s (a Vec plus \
-         bookkeeping each) and a Config. Counter/Gauge need 8 bytes and pay 176."
+        32,
+        "Histogram/Summary's Vec<(f64, _)> (24 bytes) plus discriminant is now the largest \
+         variant, since Distribution holds only a Box<DdSketch> (8 bytes)"
     );
     assert_eq!(
         size_of::<MetricRecord>(),
-        184,
+        40,
         "MetricKind + a Symbol + a niche-free Option<Symbol>"
     );
     assert_eq!(
         size_of::<MetricList>(),
-        192,
+        48,
         "SmallVec<[MetricRecord; 1]>: the inline record, plus 8 bytes of capacity-and-\
          discriminant overhead (smallvec's `union` feature, enabled workspace-wide in \
          Cargo.toml, saved the other 8)"
@@ -119,17 +125,19 @@ fn record_types() {
 /// clone for each extra fan-out consumer. `docs/design/memory.md` breaks this down term by term
 /// and lists what could be reclaimed.
 ///
-/// Note what this means for the cheap cases: a bare log line with two attributes and a statsd
-/// counter with three tags both cost this same 648 bytes to move, because `AttrMap`'s inline
-/// capacity and `MetricKind`'s inlined sketch are paid unconditionally -- neither carries a span,
-/// and boxing `SpanRecord` (item 9) is exactly why that no longer costs them 136 bytes apiece.
+/// Note what this means for the cheap cases: a bare log line with two attributes now costs 504
+/// bytes to move (down from 792 before this pass' three changes), because `AttrMap`'s inline
+/// capacity is still paid unconditionally regardless of whether the event carries a span or a
+/// distribution -- but boxing `SpanRecord` (item 9) and `DdSketch` (item 10) mean it no longer
+/// pays 136 bytes for a span it doesn't have or 144 bytes of `MetricList` slack for a sketch
+/// variant it isn't using either.
 #[test]
 fn event_size() {
     assert_eq!(
         size_of::<Event>(),
-        648,
-        "776 minus the 128 bytes boxing SpanRecord saves (136 -> 8, `docs/design/memory.md` §8 \
-         item 9)"
+        504,
+        "648 minus the 144 bytes boxing DdSketch in MetricKind::Distribution saves (MetricList \
+         192 -> 48, `docs/design/memory.md` §8 item 10)"
     );
 
     // The breakdown, asserted so it can't drift out of sync with the total above.

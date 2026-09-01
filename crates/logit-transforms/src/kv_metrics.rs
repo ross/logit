@@ -120,7 +120,7 @@ impl Transform for KvMetrics {
                 sketch.add(value);
                 event.metrics.push(MetricRecord {
                     name: m.name,
-                    kind: MetricKind::Distribution(sketch),
+                    kind: MetricKind::Distribution(Box::new(sketch)),
                     unit: m.unit,
                 });
             }
