@@ -114,18 +114,30 @@ is how the aggregator ([docs/design/data-model.md](data-model.md)'s mergeable me
 accumulated state into emitted events — this is why the flush/timer contract needs to exist in the
 pipeline design now rather than being bolted on when aggregation is implemented.
 
-**An event handle is consumed once it's returned from `process()` or included in a `flush()`
-table** — don't keep using a Lua variable referencing an event after handing it back that way. A
-Lua userdata is a reference type, so a variable a script stashed elsewhere (`pending = event`) can
-be the *exact same* underlying object as the one returned, not an independent copy; extracting the
-returned one invalidates every other reference to it, and using a stashed alias afterward is a
+**An event handle — and its `event.attributes` handle — is consumed once the event is returned
+from `process()` or included in a `flush()` table** — don't keep using a Lua variable referencing
+either after handing the event back that way. A Lua userdata is a reference type, so a variable a
+script stashed elsewhere (`pending = event`, or `pending_attrs = event.attributes`) can be the
+*exact same* underlying object as the one returned (or reached through it), not an independent
+copy; extracting the returned event invalidates every other reference to it — including a stashed
+`event.attributes` handle, since one is cached per event and reused for every access rather than
+rebuilt each time (`crates/logit-script/src/proxy.rs`) — and using a stashed alias afterward is a
 clear error, not silently wrong data. If a script genuinely needs to both emit an event now and
 keep something for later (a stateful `flush()` re-emitting it, say), stash `event:clone()` — an
-independent copy — instead of `event` itself.
+independent copy — instead of `event` (or `event.attributes`) itself.
 
 `return {a, b}` must be a proper array-like table (keys exactly `1..=n`, matching Lua's own
 notion of a sequence) — a malformed table (non-contiguous keys) is a clear error, not a silently
 incomplete or empty result.
+
+`process`/`flush` are resolved once, when the script loads, not looked up from `_G` again on every
+event or flush tick — a deliberate cost/behavior trade (`crates/logit-script/src/lib.rs`): a script
+that reassigns `_G.process`/`_G.flush` mid-run has no effect on what actually runs from that point
+on. Reassigning either isn't a pattern this contract ever documented or exercised, so this is very
+unlikely to change real behavior, but it is a real (if narrow) restriction worth knowing about. A
+`flush` global that exists but isn't a function (or `nil`) is rejected at load time, the same as a
+missing `process` — not silently treated as "no `flush()`" and left to quietly emit nothing at
+every tick.
 
 ## Config shape
 
