@@ -3,6 +3,7 @@
 //! `component 'id': msg` prefix, and a way to bound how many times a high-volume, low-value
 //! message repeats. See `docs/adr/0013-service-lifecycle-and-output-retry.md`.
 
+use crate::telemetry::Telemetry;
 use std::collections::HashMap;
 use std::fmt::Display;
 
@@ -18,6 +19,12 @@ pub struct Diagnostics {
     /// interfere with each other's throttling -- a component with two distinct failure modes
     /// (e.g. `json`'s "no brace found" and "parse failed") reports each on its own cadence.
     counts: HashMap<&'static str, u64>,
+    /// Mirrors every [`Diagnostics::warn_throttled`] occurrence into a
+    /// `logit.component.diagnostics{key=...}` counter -- every occurrence, not just the throttled
+    /// stderr subset, since that's exactly the volume a metric (unlike a terminal) is good at
+    /// carrying. [`Telemetry::default`] (this field's default) makes that a no-op, so attaching
+    /// telemetry is purely additive to every existing `Diagnostics` user.
+    telemetry: Telemetry,
 }
 
 impl Default for Diagnostics {
@@ -28,7 +35,18 @@ impl Default for Diagnostics {
 
 impl Diagnostics {
     pub fn new(component_id: impl Into<String>) -> Self {
-        Self { component_id: component_id.into(), counts: HashMap::new() }
+        Self {
+            component_id: component_id.into(),
+            counts: HashMap::new(),
+            telemetry: Telemetry::default(),
+        }
+    }
+
+    /// Attaches a telemetry handle -- see the `telemetry` field's doc comment. Mirrors the
+    /// existing `with_diagnostics`/`with_timeout`/`with_retry` builder idiom.
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
+        self
     }
 
     /// Reports unconditionally, prefixed with this component's id. For a diagnostic that can fire
@@ -46,7 +64,12 @@ impl Diagnostics {
     /// for diagnostics would make an otherwise-deterministic interface non-deterministic to test
     /// (see ADR 0013's Alternatives). Returns whether this call actually reported, so a test can
     /// assert the throttling directly rather than capturing stderr.
+    ///
+    /// Every occurrence -- not just the ones that actually print -- increments
+    /// `logit.component.diagnostics{key}` via `self.telemetry`, so a flood that's invisible on a
+    /// throttled stderr is still visible as a real rate once telemetry is live.
     pub fn warn_throttled(&mut self, key: &'static str, msg: impl Display) -> bool {
+        self.telemetry.count("logit.component.diagnostics", 1.0, &[("key", key)]);
         let count = self.counts.entry(key).or_insert(0);
         *count += 1;
         let count = *count; // copied out so `self.counts`'s borrow ends before `self.warn` below
@@ -61,6 +84,32 @@ impl Diagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::Registry;
+    use crate::MetricKind;
+
+    /// The metric side is not throttled even though stderr is: 10 occurrences of the same key
+    /// report only 4 times to stderr (powers of two) but should still sum to 10 on the counter,
+    /// since a flood invisible on a throttled terminal is exactly what a metric is for.
+    #[test]
+    fn every_warn_throttled_occurrence_increments_the_metric_even_when_stderr_is_suppressed() {
+        let registry = Registry::new();
+        let mut diag = Diagnostics::new("test").with_telemetry(registry.telemetry_for(
+            "test",
+            "json",
+            "transform",
+        ));
+        for _ in 0..10 {
+            diag.warn_throttled("parse_failure", "x");
+        }
+
+        let events = registry.drain(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].attributes.get("key").and_then(|v| v.as_str()), Some("parse_failure"));
+        match &events[0].metrics[0].kind {
+            MetricKind::Counter(v) => assert_eq!(*v, 10.0),
+            other => panic!("expected Counter, got {other:?}"),
+        }
+    }
 
     #[test]
     fn warn_throttled_reports_at_powers_of_two_and_suppresses_the_rest() {

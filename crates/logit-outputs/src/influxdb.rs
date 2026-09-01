@@ -5,7 +5,9 @@
 use crate::Output;
 use bytes::Bytes;
 use logit_core::interner::resolve;
-use logit_core::{Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Value};
+use logit_core::{
+    Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
+};
 use logit_proto::{CodecError, Encoder};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -75,6 +77,11 @@ pub struct InfluxDbOutput {
     request_timeout: Duration,
     retry: RetryPolicy,
     diag: Diagnostics,
+    /// Component-specific detail beyond the runtime's uniform layer-2 metrics (`docs/design/
+    /// internal-telemetry.md`'s "layer 3") -- which response class came back and how many retries
+    /// it took, which `run_output`'s own `logit.component.send.duration`/`.errors` can't see
+    /// inside a single `send` call.
+    telemetry: Telemetry,
 }
 
 impl InfluxDbOutput {
@@ -89,6 +96,7 @@ impl InfluxDbOutput {
             request_timeout: DEFAULT_TIMEOUT,
             retry: RetryPolicy::default(),
             diag: Diagnostics::default(),
+            telemetry: Telemetry::default(),
         }
     }
 
@@ -114,6 +122,25 @@ impl InfluxDbOutput {
         self.diag = diag;
         self
     }
+
+    /// Attaches a telemetry handle -- see the `telemetry` field's doc comment.
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+}
+
+/// A coarse response-status bucket, `&'static str` so it's directly usable as a telemetry tag
+/// value (`logit_core::telemetry::Tag`) with no per-response allocation or interning.
+fn status_class(status: reqwest::StatusCode) -> &'static str {
+    match status.as_u16() / 100 {
+        1 => "1xx",
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        5 => "5xx",
+        _ => "other",
+    }
 }
 
 fn build_client(timeout: Duration) -> reqwest::Client {
@@ -133,6 +160,8 @@ impl Output for InfluxDbOutput {
             // below). Not an error; nothing to write.
             return Ok(());
         }
+
+        self.telemetry.count("logit.output.batch.bytes", body.len() as f64, &[]);
 
         // Encoded once, before the retry loop: `encode` is deterministic, so re-running it on a
         // retry would be pointless. `Bytes::clone` is a cheap refcount bump, not a copy -- one
@@ -159,6 +188,7 @@ impl Output for InfluxDbOutput {
             let attempt_timeout =
                 attempt_timeout_for(self.request_timeout, self.retry.attempt_timeout, remaining);
 
+            let request_timer = self.telemetry.timer("logit.output.request.duration");
             let result = self
                 .client
                 .post(&write_url)
@@ -173,11 +203,24 @@ impl Output for InfluxDbOutput {
                 .body(body.clone())
                 .send()
                 .await;
+            drop(request_timer);
 
             let failure = match result {
-                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) if resp.status().is_success() => {
+                    self.telemetry.count(
+                        "logit.output.requests",
+                        1.0,
+                        &[("class", status_class(resp.status()))],
+                    );
+                    return Ok(());
+                }
                 Ok(resp) => {
                     let status = resp.status();
+                    self.telemetry.count(
+                        "logit.output.requests",
+                        1.0,
+                        &[("class", status_class(status))],
+                    );
                     if !is_retryable_status(status) {
                         let text = resp.text().await.unwrap_or_default();
                         anyhow::bail!("InfluxDB write failed ({status}): {text}");
@@ -185,7 +228,14 @@ impl Output for InfluxDbOutput {
                     let text = resp.text().await.unwrap_or_default();
                     format!("HTTP {status}: {text}")
                 }
-                Err(err) => err.to_string(),
+                Err(err) => {
+                    self.telemetry.count(
+                        "logit.output.requests",
+                        1.0,
+                        &[("class", "network_error")],
+                    );
+                    err.to_string()
+                }
             };
 
             let now = tokio::time::Instant::now();
@@ -199,6 +249,7 @@ impl Output for InfluxDbOutput {
             let backoff =
                 backoff_for(&self.retry, attempt).min(deadline.saturating_duration_since(now));
 
+            self.telemetry.count("logit.output.retries", 1.0, &[]);
             self.diag.warn(format_args!(
                 "InfluxDB write attempt {attempt} failed ({failure}), retrying in {backoff:?}"
             ));
@@ -1317,6 +1368,52 @@ mod tests {
             3,
             "expected exactly 3 attempts: two 503s, then the 204"
         );
+    }
+
+    /// The layer-3 telemetry example (`docs/design/internal-telemetry.md`): every response class
+    /// actually seen and every retry taken should be visible, not just whether `send` eventually
+    /// succeeded.
+    #[tokio::test]
+    async fn send_records_a_request_per_attempt_by_status_class_and_a_retry_per_backoff() {
+        let (addr, _count) = canned_server(vec![RESP_503, RESP_503, RESP_204]).await;
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
+        let mut output = InfluxDbOutput::new(
+            format!("http://{addr}"),
+            "org".into(),
+            "bucket".into(),
+            "token".into(),
+        )
+        .with_retry(fast_retry())
+        .with_telemetry(telemetry);
+
+        let batch = batch_with(vec![metric_event("x", MetricKind::Counter(1.0), &[])]);
+        output.send(&batch).await.expect("should eventually succeed once the 503s clear");
+
+        let events = registry.drain(0);
+        let value = |name: &str, tag: Option<(&str, &str)>| -> f64 {
+            events
+                .iter()
+                .find_map(|e| {
+                    if let Some((k, v)) = tag {
+                        if e.attributes.get(k).and_then(|v2| v2.as_str()) != Some(v) {
+                            return None;
+                        }
+                    }
+                    e.metrics.iter().find_map(|m| match &m.kind {
+                        MetricKind::Counter(v) if logit_core::interner::resolve(m.name) == name => {
+                            Some(*v)
+                        }
+                        _ => None,
+                    })
+                })
+                .unwrap_or(0.0)
+        };
+
+        assert_eq!(value("logit.output.requests", Some(("class", "5xx"))), 2.0);
+        assert_eq!(value("logit.output.requests", Some(("class", "2xx"))), 1.0);
+        assert_eq!(value("logit.output.retries", None), 2.0);
+        assert!(value("logit.output.batch.bytes", None) > 0.0);
     }
 
     #[tokio::test]

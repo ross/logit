@@ -21,6 +21,9 @@
 //!     implemented `influxdb_out` sink can't encode a metric with no measurement name (Influx line
 //!     protocol requires one), so this must be caught here rather than surfacing as a runtime sink
 //!     failure the first time such an event arrives.
+//! 13. At most one `internal` component -- two would each drain (and so split) the same
+//!     process-wide telemetry `Registry`, silently halving whichever one a downstream consumer
+//!     happened not to be reading from rather than failing clearly.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -40,6 +43,18 @@ pub enum Role {
     Sink,
 }
 
+impl Role {
+    /// A stable, lowercase name for this role -- used to stamp `logit.component.*` telemetry
+    /// points with which arity class produced them (`docs/design/internal-telemetry.md`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Listener => "listener",
+            Role::Transform => "transform",
+            Role::Sink => "sink",
+        }
+    }
+}
+
 /// The arity class a kind belongs to. Public so `logit graph` (`logit-cli`) can style nodes by
 /// role directly off a `Config`, without needing a fully-resolved `Graph` -- useful precisely
 /// because it lets `logit graph` render *something* even for a config that fails validation
@@ -47,9 +62,12 @@ pub enum Role {
 pub fn role(kind: &ComponentKind) -> Role {
     use ComponentKind::*;
     match kind {
-        StatsdIn { .. } | SyslogIn { .. } | OtlpIn { .. } | FileTail { .. } | LogitIn { .. } => {
-            Role::Listener
-        }
+        StatsdIn { .. }
+        | SyslogIn { .. }
+        | OtlpIn { .. }
+        | FileTail { .. }
+        | LogitIn { .. }
+        | Internal { .. } => Role::Listener,
         Lua { .. }
         | LuaFile { .. }
         | Aggregate { .. }
@@ -70,6 +88,45 @@ pub fn role(kind: &ComponentKind) -> Role {
     }
 }
 
+/// A stable, human-readable name for this kind -- exactly the config `type` tag it deserializes
+/// from. Not derived from `Serialize` (that would round-trip a whole `Component`, not just name a
+/// variant) -- alongside [`role`], this is the one other place that must be kept in sync with a
+/// new `ComponentKind` variant landing ("the kind already knows its own arity",
+/// `docs/design/pipeline-graph.md`, extended here to naming). Used to stamp `logit.component.*`
+/// telemetry points with which kind produced them (`docs/design/internal-telemetry.md`) --
+/// `logit-cli::pipeline::build_spec` is the one caller.
+pub fn kind_name(kind: &ComponentKind) -> &'static str {
+    use ComponentKind::*;
+    match kind {
+        StatsdIn { .. } => "statsd_in",
+        SyslogIn { .. } => "syslog_in",
+        OtlpIn { .. } => "otlp_in",
+        FileTail { .. } => "file_tail",
+        LogitIn { .. } => "logit_in",
+        Internal { .. } => "internal",
+        Lua { .. } => "lua",
+        LuaFile { .. } => "lua_file",
+        Aggregate { .. } => "aggregate",
+        Json { .. } => "json",
+        KvMetrics { .. } => "kv_metrics",
+        Keep { .. } => "keep",
+        Remove { .. } => "remove",
+        Logfmt => "logfmt",
+        Kv => "kv",
+        Regex { .. } => "regex",
+        Csv => "csv",
+        Rename { .. } => "rename",
+        Filter { .. } => "filter",
+        Sample { .. } => "sample",
+        Throttle { .. } => "throttle",
+        Dedup { .. } => "dedup",
+        InfluxDbOut { .. } => "influxdb_out",
+        OtlpOut { .. } => "otlp_out",
+        LogitOut { .. } => "logit_out",
+        StdioOut { .. } => "stdio_out",
+    }
+}
+
 /// The single source of truth for which `ComponentKind`s the runtime can actually build --
 /// mirrors the pre-graph `require_implemented_input`/`require_implemented_output`/
 /// `require_implemented_transform` trio, now unified over one enum.
@@ -78,6 +135,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
         kind,
         ComponentKind::StatsdIn { .. }
             | ComponentKind::SyslogIn { .. }
+            | ComponentKind::Internal { .. }
             | ComponentKind::Lua { .. }
             | ComponentKind::LuaFile { .. }
             | ComponentKind::Aggregate { .. }
@@ -97,7 +155,9 @@ fn is_implemented(kind: &ComponentKind) -> bool {
 fn interval(kind: &ComponentKind) -> Option<Duration> {
     match kind {
         ComponentKind::Lua { interval, .. } | ComponentKind::LuaFile { interval, .. } => *interval,
-        ComponentKind::Aggregate { interval } => Some(*interval),
+        ComponentKind::Aggregate { interval } | ComponentKind::Internal { interval } => {
+            Some(*interval)
+        }
         _ => None,
     }
 }
@@ -111,6 +171,10 @@ pub struct ResolvedComponent {
 impl ResolvedComponent {
     pub fn role(&self) -> Role {
         role(&self.kind)
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        kind_name(&self.kind)
     }
 }
 
@@ -237,6 +301,22 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 );
             }
         }
+    }
+
+    // Rule 13: at most one `internal` component.
+    let internal_ids: Vec<&String> = components
+        .iter()
+        .filter(|(_, c)| matches!(c.kind, ComponentKind::Internal { .. }))
+        .map(|(id, _)| id)
+        .collect();
+    if internal_ids.len() > 1 {
+        let mut ids: Vec<&str> = internal_ids.iter().map(|s| s.as_str()).collect();
+        ids.sort_unstable();
+        anyhow::bail!(
+            "config defines more than one 'internal' component ({}) -- each would drain (and so \
+             split) the same process-wide telemetry",
+            ids.join(", ")
+        );
     }
 
     let mut resolved = HashMap::with_capacity(components.len());
@@ -624,5 +704,42 @@ mod tests {
         assert_eq!(order[3], "out");
         assert!(order[1..3].contains(&"left".to_string()));
         assert!(order[1..3].contains(&"right".to_string()));
+    }
+
+    fn internal() -> ComponentKind {
+        ComponentKind::Internal { interval: Duration::from_secs(10) }
+    }
+
+    #[test]
+    fn kind_name_matches_the_configs_own_type_tag() {
+        assert_eq!(kind_name(&listener()), "statsd_in");
+        assert_eq!(kind_name(&internal()), "internal");
+        assert_eq!(kind_name(&sink()), "influxdb_out");
+    }
+
+    #[test]
+    fn internal_resolves_as_a_listener() {
+        let graph = resolve(cfg(vec![("self", vec![], internal()), ("out", vec!["self"], sink())]))
+            .expect("should resolve");
+        assert_eq!(graph.components["self"].role(), Role::Listener);
+    }
+
+    #[test]
+    fn a_second_internal_component_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("self", vec![], internal()),
+            ("self2", vec![], internal()),
+            ("out", vec!["self", "self2"], sink()),
+        ]));
+        assert!(err.contains("more than one 'internal' component"), "got: {err}");
+    }
+
+    #[test]
+    fn internal_with_zero_interval_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("self", vec![], ComponentKind::Internal { interval: Duration::ZERO }),
+            ("out", vec!["self"], sink()),
+        ]));
+        assert!(err.contains("flush interval of 0s"), "got: {err}");
     }
 }

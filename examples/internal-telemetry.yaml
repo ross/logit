@@ -1,0 +1,31 @@
+# Self-observability: drains logit's own component-level telemetry into the graph like any other
+# source (docs/design/internal-telemetry.md, docs/adr/0018-internal-telemetry-as-pipeline-events.md).
+# `self` here is just a component id -- nothing about `internal`'s type requires that name.
+#
+# `self`'s `interval` is both the drain cadence for every component's buffered points and the
+# sampling tick for logit's own process-level gauges (interner size, uptime). It's picked here to
+# divide evenly into `windowed`'s 60s aggregation interval, per docs/design/internal-telemetry.md's
+# guidance -- a real aggregation window should never straddle two `internal` drains.
+#
+# `windowed` isn't required -- `internal`'s own buffer already coalesces repeat points between
+# drains -- but attaching `aggregate` here is the intended way to get real time-windowed telemetry:
+# `internal` emits whatever accumulated since the last drain, `aggregate` turns that into actual
+# 60-second windows, using the exact same merge semantics (docs/adr/0008-aggregation-window-
+# semantics.md) as any other metric passing through it.
+components:
+  self:
+    type: internal
+    interval: 10s
+
+  windowed:
+    type: aggregate
+    sources: [self]
+    interval: 60s
+
+  influx_out:
+    type: influxdb_out
+    sources: [windowed]
+    url: http://influxdb:8086
+    org: logit
+    bucket: internal
+    token: !env INFLUXDB_TOKEN

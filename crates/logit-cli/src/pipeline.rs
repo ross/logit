@@ -12,7 +12,8 @@
 use crate::config;
 use anyhow::Context;
 use logit_config::{Config, StdioTarget};
-use logit_core::Diagnostics;
+use logit_core::{Diagnostics, Registry, Telemetry};
+use logit_inputs::internal::InternalInput;
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_outputs::influxdb::InfluxDbOutput;
@@ -25,6 +26,7 @@ use logit_transforms::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Loads `path`, resolves its component graph, and runs it until the first component fails or a
 /// shutdown signal is received.
@@ -43,7 +45,7 @@ pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
     // listening.
     let config = config::load(&path)?;
     let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let (graph, specs) = prepare(config, base_dir)?;
+    let (graph, specs, telemetry) = prepare(config, base_dir)?;
 
     // Independent listener from the one `run_with_shutdown` races internally (below) -- multiple
     // concurrent listeners on the same signal kind are supported and all get notified, so this
@@ -55,35 +57,54 @@ pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
         std::process::exit(130);
     });
 
-    let result = logit_pipeline::run_with_shutdown(graph, specs, shutdown_signal()).await;
+    let result =
+        logit_pipeline::run_with_telemetry(graph, specs, telemetry, shutdown_signal()).await;
     kill_switch.abort();
     result
 }
 
-/// Resolves a config into a `Graph` plus one built `NodeSpec` per component -- the shared setup
-/// between [`run_pipelines`] and [`run_config`] (the latter used directly by tests below, which
-/// don't need shutdown wiring).
-fn prepare(
-    config: Config,
-    base_dir: PathBuf,
-) -> anyhow::Result<(graph::Graph, HashMap<String, NodeSpec>)> {
+/// A resolved `Graph` plus one built `NodeSpec` and one [`Telemetry`] handle per component --
+/// [`prepare`]'s return type, factored out purely to keep clippy's `type_complexity` lint happy.
+type Prepared = (graph::Graph, HashMap<String, NodeSpec>, HashMap<String, Telemetry>);
+
+/// Resolves a config into a `Graph`, one built `NodeSpec` per component, and one [`Telemetry`]
+/// handle per component -- the shared setup between [`run_pipelines`] and [`run_config`] (the
+/// latter used directly by tests below, which don't need shutdown wiring).
+///
+/// The telemetry map is empty (every handle [`Telemetry::default`], the disabled no-op) unless
+/// `config` contains an `internal` component, in which case a single process-wide [`Registry`] is
+/// built and shared by every component -- one live handle per component id, reused for both its
+/// own instrumentation (`build_spec`, layer 3) and the node runtime's uniform instrumentation
+/// (`logit_pipeline::run_with_telemetry`, layer 2), so both land in the same buffer and drain
+/// together. See `docs/design/internal-telemetry.md`.
+fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<Prepared> {
     let graph = graph::resolve(config)?;
+
+    let registry: Option<Arc<Registry>> = graph
+        .components
+        .values()
+        .any(|c| matches!(c.kind, logit_config::ComponentKind::Internal { .. }))
+        .then(Registry::new);
 
     // Sorted, not raw `HashMap` iteration order: a startup failure (a missing lua_file) should be
     // reproducible across runs, not depend on hash-seed-driven iteration order -- two
-    // independently-broken components should always report the same one first.
+    // independently-broken components should always report the same one first. Also what makes
+    // `Registry::drain`'s output order reproducible, incidentally -- components register with the
+    // registry in this same order.
     let mut ids: Vec<&String> = graph.components.keys().collect();
     ids.sort();
 
     let mut specs: HashMap<String, NodeSpec> = HashMap::with_capacity(graph.components.len());
+    let mut telemetry: HashMap<String, Telemetry> = HashMap::with_capacity(graph.components.len());
     for id in ids {
         let component = &graph.components[id];
-        let spec =
-            build_spec(id, component, &base_dir).with_context(|| format!("component '{id}'"))?;
+        let (spec, component_telemetry) = build_spec(id, component, &base_dir, registry.as_ref())
+            .with_context(|| format!("component '{id}'"))?;
         specs.insert(id.clone(), spec);
+        telemetry.insert(id.clone(), component_telemetry);
     }
 
-    Ok((graph, specs))
+    Ok((graph, specs, telemetry))
 }
 
 /// Waits for one SIGTERM or SIGINT (Ctrl-C on non-Unix, where `SignalKind` doesn't exist). Each
@@ -111,8 +132,8 @@ async fn shutdown_signal() {
 /// an in-memory `Config` directly without a signal handler racing their assertions.
 #[cfg(test)]
 async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
-    let (graph, specs) = prepare(config, base_dir)?;
-    logit_pipeline::run(graph, specs).await
+    let (graph, specs, telemetry) = prepare(config, base_dir)?;
+    logit_pipeline::run_with_telemetry(graph, specs, telemetry, std::future::pending()).await
 }
 
 /// The same checks `logit run` needs before spawning anything, exposed for `logit validate` to
@@ -133,19 +154,46 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<()> {
 /// lifecycle-and-output-retry.md`) via each kind's own `with_diagnostics` builder -- not a
 /// constructor parameter, so none of the ~60 existing tests across these four kinds needed to
 /// change.
+///
+/// `registry` is `Some` only when the config being built contains an `internal` component
+/// (`prepare` below) -- every component gets a [`Telemetry`] handle from it either way
+/// (`Telemetry::default()`, the disabled no-op, when `registry` is `None`), attached to its own
+/// `Diagnostics` (so every existing `warn_throttled` call becomes a metric for free) and, for the
+/// two kinds instrumented as a worked example (`statsd_in`, `influxdb_out`), to the component
+/// itself. See `docs/design/internal-telemetry.md`.
 fn build_spec(
     id: &str,
     component: &ResolvedComponent,
     base_dir: &Path,
-) -> anyhow::Result<NodeSpec> {
+    registry: Option<&Arc<Registry>>,
+) -> anyhow::Result<(NodeSpec, Telemetry)> {
     use logit_config::ComponentKind::*;
-    Ok(match &component.kind {
+    // Never moved into a match arm below (every arm clones instead) -- kept alive to return
+    // alongside `spec`, so `prepare` can hand this exact handle to the node runtime too
+    // (`logit_pipeline::run_with_telemetry`), landing layer 2 and layer 3 in the same buffer.
+    let telemetry: Telemetry = registry
+        .map(|r| r.telemetry_for(id, component.kind_name(), component.role().as_str()))
+        .unwrap_or_default();
+    let spec = match &component.kind {
         StatsdIn { bind } => NodeSpec::Input(Box::new(
-            StatsdInput::new(bind.clone()).with_diagnostics(Diagnostics::new(id)),
+            StatsdInput::new(bind.clone())
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
         )),
         SyslogIn { bind } => NodeSpec::Input(Box::new(
-            SyslogInput::new(bind.clone()).with_diagnostics(Diagnostics::new(id)),
+            SyslogInput::new(bind.clone())
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
         )),
+        Internal { interval } => {
+            let registry = registry
+                .cloned()
+                .expect("graph::resolve's rule 13 guarantees a Registry whenever an 'internal' component does");
+            NodeSpec::Input(Box::new(
+                InternalInput::new(*interval, registry)
+                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                    .with_telemetry(telemetry.clone()),
+            ))
+        }
 
         Lua { script, interval } => NodeSpec::Lua { script: script.clone(), interval: *interval },
         LuaFile { lua_file, interval } => {
@@ -155,10 +203,12 @@ fn build_spec(
             NodeSpec::Lua { script, interval: *interval }
         }
         Aggregate { interval } => NodeSpec::Transform(Box::new(
-            Aggregator::new(*interval).with_diagnostics(Diagnostics::new(id)),
+            Aggregator::new(*interval)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
         )),
         Json { skip_to_brace } => NodeSpec::Transform(Box::new(
-            JsonParser::new(*skip_to_brace).with_diagnostics(Diagnostics::new(id)),
+            JsonParser::new(*skip_to_brace)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
         )),
         KvMetrics { counters, gauges, distributions } => NodeSpec::Transform(Box::new(
             KvMetricsTransform::new(
@@ -166,14 +216,15 @@ fn build_spec(
                 to_metric_specs(gauges),
                 to_metric_specs(distributions),
             )
-            .with_diagnostics(Diagnostics::new(id)),
+            .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
         )),
         Keep { fields } => NodeSpec::Transform(Box::new(KeepTransform::new(fields.clone()))),
         Remove { fields } => NodeSpec::Transform(Box::new(RemoveTransform::new(fields.clone()))),
 
         InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(Box::new(
             InfluxDbOutput::new(url.clone(), org.clone(), bucket.clone(), token.clone())
-                .with_diagnostics(Diagnostics::new(id)),
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
         )),
         StdioOut { target } => {
             let output = match target {
@@ -193,7 +244,8 @@ fn build_spec(
         }
 
         other => unreachable!("graph::resolve already rejected any unimplemented kind: {other:?}"),
-    })
+    };
+    Ok((spec, telemetry))
 }
 
 /// Converts config's `MetricSpec` (`logit-config`, which `logit-transforms` deliberately doesn't
@@ -310,6 +362,50 @@ mod tests {
     }
 
     #[test]
+    fn prepare_builds_no_registry_and_only_disabled_handles_without_an_internal_component() {
+        let cfg = config(vec![("in", statsd_in()), ("out", influxdb_out(vec!["in"]))]);
+        let (_, _, telemetry) = prepare(cfg, PathBuf::new()).unwrap();
+        assert_eq!(telemetry.len(), 2);
+        assert!(
+            telemetry.values().all(|t| !t.is_enabled()),
+            "no config-level 'internal' component should mean every handle stays disabled"
+        );
+    }
+
+    #[test]
+    fn prepare_wires_a_live_registry_when_config_has_an_internal_component() {
+        let cfg = config(vec![
+            (
+                "self",
+                Component {
+                    sources: vec![],
+                    kind: ComponentKind::Internal { interval: Duration::from_secs(10) },
+                },
+            ),
+            ("out", influxdb_out(vec!["self"])),
+        ]);
+        let (_, _, telemetry) = prepare(cfg, PathBuf::new()).unwrap();
+        assert!(
+            telemetry.values().all(|t| t.is_enabled()),
+            "an 'internal' component should give every component a live telemetry handle"
+        );
+    }
+
+    #[test]
+    fn build_spec_builds_an_internal_input() {
+        let registry = Registry::new();
+        let component = ResolvedComponent {
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Internal { interval: Duration::from_secs(10) },
+        };
+        let (spec, telemetry) =
+            build_spec("self", &component, Path::new(""), Some(&registry)).unwrap();
+        assert!(matches!(spec, NodeSpec::Input(_)));
+        assert!(telemetry.is_enabled());
+    }
+
+    #[test]
     fn build_spec_builds_an_aggregate_transform() {
         let component = ResolvedComponent {
             sources: vec!["in".to_string()],
@@ -317,7 +413,7 @@ mod tests {
             kind: ComponentKind::Aggregate { interval: Duration::from_secs(10) },
         };
         assert!(matches!(
-            build_spec("windowed", &component, Path::new("")).unwrap(),
+            build_spec("windowed", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
     }
@@ -337,7 +433,7 @@ mod tests {
             },
         };
         assert!(matches!(
-            build_spec("out", &component, Path::new("")).unwrap(),
+            build_spec("out", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Output(_)
         ));
     }
@@ -350,7 +446,7 @@ mod tests {
             kind: ComponentKind::Json { skip_to_brace: true },
         };
         assert!(matches!(
-            build_spec("parse", &component, Path::new("")).unwrap(),
+            build_spec("parse", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
     }
@@ -367,7 +463,7 @@ mod tests {
     fn build_spec_builds_a_stdio_sink_for_stdout() {
         let component = stdio_out_component(StdioTarget::Stdout);
         assert!(matches!(
-            build_spec("tap", &component, Path::new("")).unwrap(),
+            build_spec("tap", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Output(_)
         ));
     }
@@ -376,7 +472,7 @@ mod tests {
     fn build_spec_builds_a_stdio_sink_for_stderr() {
         let component = stdio_out_component(StdioTarget::Stderr);
         assert!(matches!(
-            build_spec("tap", &component, Path::new("")).unwrap(),
+            build_spec("tap", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Output(_)
         ));
     }
@@ -389,7 +485,7 @@ mod tests {
 
         let component = stdio_out_component(StdioTarget::Path(path.display().to_string()));
         assert!(matches!(
-            build_spec("tap", &component, Path::new("")).unwrap(),
+            build_spec("tap", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Output(_)
         ));
 
@@ -411,7 +507,10 @@ mod tests {
         let _ = std::fs::remove_file(&expected_path);
 
         let component = stdio_out_component(StdioTarget::Path(relative.to_string()));
-        assert!(matches!(build_spec("tap", &component, &base_dir).unwrap(), NodeSpec::Output(_)));
+        assert!(matches!(
+            build_spec("tap", &component, &base_dir, None).unwrap().0,
+            NodeSpec::Output(_)
+        ));
         assert!(
             expected_path.exists(),
             "expected the relative target to be created inside base_dir ({}), not the process cwd",
@@ -429,7 +528,7 @@ mod tests {
         // reason `logit-pipeline::graph`'s tests have their own `expect_err` helper.
         let path = std::env::temp_dir().join("logit-build-spec-no-such-dir").join("x.log");
         let component = stdio_out_component(StdioTarget::Path(path.display().to_string()));
-        let err = match build_spec("tap", &component, Path::new("")) {
+        let err = match build_spec("tap", &component, Path::new(""), None) {
             Ok(_) => panic!("expected build_spec to fail for an unopenable path"),
             Err(err) => err,
         };
@@ -452,7 +551,7 @@ mod tests {
             },
         };
         assert!(matches!(
-            build_spec("derive", &component, Path::new("")).unwrap(),
+            build_spec("derive", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
     }
@@ -465,7 +564,7 @@ mod tests {
             kind: ComponentKind::Keep { fields: vec!["status".to_string()] },
         };
         assert!(matches!(
-            build_spec("keep", &component, Path::new("")).unwrap(),
+            build_spec("keep", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
     }
@@ -478,7 +577,7 @@ mod tests {
             kind: ComponentKind::Remove { fields: vec!["client_ip".to_string()] },
         };
         assert!(matches!(
-            build_spec("remove", &component, Path::new("")).unwrap(),
+            build_spec("remove", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
     }

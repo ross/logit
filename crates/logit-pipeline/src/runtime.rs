@@ -11,7 +11,7 @@ use crate::fanout::Delivered;
 use crate::graph::Graph;
 use crate::{Fanout, Input, Output, Transform};
 use anyhow::Context;
-use logit_core::{EventBatch, Resource};
+use logit_core::{EventBatch, Resource, Telemetry};
 use logit_script::{ProcessOutcome, ScriptWorker};
 use std::collections::HashMap;
 use std::future::Future;
@@ -59,7 +59,22 @@ pub async fn run(graph: Graph, specs: HashMap<String, NodeSpec>) -> anyhow::Resu
 /// `Ok(())` on its own (`FiniteInput` in this module's tests proves that cascade already works).
 pub async fn run_with_shutdown(
     graph: Graph,
+    specs: HashMap<String, NodeSpec>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    run_with_telemetry(graph, specs, HashMap::new(), shutdown).await
+}
+
+/// Same as [`run_with_shutdown`], but with a per-component [`Telemetry`] handle attached to every
+/// node -- `run`/`run_with_shutdown` are thin wrappers over this with an empty map, which is what
+/// makes them (and every existing caller and test) cost nothing new: a component with no entry
+/// gets [`Telemetry::default`], the disabled handle, same as if this function never existed. Built
+/// by `logit-cli::pipeline::prepare` only when a config's `internal` component asks for a live
+/// `Registry` (`docs/design/internal-telemetry.md`).
+pub async fn run_with_telemetry(
+    graph: Graph,
     mut specs: HashMap<String, NodeSpec>,
+    mut telemetry: HashMap<String, Telemetry>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     // A `watch` (not a `oneshot`) because every listener needs its own clone of the receiver, and
@@ -89,7 +104,9 @@ pub async fn run_with_shutdown(
 
     for id in ids {
         let component = graph.components.get(&id).expect("id came from this graph");
-        let fanout = Fanout::new(component.consumers.iter().map(|c| senders[c].clone()).collect());
+        let node_telemetry = telemetry.remove(&id).unwrap_or_default();
+        let fanout = Fanout::new(component.consumers.iter().map(|c| senders[c].clone()).collect())
+            .with_telemetry(node_telemetry.clone());
         let inbox = inboxes.remove(&id).expect("an inbox was created for every id above");
         let spec = specs
             .remove(&id)
@@ -99,15 +116,17 @@ pub async fn run_with_shutdown(
             NodeSpec::Input(input) => {
                 // A listener's own inbox is never written to (arity rule: a listener has no
                 // sources, so nothing ever names it as a source and sends into it) -- nothing
-                // reads it either.
+                // reads it either. A listener's own send-side telemetry (batches/events sent,
+                // send-blocked duration) comes from `fanout` above, already attached -- nothing
+                // further to instrument here.
                 drop(inbox);
                 tasks.spawn(run_input(id, input, fanout, shutdown_rx.clone()));
             }
             NodeSpec::Output(output) => {
-                tasks.spawn(run_output(id, output, inbox));
+                tasks.spawn(run_output(id, output, inbox, node_telemetry));
             }
             NodeSpec::Transform(transform) => {
-                tasks.spawn(run_transform(transform, inbox, fanout));
+                tasks.spawn(run_transform(transform, inbox, fanout, node_telemetry));
             }
             NodeSpec::Lua { script, interval } => {
                 let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
@@ -116,7 +135,16 @@ pub async fn run_with_shutdown(
                 std::thread::Builder::new()
                     .name(format!("logit-{id}"))
                     .spawn(move || {
-                        run_lua(thread_id, script, interval, ready_tx, inbox, fanout, handle)
+                        run_lua(
+                            thread_id,
+                            script,
+                            interval,
+                            ready_tx,
+                            inbox,
+                            fanout,
+                            node_telemetry,
+                            handle,
+                        )
                     })
                     .with_context(|| format!("spawning thread for component '{id}'"))?;
                 match ready_rx.await {
@@ -188,13 +216,23 @@ async fn run_output(
     id: String,
     mut output: Box<dyn Output + Send>,
     mut inbox: mpsc::Receiver<Delivered>,
+    telemetry: Telemetry,
 ) -> anyhow::Result<()> {
     while let Some(delivered) = inbox.recv().await {
         let batch: &EventBatch = match &delivered {
             Delivered::Owned(batch) => batch,
             Delivered::Shared(shared) => shared,
         };
-        output.send(batch).await.with_context(|| format!("component '{id}'"))?;
+        telemetry.count("logit.component.batches.received", 1.0, &[]);
+        telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
+
+        let timer = telemetry.timer("logit.component.send.duration");
+        let result = output.send(batch).await;
+        drop(timer);
+        if result.is_err() {
+            telemetry.count("logit.component.errors", 1.0, &[]);
+        }
+        result.with_context(|| format!("component '{id}'"))?;
     }
     Ok(())
 }
@@ -207,6 +245,7 @@ async fn run_transform(
     mut transform: Box<dyn Transform + Send>,
     mut inbox: mpsc::Receiver<Delivered>,
     fanout: Fanout,
+    telemetry: Telemetry,
 ) -> anyhow::Result<()> {
     let mut next_flush =
         transform.flush_interval().map(|interval| tokio::time::Instant::now() + interval);
@@ -215,11 +254,7 @@ async fn run_transform(
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
-                for (resource, events) in transform.flush(now_unix_nanos()) {
-                    if !events.is_empty() {
-                        fanout.send(EventBatch { resource, events }).await;
-                    }
-                }
+                run_flush(&mut *transform, &fanout, &telemetry).await;
                 let interval = transform
                     .flush_interval()
                     .expect("next_flush is only ever Some for a transform with an interval");
@@ -240,24 +275,49 @@ async fn run_transform(
         let Some(batch) = batch else {
             // Inbox closed: flush once more so an in-flight window isn't silently lost, then exit.
             if next_flush.is_some() {
-                for (resource, events) in transform.flush(now_unix_nanos()) {
-                    if !events.is_empty() {
-                        fanout.send(EventBatch { resource, events }).await;
-                    }
-                }
+                run_flush(&mut *transform, &fanout, &telemetry).await;
             }
             return Ok(());
         };
         let batch = unwrap_batch(batch);
+        telemetry.count("logit.component.batches.received", 1.0, &[]);
+        telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
 
+        let process_timer = telemetry.timer("logit.component.process.duration");
         let mut out = Vec::with_capacity(batch.events.len());
+        let mut absorbed: u64 = 0;
         for event in batch.events {
-            if let Some(event) = transform.process(&batch.resource, event) {
-                out.push(event);
+            match transform.process(&batch.resource, event) {
+                Some(event) => out.push(event),
+                None => absorbed += 1,
             }
+        }
+        drop(process_timer);
+        if absorbed > 0 {
+            telemetry.count(
+                "logit.component.events.dropped",
+                absorbed as f64,
+                &[("reason", "absorbed")],
+            );
         }
         if !out.is_empty() {
             fanout.send(EventBatch { resource: batch.resource, events: out }).await;
+        }
+    }
+}
+
+/// Shared by `run_transform`'s two flush call sites (the deadline tick and the close-time flush).
+/// Timed as one call even when it yields several `(resource, events)` groups -- `flush`'s own
+/// per-resource windowing (`docs/adr/0008-aggregation-window-semantics.md`) is internal to the
+/// transform, not something this timing needs to break out further.
+async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, telemetry: &Telemetry) {
+    let timer = telemetry.timer("logit.component.flush.duration");
+    let flushed = transform.flush(now_unix_nanos());
+    drop(timer);
+    for (resource, events) in flushed {
+        if !events.is_empty() {
+            telemetry.count("logit.component.flush.events", events.len() as f64, &[]);
+            fanout.send(EventBatch { resource, events }).await;
         }
     }
 }
@@ -273,6 +333,7 @@ async fn run_transform(
 /// events with (`docs/adr/0008-aggregation-window-semantics.md`) -- `last_resource` tracks
 /// whichever resource this component most recently saw on a real batch, defaulting to a fresh one
 /// if none has arrived yet.
+#[allow(clippy::too_many_arguments)]
 fn run_lua(
     id: String,
     script: String,
@@ -280,6 +341,7 @@ fn run_lua(
     ready_tx: oneshot::Sender<Result<(), String>>,
     mut inbox: mpsc::Receiver<Delivered>,
     fanout: Fanout,
+    telemetry: Telemetry,
     runtime: tokio::runtime::Handle,
 ) {
     let worker = match ScriptWorker::new(&script) {
@@ -296,14 +358,22 @@ fn run_lua(
     let mut next_flush = configured_interval.map(|interval| tokio::time::Instant::now() + interval);
     let mut last_resource = Arc::new(Resource::default());
 
-    let flush_now =
-        |worker: &ScriptWorker, resource: &Arc<Resource>, fanout: &Fanout| match worker.flush() {
+    let flush_now = |worker: &ScriptWorker, resource: &Arc<Resource>, fanout: &Fanout| {
+        let timer = telemetry.timer("logit.component.flush.duration");
+        let result = worker.flush();
+        drop(timer);
+        match result {
             Ok(events) if !events.is_empty() => {
+                telemetry.count("logit.component.flush.events", events.len() as f64, &[]);
                 fanout.send_blocking(EventBatch { resource: resource.clone(), events });
             }
             Ok(_) => {}
-            Err(err) => eprintln!("component '{id}': script flush error: {err}"),
-        };
+            Err(err) => {
+                telemetry.count("logit.component.errors", 1.0, &[("reason", "flush")]);
+                eprintln!("component '{id}': script flush error: {err}");
+            }
+        }
+    };
 
     loop {
         if let Some(deadline) = next_flush {
@@ -339,15 +409,34 @@ fn run_lua(
         };
         let batch = unwrap_batch(batch);
         last_resource = batch.resource.clone();
+        telemetry.count("logit.component.batches.received", 1.0, &[]);
+        telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
 
+        let process_timer = telemetry.timer("logit.component.process.duration");
         let mut out = Vec::with_capacity(batch.events.len());
+        let mut dropped: u64 = 0;
+        let mut errors: u64 = 0;
         for event in batch.events {
             match worker.process(event) {
                 Ok(ProcessOutcome::Emit(e)) => out.push(*e),
                 Ok(ProcessOutcome::EmitMany(es)) => out.extend(es),
-                Ok(ProcessOutcome::Drop) => {}
-                Err(err) => eprintln!("component '{id}': script error: {err}"),
+                Ok(ProcessOutcome::Drop) => dropped += 1,
+                Err(err) => {
+                    errors += 1;
+                    eprintln!("component '{id}': script error: {err}");
+                }
             }
+        }
+        drop(process_timer);
+        if dropped > 0 {
+            telemetry.count(
+                "logit.component.events.dropped",
+                dropped as f64,
+                &[("reason", "script_drop")],
+            );
+        }
+        if errors > 0 {
+            telemetry.count("logit.component.errors", errors as f64, &[("reason", "process")]);
         }
         if !out.is_empty() {
             fanout.send_blocking(EventBatch { resource: batch.resource, events: out });
@@ -429,7 +518,7 @@ mod tests {
     use super::*;
     use crate::graph;
     use logit_config::{Component, ComponentKind, Config};
-    use logit_core::Event;
+    use logit_core::{Event, MetricKind, Registry};
     use std::collections::HashMap as Map;
 
     #[test]
@@ -944,5 +1033,93 @@ mod tests {
             "try_unwrap should now succeed with no clone -- this is the property the whole \
              design rests on"
         );
+    }
+
+    /// Proves the whole point of layer 2 (`docs/design/internal-telemetry.md`): a listener, a
+    /// `Transform`, and an `Output` each produce the uniform in/out metric set with zero code of
+    /// their own, purely from `run_with_telemetry` attaching a handle per node. The listener's
+    /// send-side numbers come entirely from its `Fanout` (`FiniteInput` itself never touches
+    /// telemetry); the transform's and output's come from `run_transform`/`run_output`.
+    #[tokio::test]
+    async fn run_with_telemetry_records_the_uniform_metric_set_for_every_node_kind() {
+        let mut components = Map::new();
+        components.insert(
+            "in".to_string(),
+            Component {
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            },
+        );
+        components.insert(
+            "xform".to_string(),
+            Component {
+                sources: vec!["in".to_string()],
+                kind: ComponentKind::Json { skip_to_brace: false },
+            },
+        );
+        components.insert(
+            "out".to_string(),
+            Component { sources: vec!["xform".to_string()], kind: influxdb_out() },
+        );
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+        );
+        specs.insert("xform".to_string(), NodeSpec::Transform(Box::new(MutatingTransform)));
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(Box::new(RecordingOutput { tx: result_tx })),
+        );
+
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = ["in", "xform", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+        )
+        .await
+        .expect("should not hang")
+        .expect("should complete without error");
+
+        result_rx.recv_timeout(Duration::from_secs(1)).expect("output should receive the batch");
+
+        let events = registry.drain(0);
+        let value = |name: &str, component: &str| -> Option<f64> {
+            events.iter().find_map(|e| {
+                if e.attributes.get("component").and_then(|v| v.as_str()) != Some(component) {
+                    return None;
+                }
+                e.metrics.iter().find_map(|m| match &m.kind {
+                    MetricKind::Counter(v) if logit_core::interner::resolve(m.name) == name => {
+                        Some(*v)
+                    }
+                    _ => None,
+                })
+            })
+        };
+
+        assert_eq!(
+            value("logit.component.batches.sent", "in"),
+            Some(1.0),
+            "the listener's own Fanout should record what it sent"
+        );
+        assert_eq!(value("logit.component.events.sent", "in"), Some(1.0));
+        assert_eq!(value("logit.component.batches.received", "xform"), Some(1.0));
+        assert_eq!(value("logit.component.events.received", "xform"), Some(1.0));
+        assert_eq!(value("logit.component.batches.received", "out"), Some(1.0));
+        assert_eq!(value("logit.component.events.received", "out"), Some(1.0));
     }
 }
