@@ -9,10 +9,13 @@
 //! consumer (the common case: a linear chain, and every shipped listener's first hop) moves it
 //! through as `Delivered::Owned`, with no `Arc` involved at all. Only a real fan-out (more than one
 //! consumer) wraps the batch in an `Arc` and hands out `Delivered::Shared` clones -- a refcount
-//! bump, not a deep clone. The consuming side (`runtime.rs`'s `unwrap_batch`) turns either variant
-//! back into an owned `EventBatch` right before handing it to `Output`/`Transform`/`ScriptWorker`,
-//! so none of those trait definitions change. (A listener's own inbox is never fed at all --
-//! arity rules out a `sources` entry pointing at one -- so `Input` never receives a `Delivered`.)
+//! bump, not a deep clone. The consuming side handles either variant per node kind: `run_output`
+//! (`runtime.rs`) borrows `&EventBatch` straight out of either variant -- `Output::send` takes a
+//! reference, so this is where the fan-out saving actually lands -- while `run_transform`/`run_lua`
+//! still call `unwrap_batch` to get an owned `EventBatch`, since `Transform::process`/
+//! `ScriptWorker::process` need to mutate or consume an owned `Event`. (A listener's own inbox is
+//! never fed at all -- arity rules out a `sources` entry pointing at one -- so `Input` never
+//! receives a `Delivered` either way.)
 
 use logit_core::EventBatch;
 use std::sync::Arc;

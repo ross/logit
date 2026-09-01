@@ -175,13 +175,25 @@ async fn run_input(
     }
 }
 
+/// `Output::send` takes `&EventBatch` (`docs/adr/0016-arc-eventbatch-copy-on-write.md`), so this is
+/// the one node kind that never needs [`unwrap_batch`] at all: a `Delivered::Owned` batch is
+/// already there to borrow, and a `Delivered::Shared(Arc<EventBatch>)` is borrowed straight through
+/// the `Arc` (`&Arc<EventBatch>` derefs to `&EventBatch`) with no `Arc::try_unwrap`, no clone, ever
+/// -- regardless of how many sibling branches still hold their own handle to the same batch. This
+/// is what actually delivers the "every read-only sink branch pays one atomic, never a clone"
+/// saving `docs/design/memory.md` §8 item 4 originally recommended; `run_transform`/`run_lua` below
+/// still call `unwrap_batch`, because `Transform::process`/`ScriptWorker::process` need an owned
+/// `Event` to mutate or consume.
 async fn run_output(
     id: String,
     mut output: Box<dyn Output + Send>,
     mut inbox: mpsc::Receiver<Delivered>,
 ) -> anyhow::Result<()> {
-    while let Some(batch) = inbox.recv().await {
-        let batch = unwrap_batch(batch);
+    while let Some(delivered) = inbox.recv().await {
+        let batch: &EventBatch = match &delivered {
+            Delivered::Owned(batch) => batch,
+            Delivered::Shared(shared) => shared,
+        };
         output.send(batch).await.with_context(|| format!("component '{id}'"))?;
     }
     Ok(())
@@ -343,10 +355,12 @@ fn run_lua(
     }
 }
 
-/// Turns the channel payload back into an owned `EventBatch`, right before handing it to
-/// `Output::send`/a `Transform`/`ScriptWorker::process` -- none of which know or need to know that
-/// channels carry [`Delivered`] rather than a bare `EventBatch`
-/// (`docs/adr/0016-arc-eventbatch-copy-on-write.md`).
+/// Turns the channel payload back into an owned `EventBatch`, right before handing it to a
+/// `Transform`/`ScriptWorker::process` -- called from `run_transform`/`run_lua` only. `run_output`
+/// (above) never calls this: `Output::send` takes `&EventBatch`, so it borrows straight out of the
+/// `Delivered` instead, which is what actually realizes the fan-out saving for an `Output` branch
+/// (`docs/adr/0016-arc-eventbatch-copy-on-write.md`'s "Round two"). `Transform`/`ScriptWorker`
+/// still need to mutate or consume an *owned* `Event`, so this unwrap can't be skipped for them.
 ///
 /// `Delivered::Owned` (a single-consumer edge) is already the owned batch: no `Arc` was ever
 /// involved, so this is free. `Delivered::Shared` (a real fan-out) unwraps via `Arc::try_unwrap`,
@@ -355,7 +369,10 @@ fn run_lua(
 /// best-effort saving over always cloning, not a guarantee that exactly one branch pays nothing:
 /// nothing about `Fanout::send` privileges one branch's handle over another's, and two branches
 /// racing to unwrap concurrently can both still observe a strong count above 1 and both fall back
-/// to cloning. Either way, a sibling branch's copy is always independent before it can be mutated
+/// to cloning. An `Output` sibling on the same fan-out makes this *worse* in practice, not better:
+/// it holds its own handle for as long as its `send` takes (real I/O), so a `Transform`/Lua
+/// sibling's unwrap here will reliably find that handle still alive and clone, not just sometimes.
+/// Either way, a sibling branch's copy is always independent before it can be mutated
 /// (`a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` below pins this).
 fn unwrap_batch(batch: Delivered) -> EventBatch {
     match batch {
@@ -428,8 +445,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Output for RecordingOutput {
-        async fn send(&mut self, batch: EventBatch) -> anyhow::Result<()> {
-            let _ = self.tx.send(batch);
+        async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+            // `Output::send` only ever borrows (`docs/adr/0016-arc-eventbatch-copy-on-write.md`);
+            // this test double clones onto its own plain `std::sync::mpsc` channel purely so the
+            // assertion side of each test can inspect what arrived after this async fn returns.
+            let _ = self.tx.send(batch.clone());
             Ok(())
         }
     }

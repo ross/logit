@@ -87,12 +87,15 @@ pub enum Delivered {
   holds its own reference at the moment of unwrapping — exactly the case that needs an independent
   copy for mutation safety, whether or not that's the *only* case in a given run.
 
-**No trait changes.** `Input::run`, `Output::send`, `Transform::process`, and `ScriptWorker::process`
-all keep taking/returning owned `EventBatch`/`Event` exactly as before. The wrap/unwrap boundary
-sits entirely between `Fanout` (produces) and the node runtime's receive loops (consume), so no
-crate outside `logit-pipeline` — `logit-inputs`, `logit-outputs`, `logit-transforms`, `logit-cli` —
-needs to change at all. (A listener's own inbox is never fed at all — arity rules out a `sources`
-entry pointing at one — so `Input` never receives a `Delivered` in the first place.)
+**No trait changes — in round one.** `Input::run`, `Output::send`, `Transform::process`, and
+`ScriptWorker::process` all kept taking/returning owned `EventBatch`/`Event` exactly as before. The
+wrap/unwrap boundary sat entirely between `Fanout` (produces) and the node runtime's receive loops
+(consume), so no crate outside `logit-pipeline` — `logit-inputs`, `logit-outputs`,
+`logit-transforms`, `logit-cli` — needed to change at all. (A listener's own inbox is never fed at
+all — arity rules out a `sources` entry pointing at one — so `Input` never receives a `Delivered`
+in the first place; that stayed true in round two too.) **Round two (below) does take on one trait
+change** — `Output::send` — once the numbers below showed it was the one that actually mattered;
+`Transform`/`ScriptWorker`/`Input` are still untouched.
 
 **Branch isolation is preserved, not just assumed.** Whenever `Fanout::send` takes the fan-out path,
 every branch holds *some* reference until it's consumed, keeping the strong count above 1 until
@@ -136,16 +139,87 @@ overlapping on different cores of the multi-thread runtime, which the review con
 practice against `examples/nginx-to-influxdb.yaml`'s `tap`/`trimmed` fan-out — more than one branch
 can fail to unwrap and clone, which is *worse* than the deterministic case above, never better.
 
-**The originally-hoped saving — "every read-only branch pays one atomic, not a clone" — needs the
-`Output::send(&EventBatch)` trait change this ADR deliberately doesn't make** (see Alternatives).
-Without it, every consumer, read-only or not, must materialize an *owned* `EventBatch` to satisfy
-the existing trait signatures, which means giving up its `Arc` handle immediately on receipt —
-exactly when sharing would otherwise have paid off. `Delivered::Shared`'s best-effort savings are
-real (whichever branch's handle survives longest gets a free unwrap instead of a guaranteed clone),
-but they do not, on their own, beat the code this PR replaces for any fan-out this design has been
-measured against. The unconditional win here is scoped to `Delivered::Owned`: the single-consumer
-edge, which is the common case in the shipped v0.1 reference config and every listener's first hop.
-This is corrected here rather than left as the ADR's original, untested claim.
+**The originally-hoped saving — "every read-only branch pays one atomic, not a clone" — needed the
+`Output::send(&EventBatch)` trait change this ADR's first round deliberately didn't make.** Without
+it, every consumer, read-only or not, had to materialize an *owned* `EventBatch` to satisfy the
+existing trait signatures, giving up its `Arc` handle immediately on receipt — exactly when sharing
+would otherwise have paid off. `Delivered::Shared`'s best-effort savings were real (whichever
+branch's handle survives longest gets a free unwrap instead of a guaranteed clone), but didn't, on
+their own, beat the code this PR replaces for any fan-out measured. The unconditional win in round
+one was scoped to `Delivered::Owned`: the single-consumer edge. See the next section for what
+changed once that trait change was actually taken on.
+
+### Round two: `Output::send` takes `&EventBatch`, closing the gap for `Output` branches
+
+Once every other Wave-1 workstream had merged, the trait change round one deferred was revisited
+(see the former "Change `Output::send` to take `&EventBatch`" Alternative, folded into this
+Decision below). `Output::send` now takes `&EventBatch`:
+
+```rust
+pub trait Output {
+    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()>;
+}
+```
+
+Both implementers (`InfluxDbOutput`, `StdioOutput`) only ever read via `&EventBatch` internally
+already, so each change is signature-only. The part that actually captures the saving is
+`runtime.rs`'s `run_output`, which no longer calls `unwrap_batch` at all — it borrows straight out
+of whichever `Delivered` variant it received and hands that reference through:
+
+```rust
+async fn run_output(/* ... */) -> anyhow::Result<()> {
+    while let Some(delivered) = inbox.recv().await {
+        let batch: &EventBatch = match &delivered {
+            Delivered::Owned(batch) => batch,
+            Delivered::Shared(shared) => shared, // &Arc<EventBatch> derefs to &EventBatch
+        };
+        output.send(batch).await?;
+    }
+    Ok(())
+}
+```
+
+`run_transform` and `run_lua` are unchanged: `Transform::process`/`ScriptWorker::process` still
+need an owned `Event` to mutate or consume, so they still call `unwrap_batch` exactly as in round
+one.
+
+Measured (`crates/logit-bench/tests/allocations.rs`), for a 1-event nginx-shaped batch:
+
+| Fan-out shape (2 consumers) | Allocations |
+|---|---:|
+| Both `Output` (`fanout_send_two_output_consumers_costs_only_the_arc`) | **1** (just `Arc::new`) |
+| One `Output`, one `Transform` (`fanout_send_mixed_output_and_transform_consumers`) | **6** (1 `Arc::new` + the `Transform` branch's 5-allocation clone) |
+| Both `Transform`-style, no `Output` at all (round one's number, unchanged) | 6 |
+
+**This genuinely closes the gap for an all-`Output` fan-out.** Neither branch ever calls
+`Arc::try_unwrap`, so there's no race to win or lose — `Output::send` doesn't compete for the free
+unwrap at all, it just borrows. This *is* the "every read-only branch pays one atomic, never a
+clone" saving `docs/design/memory.md` §8 item 4 originally recommended, delivered, measured at
+exactly 1 allocation regardless of how many `Output` branches share the fan-out (a third or fourth
+`Output` sink adds nothing to that number — verify by extending either test's consumer list).
+
+**For the mixed case — the actually-common shape, matching the nginx reference config's
+`tap`/`trimmed` split — the saving is structural, not a lucky roll of the dice this time.** The
+total (6) is the same as round one's all-`Transform` number, but now all of it lands on the branch
+that actually needs an owned copy and none of it lands on the `Output` branch, deterministically.
+The reason: `Output::send` never calls `try_unwrap`, so it holds its `Arc` handle for as long as
+its own `send` takes — real I/O, in production, not the near-instant unwrap-on-receipt window round
+one's race depended on — and only drops it once that finishes. A sibling `Transform`'s
+`unwrap_batch` call therefore reliably finds a live `Output` sibling and clones, not just when
+timing happens to go against it. The practical consequence: **a fan-out with any number of
+`Output` branches and exactly one mutating branch costs the same total (one `Arc::new` plus one
+clone) no matter how many `Output` branches there are**, since none of them ever compete for or
+need the free unwrap. That is strictly better than the pre-`Arc` code, which paid a full clone for
+every consumer but the last regardless of what kind of consumer it was.
+
+**What still doesn't close: a fan-out where more than one branch needs an owned copy** (two
+`Transform`s, or a `Transform` and a Lua stage, off one node, with no `Output` involved). Neither
+side of that fan-out can borrow, so it's exactly round one's `1 + (N - 1) × clone` — one allocation
+worse than the pre-`Arc` code, still. `Output::send(&EventBatch)` doesn't touch this case; it isn't
+an `Output` case. Left as-is: the same reasoning round one's "Alternatives" gave for wrapping each
+`Event` individually still applies (`Transform::process`/`ScriptWorker::process` genuinely need
+ownership to do their job), and widening *those* traits to something reference-based would remove
+their ability to mutate or consume the event at all.
 
 ## Alternatives
 
@@ -164,57 +238,62 @@ This is corrected here rather than left as the ADR's original, untested claim.
   a second one on top would be two ways to express the same thing, plus (for a broker) losing the
   natural backpressure a bounded `mpsc` gives for free. This ADR doesn't reopen that; fan-out stays
   the normal shape, and this is a cost fix for it, not a way around it.
-- **Change `Output::send` to take `&EventBatch` instead of an owned `EventBatch`.** This is the
-  change that would actually deliver a fan-out allocation saving — "every read-only sink branch
-  pays one atomic, never a clone" — where `Delivered` alone, measured, does not (see "What this
-  change actually saves" above). Both shipped sinks (`influxdb.rs`, `stdio.rs`) only ever read via
-  `&EventBatch` internally already, so the implementations wouldn't need to change much, but the
-  trait signature would, for every implementer. Deliberately out of scope here: this ADR's whole
-  design exists specifically to avoid a trait-signature change (see "No trait changes" above), and
-  taking one on is a larger, separate decision — but it's the one that actually closes the gap this
-  ADR's own numbers expose, not a nice-to-have on top of an already-complete saving.
+- **Change `Output::send` to take `&EventBatch` instead of an owned `EventBatch`.** Round one's
+  draft of this ADR listed this as a rejected, out-of-scope alternative — the trait-signature
+  change this whole design existed specifically to avoid needing. It no longer is: round two (above)
+  takes it on, once every other Wave-1 workstream had merged and widening scope stopped competing
+  with anything else in flight. It was the change that actually closed the gap round one's own
+  numbers exposed, not a nice-to-have layered on an already-complete saving — recorded here as
+  history (why it was rejected the first time) rather than removed, since the reasoning was sound
+  for round one's scope at the time.
 - **Do nothing.** Leaves the pre-`Arc` code in place: an unconditional clone for every consumer but
-  the last, on every send, listener-to-sink or fan-out alike. Measured honestly against what this
-  ADR actually ships (see "What this change actually saves" above), doing nothing is at least as
-  cheap, and for a genuine fan-out one allocation *cheaper*, than what this ADR ships — the
-  single-consumer edge is the only place this change is a clear win, and it's a win only because an
-  earlier version of *this same PR* regressed it first. **This materially weakens the case for
-  merging the fan-out side of this change as-is**: it does not deliver the "every read-only branch
-  pays one atomic" saving `memory.md` recommended, because that saving needs
-  `Output::send(&EventBatch)` (next item), which is out of scope here. What this ADR ships without
-  that trait change is the `Delivered` plumbing plus a real fix for the single-consumer regression,
-  at a small, bounded, constant extra cost (one allocation, deterministically; possibly more under
-  the concurrent-unwrap case above) for any config with a fan-out wider than one. Recorded here
-  rather than resolved: whether that trade is worth taking now — as a step toward the trait change
-  that would actually pay off — or whether the fan-out side should wait for that change to land
-  alongside it, is a call for whoever reviews this PR, not settled by this ADR alone.
+  the last, on every send, listener-to-sink or fan-out alike. Round one's measurements left this a
+  genuinely open question — without the `Output::send(&EventBatch)` change, doing nothing was at
+  least as cheap, and for a genuine fan-out one allocation *cheaper*, than what round one shipped.
+  Round two settles it: for any fan-out with at least one `Output` branch (every sink, in every
+  config shape measured, including the common `tap`/`trimmed` mixed case), this design now beats
+  doing nothing outright — 1 allocation instead of a full clone per non-`Output` consumer for an
+  all-`Output` fan-out, and the same total but concentrated correctly for a mixed one. Doing nothing
+  is still cheaper only for the narrower case round two doesn't touch: a fan-out with no `Output`
+  branch at all (two `Transform`s, or a `Transform` and Lua, sharing one node) — there, this design
+  still costs one allocation more than the pre-`Arc` code, and nothing proposed here changes that.
 
 ## Consequences
 
-- The channel type change (`EventBatch` → `Delivered`) is internal to `logit-pipeline`; no
-  downstream crate's public surface or implementation changes.
+- The channel type change (`EventBatch` → `Delivered`) is internal to `logit-pipeline`. The
+  `Output::send(&EventBatch)` trait change is not internal — every implementer's signature changes
+  — but both shipped ones (`InfluxDbOutput`, `StdioOutput`) needed only the signature updated, no
+  logic change, since each already only read via `&EventBatch` internally.
 - A single-consumer edge — a linear chain, every shipped listener's first hop — costs nothing extra,
-  measured at zero additional allocations (`fanout_send_one_consumer_costs_nothing`). This is the
-  one unconditional win this ADR delivers, and it's a fix for a regression this same PR introduced,
-  not an improvement over `main` before this work started.
-- **A real fan-out (two or more consumers) costs one allocation more than the code this ADR
-  replaces, deterministically, and possibly more than that under genuine concurrency** — not the
-  saving originally expected. Measured at `N = 2` and `N = 3`
-  (`fanout_send_two_consumers_costs_one_clone_plus_one_arc`,
-  `crates/logit-bench/tests/allocations.rs`); see "What this change actually saves" above for why.
-  A branch that mutates pays exactly what it paid before either way, via the `try_unwrap` fallback.
-  This is a correction of an earlier draft of this ADR, which claimed "strictly no worse anywhere"
-  and "every read-only branch costs one atomic" — both wrong for the fan-out case, not just
-  optimistic.
+  measured at zero additional allocations (`fanout_send_one_consumer_costs_nothing`). This is a fix
+  for a regression this same PR introduced in its first round, not an improvement over `main` before
+  this work started.
+- **An all-`Output` fan-out (two or more sinks off one node) now costs exactly one allocation total
+  — the `Arc::new` — regardless of how many `Output` branches share it**, measured at
+  `fanout_send_two_output_consumers_costs_only_the_arc`. This is the "every read-only branch pays
+  one atomic, never a clone" saving `docs/design/memory.md` §8 item 4 originally recommended,
+  delivered — round one's design alone didn't get here; `Output::send(&EventBatch)` (round two,
+  above) is what closes it.
+- **A mixed fan-out (`Output` branches plus exactly one mutating `Transform`/Lua branch) costs the
+  same total as if there were no `Output` branches at all, but none of that cost falls on the
+  `Output` side, deterministically** — measured at `fanout_send_mixed_output_and_transform_consumers`
+  (6 allocations: 1 `Arc::new` + 1 clone, all attributable to the mutating branch). This is the
+  nginx reference config's `tap`/`trimmed` shape.
+- **A fan-out with no `Output` branch at all (two `Transform`s, or a `Transform` and Lua, sharing
+  one node) still costs one allocation more than the pre-`Arc` code, deterministically, and possibly
+  more under genuine concurrency** — unchanged from round one
+  (`fanout_send_two_consumers_costs_one_clone_plus_one_arc`). `Output::send(&EventBatch)` doesn't
+  touch this case; it isn't an `Output` case. A branch that mutates pays exactly what it paid
+  before, via the `try_unwrap` fallback, in every shape above.
 - `a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` remains the correctness
-  guard for this: it must keep passing, unweakened, for any future change that touches `Fanout` or
-  the node runtime's receive loops. `a_single_consumer_fanout_delivers_the_batch_owned_with_no_arc_involved`
-  and `a_shared_batchs_arc_is_uniquely_held_only_once_every_sibling_handle_is_dropped`
-  (`crates/logit-pipeline/src/runtime.rs`) guard the two mechanisms this design rests on, and
-  `crates/logit-bench/tests/allocations.rs`'s `fanout_send_one_consumer_costs_nothing` /
-  `fanout_send_two_consumers_costs_one_clone_plus_one_arc` put real allocation counts on both —
-  including the one that doesn't come out the way `memory.md` §8 item 4 anticipated.
+  guard for all of this: it must keep passing, unweakened, for any future change that touches
+  `Fanout`, `Output`, or the node runtime's receive loops — confirmed unmodified through both rounds.
+  `a_single_consumer_fanout_delivers_the_batch_owned_with_no_arc_involved` and
+  `a_shared_batchs_arc_is_uniquely_held_only_once_every_sibling_handle_is_dropped`
+  (`crates/logit-pipeline/src/runtime.rs`) guard the two mechanisms this design rests on;
+  `crates/logit-bench/tests/allocations.rs`'s four `fanout_send_*` tests put real allocation counts
+  on every shape above.
 - `docs/design/memory.md` §8 item 4 and `docs/known-gaps.md`'s fan-out entry recommended this fix
-  expecting a fan-out-side saving; this ADR is the record of actually building it and measuring that
-  the saving doesn't materialize without also taking on `Output::send(&EventBatch)` (Alternatives,
-  above) — worth revisiting `memory.md`/`known-gaps.md`'s framing separately, outside this ADR.
+  expecting a fan-out-side saving. Round one found `Delivered` alone didn't deliver it for any
+  shape measured; round two shows it now does, for every shape with at least one `Output` branch —
+  worth reflecting `memory.md`/`known-gaps.md`'s framing to match, separately, outside this ADR.

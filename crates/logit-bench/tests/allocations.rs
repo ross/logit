@@ -429,6 +429,118 @@ fn unwrap_delivered(delivered: Delivered) -> EventBatch {
     }
 }
 
+/// The same borrow `runtime.rs`'s `run_output` does, now that `Output::send` takes `&EventBatch`
+/// instead of an owned one -- no `Arc::try_unwrap`, no clone, ever, regardless of how many sibling
+/// branches still hold their own handle to the same batch.
+fn borrow_delivered(delivered: &Delivered) -> &EventBatch {
+    match delivered {
+        Delivered::Owned(batch) => batch,
+        Delivered::Shared(shared) => shared,
+    }
+}
+
+/// The number the second round of PR #33's review asked for, after `Output::send` was changed to
+/// take `&EventBatch`: a fan-out where every consumer is an `Output` (two sinks off one node --
+/// `stdio_out`'s `tap` and an `influxdb_out`, say, both reading the same batch) now costs *only*
+/// the one `Arc::new` per send. Neither branch ever calls `Arc::try_unwrap` or clones at all --
+/// both just borrow through their own `Delivered::Shared` handle, exactly as `run_output` does.
+/// This is the saving `docs/design/memory.md` §8 item 4 originally recommended, and the one the
+/// first round of this PR's review found `Delivered` alone didn't deliver
+/// (`fanout_send_two_consumers_costs_one_clone_plus_one_arc`, above) -- `Output::send(&EventBatch)`
+/// is what closes that gap, for this shape.
+#[test]
+fn fanout_send_two_output_consumers_costs_only_the_arc() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(1);
+    let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(1);
+    let fanout = Fanout::new(vec![tx_a, tx_b]);
+
+    let warm = fixtures::nginx_batch(1);
+    rt.block_on(async {
+        fanout.send(warm).await;
+        let a = rx_a.recv().await.expect("a should receive");
+        let b = rx_b.recv().await.expect("b should receive");
+        assert_eq!(borrow_delivered(&a).events.len(), 1);
+        assert_eq!(borrow_delivered(&b).events.len(), 1);
+    });
+
+    let batch = fixtures::nginx_batch(1);
+    let ((a_len, b_len), stats) = measure(|| {
+        rt.block_on(async {
+            fanout.send(batch).await;
+            let delivered_a = rx_a.recv().await.expect("a should receive");
+            let delivered_b = rx_b.recv().await.expect("b should receive");
+            // Both sides borrow only, exactly as `run_output` does -- never unwrap, never clone.
+            (
+                borrow_delivered(&delivered_a).events.len(),
+                borrow_delivered(&delivered_b).events.len(),
+            )
+        })
+    });
+    assert_eq!(a_len, 1);
+    assert_eq!(b_len, 1);
+    expect_allocs("fanout: send + receive, 2 Output consumers (borrow only)", stats, 1);
+}
+
+/// The actually-common shape (the nginx reference config's `tap` (`stdio_out`)/`trimmed`
+/// (`keep` -> `aggregate` -> ...) split): one `Output` branch and one `Transform`/`ScriptWorker`
+/// branch off the same fan-out. The `Output` branch costs nothing, as above -- it only ever
+/// borrows. The `Transform` branch still needs an owned `Event` to mutate, so it goes through
+/// `unwrap_batch` exactly as before this round of changes.
+///
+/// **This isn't just "sometimes the Output branch is the lucky one now" -- it's structural.**
+/// `Output::send` never calls `Arc::try_unwrap` at all, so it never even competes for the free
+/// unwrap; it holds its `Arc` handle for as long as its own `send` takes (real I/O, in production --
+/// not the near-instant window the old design's race depended on) and only drops it once that
+/// finishes. So in practice the `Transform` branch's `unwrap_batch` call almost always finds a live
+/// sibling and clones, deterministically, not just when timing happens to go against it. Simulated
+/// here by unwrapping the `Transform` side *first*, while the `Output` side's `Delivered` is still
+/// held (unread) -- exactly the ordering a real `output.send().await` still in flight produces.
+#[test]
+fn fanout_send_mixed_output_and_transform_consumers() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let (tx_out, mut rx_out) = tokio::sync::mpsc::channel(1);
+    let (tx_xform, mut rx_xform) = tokio::sync::mpsc::channel(1);
+    let fanout = Fanout::new(vec![tx_out, tx_xform]);
+
+    let warm = fixtures::nginx_batch(1);
+    rt.block_on(async {
+        fanout.send(warm).await;
+        let out = rx_out.recv().await.expect("output branch should receive");
+        let xform = rx_xform.recv().await.expect("transform branch should receive");
+        drop(unwrap_delivered(xform));
+        drop(out);
+    });
+
+    let batch = fixtures::nginx_batch(1);
+    let ((out_len, xform_len), stats) = measure(|| {
+        rt.block_on(async {
+            fanout.send(batch).await;
+            let out = rx_out.recv().await.expect("output branch should receive");
+            let xform = rx_xform.recv().await.expect("transform branch should receive");
+            // The Transform branch unwraps first, while the Output branch's handle is still alive
+            // -- forcing the Transform branch's clone. The Output branch only ever borrows, then
+            // is dropped once this block ends, matching `run_output`'s loop moving to its next
+            // receive once `output.send` has returned.
+            let xform_batch = unwrap_delivered(xform);
+            let out_len = borrow_delivered(&out).events.len();
+            (out_len, xform_batch.events.len())
+        })
+    });
+    assert_eq!(out_len, 1);
+    assert_eq!(xform_len, 1);
+    // 1 (Arc::new, once per send) + 5 (the Transform branch's forced deep clone: 1 for the
+    // Vec<Event>, 4 for the one nginx-shaped Event inside it) + 0 (the Output branch, which never
+    // unwraps or clones at all). Same total as the all-Transform 2-consumer case measured above,
+    // but now concentrated entirely on the branch that actually needs an owned copy -- the Output
+    // branch's share of that cost is gone, not just occasionally skipped.
+    expect_allocs(
+        "fanout: send + receive, 1 Output (free) + 1 Transform (clones) consumer",
+        stats,
+        6,
+    );
+}
+
 /// Cloning [`fixtures::distribution_heavy_event`] -- five *distinct* `MetricKind::Distribution`
 /// metrics, against the nginx shape's two. `clone_one_event` above costs 4 allocations for 2
 /// distributions (a spilled `AttrMap`, a spilled `MetricList`, and a `bins` Vec per sketch); this
