@@ -15,7 +15,7 @@
 //! `keep` ahead of it is what bounds the tag set `aggregate` ever keys on.
 
 use logit_core::interner::resolve;
-use logit_core::{AttrMap, Event, Resource};
+use logit_core::{AttrMap, Event, Resource, Telemetry};
 use logit_pipeline::Transform;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -24,17 +24,27 @@ use std::sync::Arc;
 /// means "drop every attribute" -- a real, if blunt, operation, not rejected as a config error.
 pub struct Keep {
     fields: HashSet<String>,
+    telemetry: Telemetry,
 }
 
 impl Keep {
     pub fn new(fields: Vec<String>) -> Self {
-        Self { fields: fields.into_iter().collect() }
+        Self { fields: fields.into_iter().collect(), telemetry: Telemetry::default() }
+    }
+
+    /// Attaches a telemetry handle -- no `Diagnostics` builder alongside it, unlike most other
+    /// transforms: filtering an `AttrMap` against a fixed set can't fail and has nothing to warn
+    /// about, so there's no `warn_throttled` call site for one to bridge.
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
+        self
     }
 }
 
 impl Transform for Keep {
     fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
-        event.attributes = filtered(&event.attributes, |key| self.fields.contains(key));
+        event.attributes =
+            filtered(&event.attributes, &self.telemetry, |key| self.fields.contains(key));
         Some(event)
     }
 }
@@ -42,17 +52,25 @@ impl Transform for Keep {
 /// Drops the named attributes, keeping the rest.
 pub struct Remove {
     fields: HashSet<String>,
+    telemetry: Telemetry,
 }
 
 impl Remove {
     pub fn new(fields: Vec<String>) -> Self {
-        Self { fields: fields.into_iter().collect() }
+        Self { fields: fields.into_iter().collect(), telemetry: Telemetry::default() }
+    }
+
+    /// See [`Keep::with_telemetry`] -- same reasoning, no `Diagnostics` here either.
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
+        self
     }
 }
 
 impl Transform for Remove {
     fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
-        event.attributes = filtered(&event.attributes, |key| !self.fields.contains(key));
+        event.attributes =
+            filtered(&event.attributes, &self.telemetry, |key| !self.fields.contains(key));
         Some(event)
     }
 }
@@ -62,7 +80,13 @@ impl Transform for Remove {
 /// that order into a fresh `AttrMap` reproduces the same sorted order for whatever survives --
 /// preserving relative order "for free," but see the tests for an explicit assertion of that
 /// rather than a silent assumption.
-fn filtered(attrs: &AttrMap, retain: impl Fn(&str) -> bool) -> AttrMap {
+///
+/// Records `logit.transform.attributes.kept`/`.dropped` -- the cardinality story `aggregate`'s
+/// `logit.transform.series.active` gauge tells from the other end: `keep` is documented as the
+/// mechanism that's supposed to bound what reaches `aggregate`, so knowing how much it's actually
+/// suppressing (or not) is what confirms that's really happening (`docs/design/
+/// internal-telemetry.md`).
+fn filtered(attrs: &AttrMap, telemetry: &Telemetry, retain: impl Fn(&str) -> bool) -> AttrMap {
     let mut out = AttrMap::new();
     for (sym, value) in attrs.iter() {
         let key = resolve(sym);
@@ -70,6 +94,8 @@ fn filtered(attrs: &AttrMap, retain: impl Fn(&str) -> bool) -> AttrMap {
             out.insert(key, value.clone());
         }
     }
+    telemetry.count("logit.transform.attributes.kept", out.len() as f64, &[]);
+    telemetry.count("logit.transform.attributes.dropped", (attrs.len() - out.len()) as f64, &[]);
     out
 }
 
@@ -77,7 +103,7 @@ fn filtered(attrs: &AttrMap, retain: impl Fn(&str) -> bool) -> AttrMap {
 mod tests {
     use super::*;
     use logit_core::interner::intern;
-    use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, Value};
+    use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, Registry, Value};
 
     fn event_with_attrs(pairs: &[(&str, &str)]) -> Event {
         let mut attrs = AttrMap::new();
@@ -182,5 +208,55 @@ mod tests {
         let event = remove.process(&resource, event).unwrap();
         assert_eq!(event.metrics.len(), 1, "remove must not touch metrics");
         assert_eq!(event.log.as_ref().unwrap().message, original_message);
+    }
+
+    // Takes already-drained `events`, not a `&Registry` -- `Registry::drain` is consuming (it
+    // empties every buffer via `mem::take`), so calling it once per assertion in the same test
+    // would make every assertion after the first see an already-emptied registry.
+    fn counter_value(events: &[Event], name: &str) -> Option<f64> {
+        events.iter().find_map(|e| {
+            e.metrics.iter().find_map(|m| match &m.kind {
+                MetricKind::Counter(v) if resolve(m.name) == name => Some(*v),
+                _ => None,
+            })
+        })
+    }
+
+    #[test]
+    fn keep_records_kept_and_dropped_attribute_counts() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("keep_fields", "keep", "transform");
+        let mut keep = Keep::new(vec!["a".to_string(), "c".to_string()]).with_telemetry(telemetry);
+        let resource = default_resource();
+        let event = event_with_attrs(&[("a", "1"), ("b", "2"), ("c", "3")]);
+        keep.process(&resource, event).unwrap();
+
+        let events = registry.drain(0);
+        assert_eq!(counter_value(&events, "logit.transform.attributes.kept"), Some(2.0));
+        assert_eq!(counter_value(&events, "logit.transform.attributes.dropped"), Some(1.0));
+    }
+
+    #[test]
+    fn remove_records_kept_and_dropped_attribute_counts() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("remove_fields", "remove", "transform");
+        let mut remove = Remove::new(vec!["a".to_string()]).with_telemetry(telemetry);
+        let resource = default_resource();
+        let event = event_with_attrs(&[("a", "1"), ("b", "2"), ("c", "3")]);
+        remove.process(&resource, event).unwrap();
+
+        let events = registry.drain(0);
+        assert_eq!(counter_value(&events, "logit.transform.attributes.kept"), Some(2.0));
+        assert_eq!(counter_value(&events, "logit.transform.attributes.dropped"), Some(1.0));
+    }
+
+    #[test]
+    fn a_disabled_telemetry_handle_is_the_default() {
+        // No `.with_telemetry(...)` call at all -- should behave exactly as before this change,
+        // just without any recorded points (nothing to assert beyond "doesn't panic").
+        let mut keep = Keep::new(vec!["a".to_string()]);
+        let resource = default_resource();
+        let event = keep.process(&resource, event_with_attrs(&[("a", "1")])).unwrap();
+        assert_eq!(attr_keys(&event), vec!["a"]);
     }
 }

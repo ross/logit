@@ -10,7 +10,8 @@
 
 use logit_core::interner::{intern, resolve};
 use logit_core::{
-    AttrMap, DdSketch, Diagnostics, Event, MetricKind, MetricRecord, Resource, Symbol, Value,
+    AttrMap, DdSketch, Diagnostics, Event, MetricKind, MetricRecord, Resource, Symbol, Telemetry,
+    Value,
 };
 use logit_pipeline::Transform;
 use std::sync::Arc;
@@ -54,6 +55,7 @@ pub struct KvMetrics {
     gauges: Vec<CompiledMetric>,
     distributions: Vec<CompiledMetric>,
     diag: Diagnostics,
+    telemetry: Telemetry,
 }
 
 impl KvMetrics {
@@ -67,11 +69,19 @@ impl KvMetrics {
             gauges: gauges.into_iter().map(CompiledMetric::from).collect(),
             distributions: distributions.into_iter().map(CompiledMetric::from).collect(),
             diag: Diagnostics::default(),
+            telemetry: Telemetry::default(),
         }
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
+        self
+    }
+
+    /// Attaches a telemetry handle -- see `process`'s `logit.transform.derived`/`.derived.skipped`
+    /// counters.
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
         self
     }
 }
@@ -80,6 +90,12 @@ impl Transform for KvMetrics {
     /// Appends zero or more metrics to `event.metrics`, in config order (counters, then gauges,
     /// then distributions) -- never replacing what's already there, and never dropping the event:
     /// this always returns `Some`. `log`/`span`/`attributes`/`timestamp` are untouched.
+    ///
+    /// Records `logit.transform.derived{kind}`/`.derived.skipped{kind}` for every configured
+    /// metric, whether or not `metric_value`/`numeric` below actually produced a value -- the
+    /// skipped-vs-derived ratio is the visible signal for the documented silent-skip path (a
+    /// missing field, a non-numeric value) this transform deliberately never turns into a
+    /// diagnostic (`docs/design/internal-telemetry.md`).
     fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
         for m in &self.counters {
             if let Some(value) = metric_value(m, &event.attributes) {
@@ -88,6 +104,13 @@ impl Transform for KvMetrics {
                     kind: MetricKind::Counter(value),
                     unit: m.unit,
                 });
+                self.telemetry.count("logit.transform.derived", 1.0, &[("kind", "counter")]);
+            } else {
+                self.telemetry.count(
+                    "logit.transform.derived.skipped",
+                    1.0,
+                    &[("kind", "counter")],
+                );
             }
         }
         for m in &self.gauges {
@@ -97,6 +120,9 @@ impl Transform for KvMetrics {
                     kind: MetricKind::Gauge(value),
                     unit: m.unit,
                 });
+                self.telemetry.count("logit.transform.derived", 1.0, &[("kind", "gauge")]);
+            } else {
+                self.telemetry.count("logit.transform.derived.skipped", 1.0, &[("kind", "gauge")]);
             }
         }
         for m in &self.distributions {
@@ -123,6 +149,13 @@ impl Transform for KvMetrics {
                     kind: MetricKind::Distribution(sketch),
                     unit: m.unit,
                 });
+                self.telemetry.count("logit.transform.derived", 1.0, &[("kind", "distribution")]);
+            } else {
+                self.telemetry.count(
+                    "logit.transform.derived.skipped",
+                    1.0,
+                    &[("kind", "distribution")],
+                );
             }
         }
         Some(event)
@@ -403,5 +436,68 @@ mod tests {
         assert!(metric_named(&event, "up").is_some());
         assert!(metric_named(&event, "bytes").is_none());
         assert!(metric_named(&event, "rt").is_none());
+    }
+
+    // Takes already-drained `events`, not a `&Registry` -- `Registry::drain` is consuming (it
+    // empties every buffer via `mem::take`), so calling it once per assertion in the same test
+    // would make every assertion after the first see an already-emptied registry.
+    fn derived_count(events: &[Event], name: &str, kind: &str) -> Option<f64> {
+        events.iter().find_map(|e| {
+            if e.attributes.get("kind").and_then(|v| v.as_str()) != Some(kind) {
+                return None;
+            }
+            e.metrics.iter().find_map(|m| match &m.kind {
+                MetricKind::Counter(v) if resolve(m.name) == name => Some(*v),
+                _ => None,
+            })
+        })
+    }
+
+    #[test]
+    fn a_derived_metric_records_derived_not_skipped() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("derive", "kv_metrics", "transform");
+        let mut kv =
+            KvMetrics::new(vec![spec("hits", None)], vec![], vec![]).with_telemetry(telemetry);
+        let resource = default_resource();
+        kv.process(&resource, event_with_attrs(&[])).unwrap();
+
+        let events = registry.drain(0);
+        assert_eq!(derived_count(&events, "logit.transform.derived", "counter"), Some(1.0));
+        assert_eq!(derived_count(&events, "logit.transform.derived.skipped", "counter"), None);
+    }
+
+    #[test]
+    fn a_skipped_metric_records_skipped_not_derived() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("derive", "kv_metrics", "transform");
+        let mut kv = KvMetrics::new(vec![spec("missing", Some("nope"))], vec![], vec![])
+            .with_telemetry(telemetry);
+        let resource = default_resource();
+        kv.process(&resource, event_with_attrs(&[])).unwrap();
+
+        let events = registry.drain(0);
+        assert_eq!(derived_count(&events, "logit.transform.derived", "counter"), None);
+        assert_eq!(derived_count(&events, "logit.transform.derived.skipped", "counter"), Some(1.0));
+    }
+
+    #[test]
+    fn derived_and_skipped_are_tagged_by_their_own_kind() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("derive", "kv_metrics", "transform");
+        let mut kv = KvMetrics::new(
+            vec![spec("present", Some("a"))],
+            vec![spec("missing_gauge", Some("nope"))],
+            vec![spec("rt", Some("request_time"))],
+        )
+        .with_telemetry(telemetry);
+        let resource = default_resource();
+        let event = event_with_attrs(&[("a", Value::U64(1)), ("request_time", Value::F64(0.5))]);
+        kv.process(&resource, event).unwrap();
+
+        let events = registry.drain(0);
+        assert_eq!(derived_count(&events, "logit.transform.derived", "counter"), Some(1.0));
+        assert_eq!(derived_count(&events, "logit.transform.derived.skipped", "gauge"), Some(1.0));
+        assert_eq!(derived_count(&events, "logit.transform.derived", "distribution"), Some(1.0));
     }
 }

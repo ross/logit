@@ -344,7 +344,8 @@ fn run_lua(
     telemetry: Telemetry,
     runtime: tokio::runtime::Handle,
 ) {
-    let worker = match ScriptWorker::new(&script) {
+    let worker = match ScriptWorker::new(&script).and_then(|w| w.with_telemetry(telemetry.clone()))
+    {
         Ok(worker) => worker,
         Err(err) => {
             // The receiver may already be gone if `run` bailed for an unrelated reason first;
@@ -418,8 +419,18 @@ fn run_lua(
         let mut errors: u64 = 0;
         for event in batch.events {
             match worker.process(event) {
-                Ok(ProcessOutcome::Emit(e)) => out.push(*e),
-                Ok(ProcessOutcome::EmitMany(es)) => out.extend(es),
+                Ok(ProcessOutcome::Emit(e)) => {
+                    out.push(*e);
+                    telemetry.count("logit.script.events.emitted", 1.0, &[("outcome", "emit")]);
+                }
+                Ok(ProcessOutcome::EmitMany(es)) => {
+                    telemetry.count(
+                        "logit.script.events.emitted",
+                        es.len() as f64,
+                        &[("outcome", "emit_many")],
+                    );
+                    out.extend(es);
+                }
                 Ok(ProcessOutcome::Drop) => dropped += 1,
                 Err(err) => {
                     errors += 1;
@@ -428,6 +439,10 @@ fn run_lua(
             }
         }
         drop(process_timer);
+        // Sampled once per batch, not per event: the strongest single candidate found for
+        // observing a stateful script leaking VM-side state (`docs/design/internal-telemetry.md`)
+        // -- otherwise invisible until the process's own memory visibly grows.
+        telemetry.gauge("logit.script.vm.memory", worker.used_memory() as f64, &[]);
         if dropped > 0 {
             telemetry.count(
                 "logit.component.events.dropped",
@@ -1121,5 +1136,114 @@ mod tests {
         assert_eq!(value("logit.component.events.received", "xform"), Some(1.0));
         assert_eq!(value("logit.component.batches.received", "out"), Some(1.0));
         assert_eq!(value("logit.component.events.received", "out"), Some(1.0));
+    }
+
+    /// The Lua-specific layer-3 additions (`docs/design/internal-telemetry.md`): VM memory is
+    /// visible, and a fan-out script (`return {a, b}`, `ProcessOutcome::EmitMany`) is
+    /// distinguishable from a plain 1:1 script by outcome, not just by the aggregate event count
+    /// `Fanout` already reports.
+    #[tokio::test]
+    async fn run_lua_records_vm_memory_and_emit_outcome() {
+        let mut components = Map::new();
+        components.insert(
+            "in".to_string(),
+            Component {
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            },
+        );
+        components.insert(
+            "enrich".to_string(),
+            Component {
+                sources: vec!["in".to_string()],
+                kind: ComponentKind::Lua {
+                    script: "function process(event) return {event, event:clone()} end".to_string(),
+                    interval: None,
+                },
+            },
+        );
+        components.insert(
+            "out".to_string(),
+            Component { sources: vec!["enrich".to_string()], kind: influxdb_out() },
+        );
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+        );
+        specs.insert(
+            "enrich".to_string(),
+            NodeSpec::Lua {
+                script: "function process(event) return {event, event:clone()} end".to_string(),
+                interval: None,
+            },
+        );
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(Box::new(RecordingOutput { tx: result_tx })),
+        );
+
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = ["in", "enrich", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+        )
+        .await
+        .expect("should not hang")
+        .expect("should complete without error");
+
+        let received =
+            result_rx.recv_timeout(Duration::from_secs(1)).expect("output should receive a batch");
+        assert_eq!(received.events.len(), 2, "one event in should fan out to two events out");
+
+        let events = registry.drain(0);
+        let value = |name: &str, tag: Option<(&str, &str)>| -> Option<f64> {
+            events.iter().find_map(|e| {
+                if e.attributes.get("component").and_then(|v| v.as_str()) != Some("enrich") {
+                    return None;
+                }
+                if let Some((k, v)) = tag {
+                    if e.attributes.get(k).and_then(|v2| v2.as_str()) != Some(v) {
+                        return None;
+                    }
+                }
+                e.metrics.iter().find_map(|m| match &m.kind {
+                    MetricKind::Counter(v) if logit_core::interner::resolve(m.name) == name => {
+                        Some(*v)
+                    }
+                    _ => None,
+                })
+            })
+        };
+
+        assert_eq!(value("logit.script.events.emitted", Some(("outcome", "emit_many"))), Some(2.0));
+
+        let vm_memory = events.iter().find_map(|e| {
+            if e.attributes.get("component").and_then(|v| v.as_str()) != Some("enrich") {
+                return None;
+            }
+            e.metrics.iter().find_map(|m| match &m.kind {
+                MetricKind::Gauge(v)
+                    if logit_core::interner::resolve(m.name) == "logit.script.vm.memory" =>
+                {
+                    Some(*v)
+                }
+                _ => None,
+            })
+        });
+        assert!(vm_memory.is_some_and(|v| v > 0.0), "a loaded Lua VM should report nonzero memory");
     }
 }

@@ -172,9 +172,14 @@ receive/processing side from their own loops, which already see every batch and 
 | `logit.component.send.duration` | timing | `Output::send` |
 | `logit.component.errors` | count | `Output::send` failed, or a Lua script error |
 | `logit.component.diagnostics{key=...}` | count | every `Diagnostics::warn_throttled` occurrence, throttled or not |
+| `logit.script.vm.memory` | gauge | `run_lua`, once per batch — the strongest signal a stateful script is leaking Lua-side state |
+| `logit.script.events.emitted{outcome="emit"\|"emit_many"}` | count | `run_lua`, per `ProcessOutcome` — distinguishes a 1:1 script from a fan-out one |
 
 This set never needs updating when a new component kind lands — it comes from `ComponentKind`'s
-role and the node runtime alone, the same way arity and thread-vs-task dispatch already do.
+role and the node runtime alone, the same way arity and thread-vs-task dispatch already do. The
+last two rows are Lua-specific (recorded in `run_lua`, not shared with `run_transform`/`run_output`)
+because only a Lua node has a VM to sample or a script return value to classify — everything else
+in this table applies uniformly across every component kind.
 
 **Layer 3: a component adds only what only it knows**, via the same `with_telemetry` builder
 idiom `with_diagnostics`/`with_timeout`/`with_retry` already established
@@ -183,15 +188,61 @@ idiom `with_diagnostics`/`with_timeout`/`with_retry` already established
 the component itself and to the runtime's per-node instrumentation, so a drain sees one coherent
 picture per component, not two.
 
-Two worked examples ship as the pattern to follow:
+Worked examples, one per shipped component:
 
 - `statsd_in` (`crates/logit-inputs/src/statsd.rs`): `logit.input.datagrams`,
   `logit.input.datagram.bytes` — per-datagram detail `Fanout`'s per-batch view can't see, plus
   decode failures free via the `Diagnostics` bridge.
+- `syslog_in` (`crates/logit-inputs/src/syslog.rs`): the same pair, `logit.input.datagrams`/
+  `.datagram.bytes` — direct parity with `statsd_in`, the other UDP listener.
+- `aggregate` (`crates/logit-transforms/src/aggregate.rs`): `logit.transform.series.active` and
+  `logit.transform.resource.groups`, sampled at the top of `flush` before it drains its own state
+  — the peak-of-window series count, which is the visible signal for the cardinality blow-up
+  `crate::keep`'s own module doc already warns `aggregate` is exposed to.
+- `kv_metrics` (`crates/logit-transforms/src/kv_metrics.rs`): `logit.transform.derived{kind}` /
+  `.derived.skipped{kind}` — makes the documented silent-skip path (a missing or non-numeric
+  field, deliberately never a diagnostic) visible as a rate instead of invisible.
+- `keep`/`remove` (`crates/logit-transforms/src/keep.rs`): `logit.transform.attributes.kept` /
+  `.dropped` — the other half of `aggregate`'s cardinality story: how much `keep` is actually
+  suppressing before events reach it. No `Diagnostics` on either (pure attribute filtering has
+  nothing to warn about), so `Telemetry` is attached directly rather than through the
+  `Diagnostics` bridge.
+- `stdio_out` (`crates/logit-outputs/src/stdio.rs`): `logit.output.batch.bytes` — direct parity
+  with `influxdb_out`'s own batch-bytes metric. Also has no `Diagnostics` (a write error
+  propagates as a hard failure today, with no `warn_throttled` call site to bridge).
+- `lua`/`lua_file` (`crates/logit-script`, `crates/logit-pipeline/src/runtime.rs::run_lua`):
+  `logit.script.vm.memory` (the Lua VM's own `used_memory()`, the strongest single signal of a
+  leaking stateful script) and `logit.script.events.emitted{outcome}`, both from the Rust side —
+  plus, uniquely among all these, a **script-facing** `telemetry` global a script itself can call
+  (`telemetry.count(...)`/`.gauge(...)`), for domain facts only the script knows. See "Metrics from
+  Lua scripts" below and `docs/design/lua-api.md`.
 - `influxdb_out` (`crates/logit-outputs/src/influxdb.rs`): `logit.output.requests{class="2xx|
   4xx|5xx|network_error"}`, `logit.output.request.duration` (per attempt), `logit.output.retries`,
   `logit.output.batch.bytes` — the retry loop's internal detail `run_output`'s single
   `send.duration` timer can't distinguish.
+
+## Metrics from Lua scripts
+
+`telemetry.count(name, n, tags?)` / `telemetry.gauge(name, v, tags?)` are callable from a script's
+`process()`/`flush()` (`crates/logit-script/src/telemetry.rs`, wired in via
+`ScriptWorker::with_telemetry` — a builder, not a constructor parameter, so it doesn't touch
+`logit-script`'s existing `ScriptWorker::new(script)` call sites). Points a script emits go
+through the exact same buffer, `internal` component, and downstream tools as everything else —
+there's no separate script-telemetry pipeline to configure.
+
+**Cardinality here is convention-enforced, not type-system-enforced.** Every Rust `Telemetry` call
+takes `&'static str` names/tags specifically so cardinality is bounded by code the type system
+checks. A Lua-provided string can't satisfy that at compile time, so it's round-tripped through
+the process's own interner (`interner::resolve(interner::intern(s))`, which genuinely returns
+`&'static str`) — reusing existing, already-accepted infrastructure rather than a new leak
+mechanism, at the cost that a script author (not the compiler) is now the one responsible for not
+building a metric name or tag value out of per-event data. Full reasoning, including the
+alternatives considered: [ADR 0019](../adr/0019-lua-authored-telemetry-cardinality.md). See
+`docs/design/lua-api.md`'s "Emitting telemetry from a script" for the script-author-facing version
+of this same warning.
+
+No `timing()` for scripts: the sandboxed stdlib exposes no clock (`table`/`string`/`math` only),
+so there's no way for a script to produce a duration to hand it.
 
 ## Adding a new internal metric
 
