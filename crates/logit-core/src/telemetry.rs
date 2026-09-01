@@ -135,6 +135,15 @@ impl Telemetry {
 }
 
 /// See [`Telemetry::timer`].
+///
+/// **Recording on `Drop` means a cancelled `.await` still records a sample** -- if the future
+/// holding this `Timer` is dropped mid-wait (e.g. `run_input`'s shutdown-racing `tokio::select!`
+/// in `crates/logit-pipeline/src/runtime.rs` winning while a listener is mid-`Fanout::send`), the
+/// elapsed time reflects time-to-cancellation, not a completed operation. Accepted rather than
+/// worked around: it's inherent to the record-on-`Drop` idiom every call site here relies on, the
+/// effect is confined to one metric's statistical shape, and it only fires during a shutdown race
+/// -- exactly the window an operator is more likely to be watching this for "is it stuck," where a
+/// short, truncated sample is a reasonable enough signal anyway.
 #[must_use = "a Timer records nothing until it is dropped or stopped"]
 pub struct Timer {
     telemetry: Telemetry,
@@ -275,9 +284,22 @@ impl Registry {
     /// are stamped onto every point this handle ever records (`component`/`kind`/`role`
     /// attributes) -- pass the config `type` tag and the arity role, both known once at
     /// construction, never per call.
+    ///
+    /// A second call for an `id` already registered returns a handle to the *same* buffer rather
+    /// than creating a second, independent one -- every call site today (`logit-cli::pipeline::
+    /// prepare`) registers each id exactly once, so this only matters for a caller this crate
+    /// doesn't have yet (a hot-reload/reconfiguration path, say); without it, two buffers stamped
+    /// with the same `component` attribute would coalesce and drain independently, racing each
+    /// other under what looks downstream like one component. `kind`/`role` are taken from
+    /// whichever call registered first; a later call's values are ignored, same as they would be
+    /// if that caller had simply kept its first handle around instead of asking again.
     pub fn telemetry_for(&self, id: &str, kind: &'static str, role: &'static str) -> Telemetry {
+        let mut buffers = self.buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = buffers.iter().find(|buf| buf.id == id) {
+            return Telemetry(Some(existing.clone()));
+        }
         let buf = Arc::new(ComponentBuffer::new(id.to_string(), kind, role));
-        self.buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(buf.clone());
+        buffers.push(buf.clone());
         Telemetry(Some(buf))
     }
 
@@ -471,5 +493,45 @@ mod tests {
         b.count("m", 1.0, &[]);
 
         assert_eq!(registry.drain(0).len(), 2);
+    }
+
+    #[test]
+    fn a_second_telemetry_for_call_with_the_same_id_reuses_the_first_buffer_not_a_second_one() {
+        let registry = Registry::new();
+        let first = registry.telemetry_for("dup", "statsd_in", "listener");
+        let second = registry.telemetry_for("dup", "influxdb_out", "sink");
+
+        first.count("m", 1.0, &[]);
+        second.count("m", 1.0, &[]);
+
+        let events = registry.drain(0);
+        assert_eq!(events.len(), 1, "both handles should coalesce into one buffer, not race two");
+        match &events[0].metrics[0].kind {
+            MetricKind::Counter(v) => assert_eq!(*v, 2.0),
+            other => panic!("expected Counter, got {other:?}"),
+        }
+        // The first registration's kind/role wins -- a later call didn't silently overwrite it.
+        assert_eq!(events[0].attributes.get("kind").and_then(|v| v.as_str()), Some("statsd_in"));
+    }
+
+    /// Pins the caveat documented on `Timer`: recording on `Drop` means a `Timer` dropped without
+    /// ever observing the "real" elapsed time (e.g. because the future holding it was cancelled)
+    /// still records *something*, deliberately -- there is no way to distinguish "completed" from
+    /// "cancelled" from inside `Drop` alone, and that's accepted, not a bug this test exists to
+    /// catch. What it does pin: a `Timer` explicitly dropped early still records exactly one
+    /// sample, never zero and never a panic.
+    #[test]
+    fn a_timer_dropped_early_still_records_exactly_one_sample() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("x", "x", "transform");
+        let timer = telemetry.timer("logit.component.send.blocked.duration");
+        drop(timer); // simulates a cancelled `.await` dropping its in-flight Timer
+
+        let events = registry.drain(0);
+        assert_eq!(events.len(), 1);
+        match &events[0].metrics[0].kind {
+            MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 1),
+            other => panic!("expected Distribution, got {other:?}"),
+        }
     }
 }
