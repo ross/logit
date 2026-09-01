@@ -301,6 +301,11 @@ async fn run_transform(
         // `crates/logit-pipeline/src/fanout.rs`). `run_flush` below has no such single parent and
         // deliberately doesn't do this.
         let parent = batch.context();
+        // Lets a flush-bearing transform (only `Aggregator` today) record this batch as a
+        // contributor to whatever it's about to absorb from it -- the flush-side linking
+        // `TraceContext`'s doc comment and `docs/known-gaps.md`'s internal-spans entry describe.
+        // A no-op for every other transform.
+        transform.observe_batch_context(parent);
         let batch = unwrap_batch(batch);
         if let Some(out) = process_batch(&mut *transform, batch, &telemetry) {
             fanout.send_with_context(out, parent).await;
@@ -361,9 +366,14 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
     let timer = telemetry.timer("logit.component.flush.duration");
     let flushed = transform.flush(now_unix_nanos());
     drop(timer);
-    for (resource, events) in flushed {
-        if !events.is_empty() {
-            telemetry.count("logit.component.flush.events", events.len() as f64, &[]);
+    for (resource, events_with_links) in flushed {
+        if !events_with_links.is_empty() {
+            telemetry.count("logit.component.flush.events", events_with_links.len() as f64, &[]);
+            // The links aren't attached to anything yet -- nothing turns a (context, node, batch)
+            // tuple into a real SpanRecord-carrying Event (docs/known-gaps.md's internal-spans
+            // entry, item 2, still open). Discarded here on purpose; this is where they'll attach
+            // once that exists.
+            let events = events_with_links.into_iter().map(|(event, _links)| event).collect();
             fanout.send(EventBatch { resource, events }).await;
         }
     }
@@ -475,6 +485,13 @@ fn run_lua(
         // this call's entire emission traces back to this one incoming batch. `flush_now` above
         // has no such single parent and deliberately doesn't do this.
         let parent = batch.context();
+        // Lets the script's own `process()` read `trace.trace_id`/`trace.span_id`
+        // (`crates/logit-script/src/trace.rs`) -- essentially infallible in practice (the
+        // registry-held table is independent of whatever a script does to the `trace` global),
+        // logged rather than treated as fatal on the off chance it isn't.
+        if let Err(err) = worker.set_trace_context(parent.trace_id, parent.span_id) {
+            eprintln!("component '{id}': setting trace context failed: {err}");
+        }
         let batch = unwrap_batch(batch);
         last_resource = batch.resource.clone();
         telemetry.count("logit.component.batches.received", 1.0, &[]);
@@ -613,7 +630,7 @@ mod tests {
     use crate::fanout::TraceContext;
     use crate::graph;
     use logit_config::{Component, ComponentKind, Config};
-    use logit_core::{Event, MetricKind, Registry};
+    use logit_core::{Event, MetricKind, Registry, SpanLink};
     use std::collections::HashMap as Map;
 
     #[test]
@@ -953,11 +970,13 @@ mod tests {
             Some(self.interval)
         }
 
-        fn flush(&mut self, _now: i64) -> Vec<(Arc<Resource>, Vec<Event>)> {
+        fn flush(&mut self, _now: i64) -> Vec<(Arc<Resource>, Vec<(Event, Vec<SpanLink>)>)> {
             if self.buffered.is_empty() {
                 return Vec::new();
             }
-            vec![(Arc::new(Resource::default()), std::mem::take(&mut self.buffered))]
+            let events =
+                std::mem::take(&mut self.buffered).into_iter().map(|e| (e, Vec::new())).collect();
+            vec![(Arc::new(Resource::default()), events)]
         }
     }
 

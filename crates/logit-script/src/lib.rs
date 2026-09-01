@@ -14,6 +14,7 @@ use std::marker::PhantomData;
 
 mod proxy;
 mod telemetry;
+mod trace;
 mod value;
 
 pub use proxy::EventProxy;
@@ -76,6 +77,10 @@ pub struct ScriptWorker {
     /// `Option`al because a script may not define one at all (the stateless-processor case).
     process: RegistryKey,
     flush: Option<RegistryKey>,
+    /// The installed `trace` global's table, held so [`ScriptWorker::set_trace_context`] can
+    /// mutate it in place -- see `crate::trace`'s module doc for why this is unconditional,
+    /// unlike `telemetry`'s opt-in builder.
+    trace_table: RegistryKey,
     _not_send_sync: PhantomData<*const ()>,
 }
 
@@ -125,7 +130,21 @@ impl ScriptWorker {
         // does via `MissingProcess`.
         let flush_fn: Option<mlua::Function> = lua.globals().get("flush")?;
         let flush = flush_fn.map(|f| lua.create_registry_value(f)).transpose()?;
-        Ok(Self { lua, process, flush, _not_send_sync: PhantomData })
+        let trace_table = trace::install(&lua)?;
+        Ok(Self { lua, process, flush, trace_table, _not_send_sync: PhantomData })
+    }
+
+    /// Overwrites the `trace` global's `trace_id`/`span_id` (hex-encoded) so this worker's next
+    /// `process()` call reads the given batch's context. Called once per incoming batch, before
+    /// its events reach `process` (`crates/logit-pipeline/src/runtime.rs`'s `run_lua`) -- not
+    /// called at all around a `flush()` call, which keeps whatever was last set, exactly like
+    /// `run_lua`'s own `last_resource` staleness (see `docs/known-gaps.md`'s entry for both).
+    pub fn set_trace_context(
+        &self,
+        trace_id: [u8; 16],
+        span_id: [u8; 8],
+    ) -> Result<(), ScriptError> {
+        trace::set_context(&self.lua, &self.trace_table, trace_id, span_id).map_err(Into::into)
     }
 
     /// Installs a `telemetry` global so `process()`/`flush()` can emit their own metrics -- a
@@ -1226,5 +1245,46 @@ mod tests {
     fn used_memory_reports_a_positive_byte_count() {
         let w = worker("function process(event) return event end");
         assert!(w.used_memory() > 0, "a loaded Lua VM should already have some memory in use");
+    }
+
+    /// `trace.trace_id`/`trace.span_id` are readable inside `process()` -- installed for every
+    /// worker unconditionally (`crate::trace`'s module doc, unlike `telemetry`'s opt-in builder),
+    /// starting at the all-zero placeholder and changing once `set_trace_context` is called, the
+    /// same way `run_lua` calls it once per incoming batch
+    /// (`crates/logit-pipeline/src/runtime.rs`).
+    #[test]
+    fn trace_context_is_readable_in_process_and_changes_after_set_trace_context() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.trace_id = trace.trace_id
+                event.attributes.span_id = trace.span_id
+                return event
+            end
+            "#,
+        );
+
+        let before = emitted(w.process(counter_event("hits", 1.0)).unwrap());
+        assert_eq!(
+            before.attributes.get("trace_id").and_then(|v| v.as_str()),
+            Some(&"0".repeat(32)[..])
+        );
+        assert_eq!(
+            before.attributes.get("span_id").and_then(|v| v.as_str()),
+            Some(&"0".repeat(16)[..])
+        );
+
+        w.set_trace_context([0xab; 16], [0xcd; 8])
+            .expect("setting the trace context should not fail");
+
+        let after = emitted(w.process(counter_event("hits", 1.0)).unwrap());
+        assert_eq!(
+            after.attributes.get("trace_id").and_then(|v| v.as_str()),
+            Some(&"ab".repeat(16)[..])
+        );
+        assert_eq!(
+            after.attributes.get("span_id").and_then(|v| v.as_str()),
+            Some(&"cd".repeat(8)[..])
+        );
     }
 }
