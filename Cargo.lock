@@ -712,6 +712,7 @@ dependencies = [
  "logit-proto",
  "logit-script",
  "logit-transforms",
+ "tokio",
 ]
 
 [[package]]

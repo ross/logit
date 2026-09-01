@@ -7,6 +7,7 @@
 //! doesn't actually need dependency ordering: a `Fanout` is just cloned `Sender`s into inboxes
 //! that already exist by construction, regardless of which node gets spawned first.
 
+use crate::fanout::Delivered;
 use crate::graph::Graph;
 use crate::{Fanout, Input, Output, Transform};
 use anyhow::Context;
@@ -73,9 +74,8 @@ pub async fn run_with_shutdown(
 
     let ids: Vec<String> = graph.components.keys().cloned().collect();
 
-    let mut senders: HashMap<String, mpsc::Sender<EventBatch>> = HashMap::with_capacity(ids.len());
-    let mut inboxes: HashMap<String, mpsc::Receiver<EventBatch>> =
-        HashMap::with_capacity(ids.len());
+    let mut senders: HashMap<String, mpsc::Sender<Delivered>> = HashMap::with_capacity(ids.len());
+    let mut inboxes: HashMap<String, mpsc::Receiver<Delivered>> = HashMap::with_capacity(ids.len());
     for id in &ids {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         senders.insert(id.clone(), tx);
@@ -175,12 +175,25 @@ async fn run_input(
     }
 }
 
+/// `Output::send` takes `&EventBatch` (`docs/adr/0016-arc-eventbatch-copy-on-write.md`), so this is
+/// the one node kind that never needs [`unwrap_batch`] at all: a `Delivered::Owned` batch is
+/// already there to borrow, and a `Delivered::Shared(Arc<EventBatch>)` is borrowed straight through
+/// the `Arc` (`&Arc<EventBatch>` derefs to `&EventBatch`) with no `Arc::try_unwrap`, no clone, ever
+/// -- regardless of how many sibling branches still hold their own handle to the same batch. This
+/// is what actually delivers the "every read-only sink branch pays one atomic, never a clone"
+/// saving `docs/design/memory.md` §8 item 4 originally recommended; `run_transform`/`run_lua` below
+/// still call `unwrap_batch`, because `Transform::process`/`ScriptWorker::process` need an owned
+/// `Event` to mutate or consume.
 async fn run_output(
     id: String,
     mut output: Box<dyn Output + Send>,
-    mut inbox: mpsc::Receiver<EventBatch>,
+    mut inbox: mpsc::Receiver<Delivered>,
 ) -> anyhow::Result<()> {
-    while let Some(batch) = inbox.recv().await {
+    while let Some(delivered) = inbox.recv().await {
+        let batch: &EventBatch = match &delivered {
+            Delivered::Owned(batch) => batch,
+            Delivered::Shared(shared) => shared,
+        };
         output.send(batch).await.with_context(|| format!("component '{id}'"))?;
     }
     Ok(())
@@ -192,7 +205,7 @@ async fn run_output(
 /// indirection, since it's already running inside the async runtime.
 async fn run_transform(
     mut transform: Box<dyn Transform + Send>,
-    mut inbox: mpsc::Receiver<EventBatch>,
+    mut inbox: mpsc::Receiver<Delivered>,
     fanout: Fanout,
 ) -> anyhow::Result<()> {
     let mut next_flush =
@@ -235,6 +248,7 @@ async fn run_transform(
             }
             return Ok(());
         };
+        let batch = unwrap_batch(batch);
 
         let mut out = Vec::with_capacity(batch.events.len());
         for event in batch.events {
@@ -264,7 +278,7 @@ fn run_lua(
     script: String,
     configured_interval: Option<Duration>,
     ready_tx: oneshot::Sender<Result<(), String>>,
-    mut inbox: mpsc::Receiver<EventBatch>,
+    mut inbox: mpsc::Receiver<Delivered>,
     fanout: Fanout,
     runtime: tokio::runtime::Handle,
 ) {
@@ -323,6 +337,7 @@ fn run_lua(
             }
             return;
         };
+        let batch = unwrap_batch(batch);
         last_resource = batch.resource.clone();
 
         let mut out = Vec::with_capacity(batch.events.len());
@@ -336,6 +351,47 @@ fn run_lua(
         }
         if !out.is_empty() {
             fanout.send_blocking(EventBatch { resource: batch.resource, events: out });
+        }
+    }
+}
+
+/// Turns the channel payload back into an owned `EventBatch`, right before handing it to a
+/// `Transform`/`ScriptWorker::process` -- called from `run_transform`/`run_lua` only. `run_output`
+/// (above) never calls this: `Output::send` takes `&EventBatch`, so it borrows straight out of the
+/// `Delivered` instead, which is what actually realizes the fan-out saving for an `Output` branch
+/// (`docs/adr/0016-arc-eventbatch-copy-on-write.md`'s "Round two"). `Transform`/`ScriptWorker`
+/// still need to mutate or consume an *owned* `Event`, so this unwrap can't be skipped for them.
+///
+/// `Delivered::Owned` (a single-consumer edge) is already the owned batch: no `Arc` was ever
+/// involved, so this is free. `Delivered::Shared` (a real fan-out) unwraps via `Arc::try_unwrap`,
+/// which succeeds with no clone whenever this is the only remaining strong reference -- in
+/// practice, whichever branch happens to drop its own reference last at runtime. That is a
+/// best-effort saving over always cloning, not a guarantee that exactly one branch pays nothing:
+/// nothing about `Fanout::send` privileges one branch's handle over another's, and two branches
+/// racing to unwrap concurrently can both still observe a strong count above 1 and both fall back
+/// to cloning.
+///
+/// **An `Output` sibling on the same fan-out doesn't change this into a guarantee either way --
+/// it's still genuinely racy, just against a different clock.** `run_output` (above) drops its own
+/// `Delivered` the moment `output.send` returns, immediately before its next `inbox.recv().await`
+/// -- it does not hold the handle for the rest of its loop, and it never itself calls
+/// `try_unwrap`. So whether *this* function's unwrap succeeds for a `Transform`/Lua sibling comes
+/// down to real tokio scheduling: whichever happens first, `Output`'s task completing its `send`
+/// and dropping its handle, or this call actually running. If `Output` finishes first, this
+/// succeeds for free (1 allocation total for the whole fan-out send -- see
+/// `fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first`,
+/// `crates/logit-bench/tests/allocations.rs`); if `Output` is still mid-`send` (plausible, even
+/// likely, since `Output::send` typically does real I/O against a network or file, which tends to
+/// be slower than a `Transform`'s local processing), this fails and clones (`Delivered::Owned`
+/// and `Delivered::Shared`'s handling is the same as it would be with no `Output` sibling at all --
+/// see `fanout_send_mixed_output_and_transform_consumers`, same file). Either outcome keeps
+/// isolation intact: a sibling branch's copy is always independent before it can be mutated
+/// (`a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` below pins this).
+fn unwrap_batch(batch: Delivered) -> EventBatch {
+    match batch {
+        Delivered::Owned(batch) => batch,
+        Delivered::Shared(shared) => {
+            Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone())
         }
     }
 }
@@ -402,8 +458,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Output for RecordingOutput {
-        async fn send(&mut self, batch: EventBatch) -> anyhow::Result<()> {
-            let _ = self.tx.send(batch);
+        async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+            // `Output::send` only ever borrows (`docs/adr/0016-arc-eventbatch-copy-on-write.md`);
+            // this test double clones onto its own plain `std::sync::mpsc` channel purely so the
+            // assertion side of each test can inspect what arrived after this async fn returns.
+            let _ = self.tx.send(batch.clone());
             Ok(())
         }
     }
@@ -598,10 +657,14 @@ mod tests {
         }
     }
 
-    /// Operationalizes branch isolation (docs/adr/0012-multi-payload-events.md): `Fanout` deep-
-    /// clones an `EventBatch` for every consumer but the last, *before* any downstream node can
-    /// touch it, so a mutation one branch of a fan-out makes is never visible on a sibling
-    /// branch's copy of the same upstream event -- even now that `Event` can carry several
+    /// Operationalizes branch isolation (docs/adr/0012-multi-payload-events.md). Since
+    /// docs/adr/0016-arc-eventbatch-copy-on-write.md, `Fanout` no longer deep-clones eagerly at
+    /// send time -- a real fan-out hands every branch its own `Delivered::Shared` handle onto one
+    /// `Arc`, and the clone (if any) happens lazily, at `unwrap_batch`, right before a branch's own
+    /// node can touch the batch at all. Whichever branch doesn't win `Arc::try_unwrap` gets a real,
+    /// independent deep clone at that point, so no branch ever mutates a batch another branch still
+    /// holds a handle to -- a mutation one branch of a fan-out makes is still never visible on a
+    /// sibling branch's copy of the same upstream event, even now that `Event` can carry several
     /// payloads at once. Proven against a real two-branch fan-out (one listener feeding a
     /// mutating transform on one branch and a sink directly on the other -- exactly the "one
     /// listener, two independently-processed downstream chains" shape ADR 0009 exists to make an
@@ -816,5 +879,70 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("the flushed window should have reached the output before exit");
         assert_eq!(received.events.len(), 1);
+    }
+
+    /// The property `unwrap_batch` (and the whole `Arc<EventBatch>` design,
+    /// docs/adr/0016-arc-eventbatch-copy-on-write.md) rests on for a single-consumer edge: `Fanout`
+    /// with exactly one consumer never touches an `Arc` at all, so what arrives at the other end is
+    /// `Delivered::Owned` -- proving the fast path (item 1 of the PR #33 review) actually takes,
+    /// not just that the code happens to also be correct if it didn't.
+    #[tokio::test]
+    async fn a_single_consumer_fanout_delivers_the_batch_owned_with_no_arc_involved() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]);
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+
+        fanout.send(batch).await;
+
+        let received = rx.recv().await.expect("should receive");
+        assert!(
+            matches!(received, Delivered::Owned(_)),
+            "a single-consumer edge should never wrap the batch in an Arc"
+        );
+    }
+
+    /// The property `Arc::try_unwrap` at each consumption point actually depends on: a real
+    /// fan-out's `Arc` reaches strong count 1 -- and so becomes unwrappable with no clone -- only
+    /// once every sibling handle has been dropped. Demonstrated deterministically (no concurrent
+    /// consumers racing each other) rather than asserted as a property of the design, since the PR
+    /// review that asked for this test found that race is real: two branches unwrapping
+    /// concurrently can both still observe strong count 2 and both fall back to cloning. This test
+    /// pins the mechanics `unwrap_batch`'s fallback correctly handles either way, not the timing.
+    #[tokio::test]
+    async fn a_shared_batchs_arc_is_uniquely_held_only_once_every_sibling_handle_is_dropped() {
+        let (tx_a, mut rx_a) = mpsc::channel(1);
+        let (tx_b, mut rx_b) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx_a, tx_b]);
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+
+        fanout.send(batch).await;
+
+        let Delivered::Shared(shared_a) = rx_a.recv().await.expect("a should receive") else {
+            panic!("a fan-out of two consumers should share, not own")
+        };
+        let Delivered::Shared(shared_b) = rx_b.recv().await.expect("b should receive") else {
+            panic!("a fan-out of two consumers should share, not own")
+        };
+
+        assert_eq!(Arc::strong_count(&shared_a), 2, "both branches still hold their own handle");
+
+        drop(shared_b);
+
+        assert_eq!(
+            Arc::strong_count(&shared_a),
+            1,
+            "once the sibling branch drops its handle, this one is uniquely held"
+        );
+        assert!(
+            Arc::try_unwrap(shared_a).is_ok(),
+            "try_unwrap should now succeed with no clone -- this is the property the whole \
+             design rests on"
+        );
     }
 }

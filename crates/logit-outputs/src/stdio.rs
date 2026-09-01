@@ -515,8 +515,8 @@ impl StdioOutput {
 
 #[async_trait::async_trait]
 impl Output for StdioOutput {
-    async fn send(&mut self, batch: EventBatch) -> anyhow::Result<()> {
-        let text = self.encoder.encode(&batch);
+    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let text = self.encoder.encode(batch);
         if text.is_empty() {
             // An empty batch (`batch.events` is empty). Every *non-empty* batch always produces
             // at least a timestamp line per event -- see `render_event_block` -- so this can only
@@ -911,7 +911,7 @@ mod tests {
 
         let mut output = StdioOutput::open_path(&path).expect("path should open");
         output
-            .send(batch_with(vec![metric_event(0, "x", MetricKind::Counter(1.0))]))
+            .send(&batch_with(vec![metric_event(0, "x", MetricKind::Counter(1.0))]))
             .await
             .expect("send should succeed");
 
@@ -928,11 +928,11 @@ mod tests {
 
         let mut output = StdioOutput::open_path(&path).expect("path should open");
         output
-            .send(batch_with(vec![metric_event(0, "first", MetricKind::Counter(1.0))]))
+            .send(&batch_with(vec![metric_event(0, "first", MetricKind::Counter(1.0))]))
             .await
             .expect("send should succeed");
         output
-            .send(batch_with(vec![metric_event(0, "second", MetricKind::Counter(2.0))]))
+            .send(&batch_with(vec![metric_event(0, "second", MetricKind::Counter(2.0))]))
             .await
             .expect("send should succeed");
 
@@ -958,7 +958,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let mut output = StdioOutput::open_path(&path).expect("path should open");
-        output.send(batch_with(vec![])).await.expect("send should succeed");
+        output.send(&batch_with(vec![])).await.expect("send should succeed");
 
         let contents = std::fs::read_to_string(&path).unwrap_or_default();
         assert_eq!(contents, "", "an empty batch should write nothing");

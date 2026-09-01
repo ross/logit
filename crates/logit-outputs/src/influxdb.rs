@@ -125,8 +125,8 @@ fn build_client(timeout: Duration) -> reqwest::Client {
 
 #[async_trait::async_trait]
 impl Output for InfluxDbOutput {
-    async fn send(&mut self, batch: EventBatch) -> anyhow::Result<()> {
-        let body = self.encoder.encode(&batch)?;
+    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let body = self.encoder.encode(batch)?;
         if body.is_empty() {
             // Nothing in this batch had a line-protocol encoding (e.g. every event carried only
             // a log or span and no metrics, or every metric was a Set -- see `metric_fields`
@@ -1163,7 +1163,7 @@ mod tests {
 
         let batch = batch_with(vec![metric_event("x", MetricKind::Counter(1.0), &[])]);
         let start = std::time::Instant::now();
-        let result = output.send(batch).await;
+        let result = output.send(&batch).await;
 
         assert!(result.is_err(), "expected the stalled write to eventually give up, not hang");
         assert!(
@@ -1311,7 +1311,7 @@ mod tests {
         .with_retry(fast_retry());
 
         let batch = batch_with(vec![metric_event("x", MetricKind::Counter(1.0), &[])]);
-        output.send(batch).await.expect("should eventually succeed once the 503s clear");
+        output.send(&batch).await.expect("should eventually succeed once the 503s clear");
         assert_eq!(
             count.load(std::sync::atomic::Ordering::SeqCst),
             3,
@@ -1333,7 +1333,7 @@ mod tests {
         .with_retry(fast_retry());
 
         let batch = batch_with(vec![metric_event("x", MetricKind::Counter(1.0), &[])]);
-        output.send(batch).await.expect("should succeed after the rate limit clears");
+        output.send(&batch).await.expect("should succeed after the rate limit clears");
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
@@ -1349,7 +1349,7 @@ mod tests {
         .with_retry(fast_retry());
 
         let batch = batch_with(vec![metric_event("x", MetricKind::Counter(1.0), &[])]);
-        let result = output.send(batch).await;
+        let result = output.send(&batch).await;
         assert!(result.is_err(), "a 400 should still fail send");
         assert_eq!(
             count.load(std::sync::atomic::Ordering::SeqCst),
@@ -1376,7 +1376,7 @@ mod tests {
 
         let batch = batch_with(vec![metric_event("x", MetricKind::Counter(1.0), &[])]);
         let start = std::time::Instant::now();
-        let result = output.send(batch).await;
+        let result = output.send(&batch).await;
 
         assert!(result.is_err(), "persistent 5xx should still fail once the budget runs out");
         assert!(
