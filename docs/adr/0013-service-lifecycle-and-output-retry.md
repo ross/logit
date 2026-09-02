@@ -64,7 +64,7 @@ Recorded in `docs/known-gaps.md`.
 
 ### Retry: a tight wall-clock budget, not an attempt count
 
-> **Revised by [ADR 0019](0019-buffered-sink-delivery.md).** The ~5s default budget below is
+> **Revised by [ADR 0020](0020-buffered-sink-delivery.md).** The ~5s default budget below is
 > deliberately tight *because* delivery isn't decoupled from the drain loop at this point — see
 > that ADR's "Retry moves behind the queue boundary and its budget widens" section. Once a sink
 > holds its own queue, the same reasoning argues for a much larger default. This section's

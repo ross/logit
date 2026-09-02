@@ -28,7 +28,7 @@ use tokio::task::JoinSet;
 /// genuinely misconfigured sink (bad token, bad bucket) still fails loudly enough for a
 /// restart-policy supervisor to notice; one malformed batch cannot kill an otherwise-healthy
 /// pipeline. Fixed for now -- not configurable until workstream F.
-/// See `docs/adr/0019-buffered-sink-delivery.md`'s "Failure handling" section.
+/// See `docs/adr/0020-buffered-sink-delivery.md`'s "Failure handling" section.
 const PERMANENT_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Bounded channel capacity between two graph nodes. Small and arbitrary -- just enough to smooth
@@ -200,7 +200,7 @@ pub async fn run_with_telemetry(
     // On the first error (from either arm below), record it and trigger the same shutdown signal
     // SIGTERM already drives -- every remaining task then gets the graceful-shutdown treatment it
     // already knows how to handle (a listener's inbox closes normally, cascading through to
-    // `write_loop`'s shutdown-grace drain, `docs/adr/0019-buffered-sink-delivery.md`) instead of
+    // `write_loop`'s shutdown-grace drain, `docs/adr/0020-buffered-sink-delivery.md`) instead of
     // being aborted mid-flight by dropping `tasks` early, which would silently discard a healthy
     // sibling's buffered, not-yet-delivered work. Keep `join_next`ing until every task has actually
     // exited (the loop condition, unchanged) rather than breaking -- only the *first* error is kept
@@ -246,7 +246,7 @@ async fn run_input(
 }
 
 /// A sink node's drain-and-deliver pair, decoupled through a [`SinkQueue`]
-/// (`docs/adr/0019-buffered-sink-delivery.md`): [`drain_inbox`] moves every `Delivered` off this
+/// (`docs/adr/0020-buffered-sink-delivery.md`): [`drain_inbox`] moves every `Delivered` off this
 /// component's inbox into the queue as fast as the queue's own bounds allow, while [`write_loop`]
 /// delivers from the queue independently -- so a slow or backing-off `Output::send` no longer
 /// stops this sink's own inbox from moving batches into its (deeper, byte-bounded) queue, the way
@@ -325,7 +325,7 @@ pub async fn drain_inbox(
 
 /// Retry budget for [`write_loop`]'s generic `deliver_with_retry`, driving every sink -- moved
 /// here from `logit-outputs::influxdb::RetryPolicy`, which owned its own retry loop before
-/// `docs/adr/0019-buffered-sink-delivery.md`; now every sink gets retry for free instead of
+/// `docs/adr/0020-buffered-sink-delivery.md`; now every sink gets retry for free instead of
 /// reimplementing it.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryConfig {
@@ -344,7 +344,7 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         // Widened from ADR 0013's ~5s default: a stall here no longer reaches the drain loop or
-        // the listener behind it (docs/adr/0019-buffered-sink-delivery.md), since the queue
+        // the listener behind it (docs/adr/0020-buffered-sink-delivery.md), since the queue
         // absorbs it instead -- so a much larger budget, enough to ride out a real destination
         // restart, is now affordable.
         Self {
@@ -363,10 +363,10 @@ pub struct WriteLoopConfig {
     /// Once the shutdown signal fires, `write_loop`'s remaining allowed drain time is capped at
     /// this, measured from the moment shutdown first fired (not reset per batch) -- so a
     /// permanently-down sink can't hang process exit indefinitely under SIGTERM. See
-    /// `docs/adr/0019-buffered-sink-delivery.md`'s "shutdown grace" section.
+    /// `docs/adr/0020-buffered-sink-delivery.md`'s "shutdown grace" section.
     pub shutdown_grace: Duration,
     /// Overrides the delivery posture `write_loop` would otherwise derive from
-    /// `output.duplicate_safe()` (`docs/adr/0019-buffered-sink-delivery.md`'s three-layer posture
+    /// `output.duplicate_safe()` (`docs/adr/0020-buffered-sink-delivery.md`'s three-layer posture
     /// design: sink fact -> runtime default -> this config override). `None` -- the default --
     /// means "use the derived default"; workstream F's `logit-config::BufferConfig::delivery`
     /// is what sets this per component.
@@ -396,7 +396,7 @@ enum Delivery {
 /// Attempts to deliver `batch` via `output.send`, retrying per `posture`/[`is_retryable`] until
 /// either it succeeds, a failure isn't retryable, or `retry.total_budget` (a fresh budget for this
 /// call) is exhausted. Moved here from `logit-outputs::influxdb::InfluxDbOutput::send`'s own retry
-/// loop (`docs/adr/0019-buffered-sink-delivery.md`) -- every sink gets this for free now, driven by
+/// loop (`docs/adr/0020-buffered-sink-delivery.md`) -- every sink gets this for free now, driven by
 /// its own `Fault` classification and `duplicate_safe` fact rather than reimplementing the loop.
 async fn deliver_with_retry(
     output: &mut (dyn Output + Send),
@@ -436,7 +436,7 @@ async fn deliver_with_retry(
 /// The backoff before retry attempt `attempt + 1`: `base_delay` doubled `attempt - 1` times via
 /// repeated `saturating_mul`, stopping early once it's already at or past `max_delay` -- correct
 /// for *any* `base_delay`/`max_delay` pair, not just `RetryConfig::default`'s. Moved here from
-/// `logit-outputs::influxdb` verbatim (`docs/adr/0019-buffered-sink-delivery.md`) -- it was never
+/// `logit-outputs::influxdb` verbatim (`docs/adr/0020-buffered-sink-delivery.md`) -- it was never
 /// InfluxDB-specific, just historically homed on the one sink that had a retry loop at all. See
 /// that module's history for why the loop is bounded at 128 iterations and why a single
 /// `base_delay * 2u32.pow(shift)` with a fixed shift cap doesn't work for every `base_delay`/
@@ -520,7 +520,7 @@ async fn drain_remaining_on_shutdown(
 /// and empty -- see [`SinkQueue::peek`]) or shutdown grace expires. Per batch: attempt delivery via
 /// [`deliver_with_retry`], per the posture resolved from `write_config.delivery_override` (config,
 /// workstream F) falling back to `output.duplicate_safe()`'s derived default
-/// (`docs/adr/0019-buffered-sink-delivery.md`). On success, commit and reset the permanent-failure
+/// (`docs/adr/0020-buffered-sink-delivery.md`). On success, commit and reset the permanent-failure
 /// streak. On failure (not retryable, or retryable but the budget ran out), commit anyway (the
 /// process no longer exits on an ordinary sink failure), count and warn -- *except*: a run of nothing
 /// but `Fault::Permanent` outcomes, with no successful delivery anywhere in between, for
@@ -757,7 +757,8 @@ fn run_lua(
     telemetry: Telemetry,
     runtime: tokio::runtime::Handle,
 ) {
-    let worker = match ScriptWorker::new(&script) {
+    let worker = match ScriptWorker::new(&script).and_then(|w| w.with_telemetry(telemetry.clone()))
+    {
         Ok(worker) => worker,
         Err(err) => {
             // The receiver may already be gone if `run` bailed for an unrelated reason first;
@@ -775,6 +776,14 @@ fn run_lua(
         let timer = telemetry.timer("logit.component.flush.duration");
         let result = worker.flush();
         drop(timer);
+        // Sampled here too, not only after a batch (below) -- `ScriptWorker::used_memory`'s own
+        // doc comment names accumulation *across `flush()` calls* as exactly the leak shape this
+        // metric exists to catch. A script whose only growth happens in `flush()` (nothing new
+        // arriving on the inbox between ticks) would otherwise leave `logit.script.vm.memory`
+        // frozen or absent for as long as the input stays idle -- the metric would go silent right
+        // when it matters. Sampled unconditionally, including the empty and error outcomes below:
+        // the VM's memory doesn't care whether `flush()` had anything to emit.
+        telemetry.gauge("logit.script.vm.memory", worker.used_memory() as f64, &[]);
         match result {
             Ok(events) if !events.is_empty() => {
                 telemetry.count("logit.component.flush.events", events.len() as f64, &[]);
@@ -831,8 +840,18 @@ fn run_lua(
         let mut errors: u64 = 0;
         for event in batch.events {
             match worker.process(event) {
-                Ok(ProcessOutcome::Emit(e)) => out.push(*e),
-                Ok(ProcessOutcome::EmitMany(es)) => out.extend(es),
+                Ok(ProcessOutcome::Emit(e)) => {
+                    out.push(*e);
+                    telemetry.count("logit.script.events.emitted", 1.0, &[("outcome", "emit")]);
+                }
+                Ok(ProcessOutcome::EmitMany(es)) => {
+                    telemetry.count(
+                        "logit.script.events.emitted",
+                        es.len() as f64,
+                        &[("outcome", "emit_many")],
+                    );
+                    out.extend(es);
+                }
                 Ok(ProcessOutcome::Drop) => dropped += 1,
                 Err(err) => {
                     errors += 1;
@@ -841,6 +860,10 @@ fn run_lua(
             }
         }
         drop(process_timer);
+        // Sampled once per batch, not per event: the strongest single candidate found for
+        // observing a stateful script leaking VM-side state (`docs/design/internal-telemetry.md`)
+        // -- otherwise invisible until the process's own memory visibly grows.
+        telemetry.gauge("logit.script.vm.memory", worker.used_memory() as f64, &[]);
         if dropped > 0 {
             telemetry.count(
                 "logit.component.events.dropped",
@@ -875,7 +898,7 @@ fn run_lua(
 ///
 /// **An `Output` sibling on the same fan-out doesn't change this into a guarantee either way --
 /// it's still genuinely racy, just against a different clock than it used to be.** Before
-/// `docs/adr/0019-buffered-sink-delivery.md` split `run_output` into `drain_inbox`/`write_loop`,
+/// `docs/adr/0020-buffered-sink-delivery.md` split `run_output` into `drain_inbox`/`write_loop`,
 /// the `Output` branch held its `Delivered` handle for the full duration of `output.send`, which
 /// typically does real I/O -- slower than a `Transform`'s local processing, making a clone (cost
 /// 6) the likelier practical outcome even though a free unwrap (cost 1) was reachable. That's no
@@ -1592,8 +1615,219 @@ mod tests {
         assert_eq!(value("logit.component.events.received", "out"), Some(1.0));
     }
 
+    /// The Lua-specific layer-3 additions (`docs/design/internal-telemetry.md`): VM memory is
+    /// visible, and a fan-out script (`return {a, b}`, `ProcessOutcome::EmitMany`) is
+    /// distinguishable from a plain 1:1 script by outcome, not just by the aggregate event count
+    /// `Fanout` already reports.
+    #[tokio::test]
+    async fn run_lua_records_vm_memory_and_emit_outcome() {
+        let mut components = Map::new();
+        components.insert(
+            "in".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            },
+        );
+        components.insert(
+            "enrich".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec!["in".to_string()],
+                kind: ComponentKind::Lua {
+                    script: "function process(event) return {event, event:clone()} end".to_string(),
+                    interval: None,
+                },
+            },
+        );
+        components.insert(
+            "out".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec!["enrich".to_string()],
+                kind: influxdb_out(),
+            },
+        );
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+        );
+        specs.insert(
+            "enrich".to_string(),
+            NodeSpec::Lua {
+                script: "function process(event) return {event, event:clone()} end".to_string(),
+                interval: None,
+            },
+        );
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx: result_tx }),
+                SinkQueueConfig::default(),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = ["in", "enrich", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+        )
+        .await
+        .expect("should not hang")
+        .expect("should complete without error");
+
+        let received =
+            result_rx.recv_timeout(Duration::from_secs(1)).expect("output should receive a batch");
+        assert_eq!(received.events.len(), 2, "one event in should fan out to two events out");
+
+        let events = registry.drain(0);
+        let value = |name: &str, tag: Option<(&str, &str)>| -> Option<f64> {
+            events.iter().find_map(|e| {
+                if e.attributes.get("component").and_then(|v| v.as_str()) != Some("enrich") {
+                    return None;
+                }
+                if let Some((k, v)) = tag {
+                    if e.attributes.get(k).and_then(|v2| v2.as_str()) != Some(v) {
+                        return None;
+                    }
+                }
+                e.metrics.iter().find_map(|m| match &m.kind {
+                    MetricKind::Counter(v) if logit_core::interner::resolve(m.name) == name => {
+                        Some(*v)
+                    }
+                    _ => None,
+                })
+            })
+        };
+
+        assert_eq!(value("logit.script.events.emitted", Some(("outcome", "emit_many"))), Some(2.0));
+
+        let vm_memory = events.iter().find_map(|e| {
+            if e.attributes.get("component").and_then(|v| v.as_str()) != Some("enrich") {
+                return None;
+            }
+            e.metrics.iter().find_map(|m| match &m.kind {
+                MetricKind::Gauge(v)
+                    if logit_core::interner::resolve(m.name) == "logit.script.vm.memory" =>
+                {
+                    Some(*v)
+                }
+                _ => None,
+            })
+        });
+        assert!(vm_memory.is_some_and(|v| v > 0.0), "a loaded Lua VM should report nonzero memory");
+    }
+
+    /// A stateful script whose only growth happens inside `flush()` (nothing new arriving on the
+    /// inbox between ticks) must not leave `logit.script.vm.memory` frozen or absent -- that's
+    /// exactly the leak shape `ScriptWorker::used_memory`'s own doc comment names. Proven with no
+    /// batch ever sent at all: `FiniteInput { batch: None }` finishes immediately, closing this
+    /// Lua node's inbox and triggering the same close-time flush a real flush-interval tick would
+    /// (`next_flush.is_some()` is all that's required, regardless of whether a deadline actually
+    /// elapsed) -- so if `flush_now` didn't sample memory, this test would see no gauge at all.
+    #[tokio::test]
+    async fn a_flush_with_no_batch_ever_received_still_records_vm_memory() {
+        let mut components = Map::new();
+        components.insert(
+            "in".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            },
+        );
+        components.insert(
+            "windowed".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec!["in".to_string()],
+                kind: ComponentKind::Lua {
+                    script: "function process(event) return event end".to_string(),
+                    interval: Some(Duration::from_secs(3600)),
+                },
+            },
+        );
+        components.insert(
+            "out".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec!["windowed".to_string()],
+                kind: influxdb_out(),
+            },
+        );
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert("in".to_string(), NodeSpec::Input(Box::new(FiniteInput { batch: None })));
+        specs.insert(
+            "windowed".to_string(),
+            NodeSpec::Lua {
+                script: "function process(event) return event end".to_string(),
+                interval: Some(Duration::from_secs(3600)),
+            },
+        );
+        let (result_tx, _result_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx: result_tx }),
+                SinkQueueConfig::default(),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = ["in", "windowed", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+        )
+        .await
+        .expect("should not hang")
+        .expect("should complete without error");
+
+        let events = registry.drain(0);
+        let vm_memory = events.iter().find_map(|e| {
+            if e.attributes.get("component").and_then(|v| v.as_str()) != Some("windowed") {
+                return None;
+            }
+            e.metrics.iter().find_map(|m| match &m.kind {
+                MetricKind::Gauge(v)
+                    if logit_core::interner::resolve(m.name) == "logit.script.vm.memory" =>
+                {
+                    Some(*v)
+                }
+                _ => None,
+            })
+        });
+        assert!(
+            vm_memory.is_some_and(|v| v > 0.0),
+            "the close-time flush should have sampled VM memory even with no batch ever received"
+        );
+    }
+
     // -----------------------------------------------------------------------------------------
-    // `run_output`'s drain/write split (`docs/adr/0019-buffered-sink-delivery.md`)
+    // `run_output`'s drain/write split (`docs/adr/0020-buffered-sink-delivery.md`)
     // -----------------------------------------------------------------------------------------
 
     /// A minimal one-shot gate for tests: `wait()` blocks until `open()` is called, from anywhere,
@@ -1713,7 +1947,7 @@ mod tests {
     }
 
     /// The property this whole workstream exists to deliver
-    /// (`docs/adr/0019-buffered-sink-delivery.md`, `docs/plans/0003-buffered-sink-delivery.md`
+    /// (`docs/adr/0020-buffered-sink-delivery.md`, `docs/plans/0003-buffered-sink-delivery.md`
     /// section C): a slow/backing-off `Output::send` no longer stops its own component's inbox
     /// from draining. Proven directly: while the sink's very first delivery attempt is parked on a
     /// gate, several more batches sent right behind it still make it off the inbox and into the
@@ -1809,7 +2043,7 @@ mod tests {
     }
 
     /// **Behavior change from before this workstream, deliberate**
-    /// (`docs/adr/0019-buffered-sink-delivery.md`'s "Failure handling" section): an isolated,
+    /// (`docs/adr/0020-buffered-sink-delivery.md`'s "Failure handling" section): an isolated,
     /// unclassified send failure (defaults to `Fault::Permanent`, see `output::classify`) used to
     /// end `run` outright the moment it happened. It no longer does -- `write_loop` drops the
     /// batch, counts it, and moves on; only a *sustained* run of nothing but `Permanent` failures
@@ -1984,7 +2218,7 @@ mod tests {
 
     // -----------------------------------------------------------------------------------------
     // `write_loop`'s retry/posture/failure-handling/shutdown-grace logic
-    // (`docs/adr/0019-buffered-sink-delivery.md`, workstream D)
+    // (`docs/adr/0020-buffered-sink-delivery.md`, workstream D)
     // -----------------------------------------------------------------------------------------
 
     /// A sink whose `send` fails with a `fault`-tagged error for its first `fail_times` calls,
@@ -2424,7 +2658,7 @@ mod tests {
     // -----------------------------------------------------------------------------------------
     // `run_with_telemetry`'s join loop: drain every task on the first error instead of aborting
     // (`docs/plans/0003-buffered-sink-delivery.md` workstream E,
-    // `docs/adr/0019-buffered-sink-delivery.md`)
+    // `docs/adr/0020-buffered-sink-delivery.md`)
     // -----------------------------------------------------------------------------------------
 
     /// An `Input` fully driven by the test: every batch handed to the paired `UnboundedSender`

@@ -1,5 +1,5 @@
 //! [`SinkQueue`]: the async wrapper around `logit_proto::buffer::Buffer` that a sink's writer
-//! drains from and its drain loop pushes into -- see `docs/adr/0019-buffered-sink-delivery.md`.
+//! drains from and its drain loop pushes into -- see `docs/adr/0020-buffered-sink-delivery.md`.
 //! `Buffer` itself is sync (no `.await` in a critical section), so this type owns the one thing a
 //! sync trait can't express: `Block`, which awaits room rather than dropping.
 
@@ -43,7 +43,7 @@ impl Default for SinkQueueConfig {
 
 /// The async wrapper around `logit_proto::buffer::InMemoryBuffer<Arc<EventBatch>>` that sits
 /// between a sink's inbox drain and its writer, letting the two proceed independently
-/// (`docs/adr/0019-buffered-sink-delivery.md`). Not `Clone` -- exactly one `SinkQueue` value
+/// (`docs/adr/0020-buffered-sink-delivery.md`). Not `Clone` -- exactly one `SinkQueue` value
 /// exists per sink, wrapped in `Arc` by its two callers (`drain_inbox`/`write_loop` in
 /// `runtime.rs`, each holding their own `Arc::clone`).
 ///

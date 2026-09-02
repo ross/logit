@@ -25,7 +25,7 @@
 //!     process-wide telemetry `Registry`, silently halving whichever one a downstream consumer
 //!     happened not to be reading from rather than failing clearly.
 //! 14. A non-default `buffer:` block on a non-sink component is rejected -- `buffer:`
-//!     (`docs/adr/0019-buffered-sink-delivery.md`) configures a sink's delivery queue, which only a
+//!     (`docs/adr/0020-buffered-sink-delivery.md`) configures a sink's delivery queue, which only a
 //!     sink has, so a listener or transform carrying one is almost certainly a misplaced block
 //!     rather than a meaningful setting silently ignored.
 //!
@@ -170,7 +170,7 @@ pub struct ResolvedComponent {
     pub sources: Vec<String>,
     pub consumers: Vec<String>,
     pub kind: ComponentKind,
-    /// Per-sink delivery buffer config (`docs/adr/0019-buffered-sink-delivery.md`). Validated as
+    /// Per-sink delivery buffer config (`docs/adr/0020-buffered-sink-delivery.md`). Validated as
     /// sink-only by [`resolve`] (rule 14); meaningless on any other role, so a non-sink component's
     /// value here is always [`BufferConfig::default`] once resolution has succeeded.
     pub buffer: BufferConfig,

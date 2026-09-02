@@ -23,7 +23,7 @@ already built that have a known, accepted rough edge.
   (`crates/logit-pipeline/src/sink_queue.rs`) that keeps accepting while a delivery attempt is in
   flight or backing off, with retry (`RetryConfig`, up to 60s by default) and fault-classification-
   driven duplicate-safety (`Fault`/`DeliveryPosture`, `crates/logit-pipeline/src/output.rs`) moved
-  behind that boundary ([ADR 0019](adr/0019-buffered-sink-delivery.md)). A persistent failure no
+  behind that boundary ([ADR 0020](adr/0020-buffered-sink-delivery.md)). A persistent failure no
   longer ends `logit run` by default — it degrades to dropping the offending batch and continuing,
   exiting only after a sustained ~60s window of nothing but configuration-error (`Fault::Permanent`)
   failures. What's left, genuinely open:
@@ -41,7 +41,7 @@ already built that have a known, accepted rough edge.
 - **Delivery I/O is not decoupled from event processing within a node: listener half only, sink half
   closed.** Each component is its own tokio task, but *within* one node, I/O and processing used to
   share a single sequential path on both the sink and the listener side. The sink half is fixed
-  ([ADR 0019](adr/0019-buffered-sink-delivery.md), directly above): `run_output`
+  ([ADR 0020](adr/0020-buffered-sink-delivery.md), directly above): `run_output`
   (`crates/logit-pipeline/src/runtime.rs`) now splits into a drain half (`drain_inbox`) and a writer
   half (`write_loop`) sharing the `SinkQueue`, so a slow or retrying sink no longer stops draining
   its own inbox. **The listener half remains fully open**: `StatsdInput::run`
@@ -82,7 +82,7 @@ already built that have a known, accepted rough edge.
     the aggregation window (which this fix does protect) is not.
 
   ~~`Output` still has no close/flush hook of its own.~~ **Closed**
-  ([ADR 0019](adr/0019-buffered-sink-delivery.md)): `Output` gains `async fn flush(&mut self)`
+  ([ADR 0020](adr/0020-buffered-sink-delivery.md)): `Output` gains `async fn flush(&mut self)`
   (default no-op, so no existing sink needed to change), called once `write_loop`
   (`crates/logit-pipeline/src/runtime.rs`) stops delivering — either because its queue drained to
   closed-and-empty, or because a bounded shutdown grace (default 5s) expired first with batches
@@ -319,3 +319,39 @@ already built that have a known, accepted rough edge.
   (`logit.internal.points.dropped{reason="cardinality"}`), never silent, but the cap itself is a
   fixed constant, not configurable — revisit if a legitimate component ever needs more than 1024
   distinct points between drains.
+- **Lua-authored telemetry (`crates/logit-script/src/telemetry.rs`,
+  [ADR 0020](adr/0019-lua-authored-telemetry-cardinality.md)) trades the type-system cardinality
+  guarantee the rest of `internal-telemetry.md` relies on for a convention-enforced one** — a
+  script's metric name/tag value is round-tripped through the process interner rather than
+  required to be a Rust `&'static str`, so nothing stops a script from building one out of per-event
+  data and leaking the interner one entry at a time. Accepted for the same reason the interner's
+  own never-evicting design is accepted (above): bounded in the intended, documented use (a fixed
+  literal in the script's own source), and the fix if it ever isn't (a bounded per-`ScriptWorker`
+  cache instead of the process-wide interner) is recorded as a considered-and-deferred alternative
+  in the ADR, not undesigned.
+- **The internal-telemetry component survey (`docs/design/internal-telemetry.md`'s worked-examples
+  list) found several more candidates not built yet** — real, but each needs more than a
+  `telemetry.count(...)` call:
+  - **Process-level facts beyond what `internal` already samples** — `logit.process.memory.*` via
+    jemalloc heap stats needs a new `tikv-jemalloc-ctl` dependency, and cross-crate plumbing since
+    `crates/logit-inputs` (where `internal` lives) doesn't depend on `crates/logit-cli` (where the
+    `jemalloc` feature is, `docs/adr/0015-jemalloc-global-allocator.md`). `logit.process.threads`/
+    `.fds`/`.cpu.seconds` would need Linux-specific `/proc` parsing. Candidate names:
+    `logit.process.memory.allocated`/`.resident`, `.threads`, `.fds`, `.cpu.seconds`.
+  - **`json`'s parse-outcome counts** — its two real failure modes (`no_brace`, `parse_failure`)
+    already ride the `Diagnostics` bridge for free (`logit.component.diagnostics{key=...}`), so a
+    dedicated metric would mostly restate what's already visible.
+  - **`logit-proto`'s `frame.rs` metrics** — still a stub (see the entries above), nothing to
+    instrument until an implementation exists. Candidate names, pre-committed so whoever builds it
+    doesn't have to re-derive them: `logit.proto.frames{direction,codec,compression}`,
+    `logit.proto.frame.bytes`, `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated"}`.
+    (`buffer.rs`'s own metrics are no longer on this list — implemented at the `SinkQueue` layer,
+    `docs/adr/0020-buffered-sink-delivery.md`, as `logit.component.buffer.batches`/`.bytes`/
+    `.utilization`/`.push.blocked.duration` and new `reason` values on `batches.dropped`/
+    `events.dropped`, per `docs/design/internal-telemetry.md`'s catalog.)
+  - **Lua per-call latency, error classification, flush-tick-empty tracking** — a per-event
+    `ScriptWorker::process` timing distribution would isolate one pathological event from a big
+    batch (today's `logit.component.process.duration` is whole-batch), but costs a clock read per
+    event; `ScriptError`'s `MissingProcess`/`Lua(...)`/malformed-return cases collapse into one
+    `errors{reason="process"}` today, when a script-bug class (a malformed `flush()` return) is a
+    different signal than a runtime error. Each is real; none was a default yes.

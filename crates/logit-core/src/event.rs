@@ -16,7 +16,7 @@ impl EventBatch {
     /// Approximate heap bytes held by this batch: attribute keys/values, log bodies, metric
     /// records, and the batch's resource. Deliberately approximate -- an O(events) walk for
     /// admission control (bounding an in-memory delivery buffer, see
-    /// `docs/adr/0019-buffered-sink-delivery.md`), NOT an allocator-accounting figure. Exempt from
+    /// `docs/adr/0020-buffered-sink-delivery.md`), NOT an allocator-accounting figure. Exempt from
     /// this crate's exact-size/exact-allocation-count discipline (`tests/type_sizes.rs`,
     /// `crates/logit-bench/tests/allocations.rs`) on purpose -- don't add this to either of those.
     ///

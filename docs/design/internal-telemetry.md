@@ -173,9 +173,11 @@ receive/processing side from their own loops, which already see every batch and 
 | `logit.component.retries` | count | a retried delivery attempt, `deliver_with_retry` (`write_loop`) |
 | `logit.component.errors` | count | `Output::send` failed (any attempt), or a Lua script error |
 | `logit.component.diagnostics{key=...}` | count | every `Diagnostics::warn_throttled` occurrence, throttled or not |
+| `logit.script.vm.memory` | gauge | `run_lua`, once per batch — the strongest signal a stateful script is leaking Lua-side state |
+| `logit.script.events.emitted{outcome="emit"\|"emit_many"}` | count | `run_lua`, per `ProcessOutcome` — distinguishes a 1:1 script from a fan-out one |
 
 **Every sink also gets a `SinkQueue`** (`crates/logit-pipeline/src/sink_queue.rs`,
-`docs/adr/0019-buffered-sink-delivery.md`) sitting between its inbox drain and delivery — its own
+`docs/adr/0020-buffered-sink-delivery.md`) sitting between its inbox drain and delivery — its own
 uniform layer, same reasoning as `Fanout`'s: instrumenting the one choke point every sink's batches
 pass through gives every sink these for free, no per-sink code:
 
@@ -194,7 +196,10 @@ Two metrics named in this doc's original design were not built in the pass that 
 question; the finer breakdowns are a plausible future addition, not a gap blocking anything today.
 
 This set never needs updating when a new component kind lands — it comes from `ComponentKind`'s
-role and the node runtime alone, the same way arity and thread-vs-task dispatch already do.
+role and the node runtime alone, the same way arity and thread-vs-task dispatch already do. The
+last two rows are Lua-specific (recorded in `run_lua`, not shared with `run_transform`/`run_output`)
+because only a Lua node has a VM to sample or a script return value to classify — everything else
+in this table applies uniformly across every component kind.
 
 **Layer 3: a component adds only what only it knows**, via the same `with_telemetry` builder
 idiom `with_diagnostics`/`with_timeout`/`with_retry` already established
@@ -203,18 +208,92 @@ idiom `with_diagnostics`/`with_timeout`/`with_retry` already established
 the component itself and to the runtime's per-node instrumentation, so a drain sees one coherent
 picture per component, not two.
 
-Two worked examples ship as the pattern to follow:
+Worked examples, one per shipped component:
 
 - `statsd_in` (`crates/logit-inputs/src/statsd.rs`): `logit.input.datagrams`,
   `logit.input.datagram.bytes` — per-datagram detail `Fanout`'s per-batch view can't see, plus
   decode failures free via the `Diagnostics` bridge.
+- `syslog_in` (`crates/logit-inputs/src/syslog.rs`): the same pair, `logit.input.datagrams`/
+  `.datagram.bytes` — direct parity with `statsd_in`, the other UDP listener.
+- `aggregate` (`crates/logit-transforms/src/aggregate.rs`): `logit.transform.series.active` and
+  `logit.transform.resource.groups`, sampled at the top of `flush` before it drains its own state
+  — the peak-of-window series count, which is the visible signal for the cardinality blow-up
+  `crate::keep`'s own module doc already warns `aggregate` is exposed to.
+- `kv_metrics` (`crates/logit-transforms/src/kv_metrics.rs`): `logit.transform.derived{metric_
+  kind}` / `.derived.skipped{metric_kind}` — makes the documented silent-skip path (a missing or
+  non-numeric field, deliberately never a diagnostic) visible as a rate instead of invisible.
+  `metric_kind`, not `kind` — `kind` is reserved for a point's own component-kind identity (see
+  below), and this is the first component to actually need a tag that would have collided with it.
+- `keep`/`remove` (`crates/logit-transforms/src/keep.rs`): `logit.transform.attributes.kept` /
+  `.dropped` — the other half of `aggregate`'s cardinality story: how much `keep` is actually
+  suppressing before events reach it. No `Diagnostics` on either (pure attribute filtering has
+  nothing to warn about), so `Telemetry` is attached directly rather than through the
+  `Diagnostics` bridge.
+- `stdio_out` (`crates/logit-outputs/src/stdio.rs`): `logit.output.batch.bytes` — direct parity
+  with `influxdb_out`'s own batch-bytes metric. Also has no `Diagnostics` (a write error
+  propagates as a hard failure today, with no `warn_throttled` call site to bridge).
+- `lua`/`lua_file` (`crates/logit-script`, `crates/logit-pipeline/src/runtime.rs::run_lua`):
+  `logit.script.vm.memory` (the Lua VM's own `used_memory()`, the strongest single signal of a
+  leaking stateful script) and `logit.script.events.emitted{outcome}`, both from the Rust side —
+  plus, uniquely among all these, a **script-facing** `telemetry` global a script itself can call
+  (`telemetry.count(...)`/`.gauge(...)`), for domain facts only the script knows. See "Metrics from
+  Lua scripts" below and `docs/design/lua-api.md`.
 - `influxdb_out` (`crates/logit-outputs/src/influxdb.rs`): `logit.output.requests{class="2xx|
   4xx|5xx|network_error"}`, `logit.output.request.duration` (per attempt), `logit.output.batch.bytes`
   — the encode/HTTP-response detail a generic `send.duration` timer can't distinguish. **Not**
   `logit.output.retries` — retry moved out of this sink entirely
-  (`docs/adr/0019-buffered-sink-delivery.md`) into the generic `deliver_with_retry` every sink now
+  (`docs/adr/0020-buffered-sink-delivery.md`) into the generic `deliver_with_retry` every sink now
   shares, so retry counting is a Layer 2 metric (`logit.component.retries`, above), not something
   each sink tracks for itself.
+
+## Metrics from Lua scripts
+
+`telemetry.count(name, n, tags?)` / `telemetry.gauge(name, v, tags?)` are callable from a script's
+`process()`/`flush()` (`crates/logit-script/src/telemetry.rs`, wired in via
+`ScriptWorker::with_telemetry` — a builder, not a constructor parameter, so it doesn't touch
+`logit-script`'s existing `ScriptWorker::new(script)` call sites). Points a script emits go
+through the exact same buffer, `internal` component, and downstream tools as everything else —
+there's no separate script-telemetry pipeline to configure.
+
+**Cardinality here is convention-enforced, not type-system-enforced.** Every Rust `Telemetry` call
+takes `&'static str` names/tags specifically so cardinality is bounded by code the type system
+checks. A Lua-provided string can't satisfy that at compile time, so it's round-tripped through
+the process's own interner (`interner::resolve(interner::intern(s))`, which genuinely returns
+`&'static str`) — reusing existing, already-accepted infrastructure rather than a new leak
+mechanism, at the cost that a script author (not the compiler) is now the one responsible for not
+building a metric name or tag value out of per-event data. Full reasoning, including the
+alternatives considered: [ADR 0020](../adr/0019-lua-authored-telemetry-cardinality.md). See
+`docs/design/lua-api.md`'s "Emitting telemetry from a script" for the script-author-facing version
+of this same warning.
+
+No `timing()` for scripts: the sandboxed stdlib exposes no clock (`table`/`string`/`math` only),
+so there's no way for a script to produce a duration to hand it.
+
+**Two more boundaries [`crates/logit-script/src/telemetry.rs`] holds, both because a script's
+input is less constrained than a Rust call site's:**
+
+- **Checked before anything else, on every call: `Telemetry::is_enabled()`.** Reading a Lua
+  argument, converting it, and interning it are all real work — a disabled handle (no `internal`
+  component configured) has to skip every bit of that, not just the eventual `Telemetry::count`
+  call, or a pipeline with telemetry "off" would still permanently intern whatever a script passes
+  it. This is what makes the zero-cost-when-disabled guarantee hold all the way to the Lua
+  boundary, not just at the Rust one.
+- **The `logit.` prefix is reserved.** A `(name, tags)` key in a component's buffer carries no
+  notion of which caller wrote to it — a script calling `telemetry.count("logit.component.
+  events.received", 1)` would coalesce into (and corrupt) the exact key the runtime itself writes
+  to, since `count` and `gauge` on the same key silently convert one into the other. Rejected with
+  a clear Lua error naming the reserved namespace, not a silent collision.
+
+Also worth knowing, since a Lua tag key is script-chosen rather than fixed at a Rust call site:
+`component`, `kind`, and `role` are reserved for a point's own identity and can never become part
+of a tag, at two levels. `PointKey::new` (`crates/logit-core/src/telemetry.rs`) filters a reserved
+key out *before* a point's cardinality key is built — not just at drain time — because overwriting
+the label alone would still leave two differently-tagged calls (`{kind = "a"}` vs. `{kind = "b"}`)
+occupying two distinct, wasted key slots that drain to externally indistinguishable points instead
+of coalescing into one. That's a framework-level guarantee, holding for any caller. The Lua binding
+additionally *rejects* a reserved tag key outright (`crates/logit-script/src/telemetry.rs`) rather
+than silently relying on that filter — a script that set one probably meant something by it, so a
+clear error surfaces the mistake instead of a silent no-op.
 
 ## Adding a new internal metric
 

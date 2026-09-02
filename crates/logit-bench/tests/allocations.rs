@@ -486,7 +486,7 @@ fn fanout_send_two_output_consumers_costs_only_the_arc() {
 /// Residual item from workstream C (`docs/plans/0003-buffered-sink-delivery.md`): the
 /// `fanout_send_*` tests above measure `Fanout::send` alone, stopping short of the actual
 /// `run_output`/`drain_inbox` hop a sink's `Delivered` batch takes next
-/// (`docs/adr/0019-buffered-sink-delivery.md`). Drives `drain_inbox` directly (not through a full
+/// (`docs/adr/0020-buffered-sink-delivery.md`). Drives `drain_inbox` directly (not through a full
 /// `run`) against a single-consumer `Delivered::Owned` batch: exactly one allocation, the
 /// `Arc::new` `drain_inbox` performs to hand the batch to its `SinkQueue`
 /// (`crates/logit-pipeline/src/runtime.rs`) -- previously zero on this path, since a

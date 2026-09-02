@@ -182,7 +182,8 @@ fn build_spec(
         )),
         SyslogIn { bind } => NodeSpec::Input(Box::new(
             SyslogInput::new(bind.clone())
-                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
         )),
         Internal { interval } => {
             let registry = registry
@@ -204,7 +205,8 @@ fn build_spec(
         }
         Aggregate { interval } => NodeSpec::Transform(Box::new(
             Aggregator::new(*interval)
-                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
         )),
         Json { skip_to_brace } => NodeSpec::Transform(Box::new(
             JsonParser::new(*skip_to_brace)
@@ -216,10 +218,15 @@ fn build_spec(
                 to_metric_specs(gauges),
                 to_metric_specs(distributions),
             )
-            .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
+            .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry.clone()),
         )),
-        Keep { fields } => NodeSpec::Transform(Box::new(KeepTransform::new(fields.clone()))),
-        Remove { fields } => NodeSpec::Transform(Box::new(RemoveTransform::new(fields.clone()))),
+        Keep { fields } => NodeSpec::Transform(Box::new(
+            KeepTransform::new(fields.clone()).with_telemetry(telemetry.clone()),
+        )),
+        Remove { fields } => NodeSpec::Transform(Box::new(
+            RemoveTransform::new(fields.clone()).with_telemetry(telemetry.clone()),
+        )),
 
         InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(
             Box::new(
@@ -245,7 +252,7 @@ fn build_spec(
                 StdioTarget::Path(path) => StdioOutput::open_path(base_dir.join(path))?,
             };
             NodeSpec::Output(
-                Box::new(output),
+                Box::new(output.with_telemetry(telemetry.clone())),
                 queue_config(&component.buffer),
                 write_config(&component.buffer),
             )
@@ -256,7 +263,7 @@ fn build_spec(
     Ok((spec, telemetry))
 }
 
-/// Builds a sink's `SinkQueueConfig` from its `BufferConfig` (`docs/adr/0019-buffered-sink-
+/// Builds a sink's `SinkQueueConfig` from its `BufferConfig` (`docs/adr/0020-buffered-sink-
 /// delivery.md`, workstream F) -- the sole place `logit_config::OverflowPolicy` is converted to
 /// `logit_pipeline::OverflowPolicy`, since neither config nor pipeline crate can see both types
 /// without violating the dependency direction (`logit-pipeline` depends on `logit-config`, never

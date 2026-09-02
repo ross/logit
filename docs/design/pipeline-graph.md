@@ -186,7 +186,7 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     telemetry `Registry`, silently halving whichever one a downstream consumer happened not to be
     reading from rather than failing clearly.
 14. A non-default `buffer:` block on a non-sink component is rejected — `buffer:`
-    (`docs/adr/0019-buffered-sink-delivery.md`) configures a sink's delivery queue, which only a
+    (`docs/adr/0020-buffered-sink-delivery.md`) configures a sink's delivery queue, which only a
     sink has, so a listener or transform carrying one is almost certainly a misplaced block rather
     than a meaningful setting silently ignored.
 
@@ -305,7 +305,7 @@ really propagate as a shutdown signal rather than vanish. A per-edge `on_full: b
 is a plausible future answer; out of scope for the initial graph implementation.
 
 **Sink-side buffering decouples a sink's own inbox from its delivery**
-(`docs/adr/0019-buffered-sink-delivery.md`). `run_output` used to await `Output::send` inline, so a
+(`docs/adr/0020-buffered-sink-delivery.md`). `run_output` used to await `Output::send` inline, so a
 slow or backing-off sink stopped draining its own inbox for as long as delivery took — backpressure
 from that sink reached its upstream almost immediately. It now splits into a drain half that moves
 batches off the inbox into a `SinkQueue` and a writer half that delivers from that queue

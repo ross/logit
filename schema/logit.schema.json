@@ -14,11 +14,11 @@
   },
   "definitions": {
     "BufferConfig": {
-      "description": "Per-sink delivery buffer (`docs/adr/0019-buffered-sink-delivery.md`). Meaningful only on a sink; graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind. Every field defaults, so an omitted `buffer:` block is exactly today's behavior.",
+      "description": "Per-sink delivery buffer (`docs/adr/0020-buffered-sink-delivery.md`). Meaningful only on a sink; graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind. Every field defaults, so an omitted `buffer:` block is exactly today's behavior.",
       "type": "object",
       "properties": {
         "delivery": {
-          "description": "`None` -- the default -- means \"derive from the sink's own `duplicate_safe()` fact\" (`docs/adr/0019-buffered-sink-delivery.md`'s three-layer posture design). `Some(_)` overrides that default for this component specifically.",
+          "description": "`None` -- the default -- means \"derive from the sink's own `duplicate_safe()` fact\" (`docs/adr/0020-buffered-sink-delivery.md`'s three-layer posture design). `Some(_)` overrides that default for this component specifically.",
           "default": null,
           "anyOf": [
             {
@@ -620,7 +620,7 @@
       ],
       "properties": {
         "buffer": {
-          "description": "Per-sink delivery buffer (`docs/adr/0019-buffered-sink-delivery.md`). Meaningful only on a sink -- graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind. A sibling field of `kind`, not nested inside every sink `ComponentKind` variant, so a future fifth sink kind costs nothing extra here.",
+          "description": "Per-sink delivery buffer (`docs/adr/0020-buffered-sink-delivery.md`). Meaningful only on a sink -- graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind. A sibling field of `kind`, not nested inside every sink `ComponentKind` variant, so a future fifth sink kind costs nothing extra here.",
           "default": {
             "delivery": null,
             "max_batches": 1024,

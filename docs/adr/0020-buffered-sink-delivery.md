@@ -1,4 +1,4 @@
-# 0019 — Buffered, decoupled sink delivery
+# 0020 — Buffered, decoupled sink delivery
 
 ## Status
 Accepted

@@ -68,7 +68,7 @@ summary:
   not a person at a terminal, is what's waiting on the process to exit.
 - **A sink failure — transient or extended — no longer ends the process by default.** Every sink
   now sits behind a decoupled delivery buffer with its own retry budget
-  ([ADR 0019](adr/0019-buffered-sink-delivery.md), revising ADR 0013's retry-budget rationale
+  ([ADR 0020](adr/0020-buffered-sink-delivery.md), revising ADR 0013's retry-budget rationale
   without superseding its other decisions); see [Sink delivery buffering](#sink-delivery-buffering)
   below for the full failure and sizing story, including the one case that still exits the process
   (a sustained, purely-configuration-error failure).
@@ -77,7 +77,7 @@ summary:
 
 Every sink (`influxdb_out`, `stdio_out`, ...) sits behind a per-component, in-memory delivery
 queue that decouples receiving events from delivering them
-([ADR 0019](adr/0019-buffered-sink-delivery.md)). This is what lets a slow or temporarily-down
+([ADR 0020](adr/0020-buffered-sink-delivery.md)). This is what lets a slow or temporarily-down
 destination be ridden out instead of stalling or killing the whole pipeline. It's tunable per sink
 via a `buffer:` block on that component (`buffer:` is rejected at validation time on anything but a
 sink) — see the commented example in

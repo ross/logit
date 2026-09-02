@@ -37,7 +37,7 @@ use logit_core::interner::resolve;
 use logit_core::time::format_rfc3339_utc;
 use logit_core::{
     AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource, Severity, SpanEvent, SpanKind,
-    SpanLink, SpanRecord, SpanStatus, Value,
+    SpanLink, SpanRecord, SpanStatus, Telemetry, Value,
 };
 use std::cmp::Ordering;
 // `std::fmt::Write`, for `write!` into a `String` -- formatting straight into the output buffer
@@ -481,15 +481,28 @@ enum Sink {
 pub struct StdioOutput {
     sink: Sink,
     encoder: EventDump,
+    /// No `Diagnostics` here, unlike most other shipped outputs: a write error propagates as an
+    /// `anyhow::Error` today (matching `InfluxDbOutput`'s hard-failure stance for a non-transient
+    /// sink error), so there's no `warn_throttled` call site for one to bridge -- see
+    /// `docs/design/internal-telemetry.md`'s `keep`/`remove` note for the same reasoning.
+    telemetry: Telemetry,
 }
 
 impl StdioOutput {
     pub fn stdout() -> Self {
-        Self { sink: Sink::Stdout(io::stdout()), encoder: EventDump::default() }
+        Self {
+            sink: Sink::Stdout(io::stdout()),
+            encoder: EventDump::default(),
+            telemetry: Telemetry::default(),
+        }
     }
 
     pub fn stderr() -> Self {
-        Self { sink: Sink::Stderr(io::stderr()), encoder: EventDump::default() }
+        Self {
+            sink: Sink::Stderr(io::stderr()),
+            encoder: EventDump::default(),
+            telemetry: Telemetry::default(),
+        }
     }
 
     /// Opens (creating if necessary) `path` in append mode, eagerly -- called from `build_spec` at
@@ -509,7 +522,14 @@ impl StdioOutput {
         Ok(Self {
             sink: Sink::File(tokio::fs::File::from_std(file)),
             encoder: EventDump::default(),
+            telemetry: Telemetry::default(),
         })
+    }
+
+    /// Attaches a telemetry handle -- see `send`'s `logit.output.batch.bytes`.
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
+        self
     }
 }
 
@@ -524,6 +544,7 @@ impl Output for StdioOutput {
             return Ok(());
         }
         let bytes = text.into_bytes();
+        self.telemetry.count("logit.output.batch.bytes", bytes.len() as f64, &[]);
         // One `write_all` plus one `flush` per batch: `Output` has no close/flush hook of its own
         // (a documented known gap, `docs/known-gaps.md`), so flushing every batch immediately is
         // what guarantees nothing sits buffered in `tokio`'s (or the OS's) write path at shutdown.
@@ -963,5 +984,42 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap_or_default();
         assert_eq!(contents, "", "an empty batch should write nothing");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The layer-3 example (`docs/design/internal-telemetry.md`): `logit.output.batch.bytes`
+    /// should match the actual encoded length written to the file, not just be present.
+    #[tokio::test]
+    async fn send_records_batch_bytes_matching_the_actual_encoded_length() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("logit-stdio-out-test-telemetry-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("tap", "stdio_out", "sink");
+        let mut output =
+            StdioOutput::open_path(&path).expect("path should open").with_telemetry(telemetry);
+        output
+            .send(&batch_with(vec![metric_event(0, "x", MetricKind::Counter(1.0))]))
+            .await
+            .expect("send should succeed");
+
+        let contents = std::fs::read(&path).expect("file should exist and be readable");
+        std::fs::remove_file(&path).ok();
+
+        let events = registry.drain(0);
+        let recorded = events
+            .iter()
+            .find_map(|e| {
+                e.metrics.iter().find_map(|m| match &m.kind {
+                    MetricKind::Counter(v)
+                        if logit_core::interner::resolve(m.name) == "logit.output.batch.bytes" =>
+                    {
+                        Some(*v)
+                    }
+                    _ => None,
+                })
+            })
+            .expect("logit.output.batch.bytes should have been recorded");
+        assert_eq!(recorded, contents.len() as f64);
     }
 }

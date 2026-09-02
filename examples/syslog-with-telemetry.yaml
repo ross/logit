@@ -1,0 +1,52 @@
+# A small pipeline demonstrating internal telemetry at every layer it's landed so far
+# (docs/design/internal-telemetry.md): the uniform runtime metrics every component gets for free,
+# the component-specific detail `syslog_in`/`keep`/`aggregate` add, and a Lua stage emitting its
+# own business metric (docs/design/lua-api.md's "Emitting telemetry from a script"). Not the
+# nginx reference integration (examples/nginx-to-influxdb.yaml) -- this is deliberately minimal,
+# built to show telemetry landing at `self`, not to prove out a real log format.
+#
+# Topology:
+#
+#   syslog_in --> enrich (lua, emits requests.seen) --> trimmed (keep) --> windowed (aggregate) --> influx_out
+#   self (internal) -----------------------------------------------------------------------------> influx_out
+#
+# Run both branches into the same sink so one InfluxDB bucket carries both the pipeline's own
+# data and logit's own telemetry about processing it -- exactly the point of emitting telemetry as
+# ordinary events rather than a separate side channel.
+components:
+  syslog_in:
+    type: syslog_in
+    bind: 0.0.0.0:5141
+
+  enrich:
+    type: lua
+    sources: [syslog_in]
+    script: |
+      function process(event)
+        -- A fixed literal name -- never build one from event data (docs/adr/0019-lua-authored-
+        -- telemetry-cardinality.md). Tags are optional; shown here with a compile-time-fixed value.
+        telemetry.count("requests.seen", 1, {source = "syslog"})
+        return event
+      end
+
+  trimmed:
+    type: keep
+    sources: [enrich]
+    fields: [syslog.hostname, syslog.severity]
+
+  windowed:
+    type: aggregate
+    sources: [trimmed]
+    interval: 10s
+
+  self:
+    type: internal
+    interval: 10s
+
+  influx_out:
+    type: influxdb_out
+    sources: [windowed, self]
+    url: http://influxdb:8086
+    org: logit
+    bucket: telemetry_demo
+    token: !env INFLUXDB_TOKEN

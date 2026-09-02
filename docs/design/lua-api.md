@@ -139,6 +139,50 @@ unlikely to change real behavior, but it is a real (if narrow) restriction worth
 missing `process` — not silently treated as "no `flush()`" and left to quietly emit nothing at
 every tick.
 
+## Emitting telemetry from a script
+
+A script can emit its own metrics via a `telemetry` global, callable from `process()` or
+`flush()`:
+
+```lua
+function process(event)
+  telemetry.count("orders.total_value", event.attributes.amount, {status = "completed"})
+  telemetry.gauge("queue.depth", 42)
+  return event
+end
+```
+
+`telemetry.count(name, n, tags?)` / `telemetry.gauge(name, v, tags?)` -- `tags`, if given, is a
+plain table of string keys to string values. No `timing()`: scripts have no clock exposed in the
+sandboxed stdlib (`table`/`string`/`math` only, "Sandboxing" below), so there's no way for a
+script to produce a duration.
+
+This is the same self-observability mechanism `logit` uses on itself
+(`docs/design/internal-telemetry.md`), extended one level further: a component's Rust code can
+only instrument what it can see, but a script often knows something about the domain (an order
+value, a custom business counter) no amount of Rust-side instrumentation could infer. Points a
+script emits go through the same buffer, the same `internal` component, and the same downstream
+tools (`aggregate`, any sink) as everything else -- nothing script-specific to configure beyond the
+call itself. If no config uses an `internal` component, `telemetry` calls are no-ops, same as
+every other telemetry call site in the codebase.
+
+**A metric name or tag value should be a fixed literal in the script's own source, not built from
+event data.** `telemetry.count("orders.total", 1)` is fine, called as often as you like.
+`telemetry.count(event.attributes.order_id, 1)` compiles and runs, but leaks one process-wide
+interner entry per distinct order id, forever -- cardinality safety for script-authored telemetry
+is the script author's responsibility, not something the type system checks for you the way it
+does for the Rust call sites `internal-telemetry.md` documents. See
+[ADR 0019](../adr/0019-lua-authored-telemetry-cardinality.md) for the full reasoning.
+
+**Metric names starting with `logit.` are reserved** for `logit`'s own internal metrics
+(`docs/design/internal-telemetry.md`) -- `telemetry.count("logit.component.events.received", 1)`
+is a clear call-time error, not a silent merge into the runtime's own counter. Pick a name outside
+that namespace for anything script-specific.
+
+**A tag keyed `component`, `kind`, or `role` is rejected the same way** -- those identify which
+component emitted a point and can't be set as a tag; `telemetry.count("m", 1, {kind = "x"})` is a
+clear error, not a silent no-op and not a point quietly misattributed to another component.
+
 ## Config shape
 
 A Lua transform is one component in the pipeline's component graph
