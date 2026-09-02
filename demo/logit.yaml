@@ -1,8 +1,9 @@
 # The demo pipeline (demo/README.md, docs/plans/0003-demo-stack.md, docs/plans/
 # 0005-otlp-end-to-end.md). Exercises exactly what `logit` implements today -- syslog in, json +
-# kv_metrics + keep + aggregate, InfluxDB out, OTLP/gRPC out, plus `internal` observing the
-# pipeline itself (ADR 0018, ADR 0022) -- against the traffic `demo/compose.yaml`'s `hello` service
-# emits (real visits plus a background synthetic loop).
+# kv_metrics + keep + aggregate, InfluxDB out, syslog out, OTLP/gRPC out, plus `internal` observing
+# the pipeline itself (ADR 0018, ADR 0025) -- against the traffic `demo/compose.yaml`'s `hello`
+# service emits (real visits plus a background synthetic loop). All three signals -- logs, metrics,
+# traces -- now leave `logit` for a real backend: Loki, InfluxDB, and Tempo respectively.
 #
 # Topology:
 #
@@ -10,9 +11,12 @@
 #                               |
 #                               v
 #                          access_json (json)     <- merges the JSON body into attributes
-#                              / \
-#                             v   v
-#                    tap (stdio_out)  access_metrics (kv_metrics) <- adds metrics to the event
+#                             /  |  \
+#                            v   v   v
+#              tap (stdio_out)  |    log_out (syslog_out) --> alloy --> Loki
+#                                |
+#                                v
+#                       access_metrics (kv_metrics) <- adds metrics to the event
 #                                          |
 #                                          v
 #                                    trimmed (keep)   <- drops high-cardinality attrs (request_id)
@@ -20,7 +24,7 @@
 #                                          v
 #                                    windowed (aggregate)
 #                                          |
-#   self (internal) --+-> self_windowed (aggregate) --> influx_out
+#   self (internal) --+-> self_windowed (aggregate) --> influx_out --> InfluxDB
 #                      |
 #                      +-> trace_windowed (aggregate) --> trace_out (otlp_out, gRPC) --> tempo
 components:
@@ -36,6 +40,21 @@ components:
   tap:
     type: stdio_out
     sources: [access_json]
+
+  # Logs to Loki, via the `alloy` service's syslog listener (demo/alloy/config.alloy). Sources
+  # `access_json`, so the message is the raw JSON body -- exactly what the dashboard's `| json`
+  # LogQL panels parse. RFC 5424, not 3164: 3164 carries no year and no timezone, so a receiver
+  # has to guess both (docs/adr/0022-syslog-output.md). `facility`/`hostname`/`app_name` are all
+  # left at their defaults on purpose -- the demo's traffic already carries `syslog.facility`,
+  # `syslog.hostname` (`demo-hello`), and `syslog.tag` (`demoapp`) from `access_in`'s own
+  # `syslog_in` decode, and `syslog_out` round-trips those attributes onto every relayed message,
+  # which is what gives Loki real `host`/`app` stream labels from the first line.
+  log_out:
+    type: syslog_out
+    sources: [access_json]
+    endpoint: alloy:5141
+    transport: udp
+    format: rfc5424
 
   access_metrics:
     type: kv_metrics
@@ -63,7 +82,7 @@ components:
 
   # `logit` observing itself (docs/design/internal-telemetry.md, ADR 0018) -- the dashboard's
   # `logit.*` panels come from here. `span_sample_rate` set explicitly to `1.0` rather than left at
-  # its `0.1` default (docs/adr/0022-internal-span-emission-and-deterministic-sampling.md) -- this
+  # its `0.1` default (docs/adr/0025-internal-span-emission-and-deterministic-sampling.md) -- this
   # is a demo meant to show every span it can, not a production deployment weighing span volume
   # against storage cost.
   self:
@@ -123,16 +142,3 @@ components:
     sources: [trace_windowed]
     protocol: grpc
     endpoint: tempo:4317
-
-  # -- Pending, not runnable yet --
-  #
-  # Logs to Loki: needs a `syslog_out` ComponentKind, which doesn't exist (docs/plans/
-  # 0003-demo-stack.md). It would mirror `syslog_in` -- UDP, RFC 3164 -- and point at the `alloy`
-  # service's syslog listener (demo/alloy/config.alloy), which is already up and provisioned in
-  # Grafana as the Loki datasource, waiting. Deliberately left out of this session
-  # (docs/plans/0005-otlp-end-to-end.md's "Out of scope") -- OTLP was large enough on its own.
-  #
-  # log_out:
-  #   type: syslog_out
-  #   sources: [access_json]
-  #   endpoint: alloy:5141

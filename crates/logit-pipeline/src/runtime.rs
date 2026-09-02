@@ -738,7 +738,7 @@ async fn write_loop(
         };
 
         // The sink span: the only span that can carry `SpanStatus::Error` and a fault tag,
-        // which is the whole point of instrumenting a sink (`docs/adr/0022-internal-span-
+        // which is the whole point of instrumenting a sink (`docs/adr/0025-internal-span-
         // emission-and-deterministic-sampling.md`). `ctx.child()` is minted, used as this span's
         // identity, and then discarded -- `run_output` emits nothing further downstream for
         // anything to inherit it (`Output::send` takes `&EventBatch`, not `&Delivered`), so there
@@ -915,7 +915,7 @@ async fn run_transform(
         // A no-op for every other transform.
         transform.observe_batch_context(parent);
         // Minted here, not inside `Fanout::send_with_context`, because this node records its own
-        // span around `process_batch` *and* the send (`docs/adr/0022-internal-span-emission-and-
+        // span around `process_batch` *and* the send (`docs/adr/0025-internal-span-emission-and-
         // deterministic-sampling.md`'s per-node-kind table): the span's `span_id` and the outgoing
         // `Delivered`'s `span_id` have to be the same id, which only holds if this is the one and
         // only place a context is minted for this emission.
@@ -985,7 +985,7 @@ pub fn process_batch(
 /// there is still no single correct parent to inherit (`TraceContext`'s own doc comment,
 /// `crates/logit-pipeline/src/fanout.rs`; `docs/known-gaps.md`'s internal-spans entry tracks this
 /// *n*-to-1 gap as deliberate, not something this function is wrong to leave open). What changed
-/// (`docs/adr/0022-internal-span-emission-and-deterministic-sampling.md`): earlier, every resource
+/// (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`): earlier, every resource
 /// group minted its *own* fresh root via plain `fanout.send`, so an `aggregate` flush spanning
 /// several resources looked like several unrelated hops; now one root is minted before `flush()`
 /// runs, and every group's batch goes out as a *sibling* under it -- one flush is one unit of
@@ -1196,6 +1196,14 @@ fn run_lua(
         }
         if errors > 0 {
             telemetry.count("logit.component.errors", errors as f64, &[("reason", "process")]);
+            // Consistent with `write_loop`'s own rule (ADR 0025): the call site whose error path
+            // fired is the one that marks the span, not a downstream reader inferring it from
+            // `logit.component.errors`. A batch with *any* script error, even a partial one mixed
+            // with successful emits, is not a clean node visit -- `span`'s default status is `Ok`,
+            // so a batch where every event errored (`out` stays empty, `span.events` never called
+            // below) would otherwise drain silently as a *successful* zero-event span instead of a
+            // failed one.
+            span.error();
         }
         if !out.is_empty() {
             span.events(out.len() as u64);
@@ -2071,6 +2079,203 @@ mod tests {
             })
         });
         assert!(vm_memory.is_some_and(|v| v > 0.0), "a loaded Lua VM should report nonzero memory");
+    }
+
+    /// Finds the drained `process` span `run_lua` recorded for `component_id`, panicking with the
+    /// full drained batch if none is present -- shared by the two error-status tests below.
+    fn find_process_span<'a>(events: &'a [Event], component_id: &str) -> &'a Event {
+        events
+            .iter()
+            .find(|e| {
+                e.span.is_some()
+                    && span_op(e) == Some("process")
+                    && e.attributes.get("component").and_then(|v| v.as_str()) == Some(component_id)
+            })
+            .unwrap_or_else(|| panic!("no process span for '{component_id}' in: {events:?}"))
+    }
+
+    /// The error half of `run_lua_records_vm_memory_and_emit_outcome`'s success case: a script
+    /// error must mark the process span `SpanStatus::Error`, not leave it at its default `Ok` --
+    /// ADR 0025's rule that the call site whose own error path fired is the one that marks the
+    /// span, applied to Lua's `process` the same way `write_loop` already applies it to a failed
+    /// delivery. Every event in the batch errors here, so `out` also stays empty and nothing is
+    /// ever sent downstream -- exactly the case that would otherwise drain as a *successful*
+    /// zero-event span.
+    #[tokio::test]
+    async fn run_lua_marks_its_process_span_as_error_when_every_event_in_the_batch_errors() {
+        let mut components = Map::new();
+        components.insert(
+            "in".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            },
+        );
+        components.insert(
+            "enrich".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec!["in".to_string()],
+                kind: ComponentKind::Lua {
+                    script: "function process(event) error('boom') end".to_string(),
+                    interval: None,
+                },
+            },
+        );
+        components.insert(
+            "out".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec!["enrich".to_string()],
+                kind: influxdb_out(),
+            },
+        );
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (result_tx, _result_rx) = std::sync::mpsc::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0), counter_event("hits", 2.0)],
+        };
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+        );
+        specs.insert(
+            "enrich".to_string(),
+            NodeSpec::Lua {
+                script: "function process(event) error('boom') end".to_string(),
+                interval: None,
+            },
+        );
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx: result_tx }),
+                SinkQueueConfig::default(),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        // `with_span_sampling(1.0)`, not `Registry::new()` -- this test needs every span kept,
+        // not the default 10%.
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry: HashMap<String, Telemetry> = ["in", "enrich", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+        )
+        .await
+        .expect("should not hang")
+        .expect("should complete without error");
+
+        let events = registry.drain(0);
+        let span_event = find_process_span(&events, "enrich");
+        let record = span_event.span.as_ref().expect("span record");
+        assert_eq!(
+            record.status,
+            SpanStatus::Error,
+            "a batch where every event errored must not drain as a successful span"
+        );
+    }
+
+    /// The partial-failure half of the same rule: a batch mixing successful and failing events
+    /// must still mark its process span `Error` -- a script that got *some* events through is not
+    /// the same as a clean node visit either. The script alternates outcomes via a persistent Lua
+    /// global (`n`), which survives across `process` calls within this one batch because `run_lua`
+    /// calls `worker.process` once per event against the same `ScriptWorker`/VM.
+    #[tokio::test]
+    async fn run_lua_marks_its_process_span_as_error_on_a_mixed_batch_of_successes_and_failures() {
+        let mut components = Map::new();
+        components.insert(
+            "in".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            },
+        );
+        let script = "n = 0\n\
+                       function process(event)\n\
+                       \x20 n = n + 1\n\
+                       \x20 if n % 2 == 0 then error('boom') end\n\
+                       \x20 return event\n\
+                       end"
+        .to_string();
+        components.insert(
+            "enrich".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec!["in".to_string()],
+                kind: ComponentKind::Lua { script: script.clone(), interval: None },
+            },
+        );
+        components.insert(
+            "out".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec!["enrich".to_string()],
+                kind: influxdb_out(),
+            },
+        );
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0), counter_event("hits", 2.0)],
+        };
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+        );
+        specs.insert("enrich".to_string(), NodeSpec::Lua { script, interval: None });
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx: result_tx }),
+                SinkQueueConfig::default(),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry: HashMap<String, Telemetry> = ["in", "enrich", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+        )
+        .await
+        .expect("should not hang")
+        .expect("should complete without error");
+
+        // The one surviving event (the odd-numbered call) still made it downstream -- this is a
+        // partial failure, not a total one.
+        let received =
+            result_rx.recv_timeout(Duration::from_secs(1)).expect("output should receive a batch");
+        assert_eq!(received.events.len(), 1, "only the non-erroring event should survive");
+
+        let events = registry.drain(0);
+        let span_event = find_process_span(&events, "enrich");
+        let record = span_event.span.as_ref().expect("span record");
+        assert_eq!(
+            record.status,
+            SpanStatus::Error,
+            "a mixed success/error batch must not drain as a successful span"
+        );
     }
 
     /// A stateful script whose only growth happens inside `flush()` (nothing new arriving on the

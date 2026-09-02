@@ -17,9 +17,13 @@
 //! never fed at all -- arity rules out a `sources` entry pointing at one -- so `Input` never
 //! receives a `Delivered` either way.)
 //!
-//! Every `Delivered` also carries a [`TraceContext`] -- the internal-spans propagation this PR's
-//! costing exercise (`docs/known-gaps.md`) measured and reverted before deciding to build for
-//! real. See [`TraceContext`]'s own doc comment for the propagation model, and
+//! Every `Delivered` also carries a [`TraceContext`] -- the substrate for internal spans, built
+//! per `docs/adr/0020-trace-context-propagation-on-delivered.md` on the measured evidence of a
+//! costing exercise that came before it (`docs/known-gaps.md`). Real span emission -- turning
+//! that context into an actual `SpanRecord`-carrying `Event` -- landed in
+//! `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`: `Fanout::send`/
+//! `send_blocking` (below) record this node's own listener span around the send. See
+//! [`TraceContext`]'s own doc comment for the propagation model, and
 //! `docs/design/pipeline-graph.md`'s "Trace context propagation" section for the account of which
 //! node kinds propagate a real parent today and which still mint a root.
 
@@ -35,17 +39,19 @@ use tokio::sync::mpsc;
 /// **Propagation model:** `trace_id` is set once, at a trace's true origin, and never changes
 /// again as a batch moves through the graph -- every hop's emitted batch keeps its parent's
 /// `trace_id`. `span_id` changes at *every* hop: [`TraceContext::child`] keeps `trace_id` and mints
-/// a fresh `span_id`, so a hop's own `span_id` is what the *next* hop's span would record as its
-/// `parent_span_id`, once something actually builds a `SpanRecord` from this (not done yet -- see
-/// the module doc above).
+/// a fresh `span_id`, so a hop's own `span_id` is what the *next* hop's span records as its own
+/// `parent_span_id` -- the actual `SpanRecord` this builds into is real now
+/// (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`; see the module doc above).
 ///
-/// **Not every node can produce a `child` today.** A node with exactly one incoming batch per
-/// emission (a listener producing its first batch, `Transform::process`/`ScriptWorker::process`'s
-/// per-batch loop) has one unambiguous parent, and does. A node whose emission is built from
-/// however many upstream batches contributed since the last tick (`Transform::flush`, Lua's
-/// timer-driven `flush()`) has no single correct parent -- an *n*-to-1 relationship, not 1-to-1 --
-/// and still mints a fresh [`TraceContext::new_root`] rather than picking one arbitrarily.
-/// `docs/known-gaps.md`'s internal-spans entry tracks this as the open half.
+/// **Not every node can produce a `child`.** A node with exactly one incoming batch per emission (a
+/// listener producing its first batch, `Transform::process`/`ScriptWorker::process`'s per-batch
+/// loop) has one unambiguous parent, and does. A node whose emission is built from however many
+/// upstream batches contributed since the last tick (`Transform::flush`, Lua's timer-driven
+/// `flush()`) has no single correct parent -- an *n*-to-1 relationship, not 1-to-1 -- and mints a
+/// fresh [`TraceContext::new_root`] instead, deliberately, rather than picking one arbitrarily; ADR
+/// 0022 records this as the settled design, not something still to be built. `docs/known-gaps.md`'s
+/// internal-spans entry names the narrower residuals that *are* still open (the listener span's
+/// window, Lua `flush()`'s link-less root).
 /// `Default` is the all-zero context -- a placeholder for tests/benches that construct a
 /// `Delivered` directly and don't care what it carries, never used by `Fanout` itself (which
 /// always calls [`TraceContext::new_root`] or [`TraceContext::child`]).
@@ -190,7 +196,7 @@ impl Fanout {
     /// to inherit). See [`Fanout::send_with_own_context`] for everything about delivery mechanics.
     ///
     /// **This is the one place a listener's own `SpanKind::Producer` span is recorded** --
-    /// `docs/adr/0022-internal-span-emission-and-deterministic-sampling.md`'s per-node-kind table.
+    /// `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`'s per-node-kind table.
     /// Its window is deliberately just this call, not "however long the listener spent building
     /// `batch`": `Fanout::send` has no visibility into that (`Input::run` is a free-form loop), so
     /// this doesn't fabricate a start time it can't actually know. Once `run_flush`/`run_lua`'s
@@ -511,7 +517,7 @@ mod tests {
 
     /// `send` mints a root and records exactly one `SpanKind::Producer` span for it -- the
     /// drained span's own `span_id` must be the same id the delivered batch actually went out
-    /// under, not some unrelated id minted separately (`docs/adr/0022-internal-span-emission-and-
+    /// under, not some unrelated id minted separately (`docs/adr/0025-internal-span-emission-and-
     /// deterministic-sampling.md`'s "the span's `span_id` and the outgoing `Delivered`'s `span_id`
     /// must be the same id").
     #[tokio::test]

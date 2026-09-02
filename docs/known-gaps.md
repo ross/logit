@@ -237,10 +237,40 @@ already built that have a known, accepted rough edge.
   substituted a placeholder for a missing variable was tried and reverted (ADR 0011's
   Alternatives) — visualizing a config's shape without its production secrets set needs a copy of
   the config with dummy values filled in, not a feature of `logit graph` itself.
-- **syslog TCP and structured data** — `syslog_in` is UDP-only (nginx's `syslog:` writer is
-  UDP-only, so TCP buys the driving integration nothing) and skips RFC 5424 STRUCTURED-DATA rather
-  than merging it into attributes (no producer needs it yet, and a naming scheme for
-  `[id@32473 k="v"]` invented without a consumer would be guesswork). Both are additive later.
+- **`syslog_in` is UDP-only, and skips RFC 5424 structured data** — nginx's `syslog:` writer is
+  UDP-only, so TCP buys the driving integration nothing, and `syslog_in` skips RFC 5424
+  STRUCTURED-DATA rather than merging it into attributes (no producer needs it yet, and a naming
+  scheme for `[id@32473 k="v"]` invented without a consumer would be guesswork). Both stay
+  additive-later on the *input* side specifically — `syslog_out` (the egress side,
+  `docs/adr/0022-syslog-output.md`) does support both UDP and TCP, and that asymmetry is
+  deliberate, not a sign this entry needs closing to match.
+- **`syslog_out` doesn't emit RFC 5424 structured data either** — everything a `json`/`kv_metrics`
+  stage merged into `event.attributes` is lost on the way out unless the message body already
+  carried it, so `syslog_in -> json -> syslog_out` is *less* than a byte-for-byte relay. Mapping
+  attributes to SD-ELEMENTs would need an SD-ID convention (a private enterprise number, RFC 5424
+  §7.2.2) that shouldn't be picked in passing while implementing the sink itself.
+- **`syslog_out` re-stamps a relayed message's timestamp rather than preserving the origin's** —
+  every emitted message's TIMESTAMP is `event.timestamp` (receipt time), never the `syslog.
+  timestamp` attribute `syslog_in` may have left on the event, for the same reason `syslog_in`
+  itself can't resolve that attribute to an instant for RFC 3164 (no year, no timezone) without
+  guessing (see the receipt-time entry below, which this mirrors on the way out). The opt-in
+  `syslog_timestamp` transform sketched there would fix this in both directions at once.
+- **`syslog_out`'s control-character escaping is ambiguous with a message that already contained
+  the escape sequence literally** — the encoder escapes an embedded newline as the two characters
+  `\`/`n` (and similarly for `\r`/NUL) so it can't forge a second syslog message downstream, but
+  deliberately leaves a literal backslash untouched (escaping it would double every backslash in a
+  JSON message body and break a `| json` LogQL filter on every line). Consequence: a message that
+  genuinely contained the literal two characters `\`/`n` is indistinguishable on the wire from one
+  that contained a real newline. Accepted in `docs/adr/0022-syslog-output.md`.
+- **`syslog_out` has no TLS** — plaintext UDP/TCP only; RFC 5425 (syslog over TLS) and RFC 6012
+  (DTLS) are both out of scope. A `logit -> remote collector` hop over an untrusted network has no
+  transport security today.
+- **`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
+  per-message framing** — `syslog_out` needs one UDP datagram or one octet-counted TCP frame per
+  *message*, which one opaque `Bytes` per *batch* can't express, so it bypasses the trait entirely
+  (`crates/logit-outputs/src/syslog.rs`'s module doc has the full reasoning). Generalizing the
+  trait (an associated framing type, or a sink-driven push interface) is deferred until a second
+  sink needs the same thing, so it isn't designed against a single caller.
 - **A non-UTF-8 syslog MSG is a rejected line, not a `Value::Bytes` event** — RFC 5424's `MSG-ANY`
   permits arbitrary octets, and `logit-core::Value` already has a `Bytes` variant for exactly this.
   `syslog_in` isolates UTF-8 validation to one line at a time (so one bad line no longer takes its
@@ -349,7 +379,7 @@ already built that have a known, accepted rough edge.
     contributing batch as "the" parent, for either case, was considered and rejected (silently
     wrong is worse than visibly incomplete).
 
-    **[ADR 0022](adr/0022-internal-span-emission-and-deterministic-sampling.md) closed both items
+    **[ADR 0025](adr/0025-internal-span-emission-and-deterministic-sampling.md) closed both items
     this entry used to list as open: emission and sampling.** `Telemetry::span`/`SpanGuard` (mirroring
     `Timer`'s disabled-is-free shape) turn a `(context, node, batch)` visit into a real
     `SpanRecord`-carrying `Event`, drained by `ComponentBuffer::drain`'s new span pass alongside the
@@ -365,7 +395,7 @@ already built that have a known, accepted rough edge.
     resulting per-node-kind span record.
 
     **[docs/plans/0005-otlp-end-to-end.md](plans/0005-otlp-end-to-end.md) (the OTLP series' fourth
-    PR) is what actually closes this item, not ADR 0022 alone.** Everything above built a real
+    PR) is what actually closes this item, not ADR 0025 alone.** Everything above built a real
     `SpanRecord` inside `logit`'s own process; nothing tested whether the result was a span *any
     other system would recognize*. `otlp_out` (ADR 0023's codec, ADR 0024's hand-rolled gRPC
     transport) is that proof: `demo/logit.yaml`'s `trace_out` exports `internal`'s spans to a real
@@ -386,7 +416,7 @@ already built that have a known, accepted rough edge.
     still flow through the pipeline and reach every configured sink, untouched); it doesn't
     propagate to or from a peer (no `sampled` flag crosses `otlp_in`/`otlp_out`'s wire boundary, so
     a `logit` downstream of another `logit` -- or of any other OTLP producer -- makes its own
-    independent keep/drop decision on the same `trace_id`, per ADR 0022's "no propagated bit"
+    independent keep/drop decision on the same `trace_id`, per ADR 0025's "no propagated bit"
     decision); and it doesn't thin the *metrics* signal at all -- `internal`'s point-side buffer and
     `otlp_out`'s metrics encoding are entirely unaffected by this knob, which is why the demo's
     InfluxDB dashboard populates identically whether `span_sample_rate` is `0.1` or `1.0`.
@@ -396,7 +426,7 @@ already built that have a known, accepted rough edge.
        has no visibility into how long a listener spent building the batch it's about to send
        (`Input::run` is a free-form loop) — the still-open listener-side half of "delivery I/O is
        not decoupled from event processing" (below).
-    2. **Lua `flush()` still gets a link-less root.** It gets a real span now (ADR 0022), but no
+    2. **Lua `flush()` still gets a link-less root.** It gets a real span now (ADR 0025), but no
        links — there is still no accumulator on the Lua side to inspect, same limitation as the
        `Resource`-staleness gap above.
     3. **A `SinkQueue` entry is 24 bytes larger.** `TraceContext` now rides inline in every queue

@@ -93,8 +93,9 @@ pub enum ComponentKind {
 into one tagged enum creates real collisions — `Otlp { bind }` (a listener) and `Otlp { endpoint }`
 (a sink) can't both be `type: otlp` in an internally-tagged enum, and the same is true of the two
 `Logit` variants. Suffixing *every* protocol kind uniformly, not just the two that collide today,
-keeps the rule predictable as more protocols gain a second side (`syslog_out`, once syslog egress
-exists, say). Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`,
+keeps the rule predictable as more protocols gain a second side — `syslog_out` (RFC 3164/5424 over
+UDP or TCP, `docs/adr/0022-syslog-output.md`) is exactly that case, landing well after `SyslogIn`.
+Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`,
 `remove`, and any future native transform — take no suffix; there's only ever one direction for a
 transform to be.
 
@@ -165,7 +166,11 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 5. **No cycles.** DFS with a recursion-stack set, or Kahn's algorithm falling back to "nodes remain
    with no zero-indegree candidate." This is the one genuinely new must-have: a cycle plus bounded
    `mpsc` channels is a deadlock, not a slow pipeline, and today's linear-pipeline shape made cycles
-   structurally impossible — the graph model makes them a real config mistake to guard against.
+   structurally impossible — the graph model makes them a real config mistake to guard against. The
+   nodes still unresolved once Kahn's algorithm runs out of zero-indegree candidates are the cycle
+   *plus* everything downstream of it, not the cycle alone — the error walks that set back down to
+   one concrete cycle path before reporting it, so a downstream victim is never named as if it were
+   part of the cycle.
 6. Arity per kind, per the table above — a listener with `sources`, a sink with none, a sink named as
    another component's source.
 7. Every non-sink component has ≥1 consumer — replaces today's "pipeline has no outputs" check and
@@ -274,7 +279,7 @@ Every `Delivered` (the channel payload one `Fanout` edge carries, `crates/logit-
 carries a `TraceContext { trace_id: [u8; 16], span_id: [u8; 8] }` — the substrate for internal
 spans, decided and built per [ADR 0020](../adr/0020-trace-context-propagation-on-delivered.md) on
 the measured evidence [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md) required.
-[ADR 0022](../adr/0022-internal-span-emission-and-deterministic-sampling.md) is what actually turns
+[ADR 0025](../adr/0025-internal-span-emission-and-deterministic-sampling.md) is what actually turns
 this plumbing into a `SpanRecord`-carrying `Event` — see `docs/design/internal-telemetry.md`'s
 "Spans" section for the emit API, the sampler, and the bound.
 
@@ -286,11 +291,11 @@ per-batch processing and its flush:**
 |---|---|---|
 | A listener's own batches | Always a fresh root — `Input::run` never receives a `Delivered` (arity rules out a `sources` entry pointing at one), so there is no parent to inherit. | `SpanKind::Producer`, in `Fanout::send`/`send_blocking` |
 | `Transform::process`/`ScriptWorker::process` (the non-flush path) | A [`TraceContext::child`] of the one incoming batch that produced it — 1-to-1, unambiguous. | `SpanKind::Internal`, in `run_transform`/`run_lua` |
-| `Transform::flush`/Lua's timer-driven `flush()` | A fresh root, deliberately — an *n*-to-1 relationship (however many batches were absorbed since the last tick), with no single correct parent to propagate. Tracked as an open gap, not silently approximated; see ADR 0020's "What this doesn't do." One root now covers *every* resource group a flush emits, not one root per group (ADR 0022). | `SpanKind::Internal`, in `run_flush`/`run_lua`'s `flush_now` |
-| `run_output` | Already borrows the incoming `Delivered` without unwrapping (`Output::send(&EventBatch)`, [ADR 0016](../adr/0016-arc-eventbatch-copy-on-write.md)), so the context is there to read. Nothing further downstream to propagate *to* — the sink span mints `ctx.child()` as its own identity and then discards it (ADR 0022). | `SpanKind::Client`, in `write_loop` |
+| `Transform::flush`/Lua's timer-driven `flush()` | A fresh root, deliberately — an *n*-to-1 relationship (however many batches were absorbed since the last tick), with no single correct parent to propagate. Tracked as an open gap, not silently approximated; see ADR 0020's "What this doesn't do." One root now covers *every* resource group a flush emits, not one root per group (ADR 0025). | `SpanKind::Internal`, in `run_flush`/`run_lua`'s `flush_now` |
+| `run_output` | Already borrows the incoming `Delivered` without unwrapping (`Output::send(&EventBatch)`, [ADR 0016](../adr/0016-arc-eventbatch-copy-on-write.md)), so the context is there to read. Nothing further downstream to propagate *to* — the sink span mints `ctx.child()` as its own identity and then discards it (ADR 0025). | `SpanKind::Client`, in `write_loop` |
 
 Mechanically: `Fanout::send`/`send_blocking` mint a root, open the listener's own span, and
-delegate to `Fanout::send_with_own_context` (new, ADR 0022) — the *only* remaining caller of
+delegate to `Fanout::send_with_own_context` (new, ADR 0025) — the *only* remaining caller of
 `send`/`send_blocking`, now that a flush-driven emission (which used to call `send` directly) also
 mints its own root and calls `send_with_own_context` instead, so it can record its own span around
 the same context. `Fanout::send_with_context`/`send_blocking_with_context` (mint a child of a given
@@ -299,7 +304,7 @@ methods, no existing signature changed. `Delivered::context()` is a cheap `&self
 it *before* `unwrap_batch` consumes the batch, since `unwrap_batch` itself still discards the
 context (changing its return type to include one would force every existing caller, most of which
 don't propagate anything, to thread a value through unused). `SinkQueue`'s entries carry the
-context too now (`push`/`peek`, ADR 0022) — the last place it was still being discarded, on the
+context too now (`push`/`peek`, ADR 0025) — the last place it was still being discarded, on the
 one path (`drain_inbox` → `write_loop`) that needs it to parent the sink's own span.
 
 A fan-out (one batch, several downstream branches) gives every branch the *identical* child
@@ -367,7 +372,7 @@ config is a graph rather than a list of linear pipelines.
   undefined component can't be drawn at all" and required rule 2 to pass first — that premise was
   simply wrong once actually tried; corrected here rather than left as a stated constraint the
   implementation quietly didn't follow.)
-- Runs the full validation (rules 2–9) after rendering and reports any failures to stderr with a
+- Runs the full validation (all fifteen rules) after rendering and reports any failures to stderr with a
   non-zero exit — without suppressing the DOT output. This is deliberate: `graph` is most useful on
   exactly the configs that fail validation, since a cycle — or a typo'd source, now visibly
   dangling — is far easier to see rendered than to parse out of an error message naming two
@@ -413,7 +418,7 @@ logit-core   logit-config   logit-script
 - Keeps the channel type out of `logit-core`, whose doc comment states "no I/O, no pipeline" —
   weakening that would blur a boundary the crate exists to hold.
 
-`graph.rs` (resolution + the eight validation rules + topo-sort) is a **pure function over
+`graph.rs` (resolution + the fifteen validation rules + topo-sort) is a **pure function over
 `Config`** — no channels, no threads, no tokio — mirroring how `apply_transforms` in today's
 `pipeline.rs` was deliberately kept pure specifically so it's unit-testable without spinning up
 real I/O. `logit run`, `logit validate`, and `logit graph` are three different things layered on

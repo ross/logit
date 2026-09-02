@@ -1,4 +1,4 @@
-# 0022 — Internal span emission, one span per node-visit, and deterministic-on-`trace_id` sampling
+# 0025 — Internal span emission, one span per node-visit, and deterministic-on-`trace_id` sampling
 
 ## Status
 

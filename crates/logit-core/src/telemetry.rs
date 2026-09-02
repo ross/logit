@@ -85,7 +85,7 @@ const MAX_LINKS_PER_SPAN: usize = 32;
 /// `internal` component doesn't set one. Below `1.0` deliberately: span volume is a different
 /// shape than metric volume -- one span per node-visit per batch, where a metric point coalesces
 /// between drains -- so keeping everything by default would multiply internal telemetry's own
-/// volume in a way metrics never do. See `docs/adr/0022-internal-span-emission-and-deterministic-sampling.md`.
+/// volume in a way metrics never do. See `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`.
 pub const DEFAULT_SPAN_SAMPLE_RATE: f64 = 0.1;
 
 /// Deterministic on `trace_id`, so every node -- and every `logit` process in a split-collection
@@ -210,7 +210,7 @@ impl Telemetry {
     }
 
     /// Opens a span for this component's one visit to one unit of work -- see
-    /// `docs/adr/0022-internal-span-emission-and-deterministic-sampling.md` for what "one unit of
+    /// `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md` for what "one unit of
     /// work" means per node kind. The sample decision (`trace_is_sampled`) is made here, from
     /// `trace_id` alone, before any span-shaped state exists at all: an unsampled trace gets the
     /// same `SpanGuard::disabled()` a disabled handle's [`Telemetry::timer`] returns, so every
@@ -237,6 +237,7 @@ impl Telemetry {
             telemetry: Telemetry(Some(buf.clone())),
             span: Some(PendingSpan {
                 start: now_unix_nanos(),
+                started_at: Instant::now(),
                 end: 0,
                 trace_id,
                 span_id,
@@ -252,7 +253,23 @@ impl Telemetry {
     }
 }
 
+/// The wall-clock Unix-nanosecond "now" -- read exactly once per span, at
+/// [`Telemetry::span`]'s own call, never again at finish (see [`PendingSpan::started_at`]'s doc
+/// comment for why: a second independent read is what this whole split avoids).
+///
+/// The `#[cfg(test)]` override below exists purely so a test can simulate a wall clock that jumps
+/// (an NTP correction, an admin `date` call) *between* a span's start and its finish, without an
+/// actual multi-second sleep -- see `a_wall_clock_moving_backward_between_start_and_finish_cannot_make_end_precede_start`.
+/// Never compiled into a non-test binary: the thread-local's own overhead (a branch and a
+/// thread-local read) would otherwise be paid on every single span, sampled or not, for a facility
+/// only tests use.
 fn now_unix_nanos() -> i64 {
+    #[cfg(test)]
+    {
+        if let Some(overridden) = tests::CLOCK_OVERRIDE.with(|cell| cell.get()) {
+            return overridden;
+        }
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -304,6 +321,15 @@ struct PendingSpan {
     /// Unix nanoseconds -- becomes the drained `Event::timestamp`, *not* the drain time
     /// (`ComponentBuffer::drain`'s doc comment).
     start: i64,
+    /// Captured alongside `start`, from the same [`Telemetry::span`] call -- a monotonic clock
+    /// reading `end` is derived from at finish time (`started_at.elapsed()`), instead of a second
+    /// independent `SystemTime::now()` read. Two independent wall-clock reads would let the
+    /// *system* clock moving backward between them (an NTP correction, an admin `date` call --
+    /// plausible over a long span, e.g. a retrying sink send) produce `end < start`, an invalid
+    /// duration downstream; `Instant` is guaranteed monotonically non-decreasing on every platform
+    /// this project ships to, so `start + elapsed` can never precede `start`, structurally, by
+    /// construction -- not merely "usually doesn't."
+    started_at: Instant,
     /// Unix nanoseconds, set when the guard finishes (`SpanGuard::finish`/`Drop`) -- becomes
     /// `SpanRecord::end_timestamp`. `0` until then; never observed in that state, since nothing
     /// reads a `PendingSpan` before it's pushed to the buffer, which only ever happens once `end`
@@ -418,7 +444,12 @@ impl SpanGuard {
     fn finish_inner(&mut self) {
         let Some(mut span) = self.span.take() else { return };
         let Some(buf) = self.telemetry.0.as_ref() else { return };
-        span.end = now_unix_nanos();
+        // `start + elapsed`, never a second `now_unix_nanos()` read -- see `PendingSpan::started_at`'s
+        // doc comment. `as i64` after `.min(i64::MAX as u128)` is a saturating conversion: a span
+        // living longer than ~292 years is never real, but this must not panic or wrap negative on
+        // the (impossible in practice) day it happens.
+        let elapsed_nanos = span.started_at.elapsed().as_nanos().min(i64::MAX as u128) as i64;
+        span.end = span.start.saturating_add(elapsed_nanos);
         buf.push_span(span);
     }
 }
@@ -689,6 +720,26 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    // `now_unix_nanos`'s test-only wall-clock override -- see that fn's own doc comment.
+    // `pub(super)` so `now_unix_nanos` (defined in the parent module) can read it; nothing outside
+    // this crate ever sees it, `#[cfg(test)]` on both this module and the read site keeps it out
+    // of a non-test binary entirely.
+    thread_local! {
+        pub(super) static CLOCK_OVERRIDE: Cell<Option<i64>> = const { Cell::new(None) };
+    }
+
+    /// Sets the wall clock `now_unix_nanos()` will report on this thread until
+    /// [`clear_test_clock`] is called -- thread-local, and `cargo nextest` runs each test in its
+    /// own process, so this can't leak into a sibling test.
+    fn set_test_clock(nanos: i64) {
+        CLOCK_OVERRIDE.with(|cell| cell.set(Some(nanos)));
+    }
+
+    fn clear_test_clock() {
+        CLOCK_OVERRIDE.with(|cell| cell.set(None));
+    }
 
     fn tags(pairs: &[Tag]) -> Vec<Tag> {
         pairs.to_vec()
@@ -1094,6 +1145,40 @@ mod tests {
             span_event.timestamp
         );
         assert_ne!(span_event.timestamp, 1, "must not be stamped with the drain time");
+    }
+
+    /// The clock-safety guarantee `PendingSpan::started_at`'s doc comment describes, proven
+    /// directly rather than merely asserted after one lucky run: simulates a wall clock that jumps
+    /// backward between a span's start and its finish (an NTP correction, an admin `date` call) via
+    /// `now_unix_nanos`'s test-only override, and shows `end_timestamp` still can't precede
+    /// `Event::timestamp` (the span's own start) -- because `finish_inner` never reads the wall
+    /// clock a second time at all, only `started_at.elapsed()` (`Instant`, monotonic on every
+    /// platform this project ships to). Against a two-independent-`SystemTime::now()`-reads
+    /// version, the exact backward jump below would produce `end < start` every time, not
+    /// occasionally -- this is a structural guarantee, not a timing-dependent one.
+    #[test]
+    fn a_wall_clock_moving_backward_between_start_and_finish_cannot_make_end_precede_start() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("x", "x", "transform");
+
+        set_test_clock(1_000_000_000); // T0: an arbitrary wall-clock start
+        let span = telemetry.span("deliver", SpanKind::Client, trace_id(1), span_id(1), None);
+        // The wall clock jumps backward by a full second while the span is still open -- far
+        // larger than any real elapsed time this test's own execution could add on its own.
+        set_test_clock(0);
+        drop(span);
+        clear_test_clock();
+
+        let events = registry.drain(0);
+        let span_event = find_span_event(&events).expect("a span event should be present");
+        let record = span_event.span.as_ref().expect("span record");
+        assert!(
+            record.end_timestamp >= span_event.timestamp,
+            "end_timestamp ({}) must never precede the span's own start ({}), even across a \
+             backward wall-clock jump",
+            record.end_timestamp,
+            span_event.timestamp
+        );
     }
 
     #[test]

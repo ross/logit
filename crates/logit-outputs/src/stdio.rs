@@ -349,7 +349,14 @@ fn span_status_label(status: SpanStatus) -> &'static str {
 /// bytes may not be valid text at all); `Str` is quoted with escapes; `Timestamp` goes through the
 /// same [`format_rfc3339_utc`] the event's own timestamp line uses; `Array`/`Map` render compactly
 /// and recursively.
-fn render_value(out: &mut String, value: &Value) {
+///
+/// `pub(crate)`, not private: `logit_outputs::syslog`'s message-body rendering reuses this for a
+/// `Value::Map`/`Value::Array` log message (its own container-encoding fallback, not a case worth
+/// a second implementation) -- but deliberately does **not** route `Value::Str` through it, since
+/// this function quotes and escapes a string for a human reading a terminal
+/// ([`render_quoted_str`]), which would wrap a syslog MSG's raw JSON body in quotes and double
+/// its backslashes. See `syslog.rs`'s module doc for the full reasoning.
+pub(crate) fn render_value(out: &mut String, value: &Value) {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => {

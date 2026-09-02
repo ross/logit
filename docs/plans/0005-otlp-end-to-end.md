@@ -81,8 +81,13 @@ Non-negotiable, from `AGENTS.md`, restated here because this plan cites them rep
 - **Run `script/*`, never bare `cargo`** — nothing is installed on the host. `script/cibuild` before
   opening a PR; it is byte-for-byte what CI runs.
 - **An ADR per real decision**, numbered, in `docs/adr/`, following the existing
-  Status/Context/Decision/Alternatives/Consequences shape. This series used **0022** through
-  **0024** (`0020` was already used twice before this series started; no third use was added).
+  Status/Context/Decision/Alternatives/Consequences shape. This series originally reserved **0022**
+  through **0024**; `feat/syslog-out` (#47, an independent PR, not part of this series) landed its
+  own real `0022-syslog-output.md` first, so PR1's own ADR (internal span emission) renumbered
+  to **0025** when merging into `main` to avoid the collision -- `docs/adr/`'s existing files
+  finished at **0023** (`otlp-codec`), **0024** (`otlp-components`'/hand-rolled gRPC), and **0025**
+  (internal span emission). `0020` was already used twice before this series started; no third use
+  was added.
 - **Every config type derives `Serialize + Deserialize + JsonSchema` together** (ADR 0003), and
   `schema/logit.schema.json` is regenerated via `script/schema` and committed in the same change.
   `script/cibuild` fails on drift.

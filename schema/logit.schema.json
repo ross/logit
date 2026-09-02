@@ -87,7 +87,7 @@
           }
         },
         {
-          "description": "RFC 3164 / RFC 5424 syslog over UDP or TCP.",
+          "description": "RFC 3164 / RFC 5424 syslog over UDP. **Not** TCP, despite this doc comment's old claim -- `crates/logit-inputs/src/syslog.rs`'s own module doc has always said UDP-only (nginx's `syslog:` writer is UDP-only, so a TCP accept loop would buy this listener nothing; `docs/known-gaps.md`'s \"syslog TCP and structured data\" entry tracks it as future, additive work). `syslog_out` (the egress side, `docs/adr/0022-syslog-output.md`) supports both UDP and TCP -- that asymmetry is deliberate, not a sign this needs fixing to match.",
           "type": "object",
           "required": [
             "bind",
@@ -193,7 +193,7 @@
               "type": "string"
             },
             "span_sample_rate": {
-              "description": "Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id` the same way at every node -- a kept trace is kept at every hop, never partially. Below `1.0` by default: span volume is a different shape than metric volume (one span per node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans off entirely; `1.0` keeps everything (what `demo/logit.yaml` sets). Named `span_sample_rate`, not `sample_rate` -- there is already a `ComponentKind::Sample` transform, and `internal` may grow other sampling knobs later. See `docs/adr/0022-internal-span-emission-and-deterministic-sampling.md`.",
+              "description": "Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id` the same way at every node -- a kept trace is kept at every hop, never partially. Below `1.0` by default: span volume is a different shape than metric volume (one span per node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full traces rather than a representative sample would set this explicitly. Named `span_sample_rate`, not `sample_rate` -- there is already a `ComponentKind::Sample` transform, and `internal` may grow other sampling knobs later. See `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`.",
               "default": 0.1,
               "type": "number",
               "format": "double"
@@ -638,6 +638,77 @@
               ]
             }
           }
+        },
+        {
+          "description": "RFC 3164 / RFC 5424 syslog egress over UDP or TCP -- the mirror of `SyslogIn`, and a real relay: header fields round-trip from an event's `syslog.*` attributes when present, falling back to the defaults below only when an event carries none (e.g. one that never passed through `syslog_in`). See `docs/adr/0022-syslog-output.md`.",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "type"
+          ],
+          "properties": {
+            "app_name": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "connect_timeout": {
+              "description": "TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a dropped connection) is allowed to take before `send` reports it as a failure.",
+              "default": "5s",
+              "type": "string"
+            },
+            "endpoint": {
+              "description": "`host:port`. Resolved at connect/bind time, never at config-load time -- a `syslog_out` pointed at a destination that isn't up yet is not a config error (`!env` still applies like any other string field, ADR 0011).",
+              "type": "string"
+            },
+            "facility": {
+              "description": "PRI facility used only when the event carries no `syslog.facility` attribute.",
+              "default": "local0",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SyslogFacility"
+                }
+              ]
+            },
+            "format": {
+              "description": "RFC 3164 carries no year and no timezone in its TIMESTAMP, so a receiver has to guess both -- `rfc5424`'s unambiguous RFC 3339 timestamp is the better default; `syslog_in` already parses both dialects, so emitting both is parity, not new scope.",
+              "default": "rfc5424",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SyslogFormat"
+                }
+              ]
+            },
+            "hostname": {
+              "description": "HOSTNAME/APP-NAME fallbacks, used only when the event carries no `syslog.hostname`/ `syslog.tag` attribute -- e.g. an event that never passed through `syslog_in`. Omitted entirely (rather than a literal `logit` default) so a relayed line's origin is never silently overwritten with something that looks like a config mistake.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max_message_bytes": {
+              "description": "Bounds one encoded message (PRI + header + MSG). Defaults to 8192, matching Grafana Alloy's `loki.source.syslog` `max_message_length` default -- the receiver the demo stack points this at -- rather than RFC 3164 §4.1's traditional 1024, which would truncate a JSON-bodied message on every modern relay chain. A string via [`human_bytes`], exactly like `BufferConfig::max_bytes`.",
+              "default": "8192",
+              "type": "string"
+            },
+            "transport": {
+              "default": "udp",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SyslogTransport"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "syslog_out"
+              ]
+            }
+          }
         }
       ],
       "properties": {
@@ -733,6 +804,52 @@
     },
     "StdioTarget": {
       "type": "string"
+    },
+    "SyslogFacility": {
+      "description": "The syslog PRI facility, named rather than a bare `0..=23` integer so schemars publishes a real enumeration and a typo is a config error rather than a silently-wrong PRI. Ordered to match the standard facility codes (`kern` is 0); `as_u8` reads the discriminant back out. `local0` defaults, matching `demo/hello/app.py`'s own `PRI = 134` (facility 16), so the demo round-trips its own PRI unchanged even before `syslog.facility` attribute precedence applies.",
+      "type": "string",
+      "enum": [
+        "kern",
+        "user",
+        "mail",
+        "daemon",
+        "auth",
+        "syslog",
+        "lpr",
+        "news",
+        "uucp",
+        "cron",
+        "authpriv",
+        "ftp",
+        "ntp",
+        "security",
+        "console",
+        "solaris_cron",
+        "local0",
+        "local1",
+        "local2",
+        "local3",
+        "local4",
+        "local5",
+        "local6",
+        "local7"
+      ]
+    },
+    "SyslogFormat": {
+      "description": "Which syslog dialect `syslog_out` emits. See `SyslogOut::format`'s doc comment for why `rfc5424` is the default.",
+      "type": "string",
+      "enum": [
+        "rfc3164",
+        "rfc5424"
+      ]
+    },
+    "SyslogTransport": {
+      "description": "`syslog_out`'s transport. UDP (the default) mirrors `syslog_in` and needs no ordering guarantee against the receiver's startup -- a fire-and-forget `send_to` before the receiver is up just loses that line, the same honest limit `syslog_in`'s own UDP intake accepts on the way in. TCP is what makes `Fault` classification (`docs/adr/0021-buffered-sink-delivery.md`) meaningful for this sink: a connect failure is unambiguously `Fault::Clean`.",
+      "type": "string",
+      "enum": [
+        "udp",
+        "tcp"
+      ]
     }
   }
 }
