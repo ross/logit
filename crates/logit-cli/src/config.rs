@@ -267,10 +267,12 @@ components:
         assert_eq!(out.buffer.shutdown_grace, std::time::Duration::from_secs(10));
     }
 
-    /// The bare-integer form of `max_bytes` (as opposed to `"64MiB"` above) through the same real
-    /// YAML path.
+    /// The quoted-bare-number form of `max_bytes` (as opposed to `"64MiB"` above) through the
+    /// same real YAML path. `human_bytes` is string-only, both directions (an unquoted YAML
+    /// integer is rejected -- see `crates/logit-config/src/lib.rs`'s `human_bytes` module doc
+    /// comment for why), so this must be quoted.
     #[test]
-    fn buffer_config_bare_integer_max_bytes_round_trips_through_the_real_yaml_path() {
+    fn buffer_config_quoted_bare_number_max_bytes_round_trips_through_the_real_yaml_path() {
         let yaml = r#"
 components:
   in:
@@ -284,7 +286,7 @@ components:
     bucket: b
     token: t
     buffer:
-      max_bytes: 134217728
+      max_bytes: "134217728"
 "#;
         let config = parse(yaml, &env(&[])).expect("should parse");
         assert_eq!(config.components["out"].buffer.max_bytes, 134_217_728);

@@ -306,8 +306,10 @@ impl JsonSchema for StdioTarget {
 pub struct BufferConfig {
     pub max_batches: usize,
     /// Byte bound on the buffer's estimated heap footprint (`EventBatch::estimated_heap_bytes`),
-    /// checked alongside `max_batches` -- whichever trips first. Human-readable in YAML (`64MiB`,
-    /// `134217728`) via the [`human_bytes`] codec below, not a bare byte count.
+    /// checked alongside `max_batches` -- whichever trips first. A quoted string in YAML --
+    /// `"64MiB"` or a plain `"134217728"` -- via the [`human_bytes`] codec below, string-only in
+    /// both directions to match this field's published schema exactly (an unquoted number is
+    /// rejected, not silently accepted).
     #[serde(with = "human_bytes")]
     #[schemars(with = "String")]
     pub max_bytes: u64,
@@ -379,37 +381,34 @@ mod human_bytes {
     const MIB: u64 = KIB * 1024;
     const GIB: u64 = MIB * 1024;
 
+    /// String-only, both directions -- deliberately, not just permissively. An earlier version
+    /// accepted a bare YAML/JSON integer on input (via `deserialize_any`) while always
+    /// serializing as an integer, which contradicted `#[schemars(with = "String")]`'s published
+    /// claim in *both* directions at once: the generated schema said `"type": "string"` while a
+    /// real config's serialized form was always a bare number, and a schema-strict validator
+    /// would separately reject the bare-integer input form `logit` itself accepted -- two
+    /// distinct violations of ADR 0003's "the schema can't drift from what the binary accepts"
+    /// contract, not one. Consistently string-only (a quoted `"134217728"` or `"64MiB"`, always
+    /// serialized the same way) matches the published schema exactly, with no asymmetry to
+    /// reason about.
     pub fn serialize<S: Serializer>(bytes: &u64, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_u64(*bytes)
+        s.serialize_str(&bytes.to_string())
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
-        // Accepts either a bare YAML/JSON integer or a suffixed string -- `deserialize_any` lets
-        // both shapes through to `parse` below without committing to one at the schema level (the
-        // `#[schemars(with = "String")]` on the field covers the string form config actually
-        // documents; a bare integer still round-trips through this same codec, exercised by this
-        // module's own tests).
         struct Visitor;
         impl serde::de::Visitor<'_> for Visitor {
             type Value = u64;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a byte count, e.g. 134217728 or 64MiB")
-            }
-
-            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<u64, E> {
-                Ok(v)
-            }
-
-            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<u64, E> {
-                u64::try_from(v).map_err(|_| E::custom(format!("negative byte count: {v}")))
+                f.write_str("a byte count string, e.g. \"134217728\" or \"64MiB\"")
             }
 
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<u64, E> {
                 parse(v).map_err(E::custom)
             }
         }
-        d.deserialize_any(Visitor)
+        d.deserialize_str(Visitor)
     }
 
     fn parse(raw: &str) -> Result<u64, String> {
@@ -449,8 +448,12 @@ mod human_bytes {
         }
 
         #[test]
-        fn round_trips_a_bare_integer() {
-            assert_eq!(parse_json("134217728").unwrap(), 134_217_728);
+        fn a_bare_unquoted_integer_is_rejected_not_silently_accepted() {
+            // String-only, deliberately, both directions -- see this module's own doc comment.
+            // An earlier version accepted this via `deserialize_any`, which contradicted the
+            // published schema's `"type": "string"` claim.
+            let err = parse_json("134217728").unwrap_err();
+            assert!(err.contains("byte count string"), "got: {err}");
         }
 
         #[test]
@@ -481,19 +484,33 @@ mod human_bytes {
 
         #[test]
         fn rejects_a_negative_number() {
-            let err = parse_json("-5").unwrap_err();
-            assert!(err.contains("negative"), "got: {err}");
+            // Quoted, since input is string-only now -- an unquoted `-5` is rejected as the
+            // wrong JSON type entirely (see `an_unquoted_negative_number_is_also_rejected`
+            // below), not because it's negative specifically. `-` isn't an ASCII digit, so
+            // `parse`'s digit-scan sees an empty numeric prefix and reports the same "expected a
+            // byte count" shape it would for any other non-numeric-looking string.
+            let err = parse_json(r#""-5""#).unwrap_err();
+            assert!(err.contains("expected a byte count"), "got: {err}");
         }
 
         #[test]
-        fn serialize_emits_a_bare_integer() {
+        fn an_unquoted_negative_number_is_also_rejected() {
+            let err = parse_json("-5").unwrap_err();
+            assert!(err.contains("byte count string"), "got: {err}");
+        }
+
+        #[test]
+        fn serialize_emits_a_string_matching_the_published_schema() {
+            // Matches `#[schemars(with = "String")]`'s claim exactly, both directions -- see
+            // this module's own doc comment for why an earlier bare-integer form was a real
+            // ADR-0003 schema-drift bug, not just a style choice.
             #[derive(serde::Serialize)]
             struct W {
                 #[serde(with = "super")]
                 bytes: u64,
             }
             let json = serde_json::to_string(&W { bytes: 64 * 1024 * 1024 }).unwrap();
-            assert_eq!(json, r#"{"bytes":67108864}"#);
+            assert_eq!(json, r#"{"bytes":"67108864"}"#);
         }
     }
 }

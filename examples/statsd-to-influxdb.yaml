@@ -35,13 +35,13 @@ components:
     org: logit
     bucket: metrics
     token: !env INFLUXDB_TOKEN
-    # Every field below defaults (docs/adr/0019-buffered-sink-delivery.md) -- an omitted `buffer:`
+    # Every field below defaults (docs/adr/0020-buffered-sink-delivery.md) -- an omitted `buffer:`
     # block is exactly the values shown here, commented out purely as a reference for tuning a
     # real deployment. `buffer:` is meaningful only on a sink; `logit-pipeline`'s graph validation
     # rejects it on any other component kind.
     # buffer:
     #   max_batches: 1024      # queue depth, in batches -- whichever of this or max_bytes trips first
-    #   max_bytes: 64MiB       # estimated heap footprint bound (human-readable: KiB/MiB/GiB, or a bare integer)
+    #   max_bytes: "64MiB"     # estimated heap footprint bound -- a quoted string, always (KiB/MiB/GiB or a bare number)
     #   overflow: block        # block | drop_oldest | drop_newest -- what happens once both bounds are full
     #   # delivery: at_least_once  # at_least_once | at_most_once -- omitted derives from the sink's own
     #                              # duplicate_safe() fact (true for influxdb_out's idempotent overwrite)

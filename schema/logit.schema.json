@@ -37,7 +37,7 @@
         },
         "max_bytes": {
           "description": "Byte bound on the buffer's estimated heap footprint (`EventBatch::estimated_heap_bytes`), checked alongside `max_batches` -- whichever trips first. Human-readable in YAML (`64MiB`, `134217728`) via the [`human_bytes`] codec below, not a bare byte count.",
-          "default": 67108864,
+          "default": "67108864",
           "type": "string"
         },
         "overflow": {
@@ -624,7 +624,7 @@
           "default": {
             "delivery": null,
             "max_batches": 1024,
-            "max_bytes": 67108864,
+            "max_bytes": "67108864",
             "overflow": "block",
             "retry_budget": "60s",
             "retry_max_delay": "10s",
