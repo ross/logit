@@ -7,5 +7,6 @@
 
 pub mod influxdb;
 pub mod stdio;
+pub mod syslog;
 
 pub use logit_pipeline::Output;
