@@ -1,8 +1,7 @@
-// syslog -> Loki shim (docs/plans/0003-demo-stack.md). Loki has no syslog receiver of its own,
-// and promtail (the historical answer) is EOL -- Alloy's `loki.source.syslog` is the current,
-// supported path. Scaffolding for `syslog_out`: once that ComponentKind exists, `logit` can
-// point straight at the listener below instead of `demo/compose.yaml`'s `writer` writing here
-// directly.
+// syslog -> Loki shim (docs/plans/0003-demo-stack.md). Nothing writes here today -- pure
+// scaffolding for `syslog_out`: once that ComponentKind exists, `logit` can point straight at
+// the listener below. Loki has no syslog receiver of its own, and promtail (the historical
+// answer) is EOL, which is why this is Alloy's `loki.source.syslog` rather than nothing at all.
 loki.source.syslog "demo" {
   listener {
     address                         = "0.0.0.0:5141"

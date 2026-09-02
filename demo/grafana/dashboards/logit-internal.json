@@ -14,7 +14,7 @@
       "id": 1,
       "type": "timeseries",
       "title": "web.requests (demo traffic)",
-      "description": "Synthetic requests from the writer service, by status code -- proves syslog_in -> json -> kv_metrics -> keep -> aggregate end to end.",
+      "description": "Requests from the hello-world app -- real visits plus a background synthetic loop -- by status code, proving syslog_in -> json -> kv_metrics -> keep -> aggregate end to end.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "targets": [
@@ -118,8 +118,8 @@
     {
       "id": 8,
       "type": "logs",
-      "title": "Loki: raw demo traffic ({job=\"demo\"})",
-      "description": "The writer's lines as delivered through the syslog -> Alloy -> Loki shim (demo/alloy/config.alloy) -- scaffolding for `syslog_out`, not `logit` writing to Loki directly. See demo/README.md's \"What isn't wired yet\".",
+      "title": "Loki: raw demo traffic ({job=\"demo\"}) -- empty by design",
+      "description": "Nothing feeds Loki today -- `logit` has no `syslog_out` yet, and the demo doesn't work around that. This panel is a sample LogQL query, ready for the day something writes here (demo/alloy/config.alloy is unfed scaffolding for exactly that). See demo/README.md's \"What isn't wired yet\".",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
       "datasource": { "type": "loki", "uid": "loki" },
       "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true },

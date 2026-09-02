@@ -1,11 +1,11 @@
 # The demo pipeline (demo/README.md, docs/plans/0003-demo-stack.md). Exercises exactly what
 # `logit` implements today -- syslog in, json + kv_metrics + keep + aggregate, InfluxDB out, plus
-# `internal` observing the pipeline itself (ADR 0018) -- against the synthetic traffic `demo/
-# compose.yaml`'s `writer` service emits.
+# `internal` observing the pipeline itself (ADR 0018) -- against the traffic `demo/compose.yaml`'s
+# `hello` service emits (real visits plus a background synthetic loop).
 #
 # Topology:
 #
-#   writer --syslog/UDP--> access_in (syslog_in)
+#   hello --syslog/UDP--> access_in (syslog_in)
 #                               |
 #                               v
 #                          access_json (json)     <- merges the JSON body into attributes

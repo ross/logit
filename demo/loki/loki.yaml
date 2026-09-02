@@ -33,7 +33,8 @@ schema_config:
         period: 24h
 
 limits_config:
-  # A restarted `writer` (demo/compose.yaml) can replay lines slightly out of order; without this
+  # Nothing feeds Loki today (demo/README.md's "What isn't wired yet") -- kept for whatever
+  # eventually does: a restarted sender can replay lines slightly out of order, and without this
   # Loki rejects them as "too old" rather than accepting them.
   reject_old_samples: false
   allow_structured_metadata: true

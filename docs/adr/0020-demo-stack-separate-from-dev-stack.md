@@ -26,8 +26,10 @@ who only wants to see Grafana light up.
 actually gets, not what compiles inside this repo's own build environment. It has its own InfluxDB
 and Grafana service definitions (deliberately duplicated, not shared via YAML anchors or a second
 compose file layered on the first — see Alternatives), plus Loki, Tempo, and Alloy, none of which
-the dev stack needs. Root `compose.yaml`, `script/server`, and every `script/*` entrypoint that
-targets the dev stack are unchanged.
+the dev stack needs, and a hello-world app (`hello`) that doubles as the demo's landing page and
+its traffic source, fed by a small `logit graph`-to-SVG render chain (`graph-dot`/`graph-svg`, two
+one-shot containers) that has no dev-stack analogue at all. Root `compose.yaml`, `script/server`,
+and every `script/*` entrypoint that targets the dev stack are unchanged.
 
 `script/demo` is a thin wrapper (`${DOCKER} compose -f demo/compose.yaml "$@"`) for
 `$DOCKER`/podman/sudo parity with the rest of `script/*` (ADR 0006) — but `demo/README.md`'s
@@ -60,3 +62,7 @@ it requires nothing this repo provides beyond the compose file itself.
 - `examples/nginx/` remains real and runnable for the dev stack's sake even though it is no longer
   anyone's onboarding path — see `docs/plans/0003-demo-stack.md` workstream E for why deleting it
   isn't free.
+- Reusing the release image for a second purpose (`logit graph`, in `graph-dot`) works only
+  because the `logit` service is given an explicit `image: logit-demo:latest` tag rather than
+  Compose's derived `<project>-logit` default — a second `build:` block for the identical image
+  was the alternative, rejected as pure duplication for no benefit.

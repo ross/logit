@@ -45,10 +45,10 @@ services:
       - grafana_data:/var/lib/grafana
     networks: [demo]
 
-  # Log backend -- up and provisioned in Grafana, but nothing reaches it through `logit` yet
-  # (`syslog_out` doesn't exist). The `alloy` service below feeds it directly from the `writer`
-  # in the meantime, so the Loki half of the demo isn't just an empty datasource. See
-  # demo/README.md's "What isn't wired yet" section.
+  # Log backend -- up and provisioned in Grafana, but genuinely empty: nothing reaches it through
+  # `logit` yet (`syslog_out` doesn't exist), and unlike the old demo writer, `hello` below
+  # doesn't work around that by writing to Loki directly. See demo/README.md's "What isn't wired
+  # yet" section.
   loki:
     image: docker.io/grafana/loki:3.7.7
     command: ["-config.file=/etc/loki/loki.yaml"]
@@ -84,9 +84,10 @@ services:
       - "4318:4318" # OTLP/HTTP
     networks: [demo]
 
-  # syslog -> Loki shim (demo/alloy/config.alloy). Loki has no syslog receiver of its own, and
-  # promtail (the historical answer) is EOL -- Alloy is the current, supported path. Scaffolding
-  # for `syslog_out`: once that lands, `logit` can point straight at this listener.
+  # syslog -> Loki shim (demo/alloy/config.alloy). Nothing feeds it today -- pure scaffolding for
+  # `syslog_out`, which doesn't exist yet: once it lands, `logit` can point straight at this
+  # listener. Loki has no syslog receiver of its own, and promtail (the historical answer) is
+  # EOL, which is why this is Alloy rather than nothing at all.
   alloy:
     image: docker.io/grafana/alloy:v1.19.2
     command:
@@ -106,6 +107,10 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+    # Named explicitly so `graph-dot` below can reuse this exact image without a second `build:`
+    # -- unnamed, Compose would call it `<project>-logit`, derived from the directory name and
+    # overridable via -p/COMPOSE_PROJECT_NAME, not something worth another service guessing at.
+    image: logit-demo:latest
     command: ["run", "/config.yaml"]
     depends_on:
       # influxdb_out retries transient failures (ADR 0013), but there's no reason to spend the
@@ -120,50 +125,89 @@ services:
       demo:
         aliases: [logit]
 
-  # Synthetic access-log traffic -- the same RFC 3164 + JSON-body shape
-  # crates/logit-bench/src/fixtures.rs measures (NGINX_SYSLOG_LINE), so this exercises a workload
-  # someone actually runs, not a made-up one.
+  # -- The demo's front door, and the graph render that feeds it ------------------------------
   #
-  # UDP is fire-and-forget, so `logit` (or `alloy`) not being bound yet just loses lines silently
-  # rather than failing -- `depends_on: service_started` is the honest limit here, there's no way
-  # to know a UDP listener is actually bound short of a manual probe (docs/deploying.md's
-  # "ordering rule").
+  # `logit graph` prints DOT; turning that into an SVG needs graphviz, which the release image
+  # doesn't (and shouldn't) carry. So: two one-shot containers, chained by
+  # `service_completed_successfully`, writing through a shared `graph_data` volume. This is
+  # runtime sequencing, not build-time -- `up --build` finishes every build before starting any
+  # container, but doesn't order builds relative to each other, so a cross-image
+  # `COPY --from=<another service's image>` at build time would be a race; depends_on isn't.
   #
-  # Also writes straight to `alloy` (in addition to `logit`), purely so the Loki half of the demo
-  # has data before `syslog_out` exists -- delete that second write once `log_out` in
-  # demo/logit.yaml is real.
-  writer:
-    image: docker.io/library/debian:13-slim
+  # Note for podman-compose (script/common.sh's DOCKER=podman): `service_completed_successfully`
+  # is reportedly unimplemented there and may be ignored rather than honored, in which case
+  # `hello` can start before `graph-svg` finishes. Harmless either way -- see `hello`'s
+  # _load_graph_svg, which reads the file fresh per request rather than caching it, so a page
+  # load a few seconds later just works.
+
+  # Step 1: render the pipeline config to DOT, from the very image the demo is running.
+  graph-dot:
+    # Not a `build:` -- reuses the `logit` service's already-built `logit-demo:latest` tag.
+    image: logit-demo:latest
+    # The release image runs as the non-root `logit` user (../Dockerfile). A named volume whose
+    # mountpoint doesn't exist in the image is created root-owned, so the redirect below would
+    # fail EPERM -- silently, given the `|| true` needed for the reason in the next comment.
+    # Root just for this one-shot write.
+    user: "0:0"
+    # Overrides ENTRYPOINT ["logit"] with a shell, purely to redirect stdout to a file. `|| true`:
+    # `logit graph` resolves `!env` exactly like `validate`/`run` (needs INFLUXDB_TOKEN) and
+    # exits 1 with nothing on stdout if that fails to resolve -- but on a config that loads yet
+    # fails *semantic* validation, it prints complete, valid DOT to stdout before exiting 1, so
+    # gating this step on exit code alone would throw away perfectly good output.
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["logit graph /config.yaml > /graph/logit.dot || true"]
+    environment:
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-logit-demo-token}
+    volumes:
+      - ./logit.yaml:/config.yaml:ro
+      - graph_data:/graph
+    networks: [demo]
+
+  # Step 2: DOT -> SVG.
+  graph-svg:
+    build:
+      context: ./graph-renderer
+    image: logit-demo-graph-renderer:latest
     depends_on:
+      graph-dot:
+        condition: service_completed_successfully
+    # `test -s` first: a config that fails to *load* leaves graph-dot's redirect writing nothing
+    # at all (as opposed to the semantic-validation-failure case, which still writes real DOT).
+    # Either way this must exit 0, or `hello` (below) never starts.
+    command: ["test -s /graph/logit.dot && dot -Tsvg /graph/logit.dot -o /graph/logit.svg || true"]
+    volumes:
+      - graph_data:/graph
+    networks: [demo]
+
+  # Step 3: the page a visitor actually lands on, and the demo's traffic source -- it logs its
+  # own real requests plus a background stream of synthetic ones, the same RFC 3164 + JSON-body
+  # shape crates/logit-bench/src/fixtures.rs measures (NGINX_SYSLOG_LINE), so this exercises a
+  # workload someone actually runs, not a made-up one. Replaces the old writer service's bash
+  # loop; unlike it, this doesn't also write to `alloy` -- Loki stays empty by design, like Tempo.
+  #
+  # A stock image plus a bind-mounted script, not a Dockerfile: it's stdlib-only Python, so
+  # there's nothing to install and nothing to rebuild after an edit.
+  hello:
+    image: docker.io/library/python:3.14-slim
+    command: ["python3", "/app/app.py"]
+    depends_on:
+      graph-svg:
+        condition: service_completed_successfully
+      # UDP is fire-and-forget, so `logit` not being bound yet just loses lines silently rather
+      # than failing -- `service_started` is the honest limit, there's no way to know a UDP
+      # listener is actually bound short of a manual probe (docs/deploying.md's "ordering rule").
       logit:
         condition: service_started
-      alloy:
-        condition: service_started
+    environment:
+      # The URL a *browser on the host* uses, not a container-network name.
+      GRAFANA_URL: http://localhost:3000
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./hello/app.py:/app/app.py:z,ro
+      - graph_data:/graph:ro
     restart: unless-stopped
     networks: [demo]
-    command:
-      - bash
-      - -c
-      - |
-        set -u
-        methods=(GET GET GET GET POST PUT DELETE)
-        paths=(/ /login /api/items /api/items/42 /static/app.js /health)
-        codes=(200 200 200 200 201 204 301 404 500)
-        i=0
-        while :; do
-          i=$$((i + 1))
-          m=$${methods[$$((RANDOM % $${#methods[@]}))]}
-          p=$${paths[$$((RANDOM % $${#paths[@]}))]}
-          c=$${codes[$$((RANDOM % $${#codes[@]}))]}
-          bytes=$$((RANDOM % 20000 + 200))
-          dur=$$(printf '0.%03d' $$((RANDOM % 1000)))
-          ts=$$(date '+%b %e %H:%M:%S')
-          body="{\"request_method\":\"$$m\",\"path\":\"$$p\",\"status\":$$c,\"body_bytes_sent\":$$bytes,\"request_time\":$$dur,\"host\":\"demo.local\",\"request_id\":\"$$i\"}"
-          line="<134>$$ts demo-writer demoapp: $$body"
-          printf '%s' "$$line" > /dev/udp/logit/5140 2>/dev/null || true
-          printf '%s' "$$line" > /dev/udp/alloy/5141 2>/dev/null || true
-          sleep 0.5
-        done
 
 networks:
   demo: {}
@@ -174,3 +218,4 @@ volumes:
   loki_data: {}
   tempo_data: {}
   alloy_data: {}
+  graph_data: {}

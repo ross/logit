@@ -14,10 +14,12 @@ built so far.
 cd demo && docker compose up --build
 ```
 
-Stands up `logit` plus InfluxDB and Grafana (with a working dashboard already provisioned), and
-feeds it synthetic traffic — no Rust toolchain, no clone-and-build, nothing else in this repo
-required. Loki and Tempo come up too, provisioned and ready for the logs and traces `logit` can't
-send yet — see [demo/README.md](demo/README.md) for what's flowing and what isn't.
+Then open **http://localhost:8080** — a small hello-world app that's both the landing page and the
+demo's traffic source, with a link to Grafana (dashboard already provisioned) and this stack's own
+pipeline rendered live via `logit graph | dot`. No Rust toolchain, no clone-and-build, nothing else
+in this repo required. Loki and Tempo come up too, provisioned and empty, ready for the logs and
+traces `logit` can't send yet — see [demo/README.md](demo/README.md) for what's flowing and what
+isn't.
 
 **Status:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a Lua
 enrichment stage, InfluxDB 2.x out, via `logit run <config>`. Since then, `syslog_in` (RFC 3164/5424

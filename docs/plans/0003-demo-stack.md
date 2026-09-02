@@ -27,11 +27,12 @@ eventual `syslog_out` and `otlp_out` work somewhere to land on day one.
 |---|---|
 | Where the demo lives | A new, self-contained `demo/` directory with its own `compose.yaml`. Root `compose.yaml` (the contributor dev stack) is untouched — see [ADR 0020](../adr/0020-demo-stack-separate-from-dev-stack.md). |
 | What runs `logit` | The production image (`Dockerfile`), built by compose — no published image exists yet ([docs/deploying.md](../deploying.md)). |
-| Data source | A trivial writer container looping synthetic syslog datagrams. No nginx in the demo — `examples/nginx/` stays a dev-stack fixture. |
+| Data source | A hello-world Python app (stdlib only) that's also the demo's landing page — real visits plus a background synthetic loop. No nginx in the demo — `examples/nginx/` stays a dev-stack fixture. |
 | Log line shape | The same RFC 3164 + JSON-body shape `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE` already measures. |
-| Log backend | Loki, up and provisioned — no data through `logit` until `syslog_out` exists. |
+| Log backend | Loki, up and provisioned — genuinely empty, no scaffolding double-write, until `syslog_out` exists. |
 | Trace backend | Tempo, up and provisioned — no data until `otlp_out` and a span producer both exist. |
-| syslog → Loki shim | Grafana Alloy (`loki.source.syslog`, confirmed to accept UDP and RFC 3164). Loki has no syslog receiver of its own; promtail is EOL. |
+| syslog → Loki shim | Grafana Alloy (`loki.source.syslog`, confirmed to accept UDP and RFC 3164) stays up as unfed scaffolding for `syslog_out`. Loki has no syslog receiver of its own; promtail is EOL. |
+| Pipeline visualization | `logit graph demo/logit.yaml`, piped through real Graphviz at startup (two chained one-shot containers), served as an SVG on the landing page — not hand-drawn, always reflects the running config. |
 | This plan writes no Rust | No new `ComponentKind`, no new sink, no span emission. The log and trace legs ship as commented-out config plus a documented pointer to what has to be built. |
 
 ## Gaps this plan exists to schedule
@@ -47,32 +48,32 @@ eventual `syslog_out` and `otlp_out` work somewhere to land on day one.
 ## Reference topology
 
 ```
-writer --syslog/UDP--> access_in (syslog_in)
-                            |
-                            v
-                        access_json (json)     <- merges the JSON body into attributes
-                           / \
-                          v   v
-                 tap (stdio_out)   access_metrics (kv_metrics) <- adds metrics to the event
-                                        |
-                                        v
-                                  trimmed (keep)   <- drops high-cardinality attrs
-                                        |
-                                        v
-                                  windowed (aggregate)
-                                        |
+hello --syslog/UDP--> access_in (syslog_in)
+  ^                        |
+  | serves                 v
+  |                    access_json (json)     <- merges the JSON body into attributes
+  |                       / \
+  |                      v   v
+graph-dot -> graph-svg (stdio_out)   access_metrics (kv_metrics) <- adds metrics to the event
+(logit graph | dot)                        |
+                                            v
+                                      trimmed (keep)   <- drops high-cardinality attrs
+                                            |
+                                            v
+                                      windowed (aggregate)
+                                            |
 self (internal) --> self_windowed (aggregate) ------+
                                                       v
                                                 influx_out --> InfluxDB --> Grafana
 
-writer --syslog/UDP--> alloy (loki.source.syslog) --> Loki --> Grafana   [scaffolding, see below]
+alloy (loki.source.syslog) --> Loki --> Grafana   [unfed scaffolding, see below]
 
                                                         Tempo --> Grafana   [empty, provisioned]
 ```
 
 ## Workstream dependency graph
 
-A (stack) → B (pipeline config) → C (writer), D (Grafana provisioning) → E (reset `examples/`) → F (guard + docs)
+A (stack) → B (pipeline config) → C (hello-world app + graph render), D (Grafana provisioning) → E (reset `examples/`) → F (guard + docs)
 
 ## A. The demo stack
 
@@ -114,27 +115,55 @@ Grafana's InfluxDB datasource returns `web.*` series tagged exactly `host`/`requ
 `status` — no `syslog.*` or `request_id` attribute, which is what `keep`-before-`aggregate` exists
 to prevent.
 
-## C. The traffic writer
+## C. The hello-world app, and the graph render that feeds it
 
-**Goal:** synthetic access-log traffic, varied enough that `web.request_time`'s distribution and
-the `keep` tag set are non-degenerate, with no custom image to build or maintain.
+**Goal:** a landing page that's also the demo's traffic source, showing this stack's own pipeline
+topology rendered live rather than hand-drawn.
 
-**Files:** `demo/compose.yaml`'s `writer` service — `debian:13-slim` (bash built with
-`--enable-net-redirections`, unlike some Alpine builds) plus an inline loop writing to
-`/dev/udp/logit/5140`. No `logger`: busybox's applet can't send to a remote host at all (`-n`/`-P`
-are util-linux flags it doesn't have), and installing util-linux at container start makes every
-`docker compose up` depend on network access, which breaks the "survives restarts" bar.
+**Files:** `demo/hello/app.py` — stdlib-only Python (`http.server`, `socket`, `threading`),
+bind-mounted into a stock `python:3.14-slim` image with an inline `command:`, no Dockerfile, same
+"stock image, no custom build" approach the earlier bash writer used. Serves exactly two real
+routes: `GET /` (the page: a brief intro, a Grafana link with get-started steps, the embedded
+graph) and `GET /graph.svg` (the rendered pipeline). Both log the real request they just served —
+method, actual path, actual status, actual byte count, measured timing — through one shared
+`emit_log_line()`, the same function a background daemon thread calls every ~0.5s with fabricated
+`method`/`path`/`status`/`bytes`/`duration` values (log-body content, not real routes) so the
+dashboard has something to show immediately on `docker compose up`, matching the old writer's
+behavior. RFC 3164 + JSON body, unchanged shape, sent by raw UDP socket straight to `logit:5140` —
+**no more double-write to `alloy:5141`**: Loki goes empty by design now (see workstream D).
 
-Also writes the same line to `alloy:5141` — temporary scaffolding so the Loki side of the demo has
-data before `syslog_out` exists (see workstream D and `demo/README.md`). Delete that second write
-the day `syslog_out` lands and `log_out` in `demo/logit.yaml` is real.
-
-UDP is fire-and-forget, so a writer starting before `logit`'s listener binds just loses those
+UDP is fire-and-forget, so `hello` starting before `logit`'s listener binds just loses those first
 lines silently — `depends_on: service_started` is the honest limit; there's no way to know a UDP
 socket is actually bound short of a manual probe (`docs/deploying.md`'s "ordering rule").
 
-**Done when:** the writer survives `docker compose down && up` repeatedly with no image builds and
-no network access beyond talking to `logit`/`alloy`.
+**The graph itself** comes from two one-shot init containers, chained by
+`depends_on: condition: service_completed_successfully` (runtime sequencing, which Compose
+guarantees; a build-time cross-image `COPY --from=<sibling service's tag>` would not be, since
+`up --build` finishes every build before starting any container but doesn't order builds relative
+to each other):
+
+- `graph-dot` reuses the already-built `logit` image (given an explicit `image: logit-demo:latest`
+  tag so a second service can name it, rather than relying on Compose's derived
+  `<project>-logit`), overrides its entrypoint to a shell, and redirects `logit graph
+  /config.yaml`'s stdout to a shared `graph_data` volume. Runs as root (`user: "0:0"`) — the
+  release image's final stage runs as non-root `logit` (`../Dockerfile`), and a named volume
+  mounted at a path absent from the image is created root-owned, so the redirect would otherwise
+  fail EPERM. `logit graph` resolves `!env` exactly like `validate`/`run` (needs
+  `INFLUXDB_TOKEN`), and on a semantically-invalid-but-loadable config prints complete DOT to
+  stdout *before* exiting 1 — so the command ends `|| true` rather than gating on exit code.
+- `graph-svg` (new `demo/graph-renderer/Dockerfile`: `debian:13-slim` + `graphviz` +
+  `fonts-liberation` — the font matters, since `--no-install-recommends` alone leaves no fonts at
+  all and `dot.rs` sets `fontname="monospace"`) converts the DOT to SVG in the same volume.
+
+`hello` depends on `graph-svg` completing, but degrades gracefully regardless: it reads the SVG
+file fresh on every request rather than caching it, so a missing render just serves a small inline
+placeholder until the next request after `graph-svg` finishes. That matters on `podman-compose`
+specifically — `service_completed_successfully` is reportedly unimplemented there and may be
+ignored rather than honored.
+
+**Done when:** `docker compose ps` shows `graph-dot`/`graph-svg` as `Exited (0)`, `:8080/graph.svg`
+serves a real rendered graph (not the placeholder), and `hello` survives `docker compose down &&
+up` repeatedly with no image rebuilds.
 
 ## D. Grafana provisioning
 
@@ -158,7 +187,8 @@ promoting the `__syslog_*` labels Alloy strips by default (`host`, `app`) so Lok
 stream label, and `loki.write` to Loki's push API.
 
 **Done when:** all three datasources show healthy in Grafana, the dashboard renders real series,
-and a log line written by the writer is queryable in Loki via Grafana Explore.
+and Loki/Tempo both return clean, error-free empty results in Grafana Explore — provisioned and
+reachable is the bar, not populated (see workstream C: nothing feeds either of them by design).
 
 ## E. Reset `examples/`
 
@@ -181,8 +211,8 @@ and a log line written by the writer is queryable in Loki via Grafana Explore.
 `compose.yaml` and `script/server` too (out of scope — the dev stack stays as it is) and would
 strand `fixtures.rs`'s claim that its benchmark workload is "the repo's own reference example, not
 a synthetic shape." If `examples/nginx/` should go too, it's a clean follow-up once the demo's
-writer has proven out the same line shape: `fixtures.rs` needs only its comments rewritten to be
-self-contained, no re-measurement, no allocation-count churn.
+`hello` app has proven out the same line shape: `fixtures.rs` needs only its comments rewritten to
+be self-contained, no re-measurement, no allocation-count churn.
 
 **Done when:** nothing in the repo points at `examples/syslog-with-telemetry.yaml`, and every
 remaining doc cross-reference resolves.
@@ -213,15 +243,17 @@ with the repo can follow `README.md` alone to a working Grafana dashboard.
 ## Verification, across the whole plan
 
 - `cd demo && docker compose up --build` (or `script/demo`) — every service healthy, no manual
-  steps.
-- `docker compose logs -f logit` — a `stdio_out` block per synthetic line, JSON fields merged into
-  attributes.
+  steps; `graph-dot`/`graph-svg` show `Exited (0)`.
+- `localhost:8080/graph.svg` serves a real rendered graph; `localhost:8080/` renders the landing
+  page with a working Grafana link.
+- `docker compose logs -f logit` — a `stdio_out` block per line (synthetic and real visits alike),
+  JSON fields merged into attributes.
 - Grafana at `localhost:3000`: the shipped dashboard populates; a Flux query against bucket
   `metrics` returns `web.requests`/`web.request_time` tagged exactly `host`/`request_method`/
   `status`.
-- Loki and Tempo show healthy in Grafana's datasource check; Loki actually has lines (via the
-  Alloy shim); Tempo is empty but reachable.
-- `docker compose down && up` twice over — the writer keeps writing, no volume permission errors
-  from Loki's or Tempo's data directories.
+- Loki and Tempo show healthy in Grafana's datasource check; both return clean, error-free empty
+  results — genuinely nothing lands in either.
+- `docker compose down && up` twice over — `hello` keeps serving and logging, no volume permission
+  errors from Loki's, Tempo's, or `graph_data`'s directories.
 - `script/cibuild` passes, including `script/validate`.
 - `script/server` and `make up` still work unchanged against the dev stack.
