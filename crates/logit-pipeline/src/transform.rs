@@ -55,10 +55,11 @@ pub trait Transform: Send {
     /// Each emitted `Event` is paired with its own `Vec<SpanLink>` -- the bounded,
     /// best-effort set of `TraceContext`s that contributed to it, per `observe_batch_context`
     /// above (empty for a transform, like the default here, that never calls it). Paired rather
-    /// than a parallel same-length array so there's no index correspondence to get wrong. Nothing
-    /// consumes these yet -- `run_flush` (`crates/logit-pipeline/src/runtime.rs`) discards them
-    /// on the way out -- `docs/known-gaps.md`'s internal-spans entry (item 2) tracks the still-open
-    /// question of what turns a link set into a real `SpanRecord`.
+    /// than a parallel same-length array so there's no index correspondence to get wrong.
+    /// `run_flush` (`crates/logit-pipeline/src/runtime.rs`) unions every group's links onto the
+    /// one flush span it records for this call
+    /// (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`), bounded the same
+    /// way any other span's links are (`MAX_LINKS_PER_SPAN`).
     fn flush(&mut self, now: i64) -> FlushOutput {
         let _ = now;
         Vec::new()

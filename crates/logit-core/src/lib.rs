@@ -22,7 +22,9 @@ pub use interner::Symbol;
 pub use metric::{DdSketch, HyperLogLog, MetricKind, MetricRecord};
 pub use resource::Resource;
 pub use span::{SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus};
-pub use telemetry::{Registry, Tag, Telemetry};
+pub use telemetry::{
+    trace_is_sampled, Registry, SpanGuard, Tag, Telemetry, DEFAULT_SPAN_SAMPLE_RATE,
+};
 pub use time::format_rfc3339_utc;
 pub use value::Value;
 

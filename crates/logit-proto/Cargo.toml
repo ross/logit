@@ -6,7 +6,17 @@ license.workspace = true
 publish.workspace = true
 description = "Codec traits, the native logit-to-logit frame format, and the output Buffer trait."
 
+# The vendored OTLP proto comments (crates/logit-proto/proto/, carried into src/otlp/generated/ by
+# prost-build) include prose examples that read as indented/fenced code blocks to rustdoc -- e.g.
+# Span's attributes doc comment. `#![allow(rustdoc::all)]` on those files silences the *lint*, but
+# rustdoc still tries to *run* such a block as a doctest regardless of that lint. Turning doctests
+# off for the whole crate (no hand-written doctest exists here to lose -- house style favors prose
+# doc comments, see AGENTS.md) is the standard fix for third-party-generated code with this shape.
+[lib]
+doctest = false
+
 [dependencies]
 logit-core.workspace = true
 bytes.workspace = true
+prost.workspace = true
 thiserror.workspace = true

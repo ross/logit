@@ -182,7 +182,7 @@ impl Aggregator {
         for record in metrics {
             // No merge rule defined for these (docs/design/data-model.md) -- leave them on the
             // event rather than absorbing or dropping them. `GaugeDelta` is *not* here -- it has
-            // a real resolution below, unlike these three (docs/adr/0024-relative-gauge-adjustments.md).
+            // a real resolution below, unlike these three (docs/adr/0026-relative-gauge-adjustments.md).
             if matches!(
                 record.kind,
                 MetricKind::Set(_) | MetricKind::Histogram { .. } | MetricKind::Summary { .. }
@@ -227,7 +227,7 @@ impl Aggregator {
                     true
                 }
                 (Accumulator::Gauge { value, .. }, MetricKind::GaugeDelta(d)) => {
-                    // Asymmetric on purpose (docs/adr/0024-relative-gauge-adjustments.md,
+                    // Asymmetric on purpose (docs/adr/0026-relative-gauge-adjustments.md,
                     // verbatim there): a delta applies to the running value in *arrival* order
                     // and never advances `at` -- note the `..`. Mixing "deltas in arrival order"
                     // with "absolutes by last-write-wins" is undefined the moment they interleave
@@ -382,7 +382,7 @@ impl Accumulator {
             MetricKind::Counter(_) => Accumulator::Counter(0.0),
             // `Gauge` and `GaugeDelta` share one accumulator -- they're not a kind conflict, just
             // two different ways to update the same running value (`docs/adr/
-            // 0024-relative-gauge-adjustments.md`). This makes `new_for` non-injective on
+            // 0026-relative-gauge-adjustments.md`). This makes `new_for` non-injective on
             // purpose: two different `MetricKind`s map to the same `Accumulator` variant, which
             // would otherwise be easy to miss given the `unreachable!()` arm below makes the rest
             // of this mapping look total-and-one-to-one.
@@ -687,7 +687,7 @@ mod tests {
     }
 
     /// Guards `process`'s pass-through `matches!` directly, not just by implication
-    /// (`docs/adr/0024-relative-gauge-adjustments.md`): a `GaugeDelta` must be absorbed, not
+    /// (`docs/adr/0026-relative-gauge-adjustments.md`): a `GaugeDelta` must be absorbed, not
     /// forwarded, now that workstream B gives it a real resolution -- the opposite of what
     /// workstream A's version of this test pinned. A comment alone on the `matches!` wouldn't
     /// catch a future change that silently defeated the whole feature by adding `GaugeDelta`

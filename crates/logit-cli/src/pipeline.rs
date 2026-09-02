@@ -14,9 +14,11 @@ use anyhow::Context;
 use logit_config::{BufferConfig, Config, StdioTarget};
 use logit_core::{Diagnostics, Registry, Telemetry};
 use logit_inputs::internal::InternalInput;
+use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_outputs::influxdb::InfluxDbOutput;
+use logit_outputs::otlp::{OtlpOutput, OtlpTransport as OtlpOutTransport};
 use logit_outputs::stdio::StdioOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
@@ -81,11 +83,16 @@ type Prepared = (graph::Graph, HashMap<String, NodeSpec>, HashMap<String, Teleme
 fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<Prepared> {
     let graph = graph::resolve(config)?;
 
-    let registry: Option<Arc<Registry>> = graph
-        .components
-        .values()
-        .any(|c| matches!(c.kind, logit_config::ComponentKind::Internal { .. }))
-        .then(Registry::new);
+    // The rate comes off the config's own `internal` component (graph rule 13 already
+    // guarantees at most one), rather than always calling `Registry::new`'s default -- an operator
+    // who set `span_sample_rate` explicitly (`demo/logit.yaml`'s `1.0`, say) would otherwise have
+    // their choice silently ignored.
+    let internal_span_sample_rate = graph.components.values().find_map(|c| match &c.kind {
+        logit_config::ComponentKind::Internal { span_sample_rate, .. } => Some(*span_sample_rate),
+        _ => None,
+    });
+    let registry: Option<Arc<Registry>> =
+        internal_span_sample_rate.map(Registry::with_span_sampling);
 
     // Sorted, not raw `HashMap` iteration order: a startup failure (a missing lua_file) should be
     // reproducible across runs, not depend on hash-seed-driven iteration order -- two
@@ -186,7 +193,15 @@ fn build_spec(
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone()),
         )),
-        Internal { interval } => {
+        OtlpIn { bind, protocol } => NodeSpec::Input(Box::new(
+            OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
+        )),
+        // `span_sample_rate` is read by `prepare` (above) to build the `Registry` itself, not
+        // here -- by the time `build_spec` runs, the `Registry` this handle points at already has
+        // it baked in.
+        Internal { interval, span_sample_rate: _ } => {
             let registry = registry
                 .cloned()
                 .expect("graph::resolve's rule 13 guarantees a Registry whenever an 'internal' component does");
@@ -238,6 +253,16 @@ fn build_spec(
             queue_config(&component.buffer),
             write_config(&component.buffer),
         ),
+        OtlpOut { endpoint, protocol } => {
+            let output = OtlpOutput::new(endpoint.clone(), otlp_out_transport(*protocol))?
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer),
+                write_config(&component.buffer),
+            )
+        }
         StdioOut { target } => {
             let output = match target {
                 StdioTarget::Stdout => StdioOutput::stdout(),
@@ -328,6 +353,24 @@ fn write_config(buffer: &BufferConfig) -> WriteLoopConfig {
         },
         shutdown_grace: buffer.shutdown_grace,
         delivery_override: buffer.delivery.map(delivery_posture),
+    }
+}
+
+/// Translates config's `OtlpProtocol` into `logit-inputs`'s own copy of the same two-value
+/// choice -- `logit-inputs` doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s
+/// crate layout), the same reason `overflow_policy`/`delivery_posture` exist just below.
+fn otlp_in_transport(protocol: logit_config::OtlpProtocol) -> OtlpInTransport {
+    match protocol {
+        logit_config::OtlpProtocol::Http => OtlpInTransport::Http,
+        logit_config::OtlpProtocol::Grpc => OtlpInTransport::Grpc,
+    }
+}
+
+/// The `logit-outputs` mirror of [`otlp_in_transport`].
+fn otlp_out_transport(protocol: logit_config::OtlpProtocol) -> OtlpOutTransport {
+    match protocol {
+        logit_config::OtlpProtocol::Http => OtlpOutTransport::Http,
+        logit_config::OtlpProtocol::Grpc => OtlpOutTransport::Grpc,
     }
 }
 
@@ -493,7 +536,10 @@ mod tests {
                 Component {
                     buffer: logit_config::BufferConfig::default(),
                     sources: vec![],
-                    kind: ComponentKind::Internal { interval: Duration::from_secs(10) },
+                    kind: ComponentKind::Internal {
+                        interval: Duration::from_secs(10),
+                        span_sample_rate: logit_core::DEFAULT_SPAN_SAMPLE_RATE,
+                    },
                 },
             ),
             ("out", influxdb_out(vec!["self"])),
@@ -512,7 +558,10 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             sources: vec![],
             consumers: vec!["out".to_string()],
-            kind: ComponentKind::Internal { interval: Duration::from_secs(10) },
+            kind: ComponentKind::Internal {
+                interval: Duration::from_secs(10),
+                span_sample_rate: logit_core::DEFAULT_SPAN_SAMPLE_RATE,
+            },
         };
         let (spec, telemetry) =
             build_spec("self", &component, Path::new(""), Some(&registry)).unwrap();
@@ -553,6 +602,71 @@ mod tests {
             build_spec("out", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Output(_, _, _)
         ));
+    }
+
+    #[test]
+    fn build_spec_builds_an_otlp_input() {
+        for protocol in [logit_config::OtlpProtocol::Http, logit_config::OtlpProtocol::Grpc] {
+            let component = ResolvedComponent {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec![],
+                consumers: vec!["out".to_string()],
+                kind: ComponentKind::OtlpIn { bind: "127.0.0.1:0".to_string(), protocol },
+            };
+            assert!(
+                matches!(
+                    build_spec("in", &component, Path::new(""), None).unwrap().0,
+                    NodeSpec::Input(_)
+                ),
+                "protocol {protocol:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_spec_builds_an_otlp_sink() {
+        for protocol in [logit_config::OtlpProtocol::Http, logit_config::OtlpProtocol::Grpc] {
+            let component = ResolvedComponent {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec!["in".to_string()],
+                consumers: vec![],
+                kind: ComponentKind::OtlpOut {
+                    endpoint: "http://localhost:4318".to_string(),
+                    protocol,
+                },
+            };
+            assert!(
+                matches!(
+                    build_spec("out", &component, Path::new(""), None).unwrap().0,
+                    NodeSpec::Output(_, _, _)
+                ),
+                "protocol {protocol:?}"
+            );
+        }
+    }
+
+    /// `OtlpOutput::new`'s https-under-grpc guard (`crates/logit-outputs/src/otlp.rs`) surfaces
+    /// through `build_spec` as a clear config error, not a panic or a silently-downgraded
+    /// connection -- `NodeSpec` isn't `Debug` (see `build_spec_reports_a_clear_path_naming_error_
+    /// for_an_unopenable_stdio_target`'s comment for why this can't use `expect_err` directly).
+    #[test]
+    fn build_spec_rejects_an_otlp_sink_with_https_under_grpc() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::OtlpOut {
+                endpoint: "https://tempo:4317".to_string(),
+                protocol: logit_config::OtlpProtocol::Grpc,
+            },
+        };
+        let err = match build_spec("out", &component, Path::new(""), None) {
+            Ok(_) => {
+                panic!("expected build_spec to reject an https:// endpoint under protocol: grpc")
+            }
+            Err(err) => err,
+        };
+        assert!(format!("{err:?}").contains("https"), "got: {err:?}");
     }
 
     /// The wiring this workstream adds: a non-default `buffer:` on the component actually reaches

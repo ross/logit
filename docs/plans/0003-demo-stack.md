@@ -1,5 +1,13 @@
 # Enabling plan: a user-facing demo stack
 
+> **Both gaps this plan scheduled are closed.** `feat/syslog-out` (#47) built a real `syslog_out`
+> and wired `demo/logit.yaml`'s `log_out` at `alloy` -> Loki over RFC 5424, closing the log leg.
+> [docs/plans/0005-otlp-end-to-end.md](0005-otlp-end-to-end.md) built real span emission, the OTLP
+> codec, and both `otlp_in`/`otlp_out`, then wired `trace_out` at Tempo over OTLP/gRPC, closing the
+> trace leg. Loki and Tempo now both hold real data, not the empty-but-provisioned placeholders this
+> plan describes below. This plan's narrative and every other decision it records are otherwise
+> unchanged and still describe how the demo stack is built.
+
 `logit`'s examples are developer scratch material — `examples/statsd-to-influxdb.yaml`,
 `examples/nginx-to-influxdb.yaml`, each landed alongside the feature it exercises, all of them
 pointed at the *dev* stack (`compose.yaml`, `script/server`), whose entrypoint execs `cargo run`
@@ -10,7 +18,8 @@ through `logit` and land in Grafana. No Rust toolchain, no `script/*`, no knowle
 It is also the forcing function for what's missing, the same way
 [0002-nginx-integration.md](0002-nginx-integration.md) used a real nginx to schedule `syslog_in`,
 `stdio_out`, and `kv_metrics`: standing Loki and Tempo up now, provisioned and empty, gives the
-eventual `syslog_out` and `otlp_out` work somewhere to land on day one.
+eventual `syslog_out` and `otlp_out` work somewhere to land on day one. Both have since landed and
+now write real data to their backends — see the notice at the top of this file.
 
 ## The target, generically
 
@@ -30,7 +39,7 @@ eventual `syslog_out` and `otlp_out` work somewhere to land on day one.
 | Data source | A hello-world Python app (stdlib only) that's also the demo's landing page — real visits plus a background synthetic loop. No nginx in the demo — `examples/nginx/` stays a dev-stack fixture. |
 | Log line shape | The same RFC 3164 + JSON-body shape `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE` already measures. |
 | Log backend | Loki, up and provisioned. **Now live** — `syslog_out` (`docs/adr/0022-syslog-output.md`) relays `access_json`'s events through `alloy` into Loki. |
-| Trace backend | Tempo, up and provisioned — no data until `otlp_out` and a span producer both exist. |
+| Trace backend | Tempo, up and provisioned. **Now live** — spans are real ([ADR 0025](../adr/0025-internal-span-emission-and-deterministic-sampling.md)) and `otlp_out` ([docs/plans/0005-otlp-end-to-end.md](0005-otlp-end-to-end.md)) exports them over OTLP/gRPC via `demo/logit.yaml`'s `trace_out`. |
 | syslog → Loki shim | Grafana Alloy (`loki.source.syslog`, confirmed to accept UDP and both RFC 3164/5424). **Now fed** by `log_out`. Loki has no syslog receiver of its own; promtail is EOL. |
 | Pipeline visualization | `logit graph demo/logit.yaml`, piped through real Graphviz at startup (two chained one-shot containers), served as an SVG on the landing page — not hand-drawn, always reflects the running config. |
 | This plan writes no Rust | No new `ComponentKind`, no new sink, no span emission. The log and trace legs ship as commented-out config plus a documented pointer to what has to be built. |
@@ -39,9 +48,9 @@ eventual `syslog_out` and `otlp_out` work somewhere to land on day one.
 
 | Gap | Consequence |
 |---|---|
-| ~~No `syslog_out`~~ | **Closed** — implemented, UDP and TCP, RFC 3164/5424 (`docs/adr/0022-syslog-output.md`), and wired live into `demo/logit.yaml`'s `log_out`. |
-| `otlp_out` rejected at validation | Declared in `logit-config`, but `graph::is_implemented` rejects it. No OTLP code, no wire protocol chosen (ADR 0004 leaves gRPC-vs-HTTP open). |
-| No span producer | `bench/internal-spans-costing` (PR #39, draft) added a `TraceContext` prototype to `Fanout`'s `Delivered`, measured its cost, and reverted it in full — only the size-guard test and `docs/design/memory.md`'s "Costing internal spans" section remain. Nothing emits a span anywhere. |
+| ~~No `syslog_out`~~ | **Closed** — implemented, UDP and TCP, RFC 3164/5424 ([ADR 0022](../adr/0022-syslog-output.md)), and wired live into `demo/logit.yaml`'s `log_out`. |
+| ~~`otlp_out` rejected at validation~~ | **Closed** — was: declared in `logit-config`, but `graph::is_implemented` rejected it, no OTLP code, no wire protocol chosen (ADR 0004 left gRPC-vs-HTTP open). [docs/plans/0005-otlp-end-to-end.md](0005-otlp-end-to-end.md) shipped both transports, both directions ([ADR 0023](../adr/0023-committed-pregenerated-otlp-protobuf.md), [ADR 0024](../adr/0024-hand-rolled-grpc-over-hyper.md)), and it's wired live into `demo/logit.yaml`'s `trace_out`. |
+| ~~No span producer~~ | **Closed** — real internal span emission, sampled deterministically on `trace_id` ([ADR 0025](../adr/0025-internal-span-emission-and-deterministic-sampling.md)). `stdio_out` already rendered spans; `otlp_out` (above) is what exports one over the wire. |
 | `examples/` doubles as both dev fixtures and the onboarding story | Someone trying `logit` for the first time hits `script/server`'s dev-container dependency before seeing anything work. |
 | No config-drift guard | A component field rename can silently break every shipped example; nothing runs `logit validate` over them. |
 
@@ -190,7 +199,7 @@ Loki's push API. **Now live** -- `syslog_out` (`docs/adr/0022-syslog-output.md`)
 **Done when:** all three datasources show healthy in Grafana, the dashboard renders real series,
 Loki returns real data (`log_out` is live), and Tempo returns clean, error-free empty results in
 Grafana Explore — provisioned and reachable is the bar there, not populated (see workstream C:
-nothing feeds it yet, pending `otlp_out` and a span producer).
+spans are real now, but nothing exports them over the wire yet, pending `otlp_out`).
 
 ## E. Reset `examples/`
 
@@ -234,7 +243,10 @@ not silently in someone's demo.
   contributor convenience, not the primary path.
 - `demo/README.md` — quick start, the URL table, the first-build-is-slow warning (a full release
   build, no dependency-layer caching by design — `Dockerfile`'s own comment), and an explicit
-  "what isn't wired yet" section naming `syslog_out` and `otlp_out`.
+  "what isn't wired yet" section naming `syslog_out` and `otlp_out`. (Both have since landed --
+  `syslog_out` via `feat/syslog-out` (#47), `otlp_out` via
+  [docs/plans/0005-otlp-end-to-end.md](0005-otlp-end-to-end.md) -- so that section no longer names
+  either; see `demo/README.md`'s "What isn't exercised yet" for what's left instead.)
 - This plan, committed as `docs/plans/0003-demo-stack.md`.
 
 **Done when:** `script/cibuild` fails if a shipped config stops validating, and someone unfamiliar
@@ -253,10 +265,12 @@ with the repo can follow `README.md` alone to a working Grafana dashboard.
 - Grafana at `localhost:3000`: the shipped dashboard populates; a Flux query against bucket
   `metrics` returns `web.requests`/`web.request_time` tagged exactly `host`/`request_method`/
   `status`.
-- Loki and Tempo both show healthy in Grafana's datasource check. Loki returns real data — `{job=
-  "demo"}` in Explore shows lines labeled `host="demo-hello"`/`app="demoapp"`, and `{job="demo"} |
-  json | status >= 500` returns the synthetic 5xx lines. Tempo still returns a clean, error-free
-  empty result — genuinely nothing lands there yet (see workstream C).
+- Loki and Tempo both show healthy in Grafana's datasource check. At the time this plan's own
+  workstreams were built, both returned clean, error-free empty results — genuinely nothing landed
+  in either (see workstream C). Since, both gaps closed: Loki returns real data — `{job="demo"}` in
+  Explore shows lines labeled `host="demo-hello"`/`app="demoapp"`, and `{job="demo"} | json | status
+  >= 500` returns the synthetic 5xx lines — and Tempo holds real, correctly-nested traces (see
+  [docs/plans/0005-otlp-end-to-end.md](0005-otlp-end-to-end.md)'s own verification section).
 - `docker compose down && up` twice over — `hello` keeps serving and logging, no volume permission
   errors from Loki's, Tempo's, or `graph_data`'s directories.
 - `script/cibuild` passes, including `script/validate`.
