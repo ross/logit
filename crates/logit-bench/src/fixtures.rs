@@ -51,12 +51,14 @@ pub const STATSD_LINE: &str = "page.views:1|c|@0.5|#env:prod,region:us-east-1,se
 /// A statsd distribution (`ms`) line at the default, unsampled rate -- the baseline
 /// [`STATSD_SAMPLED_DISTRIBUTION_LINE`]'s allocation count is measured against: decode-time
 /// sample-rate extrapolation (`DdSketch::add_weighted`, `crates/logit-inputs/src/statsd.rs`) must
-/// add zero allocations over this unsampled case, which is the entire justification for
-/// implementing `add_weighted` as a repeated `add` rather than a `merge` of a cloned sketch.
+/// add zero allocations over this unsampled case, which `add_weighted`'s delegation to
+/// `sketches_ddsketch::DDSketch::add_with_count` (constant-time, one bin touch regardless of
+/// weight) satisfies for free.
 pub const STATSD_DISTRIBUTION_LINE: &str = "request.latency:120|ms";
 
 /// The same line as [`STATSD_DISTRIBUTION_LINE`], sampled at `@0.1` -- ten weighted samples
-/// instead of one, exercising `DdSketch::add_weighted`'s repeated-`add` loop on the decode path.
+/// instead of one, exercising `DdSketch::add_weighted`'s `add_with_count` delegation on the decode
+/// path.
 pub const STATSD_SAMPLED_DISTRIBUTION_LINE: &str = "request.latency:120|ms|@0.1";
 
 /// `count` copies of [`NGINX_SYSLOG_LINE`] newline-separated, as one UDP datagram would arrive.

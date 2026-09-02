@@ -56,21 +56,18 @@ impl DdSketch {
 
     /// Adds `value` as `count` weighted samples -- e.g. what a sampled statsd timing/histogram
     /// line needs to extrapolate `100|ms|@0.1` into ten samples rather than one
-    /// (`crates/logit-inputs/src/statsd.rs`). Implemented as a loop calling `add` `count` times,
-    /// deliberately, not by building a single-bucket sketch and `merge`-ing it in via binary
-    /// doubling: `sketches_ddsketch::DDSketch` has no native weighted add, and the merge-based
-    /// alternative allocates a fresh sketch on every merge step (O(log count) allocations),
-    /// which would show up on `statsd_decode_one_line`'s exact-equality allocation assertion in
-    /// `crates/logit-bench/tests/allocations.rs` -- `AGENTS.md` forbids relaxing that kind of
-    /// assertion to a `<=` bound. Repeated `add` allocates the bin `Vec` once, the first time any
-    /// sample ever lands in this sketch, and every call after that only touches an existing bin,
-    /// because the bin index `add` computes is a pure function of `value` alone -- so this loop
-    /// costs zero additional allocations over a single `add`, no matter how large `count` is.
-    /// `count == 0` is a no-op.
+    /// (`crates/logit-inputs/src/statsd.rs`). Delegates directly to
+    /// `sketches_ddsketch::DDSketch::add_with_count`, which computes the target bin once and
+    /// increments its stored count by `count` in constant time -- not a loop calling `add`
+    /// `count` times, and not a single-bucket sketch `merge`-d in via binary doubling either:
+    /// both would cost real, avoidable work (an O(count) loop, or O(log count) allocations for
+    /// the merge alternative) that `add_with_count` doesn't pay. Same zero-additional-allocation
+    /// property either way -- the bin `Vec` is allocated once, the first time any sample ever
+    /// lands in this sketch -- but O(1) instead of O(count) in CPU cost, which matters because
+    /// `count` can be attacker-influenced (a sampled statsd line's extrapolated weight). `count
+    /// == 0` is a no-op (`add_with_count`'s own contract).
     pub fn add_weighted(&mut self, value: f64, count: u64) {
-        for _ in 0..count {
-            self.0.add(value);
-        }
+        self.0.add_with_count(value, count);
     }
 
     /// Merges `other` into `self`. Every `DdSketch` in this codebase is built with

@@ -317,11 +317,12 @@ Worked examples, one per shipped component:
 
 - `statsd_in` (`crates/logit-inputs/src/statsd.rs`): `logit.input.datagrams`,
   `logit.input.datagram.bytes` — per-datagram detail `Fanout`'s per-batch view can't see, plus
-  decode failures free via the `Diagnostics` bridge. Also `logit.input.samples.clamped` (count) —
-  a sampled `ms`/`h`/`d` line whose `@<rate>` implied a weight above `MAX_SAMPLE_WEIGHT` (the
-  decode-time sample-rate extrapolation's denial-of-service guard), clamped rather than looping
-  unbounded; fires alongside `logit.component.diagnostics{key="sample_rate_clamped"}` via the same
-  `Diagnostics` bridge.
+  decode failures free via the `Diagnostics` bridge. A sampled `ms`/`h`/`d` line whose `@<rate>`
+  implied a weight above `MAX_SAMPLE_WEIGHT` (the decode-time sample-rate extrapolation's bound on
+  how far one value can inflate a `Distribution`'s `count()`) clamps rather than extrapolating
+  unboundedly, reported via that same `Diagnostics` bridge as
+  `logit.component.diagnostics{key="sample_rate_clamped"}` — no separate counter needed, since the
+  bridge already mirrors every occurrence.
 - `syslog_in` (`crates/logit-inputs/src/syslog.rs`): the same pair, `logit.input.datagrams`/
   `.datagram.bytes` — direct parity with `statsd_in`, the other UDP listener.
 - `aggregate` (`crates/logit-transforms/src/aggregate.rs`): `logit.transform.series.active` and

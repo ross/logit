@@ -114,11 +114,11 @@ fn statsd_decode_one_line() {
     expect_allocs("statsd_in: decode 1 line", stats, 2);
 }
 
-/// The entire justification for `DdSketch::add_weighted`'s repeated-`add` implementation
-/// (`crates/logit-core/src/metric.rs`) instead of a `merge`-based binary-doubling alternative:
-/// sample-rate extrapolation on the decode path must add zero allocations over the unsampled
-/// case. This pins the unsampled baseline; [`statsd_decode_one_sampled_distribution_line`] pins
-/// the sampled case at the same count.
+/// Pins the unsampled baseline that sample-rate extrapolation on the decode path
+/// (`DdSketch::add_weighted`, `crates/logit-core/src/metric.rs`) must add zero allocations over --
+/// which its delegation to `sketches_ddsketch::DDSketch::add_with_count` satisfies regardless of
+/// weight. [`statsd_decode_one_sampled_distribution_line`] pins the sampled case at the same
+/// count.
 #[test]
 fn statsd_decode_one_distribution_line() {
     let mut decoder = fixtures::statsd_decoder();
@@ -133,8 +133,8 @@ fn statsd_decode_one_distribution_line() {
 /// Same line as [`statsd_decode_one_distribution_line`], sampled at `@0.1` -- ten weighted
 /// `DdSketch::add_weighted` samples instead of one unweighted `add`. Must match that test's
 /// allocation count exactly: the bin `Vec` a `DdSketch` allocates on its first sample is the same
-/// single allocation whether that first sample is inserted once or ten times, because the bin
-/// index `add` computes is a pure function of the value, not of how many times it's called.
+/// single allocation whether that first sample carries a weight of one or ten, because
+/// `add_with_count` computes the bin index once and increments its stored count directly.
 #[test]
 fn statsd_decode_one_sampled_distribution_line() {
     let mut decoder = fixtures::statsd_decoder();

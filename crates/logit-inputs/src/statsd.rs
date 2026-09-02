@@ -8,7 +8,8 @@
 //! ```
 //!
 //! `<type>` is one of `c` (counter), `g` (gauge), `ms`/`h`/`d` (timing/histogram/distribution --
-//! all decoded as a single-sample [`logit_core::DdSketch`]), or `s` (set, not yet implemented --
+//! decoded into a [`logit_core::DdSketch`], extrapolated to `(1.0 / sample_rate).round()` weighted
+//! samples when `@<sample-rate>` is present), or `s` (set, not yet implemented --
 //! see the note on [`HyperLogLog`](logit_core::HyperLogLog)). Multiple `:`-separated values share
 //! one type/sample-rate/tags and become one [`Event`] each. A datagram may contain multiple
 //! newline-separated lines.
@@ -64,9 +65,8 @@ impl StatsdInput {
 impl Input for StatsdInput {
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         let socket = UdpSocket::bind(&self.bind).await?;
-        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()))
-            .with_diagnostics(self.diag.clone())
-            .with_telemetry(self.telemetry.clone());
+        let mut decoder =
+            StatsdDecoder::new(Arc::new(Resource::default())).with_diagnostics(self.diag.clone());
         // The largest possible UDP payload (65535 minus the 8-byte UDP header).
         let mut buf = vec![0u8; 65_507];
         loop {
@@ -96,25 +96,15 @@ impl Input for StatsdInput {
 pub struct StatsdDecoder {
     resource: Arc<Resource>,
     diag: Diagnostics,
-    /// Threaded down into `build_event` so a clamped sample-rate extrapolation
-    /// (`MAX_SAMPLE_WEIGHT`) has somewhere real to report -- see `with_telemetry`.
-    telemetry: Telemetry,
 }
 
 impl StatsdDecoder {
     pub fn new(resource: Arc<Resource>) -> Self {
-        Self { resource, diag: Diagnostics::default(), telemetry: Telemetry::default() }
+        Self { resource, diag: Diagnostics::default() }
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
-        self
-    }
-
-    /// Attaches a telemetry handle -- see the `telemetry` field's doc comment. Mirrors
-    /// `with_diagnostics`/`StatsdInput::with_telemetry`.
-    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.telemetry = telemetry;
         self
     }
 }
@@ -134,7 +124,7 @@ impl Decoder for StatsdDecoder {
             // datagram -- StatsD clients routinely pack several independent metrics into one
             // packet, so treating the datagram as atomic would let a single bad line take down
             // everything alongside it. Isolate per line: keep what parsed, report what didn't.
-            match parse_line(&bytes, text, line, timestamp, &mut self.diag, &self.telemetry) {
+            match parse_line(&bytes, text, line, timestamp, &mut self.diag) {
                 Ok(mut line_events) => events.append(&mut line_events),
                 Err(err) => {
                     self.diag.warn_throttled("bad_line", err);
@@ -175,7 +165,6 @@ fn parse_line(
     line: &str,
     timestamp: i64,
     diag: &mut Diagnostics,
-    telemetry: &Telemetry,
 ) -> Result<Vec<Event>, CodecError> {
     let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
 
@@ -222,26 +211,21 @@ fn parse_line(
     values_part
         .split(':')
         .map(|raw_value| {
-            build_event(
-                name,
-                raw_value,
-                type_part,
-                sample_rate,
-                &attributes,
-                timestamp,
-                line,
-                diag,
-                telemetry,
-            )
+            build_event(name, raw_value, type_part, sample_rate, &attributes, timestamp, line, diag)
         })
         .collect()
 }
 
-/// Caps the number of weighted samples one sampled statsd line can insert into a `DdSketch`.
-/// This is a denial-of-service guard, **not** a performance knob: without it, a single crafted
-/// `@0.0000001` sample rate on one UDP datagram turns into a ten-million-iteration loop per line.
-/// A fixed constant, not configurable, matching `crates/logit-transforms/src/aggregate.rs`'s
-/// stated stance on `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`.
+/// Caps the number of weighted samples one sampled statsd value can insert into a `DdSketch`.
+/// `DdSketch::add_weighted` delegates to `sketches_ddsketch::DDSketch::add_with_count`, which is
+/// O(1) regardless of `count`, so this is not a CPU-loop DoS guard -- it bounds how far a single
+/// crafted `@`-rate can inflate a `Distribution`'s `count()` (a population estimate,
+/// `docs/design/data-model.md`) away from reality: without it, a single `@0.0000001` sample rate
+/// would claim ten million observations from one UDP value. A fixed constant, not configurable,
+/// matching `crates/logit-transforms/src/aggregate.rs`'s stated stance on
+/// `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`. Applied per value, not per line or per datagram -- a
+/// multi-value line (`name:v1:v2:...:vN|ms|@rate`) clamps each value independently, which is fine
+/// now that `add_weighted` is O(1) per call regardless of the weight involved.
 const MAX_SAMPLE_WEIGHT: u64 = 1000;
 
 #[allow(clippy::too_many_arguments)]
@@ -254,7 +238,6 @@ fn build_event(
     timestamp: i64,
     line: &str,
     diag: &mut Diagnostics,
-    telemetry: &Telemetry,
 ) -> Result<Event, CodecError> {
     let malformed = |what: &str| CodecError::Malformed(format!("{what}: {line:?}"));
 
@@ -294,8 +277,12 @@ fn build_event(
             // instead. `parse_line` already guarantees `sample_rate` is finite and in `(0, 1]`
             // before this is ever reached, so `1.0 / sample_rate` can't be NaN/inf/negative here.
             let weight = (1.0 / sample_rate).round().max(1.0) as u64;
-            let weight = if weight > MAX_SAMPLE_WEIGHT {
-                // See `MAX_SAMPLE_WEIGHT`'s doc comment: this is a DoS guard, not a tuning knob.
+            if weight > MAX_SAMPLE_WEIGHT {
+                // See `MAX_SAMPLE_WEIGHT`'s doc comment: this bounds the extrapolated population
+                // estimate, not a tuning knob. `warn_throttled` mirrors every occurrence (not
+                // just the throttled-to-stderr subset) into `logit.component.diagnostics
+                // {key="sample_rate_clamped"}` via `diag`'s own telemetry handle, so there's
+                // nowhere else this needs to report to.
                 diag.warn_throttled(
                     "sample_rate_clamped",
                     format_args!(
@@ -303,11 +290,8 @@ fn build_event(
                          clamped to {MAX_SAMPLE_WEIGHT}"
                     ),
                 );
-                telemetry.count("logit.input.samples.clamped", 1.0, &[]);
-                MAX_SAMPLE_WEIGHT
-            } else {
-                weight
-            };
+            }
+            let weight = weight.min(MAX_SAMPLE_WEIGHT);
             let mut sketch = DdSketch::new();
             sketch.add_weighted(value, weight);
             MetricKind::Distribution(sketch)
@@ -376,8 +360,7 @@ mod tests {
         let bytes = Bytes::from(line.to_string());
         let text = std::str::from_utf8(&bytes).unwrap();
         let mut diag = Diagnostics::default();
-        parse_line(&bytes, text, text, 0, &mut diag, &Telemetry::default())
-            .expect_err("expected this line to be rejected")
+        parse_line(&bytes, text, text, 0, &mut diag).expect_err("expected this line to be rejected")
     }
 
     #[test]
@@ -523,19 +506,19 @@ mod tests {
         }
     }
 
-    /// A sample rate implying a weight above `MAX_SAMPLE_WEIGHT` (the DoS guard, not a tuning
-    /// knob -- see its doc comment) clamps rather than looping unbounded, and reports the clamp
-    /// on both the throttled diagnostic and a dedicated counter, following the precedent set by
-    /// `logit_core::diag`'s `every_warn_throttled_occurrence_increments_the_metric_...` test for
-    /// asserting a diagnostic fired via its telemetry mirror rather than capturing stderr.
+    /// A sample rate implying a weight above `MAX_SAMPLE_WEIGHT` (bounds the extrapolated
+    /// population estimate, not a tuning knob -- see its doc comment) clamps rather than
+    /// inflating `count()` unboundedly, and reports the clamp via `Diagnostics::warn_throttled`'s
+    /// own telemetry mirror (`logit.component.diagnostics{key="sample_rate_clamped"}`) -- the
+    /// same mechanism `logit_core::diag`'s
+    /// `every_warn_throttled_occurrence_increments_the_metric_...` test pins, asserted here via
+    /// its telemetry mirror rather than capturing stderr.
     #[test]
     fn extreme_sample_rate_clamps_the_weight_and_reports_it() {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
-        let diag = Diagnostics::new("statsd_in").with_telemetry(telemetry.clone());
-        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()))
-            .with_diagnostics(diag)
-            .with_telemetry(telemetry);
+        let diag = Diagnostics::new("statsd_in").with_telemetry(telemetry);
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default())).with_diagnostics(diag);
 
         let events = decoder
             .decode(Bytes::from("x:100|ms|@0.0000001".to_string()))
@@ -553,21 +536,17 @@ mod tests {
             other => panic!("expected Distribution, got {other:?}"),
         }
 
-        let find_counter = |name: &str| -> Option<f64> {
-            registry.drain(0).into_iter().find_map(|e| {
-                e.metrics.iter().find_map(|m| match &m.kind {
-                    MetricKind::Counter(v) if logit_core::interner::resolve(m.name) == name => {
-                        Some(*v)
-                    }
-                    _ => None,
-                })
+        let diagnostics_event = registry
+            .drain(0)
+            .into_iter()
+            .find(|e| {
+                e.attributes.get("key").and_then(|v| v.as_str()) == Some("sample_rate_clamped")
             })
-        };
-        assert_eq!(
-            find_counter("logit.input.samples.clamped"),
-            Some(1.0),
-            "clamping should fire logit.input.samples.clamped exactly once"
-        );
+            .expect("sample_rate_clamped diagnostic should have fired");
+        match &diagnostics_event.metrics[0].kind {
+            MetricKind::Counter(v) => assert_eq!(*v, 1.0, "clamping should report exactly once"),
+            other => panic!("expected Counter, got {other:?}"),
+        }
     }
 
     #[test]
