@@ -788,6 +788,41 @@ async fn write_loop(
     Ok(())
 }
 
+/// Telemetry accounting plus one `Output::send` call -- factored out (rather than left inline) for
+/// the same reason [`process_batch`] below is: so it can be measured directly in
+/// `crates/logit-bench/tests/allocations.rs`/`benches/pipeline.rs`, with no channel or the rest of
+/// the node runtime involved. Unlike `process_batch` this stays `async`, because `Output::send`
+/// itself is; call it from a `current_thread` runtime with no `tokio::spawn` to keep it measurable
+/// the same way `fanout.rs`'s own tests already are.
+///
+/// No caller in this crate any more -- `run_output`'s real delivery path now goes through
+/// `deliver_with_retry`/`write_loop` (`docs/adr/0021-buffered-sink-delivery.md`), which calls
+/// `output.send` directly so it can classify the resulting `Fault` and drive retry/posture
+/// decisions from it; `send_batch`'s all-or-nothing `anyhow::Result` return doesn't fit that. Kept
+/// as its own `pub` function purely so the bench/allocations harness can still measure this exact
+/// "one send, with telemetry" hop in isolation.
+pub async fn send_batch(
+    id: &str,
+    output: &mut (dyn Output + Send),
+    delivered: &Delivered,
+    telemetry: &Telemetry,
+) -> anyhow::Result<()> {
+    let batch: &EventBatch = match delivered {
+        Delivered::Owned(batch) => batch,
+        Delivered::Shared(shared) => shared,
+    };
+    telemetry.count("logit.component.batches.received", 1.0, &[]);
+    telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
+
+    let timer = telemetry.timer("logit.component.send.duration");
+    let result = output.send(batch).await;
+    drop(timer);
+    if result.is_err() {
+        telemetry.count("logit.component.errors", 1.0, &[]);
+    }
+    result.with_context(|| format!("component '{id}'"))
+}
+
 /// A `Transform`-trait node's loop: races its inbox against its own flush deadline (if it has
 /// one), exactly the shape `run_lua` below uses for a Lua node with `interval` set -- but as a
 /// plain tokio task, this one can use `tokio::time::timeout` directly with no `Handle::block_on`
@@ -831,29 +866,47 @@ async fn run_transform(
             return Ok(());
         };
         let batch = unwrap_batch(batch);
-        telemetry.count("logit.component.batches.received", 1.0, &[]);
-        telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
+        if let Some(out) = process_batch(&mut *transform, batch, &telemetry) {
+            fanout.send(out).await;
+        }
+    }
+}
 
-        let process_timer = telemetry.timer("logit.component.process.duration");
-        let mut out = Vec::with_capacity(batch.events.len());
-        let mut absorbed: u64 = 0;
-        for event in batch.events {
-            match transform.process(&batch.resource, event) {
-                Some(event) => out.push(event),
-                None => absorbed += 1,
-            }
+/// The per-batch body of `run_transform`'s loop above: telemetry accounting plus feeding every
+/// event through `Transform::process`, collecting what survives. Factored out (rather than left
+/// inline) so `crates/logit-bench/tests/allocations.rs` can measure the real code path directly,
+/// instead of a hand-written replica -- the same "call it directly" approach
+/// `docs/design/memory.md` §7 already uses for every other stage, applied to the node runtime for
+/// the first time. `run_transform` is the only caller in this crate; `pub` is for the bench.
+pub fn process_batch(
+    transform: &mut (dyn Transform + Send),
+    batch: EventBatch,
+    telemetry: &Telemetry,
+) -> Option<EventBatch> {
+    telemetry.count("logit.component.batches.received", 1.0, &[]);
+    telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
+
+    let process_timer = telemetry.timer("logit.component.process.duration");
+    let mut out = Vec::with_capacity(batch.events.len());
+    let mut absorbed: u64 = 0;
+    for event in batch.events {
+        match transform.process(&batch.resource, event) {
+            Some(event) => out.push(event),
+            None => absorbed += 1,
         }
-        drop(process_timer);
-        if absorbed > 0 {
-            telemetry.count(
-                "logit.component.events.dropped",
-                absorbed as f64,
-                &[("reason", "absorbed")],
-            );
-        }
-        if !out.is_empty() {
-            fanout.send(EventBatch { resource: batch.resource, events: out }).await;
-        }
+    }
+    drop(process_timer);
+    if absorbed > 0 {
+        telemetry.count(
+            "logit.component.events.dropped",
+            absorbed as f64,
+            &[("reason", "absorbed")],
+        );
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(EventBatch { resource: batch.resource, events: out })
     }
 }
 
@@ -1053,7 +1106,10 @@ fn run_lua(
 /// likelihood* of each outcome in the real running pipeline changed). Either outcome keeps
 /// isolation intact: a sibling branch's copy is always independent before it can be mutated
 /// (`a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` below pins this).
-fn unwrap_batch(batch: Delivered) -> EventBatch {
+///
+/// `pub` (rather than crate-private) for `crates/logit-bench/tests/allocations.rs`, which needs
+/// to measure this allocation-relevant path directly rather than reconstruct it.
+pub fn unwrap_batch(batch: Delivered) -> EventBatch {
     match batch {
         Delivered::Owned(batch) => batch,
         Delivered::Shared(shared) => {

@@ -274,6 +274,149 @@ the single most allocation-hungry ingest-side stage at 3, and `Event::clone`'s 4
 branch is comparable to or larger than any individual ingest stage. The recommendations in §8 are
 ordered accordingly.
 
+### Runtime: the node loops, not just the components they call
+
+Every row above measures a decoder, transform, or encoder called directly. Nothing above measured
+what `crates/logit-pipeline/src/runtime.rs`'s node loops (`run_transform`/`run_output`) add on top
+— a gap `internal` telemetry's own PR (`docs/design/internal-telemetry.md`) opened without closing,
+since it instrumented both loops and added no coverage of what that instrumentation costs. Closed
+here: `run_transform`'s per-batch body is exported as `process_batch` (a plain synchronous
+function — no channel, no runtime), and `run_output`'s as `send_batch` (async, since `Output::send`
+is, but still callable directly), specifically so both — and `unwrap_batch` — can be measured
+directly in `crates/logit-bench/tests/allocations.rs`'s "Runtime" section, the same as everything
+above.
+
+**`send_batch` coverage, and the corrected "telemetry is free" claim, both landed in review of the
+first draft** — recorded here as findings, not silently folded in, since both change what the first
+draft actually established:
+
+| Path | allocs | Notes |
+|---|---:|---|
+| `process_batch` through `keep`, telemetry disabled | **1** | `Vec::with_capacity(batch.events.len())` for `out` — this is the whole cost |
+| `process_batch`, fully absorbed (`aggregate`) | **1** | the same `Vec`, built before any event is processed, thrown away unused when nothing survives |
+| `process_batch` through `keep`, telemetry live, **steady state** | **1** | identical to disabled — `count`/`timer` update an existing `ComponentBuffer` entry in place, no allocation of their own |
+| `process_batch`, **first call after an `internal` drain** | **3** | the `out` `Vec` (1) + a `HashMap` table rebuild (1) + a fresh `DdSketch` (1) — see below |
+| `unwrap_batch` (`Delivered::Owned`) | **0** | no `Arc` was ever involved |
+| `unwrap_batch` (`Delivered::Shared`, sole reference) | **0** | `Arc::try_unwrap` succeeds |
+| `unwrap_batch` (`Delivered::Shared`, contended) | **5** | falls back to `EventBatch::clone` — 1 for the `Vec<Event>` + `Event::clone`'s 4 (nginx shape) |
+| `send_batch` through a no-op `Output`, telemetry disabled | **1** | `#[async_trait]` boxing its future (below) — nothing to do with telemetry |
+| `send_batch`, telemetry live, **steady state** | **1** | same 1 as disabled — telemetry adds nothing on top of the box |
+| `send_batch`, **first call after an `internal` drain** | **3** | the box (1) + the same `HashMap`/`DdSketch` rebuild as `process_batch`'s (2) |
+| `send_batch` through a **failing** `Output`, telemetry disabled | **4** | the box (1) + `anyhow!(..)` constructing the error (1) + `.with_context(..)` (2: the `format!` message, and wrapping into a new boxed `anyhow::Error` node) — see below |
+| `send_batch`, failing, telemetry live, **first failure** (success keys already warm) | **5** | the failure baseline (4) + 1 — `logit.component.errors` is a brand-new 4th map key, which can grow the buffer even though the first 3 already fit |
+| `send_batch`, **failing**, first call after an `internal` drain | **7** | not simply 4 + 3 — a map absorbing 4 fresh keys (not 3) in one call can need more than one growth step; measured, not derived |
+
+**Two findings, not one, once the first draft's claim was checked properly:**
+
+1. **Steady state, telemetry really is free.** `process_batch_with_live_telemetry` and
+   `send_batch_through_a_noop_output_telemetry_live` both match their disabled counterparts exactly
+   — `count`/`timer` update an already-resident `ComponentBuffer` entry in place. `Fanout::send`'s
+   telemetry was already known to be free (`docs/design/internal-telemetry.md`'s own tests); this
+   is the same result for the receive side.
+
+2. **But "telemetry live" only ever measured steady state — the first call after every `internal`
+   drain costs more, and recurs forever.** `ComponentBuffer::drain` (`crates/logit-core/src/telemetry.rs`)
+   `mem::take`s the whole `points` map on every `internal` tick, so the next `count`/`timer` call for
+   each key is a fresh insert into an empty map, not an update. Concretely: the map's backing table
+   (first insert since the reset) plus a fresh `DdSketch` for the timing key (no prior sample to
+   merge into) — 2 allocations, on top of whatever the disabled baseline already costs (`process_batch`'s
+   `out` `Vec`, or `send_batch`'s `async_trait` box). This is not a one-time cost: it happens once per
+   `internal` drain interval, for as long as `internal` runs, on every component it's attached to.
+
+**A third, unrelated finding, found the same way: `Output` is `#[async_trait]`
+(`crates/logit-pipeline/src/output.rs`), and every call to `output.send(..).await` heap-allocates its
+future** — confirmed by measuring a direct call (no `dyn Output`, no vtable) alongside the `dyn
+Output` call `send_batch` actually makes; both cost exactly 1 (16 bytes), so this is `async_trait`'s
+boxing, not dynamic dispatch. A real, previously unmeasured, per-batch cost on every output sink in
+production, unrelated to telemetry or to this section's `internal-spans` question — worth its own
+follow-up, not fixed here. (`docs/known-gaps.md`'s entry for this originally suggested a
+hand-written `Pin<Box<dyn Future<...>>>` method as a workaround — wrong, corrected in review: that
+return type requires the identical allocation to construct, whether a macro or a person wrote the
+method, since the box *is* how a `dyn Trait` object returns a future of unknown, implementer-varying
+size. A real fix means giving up `dyn Output` for the call — enum dispatch over the closed set of
+concrete `Output` kinds, or a per-node generic runtime — not a differently-spelled boxed future.)
+
+**A fourth finding, from a second round of review: every `send_batch` test above used a
+`NoopOutput` that always succeeds, so none of them exercised `logit.component.errors` or
+`result.with_context(...)`'s error-only work — a distinct allocation shape, not just a bigger
+version of the success number.** Closed with `FailingOutput` (always `Err`) and three more tests,
+the three failure rows in the table above. The failure baseline (4) is fully decomposed, not just
+measured as one opaque number: `anyhow::anyhow!(..)` alone costs 1, and `.with_context(..)` alone
+(given an already-built error) costs 2 more — `1 (async_trait box) + 1 (anyhow!) + 2
+(.with_context) = 4`, confirmed against the isolated pieces, not asserted from the total alone.
+
+`crates/logit-bench/benches/pipeline.rs`'s `runtime` module gives the wall-clock view of the same
+paths, including `Fanout::send`+`recv` across a real `tokio::sync::mpsc` channel and `send_batch`
+through `#[async_trait]` — safe to trust on *both* columns (timing and allocations) despite the
+channel hop and the trait-object call, because both drive a **current-thread** runtime with no
+`tokio::spawn` anywhere in the loop, so nothing here leaves the one OS thread Divan's
+`AllocProfiler` is watching. Measured this way:
+
+| Path | fastest | allocs |
+|---|---:|---:|
+| `process_batch` through `keep` | 360 ns | 1 |
+| `Fanout::send`+`recv`, 1 consumer | 190 ns | 0 |
+| `Fanout::send`+`recv`, 2 consumers | 458 ns | 6 (1 `Arc::new` + the 5-allocation clone above) |
+| `send_batch` through a no-op `Output` | 189 ns | 1 (the `async_trait` box) |
+| `send_batch` through a **failing** `Output` | 238 ns | 4 (matches the disabled-telemetry failure row above exactly) |
+
+### Costing internal spans: the `Delivered` trade, measured
+
+`docs/known-gaps.md`'s internal-spans entry gates carrying trace context on `Delivered` on measured
+evidence, per [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md). The coverage above
+is what made that measurement possible; this is the measurement itself. **Not a decision** -- ADR
+0017 asks for evidence before the trade is decided, and this is that evidence, recorded so the
+decision (its own ADR, when someone takes it) doesn't have to re-derive it.
+
+**The prototype.** A 24-byte `TraceContext { trace_id: [u8; 16], span_id: [u8; 8] }` added to both
+`Delivered` variants (`Owned(EventBatch, TraceContext)`, `Shared(Arc<EventBatch>, TraceContext)`),
+minted fresh per `Fanout::send`/`send_blocking` call via a thread-local SplitMix64 (no allocation,
+no new dependency -- and deliberately not `tracing::span::Id`, which a `Registry` recycles after a
+span closes, making it unsafe as a source of identity here). No parent propagation, no `run_output`
+plumbing beyond the match arms `Delivered`'s extra field requires -- this measures the type change's
+cost, not a working span feature. Built, measured, and reverted in full; every file it touched is
+back to this table's pre-existing state except the one line below.
+
+**Size: `size_of::<Delivered>()` goes from 32 to 56 -- exactly `TraceContext`'s 24 bytes, no padding
+overhead.** This is a per-*batch* cost, on the channel payload, not a per-event one: contrast with
+`Event`'s 776 bytes, where ADR 0017 already settled that a much smaller per-event size cost is
+worth avoiding an allocation. `Delivered` isn't `Event` -- this is a different type, on a different
+part of the pipeline, at a different multiplier (one per batch, not one per event within it), so
+0017's conclusion doesn't transfer here by default; it's cited for contrast, not as the answer.
+
+**Allocations: zero change, across every existing exact-equality assertion.** Every
+`fanout_send_*` constant in `crates/logit-bench/tests/allocations.rs` (0 / 6 / 1, including the
+mixed-consumer cases) and every "Runtime" constant *as it existed at the time* held exactly, with
+the prototype in place -- confirmed by the full `script/cibuild` suite passing unmodified, not just
+spot-checked. This is the expected result stated plainly: copying 24 bytes into an already-allocated
+enum payload doesn't touch the allocator.
+
+*(Caveat added after this measurement: the "Runtime" section above was corrected and extended in
+review -- the post-drain cost and `send_batch` coverage weren't part of the baseline this prototype
+ran against, and weren't separately re-verified against it. Neither change is expected to interact
+with `Delivered`'s size: the post-drain cost lives in `ComponentBuffer`'s map/sketch, and the
+`async_trait` box lives in `Output::send`'s call, both orthogonal to what `TraceContext` on
+`Delivered` touches -- but "expected" is a claim about mechanism, not a re-measurement, and should
+be treated as such by whoever takes the actual decision.)*
+
+**Throughput: no attributable regression, but only once run-to-run noise is accounted for.** A
+naive before/after comparison showed all three `runtime` benches (`fanout_send_one_consumer`,
+`fanout_send_two_consumers`, `process_batch_through_keep`) slower by a uniform ~40-50% with the
+prototype in place -- which would be a real finding, except `process_batch_through_keep` never
+touches `Delivered`/`Fanout` at all and moved by almost exactly the same percentage as the two that
+do. That's this doc's own "runs on a busier machine come out uniformly ~20% slower" caveat (§2)
+firing, not a cost of the change -- confirmed by re-running the *unmodified* prototype benches a
+second time, which reproduced the original (pre-prototype) numbers almost exactly. Comparing
+benchmark timings across separate `script/bench` invocations remains unreliable, as already
+documented; a same-session, back-to-back comparison (not done here) is what a real decision should
+use if the allocation numbers above ever turn out not to be the deciding factor on their own.
+
+**What's left unmeasured, deliberately, because it needs a different kind of prototype:**
+propagating an *inherited* context (reading a batch's own incoming `Delivered` as the parent for
+what it produces, rather than always minting a fresh root) touches `run_transform`/`run_output`
+themselves, not just `Fanout`/`Delivered` -- a materially bigger change than the type-and-copy cost
+measured here, and the actual shape a real internal-spans feature would need.
+
 ### Zero-copy: where it holds
 
 [data-model.md](data-model.md) commits to "`bytes::Bytes` everywhere strings and blobs appear," so
@@ -615,10 +758,18 @@ runner measures the runner. divan's `AllocProfiler` reports allocation counts al
 the two layers cross-check each other.
 
 One constraint worth knowing before adding benches: divan's `AllocProfiler` only counts allocations
-on threads it controls, so every bench here calls decoders, transforms, and encoders **directly**
-rather than driving the tokio runtime and the channels between nodes. Anything measured across a
-channel hop would report allocation numbers that are quietly wrong. What a full multi-node graph
-costs end to end is a separate question needing a load generator, not a microbenchmark.
+on threads it controls. Almost every bench here sidesteps the question entirely by calling
+decoders, transforms, and encoders **directly**, never touching the tokio runtime or the channels
+between nodes. The one deliberate exception is `pipeline.rs`'s `runtime` module, which *does* drive
+`Fanout::send`/`recv` across a real channel — safely, because it never calls `tokio::spawn`: a
+`current_thread` runtime's `block_on` runs everything on the calling thread, the one thread Divan is
+already watching, so nothing is handed to a worker thread it can't see. The constraint that actually
+matters is **no cross-thread hop** (a `tokio::spawn`, a multi-thread runtime, a real OS thread), not
+"no channel" — `crates/logit-bench/tests/allocations.rs`'s own `fanout_send_*`/`unwrap_batch_*`
+tests (thread-local `CountingAlloc`, same reasoning) independently confirm the same numbers this
+module reports. What a full multi-node graph costs end to end, spread across the real worker
+threads and OS threads `run_with_shutdown` actually spawns, is still a separate question needing a
+load generator, not a microbenchmark.
 
 ### Fixtures: synthetic inputs, no external services
 

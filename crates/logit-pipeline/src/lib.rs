@@ -20,7 +20,8 @@ pub use fanout::{Delivered, Fanout};
 pub use input::Input;
 pub use output::{classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fault, Output};
 pub use runtime::{
-    run, run_with_shutdown, run_with_telemetry, NodeSpec, RetryConfig, WriteLoopConfig,
+    process_batch, run, run_with_shutdown, run_with_telemetry, send_batch, unwrap_batch, NodeSpec,
+    RetryConfig, WriteLoopConfig,
 };
 pub use sink_queue::{OverflowPolicy, SinkQueue, SinkQueueConfig};
 pub use transform::Transform;
