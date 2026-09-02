@@ -1,13 +1,15 @@
-// syslog -> Loki shim (docs/plans/0003-demo-stack.md). Nothing writes here today -- pure
-// scaffolding for `syslog_out`: once that ComponentKind exists, `logit` can point straight at
-// the listener below. Loki has no syslog receiver of its own, and promtail (the historical
-// answer) is EOL, which is why this is Alloy's `loki.source.syslog` rather than nothing at all.
+// syslog -> Loki shim (docs/plans/0003-demo-stack.md, docs/adr/0022-syslog-output.md). `logit`'s
+// `log_out` component (demo/logit.yaml) points straight at the listener below -- Loki has no
+// syslog receiver of its own, and promtail (the historical answer) is EOL, which is why this is
+// Alloy's `loki.source.syslog` rather than nothing at all.
 loki.source.syslog "demo" {
   listener {
-    address                         = "0.0.0.0:5141"
-    protocol                        = "udp"
-    syslog_format                   = "rfc3164" // matches syslog_in's own format (RFC 3164 only)
-    rfc3164_default_to_current_year = true
+    address             = "0.0.0.0:5141"
+    protocol            = "udp"
+    syslog_format       = "rfc5424" // matches `log_out`'s own default format -- unambiguous
+                                      // timestamps, unlike rfc3164 (docs/adr/0022-syslog-output.md)
+    max_message_length  = 8192      // matches `syslog_out`'s own `max_message_bytes` default, so
+                                      // both ends of the wire agree on one bound
     labels = {
       job      = "demo",
       protocol = "udp",
@@ -16,7 +18,11 @@ loki.source.syslog "demo" {
 
   // Alloy strips every `__`-prefixed label (including `__syslog_*`) before forwarding -- without
   // this, Loki would see no stream label from the syslog headers at all. Kept short: every label
-  // here is a Loki stream, so only the low-cardinality header fields are promoted.
+  // here is a Loki stream, so only the low-cardinality header fields are promoted. No change
+  // needed here for `syslog_out` to go live -- `logit`'s own `syslog.hostname`/`syslog.tag`
+  // attributes (set by `access_in`'s `syslog_in` decode) round-trip onto every relayed message's
+  // HOSTNAME/APP-NAME (docs/adr/0022-syslog-output.md), which is exactly what these two rules
+  // were already waiting to relabel.
   relabel_rules = loki.relabel.syslog_headers.rules
   forward_to    = [loki.write.demo.receiver]
 }
