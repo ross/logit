@@ -9,8 +9,15 @@ description = "The component graph: Input/Output/Transform traits, Fanout, graph
 [dependencies]
 logit-core.workspace = true
 logit-config.workspace = true
+logit-proto.workspace = true
 logit-script.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# `test-util` (for `tokio::time::pause`/`#[tokio::test(start_paused = true)]`) only needs to be
+# enabled for this crate's own tests -- a `dev-dependencies` override of the same workspace
+# dependency applies just to test/bench/example builds, not the normal library build.
+tokio = { workspace = true, features = ["test-util"] }
