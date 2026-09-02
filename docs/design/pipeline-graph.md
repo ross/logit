@@ -93,8 +93,9 @@ pub enum ComponentKind {
 into one tagged enum creates real collisions — `Otlp { bind }` (a listener) and `Otlp { endpoint }`
 (a sink) can't both be `type: otlp` in an internally-tagged enum, and the same is true of the two
 `Logit` variants. Suffixing *every* protocol kind uniformly, not just the two that collide today,
-keeps the rule predictable as more protocols gain a second side (`syslog_out`, once syslog egress
-exists, say). Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`,
+keeps the rule predictable as more protocols gain a second side — `syslog_out` (RFC 3164/5424 over
+UDP or TCP, `docs/adr/0022-syslog-output.md`) is exactly that case, landing well after `SyslogIn`.
+Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`,
 `remove`, and any future native transform — take no suffix; there's only ever one direction for a
 transform to be.
 

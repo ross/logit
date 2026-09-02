@@ -90,7 +90,11 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Sample { .. }
         | Throttle { .. }
         | Dedup { .. } => Role::Transform,
-        InfluxDbOut { .. } | OtlpOut { .. } | LogitOut { .. } | StdioOut { .. } => Role::Sink,
+        InfluxDbOut { .. }
+        | OtlpOut { .. }
+        | LogitOut { .. }
+        | StdioOut { .. }
+        | SyslogOut { .. } => Role::Sink,
     }
 }
 
@@ -130,6 +134,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         OtlpOut { .. } => "otlp_out",
         LogitOut { .. } => "logit_out",
         StdioOut { .. } => "stdio_out",
+        SyslogOut { .. } => "syslog_out",
     }
 }
 
@@ -151,6 +156,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Remove { .. }
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::StdioOut { .. }
+            | ComponentKind::SyslogOut { .. }
     )
 }
 
