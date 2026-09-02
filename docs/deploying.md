@@ -3,7 +3,9 @@
 How to run `logit` outside this repo's own dev stack: get the image, run it against a config, and
 what to expect from `logit`'s signal and restart behavior once something under it (a sink, a signal
 from an orchestrator) doesn't cooperate. For the nginx-specific side of pointing a real nginx at a
-running `logit`, see [the nginx-side recipe](#the-nginx-side-recipe) below.
+running `logit`, see [the nginx-side recipe](#the-nginx-side-recipe) below. If you just want to see
+`logit` running rather than deploy it, [`demo/`](../demo/README.md) is a self-contained
+`docker compose up` — no image-building steps to follow.
 
 ## Getting the image
 
