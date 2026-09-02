@@ -45,11 +45,16 @@ mod tests {
         let mut components = HashMap::new();
         components.insert(
             "in".to_string(),
-            Component { sources: vec![], kind: ComponentKind::StatsdIn { bind: "x".to_string() } },
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "x".to_string() },
+            },
         );
         components.insert(
             "out".to_string(),
             Component {
+                buffer: logit_config::BufferConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::InfluxDbOut {
                     url: "u".to_string(),
@@ -75,6 +80,7 @@ mod tests {
         components.insert(
             "out".to_string(),
             Component {
+                buffer: logit_config::BufferConfig::default(),
                 sources: vec!["missing".to_string()],
                 kind: ComponentKind::InfluxDbOut {
                     url: "u".to_string(),
