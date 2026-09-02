@@ -165,7 +165,11 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 5. **No cycles.** DFS with a recursion-stack set, or Kahn's algorithm falling back to "nodes remain
    with no zero-indegree candidate." This is the one genuinely new must-have: a cycle plus bounded
    `mpsc` channels is a deadlock, not a slow pipeline, and today's linear-pipeline shape made cycles
-   structurally impossible — the graph model makes them a real config mistake to guard against.
+   structurally impossible — the graph model makes them a real config mistake to guard against. The
+   nodes still unresolved once Kahn's algorithm runs out of zero-indegree candidates are the cycle
+   *plus* everything downstream of it, not the cycle alone — the error walks that set back down to
+   one concrete cycle path before reporting it, so a downstream victim is never named as if it were
+   part of the cycle.
 6. Arity per kind, per the table above — a listener with `sources`, a sink with none, a sink named as
    another component's source.
 7. Every non-sink component has ≥1 consumer — replaces today's "pipeline has no outputs" check and
@@ -360,7 +364,7 @@ config is a graph rather than a list of linear pipelines.
   undefined component can't be drawn at all" and required rule 2 to pass first — that premise was
   simply wrong once actually tried; corrected here rather than left as a stated constraint the
   implementation quietly didn't follow.)
-- Runs the full validation (rules 2–9) after rendering and reports any failures to stderr with a
+- Runs the full validation (all fifteen rules) after rendering and reports any failures to stderr with a
   non-zero exit — without suppressing the DOT output. This is deliberate: `graph` is most useful on
   exactly the configs that fail validation, since a cycle — or a typo'd source, now visibly
   dangling — is far easier to see rendered than to parse out of an error message naming two
@@ -406,7 +410,7 @@ logit-core   logit-config   logit-script
 - Keeps the channel type out of `logit-core`, whose doc comment states "no I/O, no pipeline" —
   weakening that would blur a boundary the crate exists to hold.
 
-`graph.rs` (resolution + the eight validation rules + topo-sort) is a **pure function over
+`graph.rs` (resolution + the fifteen validation rules + topo-sort) is a **pure function over
 `Config`** — no channels, no threads, no tokio — mirroring how `apply_transforms` in today's
 `pipeline.rs` was deliberately kept pure specifically so it's unit-testable without spinning up
 real I/O. `logit run`, `logit validate`, and `logit graph` are three different things layered on
