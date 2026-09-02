@@ -351,8 +351,8 @@ already built that have a known, accepted rough edge.
   [ADR 0018](adr/0018-internal-telemetry-as-pipeline-events.md)) covers metrics only** — the
   framework (the `internal` component, the per-component buffer, the emit API) is built to extend,
   but three extensions are deliberately not part of this first cut:
-  - **Internal spans — the propagation substrate is built; nothing emits a `SpanRecord` yet.**
-    `internal`'s name (not `internal_metrics`) deliberately leaves room for this without a rename.
+  - **Internal spans — emission and sampling are now built; three narrower residuals remain (below).**
+    `internal`'s name (not `internal_metrics`) deliberately left room for this without a rename.
     History: `crates/logit-bench/tests/allocations.rs`/`benches/pipeline.rs`'s node-runtime
     coverage closed the gap where nothing measured what `run_transform`/`run_output`/`Fanout::send`
     themselves cost (including the *first* call after every `internal` drain,
@@ -363,42 +363,48 @@ already built that have a known, accepted rough edge.
     allocation change, `size_of::<Delivered>()` 32 → 56, no attributable throughput regression.
     See `docs/design/memory.md`'s "Runtime" and "Costing internal spans" sections for that account.
 
-    **On that evidence, [ADR 0020](adr/0020-trace-context-propagation-on-delivered.md) built it for
-    real** — `Delivered` permanently carries a `TraceContext`, and the two node kinds with an
+    **On that evidence, [ADR 0020](adr/0020-trace-context-propagation-on-delivered.md) built real
+    propagation** — `Delivered` permanently carries a `TraceContext`, and the two node kinds with an
     unambiguous parent propagate a real one: `Transform::process`/`ScriptWorker::process` (the
     non-flush path, one incoming batch per emission) via `Fanout::send_with_context`, and
     `run_output` (already borrows the incoming `Delivered` without unwrapping, so nothing further
-    to wire — see `docs/design/pipeline-graph.md`'s "Trace context propagation" section for the
-    full per-node-kind table). Every listener and every flush-driven emission still mints a fresh
-    root, unchanged from the prototype's behavior — not an oversight, see below.
+    to wire). A follow-up gave `Transform::flush`/`Aggregator` a bounded, best-effort
+    `ContributingContexts` set per series (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8 — dropped and
+    counted past the cap, `logit.transform.links.dropped{reason="cardinality"}`) and paired each
+    flushed `Event` with the `SpanLink`s that set produced. Lua's `flush()` got no equivalent — no
+    accumulator `logit` can inspect — left as an accepted stale-context limitation (next to the
+    identical `Resource`-staleness gap), with `trace.trace_id`/`trace.span_id`
+    (`docs/design/lua-api.md`) exposed to a script's own `process()` instead. Picking an arbitrary
+    contributing batch as "the" parent, for either case, was considered and rejected (silently
+    wrong is worse than visibly incomplete).
 
-    **Item 1, `Transform::flush`/Lua's `flush()`, is now built for both native transforms and
-    Lua** — an *n*-to-1 relationship (however many batches were absorbed since the last tick), with
-    no single correct parent. `Aggregator` (`crates/logit-transforms/src/aggregate.rs`) tracks a
-    bounded, best-effort `ContributingContexts` set per series (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`,
-    8 — dropped and counted past the cap, `logit.transform.links.dropped{reason="cardinality"}`,
-    the same shape `MAX_KEYS_PER_COMPONENT` below uses) and `Transform::flush`'s return type now
-    pairs each emitted `Event` with the `SpanLink`s that set produced. Lua's `flush()` gets no
-    equivalent — no accumulator `logit` can inspect — and is instead documented as an accepted
-    stale-context limitation (above, next to the identical `Resource`-staleness gap), with
-    `trace.trace_id`/`trace.span_id` (`docs/design/lua-api.md`) exposed to a script's own
-    `process()` so it can do its own bookkeeping if it wants better than that. Picking an arbitrary
-    contributing batch as "the" parent, for either case, was considered and rejected in ADR 0020
-    (silently wrong is worse than visibly incomplete).
+    **[ADR 0025](adr/0025-internal-span-emission-and-deterministic-sampling.md) closed both items
+    this entry used to list as open: emission and sampling.** `Telemetry::span`/`SpanGuard` (mirroring
+    `Timer`'s disabled-is-free shape) turn a `(context, node, batch)` visit into a real
+    `SpanRecord`-carrying `Event`, drained by `ComponentBuffer::drain`'s new span pass alongside the
+    existing metric pass — exactly the "`ComponentBuffer`/drain turns counters into events" shape
+    this entry once named as the expected home, per ADR 0018. `run_flush` also changed shape here:
+    it now mints **one** root before `transform.flush(now)` and sends every resource group under it
+    (`Fanout::send_with_own_context`), rather than minting a fresh root per group as it used to — one
+    flush is one unit of work, not *N* hops. Sampling is deterministic on `trace_id`
+    (`trace_is_sampled`, `ComponentKind::Internal::span_sample_rate`, default 0.1) — every node
+    reaches the same keep/drop verdict independently, with no propagated bit and no growth to
+    `TraceContext`/`Delivered`. See `docs/design/internal-telemetry.md`'s "Spans" section for the
+    full account, and `docs/design/pipeline-graph.md`'s "Trace context propagation" table for the
+    resulting per-node-kind span record.
 
-    **What's still open, in order:**
-    1. **Nothing turns a (context, node, batch) tuple into a real `SpanRecord`-carrying `Event`
-       yet.** `Transform::flush`'s `Vec<SpanLink>` is real and tested
-       (`crates/logit-transforms/src/aggregate.rs`'s own test module), but nothing downstream reads
-       it — `run_flush` (`crates/logit-pipeline/src/runtime.rs`) discards it, and propagation
-       through `Delivered` is still unobservable outside `logit-pipeline` (`Output::send` takes
-       `&EventBatch`, not `&Delivered`). This is the piece analogous to how `internal`'s
-       `ComponentBuffer`/drain mechanism turns counters into events
-       (`docs/design/internal-telemetry.md`); routing through the same `internal` component is the
-       expected shape, per ADR 0018.
-    2. **Sampling** — span volume would be a different shape than metric volume once emission
-       exists (potentially one span per node-visit per batch); `internal` will likely need its own
-       knob for this, separate from its drain `interval`.
+    **What's still open, deliberately, not oversights:**
+    1. **The listener span's window is the `send` call only, not decode-to-send.** `Fanout::send`
+       has no visibility into how long a listener spent building the batch it's about to send
+       (`Input::run` is a free-form loop) — the still-open listener-side half of "delivery I/O is
+       not decoupled from event processing" (below).
+    2. **Lua `flush()` still gets a link-less root.** It gets a real span now (ADR 0025), but no
+       links — there is still no accumulator on the Lua side to inspect, same limitation as the
+       `Resource`-staleness gap above.
+    3. **A `SinkQueue` entry is 24 bytes larger.** `TraceContext` now rides inline in every queue
+       entry (`push`/`peek`) so `write_loop` can parent its own sink span on the context a batch
+       actually arrived under — the same size-for-a-span trade `Delivered` itself already made and
+       measured (`docs/design/memory.md`'s "Costing internal spans" section).
   - **Internal logs** — routing `Diagnostics`' stderr output into the graph as `LogRecord` events
     is the natural next layer, and what the still-deferred `tracing` migration (above) should build
     on rather than duplicate.

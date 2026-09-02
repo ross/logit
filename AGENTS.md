@@ -32,9 +32,9 @@ UDP or TCP, header fields round-tripped from an event's `syslog.*` attributes,
 metrics, and traces, both OTLP/HTTP and a hand-rolled OTLP/gRPC transport,
 [ADR 0023](docs/adr/0023-committed-pregenerated-otlp-protobuf.md)/
 [ADR 0024](docs/adr/0024-hand-rolled-grpc-over-hyper.md)) have landed too, as real, implemented
-`ComponentKind`s — not yet wired into `demo/logit.yaml`'s commented-out `trace_out` stanza, which
-also needs a span producer before it's worth uncommenting (nothing emits a `SpanRecord` yet outside
-tests). Config is a flat graph of named components (ADR 0009,
+`ComponentKind`s — not yet wired into `demo/logit.yaml`'s commented-out `trace_out` stanza, though
+(with spans now real too, below) nothing but that wiring is left before traces flow end to end in
+the demo. Config is a flat graph of named components (ADR 0009,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively
@@ -55,12 +55,18 @@ per-component buffers into ordinary events on its own `interval`; see
 [ADR 0018](docs/adr/0018-internal-telemetry-as-pipeline-events.md) and
 [internal-telemetry.md](docs/design/internal-telemetry.md) for the framework, and
 [examples/internal-telemetry.yaml](examples/internal-telemetry.yaml) for a runnable config. Every
-`Delivered` (one `Fanout` edge's channel payload) now carries a real `TraceContext`, propagated as
-a child of its parent for the two node kinds with an unambiguous one to propagate
-(`Transform::process`/`ScriptWorker::process`'s non-flush path, and `run_output`) — the substrate
-for internal spans, not spans themselves yet; see
+`Delivered` (one `Fanout` edge's channel payload) carries a real `TraceContext`, propagated as a
+child of its parent for the two node kinds with an unambiguous one to propagate
+(`Transform::process`/`ScriptWorker::process`'s non-flush path, and `run_output`); see
 [ADR 0020](docs/adr/0020-trace-context-propagation-on-delivered.md) and
-[pipeline-graph.md](docs/design/pipeline-graph.md)'s "Trace context propagation" section.
+[pipeline-graph.md](docs/design/pipeline-graph.md)'s "Trace context propagation" section. That
+context is now turned into real spans: every node kind records a `SpanRecord`-carrying `Event` for
+its own visit to a unit of work (a listener's send, a transform's process-or-flush, a sink's
+delivery), sampled deterministically on `trace_id` (`span_sample_rate` on the `internal` component,
+default 0.1); see [ADR 0025](docs/adr/0025-internal-span-emission-and-deterministic-sampling.md)
+and [internal-telemetry.md](docs/design/internal-telemetry.md)'s "Spans" section. `docs/known-gaps.md`'s
+internal-spans entry tracks what's still open (the listener span's window, Lua `flush()`'s
+link-less root).
 
 ## Environment
 

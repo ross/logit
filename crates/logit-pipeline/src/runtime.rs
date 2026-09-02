@@ -7,13 +7,13 @@
 //! doesn't actually need dependency ordering: a `Fanout` is just cloned `Sender`s into inboxes
 //! that already exist by construction, regardless of which node gets spawned first.
 
-use crate::fanout::Delivered;
+use crate::fanout::{Delivered, TraceContext};
 use crate::graph::Graph;
 use crate::output::{classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fault};
 use crate::sink_queue::{SinkQueue, SinkQueueConfig};
 use crate::{Fanout, Input, Output, Transform};
 use anyhow::Context;
-use logit_core::{Diagnostics, EventBatch, Resource, Telemetry};
+use logit_core::{Diagnostics, EventBatch, Resource, SpanKind, Telemetry};
 use logit_script::{ProcessOutcome, ScriptWorker};
 use std::collections::HashMap;
 use std::future::Future;
@@ -398,10 +398,14 @@ pub async fn drain_inbox(
     telemetry: Telemetry,
 ) {
     while let Some(delivered) = inbox.recv().await {
+        // Read before `unwrap_batch_arc` consumes `delivered` -- `SinkQueue` now carries this
+        // context alongside the batch (`sink_queue.rs`'s own doc comment) specifically so
+        // `write_loop`'s sink span can be parented on it once `peek` reads it back.
+        let ctx = delivered.context();
         let batch = unwrap_batch_arc(delivered);
         telemetry.count("logit.component.batches.received", 1.0, &[]);
         telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
-        queue.push(batch).await;
+        queue.push(batch, ctx).await;
     }
     queue.close();
 }
@@ -571,6 +575,18 @@ fn backoff_for(retry: &RetryConfig, attempt: u32) -> Duration {
     backoff.min(retry.max_delay)
 }
 
+/// `&'static str` for a [`Fault`], for `write_loop`'s sink span (`SpanGuard::tag` needs a
+/// `&'static str`, and `Fault`'s own `Display` impl returns a formatted `String`, not the
+/// underlying literal). Not the same thing as `Fault`'s `Display` output being unusable here --
+/// this just avoids an allocation on the failure path a span records.
+fn fault_tag(fault: Fault) -> &'static str {
+    match fault {
+        Fault::Clean => "clean",
+        Fault::Ambiguous => "ambiguous",
+        Fault::Permanent => "permanent",
+    }
+}
+
 /// Resolves once `shutdown`'s grace period has fully elapsed -- never before `shutdown` fires at
 /// all, and never more than `grace` after it does. `deadline` is `&mut` so it persists across
 /// repeated calls (once per `write_loop` iteration): the grace window is anchored to the instant
@@ -702,24 +718,40 @@ async fn write_loop(
         // actually driven to completion. Reducing each `select!` to a plain enum keeps every
         // `output` access outside the macro, in the `match` below, where there's no ambiguity.
         enum NextBatch {
-            Batch(Arc<EventBatch>),
+            Batch(Arc<EventBatch>, TraceContext),
             Closed,
             ShutdownExpired,
         }
         let next = tokio::select! {
             batch = queue.peek() => match batch {
-                Some(batch) => NextBatch::Batch(batch),
+                Some((batch, ctx)) => NextBatch::Batch(batch, ctx),
                 None => NextBatch::Closed,
             },
             () = shutdown_grace_expired(&mut shutdown, &mut shutdown_deadline, write_config.shutdown_grace) => {
                 NextBatch::ShutdownExpired
             }
         };
-        let batch = match next {
-            NextBatch::Batch(batch) => batch,
+        let (batch, ctx) = match next {
+            NextBatch::Batch(batch, ctx) => (batch, ctx),
             NextBatch::Closed => break, // queue closed and empty: nothing left to deliver.
             NextBatch::ShutdownExpired => return Ok(()),
         };
+
+        // The sink span: the only span that can carry `SpanStatus::Error` and a fault tag,
+        // which is the whole point of instrumenting a sink (`docs/adr/0025-internal-span-
+        // emission-and-deterministic-sampling.md`). `ctx.child()` is minted, used as this span's
+        // identity, and then discarded -- `run_output` emits nothing further downstream for
+        // anything to inherit it (`Output::send` takes `&EventBatch`, not `&Delivered`), so there
+        // is no propagation left to do with it beyond this one span.
+        let span_ctx = ctx.child();
+        let mut span = telemetry.span(
+            "deliver",
+            SpanKind::Client,
+            span_ctx.trace_id,
+            span_ctx.span_id,
+            Some(ctx.span_id),
+        );
+        span.events(batch.events.len() as u64);
 
         enum DeliverStep {
             Outcome(Delivery),
@@ -746,6 +778,8 @@ async fn write_loop(
             }
             Delivery::Dropped { fault, explicit_permanent } => {
                 queue.commit();
+                span.error();
+                span.tag("fault", fault_tag(fault));
                 telemetry.count(
                     "logit.component.batches.dropped",
                     1.0,
@@ -880,9 +914,23 @@ async fn run_transform(
         // `TraceContext`'s doc comment and `docs/known-gaps.md`'s internal-spans entry describe.
         // A no-op for every other transform.
         transform.observe_batch_context(parent);
+        // Minted here, not inside `Fanout::send_with_context`, because this node records its own
+        // span around `process_batch` *and* the send (`docs/adr/0025-internal-span-emission-and-
+        // deterministic-sampling.md`'s per-node-kind table): the span's `span_id` and the outgoing
+        // `Delivered`'s `span_id` have to be the same id, which only holds if this is the one and
+        // only place a context is minted for this emission.
+        let ctx = parent.child();
+        let mut span = telemetry.span(
+            "process",
+            SpanKind::Internal,
+            ctx.trace_id,
+            ctx.span_id,
+            Some(parent.span_id),
+        );
         let batch = unwrap_batch(batch);
         if let Some(out) = process_batch(&mut *transform, batch, &telemetry) {
-            fanout.send_with_context(out, parent).await;
+            span.events(out.events.len() as u64);
+            fanout.send_with_own_context(out, ctx).await;
         }
     }
 }
@@ -930,27 +978,44 @@ pub fn process_batch(
 /// per-resource windowing (`docs/adr/0008-aggregation-window-semantics.md`) is internal to the
 /// transform, not something this timing needs to break out further.
 ///
-/// **Sends via plain `fanout.send` (a fresh trace root), not `send_with_context`.** A flushed
-/// batch is built from however many incoming batches `Transform::process` absorbed since the last
-/// tick -- an *n*-to-1 relationship, not the 1-to-1 the non-flush path (`process_batch`'s caller,
-/// above) propagates a real parent for. `TraceContext`'s own doc comment
-/// (`crates/logit-pipeline/src/fanout.rs`) and `docs/known-gaps.md`'s internal-spans entry both
-/// track this as a deliberate, open gap -- not something this function is wrong to skip.
+/// **Mints one root before `transform.flush(now)`, then sends every resource group under that
+/// same root via `send_with_own_context`.** A flushed batch is built from however many incoming
+/// batches `Transform::process` absorbed since the last tick -- an *n*-to-1 relationship, not the
+/// 1-to-1 the non-flush path (`process_batch`'s caller, above) propagates a real parent for, so
+/// there is still no single correct parent to inherit (`TraceContext`'s own doc comment,
+/// `crates/logit-pipeline/src/fanout.rs`; `docs/known-gaps.md`'s internal-spans entry tracks this
+/// *n*-to-1 gap as deliberate, not something this function is wrong to leave open). What changed
+/// (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`): earlier, every resource
+/// group minted its *own* fresh root via plain `fanout.send`, so an `aggregate` flush spanning
+/// several resources looked like several unrelated hops; now one root is minted before `flush()`
+/// runs, and every group's batch goes out as a *sibling* under it -- one flush is one unit of
+/// work, and N resource groups are an internal detail of `aggregate`'s per-resource windowing
+/// (`docs/adr/0008-aggregation-window-semantics.md`), not N hops. The contributing-context links
+/// `Transform::flush` returns per event (`Aggregator`'s bounded `ContributingContexts`) are unioned
+/// onto this one flush span, bounded by `MAX_LINKS_PER_SPAN` same as any other span's links.
 async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, telemetry: &Telemetry) {
+    let ctx = TraceContext::new_root();
+    let mut span = telemetry.span("flush", SpanKind::Internal, ctx.trace_id, ctx.span_id, None);
+
     let timer = telemetry.timer("logit.component.flush.duration");
     let flushed = transform.flush(now_unix_nanos());
     drop(timer);
+
+    let mut total_events: u64 = 0;
     for (resource, events_with_links) in flushed {
-        if !events_with_links.is_empty() {
-            telemetry.count("logit.component.flush.events", events_with_links.len() as f64, &[]);
-            // The links aren't attached to anything yet -- nothing turns a (context, node, batch)
-            // tuple into a real SpanRecord-carrying Event (docs/known-gaps.md's internal-spans
-            // entry, item 2, still open). Discarded here on purpose; this is where they'll attach
-            // once that exists.
-            let events = events_with_links.into_iter().map(|(event, _links)| event).collect();
-            fanout.send(EventBatch { resource, events }).await;
+        if events_with_links.is_empty() {
+            continue;
         }
+        telemetry.count("logit.component.flush.events", events_with_links.len() as f64, &[]);
+        total_events += events_with_links.len() as u64;
+        let mut events = Vec::with_capacity(events_with_links.len());
+        for (event, links) in events_with_links {
+            span.links(links);
+            events.push(event);
+        }
+        fanout.send_with_own_context(EventBatch { resource, events }, ctx).await;
     }
+    span.events(total_events);
 }
 
 /// A Lua node's loop, on its own dedicated OS thread (`ScriptWorker` is `!Send`). Structurally
@@ -990,14 +1055,18 @@ fn run_lua(
     let mut next_flush = configured_interval.map(|interval| tokio::time::Instant::now() + interval);
     let mut last_resource = Arc::new(Resource::default());
 
-    // Sends via plain `fanout.send_blocking` below (a fresh trace root), same reasoning as
-    // `run_flush`'s own doc comment above: a Lua `flush()`'s emission has no single incoming
-    // batch to call its parent -- worse than `Transform::flush`, even, since there's no
-    // accumulator here at all to eventually attribute it to (`docs/known-gaps.md`'s
+    // Mints its own root and records this node's `flush` span directly (rather than going
+    // through `fanout.send_blocking`, which now only ever mints a root for a genuine listener --
+    // `fanout.rs`'s own doc comment), same reasoning as `run_flush`'s: a Lua `flush()`'s emission
+    // has no single incoming batch to call its parent -- worse than `Transform::flush`, even,
+    // since there's no accumulator here at all to eventually attribute it to (`docs/known-gaps.md`'s
     // internal-spans entry, and the existing resource-stamping gap this same imprecision already
     // has: `last_resource` above is the identical shape of approximation, just for `Resource`
     // instead of `TraceContext`).
     let flush_now = |worker: &ScriptWorker, resource: &Arc<Resource>, fanout: &Fanout| {
+        let ctx = TraceContext::new_root();
+        let mut span = telemetry.span("flush", SpanKind::Internal, ctx.trace_id, ctx.span_id, None);
+
         let timer = telemetry.timer("logit.component.flush.duration");
         let result = worker.flush();
         drop(timer);
@@ -1012,12 +1081,17 @@ fn run_lua(
         match result {
             Ok(events) if !events.is_empty() => {
                 telemetry.count("logit.component.flush.events", events.len() as f64, &[]);
-                fanout.send_blocking(EventBatch { resource: resource.clone(), events });
+                span.events(events.len() as u64);
+                fanout.send_blocking_with_own_context(
+                    EventBatch { resource: resource.clone(), events },
+                    ctx,
+                );
             }
             Ok(_) => {}
             Err(err) => {
                 telemetry.count("logit.component.errors", 1.0, &[("reason", "flush")]);
                 eprintln!("component '{id}': script flush error: {err}");
+                span.error();
             }
         }
     };
@@ -1059,6 +1133,18 @@ fn run_lua(
         // this call's entire emission traces back to this one incoming batch. `flush_now` above
         // has no such single parent and deliberately doesn't do this.
         let parent = batch.context();
+        // Same reasoning as `run_transform`'s non-flush path: this node records its own span
+        // around `worker.process()` *and* the blocking send, so the context has to be minted once,
+        // here, rather than letting `Fanout::send_blocking_with_context` mint an unrelated one
+        // later -- the span's `span_id` and the outgoing `Delivered`'s `span_id` must match.
+        let ctx = parent.child();
+        let mut span = telemetry.span(
+            "process",
+            SpanKind::Internal,
+            ctx.trace_id,
+            ctx.span_id,
+            Some(parent.span_id),
+        );
         // Lets the script's own `process()` read `trace.trace_id`/`trace.span_id`
         // (`crates/logit-script/src/trace.rs`) -- essentially infallible in practice (the
         // registry-held table is independent of whatever a script does to the `trace` global),
@@ -1110,11 +1196,20 @@ fn run_lua(
         }
         if errors > 0 {
             telemetry.count("logit.component.errors", errors as f64, &[("reason", "process")]);
+            // Consistent with `write_loop`'s own rule (ADR 0025): the call site whose error path
+            // fired is the one that marks the span, not a downstream reader inferring it from
+            // `logit.component.errors`. A batch with *any* script error, even a partial one mixed
+            // with successful emits, is not a clean node visit -- `span`'s default status is `Ok`,
+            // so a batch where every event errored (`out` stays empty, `span.events` never called
+            // below) would otherwise drain silently as a *successful* zero-event span instead of a
+            // failed one.
+            span.error();
         }
         if !out.is_empty() {
-            fanout.send_blocking_with_context(
+            span.events(out.len() as u64);
+            fanout.send_blocking_with_own_context(
                 EventBatch { resource: batch.resource, events: out },
-                parent,
+                ctx,
             );
         }
     }
@@ -1208,7 +1303,7 @@ mod tests {
     use crate::graph;
     use crate::sink_queue::OverflowPolicy;
     use logit_config::{Component, ComponentKind, Config};
-    use logit_core::{Event, MetricKind, Registry, SpanLink};
+    use logit_core::{Event, MetricKind, Registry, SpanLink, SpanStatus};
     use std::collections::HashMap as Map;
 
     #[test]
@@ -1986,6 +2081,203 @@ mod tests {
         assert!(vm_memory.is_some_and(|v| v > 0.0), "a loaded Lua VM should report nonzero memory");
     }
 
+    /// Finds the drained `process` span `run_lua` recorded for `component_id`, panicking with the
+    /// full drained batch if none is present -- shared by the two error-status tests below.
+    fn find_process_span<'a>(events: &'a [Event], component_id: &str) -> &'a Event {
+        events
+            .iter()
+            .find(|e| {
+                e.span.is_some()
+                    && span_op(e) == Some("process")
+                    && e.attributes.get("component").and_then(|v| v.as_str()) == Some(component_id)
+            })
+            .unwrap_or_else(|| panic!("no process span for '{component_id}' in: {events:?}"))
+    }
+
+    /// The error half of `run_lua_records_vm_memory_and_emit_outcome`'s success case: a script
+    /// error must mark the process span `SpanStatus::Error`, not leave it at its default `Ok` --
+    /// ADR 0025's rule that the call site whose own error path fired is the one that marks the
+    /// span, applied to Lua's `process` the same way `write_loop` already applies it to a failed
+    /// delivery. Every event in the batch errors here, so `out` also stays empty and nothing is
+    /// ever sent downstream -- exactly the case that would otherwise drain as a *successful*
+    /// zero-event span.
+    #[tokio::test]
+    async fn run_lua_marks_its_process_span_as_error_when_every_event_in_the_batch_errors() {
+        let mut components = Map::new();
+        components.insert(
+            "in".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            },
+        );
+        components.insert(
+            "enrich".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec!["in".to_string()],
+                kind: ComponentKind::Lua {
+                    script: "function process(event) error('boom') end".to_string(),
+                    interval: None,
+                },
+            },
+        );
+        components.insert(
+            "out".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec!["enrich".to_string()],
+                kind: influxdb_out(),
+            },
+        );
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (result_tx, _result_rx) = std::sync::mpsc::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0), counter_event("hits", 2.0)],
+        };
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+        );
+        specs.insert(
+            "enrich".to_string(),
+            NodeSpec::Lua {
+                script: "function process(event) error('boom') end".to_string(),
+                interval: None,
+            },
+        );
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx: result_tx }),
+                SinkQueueConfig::default(),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        // `with_span_sampling(1.0)`, not `Registry::new()` -- this test needs every span kept,
+        // not the default 10%.
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry: HashMap<String, Telemetry> = ["in", "enrich", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+        )
+        .await
+        .expect("should not hang")
+        .expect("should complete without error");
+
+        let events = registry.drain(0);
+        let span_event = find_process_span(&events, "enrich");
+        let record = span_event.span.as_ref().expect("span record");
+        assert_eq!(
+            record.status,
+            SpanStatus::Error,
+            "a batch where every event errored must not drain as a successful span"
+        );
+    }
+
+    /// The partial-failure half of the same rule: a batch mixing successful and failing events
+    /// must still mark its process span `Error` -- a script that got *some* events through is not
+    /// the same as a clean node visit either. The script alternates outcomes via a persistent Lua
+    /// global (`n`), which survives across `process` calls within this one batch because `run_lua`
+    /// calls `worker.process` once per event against the same `ScriptWorker`/VM.
+    #[tokio::test]
+    async fn run_lua_marks_its_process_span_as_error_on_a_mixed_batch_of_successes_and_failures() {
+        let mut components = Map::new();
+        components.insert(
+            "in".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            },
+        );
+        let script = "n = 0\n\
+                       function process(event)\n\
+                       \x20 n = n + 1\n\
+                       \x20 if n % 2 == 0 then error('boom') end\n\
+                       \x20 return event\n\
+                       end"
+        .to_string();
+        components.insert(
+            "enrich".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec!["in".to_string()],
+                kind: ComponentKind::Lua { script: script.clone(), interval: None },
+            },
+        );
+        components.insert(
+            "out".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                sources: vec!["enrich".to_string()],
+                kind: influxdb_out(),
+            },
+        );
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0), counter_event("hits", 2.0)],
+        };
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+        );
+        specs.insert("enrich".to_string(), NodeSpec::Lua { script, interval: None });
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx: result_tx }),
+                SinkQueueConfig::default(),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry: HashMap<String, Telemetry> = ["in", "enrich", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+        )
+        .await
+        .expect("should not hang")
+        .expect("should complete without error");
+
+        // The one surviving event (the odd-numbered call) still made it downstream -- this is a
+        // partial failure, not a total one.
+        let received =
+            result_rx.recv_timeout(Duration::from_secs(1)).expect("output should receive a batch");
+        assert_eq!(received.events.len(), 1, "only the non-erroring event should survive");
+
+        let events = registry.drain(0);
+        let span_event = find_process_span(&events, "enrich");
+        let record = span_event.span.as_ref().expect("span record");
+        assert_eq!(
+            record.status,
+            SpanStatus::Error,
+            "a mixed success/error batch must not drain as a successful span"
+        );
+    }
+
     /// A stateful script whose only growth happens inside `flush()` (nothing new arriving on the
     /// inbox between ticks) must not leave `logit.script.vm.memory` frozen or absent -- that's
     /// exactly the leak shape `ScriptWorker::used_memory`'s own doc comment names. Proven with no
@@ -2569,7 +2861,7 @@ mod tests {
         let telemetry = Telemetry::default();
         let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
         for batch in batches {
-            queue.push(batch).await;
+            queue.push(batch, TraceContext::default()).await;
         }
         queue.close();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2721,7 +3013,7 @@ mod tests {
         let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        queue.push(one_event_batch(1.0)).await;
+        queue.push(one_event_batch(1.0), TraceContext::default()).await;
 
         let queue_for_task = Arc::clone(&queue);
         // `write_loop` borrows `output` (it no longer owns it -- `run_output` does, normally);
@@ -2748,7 +3040,7 @@ mod tests {
         // above documents.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW).await;
 
-        queue.push(one_event_batch(2.0)).await;
+        queue.push(one_event_batch(2.0), TraceContext::default()).await;
         queue.close();
 
         let result = tokio::time::timeout(Duration::from_secs(5), handle)
@@ -2804,7 +3096,8 @@ mod tests {
             attempted: attempted_tx,
         };
 
-        queue.push(one_event_batch(1.0)).await; // attempt 1: Permanent -- sets streak_since
+        // attempt 1: Permanent -- sets streak_since
+        queue.push(one_event_batch(1.0), TraceContext::default()).await;
 
         let queue_for_task = Arc::clone(&queue);
         let handle = tokio::spawn(async move {
@@ -2824,10 +3117,12 @@ mod tests {
         // Well past where the window would trip -- but the *next* batch succeeds, which must
         // reset the streak before the window is ever checked again.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
-        queue.push(one_event_batch(2.0)).await; // attempt 2: success -- resets the streak
+        // attempt 2: success -- resets the streak
+        queue.push(one_event_batch(2.0), TraceContext::default()).await;
         attempted_rx.recv().await.expect("attempt 2 (succeeding) should have happened");
 
-        queue.push(one_event_batch(3.0)).await; // attempt 3: Permanent again -- a fresh streak
+        // attempt 3: Permanent again -- a fresh streak
+        queue.push(one_event_batch(3.0), TraceContext::default()).await;
         attempted_rx.recv().await.expect("attempt 3 (failing again) should have happened");
         queue.close();
 
@@ -2871,7 +3166,7 @@ mod tests {
         let (attempted_tx, mut attempted_rx) = mpsc::unbounded_channel();
         let output = AlwaysUnclassifiedFailure { attempted: attempted_tx };
 
-        queue.push(one_event_batch(1.0)).await;
+        queue.push(one_event_batch(1.0), TraceContext::default()).await;
         let queue_for_task = Arc::clone(&queue);
         let handle = tokio::spawn(async move {
             let mut output = output;
@@ -2889,7 +3184,7 @@ mod tests {
 
         // Well past the window, with nothing but this unclassified failure the whole time.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
-        queue.push(one_event_batch(2.0)).await;
+        queue.push(one_event_batch(2.0), TraceContext::default()).await;
         attempted_rx.recv().await.expect("a later attempt should have happened");
         queue.close();
 
@@ -2955,7 +3250,8 @@ mod tests {
             ..WriteLoopConfig::default()
         };
 
-        queue.push(one_event_batch(1.0)).await; // Permanent -- sets streak_since
+        // Permanent -- sets streak_since
+        queue.push(one_event_batch(1.0), TraceContext::default()).await;
         let queue_for_task = Arc::clone(&queue);
         let handle = tokio::spawn(async move {
             let mut output = output;
@@ -2978,11 +3274,12 @@ mod tests {
         // retry loop has already given up and committed batch 2 before batch 3 is pushed --
         // simpler and less brittle than trying to count exactly how many retries it took.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
-        queue.push(one_event_batch(2.0)).await;
+        queue.push(one_event_batch(2.0), TraceContext::default()).await;
         attempted_rx.recv().await.expect("batch 2's first attempt should have happened");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        queue.push(one_event_batch(3.0)).await; // Permanent again -- must be a fresh streak
+        // Permanent again -- must be a fresh streak
+        queue.push(one_event_batch(3.0), TraceContext::default()).await;
         attempted_rx.recv().await.expect("attempt 3 (Permanent) should have happened");
         queue.close();
 
@@ -3007,7 +3304,7 @@ mod tests {
 
         let telemetry = Telemetry::default();
         let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
-        queue.push(one_event_batch(1.0)).await;
+        queue.push(one_event_batch(1.0), TraceContext::default()).await;
         // Deliberately left open (not closed) -- shutdown grace must cut delivery off even while
         // the queue could still receive more, not just once it's known to be exhausted.
 
@@ -3699,5 +3996,254 @@ mod tests {
         let flushed = out_rx.recv().await.expect("the close-time flush should emit").context();
         assert_ne!(flushed.trace_id, ctx_a.trace_id);
         assert_ne!(flushed.trace_id, ctx_b.trace_id);
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Spans
+    // -------------------------------------------------------------------------------------------
+
+    fn span_events(events: &[Event]) -> impl Iterator<Item = &Event> {
+        events.iter().filter(|e| e.span.is_some())
+    }
+
+    fn span_op(event: &Event) -> Option<&str> {
+        event.attributes.get("logit.node.op").and_then(|v| v.as_str())
+    }
+
+    /// `run_transform`'s non-flush path mints its own child context (not through
+    /// `Fanout::send_with_context`) specifically so it can record a span under the same id it
+    /// sends with -- this pins the span half of that contract: parented on the incoming batch's
+    /// context, `SpanKind::Internal`, op `"process"`.
+    #[tokio::test]
+    async fn run_transform_records_one_span_per_incoming_batch_parented_on_that_batchs_context() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("t", "keep", "transform");
+        let (in_tx, in_rx) = mpsc::channel(1);
+        let (out_tx, out_rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![out_tx]);
+        let transform: Box<dyn Transform + Send> = Box::new(MutatingTransform);
+
+        let parent = TraceContext::new_root();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+        in_tx.send(Delivered::Owned(batch, parent)).await.expect("inbox should accept");
+        drop(in_tx);
+
+        run_transform(transform, in_rx, fanout, telemetry)
+            .await
+            .expect("should complete without error");
+        drop(out_rx);
+
+        let events = registry.drain(0);
+        let span_event = span_events(&events)
+            .find(|e| span_op(e) == Some("process"))
+            .expect("a process span should be recorded");
+        let record = span_event.span.as_ref().expect("span record");
+        assert_eq!(record.trace_id, parent.trace_id);
+        assert_eq!(record.parent_span_id, Some(parent.span_id));
+        assert_eq!(record.kind, SpanKind::Internal);
+    }
+
+    /// The context this PR's design settles: a span records the *node's visit*, not "whether it
+    /// produced anything" -- `WindowingTransform::process` always returns `None` (absorbed into
+    /// its own accumulator), and a process span should still be recorded for that visit.
+    #[tokio::test]
+    async fn a_transform_that_absorbs_every_event_still_records_a_span() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("agg", "aggregate", "transform");
+        let (in_tx, in_rx) = mpsc::channel(1);
+        let (out_tx, out_rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![out_tx]);
+        let transform: Box<dyn Transform + Send> = Box::new(WindowingTransform {
+            interval: Duration::from_secs(3600),
+            buffered: Vec::new(),
+        });
+
+        let parent = TraceContext::new_root();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+        in_tx.send(Delivered::Owned(batch, parent)).await.expect("inbox should accept");
+        drop(in_tx);
+
+        run_transform(transform, in_rx, fanout, telemetry)
+            .await
+            .expect("should complete without error");
+        drop(out_rx);
+
+        let events = registry.drain(0);
+        assert!(
+            span_events(&events).any(|e| span_op(e) == Some("process")),
+            "an absorbing transform should still record a process span, got: {events:?}"
+        );
+    }
+
+    /// The fan-out collision this PR's design explicitly rules out: one `send_with_own_context`
+    /// call, however many consumers it fans out to, records exactly one span for that emission --
+    /// the span belongs to the emission, not to any one edge.
+    #[tokio::test]
+    async fn a_fan_out_records_exactly_one_span_not_one_per_branch() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("t", "keep", "transform");
+        let (in_tx, in_rx) = mpsc::channel(1);
+        let (out_tx_a, out_rx_a) = mpsc::channel(1);
+        let (out_tx_b, out_rx_b) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![out_tx_a, out_tx_b]);
+        let transform: Box<dyn Transform + Send> = Box::new(MutatingTransform);
+
+        let parent = TraceContext::new_root();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+        in_tx.send(Delivered::Owned(batch, parent)).await.expect("inbox should accept");
+        drop(in_tx);
+
+        run_transform(transform, in_rx, fanout, telemetry)
+            .await
+            .expect("should complete without error");
+        drop(out_rx_a);
+        drop(out_rx_b);
+
+        let events = registry.drain(0);
+        let process_spans: Vec<&Event> =
+            span_events(&events).filter(|e| span_op(e) == Some("process")).collect();
+        assert_eq!(
+            process_spans.len(),
+            1,
+            "one fan-out emission should record exactly one span, got {process_spans:?}"
+        );
+    }
+
+    /// A local fake `Transform` whose `flush()` always emits two resource groups in one call --
+    /// standing in for `Aggregator`'s per-resource windowing
+    /// (`docs/adr/0008-aggregation-window-semantics.md`) -- used to prove `run_flush` sends every
+    /// group under one shared root context and unions every group's links onto one flush span.
+    struct MultiGroupFlushTransform {
+        links_for_first_group: Vec<SpanLink>,
+    }
+
+    impl Transform for MultiGroupFlushTransform {
+        fn process(&mut self, _resource: &Arc<Resource>, _event: Event) -> Option<Event> {
+            None
+        }
+
+        fn flush_interval(&self) -> Option<Duration> {
+            Some(Duration::from_secs(3600))
+        }
+
+        fn flush(&mut self, _now: i64) -> Vec<(Arc<Resource>, Vec<(Event, Vec<SpanLink>)>)> {
+            vec![
+                (
+                    Arc::new(Resource::default()),
+                    vec![(counter_event("a", 1.0), self.links_for_first_group.clone())],
+                ),
+                (Arc::new(Resource::default()), vec![(counter_event("b", 1.0), Vec::new())]),
+            ]
+        }
+    }
+
+    #[tokio::test]
+    async fn run_flush_attaches_the_links_the_transform_produced_to_one_flush_span() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("agg", "aggregate", "transform");
+        let (out_tx, out_rx) = mpsc::channel(2);
+        let fanout = Fanout::new(vec![out_tx]);
+        let link =
+            SpanLink { trace_id: [7; 16], span_id: [7; 8], attributes: logit_core::AttrMap::new() };
+        let mut transform = MultiGroupFlushTransform { links_for_first_group: vec![link.clone()] };
+
+        run_flush(&mut transform, &fanout, &telemetry).await;
+        drop(out_rx);
+
+        let events = registry.drain(0);
+        let span_event =
+            span_events(&events).find(|e| span_op(e) == Some("flush")).expect("a flush span");
+        let record = span_event.span.as_ref().expect("span record");
+        assert_eq!(record.links.len(), 1, "the one link the transform produced");
+        assert_eq!(record.links[0].trace_id, link.trace_id);
+        assert_eq!(record.links[0].span_id, link.span_id);
+    }
+
+    #[tokio::test]
+    async fn run_flush_sends_every_resource_group_under_one_root_context() {
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        let fanout = Fanout::new(vec![out_tx]);
+        let mut transform = MultiGroupFlushTransform { links_for_first_group: Vec::new() };
+
+        run_flush(&mut transform, &fanout, &Telemetry::default()).await;
+
+        let a = out_rx.recv().await.expect("the first group should send").context();
+        let b = out_rx.recv().await.expect("the second group should send").context();
+        assert_eq!(a, b, "both resource groups from one flush should share the identical context");
+    }
+
+    /// The whole point of instrumenting a sink: `write_loop`'s span is the only one that can
+    /// carry `SpanStatus::Error` and name the `Fault` that caused it.
+    #[tokio::test]
+    async fn write_loop_records_a_sink_span_with_error_status_and_a_fault_tag_on_a_failed_delivery()
+    {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
+        let (mut output, _handles) = faulty_output(Fault::Permanent, u32::MAX, false);
+        let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
+        queue.push(one_event_batch(1.0), TraceContext::new_root()).await;
+        queue.close();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        write_loop(
+            "out".to_string(),
+            &mut output,
+            queue,
+            telemetry.clone(),
+            WriteLoopConfig { retry: fast_retry_config(), ..WriteLoopConfig::default() },
+            shutdown_rx,
+        )
+        .await
+        .expect("one permanent failure alone should not end write_loop");
+
+        let events = registry.drain(0);
+        let span_event =
+            span_events(&events).find(|e| span_op(e) == Some("deliver")).expect("a sink span");
+        let record = span_event.span.as_ref().expect("span record");
+        assert_eq!(record.status, SpanStatus::Error);
+        assert_eq!(record.kind, SpanKind::Client);
+        assert_eq!(span_event.attributes.get("fault").and_then(|v| v.as_str()), Some("permanent"));
+    }
+
+    /// The propagation half of the same span: parented on the context the batch actually arrived
+    /// under (read from the `SinkQueue` entry `drain_inbox` pushed it with), not an unrelated one.
+    #[tokio::test]
+    async fn write_loop_records_a_sink_span_parented_on_the_incoming_batchs_context() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
+        let (mut output, _handles) = faulty_output(Fault::Clean, 0, false);
+        let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
+        let parent = TraceContext::new_root();
+        queue.push(one_event_batch(1.0), parent).await;
+        queue.close();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        write_loop(
+            "out".to_string(),
+            &mut output,
+            queue,
+            telemetry.clone(),
+            WriteLoopConfig::default(),
+            shutdown_rx,
+        )
+        .await
+        .expect("a successful delivery should not end write_loop with an error");
+
+        let events = registry.drain(0);
+        let span_event =
+            span_events(&events).find(|e| span_op(e) == Some("deliver")).expect("a sink span");
+        let record = span_event.span.as_ref().expect("span record");
+        assert_eq!(record.trace_id, parent.trace_id);
+        assert_eq!(record.parent_span_id, Some(parent.span_id));
+        assert_eq!(record.status, SpanStatus::Ok);
     }
 }
