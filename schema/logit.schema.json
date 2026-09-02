@@ -13,6 +13,56 @@
     }
   },
   "definitions": {
+    "BufferConfig": {
+      "description": "Per-sink delivery buffer (`docs/adr/0021-buffered-sink-delivery.md`). Meaningful only on a sink; graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind. Every field defaults, so an omitted `buffer:` block is exactly today's behavior.",
+      "type": "object",
+      "properties": {
+        "delivery": {
+          "description": "`None` -- the default -- means \"derive from the sink's own `duplicate_safe()` fact\" (`docs/adr/0021-buffered-sink-delivery.md`'s three-layer posture design). `Some(_)` overrides that default for this component specifically.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DeliveryPosture"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_batches": {
+          "default": 1024,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_bytes": {
+          "description": "Byte bound on the buffer's estimated heap footprint (`EventBatch::estimated_heap_bytes`), checked alongside `max_batches` -- whichever trips first. A quoted string in YAML -- `\"64MiB\"` or a plain `\"134217728\"` -- via the [`human_bytes`] codec below, string-only in both directions to match this field's published schema exactly (an unquoted number is rejected, not silently accepted).",
+          "default": "67108864",
+          "type": "string"
+        },
+        "overflow": {
+          "default": "block",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OverflowPolicy"
+            }
+          ]
+        },
+        "retry_budget": {
+          "default": "60s",
+          "type": "string"
+        },
+        "retry_max_delay": {
+          "default": "10s",
+          "type": "string"
+        },
+        "shutdown_grace": {
+          "default": "5s",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
     "Component": {
       "description": "One node in the pipeline's component graph. `sources` names the other components this one reads events from -- empty for a listener, required for everything else (enforced at validation time, not in this schema: which arity is legal depends on `kind`, not something a blanket `minItems` on this shared field can express). See `docs/design/pipeline-graph.md` for the full arity table and validation rules.",
       "type": "object",
@@ -569,6 +619,23 @@
         }
       ],
       "properties": {
+        "buffer": {
+          "description": "Per-sink delivery buffer (`docs/adr/0021-buffered-sink-delivery.md`). Meaningful only on a sink -- graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind. A sibling field of `kind`, not nested inside every sink `ComponentKind` variant, so a future fifth sink kind costs nothing extra here.",
+          "default": {
+            "delivery": null,
+            "max_batches": 1024,
+            "max_bytes": "67108864",
+            "overflow": "block",
+            "retry_budget": "60s",
+            "retry_max_delay": "10s",
+            "shutdown_grace": "5s"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/BufferConfig"
+            }
+          ]
+        },
         "sources": {
           "default": [],
           "type": "array",
@@ -577,6 +644,14 @@
           }
         }
       }
+    },
+    "DeliveryPosture": {
+      "description": "Whether re-delivering an already-delivered batch is safe for a sink's destination -- see `BufferConfig::delivery`. `logit-config`'s own copy, for the same crate-layout reason as [`OverflowPolicy`]; converted to `logit_pipeline::DeliveryPosture` in `crates/logit-cli/src/pipeline.rs`.",
+      "type": "string",
+      "enum": [
+        "at_least_once",
+        "at_most_once"
+      ]
     },
     "MetricSpec": {
       "description": "One `kv_metrics` entry: a metric `name`, an optional source `field`, and an optional `unit`. See `ComponentKind::KvMetrics` and `docs/adr/0014-kv-metrics-semantics.md`.",
@@ -605,6 +680,15 @@
           ]
         }
       }
+    },
+    "OverflowPolicy": {
+      "description": "What a sink's `SinkQueue` does once both its bounds (`max_batches`/`max_bytes`) are full. `logit-config`'s own copy -- `logit-config` must not depend on `logit-pipeline` (`docs/design/pipeline-graph.md`'s crate layout), so `crates/logit-cli/src/pipeline.rs` converts this to `logit_pipeline::OverflowPolicy` when building a `NodeSpec::Output`.",
+      "type": "string",
+      "enum": [
+        "block",
+        "drop_oldest",
+        "drop_newest"
+      ]
     },
     "StdioTarget": {
       "type": "string"
