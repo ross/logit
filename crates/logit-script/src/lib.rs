@@ -113,6 +113,17 @@ impl ScriptWorker {
     pub fn new(source: &str) -> Result<Self, ScriptError> {
         let lua = Lua::new_with(sandbox_libs(), LuaOptions::new())?;
         remove_unsandboxed_base_globals(&lua)?;
+        // Installed *before* the script's own top-level code runs, unlike `telemetry` below --
+        // `trace` is an unconditional global (`crate::trace`'s module doc), and a script's
+        // top-level code can run arbitrary statements, including caching a global into a local
+        // (`local ctx = trace`, a completely ordinary pattern) before `process`/`flush` are even
+        // defined. Lua resolves a *function body's* global lookup at call time, which is what
+        // lets `telemetry::install` (below, after `.exec()`) get away with installing late -- but
+        // a top-level assignment happens once, during `.exec()` itself, and captures whatever
+        // `trace` was at that instant. Installing after `.exec()` would make that instant "before
+        // `trace` exists," permanently capturing `nil` -- caught in review with a script using
+        // exactly that pattern (`local incoming_trace = trace`), which then failed on every event.
+        let trace_table = trace::install(&lua)?;
         lua.load(source).exec()?;
         let process_fn = match lua.globals().get::<_, LuaValue>("process")? {
             LuaValue::Function(f) => f,
@@ -130,7 +141,6 @@ impl ScriptWorker {
         // does via `MissingProcess`.
         let flush_fn: Option<mlua::Function> = lua.globals().get("flush")?;
         let flush = flush_fn.map(|f| lua.create_registry_value(f)).transpose()?;
-        let trace_table = trace::install(&lua)?;
         Ok(Self { lua, process, flush, trace_table, _not_send_sync: PhantomData })
     }
 
@@ -1285,6 +1295,32 @@ mod tests {
         assert_eq!(
             after.attributes.get("span_id").and_then(|v| v.as_str()),
             Some(&"cd".repeat(8)[..])
+        );
+    }
+
+    /// Regression: `trace` must be installed *before* the script's own top-level code runs
+    /// (`crate::trace`'s module doc). A top-level alias like this one runs once, during
+    /// `ScriptWorker::new`'s `Lua::load(source).exec()` -- if `trace` were installed after that
+    /// (as `telemetry` deliberately is), `incoming_trace` would capture `nil` permanently, and
+    /// every `process()` call would fail indexing it. Caught in review with exactly this script.
+    #[test]
+    fn a_top_level_alias_of_trace_sees_a_real_table_not_nil() {
+        let w = worker(
+            r#"
+            local incoming_trace = trace
+
+            function process(event)
+                event.attributes.trace_id = incoming_trace.trace_id
+                return event
+            end
+            "#,
+        );
+
+        let out = emitted(w.process(counter_event("hits", 1.0)).unwrap());
+        assert_eq!(
+            out.attributes.get("trace_id").and_then(|v| v.as_str()),
+            Some(&"0".repeat(32)[..]),
+            "a top-level alias of `trace` should see the installed table, not nil"
         );
     }
 }
