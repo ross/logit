@@ -54,6 +54,25 @@ impl DdSketch {
         self.0.add(value);
     }
 
+    /// Adds `value` as `count` weighted samples -- e.g. what a sampled statsd timing/histogram
+    /// line needs to extrapolate `100|ms|@0.1` into ten samples rather than one
+    /// (`crates/logit-inputs/src/statsd.rs`). Implemented as a loop calling `add` `count` times,
+    /// deliberately, not by building a single-bucket sketch and `merge`-ing it in via binary
+    /// doubling: `sketches_ddsketch::DDSketch` has no native weighted add, and the merge-based
+    /// alternative allocates a fresh sketch on every merge step (O(log count) allocations),
+    /// which would show up on `statsd_decode_one_line`'s exact-equality allocation assertion in
+    /// `crates/logit-bench/tests/allocations.rs` -- `AGENTS.md` forbids relaxing that kind of
+    /// assertion to a `<=` bound. Repeated `add` allocates the bin `Vec` once, the first time any
+    /// sample ever lands in this sketch, and every call after that only touches an existing bin,
+    /// because the bin index `add` computes is a pure function of `value` alone -- so this loop
+    /// costs zero additional allocations over a single `add`, no matter how large `count` is.
+    /// `count == 0` is a no-op.
+    pub fn add_weighted(&mut self, value: f64, count: u64) {
+        for _ in 0..count {
+            self.0.add(value);
+        }
+    }
+
     /// Merges `other` into `self`. Every `DdSketch` in this codebase is built with
     /// `Config::defaults()` (via [`DdSketch::new`]), so the mismatched-config failure case this
     /// can't-actually-happen -- if that stops being true, this needs a real `Result`.
@@ -85,4 +104,72 @@ impl Default for DdSketch {
 pub struct HyperLogLog {
     // TODO: wrap a real HLL implementation.
     _todo: (),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `add_weighted(v, 1)` is the `count == 1` case a sample-rate-1 statsd line always takes --
+    /// it must be indistinguishable from the plain `add(v)` path it replaces there.
+    #[test]
+    fn add_weighted_with_count_one_matches_plain_add() {
+        let mut weighted = DdSketch::new();
+        weighted.add_weighted(42.0, 1);
+
+        let mut plain = DdSketch::new();
+        plain.add(42.0);
+
+        assert_eq!(weighted.count(), plain.count());
+        assert_eq!(weighted.quantile(0.5), plain.quantile(0.5));
+        assert_eq!(weighted.quantile(0.99), plain.quantile(0.99));
+    }
+
+    /// `add_weighted(v, 100)` extrapolates one sample into a hundred identical ones -- `count()`
+    /// reports the extrapolated population, and every quantile (not just the median) lands within
+    /// `DdSketch`'s documented 1% relative-error bound of `v`, since all 100 samples fall in the
+    /// same bucket. Not *exactly* `v`: DDSketch is a bucketed approximation by construction --
+    /// `quantile` returns a bucket boundary estimate, not the stored value -- so even a sketch fed
+    /// nothing but identical samples doesn't round-trip them exactly.
+    #[test]
+    fn add_weighted_with_large_count_extrapolates_count_and_every_quantile() {
+        let mut sketch = DdSketch::new();
+        sketch.add_weighted(7.5, 100);
+
+        assert_eq!(sketch.count(), 100);
+        for q in [0.0, 0.1, 0.5, 0.9, 0.99, 1.0] {
+            let value = sketch.quantile(q).expect("quantile should be present");
+            let relative_error = (value - 7.5).abs() / 7.5;
+            assert!(
+                relative_error <= 0.01,
+                "quantile({q}) = {value} is more than 1% away from the true value 7.5"
+            );
+        }
+    }
+
+    /// `add_weighted(v, 0)` must be a true no-op -- the clamp in `statsd.rs` never produces a
+    /// zero weight, but the method's own contract should hold regardless of the caller.
+    #[test]
+    fn add_weighted_with_zero_count_is_a_no_op() {
+        let mut sketch = DdSketch::new();
+        sketch.add_weighted(1.0, 0);
+        assert_eq!(sketch.count(), 0);
+        assert_eq!(sketch.quantile(0.5), None);
+    }
+
+    /// A weighted add still respects `Config::defaults()`'s documented 1% relative-accuracy bound
+    /// (`sketches_ddsketch::Config::defaults()`: alpha = 0.01) -- extrapolating via repeated `add`
+    /// must not degrade the sketch's error guarantee versus the same number of genuine samples.
+    #[test]
+    fn add_weighted_quantile_stays_within_the_configured_relative_error_bound() {
+        let mut sketch = DdSketch::new();
+        sketch.add_weighted(200.0, 50);
+
+        let q = sketch.quantile(0.5).expect("quantile should be present");
+        let relative_error = (q - 200.0).abs() / 200.0;
+        assert!(
+            relative_error <= 0.01,
+            "quantile {q} is more than 1% away from the true value 200.0"
+        );
+    }
 }

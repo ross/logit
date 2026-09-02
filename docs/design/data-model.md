@@ -138,6 +138,14 @@ downstream, and that has to be correct, not approximate-and-hope:
 - `Set` uses a **HyperLogLog**, which merges (union) exactly by construction.
 - `Counter`/`Gauge` merge trivially (sum / last-write-wins by timestamp).
 
+A `Distribution`'s `count()` becomes a **population estimate**, not a count of received
+datagrams, wherever sample-rate extrapolation is in play: `statsd_in`'s `ms`/`h`/`d` decoding
+(`crates/logit-inputs/src/statsd.rs`) inserts `(1.0 / sample_rate).round()` weighted samples per
+line via `DdSketch::add_weighted`, so a sketch fed by `100|ms|@0.1` reports `count() == 10` even
+though only one datagram arrived. This is the same relationship `Counter(value / sample_rate)`
+already has for counters, made explicit for distributions too — `count` answers "how many events
+this represents," not "how many datagrams I received."
+
 ## What lives outside `Event`
 
 Two things are deliberately *not* part of the per-event type, because putting them there would

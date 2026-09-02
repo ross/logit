@@ -57,7 +57,10 @@ already built that have a known, accepted rough edge.
   decoder still has no representation for "this is a delta, not an absolute value" to hand it, and
   any leading sign is ambiguous with a plain negative number at the wire level regardless. Relative
   gauges are explicitly rejected with a clear decode error rather than silently miscoded
-  (`crates/logit-inputs/src/statsd.rs`).
+  (`crates/logit-inputs/src/statsd.rs`). (The sample-rate-extrapolation half of this entry is now
+  closed: `ms`/`h`/`d` lines extrapolate via `DdSketch::add_weighted`, clamped at
+  `MAX_SAMPLE_WEIGHT`. The relative-gauge half is still open; this entry's text will be rewritten
+  once both halves land.)
 - **`eprintln!` instead of a real diagnostics facility** — every component's diagnostic now goes
   through `logit_core::diag::Diagnostics` ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md)),
   which closes the two concrete hazards this entry used to name: every message is prefixed with its

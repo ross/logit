@@ -48,6 +48,17 @@ pub const NGINX_SYSLOG_LINE: &str = concat!(
 /// (`docs/design/memory.md`'s interner section).
 pub const STATSD_LINE: &str = "page.views:1|c|@0.5|#env:prod,region:us-east-1,service:web";
 
+/// A statsd distribution (`ms`) line at the default, unsampled rate -- the baseline
+/// [`STATSD_SAMPLED_DISTRIBUTION_LINE`]'s allocation count is measured against: decode-time
+/// sample-rate extrapolation (`DdSketch::add_weighted`, `crates/logit-inputs/src/statsd.rs`) must
+/// add zero allocations over this unsampled case, which is the entire justification for
+/// implementing `add_weighted` as a repeated `add` rather than a `merge` of a cloned sketch.
+pub const STATSD_DISTRIBUTION_LINE: &str = "request.latency:120|ms";
+
+/// The same line as [`STATSD_DISTRIBUTION_LINE`], sampled at `@0.1` -- ten weighted samples
+/// instead of one, exercising `DdSketch::add_weighted`'s repeated-`add` loop on the decode path.
+pub const STATSD_SAMPLED_DISTRIBUTION_LINE: &str = "request.latency:120|ms|@0.1";
+
 /// `count` copies of [`NGINX_SYSLOG_LINE`] newline-separated, as one UDP datagram would arrive.
 ///
 /// `count = 1` is the honest single-line cost. Larger counts matter because the decoder amortizes
@@ -61,6 +72,16 @@ pub fn nginx_syslog_datagram(count: usize) -> Bytes {
 /// `count` copies of [`STATSD_LINE`], newline-separated.
 pub fn statsd_datagram(count: usize) -> Bytes {
     join_lines(STATSD_LINE, count)
+}
+
+/// `count` copies of [`STATSD_DISTRIBUTION_LINE`], newline-separated.
+pub fn statsd_distribution_datagram(count: usize) -> Bytes {
+    join_lines(STATSD_DISTRIBUTION_LINE, count)
+}
+
+/// `count` copies of [`STATSD_SAMPLED_DISTRIBUTION_LINE`], newline-separated.
+pub fn statsd_sampled_distribution_datagram(count: usize) -> Bytes {
+    join_lines(STATSD_SAMPLED_DISTRIBUTION_LINE, count)
 }
 
 fn join_lines(line: &str, count: usize) -> Bytes {

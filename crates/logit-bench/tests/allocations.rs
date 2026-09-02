@@ -114,6 +114,44 @@ fn statsd_decode_one_line() {
     expect_allocs("statsd_in: decode 1 line", stats, 2);
 }
 
+/// The entire justification for `DdSketch::add_weighted`'s repeated-`add` implementation
+/// (`crates/logit-core/src/metric.rs`) instead of a `merge`-based binary-doubling alternative:
+/// sample-rate extrapolation on the decode path must add zero allocations over the unsampled
+/// case. This pins the unsampled baseline; [`statsd_decode_one_sampled_distribution_line`] pins
+/// the sampled case at the same count.
+#[test]
+fn statsd_decode_one_distribution_line() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_distribution_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    expect_allocs("statsd_in: decode 1 distribution line", stats, 3);
+}
+
+/// Same line as [`statsd_decode_one_distribution_line`], sampled at `@0.1` -- ten weighted
+/// `DdSketch::add_weighted` samples instead of one unweighted `add`. Must match that test's
+/// allocation count exactly: the bin `Vec` a `DdSketch` allocates on its first sample is the same
+/// single allocation whether that first sample is inserted once or ten times, because the bin
+/// index `add` computes is a pure function of the value, not of how many times it's called.
+#[test]
+fn statsd_decode_one_sampled_distribution_line() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_sampled_distribution_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    match &batch.events[0].metrics[0].kind {
+        logit_core::MetricKind::Distribution(sketch) => {
+            assert_eq!(sketch.count(), 10, "@0.1 should extrapolate to 10 weighted samples")
+        }
+        other => panic!("expected Distribution, got {other:?}"),
+    }
+    expect_allocs("statsd_in: decode 1 sampled distribution line", stats, 3);
+}
+
 /// The logs-only workload `docs/design/memory.md` §0 names as unmeasured: a plain-text syslog
 /// line with no JSON body anywhere in the pipeline (`fixtures::SSHD_SYSLOG_LINE`). Same zero-copy
 /// decode as [`syslog_decode_one_line`] -- one allocation for the `Vec<Event>`, nothing per

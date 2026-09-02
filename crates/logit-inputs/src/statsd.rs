@@ -64,8 +64,9 @@ impl StatsdInput {
 impl Input for StatsdInput {
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         let socket = UdpSocket::bind(&self.bind).await?;
-        let mut decoder =
-            StatsdDecoder::new(Arc::new(Resource::default())).with_diagnostics(self.diag.clone());
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()))
+            .with_diagnostics(self.diag.clone())
+            .with_telemetry(self.telemetry.clone());
         // The largest possible UDP payload (65535 minus the 8-byte UDP header).
         let mut buf = vec![0u8; 65_507];
         loop {
@@ -95,15 +96,25 @@ impl Input for StatsdInput {
 pub struct StatsdDecoder {
     resource: Arc<Resource>,
     diag: Diagnostics,
+    /// Threaded down into `build_event` so a clamped sample-rate extrapolation
+    /// (`MAX_SAMPLE_WEIGHT`) has somewhere real to report -- see `with_telemetry`.
+    telemetry: Telemetry,
 }
 
 impl StatsdDecoder {
     pub fn new(resource: Arc<Resource>) -> Self {
-        Self { resource, diag: Diagnostics::default() }
+        Self { resource, diag: Diagnostics::default(), telemetry: Telemetry::default() }
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
+        self
+    }
+
+    /// Attaches a telemetry handle -- see the `telemetry` field's doc comment. Mirrors
+    /// `with_diagnostics`/`StatsdInput::with_telemetry`.
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
         self
     }
 }
@@ -123,7 +134,7 @@ impl Decoder for StatsdDecoder {
             // datagram -- StatsD clients routinely pack several independent metrics into one
             // packet, so treating the datagram as atomic would let a single bad line take down
             // everything alongside it. Isolate per line: keep what parsed, report what didn't.
-            match parse_line(&bytes, text, line, timestamp) {
+            match parse_line(&bytes, text, line, timestamp, &mut self.diag, &self.telemetry) {
                 Ok(mut line_events) => events.append(&mut line_events),
                 Err(err) => {
                     self.diag.warn_throttled("bad_line", err);
@@ -163,6 +174,8 @@ fn parse_line(
     text: &str,
     line: &str,
     timestamp: i64,
+    diag: &mut Diagnostics,
+    telemetry: &Telemetry,
 ) -> Result<Vec<Event>, CodecError> {
     let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
 
@@ -209,11 +222,29 @@ fn parse_line(
     values_part
         .split(':')
         .map(|raw_value| {
-            build_event(name, raw_value, type_part, sample_rate, &attributes, timestamp, line)
+            build_event(
+                name,
+                raw_value,
+                type_part,
+                sample_rate,
+                &attributes,
+                timestamp,
+                line,
+                diag,
+                telemetry,
+            )
         })
         .collect()
 }
 
+/// Caps the number of weighted samples one sampled statsd line can insert into a `DdSketch`.
+/// This is a denial-of-service guard, **not** a performance knob: without it, a single crafted
+/// `@0.0000001` sample rate on one UDP datagram turns into a ten-million-iteration loop per line.
+/// A fixed constant, not configurable, matching `crates/logit-transforms/src/aggregate.rs`'s
+/// stated stance on `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`.
+const MAX_SAMPLE_WEIGHT: u64 = 1000;
+
+#[allow(clippy::too_many_arguments)]
 fn build_event(
     name: &str,
     raw_value: &str,
@@ -222,6 +253,8 @@ fn build_event(
     attributes: &AttrMap,
     timestamp: i64,
     line: &str,
+    diag: &mut Diagnostics,
+    telemetry: &Telemetry,
 ) -> Result<Event, CodecError> {
     let malformed = |what: &str| CodecError::Malformed(format!("{what}: {line:?}"));
 
@@ -244,21 +277,45 @@ fn build_event(
                     "relative gauge adjustments ('+'/'-') are not implemented yet",
                 ));
             }
+            // `sample_rate` is deliberately ignored here (and below, for `s`): a gauge/set value
+            // is absolute, not a count of occurrences, so there is nothing to extrapolate --
+            // unlike `c`/`ms`/`h`/`d`, "1 in N samples reported this value" doesn't imply
+            // anything about the other N-1, and pretending otherwise would be meaningless, not
+            // just a missed opportunity.
             let value = parse_finite_value(raw_value, "gauge", line)?;
             MetricKind::Gauge(value)
         }
         "ms" | "h" | "d" => {
             let value = parse_finite_value(raw_value, "timing/histogram", line)?;
-            // TODO: DDSketch has no native weighted-add, so a sample rate < 1 here is decoded as
-            // a single unweighted sample rather than extrapolated -- a smaller gap in practice
-            // than for counters, since timings/histograms are rarely sampled in DogStatsD
-            // clients, but a gap nonetheless.
+            // Decode-time extrapolation, matching what `c` already does above
+            // (`Counter(value / sample_rate)`): a sampled distribution can't scale a single
+            // stored number the way a counter can, since `DdSketch` has no notion of "this one
+            // sample represents N" -- so the extrapolation has to happen as N actual samples
+            // instead. `parse_line` already guarantees `sample_rate` is finite and in `(0, 1]`
+            // before this is ever reached, so `1.0 / sample_rate` can't be NaN/inf/negative here.
+            let weight = (1.0 / sample_rate).round().max(1.0) as u64;
+            let weight = if weight > MAX_SAMPLE_WEIGHT {
+                // See `MAX_SAMPLE_WEIGHT`'s doc comment: this is a DoS guard, not a tuning knob.
+                diag.warn_throttled(
+                    "sample_rate_clamped",
+                    format_args!(
+                        "sample rate @{sample_rate} on {line:?} implies a weight of {weight}, \
+                         clamped to {MAX_SAMPLE_WEIGHT}"
+                    ),
+                );
+                telemetry.count("logit.input.samples.clamped", 1.0, &[]);
+                MAX_SAMPLE_WEIGHT
+            } else {
+                weight
+            };
             let mut sketch = DdSketch::new();
-            sketch.add(value);
+            sketch.add_weighted(value, weight);
             MetricKind::Distribution(sketch)
         }
         "s" => {
-            // See the note on `HyperLogLog` in logit-core::metric: not implemented yet.
+            // See the note on `HyperLogLog` in logit-core::metric: not implemented yet. When it
+            // is, `sample_rate` should stay ignored here too, for the same reason it's ignored on
+            // `g` above: a set membership is not a count to extrapolate.
             return Err(malformed("set metrics ('s') are not implemented yet"));
         }
         other => return Err(malformed(&format!("unknown metric type '{other}'"))),
@@ -293,6 +350,7 @@ fn parse_finite_value(raw_value: &str, what: &str, line: &str) -> Result<f64, Co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logit_core::Registry;
 
     fn decode(line: &str) -> Vec<Event> {
         let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
@@ -317,7 +375,9 @@ mod tests {
     fn parse_err(line: &str) -> CodecError {
         let bytes = Bytes::from(line.to_string());
         let text = std::str::from_utf8(&bytes).unwrap();
-        parse_line(&bytes, text, text, 0).expect_err("expected this line to be rejected")
+        let mut diag = Diagnostics::default();
+        parse_line(&bytes, text, text, 0, &mut diag, &Telemetry::default())
+            .expect_err("expected this line to be rejected")
     }
 
     #[test]
@@ -411,6 +471,103 @@ mod tests {
             }
             other => panic!("expected Distribution, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sampled_distribution_at_half_rate_inserts_two_weighted_samples() {
+        let metric = only_metric(decode("x:100|ms|@0.5"));
+        match metric.kind {
+            MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 2),
+            other => panic!("expected Distribution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sampled_distribution_at_tenth_rate_inserts_ten_weighted_samples() {
+        let metric = only_metric(decode("x:100|ms|@0.1"));
+        match metric.kind {
+            MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 10),
+            other => panic!("expected Distribution, got {other:?}"),
+        }
+    }
+
+    /// The most important test in this set: an explicit `@1` (the default, unsampled rate) must
+    /// decode a distribution exactly as it always has -- one sample, not extrapolated -- so this
+    /// change is additive only for genuinely sampled lines. `statsd_decode_one_line` in
+    /// `crates/logit-bench/tests/allocations.rs` pins the same claim at the allocation level.
+    #[test]
+    fn unsampled_distribution_still_inserts_exactly_one_sample() {
+        let metric = only_metric(decode("x:100|ms|@1"));
+        match metric.kind {
+            MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 1),
+            other => panic!("expected Distribution, got {other:?}"),
+        }
+    }
+
+    /// A weighted extrapolation is still a real DDSketch, subject to `Config::defaults()`'s 1%
+    /// relative-accuracy bound (`crates/logit-core/src/metric.rs`) -- pins that decode-time
+    /// extrapolation doesn't degrade quantile accuracy versus an unsampled line.
+    #[test]
+    fn sampled_distribution_quantile_stays_within_the_configured_relative_error_bound() {
+        let metric = only_metric(decode("x:100|ms|@0.1"));
+        match metric.kind {
+            MetricKind::Distribution(sketch) => {
+                let q = sketch.quantile(0.5).expect("quantile should be present");
+                let relative_error = (q - 100.0).abs() / 100.0;
+                assert!(
+                    relative_error <= 0.01,
+                    "quantile {q} is more than 1% away from the true value 100.0"
+                );
+            }
+            other => panic!("expected Distribution, got {other:?}"),
+        }
+    }
+
+    /// A sample rate implying a weight above `MAX_SAMPLE_WEIGHT` (the DoS guard, not a tuning
+    /// knob -- see its doc comment) clamps rather than looping unbounded, and reports the clamp
+    /// on both the throttled diagnostic and a dedicated counter, following the precedent set by
+    /// `logit_core::diag`'s `every_warn_throttled_occurrence_increments_the_metric_...` test for
+    /// asserting a diagnostic fired via its telemetry mirror rather than capturing stderr.
+    #[test]
+    fn extreme_sample_rate_clamps_the_weight_and_reports_it() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let diag = Diagnostics::new("statsd_in").with_telemetry(telemetry.clone());
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()))
+            .with_diagnostics(diag)
+            .with_telemetry(telemetry);
+
+        let events = decoder
+            .decode(Bytes::from("x:100|ms|@0.0000001".to_string()))
+            .expect("decode should succeed")
+            .events;
+        let metric = only_metric(events);
+        match metric.kind {
+            MetricKind::Distribution(sketch) => {
+                assert_eq!(
+                    sketch.count(),
+                    MAX_SAMPLE_WEIGHT as usize,
+                    "weight should clamp to MAX_SAMPLE_WEIGHT"
+                );
+            }
+            other => panic!("expected Distribution, got {other:?}"),
+        }
+
+        let find_counter = |name: &str| -> Option<f64> {
+            registry.drain(0).into_iter().find_map(|e| {
+                e.metrics.iter().find_map(|m| match &m.kind {
+                    MetricKind::Counter(v) if logit_core::interner::resolve(m.name) == name => {
+                        Some(*v)
+                    }
+                    _ => None,
+                })
+            })
+        };
+        assert_eq!(
+            find_counter("logit.input.samples.clamped"),
+            Some(1.0),
+            "clamping should fire logit.input.samples.clamped exactly once"
+        );
     }
 
     #[test]
