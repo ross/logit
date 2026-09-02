@@ -175,26 +175,23 @@ fn build_spec(
         .map(|r| r.telemetry_for(id, component.kind_name(), component.role().as_str()))
         .unwrap_or_default();
     let spec = match &component.kind {
-        // TODO(docs/adr/0022-decoupled-listener-io.md, workstream F): `InputRuntimeConfig`
-        // should derive its `shutdown_grace` from the component's `receive:` block, the same way
-        // `queue_config`/`write_config` below derive from `buffer:` -- `logit_config::ReceiveConfig`
-        // doesn't exist yet, so every listener gets the default (`Duration::ZERO`, i.e. no change
-        // from today's cancel-by-drop) until that workstream lands.
         StatsdIn { bind } => NodeSpec::Input(
             Box::new(
                 StatsdInput::new(bind.clone())
                     .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                    .with_telemetry(telemetry.clone()),
+                    .with_telemetry(telemetry.clone())
+                    .with_receive(receive_config(&component.receive)),
             ),
-            InputRuntimeConfig::default(),
+            input_runtime_config(&component.receive),
         ),
         SyslogIn { bind } => NodeSpec::Input(
             Box::new(
                 SyslogInput::new(bind.clone())
                     .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                    .with_telemetry(telemetry.clone()),
+                    .with_telemetry(telemetry.clone())
+                    .with_receive(receive_config(&component.receive)),
             ),
-            InputRuntimeConfig::default(),
+            input_runtime_config(&component.receive),
         ),
         Internal { interval } => {
             let registry = registry
@@ -206,7 +203,7 @@ fn build_spec(
                         .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                         .with_telemetry(telemetry.clone()),
                 ),
-                InputRuntimeConfig::default(),
+                input_runtime_config(&component.receive),
             )
         }
 
@@ -313,6 +310,31 @@ fn overflow_policy(cfg: logit_config::OverflowPolicy) -> logit_pipeline::Overflo
     }
 }
 
+/// Builds a UDP listener's `UdpListenerConfig` from its `ReceiveConfig`
+/// (`docs/adr/0022-decoupled-listener-io.md`) -- the receive-side mirror of `queue_config`/
+/// `write_config` above.
+fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::UdpListenerConfig {
+    logit_inputs::udp::UdpListenerConfig {
+        max_datagrams: receive.max_datagrams,
+        max_bytes: receive.max_bytes,
+        overflow: overflow_policy(receive.overflow),
+        receive_buffer_bytes: receive.receive_buffer_bytes,
+        batch_max_events: receive.batch_max_events,
+        batch_max_bytes: receive.batch_max_bytes,
+        batch_flush_interval: receive.batch_flush_interval,
+        shutdown_grace: receive.shutdown_grace,
+    }
+}
+
+/// Builds any listener's `InputRuntimeConfig` from its `ReceiveConfig` -- safe to call
+/// unconditionally for every `NodeSpec::Input` arm, including `internal`: graph validation's rule
+/// 16 already guarantees a non-datagram-listener's `receive` is `ReceiveConfig::default()` by the
+/// time a resolved `Graph` reaches `build_spec`, so `internal` always gets
+/// `InputRuntimeConfig::default()` (`Duration::ZERO` -- unchanged cancel-by-drop) here regardless.
+fn input_runtime_config(receive: &logit_config::ReceiveConfig) -> InputRuntimeConfig {
+    InputRuntimeConfig { shutdown_grace: receive.shutdown_grace }
+}
+
 fn delivery_posture(cfg: logit_config::DeliveryPosture) -> logit_pipeline::DeliveryPosture {
     match cfg {
         logit_config::DeliveryPosture::AtLeastOnce => logit_pipeline::DeliveryPosture::AtLeastOnce,
@@ -344,6 +366,7 @@ mod tests {
     fn statsd_in() -> Component {
         Component {
             buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
             kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
         }
@@ -352,6 +375,7 @@ mod tests {
     fn influxdb_out(sources: Vec<&str>) -> Component {
         Component {
             buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
             sources: sources.into_iter().map(String::from).collect(),
             kind: ComponentKind::InfluxDbOut {
                 url: "http://localhost:8086".to_string(),
@@ -400,6 +424,7 @@ mod tests {
                 "branch_a",
                 Component {
                     buffer: logit_config::BufferConfig::default(),
+                    receive: logit_config::ReceiveConfig::default(),
                     sources: vec!["in".to_string()],
                     kind: ComponentKind::Lua { script: "".to_string(), interval: None },
                 },
@@ -408,6 +433,7 @@ mod tests {
                 "branch_b",
                 Component {
                     buffer: logit_config::BufferConfig::default(),
+                    receive: logit_config::ReceiveConfig::default(),
                     sources: vec!["in".to_string()],
                     kind: ComponentKind::Lua { script: "".to_string(), interval: None },
                 },
@@ -425,6 +451,7 @@ mod tests {
                 "enrich",
                 Component {
                     buffer: logit_config::BufferConfig::default(),
+                    receive: logit_config::ReceiveConfig::default(),
                     sources: vec!["in".to_string()],
                     kind: ComponentKind::LuaFile {
                         lua_file: "does-not-exist.lua".to_string(),
@@ -456,6 +483,7 @@ mod tests {
                 "self",
                 Component {
                     buffer: logit_config::BufferConfig::default(),
+                    receive: logit_config::ReceiveConfig::default(),
                     sources: vec![],
                     kind: ComponentKind::Internal { interval: Duration::from_secs(10) },
                 },
@@ -474,6 +502,7 @@ mod tests {
         let registry = Registry::new();
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Internal { interval: Duration::from_secs(10) },
@@ -488,6 +517,7 @@ mod tests {
     fn build_spec_builds_an_aggregate_transform() {
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Aggregate { interval: Duration::from_secs(10) },
@@ -504,6 +534,7 @@ mod tests {
     fn build_spec_builds_an_influxdb_sink() {
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec![],
             kind: ComponentKind::InfluxDbOut {
@@ -534,6 +565,7 @@ mod tests {
                 retry_max_delay: Duration::from_secs(20),
                 shutdown_grace: Duration::from_secs(10),
             },
+            receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec![],
             kind: ComponentKind::InfluxDbOut {
@@ -569,6 +601,7 @@ mod tests {
     fn build_spec_builds_a_json_transform() {
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Json { skip_to_brace: true },
@@ -582,6 +615,7 @@ mod tests {
     fn stdio_out_component(target: StdioTarget) -> ResolvedComponent {
         ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec![],
             kind: ComponentKind::StdioOut { target },
@@ -668,6 +702,7 @@ mod tests {
     fn build_spec_builds_a_kv_metrics_transform() {
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec!["out".to_string()],
             kind: ComponentKind::KvMetrics {
@@ -690,6 +725,7 @@ mod tests {
     fn build_spec_builds_a_keep_transform() {
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Keep { fields: vec!["status".to_string()] },
@@ -704,6 +740,7 @@ mod tests {
     fn build_spec_builds_a_remove_transform() {
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Remove { fields: vec!["client_ip".to_string()] },

@@ -30,12 +30,23 @@
 //!     rather than a meaningful setting silently ignored.
 //! 15. A sink's `buffer.max_batches` or `buffer.max_bytes` of `0` is rejected -- an impossible
 //!     bound (no batch could ever be queued) rather than a small one.
+//! 16. A non-default `receive:` block is rejected on any kind that is not a datagram listener
+//!     (today `statsd_in`/`syslog_in`) -- `receive:` (`docs/adr/0022-decoupled-listener-io.md`)
+//!     configures a listener's socket-side receive queue, which only a datagram listener has.
+//!     Deliberately **not** `role(&kind) != Role::Listener`: `internal` is a listener by role but
+//!     has no socket, no queue, and no decoder, so `receive:` on it would be a silently-ignored
+//!     setting -- exactly what this rule exists to catch on the sink side (rule 14). A future
+//!     listener kind rejects `receive:` until it is actually wired to the UDP driver.
+//! 17. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, or
+//!     `receive.batch_max_events` of `0` is rejected -- an impossible bound, the twin of rule 15.
+//!     `receive.batch_flush_interval: 0s` is **not** rejected: it means "no flush timer," a
+//!     meaningful setting, unlike the count bounds.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
 //! it is required (by 7) to have a consumer, so the chain can only terminate at a sink.
 
-use logit_config::{BufferConfig, Component, ComponentKind, Config};
+use logit_config::{BufferConfig, Component, ComponentKind, Config, ReceiveConfig};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
@@ -176,6 +187,10 @@ pub struct ResolvedComponent {
     /// sink-only by [`resolve`] (rule 14); meaningless on any other role, so a non-sink component's
     /// value here is always [`BufferConfig::default`] once resolution has succeeded.
     pub buffer: BufferConfig,
+    /// Per-listener receive queue/batching config (`docs/adr/0022-decoupled-listener-io.md`).
+    /// Validated as datagram-listener-only by [`resolve`] (rule 16); meaningless on any other
+    /// kind, so its value here is always [`ReceiveConfig::default`] once resolution has succeeded.
+    pub receive: ReceiveConfig,
 }
 
 impl ResolvedComponent {
@@ -362,14 +377,64 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 16: `receive:` is a datagram-listener-only concept -- see this module's own doc
+    // comment on why this checks a dedicated predicate rather than `role() == Role::Listener`
+    // (which would wrongly also permit `internal`).
+    for (id, component) in &components {
+        if component.receive != ReceiveConfig::default() && !is_datagram_listener(&component.kind) {
+            anyhow::bail!(
+                "component '{id}': 'receive' is only meaningful on a datagram listener \
+                 (statsd_in, syslog_in), but '{id}' is a {}",
+                role(&component.kind).as_str()
+            );
+        }
+    }
+
+    // Rule 17: the twin of rule 15, for a listener's receive queue -- `0` on any of the three
+    // count/byte bounds is an impossible bound, never a small one. `batch_flush_interval: 0s` is
+    // deliberately not checked here: zero there means "no timer," a meaningful setting.
+    for (id, component) in &components {
+        if is_datagram_listener(&component.kind) {
+            if component.receive.max_datagrams == 0 {
+                anyhow::bail!(
+                    "component '{id}': 'receive.max_datagrams' must be at least 1 -- 0 means no \
+                     datagram can ever be queued"
+                );
+            }
+            if component.receive.max_bytes == 0 {
+                anyhow::bail!(
+                    "component '{id}': 'receive.max_bytes' must be at least 1 -- 0 means no \
+                     datagram can ever be queued"
+                );
+            }
+            if component.receive.batch_max_events == 0 {
+                anyhow::bail!(
+                    "component '{id}': 'receive.batch_max_events' must be at least 1 -- 0 means \
+                     no datagram could ever be accumulated"
+                );
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
-        let Component { sources, buffer, kind } = component;
+        let Component { sources, buffer, receive, kind } = component;
         let node_consumers = consumers.remove(&id).unwrap_or_default();
-        resolved.insert(id, ResolvedComponent { sources, consumers: node_consumers, kind, buffer });
+        resolved.insert(
+            id,
+            ResolvedComponent { sources, consumers: node_consumers, kind, buffer, receive },
+        );
     }
 
     Ok(Graph { components: resolved, topological_order })
+}
+
+/// The predicate rule 16 needs: which `ComponentKind`s the UDP listener driver
+/// (`docs/adr/0022-decoupled-listener-io.md`, `logit-inputs::udp::UdpListener`) actually backs.
+/// Kept explicit rather than derived from [`Role`] -- see rule 16's own doc comment -- so a new
+/// listener kind rejects `receive:` until it is actually wired to that driver.
+fn is_datagram_listener(kind: &ComponentKind) -> bool {
+    matches!(kind, ComponentKind::StatsdIn { .. } | ComponentKind::SyslogIn { .. })
 }
 
 /// Kahn's algorithm over the `sources` edges (a source's data flows *into* the component that
@@ -467,6 +532,7 @@ mod tests {
                 Component {
                     sources: sources.into_iter().map(String::from).collect(),
                     buffer: BufferConfig::default(),
+                    receive: ReceiveConfig::default(),
                     kind,
                 },
             );
@@ -483,6 +549,27 @@ mod tests {
                 Component {
                     sources: sources.into_iter().map(String::from).collect(),
                     buffer,
+                    receive: ReceiveConfig::default(),
+                    kind,
+                },
+            );
+        }
+        Config { components: map }
+    }
+
+    /// Same as [`cfg`], but with an explicit `receive` on one component -- for rules 16/17's
+    /// tests.
+    fn cfg_with_receive(
+        components: Vec<(&str, Vec<&str>, ComponentKind, ReceiveConfig)>,
+    ) -> Config {
+        let mut map = Map::new();
+        for (id, sources, kind, receive) in components {
+            map.insert(
+                id.to_string(),
+                Component {
+                    sources: sources.into_iter().map(String::from).collect(),
+                    buffer: BufferConfig::default(),
+                    receive,
                     kind,
                 },
             );
@@ -950,5 +1037,129 @@ mod tests {
         ]))
         .expect("a default buffer block on a non-sink should validate fine");
         assert_eq!(graph.components["enrich"].buffer, BufferConfig::default());
+    }
+
+    fn non_default_receive() -> ReceiveConfig {
+        ReceiveConfig { max_datagrams: 4096, ..ReceiveConfig::default() }
+    }
+
+    #[test]
+    fn a_non_default_receive_on_a_transform_is_rejected() {
+        let err = expect_err(cfg_with_receive(vec![
+            ("in", vec![], listener(), ReceiveConfig::default()),
+            (
+                "agg",
+                vec!["in"],
+                ComponentKind::Aggregate { interval: Duration::from_secs(10) },
+                non_default_receive(),
+            ),
+            ("out", vec!["agg"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'agg'"), "got: {err}");
+        assert!(err.contains("'receive' is only meaningful on a datagram listener"), "got: {err}");
+    }
+
+    #[test]
+    fn a_non_default_receive_on_a_sink_is_rejected() {
+        let err = expect_err(cfg_with_receive(vec![
+            ("in", vec![], listener(), ReceiveConfig::default()),
+            ("out", vec!["in"], sink(), non_default_receive()),
+        ]));
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(err.contains("'receive' is only meaningful on a datagram listener"), "got: {err}");
+    }
+
+    /// The reason rule 16 checks a dedicated predicate rather than `role() == Role::Listener`:
+    /// `internal` is a listener by role but has no socket, no queue, and no decoder, so a
+    /// `receive:` block on it must be rejected just as clearly as on a sink or a transform.
+    #[test]
+    fn a_non_default_receive_on_internal_is_rejected() {
+        let err = expect_err(cfg_with_receive(vec![
+            ("in", vec![], listener(), ReceiveConfig::default()),
+            ("self", vec![], internal(), non_default_receive()),
+            ("out", vec!["in", "self"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'self'"), "got: {err}");
+        assert!(err.contains("'receive' is only meaningful on a datagram listener"), "got: {err}");
+    }
+
+    #[test]
+    fn a_non_default_receive_on_a_datagram_listener_validates_fine() {
+        let graph = resolve(cfg_with_receive(vec![
+            ("in", vec![], listener(), non_default_receive()),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("a receive block on a datagram listener should validate fine");
+        assert_eq!(graph.components["in"].receive.max_datagrams, 4096);
+    }
+
+    #[test]
+    fn a_default_receive_on_a_non_listener_validates_fine() {
+        // An explicitly-written but all-default `receive: {}` is indistinguishable from an
+        // omitted block -- rule 16 only rejects a genuinely *non-default* value.
+        let graph = resolve(cfg_with_receive(vec![
+            ("in", vec![], listener(), ReceiveConfig::default()),
+            ("enrich", vec!["in"], lua(), ReceiveConfig::default()),
+            ("out", vec!["enrich"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("a default receive block on a non-listener should validate fine");
+        assert_eq!(graph.components["enrich"].receive, ReceiveConfig::default());
+    }
+
+    #[test]
+    fn a_listeners_receive_with_zero_max_datagrams_is_rejected() {
+        let err = expect_err(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                listener(),
+                ReceiveConfig { max_datagrams: 0, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("max_datagrams"), "got: {err}");
+    }
+
+    #[test]
+    fn a_listeners_receive_with_zero_max_bytes_is_rejected() {
+        let err = expect_err(cfg_with_receive(vec![
+            ("in", vec![], listener(), ReceiveConfig { max_bytes: 0, ..ReceiveConfig::default() }),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("max_bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn a_listeners_receive_with_zero_batch_max_events_is_rejected() {
+        let err = expect_err(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                listener(),
+                ReceiveConfig { batch_max_events: 0, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("batch_max_events"), "got: {err}");
+    }
+
+    /// Unlike the three count/byte bounds above, `batch_flush_interval: 0s` is a meaningful
+    /// setting ("no flush timer") -- rule 17 must not reject it.
+    #[test]
+    fn a_listeners_receive_with_a_zero_batch_flush_interval_validates_fine() {
+        let graph = resolve(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                listener(),
+                ReceiveConfig { batch_flush_interval: Duration::ZERO, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("a zero batch_flush_interval should validate fine -- it means 'no timer'");
+        assert_eq!(graph.components["in"].receive.batch_flush_interval, Duration::ZERO);
     }
 }

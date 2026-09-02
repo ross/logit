@@ -1314,6 +1314,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -1322,6 +1323,7 @@ mod tests {
             "enrich".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Lua {
                     script: r#"function process(event) event.attributes.tagged = "yes" return event end"#
@@ -1334,6 +1336,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["enrich".to_string()],
                 kind: ComponentKind::InfluxDbOut {
                     url: "http://localhost:8086".to_string(),
@@ -1420,6 +1423,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -1428,6 +1432,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::InfluxDbOut {
                     url: "http://localhost:8086".to_string(),
@@ -1509,6 +1514,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -1520,6 +1526,7 @@ mod tests {
             "branch_a".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Json { skip_to_brace: false },
             },
@@ -1528,6 +1535,7 @@ mod tests {
             "sink_a".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["branch_a".to_string()],
                 kind: influxdb_out(),
             },
@@ -1536,6 +1544,7 @@ mod tests {
             "sink_b".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: influxdb_out(),
             },
@@ -1673,6 +1682,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -1681,6 +1691,7 @@ mod tests {
             "windowed".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Aggregate { interval: Duration::from_secs(3600) },
             },
@@ -1689,6 +1700,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["windowed".to_string()],
                 kind: ComponentKind::InfluxDbOut {
                     url: "http://localhost:8086".to_string(),
@@ -2026,6 +2038,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -2034,6 +2047,7 @@ mod tests {
             "xform".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Json { skip_to_brace: false },
             },
@@ -2042,6 +2056,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["xform".to_string()],
                 kind: influxdb_out(),
             },
@@ -2126,6 +2141,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -2134,6 +2150,7 @@ mod tests {
             "enrich".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Lua {
                     script: "function process(event) return {event, event:clone()} end".to_string(),
@@ -2145,6 +2162,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["enrich".to_string()],
                 kind: influxdb_out(),
             },
@@ -2251,6 +2269,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -2259,6 +2278,7 @@ mod tests {
             "windowed".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Lua {
                     script: "function process(event) return event end".to_string(),
@@ -2270,6 +2290,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["windowed".to_string()],
                 kind: influxdb_out(),
             },
@@ -2468,6 +2489,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -2476,6 +2498,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: influxdb_out(),
             },
@@ -2568,6 +2591,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -2576,6 +2600,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: influxdb_out(),
             },
@@ -2626,6 +2651,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -2634,6 +2660,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: influxdb_out(),
             },
@@ -2685,6 +2712,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -2693,6 +2721,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: influxdb_out(),
             },
@@ -3581,6 +3610,7 @@ mod tests {
             "bad_in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -3589,6 +3619,7 @@ mod tests {
             "bad".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["bad_in".to_string()],
                 kind: influxdb_out(),
             },
@@ -3597,6 +3628,7 @@ mod tests {
             "good_in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -3605,6 +3637,7 @@ mod tests {
             "good".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["good_in".to_string()],
                 kind: influxdb_out(),
             },
@@ -3789,6 +3822,7 @@ mod tests {
             "bad1_in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -3797,6 +3831,7 @@ mod tests {
             "bad1".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["bad1_in".to_string()],
                 kind: influxdb_out(),
             },
@@ -3805,6 +3840,7 @@ mod tests {
             "bad2_in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -3813,6 +3849,7 @@ mod tests {
             "bad2".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["bad2_in".to_string()],
                 kind: influxdb_out(),
             },

@@ -13,6 +13,23 @@ components:
   statsd_in:
     type: statsd_in
     bind: 0.0.0.0:8125
+    # Every field below defaults (docs/adr/0022-decoupled-listener-io.md) -- an omitted `receive:`
+    # block is exactly the values shown here, commented out purely as a reference for tuning a
+    # real deployment. `receive:` is meaningful only on a datagram listener (statsd_in, syslog_in);
+    # `logit-pipeline`'s graph validation rejects it on any other component kind.
+    # receive:
+    #   max_datagrams: 10000        # receive-queue depth, in datagrams -- whichever of this or max_bytes trips first
+    #   max_bytes: "32MiB"          # bound on undecoded datagram bytes held in the queue
+    #   overflow: drop_oldest       # block | drop_oldest | drop_newest -- what happens once both bounds are full;
+    #                               # drop_oldest (not buffer:'s block) is the default here on purpose -- blocking a
+    #                               # UDP reader relocates loss into the kernel where nothing counts it
+    #   batch_max_events: 1000      # events accumulated across datagrams before one send downstream; 1 means
+    #                               # one send per datagram, today's pre-ADR-0022 behavior
+    #   batch_max_bytes: "1MiB"     # the other accumulation bound -- whichever trips first
+    #   batch_flush_interval: 100ms # longest an accumulated batch waits before being sent regardless of size;
+    #                               # 0s disables the timer, leaving the two bounds above as the only trigger
+    #   # receive_buffer_bytes: 8MiB  # SO_RCVBUF, requested at bind -- omitted leaves the kernel default alone
+    #   shutdown_grace: 5s          # how long SIGTERM waits for the receive queue to drain before dropping the rest
 
   windowed:
     type: aggregate

@@ -74,6 +74,12 @@ impl StatsdInput {
         self.inner = self.inner.with_config(config);
         self
     }
+
+    /// The currently-configured receive-queue/batching/shutdown-grace knobs -- for test
+    /// introspection (`logit-cli::pipeline`'s `build_spec` wiring tests).
+    pub fn receive_config(&self) -> UdpListenerConfig {
+        self.inner.config()
+    }
 }
 
 #[async_trait::async_trait]
