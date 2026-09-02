@@ -95,7 +95,7 @@ use logit_pipeline::Fault;
 use std::fmt::Write as _;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{lookup_host, TcpStream, UdpSocket};
 
 /// Matches Grafana Alloy's `loki.source.syslog` `max_message_length` default -- see the module
 /// doc's "Sizing" section.
@@ -675,6 +675,11 @@ pub struct SyslogOutput {
     encoder: SyslogEncoder,
     messages: MessageBuf,
     /// TCP only, reused across `send` calls -- the octet-counted frame for the whole batch.
+    /// Never shrinks (only `clear()`ed), so one outlier batch pins its peak capacity for the rest
+    /// of the process's life -- the same trade `InfluxLineEncoder`'s own reused buffers already
+    /// make (`docs/design/memory.md`), accepted here for the same reason: reallocating back down
+    /// only to regrow on the next similarly-sized batch would trade a one-time worst case for a
+    /// recurring one.
     frame_buf: Vec<u8>,
     diag: Diagnostics,
     telemetry: Telemetry,
@@ -748,8 +753,14 @@ impl Output for SyslogOutput {
         let request_timer = self.telemetry.timer("logit.output.request.duration");
         let result = match &mut self.conn {
             Conn::Udp(socket) => {
-                Self::send_udp(socket, &self.endpoint, &self.messages, &self.diag, &self.telemetry)
-                    .await
+                Self::send_udp(
+                    socket,
+                    &self.endpoint,
+                    &self.messages,
+                    &mut self.diag,
+                    &self.telemetry,
+                )
+                .await
             }
             Conn::Tcp { stream, connect_timeout } => {
                 Self::send_tcp(
@@ -814,17 +825,34 @@ impl SyslogOutput {
     /// (`docs/adr/0021-buffered-sink-delivery.md`'s duplicate-safety argument depends on `Clean`
     /// never over-claiming this way, exactly as `influxdb_out`'s own `classify_transport_error`
     /// doc comment stresses for its own `Clean`/`Ambiguous` split).
+    ///
+    /// `endpoint` is resolved to one [`SocketAddr`] here, once per batch -- not once per
+    /// message. `UdpSocket::send_to` accepts anything implementing `ToSocketAddrs`, and for a
+    /// non-numeric host (`alloy:5141`, the demo's own endpoint) tokio's `&str` impl re-resolves
+    /// via DNS on *every* call if handed the raw string directly, which every UDP test here never
+    /// exercises since they all pass an IP literal (tokio's `SocketAddr`-parse fast path, no DNS
+    /// at all). Resolving once per `send_udp` call still re-resolves every batch rather than
+    /// caching indefinitely, so a genuine DNS change is picked up between batches -- matching
+    /// [`SyslogOutput::udp`]'s own documented intent, which this used to violate in practice.
     async fn send_udp(
         socket: &UdpSocket,
         endpoint: &str,
         messages: &MessageBuf,
-        diag: &Diagnostics,
+        diag: &mut Diagnostics,
         telemetry: &Telemetry,
     ) -> anyhow::Result<usize> {
-        let mut diag = diag.clone();
+        let mut addrs = lookup_host(endpoint)
+            .await
+            .context("resolving syslog_out endpoint")
+            .context(Fault::Clean)?;
+        let addr = addrs
+            .next()
+            .context("syslog_out endpoint resolved to no addresses")
+            .context(Fault::Clean)?;
+
         let mut sent = 0usize;
         for msg in messages.iter() {
-            match socket.send_to(msg, endpoint).await {
+            match socket.send_to(msg, addr).await {
                 Ok(_) => sent += 1,
                 Err(err) if is_message_too_large(&err) => {
                     telemetry.count(
@@ -946,6 +974,12 @@ fn udp_send_fault(sent: usize) -> Fault {
     }
 }
 
+/// `90` is `EMSGSIZE` on Linux specifically (macOS/BSD use `40`) -- deliberately not
+/// platform-general: `logit` only ever ships and runs inside the Linux containers this repo
+/// builds (`Dockerfile`/`Dockerfile.dev`, `AGENTS.md`'s "everything runs in a container"), so a
+/// non-Linux raw errno here would be a dev-host-only false negative, never a real one in
+/// production. The `InvalidInput` fallback doesn't reliably catch other platforms' encodings of
+/// this either, which is accepted for the same reason.
 fn is_message_too_large(err: &std::io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc_emsgsize) if libc_emsgsize == 90 /* EMSGSIZE, Linux */)
         || err.kind() == std::io::ErrorKind::InvalidInput
