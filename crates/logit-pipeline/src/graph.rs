@@ -161,7 +161,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
 fn interval(kind: &ComponentKind) -> Option<Duration> {
     match kind {
         ComponentKind::Lua { interval, .. } | ComponentKind::LuaFile { interval, .. } => *interval,
-        ComponentKind::Aggregate { interval } | ComponentKind::Internal { interval } => {
+        ComponentKind::Aggregate { interval } | ComponentKind::Internal { interval, .. } => {
             Some(*interval)
         }
         _ => None,
@@ -357,6 +357,27 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': 'buffer.max_bytes' must be at least 1 -- 0 means no batch \
                      can ever be queued"
+                );
+            }
+        }
+    }
+
+    // Rule 16: `internal`'s `span_sample_rate` must be finite and within `[0, 1]` -- a config
+    // error, not something to clamp silently. `trace_is_sampled` (`crates/logit-core/src/
+    // telemetry.rs`) treats NaN as "keep everything," which would be a surprising thing to get
+    // from a typo (`span_sample_rate: tru` parsing as a string coerced to NaN, say) rather than a
+    // deliberate "sample everything" choice; a value above 1 or below 0 is unambiguously a
+    // mistake, since neither has a sensible "keep more/less than everything" reading.
+    for (id, component) in &components {
+        if let ComponentKind::Internal { span_sample_rate, .. } = &component.kind {
+            if !span_sample_rate.is_finite() {
+                anyhow::bail!(
+                    "component '{id}': 'span_sample_rate' must be a finite number, got {span_sample_rate}"
+                );
+            }
+            if !(0.0..=1.0).contains(span_sample_rate) {
+                anyhow::bail!(
+                    "component '{id}': 'span_sample_rate' must be between 0.0 and 1.0, got {span_sample_rate}"
                 );
             }
         }
@@ -770,7 +791,11 @@ mod tests {
     }
 
     fn internal() -> ComponentKind {
-        ComponentKind::Internal { interval: Duration::from_secs(10) }
+        internal_with_rate(logit_core::DEFAULT_SPAN_SAMPLE_RATE)
+    }
+
+    fn internal_with_rate(span_sample_rate: f64) -> ComponentKind {
+        ComponentKind::Internal { interval: Duration::from_secs(10), span_sample_rate }
     }
 
     #[test]
@@ -800,10 +825,50 @@ mod tests {
     #[test]
     fn internal_with_zero_interval_is_rejected() {
         let err = expect_err(cfg(vec![
-            ("self", vec![], ComponentKind::Internal { interval: Duration::ZERO }),
+            (
+                "self",
+                vec![],
+                ComponentKind::Internal {
+                    interval: Duration::ZERO,
+                    span_sample_rate: logit_core::DEFAULT_SPAN_SAMPLE_RATE,
+                },
+            ),
             ("out", vec!["self"], sink()),
         ]));
         assert!(err.contains("flush interval of 0s"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_rejects_a_span_sample_rate_above_one() {
+        let err = expect_err(cfg(vec![
+            ("self", vec![], internal_with_rate(1.5)),
+            ("out", vec!["self"], sink()),
+        ]));
+        assert!(
+            err.contains("span_sample_rate") && err.contains("between 0.0 and 1.0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_a_span_sample_rate_below_zero() {
+        let err = expect_err(cfg(vec![
+            ("self", vec![], internal_with_rate(-0.1)),
+            ("out", vec!["self"], sink()),
+        ]));
+        assert!(
+            err.contains("span_sample_rate") && err.contains("between 0.0 and 1.0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_a_span_sample_rate_that_is_not_finite() {
+        let err = expect_err(cfg(vec![
+            ("self", vec![], internal_with_rate(f64::NAN)),
+            ("out", vec!["self"], sink()),
+        ]));
+        assert!(err.contains("span_sample_rate") && err.contains("finite"), "got: {err}");
     }
 
     fn non_default_buffer() -> BufferConfig {

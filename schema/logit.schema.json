@@ -184,6 +184,12 @@
               "description": "Both the drain cadence for every component's buffered points and the sampling tick for this component's own process-level gauges (interner size, uptime). Should divide evenly into any downstream `aggregate` interval, or the two windows beat against each other.",
               "type": "string"
             },
+            "span_sample_rate": {
+              "description": "Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id` the same way at every node -- a kept trace is kept at every hop, never partially. Below `1.0` by default: span volume is a different shape than metric volume (one span per node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans off entirely; `1.0` keeps everything (what `demo/logit.yaml` sets). Named `span_sample_rate`, not `sample_rate` -- there is already a `ComponentKind::Sample` transform, and `internal` may grow other sampling knobs later. See `docs/adr/0022-internal-span-emission-and-deterministic-sampling.md`.",
+              "default": 0.1,
+              "type": "number",
+              "format": "double"
+            },
             "type": {
               "type": "string",
               "enum": [

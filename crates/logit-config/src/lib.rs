@@ -70,6 +70,15 @@ pub struct MetricSpec {
     pub unit: Option<String>,
 }
 
+/// `ComponentKind::Internal`'s `span_sample_rate` default when a config omits it -- re-exported
+/// from `logit-core` (not restated as a bare literal here) so the two crates can never drift
+/// apart on what "the default" actually is. This is also the one place `logit-config` depends on
+/// `logit-core` at all: a small, deliberately narrow edge (one `pub const`), not a general
+/// dependency on the event model this crate otherwise has no business needing.
+fn default_span_sample_rate() -> f64 {
+    logit_core::DEFAULT_SPAN_SAMPLE_RATE
+}
+
 /// A component's kind, tagged by `type` in config. Every protocol kind is suffixed `_in`/`_out`
 /// uniformly (`docs/design/pipeline-graph.md`'s naming rationale) so a listener and a sink for the
 /// same protocol never collide on one tag value; transform kinds take no suffix, since there's
@@ -112,6 +121,16 @@ pub enum ComponentKind {
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         interval: Duration,
+        /// Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id`
+        /// the same way at every node -- a kept trace is kept at every hop, never partially. Below
+        /// `1.0` by default: span volume is a different shape than metric volume (one span per
+        /// node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans
+        /// off entirely; `1.0` keeps everything (what `demo/logit.yaml` sets). Named
+        /// `span_sample_rate`, not `sample_rate` -- there is already a `ComponentKind::Sample`
+        /// transform, and `internal` may grow other sampling knobs later. See
+        /// `docs/adr/0022-internal-span-emission-and-deterministic-sampling.md`.
+        #[serde(default = "default_span_sample_rate")]
+        span_sample_rate: f64,
     },
 
     /// Inline Lua source (a YAML block scalar in practice). See `docs/design/lua-api.md`.
@@ -648,7 +667,26 @@ mod tests {
             serde_json::from_str(r#"{"type": "internal", "interval": "10s"}"#).unwrap();
         assert!(component.sources.is_empty());
         match component.kind {
-            ComponentKind::Internal { interval } => assert_eq!(interval, Duration::from_secs(10)),
+            ComponentKind::Internal { interval, .. } => {
+                assert_eq!(interval, Duration::from_secs(10));
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    /// `span_sample_rate` is optional, defaulting to `logit_core::DEFAULT_SPAN_SAMPLE_RATE`
+    /// (0.1) -- an `internal` component that predates this field (every shipped config before
+    /// this PR) still deserializes, with spans sampled at a tenth rather than silently disabled
+    /// or silently kept at full volume.
+    #[test]
+    fn internal_without_span_sample_rate_defaults_to_one_tenth() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "internal", "interval": "10s"}"#).unwrap();
+        match component.kind {
+            ComponentKind::Internal { span_sample_rate, .. } => {
+                assert_eq!(span_sample_rate, 0.1);
+                assert_eq!(span_sample_rate, logit_core::DEFAULT_SPAN_SAMPLE_RATE);
+            }
             other => panic!("expected Internal, got {other:?}"),
         }
     }

@@ -9,6 +9,10 @@ description = "YAML config types, deserialized with serde and schema'd with sche
 [dependencies]
 serde.workspace = true
 schemars.workspace = true
+# Narrow, deliberate edge: only `DEFAULT_SPAN_SAMPLE_RATE` (`ComponentKind::Internal`'s default),
+# not a general dependency on the event model -- see `default_span_sample_rate`'s own doc comment
+# in `src/lib.rs`.
+logit-core.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

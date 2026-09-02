@@ -524,7 +524,7 @@ fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
             Delivered::Owned(batch, _ctx) => Arc::new(batch),
             Delivered::Shared(shared, _ctx) => shared,
         };
-        queue.push(warmed).await;
+        queue.push(warmed, TraceContext::default()).await;
         queue.commit();
     });
 
