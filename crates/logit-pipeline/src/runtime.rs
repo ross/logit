@@ -738,7 +738,7 @@ async fn write_loop(
         };
 
         // The sink span: the only span that can carry `SpanStatus::Error` and a fault tag,
-        // which is the whole point of instrumenting a sink (`docs/adr/0023-internal-span-
+        // which is the whole point of instrumenting a sink (`docs/adr/0025-internal-span-
         // emission-and-deterministic-sampling.md`). `ctx.child()` is minted, used as this span's
         // identity, and then discarded -- `run_output` emits nothing further downstream for
         // anything to inherit it (`Output::send` takes `&EventBatch`, not `&Delivered`), so there
@@ -915,7 +915,7 @@ async fn run_transform(
         // A no-op for every other transform.
         transform.observe_batch_context(parent);
         // Minted here, not inside `Fanout::send_with_context`, because this node records its own
-        // span around `process_batch` *and* the send (`docs/adr/0023-internal-span-emission-and-
+        // span around `process_batch` *and* the send (`docs/adr/0025-internal-span-emission-and-
         // deterministic-sampling.md`'s per-node-kind table): the span's `span_id` and the outgoing
         // `Delivered`'s `span_id` have to be the same id, which only holds if this is the one and
         // only place a context is minted for this emission.
@@ -985,7 +985,7 @@ pub fn process_batch(
 /// there is still no single correct parent to inherit (`TraceContext`'s own doc comment,
 /// `crates/logit-pipeline/src/fanout.rs`; `docs/known-gaps.md`'s internal-spans entry tracks this
 /// *n*-to-1 gap as deliberate, not something this function is wrong to leave open). What changed
-/// (`docs/adr/0023-internal-span-emission-and-deterministic-sampling.md`): earlier, every resource
+/// (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`): earlier, every resource
 /// group minted its *own* fresh root via plain `fanout.send`, so an `aggregate` flush spanning
 /// several resources looked like several unrelated hops; now one root is minted before `flush()`
 /// runs, and every group's batch goes out as a *sibling* under it -- one flush is one unit of
@@ -1196,7 +1196,7 @@ fn run_lua(
         }
         if errors > 0 {
             telemetry.count("logit.component.errors", errors as f64, &[("reason", "process")]);
-            // Consistent with `write_loop`'s own rule (ADR 0023): the call site whose error path
+            // Consistent with `write_loop`'s own rule (ADR 0025): the call site whose error path
             // fired is the one that marks the span, not a downstream reader inferring it from
             // `logit.component.errors`. A batch with *any* script error, even a partial one mixed
             // with successful emits, is not a clean node visit -- `span`'s default status is `Ok`,
@@ -2096,7 +2096,7 @@ mod tests {
 
     /// The error half of `run_lua_records_vm_memory_and_emit_outcome`'s success case: a script
     /// error must mark the process span `SpanStatus::Error`, not leave it at its default `Ok` --
-    /// ADR 0023's rule that the call site whose own error path fired is the one that marks the
+    /// ADR 0025's rule that the call site whose own error path fired is the one that marks the
     /// span, applied to Lua's `process` the same way `write_loop` already applies it to a failed
     /// delivery. Every event in the batch errors here, so `out` also stays empty and nothing is
     /// ever sent downstream -- exactly the case that would otherwise drain as a *successful*

@@ -57,7 +57,7 @@ pub struct SinkQueue {
     /// `Copy`, 24 bytes, so this rides inline in the existing `(item, weight)` slot
     /// `InMemoryBuffer` already stores; no new allocation, and `EventBatch::estimated_heap_bytes`
     /// (the byte bound this queue enforces) is unaffected, since it's computed from the batch
-    /// alone. See `docs/adr/0023-internal-span-emission-and-deterministic-sampling.md` for why
+    /// alone. See `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md` for why
     /// this exists: `write_loop`'s sink span (the only span that can carry `SpanStatus::Error` and
     /// a retry count) needs the context that arrived with this batch, and `drain_inbox`/`peek`
     /// were the last place it was still being discarded.

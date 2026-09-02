@@ -30,7 +30,7 @@ eventual `syslog_out` and `otlp_out` work somewhere to land on day one.
 | Data source | A hello-world Python app (stdlib only) that's also the demo's landing page — real visits plus a background synthetic loop. No nginx in the demo — `examples/nginx/` stays a dev-stack fixture. |
 | Log line shape | The same RFC 3164 + JSON-body shape `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE` already measures. |
 | Log backend | Loki, up and provisioned. **Now live** — `syslog_out` (`docs/adr/0022-syslog-output.md`) relays `access_json`'s events through `alloy` into Loki. |
-| Trace backend | Tempo, up and provisioned — spans are now real (`docs/adr/0023-internal-span-emission-and-deterministic-sampling.md`), but no data reaches Tempo until `otlp_out` exists to export them. |
+| Trace backend | Tempo, up and provisioned — spans are now real (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`), but no data reaches Tempo until `otlp_out` exists to export them. |
 | syslog → Loki shim | Grafana Alloy (`loki.source.syslog`, confirmed to accept UDP and both RFC 3164/5424). **Now fed** by `log_out`. Loki has no syslog receiver of its own; promtail is EOL. |
 | Pipeline visualization | `logit graph demo/logit.yaml`, piped through real Graphviz at startup (two chained one-shot containers), served as an SVG on the landing page — not hand-drawn, always reflects the running config. |
 | This plan writes no Rust | No new `ComponentKind`, no new sink, no span emission. The log and trace legs ship as commented-out config plus a documented pointer to what has to be built. |
@@ -41,7 +41,7 @@ eventual `syslog_out` and `otlp_out` work somewhere to land on day one.
 |---|---|
 | ~~No `syslog_out`~~ | **Closed** — implemented, UDP and TCP, RFC 3164/5424 (`docs/adr/0022-syslog-output.md`), and wired live into `demo/logit.yaml`'s `log_out`. |
 | `otlp_out` rejected at validation | Declared in `logit-config`, but `graph::is_implemented` rejects it. No OTLP code, no wire protocol chosen (ADR 0004 leaves gRPC-vs-HTTP open). |
-| ~~No span producer~~ | **Closed** — real internal span emission, sampled deterministically on `trace_id` (`docs/adr/0023-internal-span-emission-and-deterministic-sampling.md`). `stdio_out` already renders spans; nothing yet exports one over the wire (`otlp_out`, next row). |
+| ~~No span producer~~ | **Closed** — real internal span emission, sampled deterministically on `trace_id` (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`). `stdio_out` already renders spans; nothing yet exports one over the wire (`otlp_out`, next row). |
 | `examples/` doubles as both dev fixtures and the onboarding story | Someone trying `logit` for the first time hits `script/server`'s dev-container dependency before seeing anything work. |
 | No config-drift guard | A component field rename can silently break every shipped example; nothing runs `logit validate` over them. |
 

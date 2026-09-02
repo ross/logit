@@ -57,7 +57,7 @@ child of its parent for the two node kinds with an unambiguous one to propagate
 context is now turned into real spans: every node kind records a `SpanRecord`-carrying `Event` for
 its own visit to a unit of work (a listener's send, a transform's process-or-flush, a sink's
 delivery), sampled deterministically on `trace_id` (`span_sample_rate` on the `internal` component,
-default 0.1); see [ADR 0023](docs/adr/0023-internal-span-emission-and-deterministic-sampling.md)
+default 0.1); see [ADR 0025](docs/adr/0025-internal-span-emission-and-deterministic-sampling.md)
 and [internal-telemetry.md](docs/design/internal-telemetry.md)'s "Spans" section. `docs/known-gaps.md`'s
 internal-spans entry tracks what's still open (the listener span's window, Lua `flush()`'s
 link-less root).

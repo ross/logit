@@ -142,7 +142,7 @@ events the same way the nginx config already populates `metrics` with distributi
 input exists. Treating spans as safe to box because nothing constructs one *yet* would just be
 deferring the same mistake to whenever that input lands. That prediction is now partly realized
 without any external input at all:
-[ADR 0023](../adr/0023-internal-span-emission-and-deterministic-sampling.md) makes `internal`
+[ADR 0025](../adr/0025-internal-span-emission-and-deterministic-sampling.md) makes `internal`
 itself a real, if low-volume by default, producer of `span`-carrying events — a drained span
 event costs exactly what this table already prices (776 bytes inline, `SpanRecord`'s 136 of it),
 no new type and no change to this row's reasoning, just the first real caller of the shape this
@@ -470,7 +470,7 @@ per-node-kind account, and `docs/known-gaps.md`'s internal-spans entry for what'
 (flush's *n*-to-1 problem, `SpanRecord` emission, sampling).
 
 **Emission itself landed next, on the same "measure, don't assume" basis, and changed nothing in
-this section's numbers.** [ADR 0023](../adr/0023-internal-span-emission-and-deterministic-sampling.md)
+this section's numbers.** [ADR 0025](../adr/0025-internal-span-emission-and-deterministic-sampling.md)
 built the piece this section's "what's left unmeasured" line named -- a real `Telemetry::span`/
 `SpanGuard`, a bounded per-component span buffer, and `ComponentBuffer::drain`'s span-emitting pass
 -- and the deliberately deterministic-on-`trace_id` sampler (`trace_is_sampled`) is *why* it changed
@@ -489,7 +489,7 @@ actually exercises a `Telemetry::span` call site, and it matters which do:
   disabled path is free; it says nothing about a *live* registry sampling below `1.0`.
 - `process_batch_*`/`send_batch_*`'s "telemetry live" variants attach a real `Telemetry` from a live
   `Registry` -- but `process_batch`/`send_batch` are the per-batch bodies `run_transform`/
-  `write_loop` call *into*; the actual `Telemetry::span` calls (ADR 0023) live one level up, in
+  `write_loop` call *into*; the actual `Telemetry::span` calls (ADR 0025) live one level up, in
   `run_transform`/`run_flush`/`run_lua`/`write_loop` themselves, none of which `logit-bench` drives
   directly under `CountingAlloc`. These constants holding unmodified is expected (nothing about them
   changed), but it does not exercise the sample-decision branch either.

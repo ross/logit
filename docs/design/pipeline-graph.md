@@ -279,7 +279,7 @@ Every `Delivered` (the channel payload one `Fanout` edge carries, `crates/logit-
 carries a `TraceContext { trace_id: [u8; 16], span_id: [u8; 8] }` — the substrate for internal
 spans, decided and built per [ADR 0020](../adr/0020-trace-context-propagation-on-delivered.md) on
 the measured evidence [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md) required.
-[ADR 0023](../adr/0023-internal-span-emission-and-deterministic-sampling.md) is what actually turns
+[ADR 0025](../adr/0025-internal-span-emission-and-deterministic-sampling.md) is what actually turns
 this plumbing into a `SpanRecord`-carrying `Event` — see `docs/design/internal-telemetry.md`'s
 "Spans" section for the emit API, the sampler, and the bound.
 
@@ -291,11 +291,11 @@ per-batch processing and its flush:**
 |---|---|---|
 | A listener's own batches | Always a fresh root — `Input::run` never receives a `Delivered` (arity rules out a `sources` entry pointing at one), so there is no parent to inherit. | `SpanKind::Producer`, in `Fanout::send`/`send_blocking` |
 | `Transform::process`/`ScriptWorker::process` (the non-flush path) | A [`TraceContext::child`] of the one incoming batch that produced it — 1-to-1, unambiguous. | `SpanKind::Internal`, in `run_transform`/`run_lua` |
-| `Transform::flush`/Lua's timer-driven `flush()` | A fresh root, deliberately — an *n*-to-1 relationship (however many batches were absorbed since the last tick), with no single correct parent to propagate. Tracked as an open gap, not silently approximated; see ADR 0020's "What this doesn't do." One root now covers *every* resource group a flush emits, not one root per group (ADR 0023). | `SpanKind::Internal`, in `run_flush`/`run_lua`'s `flush_now` |
-| `run_output` | Already borrows the incoming `Delivered` without unwrapping (`Output::send(&EventBatch)`, [ADR 0016](../adr/0016-arc-eventbatch-copy-on-write.md)), so the context is there to read. Nothing further downstream to propagate *to* — the sink span mints `ctx.child()` as its own identity and then discards it (ADR 0023). | `SpanKind::Client`, in `write_loop` |
+| `Transform::flush`/Lua's timer-driven `flush()` | A fresh root, deliberately — an *n*-to-1 relationship (however many batches were absorbed since the last tick), with no single correct parent to propagate. Tracked as an open gap, not silently approximated; see ADR 0020's "What this doesn't do." One root now covers *every* resource group a flush emits, not one root per group (ADR 0025). | `SpanKind::Internal`, in `run_flush`/`run_lua`'s `flush_now` |
+| `run_output` | Already borrows the incoming `Delivered` without unwrapping (`Output::send(&EventBatch)`, [ADR 0016](../adr/0016-arc-eventbatch-copy-on-write.md)), so the context is there to read. Nothing further downstream to propagate *to* — the sink span mints `ctx.child()` as its own identity and then discards it (ADR 0025). | `SpanKind::Client`, in `write_loop` |
 
 Mechanically: `Fanout::send`/`send_blocking` mint a root, open the listener's own span, and
-delegate to `Fanout::send_with_own_context` (new, ADR 0023) — the *only* remaining caller of
+delegate to `Fanout::send_with_own_context` (new, ADR 0025) — the *only* remaining caller of
 `send`/`send_blocking`, now that a flush-driven emission (which used to call `send` directly) also
 mints its own root and calls `send_with_own_context` instead, so it can record its own span around
 the same context. `Fanout::send_with_context`/`send_blocking_with_context` (mint a child of a given
@@ -304,7 +304,7 @@ methods, no existing signature changed. `Delivered::context()` is a cheap `&self
 it *before* `unwrap_batch` consumes the batch, since `unwrap_batch` itself still discards the
 context (changing its return type to include one would force every existing caller, most of which
 don't propagate anything, to thread a value through unused). `SinkQueue`'s entries carry the
-context too now (`push`/`peek`, ADR 0023) — the last place it was still being discarded, on the
+context too now (`push`/`peek`, ADR 0025) — the last place it was still being discarded, on the
 one path (`drain_inbox` → `write_loop`) that needs it to parent the sink's own span.
 
 A fan-out (one batch, several downstream branches) gives every branch the *identical* child

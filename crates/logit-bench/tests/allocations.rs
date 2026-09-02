@@ -372,7 +372,7 @@ fn fanout_send_one_consumer_costs_nothing() {
 }
 
 /// The test above proves the *disabled*-telemetry path is free, but `Fanout::send` now opens a
-/// span too (`docs/adr/0023-internal-span-emission-and-deterministic-sampling.md`), and a
+/// span too (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`), and a
 /// disabled `Telemetry` handle (`Telemetry::default()`, `Option::None` inside) never reaches
 /// `Telemetry::span`'s sample-decision branch at all -- it can't stand in for the *live-but-
 /// unsampled* path a production pipeline with an `internal` component and the default (0.1, never
