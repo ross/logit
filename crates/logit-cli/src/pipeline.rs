@@ -82,11 +82,16 @@ type Prepared = (graph::Graph, HashMap<String, NodeSpec>, HashMap<String, Teleme
 fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<Prepared> {
     let graph = graph::resolve(config)?;
 
-    let registry: Option<Arc<Registry>> = graph
-        .components
-        .values()
-        .any(|c| matches!(c.kind, logit_config::ComponentKind::Internal { .. }))
-        .then(Registry::new);
+    // The rate comes off the config's own `internal` component (graph rule 13 already
+    // guarantees at most one), rather than always calling `Registry::new`'s default -- an operator
+    // who set `span_sample_rate` explicitly (`demo/logit.yaml`'s `1.0`, say) would otherwise have
+    // their choice silently ignored.
+    let internal_span_sample_rate = graph.components.values().find_map(|c| match &c.kind {
+        logit_config::ComponentKind::Internal { span_sample_rate, .. } => Some(*span_sample_rate),
+        _ => None,
+    });
+    let registry: Option<Arc<Registry>> =
+        internal_span_sample_rate.map(Registry::with_span_sampling);
 
     // Sorted, not raw `HashMap` iteration order: a startup failure (a missing lua_file) should be
     // reproducible across runs, not depend on hash-seed-driven iteration order -- two
@@ -192,7 +197,10 @@ fn build_spec(
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone()),
         )),
-        Internal { interval } => {
+        // `span_sample_rate` is read by `prepare` (above) to build the `Registry` itself, not
+        // here -- by the time `build_spec` runs, the `Registry` this handle points at already has
+        // it baked in.
+        Internal { interval, span_sample_rate: _ } => {
             let registry = registry
                 .cloned()
                 .expect("graph::resolve's rule 13 guarantees a Registry whenever an 'internal' component does");
@@ -477,7 +485,10 @@ mod tests {
                 Component {
                     buffer: logit_config::BufferConfig::default(),
                     sources: vec![],
-                    kind: ComponentKind::Internal { interval: Duration::from_secs(10) },
+                    kind: ComponentKind::Internal {
+                        interval: Duration::from_secs(10),
+                        span_sample_rate: logit_core::DEFAULT_SPAN_SAMPLE_RATE,
+                    },
                 },
             ),
             ("out", influxdb_out(vec!["self"])),
@@ -496,7 +507,10 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             sources: vec![],
             consumers: vec!["out".to_string()],
-            kind: ComponentKind::Internal { interval: Duration::from_secs(10) },
+            kind: ComponentKind::Internal {
+                interval: Duration::from_secs(10),
+                span_sample_rate: logit_core::DEFAULT_SPAN_SAMPLE_RATE,
+            },
         };
         let (spec, telemetry) =
             build_spec("self", &component, Path::new(""), Some(&registry)).unwrap();

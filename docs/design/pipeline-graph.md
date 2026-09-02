@@ -273,31 +273,38 @@ trait object doesn't fix that, and shouldn't try to.
 Every `Delivered` (the channel payload one `Fanout` edge carries, `crates/logit-pipeline/src/fanout.rs`)
 carries a `TraceContext { trace_id: [u8; 16], span_id: [u8; 8] }` — the substrate for internal
 spans, decided and built per [ADR 0020](../adr/0020-trace-context-propagation-on-delivered.md) on
-the measured evidence [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md) required. No
-`SpanRecord` is emitted anywhere yet (that's a separate, still-open piece — see `docs/known-gaps.md`'s
-internal-spans entry) — this is only the plumbing that gets the *right* context to the *right*
-place once something does.
+the measured evidence [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md) required.
+[ADR 0022](../adr/0022-internal-span-emission-and-deterministic-sampling.md) is what actually turns
+this plumbing into a `SpanRecord`-carrying `Event` — see `docs/design/internal-telemetry.md`'s
+"Spans" section for the emit API, the sampler, and the bound.
 
 **Which node kinds propagate a real parent, and which mint a fresh root, is not uniform — it's
 exactly the 1-to-1-vs-*n*-to-1 distinction the rest of this doc already draws between a node's
 per-batch processing and its flush:**
 
-| Node kind | Context of what it emits |
-|---|---|
-| A listener's own batches | Always a fresh root — `Input::run` never receives a `Delivered` (arity rules out a `sources` entry pointing at one), so there is no parent to inherit. |
-| `Transform::process`/`ScriptWorker::process` (the non-flush path) | A [`TraceContext::child`] of the one incoming batch that produced it — 1-to-1, unambiguous. |
-| `Transform::flush`/Lua's timer-driven `flush()` | A fresh root, deliberately — an *n*-to-1 relationship (however many batches were absorbed since the last tick), with no single correct parent to propagate. Tracked as an open gap, not silently approximated; see ADR 0020's "What this doesn't do." |
-| `run_output` | Emits nothing further downstream — nothing to propagate *to*. It already borrows the incoming `Delivered` without unwrapping (`Output::send(&EventBatch)`, [ADR 0016](../adr/0016-arc-eventbatch-copy-on-write.md)), so the context is there to read (`Delivered::context()`) once something needs it. |
+| Node kind | Context of what it emits | Span recorded |
+|---|---|---|
+| A listener's own batches | Always a fresh root — `Input::run` never receives a `Delivered` (arity rules out a `sources` entry pointing at one), so there is no parent to inherit. | `SpanKind::Producer`, in `Fanout::send`/`send_blocking` |
+| `Transform::process`/`ScriptWorker::process` (the non-flush path) | A [`TraceContext::child`] of the one incoming batch that produced it — 1-to-1, unambiguous. | `SpanKind::Internal`, in `run_transform`/`run_lua` |
+| `Transform::flush`/Lua's timer-driven `flush()` | A fresh root, deliberately — an *n*-to-1 relationship (however many batches were absorbed since the last tick), with no single correct parent to propagate. Tracked as an open gap, not silently approximated; see ADR 0020's "What this doesn't do." One root now covers *every* resource group a flush emits, not one root per group (ADR 0022). | `SpanKind::Internal`, in `run_flush`/`run_lua`'s `flush_now` |
+| `run_output` | Already borrows the incoming `Delivered` without unwrapping (`Output::send(&EventBatch)`, [ADR 0016](../adr/0016-arc-eventbatch-copy-on-write.md)), so the context is there to read. Nothing further downstream to propagate *to* — the sink span mints `ctx.child()` as its own identity and then discards it (ADR 0022). | `SpanKind::Client`, in `write_loop` |
 
-Mechanically: `Fanout::send`/`send_blocking` (mint a root) are unchanged in signature and behavior;
-`Fanout::send_with_context`/`send_blocking_with_context` (mint a child of a given parent) are new,
-additive methods used only by the two propagating call sites above. `Delivered::context()` is a
-cheap `&self` accessor — read it *before* `unwrap_batch` consumes the batch, since `unwrap_batch`
-itself still discards the context (changing its return type to include one would force every
-existing caller, most of which don't propagate anything, to thread a value through unused).
+Mechanically: `Fanout::send`/`send_blocking` mint a root, open the listener's own span, and
+delegate to `Fanout::send_with_own_context` (new, ADR 0022) — the *only* remaining caller of
+`send`/`send_blocking`, now that a flush-driven emission (which used to call `send` directly) also
+mints its own root and calls `send_with_own_context` instead, so it can record its own span around
+the same context. `Fanout::send_with_context`/`send_blocking_with_context` (mint a child of a given
+parent, no span of their own) are defined in terms of `send_with_own_context` too — additive
+methods, no existing signature changed. `Delivered::context()` is a cheap `&self` accessor — read
+it *before* `unwrap_batch` consumes the batch, since `unwrap_batch` itself still discards the
+context (changing its return type to include one would force every existing caller, most of which
+don't propagate anything, to thread a value through unused). `SinkQueue`'s entries carry the
+context too now (`push`/`peek`, ADR 0022) — the last place it was still being discarded, on the
+one path (`drain_inbox` → `write_loop`) that needs it to parent the sink's own span.
 
 A fan-out (one batch, several downstream branches) gives every branch the *identical* child
-context — one emission forking into several consumers is still one hop, not several.
+context — one emission forking into several consumers is still one hop, not several, and (per ADR
+0022) records exactly one span for it, not one per branch.
 
 ## Backpressure: diamonds are the normal shape now
 

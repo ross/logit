@@ -140,7 +140,13 @@ selectively: no OTLP (or other span-producing) input exists yet, but per ADR 001
 gap, not a property of the workload — a trace-focused deployment will populate `span` on most
 events the same way the nginx config already populates `metrics` with distributions, once that
 input exists. Treating spans as safe to box because nothing constructs one *yet* would just be
-deferring the same mistake to whenever that input lands.
+deferring the same mistake to whenever that input lands. That prediction is now partly realized
+without any external input at all:
+[ADR 0022](../adr/0022-internal-span-emission-and-deterministic-sampling.md) makes `internal`
+itself a real, if low-volume by default, producer of `span`-carrying events — a drained span
+event costs exactly what this table already prices (776 bytes inline, `SpanRecord`'s 136 of it),
+no new type and no change to this row's reasoning, just the first real caller of the shape this
+section was already sized for.
 
 **`AttrMap`'s inline capacity is the largest single term (384 B), and is left exactly as it is —
 deliberately deferred, not decided.** Four shapes are measured: statsd (0-4 attributes, inline
@@ -445,6 +451,33 @@ change held exactly, re-confirmed against the real implementation, not just the 
 -- see `docs/design/pipeline-graph.md`'s "Trace context propagation" section for the resulting
 per-node-kind account, and `docs/known-gaps.md`'s internal-spans entry for what's still open
 (flush's *n*-to-1 problem, `SpanRecord` emission, sampling).
+
+**Emission itself landed next, on the same "measure, don't assume" basis, and changed nothing in
+this section's numbers.** [ADR 0022](../adr/0022-internal-span-emission-and-deterministic-sampling.md)
+built the piece this section's "what's left unmeasured" line named -- a real `Telemetry::span`/
+`SpanGuard`, a bounded per-component span buffer, and `ComponentBuffer::drain`'s span-emitting pass
+-- and the deliberately deterministic-on-`trace_id` sampler (`trace_is_sampled`) is *why* it changed
+nothing here: no `sampled` bit needed propagating, so `TraceContext`/`Delivered` gained nothing
+beyond what this section already measured. `size_of::<Delivered>()` stays exactly 56.
+`SpanGuard`'s own "disabled/unsampled holds no state" shape (mirroring `Timer`'s) is what makes the
+unsampled path free the same way a disabled `Telemetry` handle already was: `Fanout::send`/
+`send_blocking` now open a listener span on every call, and every `fanout_send_*`/`unwrap_batch_*`/
+`process_batch_*`/`send_batch_*` constant in `crates/logit-bench/tests/allocations.rs` -- all of
+which use either `Telemetry::default()` (disabled) or a live `Registry` at the *default* 0.1 sample
+rate against test fixtures whose `trace_id`s were never engineered to land in that band -- held
+exactly, unmodified, confirming a `SpanGuard::disabled()` (whether from a disabled handle or an
+unsampled trace) allocates nothing beyond the `Option::None` it already is.
+
+**What a *sampled* span costs, measured directly in `crates/logit-core/src/telemetry.rs`'s own test
+module (not `logit-bench`, since this is `logit-core`-local state, not a runtime/channel hop):** one
+`PendingSpan` pushed into `ComponentBuffer`'s `Vec` (one `Vec` growth, amortized, the same shape
+`Registry`'s own `buffers: Vec<Arc<ComponentBuffer>>` already pays) at `finish`/`Drop` time, and one
+`Value::str` (a `String` allocation) built at `ComponentBuffer::drain` time for the span's `name`
+(`"aggregate flush"`, say) -- deliberately deferred that far, so a span that never survives to a
+drain (still sitting in the buffer, or dropped past `MAX_SPANS_PER_COMPONENT`) never pays it. Both
+costs are strictly additional to whatever the surrounding node visit already paid (`process_batch`'s
+`out` `Vec`, `send_batch`'s `async_trait` box, ...) -- spans ride alongside existing work, they
+don't replace any of it.
 
 ### Zero-copy: where it holds
 
@@ -799,6 +832,19 @@ tests (thread-local `CountingAlloc`, same reasoning) independently confirm the s
 module reports. What a full multi-node graph costs end to end, spread across the real worker
 threads and OS threads `run_with_shutdown` actually spawns, is still a separate question needing a
 load generator, not a microbenchmark.
+
+**Spans are the one live-registry cost not covered by either of the two layers above.** Both
+`logit-bench` layers exercise `Telemetry::default()` (disabled) or a live `Registry` whose test
+fixtures' `trace_id`s were never engineered to land inside the sample band — exactly what proves
+the *unsampled* path is free (see "Costing internal spans" in §2), but neither says anything about
+what a span that *does* get sampled costs. That measurement lives directly in
+`crates/logit-core/src/telemetry.rs`'s own test module instead (no `CountingAlloc` harness needed
+to state it precisely): a sampled span costs one `PendingSpan` pushed into `ComponentBuffer`'s
+`Vec` at `SpanGuard::finish`/`Drop` time, plus one `Value::str` built at `ComponentBuffer::drain`
+time for the span's `name` — deferred that far specifically so a span that never survives to a
+drain (still buffered, or dropped past `MAX_SPANS_PER_COMPONENT`) never pays it. See "Costing
+internal spans" (§2) for the full account and why neither `logit-bench` layer's existing numbers
+moved.
 
 ### Fixtures: synthetic inputs, no external services
 
