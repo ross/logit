@@ -80,7 +80,12 @@ impl TraceContext {
 /// trace id is not a capability.
 fn next_id_bytes<const N: usize>() -> [u8; N] {
     thread_local! {
-        static STATE: Cell<u64> = const { Cell::new(0x9E37_79B9_7F4A_7C15) };
+        // Seeded once, lazily, on this thread's first call -- not a compile-time constant.
+        // Caught in review: a `const` seed here is identical on every thread and every process
+        // run, so the *first* `next_id_bytes()` call on any two fresh threads returned the same
+        // bytes, deterministically merging unrelated traces. `initial_seed` below is real
+        // per-run (OS-random) and per-thread entropy instead.
+        static STATE: Cell<u64> = Cell::new(initial_seed());
     }
     let mut out = [0u8; N];
     let mut filled = 0;
@@ -102,6 +107,17 @@ fn next_id_bytes<const N: usize>() -> [u8; N] {
         }
     }
     out
+}
+
+/// This thread's starting seed: real entropy, not a shared constant. `RandomState::new()` is
+/// keyed from OS randomness at process start and refreshed by an internal per-call counter, so it
+/// already differs call to call within one process; mixing in this thread's `ThreadId` makes two
+/// threads calling this at nearly the same instant diverge too, rather than relying on
+/// `RandomState`'s own per-call drift alone. Not security-relevant, same as `next_id_bytes`'s own
+/// doc comment above -- this only needs to not repeat, not resist prediction.
+fn initial_seed() -> u64 {
+    use std::hash::BuildHasher;
+    std::collections::hash_map::RandomState::new().hash_one(std::thread::current().id())
 }
 
 /// What travels one graph edge. `Fanout::send`/`send_blocking` pick the variant per send based on
@@ -308,6 +324,23 @@ mod tests {
         let b = TraceContext::new_root();
         assert_ne!(a.trace_id, b.trace_id);
         assert_ne!(a.span_id, b.span_id);
+    }
+
+    /// The bug the test above can't catch: a `const` thread-local seed is identical on every
+    /// thread, so *this* thread's first call and a *fresh* thread's first call would collide --
+    /// invisible to `two_roots_are_not_the_same_context`, which only ever calls from one thread.
+    /// Spawns a real new thread and takes its very first `new_root()`, matching the actual failure
+    /// shape (every worker thread's first trace, not some later call after the seed has already
+    /// advanced).
+    #[test]
+    fn a_fresh_threads_first_root_differs_from_this_threads_first_root() {
+        let here = TraceContext::new_root();
+        let there =
+            std::thread::spawn(TraceContext::new_root).join().expect("thread shouldn't panic");
+        assert_ne!(
+            here.trace_id, there.trace_id,
+            "two threads' first-ever ids must not collide just because they're both first"
+        );
     }
 
     fn batch(n: usize) -> EventBatch {
