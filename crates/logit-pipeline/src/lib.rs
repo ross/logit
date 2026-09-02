@@ -18,7 +18,7 @@ pub mod transform;
 
 pub use fanout::{Delivered, Fanout};
 pub use input::Input;
-pub use output::{classify, is_retryable, DeliveryPosture, Fault, Output};
+pub use output::{classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fault, Output};
 pub use runtime::{
     run, run_with_shutdown, run_with_telemetry, NodeSpec, RetryConfig, WriteLoopConfig,
 };

@@ -9,7 +9,7 @@
 
 use crate::fanout::Delivered;
 use crate::graph::Graph;
-use crate::output::{classify, is_retryable, DeliveryPosture, Fault};
+use crate::output::{classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fault};
 use crate::sink_queue::{SinkQueue, SinkQueueConfig};
 use crate::{Fanout, Input, Output, Transform};
 use anyhow::Context;
@@ -254,13 +254,14 @@ async fn run_input(
 ///
 /// The two run as one task, joined here rather than each spawned separately, so this function's
 /// `Err` (from `write_loop`; `drain_inbox` never fails) is what `run_with_telemetry`'s `JoinSet`
-/// sees -- unchanged from before this split: a permanent send failure still ends this task, and
-/// therefore still ends `run`/`run_with_shutdown`/`run_with_telemetry`'s join loop, exactly as it
-/// did when this was one inline loop. (Retrying instead of failing immediately, and not ending the
-/// whole process on a sink failure, is workstream D -- not yet built.)
+/// sees. `write_loop` no longer owns `output` for its whole lifetime -- it only ever borrows it,
+/// via `output.as_mut()` -- specifically so this function can perform the final drain-and-flush
+/// itself, *after* `drain` can no longer push anything new, rather than `write_loop` doing it from
+/// inside a race it cannot see the other half of (a real bug an earlier version of this split had:
+/// see `finish_and_flush`'s doc comment).
 async fn run_output(
     id: String,
-    output: Box<dyn Output + Send>,
+    mut output: Box<dyn Output + Send>,
     inbox: mpsc::Receiver<Delivered>,
     telemetry: Telemetry,
     queue_config: SinkQueueConfig,
@@ -268,31 +269,65 @@ async fn run_output(
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let queue = Arc::new(SinkQueue::new(queue_config, telemetry.clone()));
+    let diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
+
     let mut drain = Box::pin(drain_inbox(inbox, Arc::clone(&queue), telemetry.clone()));
-    let mut write = Box::pin(write_loop(id, output, queue, telemetry, write_config, shutdown));
+    let mut write = Box::pin(write_loop(
+        id.clone(),
+        output.as_mut(),
+        Arc::clone(&queue),
+        telemetry.clone(),
+        write_config,
+        shutdown,
+    ));
 
     // `tokio::join!` would wait for *both* futures every time, which is wrong here: `write_loop`
-    // can return early (a permanent send failure -- no retry until workstream D) while `inbox` is
+    // can return early (a permanent send failure, or shutdown grace expiring) while `inbox` is
     // still open, e.g. every real listener, which never closes its sender on its own. `drain_inbox`
     // has no way to learn that its consumer gave up, so it would keep pulling from `inbox` (and,
     // under `Block`, eventually park forever pushing into a queue nothing commits from any more)
-    // -- hanging this task, and therefore `run`, indefinitely instead of ending the process the way
-    // a permanent failure did before this split.
+    // -- hanging this task, and therefore `run`, indefinitely.
     //
     // `select!` fixes this without any new cancellation signal: whichever future finishes first
     // wins.
     // - `write` finishes first: either it drained to closed-and-empty (only possible once `drain`
     //   has already run `queue.close()` -- by construction `drain` is then already `Ready`, so no
-    //   work is lost by not polling it again) or it bailed early. Either way, `run_output` returns
-    //   now; if `drain` is still pending, dropping it here drops its `inbox: mpsc::Receiver`, so an
-    //   upstream sender observes this consumer as closed immediately -- exactly what dropping the
-    //   single pre-split loop's `inbox` did the moment `output.send` failed permanently.
+    //   work is lost by not polling it again), it bailed with a fatal error, or shutdown grace
+    //   expired. Either way, if `drain` is still pending, it is dropped below -- `Box::pin`ned
+    //   locally, never polled again after this point -- which drops its `inbox: mpsc::Receiver`,
+    //   so an upstream sender observes this consumer as closed immediately.
     // - `drain` finishes first (its inbox closed normally): `write_loop` hasn't necessarily
     //   finished draining the queue's tail yet, so wait for it.
-    tokio::select! {
-        result = &mut write => result,
-        () = &mut drain => write.await,
-    }
+    // `write` (a `Pin<Box<dyn Future>>`) holds `output`'s mutable borrow until it is dropped, and
+    // this function needs that borrow released before it can reclaim `output` for
+    // `finish_and_flush` below. The two arms consume `write` differently -- the first only
+    // *polls* it via `&mut write`, leaving the outer binding to be dropped explicitly once we
+    // know which arm fired; the second calls `write.await` on the owned binding directly, which
+    // fully consumes (and so drops) it as part of driving it to completion. Routed through an
+    // intermediate `Option` (rather than dropping `write` unconditionally after the `select!`)
+    // because the borrow checker tracks the move `write.await` performs per-arm -- referencing
+    // `write` after the `select!` regardless of which arm ran does not typecheck even though only
+    // one arm's move ever actually happens at runtime.
+    let already_finished = tokio::select! {
+        result = &mut write => Some(result),
+        () = &mut drain => None,
+    };
+    let write_result = match already_finished {
+        Some(result) => {
+            drop(write);
+            result
+        }
+        None => write.await,
+    };
+
+    // Only now, with `write` finished (and dropped) and `drain` either already finished or about
+    // to be dropped (never polled again once this local variable goes out of scope), can nothing
+    // further be pushed into `queue` -- so this snapshot is genuinely final. See
+    // `finish_and_flush`.
+    drop(drain);
+    finish_and_flush(&diag, &queue, &telemetry, output.as_mut()).await;
+
+    write_result
 }
 
 /// Moves every `Delivered` batch off `inbox` into `queue`, as fast as `queue.push` (governed by
@@ -388,9 +423,15 @@ enum Delivery {
     Delivered,
     /// Never delivered -- either `fault` wasn't retryable under the resolved posture, or it was
     /// but the retry budget ran out first. Either way the caller commits the batch off the queue
-    /// and counts it; only the caller decides whether `fault` also counts toward the
-    /// permanent-failure streak (see `write_loop`).
-    Dropped(Fault),
+    /// and counts it. `explicit_permanent` is a *narrower* fact than `fault == Fault::Permanent`:
+    /// it's true only when the sink itself attached `Fault::Permanent`, never when `classify`
+    /// merely defaulted to it for an unclassified error -- only the caller's fatal-streak logic
+    /// (see `write_loop`) needs this distinction; retry decisions already went through
+    /// `is_retryable` using the (possibly defaulted) `fault` alone.
+    Dropped {
+        fault: Fault,
+        explicit_permanent: bool,
+    },
 }
 
 /// Attempts to deliver `batch` via `output.send`, retrying per `posture`/[`is_retryable`] until
@@ -398,6 +439,16 @@ enum Delivery {
 /// call) is exhausted. Moved here from `logit-outputs::influxdb::InfluxDbOutput::send`'s own retry
 /// loop (`docs/adr/0020-buffered-sink-delivery.md`) -- every sink gets this for free now, driven by
 /// its own `Fault` classification and `duplicate_safe` fact rather than reimplementing the loop.
+///
+/// **Every attempt, including the first, is raced against the remaining budget** via
+/// `tokio::time::timeout` -- `retry.total_budget`'s own doc comment already promises a "hard
+/// ceiling on total time spent... across every attempt," but a single un-raced `output.send` could
+/// blow straight through it: a sink's own internal timeout (e.g. `InfluxDbOutput`'s 10s HTTP
+/// client timeout) can be far larger than a configured `retry_budget`, so nothing would actually
+/// enforce the budget until the loop got back around to checking it *after* that one attempt
+/// finally gave up on its own. A timeout here is classified `Fault::Ambiguous` (the destination
+/// may have received the request before this gave up waiting on the response) -- never
+/// `Permanent`, since giving up early says nothing about whether the request was valid.
 async fn deliver_with_retry(
     output: &mut (dyn Output + Send),
     batch: &EventBatch,
@@ -409,23 +460,29 @@ async fn deliver_with_retry(
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let timer = telemetry.timer("logit.component.send.duration");
-        let result = output.send(batch).await;
+        let result = tokio::time::timeout(remaining, output.send(batch)).await;
         drop(timer);
 
         let err = match result {
-            Ok(()) => return Delivery::Delivered,
-            Err(err) => err,
+            Ok(Ok(())) => return Delivery::Delivered,
+            Ok(Err(err)) => err,
+            Err(_elapsed) => {
+                anyhow::anyhow!("send attempt exceeded the remaining retry budget ({remaining:?})")
+                    .context(Fault::Ambiguous)
+            }
         };
         telemetry.count("logit.component.errors", 1.0, &[]);
         let fault = classify(&err);
+        let explicit_permanent = is_explicitly_permanent(&err);
         if !is_retryable(fault, posture) {
-            return Delivery::Dropped(fault);
+            return Delivery::Dropped { fault, explicit_permanent };
         }
 
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Delivery::Dropped(fault);
+            return Delivery::Dropped { fault, explicit_permanent };
         }
         let backoff = backoff_for(retry, attempt).min(deadline.saturating_duration_since(now));
         telemetry.count("logit.component.retries", 1.0, &[]);
@@ -475,12 +532,27 @@ async fn shutdown_grace_expired(
     tokio::time::sleep_until(deadline.expect("just set above if it was None")).await;
 }
 
-/// Commits (drops) whatever `queue` still holds once shutdown grace has expired, counting and
-/// logging what was lost, then flushes `output` -- the shutdown-grace-expiry tail shared by both
-/// of `write_loop`'s race points (waiting for a batch, and delivering one). Never awaits new
-/// pushes; this is a snapshot of whatever's sitting in the queue right now, since `write_loop` is
-/// about to return regardless.
-async fn drain_remaining_on_shutdown(
+/// Commits (drops) whatever `queue` still holds, counting and logging anything found, then
+/// flushes `output` exactly once -- called from `run_output` only, only after nothing can push
+/// into `queue` any more (`drain_inbox` has either already finished naturally or been dropped).
+///
+/// **This must not run from inside `write_loop`.** An earlier version did exactly that, on
+/// shutdown-grace expiry: it drained the queue to empty, then `await`ed `output.flush()` -- but
+/// `queue.commit()` wakes any producer blocked on `not_full`, so a concurrent `drain_inbox` could
+/// push a *new* batch into the queue while `flush()` was still pending, land uncounted (this
+/// function had already seen the queue go empty and moved on), and then get silently dropped when
+/// `write_loop` returned and `run_output`'s `select!` cancelled `drain_inbox` -- no delivery, no
+/// `reason="shutdown"` accounting, nothing. Running this only after `run_output` has already
+/// ensured `drain_inbox` can push no more closes that gap: there is no longer any window between
+/// "queue observed empty" and "flush called" for a producer to slip through.
+///
+/// This is also what makes `flush()` fire on the *ordinary* completion path too, not just on
+/// shutdown: `run_output` calls this unconditionally after `write_loop` returns, whether that was
+/// via the queue draining to closed-and-empty on its own, a fatal error, or shutdown grace
+/// expiring -- `Output::flush`'s own contract ("called once after the last batch") doesn't carve
+/// out an exception for the happy path, so this doesn't either. In the ordinary case the queue is
+/// already empty here, so `dropped_batches` stays `0` and nothing but `flush()` itself happens.
+async fn finish_and_flush(
     diag: &Diagnostics,
     queue: &SinkQueue,
     telemetry: &Telemetry,
@@ -503,17 +575,20 @@ async fn drain_remaining_on_shutdown(
             dropped_events as f64,
             &[("reason", "shutdown")],
         );
-        // Unthrottled: this fires at most once per `write_loop` (shutdown happens once), so
+        // Unthrottled: this fires at most once per `run_output` (shutdown happens once), so
         // `warn_throttled`'s occurrence-count limiting -- built for a hot-path flood -- would be
         // pointless machinery here. Goes through `Diagnostics`, not a bare `eprintln!`, so it's
         // still attributed and still mirrored into telemetry (`docs/known-gaps.md`'s closed
         // `eprintln!` entry), same as every other diagnostic in this codebase.
         diag.warn(format_args!(
-            "shutdown grace expired with {dropped_batches} batch(es) ({dropped_events} event(s)) \
-             undelivered"
+            "{dropped_batches} batch(es) ({dropped_events} event(s)) still queued when this sink \
+             stopped, undelivered"
         ));
     }
-    let _ = output.flush().await;
+    if let Err(err) = output.flush().await {
+        telemetry.count("logit.component.errors", 1.0, &[("reason", "flush")]);
+        diag.warn(format_args!("flush failed: {err}"));
+    }
 }
 
 /// Delivers from `queue`'s head, one batch at a time, until `queue.peek()` returns `None` (closed
@@ -522,21 +597,27 @@ async fn drain_remaining_on_shutdown(
 /// workstream F) falling back to `output.duplicate_safe()`'s derived default
 /// (`docs/adr/0020-buffered-sink-delivery.md`). On success, commit and reset the permanent-failure
 /// streak. On failure (not retryable, or retryable but the budget ran out), commit anyway (the
-/// process no longer exits on an ordinary sink failure), count and warn -- *except*: a run of nothing
-/// but `Fault::Permanent` outcomes, with no successful delivery anywhere in between, for
+/// process no longer exits on an ordinary sink failure), count and warn -- *except*: a run of
+/// nothing but *explicitly classified* `Fault::Permanent` outcomes (see
+/// [`is_explicitly_permanent`]), with no successful delivery anywhere in between, for
 /// [`PERMANENT_FAILURE_WINDOW`], still ends this function with `Err` (and therefore `run_output`,
-/// and therefore the whole pipeline) -- a genuinely misconfigured sink still fails loudly enough for
-/// a restart-policy supervisor to notice. Budget-exhaustion on a `Clean`/`Ambiguous` fault is a
-/// different failure mode (a destination that's merely slow/down, not misconfigured) and never
-/// counts toward that streak.
+/// and therefore the whole pipeline) -- a genuinely misconfigured sink still fails loudly enough
+/// for a restart-policy supervisor to notice. Both a budget-exhausted `Clean`/`Ambiguous` fault
+/// *and* an unclassified error that merely defaulted to `Permanent` are a different failure mode (a
+/// destination that's merely slow/down, or a sink that hasn't opted into `Fault` classification at
+/// all, neither of which is a positively-identified configuration error) and reset the streak
+/// exactly like a success would -- the streak only ever accumulates across a run of nothing *but*
+/// the sink explicitly saying "this is a config error," never merely "nothing else was retryable."
 ///
-/// `shutdown`: once it flips, this function's remaining allowed drain time is capped at
-/// `write_config.shutdown_grace` from that point (see [`shutdown_grace_expired`]) -- on expiry it
-/// drops whatever the queue still holds (see [`drain_remaining_on_shutdown`]) and returns `Ok(())`,
-/// not an error: an incomplete drain on shutdown is expected behavior, not a pipeline failure.
+/// Does **not** drain the queue or call `output.flush()` itself on any exit path -- that's
+/// `run_output`'s job, after this function returns (see [`finish_and_flush`]'s doc comment for
+/// why it must happen there and not here). `shutdown`: once it flips, this function's remaining
+/// allowed time is capped at `write_config.shutdown_grace` from that point (see
+/// [`shutdown_grace_expired`]) -- on expiry this returns `Ok(())` immediately, not an error: an
+/// incomplete drain on shutdown is expected behavior, not a pipeline failure.
 async fn write_loop(
     id: String,
-    mut output: Box<dyn Output + Send>,
+    output: &mut (dyn Output + Send),
     queue: Arc<SinkQueue>,
     telemetry: Telemetry,
     write_config: WriteLoopConfig,
@@ -554,9 +635,9 @@ async fn write_loop(
     loop {
         // Two-step, rather than touching `output` from inside either `select!`'s handler arms:
         // one arm below (`deliver_with_retry`) already borrows `output` mutably for the future
-        // itself, and a handler block running `output.as_mut()` too would be a second overlapping
-        // mutable borrow as far as the borrow checker's concerned even though only one future is
-        // ever actually driven to completion. Reducing each `select!` to a plain enum keeps every
+        // itself, and a handler block running `output` too would be a second overlapping mutable
+        // borrow as far as the borrow checker's concerned even though only one future is ever
+        // actually driven to completion. Reducing each `select!` to a plain enum keeps every
         // `output` access outside the macro, in the `match` below, where there's no ambiguity.
         enum NextBatch {
             Batch(Arc<EventBatch>),
@@ -575,10 +656,7 @@ async fn write_loop(
         let batch = match next {
             NextBatch::Batch(batch) => batch,
             NextBatch::Closed => break, // queue closed and empty: nothing left to deliver.
-            NextBatch::ShutdownExpired => {
-                drain_remaining_on_shutdown(&diag, &queue, &telemetry, output.as_mut()).await;
-                return Ok(());
-            }
+            NextBatch::ShutdownExpired => return Ok(()),
         };
 
         enum DeliverStep {
@@ -586,7 +664,7 @@ async fn write_loop(
             ShutdownExpired,
         }
         let step = tokio::select! {
-            outcome = deliver_with_retry(output.as_mut(), &batch, posture, &write_config.retry, &telemetry) => {
+            outcome = deliver_with_retry(output, &batch, posture, &write_config.retry, &telemetry) => {
                 DeliverStep::Outcome(outcome)
             }
             () = shutdown_grace_expired(&mut shutdown, &mut shutdown_deadline, write_config.shutdown_grace) => {
@@ -595,10 +673,7 @@ async fn write_loop(
         };
         let outcome = match step {
             DeliverStep::Outcome(outcome) => outcome,
-            DeliverStep::ShutdownExpired => {
-                drain_remaining_on_shutdown(&diag, &queue, &telemetry, output.as_mut()).await;
-                return Ok(());
-            }
+            DeliverStep::ShutdownExpired => return Ok(()),
         };
 
         match outcome {
@@ -607,7 +682,7 @@ async fn write_loop(
                 last_success = Some(tokio::time::Instant::now());
                 permanent_streak_since = None;
             }
-            Delivery::Dropped(fault) => {
+            Delivery::Dropped { fault, explicit_permanent } => {
                 queue.commit();
                 telemetry.count(
                     "logit.component.batches.dropped",
@@ -630,7 +705,7 @@ async fn write_loop(
                     ),
                 );
 
-                if fault == Fault::Permanent {
+                if explicit_permanent {
                     let now = tokio::time::Instant::now();
                     let since = *permanent_streak_since.get_or_insert(now);
                     if now.duration_since(since) >= PERMANENT_FAILURE_WINDOW {
@@ -640,10 +715,15 @@ async fn write_loop(
                         ))
                         .with_context(|| format!("component '{id}'"));
                     }
+                } else {
+                    // Anything short of an explicit configuration-error classification -- a
+                    // budget-exhausted Clean/Ambiguous fault (a destination that's merely
+                    // slow/down), or an unclassified error that only defaulted to Permanent --
+                    // breaks the streak exactly like a success would: the exit condition is a
+                    // sustained run of nothing *but* explicitly-identified configuration errors,
+                    // not merely "nothing else was retryable."
+                    permanent_streak_since = None;
                 }
-                // A budget-exhausted Clean/Ambiguous drop is a different failure mode (a
-                // destination that's merely slow/down, not misconfigured) -- deliberately left
-                // untouched here, never counted toward the permanent-failure streak.
             }
         }
     }
@@ -2310,7 +2390,7 @@ mod tests {
     /// Returns `write_loop`'s own result -- most tests below only care about `attempts`/
     /// `attempt_times`/`flushed`, read from the handles passed in separately.
     async fn run_write_loop_to_completion(
-        output: FaultyOutput,
+        mut output: FaultyOutput,
         batches: Vec<Arc<EventBatch>>,
         retry: RetryConfig,
     ) -> anyhow::Result<()> {
@@ -2328,14 +2408,7 @@ mod tests {
         };
         tokio::time::timeout(
             Duration::from_secs(5),
-            write_loop(
-                "out".to_string(),
-                Box::new(output),
-                queue,
-                telemetry,
-                write_config,
-                shutdown_rx,
-            ),
+            write_loop("out".to_string(), &mut output, queue, telemetry, write_config, shutdown_rx),
         )
         .await
         .expect("write_loop should not hang")
@@ -2479,14 +2552,22 @@ mod tests {
         queue.push(one_event_batch(1.0)).await;
 
         let queue_for_task = Arc::clone(&queue);
-        let handle = tokio::spawn(write_loop(
-            "out".to_string(),
-            Box::new(output),
-            queue_for_task,
-            telemetry,
-            WriteLoopConfig::default(),
-            shutdown_rx,
-        ));
+        // `write_loop` borrows `output` (it no longer owns it -- `run_output` does, normally);
+        // `tokio::spawn` needs a `'static` future, so `output` moves into this async block and
+        // the `&mut` borrow it passes to `write_loop` lives entirely inside that block's own
+        // stack frame, not tied to this test function's.
+        let handle = tokio::spawn(async move {
+            let mut output = output;
+            write_loop(
+                "out".to_string(),
+                &mut output,
+                queue_for_task,
+                telemetry,
+                WriteLoopConfig::default(),
+                shutdown_rx,
+            )
+            .await
+        });
 
         handles.attempted.recv().await.expect("the first permanent failure should have happened");
 
@@ -2554,14 +2635,18 @@ mod tests {
         queue.push(one_event_batch(1.0)).await; // attempt 1: Permanent -- sets streak_since
 
         let queue_for_task = Arc::clone(&queue);
-        let handle = tokio::spawn(write_loop(
-            "out".to_string(),
-            Box::new(output),
-            queue_for_task,
-            telemetry,
-            WriteLoopConfig::default(),
-            shutdown_rx,
-        ));
+        let handle = tokio::spawn(async move {
+            let mut output = output;
+            write_loop(
+                "out".to_string(),
+                &mut output,
+                queue_for_task,
+                telemetry,
+                WriteLoopConfig::default(),
+                shutdown_rx,
+            )
+            .await
+        });
         attempted_rx.recv().await.expect("attempt 1 (failing) should have happened");
 
         // Well past where the window would trip -- but the *next* batch succeeds, which must
@@ -2585,17 +2670,170 @@ mod tests {
         );
     }
 
+    /// A sink whose `send` always fails with no `Fault` attached at all -- e.g. `StdioOutput`'s
+    /// bare I/O errors. `classify` still defaults this to `Permanent` for retry purposes (never
+    /// retry an error the sink didn't recognize), but it must never be mistaken for a positively
+    /// identified configuration error that should end the process.
+    struct AlwaysUnclassifiedFailure {
+        attempted: mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl Output for AlwaysUnclassifiedFailure {
+        async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
+            let _ = self.attempted.send(());
+            Err(anyhow::anyhow!("some bare I/O error, no Fault attached"))
+        }
+    }
+
+    /// The review finding this guards: an unclassified error defaults to non-retryable (correct),
+    /// but that must not also make it count toward the sustained-permanent-failure exit window --
+    /// a sink that never opted into `Fault` classification at all failing forever is a very
+    /// different situation from `InfluxDbOutput` explicitly identifying a bad token forever, and
+    /// only the latter should ever end the process.
+    #[tokio::test(start_paused = true)]
+    async fn an_unclassified_error_never_trips_the_permanent_failure_window() {
+        let telemetry = Telemetry::default();
+        let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (attempted_tx, mut attempted_rx) = mpsc::unbounded_channel();
+        let output = AlwaysUnclassifiedFailure { attempted: attempted_tx };
+
+        queue.push(one_event_batch(1.0)).await;
+        let queue_for_task = Arc::clone(&queue);
+        let handle = tokio::spawn(async move {
+            let mut output = output;
+            write_loop(
+                "out".to_string(),
+                &mut output,
+                queue_for_task,
+                telemetry,
+                WriteLoopConfig::default(),
+                shutdown_rx,
+            )
+            .await
+        });
+        attempted_rx.recv().await.expect("the first attempt should have happened");
+
+        // Well past the window, with nothing but this unclassified failure the whole time.
+        tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
+        queue.push(one_event_batch(2.0)).await;
+        attempted_rx.recv().await.expect("a later attempt should have happened");
+        queue.close();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("write_loop should not hang")
+            .expect("the task should not panic");
+        assert!(
+            result.is_ok(),
+            "an unclassified error must never trip the sustained-permanent-failure exit window, \
+             no matter how long it repeats"
+        );
+    }
+
+    /// A sink whose `Fault` depends on the batch's own content (its single counter's value) --
+    /// deterministic across however many retries a single batch takes, unlike `ScriptedOutput`
+    /// (whose script advances per *call*, not per logical batch, so it can't represent "retry
+    /// this one batch several times with the same fault" at all).
+    struct FaultByBatchValue {
+        attempted: mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl Output for FaultByBatchValue {
+        async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+            let _ = self.attempted.send(());
+            let value = match &batch.events[0].metrics[0].kind {
+                MetricKind::Counter(v) => *v,
+                other => panic!("expected Counter, got {other:?}"),
+            };
+            let fault = if value == 2.0 { Fault::Ambiguous } else { Fault::Permanent };
+            Err(anyhow::anyhow!("simulated failure for batch {value}")).context(fault)
+        }
+
+        fn duplicate_safe(&self) -> bool {
+            true // AtLeastOnce, so Ambiguous is retryable at all.
+        }
+    }
+
+    /// The other half of the same review finding: a budget-exhausted `Ambiguous` drop is a
+    /// different failure mode than an explicit configuration error (a destination that's merely
+    /// slow/down, not misconfigured) and must reset the permanent-failure streak exactly like a
+    /// success would -- not merely leave it untouched. `Permanent`, then `Ambiguous` (retried,
+    /// budget exhausted, dropped) for well past the window, then one more isolated `Permanent` --
+    /// if the reset hadn't happened, that third failure would find `permanent_streak_since`
+    /// already far in the past and trip `Err` immediately; it must not.
+    #[tokio::test(start_paused = true)]
+    async fn a_budget_exhausted_ambiguous_drop_resets_the_permanent_failure_streak_like_success_does(
+    ) {
+        let telemetry = Telemetry::default();
+        let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (attempted_tx, mut attempted_rx) = mpsc::unbounded_channel();
+        let output = FaultByBatchValue { attempted: attempted_tx };
+        // A short retry budget so batch 2's Ambiguous failures exhaust quickly rather than
+        // actually taking PERMANENT_FAILURE_WINDOW of real retrying.
+        let write_config = WriteLoopConfig {
+            retry: RetryConfig {
+                total_budget: Duration::from_millis(50),
+                base_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(10),
+            },
+            ..WriteLoopConfig::default()
+        };
+
+        queue.push(one_event_batch(1.0)).await; // Permanent -- sets streak_since
+        let queue_for_task = Arc::clone(&queue);
+        let handle = tokio::spawn(async move {
+            let mut output = output;
+            write_loop(
+                "out".to_string(),
+                &mut output,
+                queue_for_task,
+                telemetry,
+                write_config,
+                shutdown_rx,
+            )
+            .await
+        });
+        attempted_rx.recv().await.expect("attempt 1 (Permanent) should have happened");
+
+        // Well past where the *original* streak would have tripped -- batch 2 (Ambiguous)
+        // retries within its short (50ms) budget, exhausts it, and gets dropped; that drop must
+        // reset the streak despite happening long after streak_since was first set. A 200ms sleep
+        // (comfortably longer than the 50ms budget, and free under start_paused) guarantees the
+        // retry loop has already given up and committed batch 2 before batch 3 is pushed --
+        // simpler and less brittle than trying to count exactly how many retries it took.
+        tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
+        queue.push(one_event_batch(2.0)).await;
+        attempted_rx.recv().await.expect("batch 2's first attempt should have happened");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        queue.push(one_event_batch(3.0)).await; // Permanent again -- must be a fresh streak
+        attempted_rx.recv().await.expect("attempt 3 (Permanent) should have happened");
+        queue.close();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("write_loop should not hang")
+            .expect("the task should not panic");
+        assert!(
+            result.is_ok(),
+            "a budget-exhausted Ambiguous drop should reset the permanent-failure streak, so a \
+             fresh isolated Permanent failure right after must not immediately trip Err"
+        );
+    }
+
     /// Shutdown grace: a sink that's permanently stuck retrying (a `Clean` fault, retried
     /// indefinitely under a huge `total_budget`) still causes `write_loop` to return within
     /// `shutdown_grace` once the shutdown signal fires -- counting the drop with
     /// `reason="shutdown"` and calling `Output::flush`.
     #[tokio::test(start_paused = true)]
-    async fn shutdown_grace_expiry_ends_write_loop_promptly_dropping_the_remainder_and_flushing() {
-        let (output, handles) = faulty_output(Fault::Clean, u32::MAX, false);
-        let flushed = Arc::clone(&handles.flushed);
+    async fn shutdown_grace_expiry_ends_write_loop_promptly_leaving_the_remainder_for_run_output() {
+        let (mut output, _handles) = faulty_output(Fault::Clean, u32::MAX, false);
 
-        let registry = Registry::new();
-        let telemetry = registry.telemetry_for("out", "x", "sink");
+        let telemetry = Telemetry::default();
         let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
         queue.push(one_event_batch(1.0)).await;
         // Deliberately left open (not closed) -- shutdown grace must cut delivery off even while
@@ -2611,14 +2849,18 @@ mod tests {
             shutdown_grace: Duration::from_millis(500),
             delivery_override: None,
         };
-        let handle = tokio::spawn(write_loop(
-            "out".to_string(),
-            Box::new(output),
-            Arc::clone(&queue),
-            telemetry,
-            write_config,
-            shutdown_rx,
-        ));
+        let queue_for_task = Arc::clone(&queue);
+        let handle = tokio::spawn(async move {
+            write_loop(
+                "out".to_string(),
+                &mut output,
+                queue_for_task,
+                telemetry,
+                write_config,
+                shutdown_rx,
+            )
+            .await
+        });
 
         // Let a couple of retry attempts actually happen before shutdown fires.
         tokio::time::sleep(Duration::from_millis(90)).await;
@@ -2629,29 +2871,90 @@ mod tests {
             .expect("write_loop should return within shutdown_grace, not hang")
             .expect("the task should not panic");
         assert!(result.is_ok(), "shutdown-grace expiry should end write_loop with Ok, not Err");
+
+        // write_loop no longer drains or flushes on shutdown-grace expiry itself -- that's
+        // run_output's job (see finish_and_flush's doc comment for why it must happen there, not
+        // here), exercised end to end by
+        // `run_output_flushes_exactly_once_and_never_loses_a_batch_racing_shutdown_grace` below.
+        // Confirm the batch is still exactly where write_loop left it: untouched, not silently
+        // dropped by write_loop itself.
+        assert!(
+            queue.commit().is_some(),
+            "write_loop must leave the undelivered batch for run_output to account for, not drop it silently itself"
+        );
+    }
+
+    /// The exact race a review finding named: `finish_and_flush` must run only after `drain_inbox`
+    /// can no longer push anything new, or a batch that lands in the gap between "queue observed
+    /// empty" and "flush called" is silently lost -- no delivery, no `reason=shutdown` accounting.
+    /// Drives `run_output` directly against a hand-fed `Delivered` channel (bypassing any real
+    /// `Input`/listener) specifically so the producer side survives past the moment shutdown
+    /// fires -- a real listener's task is cancelled by `run_input`'s own shutdown race almost
+    /// immediately (see `run_with_telemetry_returns_the_first_failure_not_a_later_cascading_one`'s
+    /// doc comment for the same lesson learned elsewhere), which would close `drain_inbox`'s inbox
+    /// well before `write_loop`'s shutdown-grace timer ever expires, and this race needs
+    /// `drain_inbox` to still be pushable exactly when grace expires.
+    #[tokio::test(start_paused = true)]
+    async fn run_output_flushes_exactly_once_and_never_loses_a_batch_racing_shutdown_grace() {
+        let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
+        let (output, mut handles) = faulty_output(Fault::Clean, u32::MAX, false);
+        let flushed = Arc::clone(&handles.flushed);
+        let write_config = WriteLoopConfig {
+            retry: RetryConfig {
+                total_budget: Duration::from_secs(3600),
+                base_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(10),
+            },
+            shutdown_grace: Duration::from_millis(100),
+            delivery_override: None,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let run = tokio::spawn(run_output(
+            "out".to_string(),
+            Box::new(output),
+            inbox_rx,
+            Telemetry::default(),
+            SinkQueueConfig::default(),
+            write_config,
+            shutdown_rx,
+        ));
+
+        // One batch, permanently failing to send -- write_loop will be mid-retry when shutdown
+        // fires.
+        inbox_tx
+            .send(Delivered::Owned(EventBatch {
+                resource: Arc::new(Resource::default()),
+                events: vec![counter_event("hits", 1.0)],
+            }))
+            .await
+            .expect("receiver should still be alive");
+        handles.attempted.recv().await.expect("the first attempt should have happened");
+
+        shutdown_tx.send(true).expect("receiver should still be alive");
+        // Right at the shutdown-grace boundary: this batch's push races finish_and_flush's final
+        // drain. Before the fix, a push landing here could slip past the snapshot and be dropped
+        // when run_output returned, uncounted. `inbox_tx` is still held by this test (not by any
+        // cancelled listener task), so this send is exactly the race the fix closes.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        inbox_tx
+            .send(Delivered::Owned(EventBatch {
+                resource: Arc::new(Resource::default()),
+                events: vec![counter_event("hits", 2.0)],
+            }))
+            .await
+            .expect("receiver should still be alive");
+        drop(inbox_tx); // let drain_inbox finish naturally once it gets to check its inbox again
+
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run_output should not hang")
+            .expect("task should not panic")
+            .expect("shutdown-grace expiry should end run_output with Ok, not Err");
+
         assert!(
             flushed.load(std::sync::atomic::Ordering::SeqCst),
-            "output.flush() should have been called on shutdown-grace expiry"
-        );
-
-        let events = registry.drain(0);
-        let dropped_for_shutdown: f64 = events
-            .iter()
-            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("shutdown"))
-            .flat_map(|e| e.metrics.iter())
-            .filter_map(|m| match &m.kind {
-                MetricKind::Counter(v)
-                    if logit_core::interner::resolve(m.name)
-                        == "logit.component.batches.dropped" =>
-                {
-                    Some(*v)
-                }
-                _ => None,
-            })
-            .sum();
-        assert_eq!(
-            dropped_for_shutdown, 1.0,
-            "the one still-undelivered batch should have been counted dropped{{reason=shutdown}}"
+            "output.flush() should have been called exactly once, on the ordinary run_output exit path"
         );
     }
 
@@ -2760,12 +3063,17 @@ mod tests {
                     max_bytes: u64::MAX,
                     overflow: OverflowPolicy::Block,
                 },
-                // A generous shutdown grace: this test wants "good"'s already-queued batches
-                // delivered via the ordinary post-shutdown-signal path, not dropped just because
-                // shutdown grace happened to expire before the test got around to opening the
-                // gate.
+                // Generous shutdown grace AND retry budget: this test deliberately holds "good"'s
+                // gate shut past bad's own PERMANENT_FAILURE_WINDOW trip (60s+), and every attempt
+                // is now raced against its own retry budget (`deliver_with_retry`'s "impossible to
+                // ever fit" fix) -- a default 60s budget would time this send out as `Ambiguous`
+                // before the gate ever opens, which is not what this test is proving. Neither
+                // bound should matter to what's actually under test here.
                 WriteLoopConfig {
-                    retry: RetryConfig::default(),
+                    retry: RetryConfig {
+                        total_budget: Duration::from_secs(3600),
+                        ..RetryConfig::default()
+                    },
                     shutdown_grace: Duration::from_secs(3600),
                     delivery_override: None,
                 },

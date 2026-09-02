@@ -139,6 +139,14 @@ blip, without touching intake at all. 0013's shutdown-signal and diagnostics dec
 unaffected and remain in force; only its retry-budget rationale is revised, noted at that ADR's
 retry section rather than marking it Superseded.
 
+**Revised during review, before merge: every attempt, including the first, races the remaining
+budget via `tokio::time::timeout`.** A first version awaited `output.send` un-raced, checking the
+deadline only *after* each attempt returned — but a sink's own internal timeout (e.g.
+`InfluxDbOutput`'s 10s HTTP client timeout) can exceed a configured `retry_budget` outright, so a
+single hung attempt could blow straight through the budget before the loop ever got a chance to
+check it. A timeout here classifies as `Fault::Ambiguous` (the destination may have received the
+request before this gave up waiting on the response), never `Permanent`.
+
 ### Failure handling: the process no longer exits on a sink failure by default
 
 Today, any `send` error `run_output` can't classify as retryable ends `logit run` outright — every
@@ -156,16 +164,40 @@ deliberately holding unwritten data. New rule:
   sink (bad token, bad bucket) still fails loudly enough for a restart-policy supervisor to notice;
   one malformed batch cannot kill an otherwise-healthy pipeline.
 
+**Revised during review, before merge, on two points both stemming from the same root cause:**
+`classify`'s default-to-`Permanent` for an *unclassified* error (one with no `Fault` attached at
+all -- `StdioOutput`'s bare I/O errors, say) is a retry decision ("never retry a failure the sink
+didn't recognize"), not a claim that the sink positively identified a configuration error. A first
+version conflated the two, so (1) a sink that never opted into `Fault` classification at all could
+trip the fatal 60-second window just by failing persistently, and (2) a *budget-exhausted*
+`Clean`/`Ambiguous` drop left the window's clock running rather than resetting it, since only a
+literal success reset it. Both are fixed by a narrower `is_explicitly_permanent` check
+(`crates/logit-pipeline/src/output.rs`) that only the sink's own `.context(Fault::Permanent)`
+satisfies -- `classify`'s default never does. The 60-second window now accumulates across a run of
+nothing *but* the sink explicitly saying "this is a config error"; a `Clean`/`Ambiguous`
+budget-exhaustion, or an unclassified drop, resets it exactly like a success does.
+
 ### `Output::flush` and a bounded shutdown grace
 
 `Output` gains `async fn flush(&mut self) -> anyhow::Result<()> { Ok(()) }`, default no-op — this
 closes ADR 0013's residual "no `Output` close hook" gap, now load-bearing since a sink can hold
-unwritten data at shutdown, without requiring any existing sink to implement anything. The writer
+unwritten data at shutdown, without requiring any existing sink to implement anything. `write_loop`
 takes the same `watch::Receiver<bool>` shutdown signal `run_input` already races against; once it
-flips, the writer's remaining drain time is capped at a configured `shutdown_grace` (default 5s),
-so a permanently-down sink cannot hang process exit indefinitely under SIGTERM. On expiry: log the
-undelivered count, count `batches.dropped{reason="shutdown"}`, call `output.flush()`, return `Ok`
-— an incomplete drain on shutdown is expected behavior, not a pipeline failure.
+flips, its remaining drain time is capped at a configured `shutdown_grace` (default 5s), so a
+permanently-down sink cannot hang process exit indefinitely under SIGTERM.
+
+**Revised during review, before merge:** `write_loop` does not call `flush()` itself, on any exit
+path. A first version had it do exactly that on shutdown-grace expiry — drain the queue, then
+`await` `output.flush()` — but `queue.commit()` (draining) wakes any producer blocked on
+`not_full`, so a concurrent `drain_inbox` could push a *new* batch while `flush()` was still
+pending, land uncounted (the drain had already observed empty and moved on), and then be silently
+dropped when `write_loop` returned and `run_output`'s `select!` cancelled `drain_inbox` — no
+delivery, no `reason="shutdown"` accounting, nothing. `run_output` performs the final drain and
+flush itself instead (`finish_and_flush`), and only after both `write_loop` has stopped and
+`drain_inbox` has either finished naturally or been dropped — there is no window left for a
+producer to slip through. This also makes `flush()` fire on `write_loop`'s *ordinary* completion
+path too (the queue draining to closed-and-empty on its own), which a first version missed
+entirely despite `Output::flush`'s own contract not carving out an exception for the happy path.
 
 ### Bounding is both batches and bytes
 

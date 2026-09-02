@@ -93,6 +93,19 @@ pub fn classify(err: &anyhow::Error) -> Fault {
     err.downcast_ref::<Fault>().copied().unwrap_or(Fault::Permanent)
 }
 
+/// Whether `err` carries an **explicit** `Fault::Permanent` marker from the sink itself, as
+/// opposed to [`classify`]'s conservative default when no `Fault` was found at all. Only an
+/// explicit classification should ever count toward `write_loop`'s sustained-permanent-failure
+/// exit window -- an unclassified error (a sink that hasn't opted into `Fault` at all, e.g.
+/// `StdioOutput`'s bare I/O errors) is correctly treated as non-retryable by [`classify`]'s
+/// default, but must never be mistaken for a *positively identified* configuration error that
+/// should eventually end the process. A `StdioOutput` hitting a transient disk-full condition
+/// forever is a very different situation from `InfluxDbOutput` hitting a bad token forever, and
+/// only the latter should ever trip that window.
+pub fn is_explicitly_permanent(err: &anyhow::Error) -> bool {
+    matches!(err.downcast_ref::<Fault>(), Some(Fault::Permanent))
+}
+
 /// Whether re-delivering an already-delivered batch is an acceptable risk for a sink's
 /// destination. Drives which [`Fault`]s are worth retrying (see [`is_retryable`]); config can
 /// override the derived default per component (workstream F, not yet built).
@@ -182,6 +195,28 @@ mod tests {
     fn classify_defaults_to_permanent_for_an_unclassified_error() {
         let err = anyhow::anyhow!("boom, no fault attached");
         assert_eq!(classify(&err), Fault::Permanent);
+    }
+
+    #[test]
+    fn an_unclassified_error_is_never_explicitly_permanent() {
+        // classify()'s default-to-Permanent is a retry decision, not a claim that the sink
+        // positively identified a configuration error -- an unclassified error must not count
+        // toward write_loop's sustained-permanent-failure exit window.
+        let err = anyhow::anyhow!("boom, no fault attached");
+        assert_eq!(classify(&err), Fault::Permanent, "still non-retryable by default");
+        assert!(!is_explicitly_permanent(&err), "but not an explicit classification");
+    }
+
+    #[test]
+    fn a_sink_that_explicitly_classifies_permanent_is_explicitly_permanent() {
+        let err = anyhow::anyhow!("bad token").context(Fault::Permanent);
+        assert!(is_explicitly_permanent(&err));
+    }
+
+    #[test]
+    fn clean_and_ambiguous_are_never_explicitly_permanent() {
+        assert!(!is_explicitly_permanent(&anyhow::anyhow!("x").context(Fault::Clean)));
+        assert!(!is_explicitly_permanent(&anyhow::anyhow!("x").context(Fault::Ambiguous)));
     }
 
     #[test]
