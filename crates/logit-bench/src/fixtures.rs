@@ -133,6 +133,14 @@ pub fn aggregator() -> Aggregator {
     Aggregator::new(Duration::from_secs(10))
 }
 
+/// Like [`aggregator`], with cross-flush gauge retention enabled -- for measuring the retained
+/// path's own allocation cost (`aggregate_flush_retained_gauges`,
+/// `crates/logit-bench/tests/allocations.rs`), which the default (`gauge_retention: 0`) fixture
+/// above never exercises.
+pub fn aggregator_with_gauge_retention(retention: u32, max_retained: usize) -> Aggregator {
+    Aggregator::new(Duration::from_secs(10)).with_gauge_retention(retention, max_retained)
+}
+
 /// One event as it looks leaving `kv_metrics` -- decoded, JSON-merged, four metrics attached.
 /// This is the widest the event ever gets in the reference pipeline (~10 attributes, 4 metrics)
 /// and therefore the shape whose clone cost fan-out actually pays.
@@ -176,6 +184,27 @@ pub fn distribution_event() -> Event {
             name: logit_core::interner::intern("nginx.request_time"),
             kind: MetricKind::Distribution(sketch),
             unit: Some(logit_core::interner::intern("s")),
+        },
+    )
+}
+
+/// A gauge metric event with a *spilled* (12, past `AttrMap`'s 8-slot inline capacity, and
+/// deliberately un-`keep`ed) attribute map -- the shape `aggregate_flush_retained_gauges`
+/// (`crates/logit-bench/tests/allocations.rs`) uses to pin the real cost of a retained series'
+/// `key.attributes.clone()`, where the clone is a genuine heap allocation rather than the memcpy
+/// `aggregate_flush_100_series`' `keep`-trimmed fixture gets away with.
+pub fn wide_gauge_event(name: &str, value: f64) -> Event {
+    let mut attributes = AttrMap::new();
+    for i in 0..12 {
+        attributes.insert(&format!("tag{i}"), format!("value{i}").as_str());
+    }
+    Event::metric(
+        0,
+        attributes,
+        MetricRecord {
+            name: logit_core::interner::intern(name),
+            kind: MetricKind::Gauge(value),
+            unit: None,
         },
     )
 }

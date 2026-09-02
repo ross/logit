@@ -146,3 +146,99 @@ See `crates/logit-transforms/src/aggregate.rs`'s `process` for the implementatio
 module for the shapes this amendment adds coverage for (a log absorbing a counter and forwarding the
 log; a mixed metric event absorbing what it can and keeping the rest; two same-series metrics on one
 event summing together; a kind conflict leaving only the conflicting metric behind).
+
+## Amendment: gauge series carry across the window boundary
+
+[ADR 0024](0024-relative-gauge-adjustments.md) adds `MetricKind::GaugeDelta`, a relative gauge
+adjustment (statsd/DogStatsD's leading `+`/`-`) that `aggregate` resolves against a gauge's running
+value. But a statsd gauge is sticky by protocol -- the sender transmits only on change and expects
+the last value to persist -- so a delta arriving in window *N+1* has to apply against window *N*'s
+final absolute value, not against an empty accumulator. `flush`'s unconditional
+`self.groups.drain(..)` (the "Tumbling windows, reset on flush" decision above) makes that
+impossible: nothing survives a flush to apply a later delta against. This amendment changes that,
+for gauge series specifically.
+
+### Why gauges, not counters
+
+This ADR's own "Alternatives considered" rejected cumulative (never-reset) counters, matching
+OTLP/Prometheus cumulative temporality, because state grows unbounded with series cardinality and a
+process restart resets every series to zero with no way to detect that from the emitted stream. Gauge
+retention is the same shape of tradeoff -- state surviving a flush, bounded imperfectly by cardinality
+-- so it has to answer the same objection, not quietly reintroduce it through a different metric kind.
+
+The answer is that **a gauge is semantically sticky and a counter is not.** A statsd counter has no
+"current value" between windows -- each window's emitted value is that window's own delta, by design
+(`Counter`'s merge rule sums; nothing about a counter implies continuity with the window before it).
+A statsd gauge, by contrast, *is* a single logical value that a sender updates over time and expects
+to persist until the next update -- that persistence is what the wire protocol's relative-adjustment
+syntax is *for*. Retention buys correctness for gauges that it would not buy for counters: a retained
+counter would just be reinventing the rejected cumulative-counter design with extra steps, while a
+retained gauge is preserving a value the protocol itself says should persist.
+
+It is bounded by **two** mechanisms, not one, specifically because a TTL alone bounds only the tail
+of the retained set, not its peak: `gauge_retention` (a windows-count TTL) answers "how long does an
+idle series linger," but a sustained stream of *C* never-repeating series names per window, at
+retention *R*, would hold *C * R* series forever regardless of how short *R* is -- the TTL never
+catches up. `max_retained_gauge_series` is the second, independent bound: a hard cap on the total
+retained set at any one time, cardinality-guarding exactly the failure mode a TTL alone cannot touch.
+Hitting it is not silent -- a later delta against an evicted series resolves against 0.0 and produces
+a wrong-looking number, so eviction fires both `logit.transform.series.evicted{reason="cardinality"}`
+and a throttled `gauge_retention_full` diagnostic.
+
+### The `at`-reset rule
+
+A retained `Accumulator::Gauge` keeps its `value` but resets `at` to `i64::MIN` the moment it survives
+a flush. `at` exists purely as a **within-window** last-write-wins tiebreak (see "Per-kind merge"
+above); retention must not be allowed to silently promote it into a **cross-window** ordering
+guarantee. Without the reset, an ordinary absolute gauge arriving in window *N+1* with an earlier
+source timestamp than window *N*'s winner would fail the `event.timestamp >= at` comparison and be
+silently dropped -- a new failure class that grows with retention depth, since a longer
+`gauge_retention` would make a stale `at` valid for longer. Resetting `at` on every retain means
+window *N+1* starts its own LWW contest from scratch, exactly as if the series were new, while still
+keeping the *value* that makes it not actually new.
+
+### `logit.transform.series.active` keeps its existing meaning
+
+Retention gives a resource group a second population of series -- ones carried over, contributing
+nothing this window -- alongside the ones that actually received data. `logit.transform.series.active`
+already has a documented job: an early-warning signal for cardinality blowup in the *current* window's
+absorbed data (see `flush`'s own comment on why it's sampled before anything is touched). Silently
+redefining it to include every retained-but-idle series too would break that signal for anyone
+watching it, understating how much a single misbehaving window actually cost while overstating the
+aggregator's true per-window load. So `.active` stays scoped to series with `updated_this_window ==
+true`; a new, separate `logit.transform.series.retained` gauge reports the idle-but-carried
+population instead, so both are visible without either question changing meaning underneath an
+existing dashboard.
+
+### Two consequences worth stating plainly
+
+**A chained downstream `aggregate` re-retains and emits only when the upstream one emitted.** ADR
+0008's own "flush is not exempt from the rest of the chain" decision means a downstream `aggregate`
+re-accumulates whatever an upstream one flushes, including its own gauge retention if configured. A
+naive reading might expect the downstream stage to emit *every* one of its own windows regardless --
+but if the upstream stage retained a gauge series and emitted nothing for it that tick (this
+amendment's whole point), the downstream stage never sees that tick at all, so it can't emit anything
+for it either. This is consistent (an aggregator only ever reacts to what it's handed), not a bug, but
+worth naming since it's a second-order effect of retention that isn't visible from either stage's
+config alone.
+
+**A close-time flush emits nothing for a retained-but-idle gauge, and that is correct, not data
+loss.** ADR 0013's shutdown-flush guarantee (see "Consequences" above) still fires once when a
+listener's inbox closes -- but for a gauge series that was idle at that moment, "flush once more"
+means exactly what it means mid-run: no event, because there is nothing new to report. Read in
+isolation, a shutdown that produces no final point for a gauge an operator knows is "live" can look
+like the last value was lost. It wasn't -- the last value was already emitted at whichever window
+actually updated it, and a gauge's whole contract is that its last emitted value stands until
+replaced. This is worth saying explicitly because it's the one place retention's silence (correct
+mid-run) could plausibly be misread as a bug (at shutdown, when a human is more likely to be watching
+closely).
+
+See `crates/logit-transforms/src/aggregate.rs`'s `flush` for the implementation and its test module
+(the block following the existing pass-through/multi-payload tests) for the shapes this amendment
+adds coverage for: a delta resolving against the previous window's final value; an idle retained
+gauge emitting nothing; eviction after `gauge_retention` idle windows followed by an unseeded delta;
+`gauge_retention: 0` reproducing today's strictly-tumbling output byte-for-byte; the `at`-reset
+regression test; a counter never surviving its window even with retention enabled; a counters-only
+resource group disappearing from `groups`; the cardinality cap evicting and firing
+`series.evicted{reason="cardinality"}`; contexts never carrying across a flush even for a retained
+series; and `flush` never emitting an empty `(resource, events)` pair.

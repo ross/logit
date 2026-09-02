@@ -195,6 +195,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `aggregate` absorb (after `keep`) | **0** | `SeriesKey` clone stays inline |
 | `aggregate` absorb (no `keep`) | **4** | one per metric — the map no longer fits inline |
 | `aggregate` flush 4 series | **6** | +4 since flush-side trace linking landed (ADR 0020) — one `Vec<SpanLink>` per series, see below |
+| `aggregate` flush 100 retained gauge series (spilled attrs) | **209** | `gauge_retention > 0` only — see below; the default (`0`) tumbling path above is unaffected |
 | **full ingest chain, 1 line** | **5** | decode → aggregate; was 11 before `json`'s fix |
 | `Event::clone` (nginx shape) | **4** | what each extra fan-out branch costs |
 | `Event::clone` (statsd shape) | **0** | fits entirely inline |
@@ -251,7 +252,33 @@ the links on the way out, since nothing turns them into a real `SpanRecord` yet
 `aggregate` flushes any series at all, whether or not a config ever routes anything to look at the
 result.
 
-### The headline result: the output encoder *was* the bottleneck, and has been fixed
+### Gauge retention's own cost, isolated and measured (ADR 0008's amendment)
+
+`gauge_retention > 0` (`docs/adr/0008-aggregation-window-semantics.md`'s amendment) adds a real,
+separate allocation cost on top of the flush numbers above, paid only by series that are actually
+retained -- the default (`gauge_retention: 0`) path above is untouched, confirmed by
+`aggregate_flush_100_series` re-measuring at exactly the same **6** it was before retention existed.
+`aggregate_flush_retained_gauges` isolates the retained path itself: 100 distinct, deliberately
+un-`keep`ed gauge series (12 attributes each, past `AttrMap`'s 8-slot inline capacity) retained
+across a second flush, measured **209** allocations. Two costs stack here, both inherent to what
+retention has to do, not incidental:
+
+- **`key.attributes.clone()`, once per retained series.** A retained series' map key has to survive
+  to become its own key again next window, so (unlike the tumbling path, which moves `key
+  .attributes` into the emitted event and drops the key) the attributes have to be cloned instead.
+  With a spilled (non-inline) map, that clone is a genuine heap allocation -- ~100 of the 209, one
+  per series. `aggregate_flush_100_series`'s `keep`-trimmed fixture never pays this, on purpose: its
+  gauge retention is off, so nothing takes this branch at all.
+- **The per-group `series` `HashMap` rebuilds its backing table on every flush that retains
+  anything.** `flush` takes each group's whole `series` map via `mem::take` and re-inserts survivors
+  into the now-empty replacement -- deliberately, so the *far* more common tumbling/drop path can
+  move `key.attributes` for free (see above) rather than paying a clone on every series, retained or
+  not. The tradeoff is that a `gauge_retention > 0` pipeline pays a full table-growth cost -- several
+  allocations, not just one -- every flush, for as long as it keeps retaining the same series. This
+  is accepted as a real, measured cost of opting into retention (not a bug), and is exactly why this
+  fixture exists as its own measurement rather than folding into the default-path number above.
+
+### `aggregate` flush now costs one allocation per series, for real trace links
 
 As first measured, encoding one event for InfluxDB cost **~180 allocations and 4.96 µs** — roughly
 twice what ingesting it cost end to end, and sixteen times what cloning it for an extra fan-out

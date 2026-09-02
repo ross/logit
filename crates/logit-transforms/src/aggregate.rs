@@ -82,8 +82,11 @@ impl ContributingContexts {
 }
 
 /// One tumbling-window aggregator, owned by one pipeline stage. `process` accumulates what it can
-/// and passes everything else straight through; `flush` drains every window it's holding, resetting
-/// each to empty -- state does not carry across flushes (tumbling, not sliding).
+/// and passes everything else straight through; `flush` drains every non-gauge accumulator and
+/// every gauge series past its retention window, resetting each to empty -- state does not carry
+/// across flushes for those. **A gauge series is the one exception**, per `gauge_retention`: see
+/// `docs/adr/0008-aggregation-window-semantics.md`'s "gauge series carry across the window
+/// boundary" amendment for the full design and why gauges specifically (not counters) get this.
 pub struct Aggregator {
     interval: Duration,
     groups: Vec<ResourceGroup>,
@@ -93,6 +96,19 @@ pub struct Aggregator {
     /// reset by `flush` (it isn't part of any one window). Mirrors `run_lua`'s `last_resource`
     /// precedent (`crates/logit-pipeline/src/runtime.rs`): default until the first batch arrives.
     current_batch_context: TraceContext,
+    /// How many consecutive *idle* windows (no update at all) a gauge series is retained past its
+    /// last update, so a delta in window N+1 can still resolve against window N's final absolute
+    /// value. `0` (the default, matching `Aggregator::new`) reproduces today's strictly-tumbling
+    /// behavior exactly -- no gauge series ever survives a flush. Set via
+    /// [`Aggregator::with_gauge_retention`]. See the ADR 0008 amendment.
+    gauge_retention: u32,
+    /// Hard cap on how many gauge series may be retained across all resource groups at once -- a
+    /// DoS/cardinality guard, not a tuning knob. `gauge_retention` alone bounds only the *tail*
+    /// (how long one series survives); this bounds the *peak* (how many can exist retained at
+    /// once), which a sustained stream of never-repeating series names would otherwise blow past
+    /// regardless of how short the retention window is. Least-recently-updated series are evicted
+    /// first once this is exceeded. Meaningless while `gauge_retention` is `0`.
+    max_retained_gauge_series: usize,
 }
 
 struct ResourceGroup {
@@ -105,6 +121,18 @@ struct ResourceGroup {
 struct SeriesState {
     accumulator: Accumulator,
     contexts: ContributingContexts,
+    /// Consecutive flushes this series has survived with **no** update at all -- reset to 0 the
+    /// moment any event touches it again. Only ever incremented for a retained (gauge,
+    /// `gauge_retention > 0`) series; a non-gauge series never survives a flush to have this
+    /// matter. Compared against `Aggregator::gauge_retention` at flush to decide eviction.
+    idle_windows: u32,
+    /// Whether any event touched this series since the last flush. An explicit field, not derived
+    /// from `contexts.seen` being non-empty -- that happens to correlate (`observe` fires on
+    /// exactly the successful merges that also flip this), but coupling this to a set built for a
+    /// different purpose (span linking) is fragile: a future change to `ContributingContexts`
+    /// that stops recording on some merge path would silently break retention's idea of "was this
+    /// updated" too. A `bool` costs nothing extra on an already heap-allocated struct.
+    updated_this_window: bool,
 }
 
 enum Accumulator {
@@ -126,7 +154,21 @@ impl Aggregator {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             current_batch_context: TraceContext::default(),
+            gauge_retention: 0,
+            max_retained_gauge_series: 0,
         }
+    }
+
+    /// Enables cross-flush gauge retention -- see the `gauge_retention`/`max_retained_gauge_series`
+    /// field doc comments and the ADR 0008 amendment. Matches the existing
+    /// `with_diagnostics`/`with_telemetry` builder shape, so `Aggregator::new(interval)`'s
+    /// signature stays unchanged and every existing caller (including `crates/logit-bench`'s
+    /// fixture) compiles unchanged, defaulting to `0` -- strictly tumbling, exactly today's
+    /// behavior.
+    pub fn with_gauge_retention(mut self, retention: u32, max_retained: usize) -> Self {
+        self.gauge_retention = retention;
+        self.max_retained_gauge_series = max_retained;
+        self
     }
 
     /// Records `ctx` as the context of the batch about to be `process`ed -- see
@@ -208,6 +250,8 @@ impl Aggregator {
             let state = entry.or_insert_with(|| SeriesState {
                 accumulator: Accumulator::new_for(&record.kind),
                 contexts: ContributingContexts::default(),
+                idle_windows: 0,
+                updated_this_window: false,
             });
             let accumulated = match (&mut state.accumulator, &record.kind) {
                 (Accumulator::Counter(sum), MetricKind::Counter(v)) => {
@@ -254,6 +298,9 @@ impl Aggregator {
                 // Only on an actual merge -- a kind-conflicted metric didn't touch this series'
                 // accumulator, so it shouldn't be recorded as one of its contributors either.
                 state.contexts.observe(ctx);
+                // An explicit flag, not derived from `contexts.seen` -- see `SeriesState`'s field
+                // doc comment for why. `flush` resets this to `false` for every series it retains.
+                state.updated_this_window = true;
                 if was_vacant && matches!(record.kind, MetricKind::GaugeDelta(_)) {
                     // A delta that opened a brand-new series resolved against 0.0 (statsd's own
                     // rule for an unseeded gauge) -- correct per spec, but indistinguishable from
@@ -299,55 +346,195 @@ impl Aggregator {
         }
     }
 
-    /// Drains every window: one group per resource that had any series, each series becoming one
-    /// emitted event stamped with `now`, paired with the `SpanLink`s
-    /// `ContributingContexts::into_links` built for it. Resets all per-series state -- the next
-    /// window starts empty, per the tumbling design in ADR 0008. `current_batch_context` is *not*
-    /// reset here -- it isn't part of any one window (see its own field doc comment).
+    /// One window's worth of series becomes one emitted event each, stamped with `now` and paired
+    /// with the `SpanLink`s `ContributingContexts::into_links` built for it. **Every non-gauge
+    /// accumulator is still removed unconditionally** -- tumbling, exactly as before this method
+    /// gained retention. A gauge series with `gauge_retention > 0` instead survives into the next
+    /// window, subject to `max_retained_gauge_series`: see the `gauge_retention`/
+    /// `max_retained_gauge_series` field doc comments and
+    /// `docs/adr/0008-aggregation-window-semantics.md`'s amendment for the full design.
+    /// `current_batch_context` is *not* reset here -- it isn't part of any one window (see its own
+    /// field doc comment).
     pub fn flush(&mut self, now: i64) -> FlushOutput {
-        // Sampled before `drain` consumes `self.groups` -- the peak-of-window value, at the one
+        // Sampled before any series is touched below -- the peak-of-window value, at the one
         // point this aggregator already visits every series it holds. `aggregate`'s own
         // `SeriesKey` includes an event's whole attribute set (this module's doc comment), so an
         // un-pruned high-cardinality attribute reaching it shows up here first -- see
         // `docs/design/internal-telemetry.md` and `crate::keep`'s own module doc, which already
         // warns about exactly this failure mode.
-        let active_series: usize = self.groups.iter().map(|g| g.series.len()).sum();
+        //
+        // `.active` keeps its documented meaning -- series that received data *this* window --
+        // rather than silently growing to include every retained-but-idle series too, which would
+        // break its existing high-cardinality early-warning use. `.retained` is the new, separate
+        // count for those.
+        let mut active_series: usize = 0;
+        let mut retained_series: usize = 0;
+        for group in &self.groups {
+            for state in group.series.values() {
+                if state.updated_this_window {
+                    active_series += 1;
+                } else {
+                    retained_series += 1;
+                }
+            }
+        }
         self.telemetry.gauge("logit.transform.series.active", active_series as f64, &[]);
+        self.telemetry.gauge("logit.transform.series.retained", retained_series as f64, &[]);
         self.telemetry.gauge("logit.transform.resource.groups", self.groups.len() as f64, &[]);
 
-        // A loop, not a `.drain().filter().map().collect()` chain, so the dropped-context total
-        // (summed across every series in every group this tick) can be tracked as it goes, then
-        // reported once -- the same per-drain (not per-key) granularity
-        // `ComponentBuffer::drain`'s own `logit.internal.points.dropped` uses.
-        let mut total_dropped: u64 = 0;
+        // Every gauge series this flush decided to keep, not yet placed back into its group --
+        // the cardinality cap below needs to see the *global* candidate set (across every
+        // resource group) before any of them are final, since the cap is a whole-`Aggregator`
+        // bound, not a per-group one. Each group's own `series` map is emptied via `mem::take`
+        // below (not the whole `self.groups` Vec) specifically so surviving series can be
+        // re-inserted straight back into their original group afterward, with no need to also
+        // rebuild a parallel `resources`/`events_per_group` Vec pair just to remember which
+        // group each one came from -- that would cost three extra allocations on the always-taken
+        // default (`gauge_retention: 0`) path for no benefit, since nothing in that path ever
+        // populates `survivors` at all.
+        let mut survivors: Vec<(usize, SeriesKey, SeriesState)> = Vec::new();
+        let mut total_dropped_links: u64 = 0;
+        let mut evicted_idle: u64 = 0;
         let mut result = Vec::new();
-        for group in self.groups.drain(..) {
-            if group.series.is_empty() {
-                continue;
+
+        for (gi, group) in self.groups.iter_mut().enumerate() {
+            let series = std::mem::take(&mut group.series);
+            let mut events = Vec::new();
+            for (key, mut state) in series {
+                let is_gauge = matches!(state.accumulator, Accumulator::Gauge { .. });
+                if state.updated_this_window {
+                    let (links, dropped) = std::mem::take(&mut state.contexts).into_links();
+                    total_dropped_links += dropped;
+
+                    if is_gauge && self.gauge_retention > 0 {
+                        // Retained: read the current value without consuming the accumulator
+                        // (`Gauge`'s fields are plain `Copy` types, so this is free) rather than
+                        // `into_kind()`, which would require cloning the whole accumulator just
+                        // to keep a copy of it around afterward. `key.attributes` is cloned here
+                        // -- and *only* here, not on the tumbling path below -- because `key`
+                        // itself has to survive to become this series' map key again.
+                        let value = match state.accumulator {
+                            Accumulator::Gauge { value, .. } => value,
+                            _ => unreachable!("is_gauge guards this"),
+                        };
+                        events.push((
+                            Event::metric(
+                                now,
+                                key.attributes.clone(),
+                                MetricRecord {
+                                    name: key.name,
+                                    kind: MetricKind::Gauge(value),
+                                    unit: key.unit,
+                                },
+                            ),
+                            links,
+                        ));
+                        // A retained gauge keeps `value` but resets `at` to `i64::MIN`: LWW is a
+                        // within-window tiebreak, and retention must not promote it to a
+                        // cross-window ordering guarantee -- an ordinary absolute gauge in the
+                        // next window with an earlier source timestamp than this window's winner
+                        // must still be accepted, not silently dropped by a stale `at`.
+                        if let Accumulator::Gauge { at, .. } = &mut state.accumulator {
+                            *at = i64::MIN;
+                        }
+                        state.updated_this_window = false;
+                        state.idle_windows = 0;
+                        survivors.push((gi, key, state));
+                    } else {
+                        // Not retained: consume the accumulator directly, exactly as before
+                        // retention existed -- zero-cost for `Distribution` (the sketch's backing
+                        // `Vec`s move rather than being cloned).
+                        let kind = state.accumulator.into_kind();
+                        events.push((
+                            Event::metric(
+                                now,
+                                key.attributes,
+                                MetricRecord { name: key.name, kind, unit: key.unit },
+                            ),
+                            links,
+                        ));
+                    }
+                } else {
+                    // A previously-retained, still-idle gauge series (only reachable when
+                    // `gauge_retention > 0` -- nothing else survives to see an unupdated flush).
+                    // Emits nothing this window -- not a repeat of last window's value, not a
+                    // zero -- which is the whole point of retention: silence, not noise, for a
+                    // gauge nobody touched.
+                    state.contexts = ContributingContexts::default(); // never carried, even empty
+                    state.idle_windows += 1;
+                    if state.idle_windows < self.gauge_retention {
+                        survivors.push((gi, key, state));
+                    } else {
+                        evicted_idle += 1;
+                    }
+                }
             }
-            let mut events = Vec::with_capacity(group.series.len());
-            for (key, state) in group.series {
-                let (links, dropped) = state.contexts.into_links();
-                total_dropped += dropped;
-                let event = Event::metric(
-                    now,
-                    key.attributes,
-                    MetricRecord {
-                        name: key.name,
-                        kind: state.accumulator.into_kind(),
-                        unit: key.unit,
-                    },
-                );
-                events.push((event, links));
+            // Guarded on `events.is_empty()` *after* building, not on whether the group's series
+            // were empty *before*: a group can now hold only retained-but-idle gauges (zero
+            // events this window) without its series map being empty, and the old "skip an
+            // empty-series group" guard would have let that same shape through as an empty batch.
+            if !events.is_empty() {
+                result.push((group.resource.clone(), events));
             }
-            result.push((group.resource, events));
         }
 
-        if total_dropped > 0 {
+        // Cardinality cap: a hard bound on *all* retained gauge series at once, evicting the
+        // least-recently-updated (highest `idle_windows`) first once exceeded. `gauge_retention`
+        // alone bounds only how long one series survives; without this, a stream of C
+        // never-repeating series names per window would hold C * gauge_retention series forever,
+        // regardless of how short the retention window is.
+        let mut evicted_cardinality: u64 = 0;
+        if survivors.len() > self.max_retained_gauge_series {
+            let excess = survivors.len() - self.max_retained_gauge_series;
+            // Stable sort: ties (e.g. several series retained fresh this same flush, all at
+            // `idle_windows == 0`) keep their relative order rather than picking an eviction
+            // victim nondeterministically among equally-idle series.
+            survivors.sort_by_key(|(_, _, state)| std::cmp::Reverse(state.idle_windows));
+            survivors.drain(0..excess);
+            evicted_cardinality = excess as u64;
+        }
+
+        // Re-insert the survivors into their original group's now-empty `series` map, then drop
+        // any group left with none: every non-gauge series was always removed above; every gauge
+        // series was either not retained, idle-evicted, or just cardinality-evicted -- a
+        // counters-only resource group disappears from `self.groups` exactly as it always has,
+        // tumbling or not.
+        for (gi, key, state) in survivors {
+            self.groups[gi].series.insert(key, state);
+        }
+        self.groups.retain(|g| !g.series.is_empty());
+
+        if total_dropped_links > 0 {
             self.telemetry.count(
                 "logit.transform.links.dropped",
-                total_dropped as f64,
+                total_dropped_links as f64,
                 &[("reason", "cardinality")],
+            );
+        }
+        if evicted_idle > 0 {
+            self.telemetry.count(
+                "logit.transform.series.evicted",
+                evicted_idle as f64,
+                &[("reason", "idle")],
+            );
+        }
+        if evicted_cardinality > 0 {
+            self.telemetry.count(
+                "logit.transform.series.evicted",
+                evicted_cardinality as f64,
+                &[("reason", "cardinality")],
+            );
+            // Never silent: hitting the cap means a later delta against an evicted series
+            // resolves against 0.0 and produces a wrong-looking number, same as an unseeded
+            // delta's own diagnostic just below it in spirit.
+            self.diag.warn_throttled(
+                "gauge_retention_full",
+                format_args!(
+                    "gauge retention cap ({}) exceeded; evicted {evicted_cardinality} least-\
+                     recently-updated series -- a later delta against an evicted series will \
+                     resolve against 0.0",
+                    self.max_retained_gauge_series
+                ),
             );
         }
 
@@ -1223,5 +1410,252 @@ mod tests {
         let events = registry.drain(0);
         assert_eq!(gauge_value(&events, "logit.transform.series.active"), Some(3.0));
         assert_eq!(gauge_value(&events, "logit.transform.resource.groups"), Some(2.0));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Workstream C: gauge series retention across the window boundary
+    // (docs/adr/0008-aggregation-window-semantics.md's amendment)
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn a_delta_in_the_next_window_resolves_against_the_previous_windows_final_value() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(5, 100);
+        let resource = default_resource();
+        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        let flushed = flush_events(&mut agg, 100);
+        match kind_of(&flushed[0].1[0]) {
+            MetricKind::Gauge(v) => assert_eq!(*v, 10.0),
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+
+        // Window 2 sees only a delta, no absolute -- it must resolve against window 1's value.
+        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 150));
+        let flushed = flush_events(&mut agg, 200);
+        assert_eq!(flushed.len(), 1);
+        match kind_of(&flushed[0].1[0]) {
+            MetricKind::Gauge(v) => {
+                assert_eq!(*v, 15.0, "the delta should resolve against window 1's final value")
+            }
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_retained_idle_gauge_emits_nothing_that_window() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(5, 100);
+        let resource = default_resource();
+        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        assert_eq!(flush_events(&mut agg, 100).len(), 1, "window 1 emits the gauge");
+
+        // Window 2: nothing touches "conns" at all -- not a repeat of 10.0, not a 0.0, nothing.
+        let flushed = agg.flush(200);
+        assert!(flushed.is_empty(), "an idle retained gauge must emit nothing that window");
+    }
+
+    #[test]
+    fn an_idle_gauge_is_evicted_after_gauge_retention_windows_and_a_later_delta_resolves_against_zero(
+    ) {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_gauge_retention(2, 100)
+            .with_telemetry(telemetry);
+        let resource = default_resource();
+        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        assert_eq!(agg.flush(100).len(), 1, "window 1: emits, idle_windows resets to 0");
+        assert!(agg.flush(200).is_empty(), "window 2: idle_windows -> 1, still under retention 2");
+        assert!(agg.flush(300).is_empty(), "window 3: idle_windows -> 2, now evicted");
+
+        // A delta after eviction opens a brand-new series, resolving against 0.0.
+        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 350));
+        let flushed = flush_events(&mut agg, 400);
+        match kind_of(&flushed[0].1[0]) {
+            MetricKind::Gauge(v) => assert_eq!(*v, 5.0, "should resolve against 0.0 post-eviction"),
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+
+        let drained = registry.drain(0);
+        let unseeded = drained.iter().find_map(|e| {
+            e.metrics.iter().find_map(|m| match &m.kind {
+                MetricKind::Counter(v)
+                    if logit_core::interner::resolve(m.name)
+                        == "logit.transform.gauge.delta.unseeded" =>
+                {
+                    Some(*v)
+                }
+                _ => None,
+            })
+        });
+        assert_eq!(unseeded, Some(1.0), "the post-eviction delta should count as unseeded");
+    }
+
+    /// `gauge_retention: 0` must reproduce today's exact tumbling behavior byte-for-byte -- the
+    /// migration story for anyone not opting into retention (which is every existing config,
+    /// since it's the field's default).
+    #[test]
+    fn gauge_retention_zero_reproduces_the_strictly_tumbling_output() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(0, 0);
+        let resource = default_resource();
+        agg.process(&resource, metric_event("temp", MetricKind::Gauge(5.0), 50));
+        agg.process(&resource, metric_event("temp", MetricKind::Gauge(1.0), 10));
+
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(flushed.len(), 1);
+        let (_, events) = &flushed[0];
+        assert_eq!(events.len(), 1);
+        match kind_of(&events[0]) {
+            MetricKind::Gauge(v) => assert_eq!(*v, 5.0, "should keep the value stamped at t=50"),
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+
+        assert!(
+            agg.flush(200).is_empty(),
+            "gauge_retention: 0 must not retain anything across flushes, exactly like today"
+        );
+    }
+
+    /// The regression test that matters most (per the plan): retaining `Gauge { value, at }`
+    /// verbatim would retain `at` too, so an ordinary absolute gauge in window 2 with an earlier
+    /// source timestamp than window 1's winner would be silently dropped by the last-write-wins
+    /// rule (`event.timestamp` compared against `at`) -- a new failure class that grows with
+    /// retention depth. A retained gauge must reset `at` to `i64::MIN`: LWW is a within-window
+    /// tiebreak, and retention must not promote it to a cross-window ordering guarantee.
+    #[test]
+    fn an_absolute_gauge_in_the_next_window_with_an_earlier_timestamp_is_still_accepted() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(5, 100);
+        let resource = default_resource();
+        // Window 1's winner is stamped at t=500.
+        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 500));
+        flush_events(&mut agg, 1000);
+
+        // Window 2: an absolute gauge stamped at t=1 -- far earlier than window 1's `at` (500).
+        // If retention had carried `at` across the boundary, this would fail `>= at` and be
+        // silently dropped.
+        agg.process(&resource, metric_event("conns", MetricKind::Gauge(99.0), 1));
+        let flushed = flush_events(&mut agg, 2000);
+        match kind_of(&flushed[0].1[0]) {
+            MetricKind::Gauge(v) => assert_eq!(
+                *v, 99.0,
+                "an earlier-timestamped absolute must still win against a reset `at`"
+            ),
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_counter_series_does_not_survive_its_window_even_with_gauge_retention_enabled() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(5, 100);
+        let resource = default_resource();
+        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+        assert_eq!(flush_events(&mut agg, 100).len(), 1);
+        assert!(
+            agg.flush(200).is_empty(),
+            "a counter series must never survive a flush, retention enabled or not"
+        );
+    }
+
+    #[test]
+    fn a_counters_only_resource_group_disappears_from_groups() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_gauge_retention(5, 100)
+            .with_telemetry(telemetry);
+        let resource = default_resource();
+        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+        agg.flush(100);
+        // A second flush's own `resource.groups` sample reflects state as of right before it --
+        // i.e. right after the first flush pruned the now-empty counters-only group.
+        agg.flush(200);
+
+        let events = registry.drain(0);
+        assert_eq!(
+            gauge_value(&events, "logit.transform.resource.groups"),
+            Some(0.0),
+            "a counters-only resource group should disappear from `groups` after its flush"
+        );
+    }
+
+    #[test]
+    fn the_cardinality_cap_evicts_and_fires_series_evicted_cardinality() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_gauge_retention(5, 2)
+            .with_telemetry(telemetry);
+        let resource = default_resource();
+        for i in 0..3 {
+            agg.process(&resource, metric_event(&format!("g{i}"), MetricKind::Gauge(i as f64), 0));
+        }
+        // 3 fresh gauge series, all wanting retention, but the cap is 2 -- one must be evicted.
+        agg.flush(100);
+
+        let events = registry.drain(0);
+        let evicted_cardinality = events.iter().find_map(|e| {
+            if e.attributes.get("reason").and_then(|v| v.as_str()) != Some("cardinality") {
+                return None;
+            }
+            e.metrics.iter().find_map(|m| match &m.kind {
+                MetricKind::Counter(v)
+                    if logit_core::interner::resolve(m.name)
+                        == "logit.transform.series.evicted" =>
+                {
+                    Some(*v)
+                }
+                _ => None,
+            })
+        });
+        assert_eq!(evicted_cardinality, Some(1.0), "exactly one series should exceed the cap");
+    }
+
+    /// `ContributingContexts`' doc comment scopes it to "since the last flush" -- a carried-over
+    /// context on a retained gauge would produce the silently-wrong `SpanLink` parent ADR 0020
+    /// rejected. `mem::take`n every flush unconditionally, retained or not.
+    #[test]
+    fn contexts_are_never_carried_across_a_flush_even_for_a_retained_gauge() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(5, 100);
+        let resource = default_resource();
+        let ctx_a = TraceContext::new_root();
+        agg.observe_batch_context(ctx_a);
+        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+
+        let flushed = agg.flush(100);
+        let (_, events) = &flushed[0];
+        let (_, links) = &events[0];
+        assert_eq!(links.len(), 1, "window 1 links its one contributing context");
+
+        // Window 2: the series is retained-idle, contributing nothing -- if its context leaked
+        // forward, a *later* series sharing the same key would incorrectly inherit ctx_a's link.
+        // Touch it again with a different context and confirm only the new one is linked.
+        let ctx_b = TraceContext::new_root();
+        agg.observe_batch_context(ctx_b);
+        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(1.0), 150));
+        let flushed = agg.flush(200);
+        let (_, events) = &flushed[0];
+        let (_, links) = &events[0];
+        assert_eq!(
+            links.len(),
+            1,
+            "only ctx_b should be linked -- ctx_a must not have carried over"
+        );
+        assert_eq!(links[0].trace_id, ctx_b.trace_id);
+    }
+
+    /// A group holding only retained-but-idle gauges emits zero events; `flush` must not send an
+    /// empty `(resource, events)` batch downstream for it.
+    #[test]
+    fn flush_emits_no_empty_resource_events_group() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(5, 100);
+        let resource = default_resource();
+        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        agg.flush(100); // retains "conns", idle from here on
+
+        // Window 2: "conns" is retained-idle (no event); nothing else touches this resource.
+        let flushed = agg.flush(200);
+        assert!(
+            flushed.iter().all(|(_, events)| !events.is_empty()),
+            "flush must never emit a (resource, events) pair with an empty events list"
+        );
+        assert!(flushed.is_empty(), "the only group present here has nothing to emit at all");
     }
 }
