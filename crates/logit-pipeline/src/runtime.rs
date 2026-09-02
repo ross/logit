@@ -27,7 +27,8 @@ use tokio::task::JoinSet;
 /// therefore the whole pipeline, exactly as an unclassified failure did before this workstream. A
 /// genuinely misconfigured sink (bad token, bad bucket) still fails loudly enough for a
 /// restart-policy supervisor to notice; one malformed batch cannot kill an otherwise-healthy
-/// pipeline. Fixed for now -- not configurable until workstream F.
+/// pipeline. Fixed, not config-exposed -- workstream F's `logit_config::BufferConfig` deliberately
+/// does not surface this window; revisit if a real deployment ever needs to tune it.
 /// See `docs/adr/0020-buffered-sink-delivery.md`'s "Failure handling" section.
 const PERMANENT_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
@@ -42,9 +43,11 @@ pub enum NodeSpec {
     Input(Box<dyn Input + Send>),
     /// The sink's own `SinkQueue` bounds/overflow policy (see `sink_queue.rs`) plus its retry
     /// budget and shutdown grace (see `RetryConfig`/`WriteLoopConfig`). Production call sites
-    /// (`logit-cli::pipeline::build_spec`) pass `SinkQueueConfig::default()`/
-    /// `WriteLoopConfig::default()`; a test can pass whatever config it needs to exercise (e.g. a
-    /// tiny `max_batches` to force overflow behavior deterministically, or a short `total_budget`/
+    /// (`logit-cli::pipeline::build_spec`) build these from the component's own
+    /// `logit_config::BufferConfig` (`queue_config`/`write_config` there), defaulting to
+    /// `SinkQueueConfig::default()`/`WriteLoopConfig::default()` only when a config omits its
+    /// `buffer:` block; a test can pass whatever config it needs to exercise (e.g. a tiny
+    /// `max_batches` to force overflow behavior deterministically, or a short `total_budget`/
     /// `shutdown_grace` to keep a retry/shutdown test fast).
     Output(Box<dyn Output + Send>, SinkQueueConfig, WriteLoopConfig),
     Transform(Box<dyn Transform + Send>),
@@ -262,7 +265,7 @@ async fn run_input(
 async fn run_output(
     id: String,
     mut output: Box<dyn Output + Send>,
-    inbox: mpsc::Receiver<Delivered>,
+    mut inbox: mpsc::Receiver<Delivered>,
     telemetry: Telemetry,
     queue_config: SinkQueueConfig,
     write_config: WriteLoopConfig,
@@ -271,7 +274,12 @@ async fn run_output(
     let queue = Arc::new(SinkQueue::new(queue_config, telemetry.clone()));
     let diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
 
-    let mut drain = Box::pin(drain_inbox(inbox, Arc::clone(&queue), telemetry.clone()));
+    // `inbox` is now owned by *this* function, not moved into `drain_inbox` -- `drain_inbox`
+    // only ever borrows it (`&mut inbox`). This is what makes the abandoned-inbox accounting
+    // below possible: dropping a future that merely borrowed `inbox` releases the borrow without
+    // touching the channel itself, so whatever `drain_inbox` never got around to `recv()`-ing
+    // stays right where it was, in `inbox`'s own buffer, for this function to still see and count.
+    let mut drain = Box::pin(drain_inbox(&mut inbox, Arc::clone(&queue), telemetry.clone()));
     let mut write = Box::pin(write_loop(
         id.clone(),
         output.as_mut(),
@@ -294,8 +302,10 @@ async fn run_output(
     //   has already run `queue.close()` -- by construction `drain` is then already `Ready`, so no
     //   work is lost by not polling it again), it bailed with a fatal error, or shutdown grace
     //   expired. Either way, if `drain` is still pending, it is dropped below -- `Box::pin`ned
-    //   locally, never polled again after this point -- which drops its `inbox: mpsc::Receiver`,
-    //   so an upstream sender observes this consumer as closed immediately.
+    //   locally, never polled again after this point. Dropping it does **not** drop `inbox` any
+    //   more (see the field comment above): whatever was still sitting in `inbox`'s own buffer,
+    //   never `recv()`-ed by the abandoned `drain`, is swept up and counted just below, instead of
+    //   silently vanishing along with the receiver the way an owned-`inbox` `drain_inbox` used to.
     // - `drain` finishes first (its inbox closed normally): `write_loop` hasn't necessarily
     //   finished draining the queue's tail yet, so wait for it.
     // `write` (a `Pin<Box<dyn Future>>`) holds `output`'s mutable borrow until it is dropped, and
@@ -325,6 +335,40 @@ async fn run_output(
     // further be pushed into `queue` -- so this snapshot is genuinely final. See
     // `finish_and_flush`.
     drop(drain);
+
+    // A `drain` abandoned mid-flight (the `write`-finishes-first case above) may leave batches
+    // sitting in `inbox`'s own buffer -- accepted by the channel but never `recv()`-ed, since
+    // `drain_inbox`'s loop never got back around to pulling them out before this function stopped
+    // polling it. Those batches never reached `queue` at all, so `finish_and_flush` below (which
+    // only ever sees what's *in* `queue`) cannot count them; without this sweep they would vanish
+    // with no `batches.dropped` count and no diagnostic, unlike every other drop path this
+    // workstream instruments. `try_recv` is non-blocking and exits as soon as `inbox` reports
+    // empty (or disconnected, the ordinary case when `drain` already ran `inbox` dry on its own),
+    // so this never waits for a sender that may never come.
+    let mut abandoned_batches: u64 = 0;
+    let mut abandoned_events: u64 = 0;
+    while let Ok(delivered) = inbox.try_recv() {
+        let batch = unwrap_batch_arc(delivered);
+        abandoned_batches += 1;
+        abandoned_events += batch.events.len() as u64;
+    }
+    if abandoned_batches > 0 {
+        telemetry.count(
+            "logit.component.batches.dropped",
+            abandoned_batches as f64,
+            &[("reason", "shutdown")],
+        );
+        telemetry.count(
+            "logit.component.events.dropped",
+            abandoned_events as f64,
+            &[("reason", "shutdown")],
+        );
+        diag.warn(format_args!(
+            "{abandoned_batches} batch(es) ({abandoned_events} event(s)) still in this sink's \
+             inbox, never handed to its delivery queue, when this sink stopped"
+        ));
+    }
+
     finish_and_flush(&diag, &queue, &telemetry, output.as_mut()).await;
 
     write_result
@@ -338,24 +382,38 @@ async fn run_output(
 /// already an `Arc`, so this is just a move, no clone. Closes `queue` once `inbox` itself closes,
 /// which is what lets `write_loop`'s `queue.peek()` loop discover "closed and empty" and return --
 /// no separate close-detection logic needed on that side.
+///
+/// Takes `&mut inbox`, not an owned receiver -- `run_output` retains ownership specifically so
+/// dropping this future (when `write_loop` gives up first, see `run_output`'s `select!`) releases
+/// only the borrow, not the channel itself, leaving whatever this loop hadn't yet `recv()`-ed
+/// still sitting in `inbox`'s buffer for `run_output`'s own abandoned-inbox sweep to find and
+/// count, instead of vanishing along with a dropped owned `Receiver`.
+///
 /// `pub` (rather than crate-private, like every other node-loop function here) purely so
 /// `logit-bench`'s allocation tests can drive it directly, isolating exactly this hop's cost --
 /// see `crates/logit-bench/tests/allocations.rs`.
 pub async fn drain_inbox(
-    mut inbox: mpsc::Receiver<Delivered>,
+    inbox: &mut mpsc::Receiver<Delivered>,
     queue: Arc<SinkQueue>,
     telemetry: Telemetry,
 ) {
     while let Some(delivered) = inbox.recv().await {
-        let batch: Arc<EventBatch> = match delivered {
-            Delivered::Owned(batch) => Arc::new(batch),
-            Delivered::Shared(shared) => shared,
-        };
+        let batch = unwrap_batch_arc(delivered);
         telemetry.count("logit.component.batches.received", 1.0, &[]);
         telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
         queue.push(batch).await;
     }
     queue.close();
+}
+
+/// Shared by [`drain_inbox`] and `run_output`'s abandoned-inbox sweep: `Delivered::Owned` costs
+/// one `Arc::new` (previously zero on this path -- see `drain_inbox`'s own doc comment);
+/// `Delivered::Shared` is already an `Arc`, so this is just a move.
+fn unwrap_batch_arc(delivered: Delivered) -> Arc<EventBatch> {
+    match delivered {
+        Delivered::Owned(batch) => Arc::new(batch),
+        Delivered::Shared(shared) => shared,
+    }
 }
 
 /// Retry budget for [`write_loop`]'s generic `deliver_with_retry`, driving every sink -- moved
@@ -2955,6 +3013,128 @@ mod tests {
         assert!(
             flushed.load(std::sync::atomic::Ordering::SeqCst),
             "output.flush() should have been called exactly once, on the ordinary run_output exit path"
+        );
+    }
+
+    /// A review finding, adjacent to the flush/shutdown race the test above closes: when
+    /// `write_loop` gives up first (shutdown-grace expiry here; a permanent-failure-window trip
+    /// is the other way this happens) while `drain_inbox` is still mid-flight, `run_output`'s
+    /// `select!` drops the abandoned `drain` future -- and `drain_inbox` used to *own* its
+    /// `inbox: mpsc::Receiver`, so dropping it also destroyed the channel, silently discarding
+    /// whatever was still sitting in its buffer (accepted by `send`, never yet `recv()`-ed) with
+    /// no `batches.dropped` count and no diagnostic, unlike every other drop path this workstream
+    /// instruments. `drain_inbox` now borrows `inbox` (`&mut`) instead of owning it, so
+    /// `run_output` can retain it, sweep whatever `drain_inbox` never got around to, and count it.
+    ///
+    /// Setup: `max_batches: 1` under `Block` means batch 1 fills the queue and is immediately
+    /// `peek()`-reserved by `write_loop`'s endless-failure retry loop. Batch 2, sent right behind
+    /// it, is pulled off the channel by `drain_inbox` but then blocks forever inside
+    /// `queue.push()` -- a separate, narrower gap this fix does not close, since that batch is
+    /// already out of the channel and held in the abandoned future's own suspended stack by the
+    /// time `drain` is dropped (see this test's final assertion, which documents that residual
+    /// loss rather than papering over it). Batch 3, sent only once `drain_inbox` is confirmed
+    /// stuck on batch 2's push, can only ever sit in `inbox`'s own buffer, genuinely
+    /// un-`recv()`-ed -- exactly the case this fix closes.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_still_sitting_in_the_inbox_when_write_loop_gives_up_is_counted_not_silently_lost(
+    ) {
+        let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
+        let (output, mut handles) = faulty_output(Fault::Clean, u32::MAX, false);
+        let write_config = WriteLoopConfig {
+            retry: RetryConfig {
+                total_budget: Duration::from_secs(3600),
+                base_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(10),
+            },
+            shutdown_grace: Duration::from_millis(100),
+            delivery_override: None,
+        };
+        let queue_config = SinkQueueConfig {
+            max_batches: 1,
+            max_bytes: u64::MAX,
+            overflow: OverflowPolicy::Block,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
+
+        let run = tokio::spawn(run_output(
+            "out".to_string(),
+            Box::new(output),
+            inbox_rx,
+            telemetry,
+            queue_config,
+            write_config,
+            shutdown_rx,
+        ));
+
+        // Batch 1: drained into the queue (filling its one slot), then peeked -- and so
+        // reserved -- by write_loop's endless-failure retry loop.
+        inbox_tx
+            .send(Delivered::Owned(EventBatch {
+                resource: Arc::new(Resource::default()),
+                events: vec![counter_event("hits", 1.0)],
+            }))
+            .await
+            .expect("receiver should still be alive");
+        handles.attempted.recv().await.expect("the first attempt should have happened");
+
+        // Batch 2: drain_inbox receives it, then blocks forever inside `queue.push` -- the queue
+        // is full and its one slot is reserved, so there is nothing a concurrent commit could
+        // ever free.
+        inbox_tx
+            .send(Delivered::Owned(EventBatch {
+                resource: Arc::new(Resource::default()),
+                events: vec![counter_event("hits", 2.0)],
+            }))
+            .await
+            .expect("receiver should still be alive");
+        // Let drain_inbox actually reach and block on that push before sending batch 3 -- if
+        // batch 3 raced ahead of batch 2, it could be the one that gets stuck instead, proving
+        // nothing about the case this fix targets.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Batch 3: drain_inbox is already stuck on batch 2's push, so this one can only ever sit
+        // in `inbox`'s own channel buffer, genuinely un-`recv()`-ed -- exactly the case this fix
+        // closes.
+        inbox_tx
+            .send(Delivered::Owned(EventBatch {
+                resource: Arc::new(Resource::default()),
+                events: vec![counter_event("hits", 3.0)],
+            }))
+            .await
+            .expect("receiver should still be alive");
+
+        shutdown_tx.send(true).expect("receiver should still be alive");
+        drop(inbox_tx);
+
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run_output should not hang")
+            .expect("task should not panic")
+            .expect("shutdown-grace expiry should end run_output with Ok, not Err");
+
+        let dropped_for_shutdown: f64 = registry
+            .drain(0)
+            .iter()
+            .filter(|e| e.attributes.get("component").and_then(|v| v.as_str()) == Some("out"))
+            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("shutdown"))
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| logit_core::interner::resolve(m.name) == "logit.component.batches.dropped")
+            .filter_map(|m| match &m.kind {
+                MetricKind::Counter(v) => Some(*v),
+                _ => None,
+            })
+            .sum();
+
+        assert_eq!(
+            dropped_for_shutdown, 2.0,
+            "batch 1 (left reserved in the queue) and batch 3 (left in the inbox, never drained \
+             into the queue at all) must both be counted as dropped -- before this fix, batch 3 \
+             would vanish uncounted, leaving this at 1.0 instead of 2.0. (Batch 2, stuck inside \
+             an abandoned in-flight `queue.push()`, is a separate, narrower residual gap this fix \
+             does not close, and is deliberately not counted here either.)"
         );
     }
 

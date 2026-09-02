@@ -521,7 +521,7 @@ fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
         rt.block_on(async move {
             tx.send(Delivered::Owned(batch)).await.expect("send should succeed");
             drop(tx); // closes the inbox, so `drain_inbox` returns after this one batch
-            drain_inbox(rx, queue_for_measure, telemetry_for_measure).await;
+            drain_inbox(&mut rx, queue_for_measure, telemetry_for_measure).await;
         })
     });
 
