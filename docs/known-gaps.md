@@ -172,6 +172,18 @@ already built that have a known, accepted rough edge.
   literals (a bounded set), so this was a wasted hash plus concurrent-map probe on the hot path,
   not a leak, but it's gone now regardless: `get`/`remove` use `interner::lookup`, a non-interning
   probe, falling through to the existing search only on a hit.
+
+  **`otlp_in` is the sharpest form of the growth premise yet, now that it's landed (PR3).**
+  Every earlier listener's attribute *keys* come from `logit`'s own config or a fixed protocol
+  grammar (statsd's `#tag:value`, syslog's structured-data field names) — a bounded set by
+  construction. `crates/logit-proto/src/otlp/common.rs`'s `key_values_into_attrs` interns every
+  OTLP `KeyValue.key` it decodes, and OTLP attribute keys are arbitrary peer-supplied strings with
+  no `logit`-side grammar bounding them at all — the first listener where "a metric name that
+  never repeats" (this entry's stated retrofit trigger, above) could plausibly come from something
+  other than a user's own naming mistake. The mitigation this entry already names is documented for
+  real now: [`docs/deploying.md`](deploying.md) has a `keep`-in-front recommendation specifically
+  for `otlp_in`, not just the general `aggregate`-cardinality one
+  [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml) already demonstrates.
 - ~~**`statsd_in` copies tag values instead of slicing them**~~ — **closed.** It used to build
   attribute values with `attributes.insert(k, v)` on a `&str`, routing through
   `Value::str` → `Bytes::from(String)` (copying bytes already in the datagram buffer), then
@@ -339,8 +351,9 @@ already built that have a known, accepted rough edge.
   [ADR 0018](adr/0018-internal-telemetry-as-pipeline-events.md)) covers metrics only** — the
   framework (the `internal` component, the per-component buffer, the emit API) is built to extend,
   but three extensions are deliberately not part of this first cut:
-  - **Internal spans — the propagation substrate is built; nothing emits a `SpanRecord` yet.**
-    `internal`'s name (not `internal_metrics`) deliberately leaves room for this without a rename.
+  - **Internal spans — emission, sampling, and export are now built and proven end to end; three
+    narrower residuals remain (below).**
+    `internal`'s name (not `internal_metrics`) deliberately left room for this without a rename.
     History: `crates/logit-bench/tests/allocations.rs`/`benches/pipeline.rs`'s node-runtime
     coverage closed the gap where nothing measured what `run_transform`/`run_output`/`Fanout::send`
     themselves cost (including the *first* call after every `internal` drain,
@@ -351,42 +364,75 @@ already built that have a known, accepted rough edge.
     allocation change, `size_of::<Delivered>()` 32 → 56, no attributable throughput regression.
     See `docs/design/memory.md`'s "Runtime" and "Costing internal spans" sections for that account.
 
-    **On that evidence, [ADR 0020](adr/0020-trace-context-propagation-on-delivered.md) built it for
-    real** — `Delivered` permanently carries a `TraceContext`, and the two node kinds with an
+    **On that evidence, [ADR 0020](adr/0020-trace-context-propagation-on-delivered.md) built real
+    propagation** — `Delivered` permanently carries a `TraceContext`, and the two node kinds with an
     unambiguous parent propagate a real one: `Transform::process`/`ScriptWorker::process` (the
     non-flush path, one incoming batch per emission) via `Fanout::send_with_context`, and
     `run_output` (already borrows the incoming `Delivered` without unwrapping, so nothing further
-    to wire — see `docs/design/pipeline-graph.md`'s "Trace context propagation" section for the
-    full per-node-kind table). Every listener and every flush-driven emission still mints a fresh
-    root, unchanged from the prototype's behavior — not an oversight, see below.
+    to wire). A follow-up gave `Transform::flush`/`Aggregator` a bounded, best-effort
+    `ContributingContexts` set per series (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8 — dropped and
+    counted past the cap, `logit.transform.links.dropped{reason="cardinality"}`) and paired each
+    flushed `Event` with the `SpanLink`s that set produced. Lua's `flush()` got no equivalent — no
+    accumulator `logit` can inspect — left as an accepted stale-context limitation (next to the
+    identical `Resource`-staleness gap), with `trace.trace_id`/`trace.span_id`
+    (`docs/design/lua-api.md`) exposed to a script's own `process()` instead. Picking an arbitrary
+    contributing batch as "the" parent, for either case, was considered and rejected (silently
+    wrong is worse than visibly incomplete).
 
-    **Item 1, `Transform::flush`/Lua's `flush()`, is now built for both native transforms and
-    Lua** — an *n*-to-1 relationship (however many batches were absorbed since the last tick), with
-    no single correct parent. `Aggregator` (`crates/logit-transforms/src/aggregate.rs`) tracks a
-    bounded, best-effort `ContributingContexts` set per series (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`,
-    8 — dropped and counted past the cap, `logit.transform.links.dropped{reason="cardinality"}`,
-    the same shape `MAX_KEYS_PER_COMPONENT` below uses) and `Transform::flush`'s return type now
-    pairs each emitted `Event` with the `SpanLink`s that set produced. Lua's `flush()` gets no
-    equivalent — no accumulator `logit` can inspect — and is instead documented as an accepted
-    stale-context limitation (above, next to the identical `Resource`-staleness gap), with
-    `trace.trace_id`/`trace.span_id` (`docs/design/lua-api.md`) exposed to a script's own
-    `process()` so it can do its own bookkeeping if it wants better than that. Picking an arbitrary
-    contributing batch as "the" parent, for either case, was considered and rejected in ADR 0020
-    (silently wrong is worse than visibly incomplete).
+    **[ADR 0025](adr/0025-internal-span-emission-and-deterministic-sampling.md) closed both items
+    this entry used to list as open: emission and sampling.** `Telemetry::span`/`SpanGuard` (mirroring
+    `Timer`'s disabled-is-free shape) turn a `(context, node, batch)` visit into a real
+    `SpanRecord`-carrying `Event`, drained by `ComponentBuffer::drain`'s new span pass alongside the
+    existing metric pass — exactly the "`ComponentBuffer`/drain turns counters into events" shape
+    this entry once named as the expected home, per ADR 0018. `run_flush` also changed shape here:
+    it now mints **one** root before `transform.flush(now)` and sends every resource group under it
+    (`Fanout::send_with_own_context`), rather than minting a fresh root per group as it used to — one
+    flush is one unit of work, not *N* hops. Sampling is deterministic on `trace_id`
+    (`trace_is_sampled`, `ComponentKind::Internal::span_sample_rate`, default 0.1) — every node
+    reaches the same keep/drop verdict independently, with no propagated bit and no growth to
+    `TraceContext`/`Delivered`. See `docs/design/internal-telemetry.md`'s "Spans" section for the
+    full account, and `docs/design/pipeline-graph.md`'s "Trace context propagation" table for the
+    resulting per-node-kind span record.
 
-    **What's still open, in order:**
-    1. **Nothing turns a (context, node, batch) tuple into a real `SpanRecord`-carrying `Event`
-       yet.** `Transform::flush`'s `Vec<SpanLink>` is real and tested
-       (`crates/logit-transforms/src/aggregate.rs`'s own test module), but nothing downstream reads
-       it — `run_flush` (`crates/logit-pipeline/src/runtime.rs`) discards it, and propagation
-       through `Delivered` is still unobservable outside `logit-pipeline` (`Output::send` takes
-       `&EventBatch`, not `&Delivered`). This is the piece analogous to how `internal`'s
-       `ComponentBuffer`/drain mechanism turns counters into events
-       (`docs/design/internal-telemetry.md`); routing through the same `internal` component is the
-       expected shape, per ADR 0018.
-    2. **Sampling** — span volume would be a different shape than metric volume once emission
-       exists (potentially one span per node-visit per batch); `internal` will likely need its own
-       knob for this, separate from its drain `interval`.
+    **[docs/plans/0005-otlp-end-to-end.md](plans/0005-otlp-end-to-end.md) (the OTLP series' fourth
+    PR) is what actually closes this item, not ADR 0025 alone.** Everything above built a real
+    `SpanRecord` inside `logit`'s own process; nothing tested whether the result was a span *any
+    other system would recognize*. `otlp_out` (ADR 0023's codec, ADR 0024's hand-rolled gRPC
+    transport) is that proof: `demo/logit.yaml`'s `trace_out` exports `internal`'s spans to a real
+    Tempo over OTLP/gRPC, and Grafana's Tempo panel shows the actual parent/child tree a config's
+    topology produces -- a listener root with transform/sink children, matching
+    `pipeline-graph.md`'s table exactly. That is the end-to-end proof this entry was missing: not
+    "a span exists," but "a span leaves the process, decodes correctly on the wire, and reconstructs
+    the right shape on the other end."
+
+    **What sampling does and doesn't do, now that it's exercised for real.** `span_sample_rate`
+    (default `0.1`, `1.0` in the demo) decides, once per `trace_id`, whether *this* trace's internal
+    spans exist at all inside `logit` -- an unsampled trace never becomes a `SpanRecord`, never
+    occupies a slot in the bounded per-component buffer, and costs nothing beyond the sampler's own
+    branch (`Telemetry::span`'s doc comment). It is a volume control on `logit`'s own
+    self-observability, deliberately independent of the traffic it's observing: raising or lowering
+    it changes how much of the internal pipeline you can see, never what the pipeline does to an
+    event. What it does *not* do: it doesn't sample the events themselves (a dropped trace's events
+    still flow through the pipeline and reach every configured sink, untouched); it doesn't
+    propagate to or from a peer (no `sampled` flag crosses `otlp_in`/`otlp_out`'s wire boundary, so
+    a `logit` downstream of another `logit` -- or of any other OTLP producer -- makes its own
+    independent keep/drop decision on the same `trace_id`, per ADR 0025's "no propagated bit"
+    decision); and it doesn't thin the *metrics* signal at all -- `internal`'s point-side buffer and
+    `otlp_out`'s metrics encoding are entirely unaffected by this knob, which is why the demo's
+    InfluxDB dashboard populates identically whether `span_sample_rate` is `0.1` or `1.0`.
+
+    **What's still open, deliberately, not oversights:**
+    1. **The listener span's window is the `send` call only, not decode-to-send.** `Fanout::send`
+       has no visibility into how long a listener spent building the batch it's about to send
+       (`Input::run` is a free-form loop) — the still-open listener-side half of "delivery I/O is
+       not decoupled from event processing" (below).
+    2. **Lua `flush()` still gets a link-less root.** It gets a real span now (ADR 0025), but no
+       links — there is still no accumulator on the Lua side to inspect, same limitation as the
+       `Resource`-staleness gap above.
+    3. **A `SinkQueue` entry is 24 bytes larger.** `TraceContext` now rides inline in every queue
+       entry (`push`/`peek`) so `write_loop` can parent its own sink span on the context a batch
+       actually arrived under — the same size-for-a-span trade `Delivered` itself already made and
+       measured (`docs/design/memory.md`'s "Costing internal spans" section).
   - **Internal logs** — routing `Diagnostics`' stderr output into the graph as `LogRecord` events
     is the natural next layer, and what the still-deferred `tracing` migration (above) should build
     on rather than duplicate.
@@ -463,3 +509,126 @@ already built that have a known, accepted rough edge.
   the pipeline currently relies on. Real work either way, with no forcing function yet — this
   entry is that forcing function, for whenever the output path's allocation cost becomes worth
   chasing.
+- **Cross-protocol semantic gaps.** OTLP (`crates/logit-proto/src/otlp/`) is `logit`'s first
+  *second* wire model, and its codec is the first place "our internal model can't cleanly express
+  what a peer protocol expects" shows up as more than a one-line doc-comment footnote. Filed as its
+  own entry, meant to grow as more codecs and more of OTLP's own surface (exemplars, profiles,
+  OTLP's log `event_name`, ...) get real mappings, rather than re-discovered by grepping doc
+  comments across encoders each time. Every mapping below is deliberate, counted, and documented at
+  its own call site — this entry exists so the list is in one place too:
+
+  | Direction | Mapping | Counter | Why |
+  |---|---|---|---|
+  | encode | `MetricKind::Distribution` (a `DDSketch`) → OTLP `Summary` of 5 fixed quantiles (p50/p75/p90/p95/p99) | `logit.output.metrics.degraded{metric_kind="distribution"}` | OTLP has no mergeable-sketch metric type; `ExponentialHistogram` is the nearest shape, but `DDSketch` exposes no bin iteration to convert from (`crates/logit-core/src/metric.rs`), and fabricating one would repeat the "non-mergeable HyperLogLog" mistake AGENTS.md already warns against (`crates/logit-proto/src/otlp/metrics.rs`'s module doc). |
+  | encode | `MetricKind::Set` (a `HyperLogLog`) → skipped entirely | `logit.output.metrics.skipped{metric_kind="set"}` | `HyperLogLog` is still a stub with no cardinality to read (this file's own first entry) — matches `crates/logit-outputs/src/influxdb.rs`'s existing precedent for the same kind. |
+  | encode | `Value::U64` above `i64::MAX` → OTLP `AnyValue.DoubleValue` | none (numeric, not a metric point) | OTLP's only integer type is signed 64-bit; exact up to `f64`'s 2^53 range, approximate above it. Any `Value::U64` (even in range) also loses the "this was unsigned" fact on decode, coming back as `Value::I64` — `otlp/common.rs`'s module doc has the full case list. |
+  | encode | `Value::Timestamp` → OTLP `AnyValue.IntValue` | none | OTLP's `AnyValue` has no timestamp variant at all; decodes back as `Value::I64`, indistinguishable from a value that was always an integer. |
+  | decode | OTLP `ExponentialHistogramDataPoint` wider than 512 derived buckets → skipped | `logit.input.metrics.skipped{metric_kind="exponential_histogram", reason="bucket_cap"}` | The *mapping itself* is exact (an exponential histogram is a fixed-bucket histogram with geometric bounds, not lossy) — this is a volume bound against a peer-chosen `scale`/`offset` producing an unbounded `Vec`, the same "bound and count" shape every buffer in this codebase uses for its own overflow. |
+  | decode | any OTLP data point with `flags & DATA_POINT_FLAGS_NO_RECORDED_VALUE_MASK` → skipped | `logit.input.metrics.skipped{metric_kind, reason="no_recorded_value"}` | Never fails the whole request — OTLP has its own channel for reporting rejected points back (`partial_success`), wired in PR3, not invented here as a second one. |
+
+  Two residual, narrower gaps in the same codec, not yet worth their own table row:
+  `BodyFormat`/a span's `Status.message` have no OTLP field of their own and round-trip through a
+  reserved attribute (`logit.body_format`, `otel.status_message`) instead — lossless, just an
+  attribute-shaped workaround, documented in `otlp/logs.rs`'s and `otlp/traces.rs`'s own module
+  docs. And a bare `LogRecord`'s OTLP `trace_id`/`span_id` fields (correlating a log to a trace
+  without carrying the span itself) are dropped on both directions — `logit_core::LogRecord` has no
+  field for them, since this codebase's own correlation mechanism is a log and its span sharing one
+  `Event`, not a pair of IDs living on the log alone.
+
+  Both `Distribution`→`Summary` and `Set`→skip are a real, if narrow, qualification of
+  [ADR 0004](adr/0004-native-wire-format-with-otlp-bridge.md)'s claim that the internal model "must
+  be a superset of what OTLP can express, or the OTLP codec becomes lossy": here it's `logit`'s own
+  model — a mergeable sketch, a cardinality stub — that can't be losslessly re-expressed *as* OTLP,
+  the direction ADR 0004 didn't anticipate. See
+  [ADR 0023](adr/0023-committed-pregenerated-otlp-protobuf.md)'s Consequences section for that
+  qualification stated plainly, and `crates/logit-proto/src/otlp/metrics.rs`'s module doc for the
+  full encode/decode tables this summarizes.
+
+- **`otlp_in` doesn't support compressed requests, and its `partial_success` response is always
+  empty.** Two separate, deliberate gaps in `crates/logit-inputs/src/otlp.rs`
+  ([ADR 0024](adr/0024-hand-rolled-grpc-over-hyper.md)):
+  - **Compression.** `Content-Encoding: gzip` (OTLP/HTTP) and `grpc-encoding: gzip` (OTLP/gRPC) are
+    both rejected outright (`415`/`grpc-status: 12`) rather than silently mishandled — `flate2`
+    isn't a dependency, and decompressing untrusted input unboundedly is real, security-relevant
+    surface (a compression-bomb-shaped request) this PR deliberately didn't take on. The practical
+    consequence: the OTel Collector's own default OTLP exporter sends gzip, so pointing a real
+    Collector at `otlp_in` fails on day one even though `otlp_out → otlp_in` (this PR's own
+    round-trip tests, which never set either header) works fine, and `otlp_out → Tempo` (PR4's demo
+    path) is unaffected since Tempo's own OTLP receiver doesn't require compression. Revisit with
+    `flate2` if a real deployment needs it.
+  - **`partial_success` accounting.** OTLP's `Export*ServiceResponse.partial_success` field exists
+    so a receiver can accept most of a request while reporting which records it rejected —
+    `otlp_out` (`crates/logit-outputs/src/otlp.rs`) fully implements the *reading* half of this (see
+    its `a_partial_success_response_is_counted_not_failed` tests). But
+    `logit_proto::SignalDecoder::decode_signal` doesn't return a per-call skip/reject count today —
+    only a self-telemetry counter (`logit.input.metrics.skipped{metric_kind, reason}`) — so there's
+    nothing for `otlp_in` to echo back into the wire response yet: every successful decode replies
+    with an empty (all-default, meaning "fully accepted") `partial_success`, even when the request
+    silently skipped a metric point internally (an over-cap exponential histogram, a
+    `NO_RECORDED_VALUE`-flagged point). A fully malformed request (bad protobuf, an invalid span id)
+    still correctly fails the *whole* request (`400`/`grpc-status: 3`), which is the one shape
+    `otlp_in`'s response *does* reflect today. Threading a real per-call count through would be a
+    `SignalDecoder` API change (`crates/logit-proto`), out of scope for the PR that added `otlp_in`
+    itself — a natural next step whenever OTLP input volume makes the gap worth closing.
+
+- **`otlp_out` aborts an entire batch's `send` on the first signal request that fails -- pointed at
+  a signal-partial backend fed by a mixed-signal source, that's not just noise, it can end the
+  process.** Discovered running `demo/`'s `trace_out` against Tempo
+  ([docs/plans/0005-otlp-end-to-end.md](plans/0005-otlp-end-to-end.md)), not anticipated by that
+  plan. `internal` (`self`, observing `logit`'s own pipeline) doesn't distinguish signals -- every
+  drain carries both spans and this process's own `logit.*` metrics (all `Counter`/`Gauge`/
+  `Distribution`, all mergeable). `OtlpOutput::send` (`crates/logit-outputs/src/otlp.rs`) issues
+  one request per non-empty signal, sequentially (traces before metrics, per `encode_signals`'
+  fixed ordering), and `?`-propagates the first failure without attempting the rest. Tempo is a
+  traces-only OTLP receiver -- it registers a `TraceService` but no `MetricsService` -- so a batch
+  mixing both sees its traces request succeed and its metrics request that follows fail with
+  `grpc-status: 12` (`UNIMPLEMENTED`, correctly classified `Fault::Permanent`, correctly not
+  retried). `write_loop` sees one failed `send` and drops the whole batch -- a batch whose trace
+  payload had already, successfully, separately reached Tempo moments earlier, confirmed directly
+  against Tempo's `/api/search`/`/api/traces` endpoints.
+
+  **That alone is recoverable noise. Pointed straight at `self` with nothing in between, it is not
+  recoverable at all.** `self`'s 10s drain interval meant *every* `trace_out` batch mixed both
+  signals, so `send` never once returned `Ok`, `last_success` never advanced, and `write_loop`'s
+  ~60s sustained-permanent-failure guard
+  ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md), revised by
+  [ADR 0021](adr/0021-buffered-sink-delivery.md)) killed the entire `logit` process about a minute
+  after startup -- taking the InfluxDB metrics path down with it, not just Tempo. That guard exists
+  specifically to end a process stuck on a genuine misconfiguration (a bad token, a bad bucket); a
+  demo whose "misconfiguration" is actually two signals correctly reaching a backend that only
+  wants one is exactly the false-positive case it wasn't built to distinguish. `demo/logit.yaml`
+  works around this at the config layer: a dedicated `aggregate` node (`trace_windowed`) sits
+  between `self` and `trace_out`, absorbing every mergeable metric into window state and
+  forwarding a metric-less event -- a pure span -- untouched and immediately
+  (`crates/logit-transforms/src/aggregate.rs`'s `process` doc comment). That makes the overwhelming
+  majority of `trace_out`'s batches traces-only, so `send` succeeds and the guard's streak keeps
+  resetting; `trace_windowed`'s own periodic `flush` still occasionally emits a real metrics-only
+  batch that fails the same way, but the many successful pure-span deliveries surrounding it (every
+  ~10s, against one `flush` per 60s) reset the guard long before it reaches 60s.
+
+  This is specific to pointing `otlp_out` at a mixed-signal source feeding a signal-partial
+  backend -- a production `otlp_out` scoped to a source that only ever carries the signals its
+  destination accepts would never hit either half of this. Not fixed at the source here
+  (`docs/plans/0005-otlp-end-to-end.md` is config/docs only, no new Rust) -- the real fix is a
+  config-layer way to filter an event stream by which payload it carries (no existing transform
+  does this directly; `keep`/`remove` filter attributes, not `event.metrics`/`event.log`/
+  `event.span` themselves -- `aggregate` only does it as a side effect of absorbing metrics for a
+  different purpose) or a per-signal partial-failure mode on `OtlpOutput::send` that doesn't abort
+  sibling signals already in flight and doesn't let one incompatible signal alone trip the
+  sustained-failure guard for signals that are succeeding. `demo/logit.yaml`'s `trace_windowed`/
+  `trace_out` components carry this same explanation inline.
+
+- **`otlp_out`'s gRPC transport opens a fresh connection per request, never pooled.** Every gRPC
+  `send` (`crates/logit-outputs/src/otlp.rs`'s `grpc_roundtrip`) connects, performs a fresh HTTP/2
+  handshake, sends exactly one framed request, reads the response, then drops the connection —
+  leaving its spawned connection-driver task to exit once the drop is observed. A mixed-signal
+  batch pays connect+handshake three times; a steady stream of batches pays it once per signal per
+  batch, where the HTTP transport gets `reqwest`'s connection pooling for free. Deliberate for this
+  PR, not an oversight: [ADR 0024](adr/0024-hand-rolled-grpc-over-hyper.md) is explicit about
+  keeping the hand-rolled gRPC surface minimal (the three unary `Export` RPCs, nothing else), and a
+  real connection pool — reuse keyed by endpoint, handling a server-initiated GOAWAY, concurrent
+  in-flight streams over one connection — is real infrastructure `tonic`/`hyper-util`'s own client
+  pooling would normally supply. Worth revisiting if `otlp_out`'s gRPC transport shows up as a
+  bottleneck under sustained load (connect+TLS-less-handshake cost per request, not per batch of
+  requests); until then this is a documented, deliberate simplicity-over-throughput trade, not a
+  silent one.

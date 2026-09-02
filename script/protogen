@@ -1,0 +1,20 @@
+#!/bin/bash
+# Usage: script/protogen
+# Regenerates crates/logit-proto/src/otlp/generated/ from the vendored .proto files
+# (crates/logit-proto/proto/, provenance in proto/README.md) via prost-build + protoc, run inside
+# a throwaway image (tools/protogen/Dockerfile) that carries protoc.
+#
+# Deliberately NOT part of script/cibuild: putting protoc in the CI image is exactly what
+# ADR 0005 rules out, and ADR 0023 settles regeneration as a deliberate, reviewed act instead of a
+# CI drift check. Review the diff under crates/logit-proto/src/otlp/generated/ and commit it
+# yourself after running this.
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+${DOCKER} build -q -t logit-protogen -f tools/protogen/Dockerfile tools/protogen
+${DOCKER} run --rm -v "${ROOT}:/work:z" -w /work logit-protogen \
+    cargo run --quiet --manifest-path tools/protogen/Cargo.toml
+
+echo "Regenerated crates/logit-proto/src/otlp/generated/ -- review the diff and commit it."

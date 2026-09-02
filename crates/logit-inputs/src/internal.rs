@@ -75,7 +75,26 @@ impl InternalInput {
         // other point here, it rides along in the *next* drain, one tick behind. Every mature
         // statsd client's own self-telemetry (packets sent/dropped) works the same way, for the
         // same reason: a drain can't include a count of itself.
-        self.telemetry.count("logit.internal.points.emitted", events.len() as f64, &[]);
+        //
+        // Split by shape, not just totalled: `drain` now returns metric-point events and
+        // span-carrying events in one flat list (`docs/design/internal-telemetry.md`'s "Spans"
+        // section), and `logit.internal.points.emitted` naming *points* specifically would become
+        // wrong the moment a span rode along inside its count uncounted-for.
+        // `logit.internal.spans.emitted` is the symmetric counter for the other half.
+        let (points_emitted, spans_emitted) =
+            events.iter().fold((0u64, 0u64), |(points, spans), event| {
+                if event.span.is_some() {
+                    (points, spans + 1)
+                } else {
+                    (points + 1, spans)
+                }
+            });
+        if points_emitted > 0 {
+            self.telemetry.count("logit.internal.points.emitted", points_emitted as f64, &[]);
+        }
+        if spans_emitted > 0 {
+            self.telemetry.count("logit.internal.spans.emitted", spans_emitted as f64, &[]);
+        }
 
         sink.send(EventBatch { resource: Arc::new(Resource::default()), events }).await;
     }
@@ -192,5 +211,50 @@ mod tests {
             }
         }
         assert!(found, "the second drain should carry the first drain's emitted-count");
+    }
+
+    /// The counting half of `docs/design/internal-telemetry.md`'s "Spans" section: a drain that
+    /// mixes span and metric events reports each kind under its own counter, not one merged
+    /// `points.emitted` that would misdescribe a span as a point.
+    #[tokio::test]
+    async fn a_drain_carrying_a_span_reports_spans_emitted_separately_from_points_emitted() {
+        let registry = logit_core::Registry::with_span_sampling(1.0);
+        let own_telemetry = registry.telemetry_for("self", "internal", "listener");
+        let component_telemetry = registry.telemetry_for("agg", "aggregate", "transform");
+        component_telemetry.count("logit.transform.series.active", 1.0, &[]);
+        drop(component_telemetry.span(
+            "flush",
+            logit_core::SpanKind::Internal,
+            [1; 16],
+            [1; 8],
+            None,
+        ));
+
+        let input =
+            InternalInput::new(Duration::from_millis(1), registry).with_telemetry(own_telemetry);
+        let (tx, mut rx) = mpsc::channel(4);
+        let fanout = Fanout::new(vec![tx]);
+
+        input.tick(Instant::now(), &fanout).await; // drains the point + the span; buffers both counts
+        input.tick(Instant::now(), &fanout).await; // now drains the emitted-counts from the first tick
+
+        let (mut found_points, mut found_spans) = (false, false);
+        while let Ok(delivered) = rx.try_recv() {
+            let batch = match delivered {
+                logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
+                logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
+            };
+            for event in &batch.events {
+                for metric in &event.metrics {
+                    match logit_core::interner::resolve(metric.name) {
+                        "logit.internal.points.emitted" => found_points = true,
+                        "logit.internal.spans.emitted" => found_spans = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(found_points, "a points.emitted counter should still be recorded");
+        assert!(found_spans, "a spans.emitted counter should also be recorded, separately");
     }
 }

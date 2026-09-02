@@ -224,7 +224,7 @@ impl Aggregator {
         for record in metrics {
             // No merge rule defined for these (docs/design/data-model.md) -- leave them on the
             // event rather than absorbing or dropping them. `GaugeDelta` is *not* here -- it has
-            // a real resolution below, unlike these three (docs/adr/0024-relative-gauge-adjustments.md).
+            // a real resolution below, unlike these three (docs/adr/0026-relative-gauge-adjustments.md).
             if matches!(
                 record.kind,
                 MetricKind::Set(_) | MetricKind::Histogram { .. } | MetricKind::Summary { .. }
@@ -271,7 +271,7 @@ impl Aggregator {
                     true
                 }
                 (Accumulator::Gauge { value, .. }, MetricKind::GaugeDelta(d)) => {
-                    // Asymmetric on purpose (docs/adr/0024-relative-gauge-adjustments.md,
+                    // Asymmetric on purpose (docs/adr/0026-relative-gauge-adjustments.md,
                     // verbatim there): a delta applies to the running value in *arrival* order
                     // and never advances `at` -- note the `..`. Mixing "deltas in arrival order"
                     // with "absolutes by last-write-wins" is undefined the moment they interleave
@@ -306,6 +306,16 @@ impl Aggregator {
                     // rule for an unseeded gauge) -- correct per spec, but indistinguishable from
                     // a real 0.0 in the emitted number, so this is counted and reported rather
                     // than left silent.
+                    //
+                    // In this workstream (B) every flush still drains the whole series map --
+                    // gauge retention across the window boundary is workstream C, not yet landed
+                    // -- so a series fed *only* by deltas (a client relying on statsd's sticky-
+                    // gauge semantics, never sending an absolute) opens a brand-new, empty
+                    // accumulator every single window and this fires every time, not once at
+                    // startup. That is expected, current-workstream behavior, not a leak or a
+                    // bug: once C lands, a gauge series survives an idle window and this only
+                    // fires for a genuinely new series or one that's aged out of retention. See
+                    // `docs/adr/0026-relative-gauge-adjustments.md`'s Consequences.
                     self.telemetry.count("logit.transform.gauge.delta.unseeded", 1.0, &[]);
                     self.diag.warn_throttled(
                         "gauge_delta_unseeded",
@@ -569,7 +579,7 @@ impl Accumulator {
             MetricKind::Counter(_) => Accumulator::Counter(0.0),
             // `Gauge` and `GaugeDelta` share one accumulator -- they're not a kind conflict, just
             // two different ways to update the same running value (`docs/adr/
-            // 0024-relative-gauge-adjustments.md`). This makes `new_for` non-injective on
+            // 0026-relative-gauge-adjustments.md`). This makes `new_for` non-injective on
             // purpose: two different `MetricKind`s map to the same `Accumulator` variant, which
             // would otherwise be easy to miss given the `unreachable!()` arm below makes the rest
             // of this mapping look total-and-one-to-one.
@@ -874,7 +884,7 @@ mod tests {
     }
 
     /// Guards `process`'s pass-through `matches!` directly, not just by implication
-    /// (`docs/adr/0024-relative-gauge-adjustments.md`): a `GaugeDelta` must be absorbed, not
+    /// (`docs/adr/0026-relative-gauge-adjustments.md`): a `GaugeDelta` must be absorbed, not
     /// forwarded, now that workstream B gives it a real resolution -- the opposite of what
     /// workstream A's version of this test pinned. A comment alone on the `matches!` wouldn't
     /// catch a future change that silently defeated the whole feature by adding `GaugeDelta`
