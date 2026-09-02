@@ -244,15 +244,16 @@ fn build_spec(
             queue_config(&component.buffer),
             write_config(&component.buffer),
         ),
-        OtlpOut { endpoint, protocol } => NodeSpec::Output(
-            Box::new(
-                OtlpOutput::new(endpoint.clone(), otlp_out_transport(*protocol))
-                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                    .with_telemetry(telemetry.clone()),
-            ),
-            queue_config(&component.buffer),
-            write_config(&component.buffer),
-        ),
+        OtlpOut { endpoint, protocol } => {
+            let output = OtlpOutput::new(endpoint.clone(), otlp_out_transport(*protocol))?
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer),
+                write_config(&component.buffer),
+            )
+        }
         StdioOut { target } => {
             let output = match target {
                 StdioTarget::Stdout => StdioOutput::stdout(),
@@ -578,6 +579,30 @@ mod tests {
                 "protocol {protocol:?}"
             );
         }
+    }
+
+    /// `OtlpOutput::new`'s https-under-grpc guard (`crates/logit-outputs/src/otlp.rs`) surfaces
+    /// through `build_spec` as a clear config error, not a panic or a silently-downgraded
+    /// connection -- `NodeSpec` isn't `Debug` (see `build_spec_reports_a_clear_path_naming_error_
+    /// for_an_unopenable_stdio_target`'s comment for why this can't use `expect_err` directly).
+    #[test]
+    fn build_spec_rejects_an_otlp_sink_with_https_under_grpc() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::OtlpOut {
+                endpoint: "https://tempo:4317".to_string(),
+                protocol: logit_config::OtlpProtocol::Grpc,
+            },
+        };
+        let err = match build_spec("out", &component, Path::new(""), None) {
+            Ok(_) => {
+                panic!("expected build_spec to reject an https:// endpoint under protocol: grpc")
+            }
+            Err(err) => err,
+        };
+        assert!(format!("{err:?}").contains("https"), "got: {err:?}");
     }
 
     /// The wiring this workstream adds: a non-default `buffer:` on the component actually reaches

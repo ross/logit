@@ -111,7 +111,7 @@ fn assert_round_tripped(received: &[EventBatch]) {
 async fn otlp_output_to_otlp_input_round_trips_a_batch_through_http() {
     let addr = ephemeral_addr().await;
     let input = OtlpInput::new(addr.clone(), InTransport::Http);
-    let output = OtlpOutput::new(format!("http://{addr}"), OutTransport::Http);
+    let output = OtlpOutput::new(format!("http://{addr}"), OutTransport::Http).unwrap();
 
     let received = round_trip(input, output, &mixed_signal_batch()).await;
     assert_round_tripped(&received);
@@ -121,7 +121,7 @@ async fn otlp_output_to_otlp_input_round_trips_a_batch_through_http() {
 async fn otlp_output_to_otlp_input_round_trips_a_batch_through_grpc() {
     let addr = ephemeral_addr().await;
     let input = OtlpInput::new(addr.clone(), InTransport::Grpc);
-    let output = OtlpOutput::new(addr.clone(), OutTransport::Grpc);
+    let output = OtlpOutput::new(addr.clone(), OutTransport::Grpc).unwrap();
 
     let received = round_trip(input, output, &mixed_signal_batch()).await;
     assert_round_tripped(&received);

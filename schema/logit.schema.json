@@ -701,16 +701,17 @@
       "description": "Which OTLP transport a component speaks -- both `otlp_in` and `otlp_out` carry identical protobuf payloads (`crates/logit-proto/src/otlp`), differing only in framing and endpoint shape (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`).",
       "oneOf": [
         {
-          "type": "string",
-          "enum": [
-            "grpc"
-          ]
-        },
-        {
           "description": "OTLP/HTTP, protobuf body, one POST per signal. Default: it's what an `http://host:4318`-shaped endpoint already implies, and a bare `endpoint: http://tempo:4318` would be silently wrong under any other default.",
           "type": "string",
           "enum": [
             "http"
+          ]
+        },
+        {
+          "description": "Unary gRPC over plaintext HTTP/2 -- `crates/logit-outputs/src/otlp.rs`'s hand-rolled gRPC transport has no TLS support at all (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`), so an `otlp_out` component's `endpoint` under this protocol is rejected at construction time if it's written with an `https://` scheme, rather than silently exporting in plaintext.",
+          "type": "string",
+          "enum": [
+            "grpc"
           ]
         }
       ]

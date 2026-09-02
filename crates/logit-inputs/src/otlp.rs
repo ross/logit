@@ -31,9 +31,12 @@
 //! `otlp_out -> otlp_in` (this PR's own round-trip tests, which never set `grpc-encoding`/
 //! `Content-Encoding`) works fine. Recorded as a known gap; revisit with `flate2` if it bites.
 //!
-//! **Size limit.** `MAX_REQUEST_BYTES` (4 MiB) matches the OTel collector's own default
-//! `max_recv_msg_size`; a request over that is rejected (`413`/`grpc-status: 8`, `RESOURCE_EXHAUSTED`)
-//! before it can grow an unbounded buffer.
+//! **Size and concurrency limits.** `MAX_REQUEST_BYTES` (4 MiB) matches the OTel collector's own
+//! default `max_recv_msg_size`; a request over that is rejected (`413`/`grpc-status: 8`,
+//! `RESOURCE_EXHAUSTED`) before it can grow an unbounded buffer. That bounds one connection's
+//! worst case, not the listener's as a whole -- `MAX_CONCURRENT_CONNECTIONS` bounds how many
+//! connections `run` serves at once, so total worst-case memory stays a real (if generous) number
+//! rather than unbounded.
 //!
 //! **The response's `partial_success` is always empty on a successful decode.** OTLP's own
 //! `Export*ServiceResponse.partial_success` exists to report *which* records within an otherwise-
@@ -59,11 +62,22 @@ use logit_pipeline::Fanout;
 use logit_proto::otlp::OtlpDecoder;
 use logit_proto::{Signal, SignalDecoder};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use tokio::net::TcpListener;
 
 /// Matches the OTel collector's own default `max_recv_msg_size` -- see this module's doc comment.
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
+/// Bounds the number of connections [`Input::run`] serves concurrently -- without this, the
+/// per-request cap [`MAX_REQUEST_BYTES`] bounds only *one* connection's worst case, and this is
+/// the first listener in this codebase (every other one is UDP, with no concept of a
+/// "connection" at all) where an unbounded number of them can each be holding that much. 1024 is
+/// the same order of magnitude `logit_pipeline::SinkQueueConfig::default`'s `max_batches` already
+/// uses elsewhere in this codebase for "a generous but real bound, not unlimited" -- worst case
+/// `1024 * MAX_REQUEST_BYTES` = 4 GiB in flight, not unbounded. Not (yet) operator-tunable; revisit
+/// as a config field if a real deployment needs a different number.
+const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// Which OTLP wire transport this listener accepts. See `logit_outputs::otlp::OtlpTransport`'s
 /// identical doc comment -- same reasoning, mirrored independently rather than shared, since this
@@ -106,14 +120,34 @@ impl OtlpInput {
 impl Input for OtlpInput {
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         let listener = TcpListener::bind(&self.bind).await?;
+        // Bounds this input's worst-case memory the same way `MAX_REQUEST_BYTES` bounds one
+        // request's -- see [`MAX_CONCURRENT_CONNECTIONS`]'s own doc comment for the reasoning and
+        // the resulting worst case.
+        let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
         loop {
             let (stream, _peer) = listener.accept().await?;
+            // Acquired *after* `accept`, not before: the kernel's own accept backlog still
+            // absorbs a burst of new connections while every permit is held, so a connection
+            // isn't refused outright at the cap -- its handler just doesn't start (and doesn't
+            // read a single byte, so it can't yet be holding any of `MAX_REQUEST_BYTES`) until an
+            // earlier connection finishes and its permit is released back (on drop, at the end of
+            // the spawned task below). This is real backpressure to the accept loop itself: the
+            // next `accept().await` above doesn't run until this acquire resolves, so the
+            // listener stops draining its backlog at all once the backlog itself fills, same
+            // shape as this crate's other listeners eventually blocking on a full downstream
+            // `Fanout` (`docs/design/pipeline-graph.md`'s backpressure section).
+            let permit = connection_limit
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("this semaphore is never closed");
             let io = TokioIo::new(stream);
             let sink = sink.clone();
             let transport = self.transport;
             let mut diag = self.diag.clone();
             let telemetry = self.telemetry.clone();
             tokio::spawn(async move {
+                let _permit = permit; // held for the connection's lifetime; released on drop
                 let result = match transport {
                     OtlpTransport::Http => {
                         let svc = service_fn(move |req| {
@@ -170,20 +204,26 @@ async fn handle_http(
             ));
         }
     }
-    if req.headers().contains_key("content-encoding") {
-        return Ok(text_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "compressed OTLP/HTTP requests are not supported -- see this module's doc comment",
-        ));
+    // `identity` is the legal, standard way to say "not compressed" -- rejecting on the header's
+    // mere *presence* would 415 a client that explicitly (if redundantly) declares no compression,
+    // not just one that actually compressed its body. Mirrors the gRPC handler's `grpc-encoding`
+    // check just below.
+    if let Some(enc) = req.headers().get("content-encoding") {
+        if enc.as_bytes() != b"identity" {
+            return Ok(text_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "compressed OTLP/HTTP requests are not supported -- see this module's doc comment",
+            ));
+        }
     }
 
     let limited = Limited::new(req.into_body(), MAX_REQUEST_BYTES);
     let bytes = match limited.collect().await {
         Ok(collected) => collected.to_bytes(),
-        Err(_) => {
+        Err(err) => {
             return Ok(text_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "request exceeds the maximum allowed size",
+                &body_read_error_message(err.as_ref()),
             ))
         }
     };
@@ -232,9 +272,7 @@ async fn handle_grpc(
     let limited = Limited::new(req.into_body(), MAX_REQUEST_BYTES);
     let framed = match limited.collect().await {
         Ok(collected) => collected.to_bytes(),
-        Err(_) => {
-            return Ok(grpc_response(8, "request exceeds the maximum allowed size", None));
-        }
+        Err(err) => return Ok(grpc_response(8, &body_read_error_message(err.as_ref()), None)),
     };
     let Some(payload) = grpc_unframe(&framed) else {
         return Ok(grpc_response(3, "malformed gRPC message frame", None));
@@ -250,6 +288,26 @@ async fn handle_grpc(
         }
         Err(err) => Ok(grpc_response(3, &err.to_string(), None)),
     }
+}
+
+/// Turns a [`Limited`] read failure into a response message that doesn't overclaim. `Limited`'s
+/// `Error` covers *any* failure reading the body, not just exceeding `MAX_REQUEST_BYTES` -- a
+/// client disconnecting mid-upload, malformed chunked encoding, or an HTTP/2 stream reset all
+/// surface the same way. Distinguished via `LengthLimitError`'s presence in the error chain
+/// (`Limited` wraps the real cause when the limit trips, and otherwise forwards the underlying
+/// body's own error untouched) rather than assumed from the mere fact that `collect` failed --
+/// callers still respond `413`/`RESOURCE_EXHAUSTED` either way (there's no better status for "the
+/// request body never finished," and this is not the place to teach every HTTP/gRPC client the
+/// difference), but the message itself says which actually happened.
+fn body_read_error_message(err: &(dyn std::error::Error + Send + Sync + 'static)) -> String {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cause {
+        if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+            return "request exceeds the maximum allowed size".to_string();
+        }
+        cause = e.source();
+    }
+    format!("failed reading the request body (not necessarily oversized): {err}")
 }
 
 /// Matches an OTLP/HTTP path (`/v1/logs`, `/v1/metrics`, `/v1/traces`) to its [`Signal`].
@@ -485,6 +543,45 @@ mod tests {
         .await;
         assert!(response.starts_with("HTTP/1.1 415"), "got: {response}");
         assert!(response.contains("OTLP/JSON is not supported"), "got: {response}");
+    }
+
+    /// `identity` is the standard, legal way to declare "not compressed" -- it must not be
+    /// mistaken for "compressed, unsupported." Regression guard for rejecting on the header's mere
+    /// *presence* rather than its value.
+    #[tokio::test]
+    async fn a_content_encoding_of_identity_is_accepted_not_rejected() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let response = post_raw(
+            &addr,
+            "/v1/traces",
+            "Content-Type: application/x-protobuf\r\nContent-Encoding: identity\r\n\
+             Connection: close\r\n",
+            &[],
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+    }
+
+    #[tokio::test]
+    async fn a_gzip_content_encoding_is_rejected_with_415() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let response = post_raw(
+            &addr,
+            "/v1/traces",
+            "Content-Type: application/x-protobuf\r\nContent-Encoding: gzip\r\n\
+             Connection: close\r\n",
+            &[],
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 415"), "got: {response}");
     }
 
     #[tokio::test]
