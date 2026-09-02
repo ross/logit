@@ -70,16 +70,19 @@ impl SinkQueue {
     /// `OverflowPolicy::Block` has no equivalent in `logit_proto::buffer::OverflowPolicy` --
     /// that trait only knows the two dropping policies (by design; a sync trait can't block
     /// usefully). The resolution: the underlying `InMemoryBuffer` is always built with a
-    /// concrete dropping policy (`DropNewest` standing in for `Block`), but under `Block`,
+    /// concrete dropping policy (`DropOldest` standing in for `Block`), but under `Block`,
     /// `push` (below) always awaits room *before* it ever calls the underlying `Buffer::push` --
     /// so in ordinary single-writer operation the underlying buffer's dropping fallback is never
-    /// actually exercised; it exists purely as the defensive fallback for the
-    /// push-races-`close()` case documented on [`SinkQueue::close`].
+    /// actually exercised. It's `DropOldest`, not `DropNewest`, specifically so the one case
+    /// where `push` *does* fall through without blocking -- a batch that could never fit even
+    /// against an empty queue, see `push`'s "impossible to ever fit" check below -- degrades to
+    /// "evict what little can be evicted, then accept anyway" rather than silently rejecting a
+    /// batch `Block`'s whole contract says should never be dropped. This is also the fallback for
+    /// the push-races-`close()` case documented on [`SinkQueue::close`].
     pub fn new(config: SinkQueueConfig, telemetry: Telemetry) -> Self {
         let block_when_full = config.overflow == OverflowPolicy::Block;
         let underlying = match config.overflow {
-            OverflowPolicy::Block => DropPolicy::DropNewest,
-            OverflowPolicy::DropOldest => DropPolicy::DropOldest,
+            OverflowPolicy::Block | OverflowPolicy::DropOldest => DropPolicy::DropOldest,
             OverflowPolicy::DropNewest => DropPolicy::DropNewest,
         };
         Self {
@@ -108,16 +111,24 @@ impl SinkQueue {
     /// dropping fallback is never reached in ordinary operation. Under `DropOldest`/`DropNewest`:
     /// one lock acquisition, one push attempt, no waiting.
     ///
+    /// **Never blocks on a batch that could never fit even against an empty queue** (`weight`
+    /// alone exceeds `max_bytes`, or `max_batches` is configured as `0`) -- no amount of waiting
+    /// would ever free enough room, since there's nothing productive for a concurrent `commit()`
+    /// to do about it. Such a batch instead falls straight through to the underlying `DropOldest`
+    /// fallback (see `new`), which evicts what little it safely can and accepts the batch anyway
+    /// rather than wedging this sink, and everything upstream of it, forever.
+    ///
     /// Every accepted push notifies `not_empty` once. A push that actually had to wait times
     /// `logit.component.buffer.push.blocked.duration` around the whole wait -- a push that never
     /// had to wait records no sample at all, so the metric isn't muddied by a stream of ~0
     /// durations from the common case.
     pub async fn push(&self, batch: Arc<EventBatch>) {
         let weight = batch.estimated_heap_bytes();
+        let impossible_to_ever_fit = weight > self.max_bytes || self.max_batches == 0;
         let mut waited = false;
         let mut blocked_timer: Option<logit_core::telemetry::Timer> = None;
 
-        let (len, total_weight) = loop {
+        let (len, total_weight, evicted, rejected) = loop {
             // Registered before the state check below -- see this method's doc comment on why
             // that ordering is what makes this race-free.
             let notified = self.not_full.notified();
@@ -125,7 +136,11 @@ impl SinkQueue {
             let attempt = {
                 let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let full = self.would_overflow(&inner, weight);
-                if self.block_when_full && full && !self.closed.load(Ordering::Acquire) {
+                if self.block_when_full
+                    && full
+                    && !impossible_to_ever_fit
+                    && !self.closed.load(Ordering::Acquire)
+                {
                     None
                 } else {
                     let outcome = inner.push(Arc::clone(&batch), weight);
@@ -144,19 +159,22 @@ impl SinkQueue {
                     notified.await;
                 }
                 Some((outcome, len, total_weight)) => {
-                    match outcome {
-                        PushOutcome::Accepted => {}
-                        PushOutcome::Evicted(evicted) => {
-                            self.count_dropped("overflow_oldest", &evicted);
-                        }
-                        PushOutcome::Rejected(rejected) => {
-                            self.count_dropped("overflow_newest", &rejected);
-                        }
-                    }
-                    break (len, total_weight);
+                    let (evicted, rejected) = match outcome {
+                        PushOutcome::Accepted => (Vec::new(), None),
+                        PushOutcome::Evicted(evicted) => (evicted, None),
+                        PushOutcome::Rejected(rejected) => (Vec::new(), Some(rejected)),
+                    };
+                    break (len, total_weight, evicted, rejected);
                 }
             }
         };
+
+        for evicted_batch in &evicted {
+            self.count_dropped("overflow_oldest", evicted_batch);
+        }
+        if let Some(rejected_batch) = &rejected {
+            self.count_dropped("overflow_newest", rejected_batch);
+        }
 
         // Only records a sample if `blocked_timer` is `Some` -- i.e. only if this push actually
         // waited at least once above.
@@ -176,7 +194,7 @@ impl SinkQueue {
         loop {
             let notified = self.not_empty.notified();
             {
-                let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(item) = inner.peek() {
                     return Some(Arc::clone(item));
                 }
@@ -212,12 +230,12 @@ impl SinkQueue {
     ///
     /// **Decision on a push racing a concurrent close:** a blocked push that wakes because of
     /// this call re-checks state (per `push`'s loop) and, seeing `closed == true`, falls through
-    /// to one best-effort attempt against the underlying buffer's dropping fallback (see `new`)
-    /// rather than waiting again -- it may then evict or reject instead of blocking forever. In
-    /// practice `drain_inbox` only calls `close()` once its own inbox is fully drained, so no
-    /// further `push()` calls happen at all; this only matters for a hypothetical caller that
-    /// pushes concurrently with closing, and the contract for that case is simply: never panic,
-    /// never hang.
+    /// to one best-effort attempt against the underlying buffer's `DropOldest` fallback (see
+    /// `new`) rather than waiting again -- it may then evict (never the reserved head, if any) or
+    /// accept over-bound instead of blocking forever. In practice `drain_inbox` only calls
+    /// `close()` once its own inbox is fully drained, so no further `push()` calls happen at all;
+    /// this only matters for a hypothetical caller that pushes concurrently with closing, and the
+    /// contract for that case is simply: never panic, never hang.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.not_empty.notify_waiters();
@@ -350,6 +368,66 @@ mod tests {
         let second = q.commit().expect("should commit");
         assert!(Arc::ptr_eq(&second, &c));
         assert!(q.commit().is_none());
+    }
+
+    /// The ack invariant a review finding named directly: with `[A, B]` at capacity, `peek()`ing
+    /// `A` (as `write_loop` does before attempting delivery) must protect it from a concurrent
+    /// `DropOldest` push evicting it -- otherwise `commit()` after a successful send of `A` would
+    /// remove whatever is now at the front (`B`, never actually sent) instead of `A`, silently
+    /// losing `B` and falsely counting `A` as an overflow drop.
+    #[tokio::test]
+    async fn drop_oldest_never_evicts_a_batch_currently_peeked_and_commit_still_returns_it() {
+        let q = queue(2, u64::MAX, OverflowPolicy::DropOldest);
+        let a = tiny_batch();
+        let b = tiny_batch();
+        let c = tiny_batch();
+        q.push(Arc::clone(&a)).await;
+        q.push(Arc::clone(&b)).await;
+
+        let peeked = q.peek().await.expect("should peek a"); // reserves `a`
+        assert!(Arc::ptr_eq(&peeked, &a));
+
+        q.push(Arc::clone(&c)).await; // must evict `b`, never the reserved `a`
+
+        let committed = q.commit().expect("should commit the batch that was actually peeked/sent");
+        assert!(
+            Arc::ptr_eq(&committed, &a),
+            "commit must return the exact batch that was peeked, not whatever is now at the front"
+        );
+        let next = q.commit().expect("should commit");
+        assert!(Arc::ptr_eq(&next, &c), "b should have been the one evicted, not delivered");
+        assert!(q.commit().is_none());
+    }
+
+    /// The other review finding: under `Block`, a batch whose own weight exceeds `max_bytes`
+    /// must not wait forever even against an empty queue -- there's nothing a concurrent
+    /// `commit()` could ever do to make room for it, since nothing else is queued.
+    #[tokio::test]
+    async fn under_block_a_batch_too_large_to_ever_fit_is_accepted_immediately_not_blocked_forever()
+    {
+        let oversized = batch(1000);
+        let weight = oversized.estimated_heap_bytes();
+        let q = queue(1000, weight - 1, OverflowPolicy::Block); // one byte too small, always
+
+        tokio::time::timeout(Duration::from_secs(5), q.push(oversized))
+            .await
+            .expect("a batch that can never fit must be accepted immediately, not block forever");
+
+        assert_eq!(
+            q.commit().map(|_| ()),
+            Some(()),
+            "the oversized batch should still be queued and deliverable"
+        );
+    }
+
+    /// The degenerate-config variant of the same finding: `max_batches: 0` makes every push
+    /// overflow unconditionally, even against an empty queue -- must not hang either.
+    #[tokio::test]
+    async fn under_block_a_zero_max_batches_config_does_not_hang_a_push() {
+        let q = queue(0, u64::MAX, OverflowPolicy::Block);
+        tokio::time::timeout(Duration::from_secs(5), q.push(tiny_batch()))
+            .await
+            .expect("max_batches: 0 must not permanently block every push");
     }
 
     #[tokio::test]

@@ -28,6 +28,8 @@
 //!     (`docs/adr/0020-buffered-sink-delivery.md`) configures a sink's delivery queue, which only a
 //!     sink has, so a listener or transform carrying one is almost certainly a misplaced block
 //!     rather than a meaningful setting silently ignored.
+//! 15. A sink's `buffer.max_batches` or `buffer.max_bytes` of `0` is rejected -- an impossible
+//!     bound (no batch could ever be queued) rather than a small one.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -335,6 +337,28 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 "component '{id}': 'buffer' is only meaningful on a sink, but '{id}' is a {}",
                 role(&component.kind).as_str()
             );
+        }
+    }
+
+    // Rule 15: `max_batches: 0` or `max_bytes: 0` is an impossible bound, not a small one -- it
+    // makes every push overflow unconditionally, even against an empty queue, with nothing a
+    // concurrent commit could ever do to free room (`SinkQueue::push`'s "impossible to ever fit"
+    // check tolerates this at runtime rather than hanging, but a config that can never accept a
+    // single batch is a mistake worth catching here, not something to silently degrade around).
+    for (id, component) in &components {
+        if role(&component.kind) == Role::Sink {
+            if component.buffer.max_batches == 0 {
+                anyhow::bail!(
+                    "component '{id}': 'buffer.max_batches' must be at least 1 -- 0 means no \
+                     batch can ever be queued"
+                );
+            }
+            if component.buffer.max_bytes == 0 {
+                anyhow::bail!(
+                    "component '{id}': 'buffer.max_bytes' must be at least 1 -- 0 means no batch \
+                     can ever be queued"
+                );
+            }
         }
     }
 
@@ -831,6 +855,26 @@ mod tests {
         ]))
         .expect("a buffer block on a sink should validate fine");
         assert_eq!(graph.components["out"].buffer.max_batches, 4096);
+    }
+
+    #[test]
+    fn a_sinks_buffer_with_zero_max_batches_is_rejected() {
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], sink(), BufferConfig { max_batches: 0, ..BufferConfig::default() }),
+        ]));
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(err.contains("max_batches"), "got: {err}");
+    }
+
+    #[test]
+    fn a_sinks_buffer_with_zero_max_bytes_is_rejected() {
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], sink(), BufferConfig { max_bytes: 0, ..BufferConfig::default() }),
+        ]));
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(err.contains("max_bytes"), "got: {err}");
     }
 
     #[test]

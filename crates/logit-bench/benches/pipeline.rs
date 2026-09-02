@@ -207,7 +207,7 @@ mod sink_queue {
             InMemoryBuffer::new(1024, u64::MAX, OverflowPolicy::DropOldest);
         let batch = item();
         drop(buf.push(Arc::clone(&batch), batch.estimated_heap_bytes()));
-        bencher.bench_local(|| divan::black_box(buf.peek()));
+        bencher.bench_local(|| divan::black_box(buf.peek().is_some()));
     }
 
     /// The worst case for `DropOldest`: the buffer is held exactly at its bound (one slot, never
