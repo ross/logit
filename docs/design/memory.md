@@ -459,25 +459,57 @@ built the piece this section's "what's left unmeasured" line named -- a real `Te
 -- and the deliberately deterministic-on-`trace_id` sampler (`trace_is_sampled`) is *why* it changed
 nothing here: no `sampled` bit needed propagating, so `TraceContext`/`Delivered` gained nothing
 beyond what this section already measured. `size_of::<Delivered>()` stays exactly 56.
-`SpanGuard`'s own "disabled/unsampled holds no state" shape (mirroring `Timer`'s) is what makes the
-unsampled path free the same way a disabled `Telemetry` handle already was: `Fanout::send`/
-`send_blocking` now open a listener span on every call, and every `fanout_send_*`/`unwrap_batch_*`/
-`process_batch_*`/`send_batch_*` constant in `crates/logit-bench/tests/allocations.rs` -- all of
-which use either `Telemetry::default()` (disabled) or a live `Registry` at the *default* 0.1 sample
-rate against test fixtures whose `trace_id`s were never engineered to land in that band -- held
-exactly, unmodified, confirming a `SpanGuard::disabled()` (whether from a disabled handle or an
-unsampled trace) allocates nothing beyond the `Option::None` it already is.
+
+`SpanGuard`'s own "disabled/unsampled holds no state" shape (mirroring `Timer`'s) is what's *meant*
+to make the unsampled path free the same way a disabled `Telemetry` handle already is -- but stated
+precisely, not every existing `crates/logit-bench/tests/allocations.rs` constant that held unmodified
+actually exercises a `Telemetry::span` call site, and it matters which do:
+
+- `fanout_send_*` (`Fanout::send`/`send_blocking`, the listener span site) build their `Fanout` via
+  `Fanout::new` with **no** `.with_telemetry(...)` call -- `Telemetry::default()`, fully disabled
+  (`self.0` is `None`), which returns `SpanGuard::disabled()` from `Telemetry::span`'s very first
+  line, *before* `trace_is_sampled` is ever called. These constants holding unmodified proves the
+  disabled path is free; it says nothing about a *live* registry sampling below `1.0`.
+- `process_batch_*`/`send_batch_*`'s "telemetry live" variants attach a real `Telemetry` from a live
+  `Registry` -- but `process_batch`/`send_batch` are the per-batch bodies `run_transform`/
+  `write_loop` call *into*; the actual `Telemetry::span` calls (ADR 0022) live one level up, in
+  `run_transform`/`run_flush`/`run_lua`/`write_loop` themselves, none of which `logit-bench` drives
+  directly under `CountingAlloc`. These constants holding unmodified is expected (nothing about them
+  changed), but it does not exercise the sample-decision branch either.
+- `unwrap_batch_*` has no span site at all, on any path.
+
+**`fanout_send_one_consumer_with_a_live_unsampled_registry_costs_nothing` closes that specific gap,
+directly, for the one span site `logit-bench` can and does drive under `CountingAlloc`:** a `Fanout`
+carrying a real `Telemetry` handle from `Registry::with_span_sampling(0.0)` -- attached the same way
+`crates/logit-cli/src/pipeline.rs::prepare` attaches one in production, deterministically never
+sampled rather than relying on a fixture's `trace_id` happening to miss the default 0.1 band. `0`
+allocations, matching the disabled case exactly: `Telemetry::span` reaches `trace_is_sampled`, gets
+`false`, and returns `SpanGuard::disabled()` -- the same value, built the same way, as the disabled
+path takes on line one. **What this does not cover:** the equivalent live-unsampled proof for
+`run_transform`'s/`run_flush`'s/`run_lua`'s/`write_loop`'s own span sites, since none of those are
+driven directly by `logit-bench` today (`process_batch`/`send_batch` are measured instead, and
+neither one contains a span site) -- the code path is structurally identical (the exact same
+`Telemetry::span` function, the exact same early return), but that is a code-reading argument, not a
+measured one, for those four call sites specifically. Worth closing the same way if one of them ever
+becomes independently benchmarkable.
 
 **What a *sampled* span costs, measured directly in `crates/logit-core/src/telemetry.rs`'s own test
 module (not `logit-bench`, since this is `logit-core`-local state, not a runtime/channel hop):** one
-`PendingSpan` pushed into `ComponentBuffer`'s `Vec` (one `Vec` growth, amortized, the same shape
-`Registry`'s own `buffers: Vec<Arc<ComponentBuffer>>` already pays) at `finish`/`Drop` time, and one
-`Value::str` (a `String` allocation) built at `ComponentBuffer::drain` time for the span's `name`
-(`"aggregate flush"`, say) -- deliberately deferred that far, so a span that never survives to a
-drain (still sitting in the buffer, or dropped past `MAX_SPANS_PER_COMPONENT`) never pays it. Both
-costs are strictly additional to whatever the surrounding node visit already paid (`process_batch`'s
-`out` `Vec`, `send_batch`'s `async_trait` box, ...) -- spans ride alongside existing work, they
-don't replace any of it.
+`PendingSpan` pushed into `ComponentBuffer`'s `Vec` at `finish`/`Drop` time, and one `Value::str` (a
+`String` allocation) built at `ComponentBuffer::drain` time for the span's `name` (`"aggregate
+flush"`, say) -- deliberately deferred that far, so a span that never survives to a drain (still
+sitting in the buffer, or dropped past `MAX_SPANS_PER_COMPONENT`) never pays it. **The `Vec` push is
+not a one-time, amortized-over-the-process-lifetime cost, the same way the points `HashMap`'s isn't**
+(the "first call after an `internal` drain" finding in the Runtime section above): `ComponentBuffer::
+drain`'s span pass takes the buffer's `Vec<PendingSpan>` with `mem::take`, exactly like the points
+pass does with its `HashMap` -- which replaces it with a fresh, zero-capacity `Vec`, discarding the
+old backing allocation along with everything it held. So the very next sampled span recorded after
+*any* drain pays a fresh `Vec` growth, not a reuse of already-grown capacity; this recurs once per
+`internal` drain interval for as long as spans keep getting sampled, the same recurring (not
+one-time) shape the points map's post-drain cost already has. Both costs -- the `Vec` push and the
+`name` `String` -- are strictly additional to whatever the surrounding node visit already paid
+(`process_batch`'s `out` `Vec`, `send_batch`'s `async_trait` box, ...) -- spans ride alongside
+existing work, they don't replace any of it.
 
 ### Zero-copy: where it holds
 
@@ -833,18 +865,22 @@ module reports. What a full multi-node graph costs end to end, spread across the
 threads and OS threads `run_with_shutdown` actually spawns, is still a separate question needing a
 load generator, not a microbenchmark.
 
-**Spans are the one live-registry cost not covered by either of the two layers above.** Both
-`logit-bench` layers exercise `Telemetry::default()` (disabled) or a live `Registry` whose test
-fixtures' `trace_id`s were never engineered to land inside the sample band — exactly what proves
-the *unsampled* path is free (see "Costing internal spans" in §2), but neither says anything about
-what a span that *does* get sampled costs. That measurement lives directly in
-`crates/logit-core/src/telemetry.rs`'s own test module instead (no `CountingAlloc` harness needed
-to state it precisely): a sampled span costs one `PendingSpan` pushed into `ComponentBuffer`'s
-`Vec` at `SpanGuard::finish`/`Drop` time, plus one `Value::str` built at `ComponentBuffer::drain`
-time for the span's `name` — deferred that far specifically so a span that never survives to a
-drain (still buffered, or dropped past `MAX_SPANS_PER_COMPONENT`) never pays it. See "Costing
-internal spans" (§2) for the full account and why neither `logit-bench` layer's existing numbers
-moved.
+**Spans are the one live-registry cost only partly covered by either of the two layers above.**
+Most of `crates/logit-bench/tests/allocations.rs`'s span-adjacent constants (`fanout_send_*`) use
+`Telemetry::default()` (disabled), which returns `SpanGuard::disabled()` before `Telemetry::span`
+ever reaches its sample-decision branch; `fanout_send_one_consumer_with_a_live_unsampled_registry_
+costs_nothing` is the one exception, a real `Registry::with_span_sampling(0.0)` proving the *live,
+deterministically-unsampled* path through `Fanout::send`'s own span site is equally free (see
+"Costing internal spans" in §2 for the account of which other span sites this does and doesn't
+cover). Neither says anything about what a span that *does* get sampled costs. That measurement
+lives directly in `crates/logit-core/src/telemetry.rs`'s own test module instead (no
+`CountingAlloc` harness needed to state it precisely): a sampled span costs one `PendingSpan`
+pushed into `ComponentBuffer`'s `Vec` at `SpanGuard::finish`/`Drop` time, plus one `Value::str`
+built at `ComponentBuffer::drain` time for the span's `name` — deferred that far specifically so a
+span that never survives to a drain (still buffered, or dropped past `MAX_SPANS_PER_COMPONENT`)
+never pays it, and recurring once per `internal` drain interval rather than amortized once, since
+`drain`'s `mem::take` discards the `Vec`'s capacity along with its contents. See "Costing internal
+spans" (§2) for the full account.
 
 ### Fixtures: synthetic inputs, no external services
 

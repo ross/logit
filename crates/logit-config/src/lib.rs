@@ -125,7 +125,8 @@ pub enum ComponentKind {
         /// the same way at every node -- a kept trace is kept at every hop, never partially. Below
         /// `1.0` by default: span volume is a different shape than metric volume (one span per
         /// node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans
-        /// off entirely; `1.0` keeps everything (what `demo/logit.yaml` sets). Named
+        /// off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full
+        /// traces rather than a representative sample would set this explicitly. Named
         /// `span_sample_rate`, not `sample_rate` -- there is already a `ComponentKind::Sample`
         /// transform, and `internal` may grow other sampling knobs later. See
         /// `docs/adr/0022-internal-span-emission-and-deterministic-sampling.md`.
