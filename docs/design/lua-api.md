@@ -183,6 +183,34 @@ that namespace for anything script-specific.
 component emitted a point and can't be set as a tag; `telemetry.count("m", 1, {kind = "x"})` is a
 clear error, not a silent no-op and not a point quietly misattributed to another component.
 
+## Reading trace context
+
+A `trace` global gives `process()` read access to the incoming batch's trace context, as lowercase
+hex strings:
+
+```lua
+function process(event)
+  event.attributes["trace.id"] = trace.trace_id
+  return event
+end
+```
+
+`trace.trace_id` (32 hex chars, 16 bytes) and `trace.span_id` (16 hex chars, 8 bytes) -- the same
+`TraceContext` every node in the graph carries on its inbound batch
+(`docs/adr/0020-trace-context-propagation-on-delivered.md`), set once per incoming batch before any
+of its events reach `process()`, so every event in one call to `process()` sees the same value.
+Both start at the all-zero placeholder (`"00...0"`) before any batch has arrived.
+
+**Stale during `flush()`.** `trace` is *not* updated around a `flush()` call -- it keeps whatever
+the most recently processed batch set, the same staleness `event.attributes`'s resource has at a
+flush tick (see this crate's own known-gaps entry for both). A `flush()`-driven emission has no
+single incoming batch to attribute itself to -- however many batches contributed to whatever a
+stateful script is about to flush, `logit` has no way to know, and doesn't try to guess. A script
+that wants better than "whichever batch was last seen" needs to track contributing contexts itself,
+inside its own `process()` -- the values are genuinely there to read, `logit` just doesn't
+aggregate them on the script's behalf the way `docs/adr/0020-trace-context-propagation-on-delivered.md`'s
+flush-side linking does for the native `aggregate` transform.
+
 ## Config shape
 
 A Lua transform is one component in the pipeline's component graph

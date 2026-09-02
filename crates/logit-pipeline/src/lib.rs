@@ -24,4 +24,4 @@ pub use runtime::{
     RetryConfig, WriteLoopConfig,
 };
 pub use sink_queue::{OverflowPolicy, SinkQueue, SinkQueueConfig};
-pub use transform::Transform;
+pub use transform::{FlushOutput, FlushedEvent, Transform};

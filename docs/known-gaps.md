@@ -111,6 +111,15 @@ already built that have a known, accepted rough edge.
   (`crates/logit-pipeline/src/runtime.rs`, see [ADR 0008](adr/0008-aggregation-window-semantics.md)).
   Fine for every config today (one listener, one resource); would need a real answer once a
   component has more than one upstream resource.
+- **A Lua component's `flush()` sees a stale trace context, for the same reason.** `trace.trace_id`/
+  `trace.span_id` (`docs/design/lua-api.md`'s "Reading trace context") reflect whichever batch
+  `process()` most recently saw, not any single batch a flush-driven emission could correctly
+  attribute itself to — the same *n*-to-1 problem `Transform::flush`'s linking solves for native
+  transforms (below), deliberately not solved the same way here: a Lua component has no
+  accumulator `logit` can inspect, so there's no state to track contributing contexts *into*. A
+  script that wants better than "stale" can read `trace.trace_id`/`trace.span_id` inside its own
+  `process()` and do its own bookkeeping — the values are genuinely there to use, just not
+  aggregated by `logit` on the script's behalf.
 - ~~**A benchmark of the event proxy against plain table conversion is still outstanding**~~ —
   **closed.** Measured in `crates/logit-bench/benches/pipeline.rs` (`lua::proxy` vs
   `lua::to_table`): the proxy is faster, widening in its favour for scripts that read few
@@ -321,20 +330,31 @@ already built that have a known, accepted rough edge.
     full per-node-kind table). Every listener and every flush-driven emission still mints a fresh
     root, unchanged from the prototype's behavior — not an oversight, see below.
 
+    **Item 1, `Transform::flush`/Lua's `flush()`, is now built for both native transforms and
+    Lua** — an *n*-to-1 relationship (however many batches were absorbed since the last tick), with
+    no single correct parent. `Aggregator` (`crates/logit-transforms/src/aggregate.rs`) tracks a
+    bounded, best-effort `ContributingContexts` set per series (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`,
+    8 — dropped and counted past the cap, `logit.transform.links.dropped{reason="cardinality"}`,
+    the same shape `MAX_KEYS_PER_COMPONENT` below uses) and `Transform::flush`'s return type now
+    pairs each emitted `Event` with the `SpanLink`s that set produced. Lua's `flush()` gets no
+    equivalent — no accumulator `logit` can inspect — and is instead documented as an accepted
+    stale-context limitation (above, next to the identical `Resource`-staleness gap), with
+    `trace.trace_id`/`trace.span_id` (`docs/design/lua-api.md`) exposed to a script's own
+    `process()` so it can do its own bookkeeping if it wants better than that. Picking an arbitrary
+    contributing batch as "the" parent, for either case, was considered and rejected in ADR 0020
+    (silently wrong is worse than visibly incomplete).
+
     **What's still open, in order:**
-    1. **`Transform::flush`/Lua's `flush()`** — an *n*-to-1 relationship (however many batches were
-       absorbed since the last tick), with no single correct parent. `SpanRecord.links` already
-       exists in the data model for this shape; building it means new bounded state on
-       `Aggregator`'s `Accumulator` and a cardinality question of its own. Real work, deliberately
-       not done in ADR 0020 — picking an arbitrary contributing batch as "the" parent was
-       considered and rejected there (silently wrong is worse than visibly incomplete).
-    2. **Nothing turns a (context, node, batch) tuple into a real `SpanRecord`-carrying `Event`
-       yet.** Propagation alone is unobservable outside `logit-pipeline` today — `Output::send`
-       still takes `&EventBatch`, not `&Delivered`. This is the piece analogous to how `internal`'s
+    1. **Nothing turns a (context, node, batch) tuple into a real `SpanRecord`-carrying `Event`
+       yet.** `Transform::flush`'s `Vec<SpanLink>` is real and tested
+       (`crates/logit-transforms/src/aggregate.rs`'s own test module), but nothing downstream reads
+       it — `run_flush` (`crates/logit-pipeline/src/runtime.rs`) discards it, and propagation
+       through `Delivered` is still unobservable outside `logit-pipeline` (`Output::send` takes
+       `&EventBatch`, not `&Delivered`). This is the piece analogous to how `internal`'s
        `ComponentBuffer`/drain mechanism turns counters into events
        (`docs/design/internal-telemetry.md`); routing through the same `internal` component is the
        expected shape, per ADR 0018.
-    3. **Sampling** — span volume would be a different shape than metric volume once emission
+    2. **Sampling** — span volume would be a different shape than metric volume once emission
        exists (potentially one span per node-visit per batch); `internal` will likely need its own
        knob for this, separate from its drain `interval`.
   - **Internal logs** — routing `Diagnostics`' stderr output into the graph as `LogRecord` events

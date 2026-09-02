@@ -194,7 +194,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `keep` filter to 3 attrs | **0** | 3 attributes fit inline |
 | `aggregate` absorb (after `keep`) | **0** | `SeriesKey` clone stays inline |
 | `aggregate` absorb (no `keep`) | **4** | one per metric — the map no longer fits inline |
-| `aggregate` flush 4 series | **2** | |
+| `aggregate` flush 4 series | **6** | +4 since flush-side trace linking landed (ADR 0020) — one `Vec<SpanLink>` per series, see below |
 | **full ingest chain, 1 line** | **5** | decode → aggregate; was 11 before `json`'s fix |
 | `Event::clone` (nginx shape) | **4** | what each extra fan-out branch costs |
 | `Event::clone` (statsd shape) | **0** | fits entirely inline |
@@ -224,6 +224,26 @@ And the corresponding times:
 > invent differences that aren't there. Compare rows within the table freely; treat absolute values
 > as this machine on this day. This table was refreshed once, in one sitting, after landing the
 > `json`/`statsd_in`/`stdio_out`/Lua-boundary fixes below -- every row reflects the current code.
+
+### `aggregate` flush now costs one allocation per series, for real trace links
+
+[ADR 0020](../adr/0020-trace-context-propagation-on-delivered.md)'s flush-side linking widened
+`Transform::flush` to pair each emitted `Event` with the bounded, best-effort `Vec<SpanLink>` that
+attributes it (`crates/logit-transforms/src/aggregate.rs`'s `ContributingContexts`). Re-measured,
+not assumed, per this file's own rule: `aggregate_flush_100_series` moved from 2 to 6 allocations —
+exactly the 4 series in that fixture, each now allocating its own one-element `Vec<SpanLink>` on
+flush (the fixture never calls `observe_batch_context`, so every series ends up with exactly one
+distinct contributing context — the default, all-zero one — but a non-empty `Vec` always allocates
+regardless of element count, so one per series is the honest floor, not a worst case). A series fed
+by more distinct sources within the 8-per-series cap doesn't cost more allocations for it — the
+`Vec<SpanLink>` is still built once, from however many contexts `ContributingContexts` ended up
+holding.
+
+Nothing downstream reads this yet — `run_flush` (`crates/logit-pipeline/src/runtime.rs`) discards
+the links on the way out, since nothing turns them into a real `SpanRecord` yet
+(`docs/known-gaps.md`'s internal-spans entry, item 2). This cost is paid regardless, the moment
+`aggregate` flushes any series at all, whether or not a config ever routes anything to look at the
+result.
 
 ### The headline result: the output encoder *was* the bottleneck, and has been fixed
 

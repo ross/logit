@@ -14,13 +14,72 @@
 
 use logit_core::interner::Symbol;
 use logit_core::{
-    AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, Telemetry, Value,
+    AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, SpanLink, Telemetry, Value,
 };
-use logit_pipeline::Transform;
+use logit_pipeline::{FlushOutput, TraceContext, Transform};
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// A small, bounded set of the distinct `TraceContext`s that have contributed to one series since
+/// the last flush -- reasonable/best-effort, not exhaustive. `SpanLink` (`crates/logit-core/src/span.rs`)
+/// already exists in the data model for exactly this shape (OTel's answer to "this span was
+/// influenced by several others, not descended from one"), per
+/// `docs/adr/0020-trace-context-propagation-on-delivered.md`. Same "cap gates insertion only,
+/// already-seen is always free to re-observe, drop-and-count past it" shape
+/// `ComponentBuffer::upsert` already uses (`crates/logit-core/src/telemetry.rs`) -- the one
+/// precedent in this codebase for a bounded, drop-and-counted set.
+///
+/// Per-series, not shared across a whole resource group or the whole `Aggregator`: a link belongs
+/// to the specific series whose flush would become a span, and attributing it to unrelated series
+/// in the same window would be exactly the "silently wrong" shape ADR 0020 rejected when it
+/// considered (and rejected) picking an arbitrary parent for a flush.
+#[derive(Default)]
+struct ContributingContexts {
+    /// Inline capacity 1: most series see exactly one contributing source, so this stays free
+    /// (`docs/adr/0017-minimize-allocations-over-event-size.md`'s policy) until a genuinely
+    /// fanned-in series needs more.
+    seen: SmallVec<[TraceContext; 1]>,
+    dropped: u64,
+}
+
+/// Caps how many distinct contexts one series tracks between flushes. A fixed constant, not
+/// configurable, matching `docs/known-gaps.md`'s stance on `MAX_KEYS_PER_COMPONENT` -- revisit if
+/// a legitimate series ever needs more than this many distinct sources tracked at once.
+const MAX_CONTRIBUTING_CONTEXTS_PER_SERIES: usize = 8;
+
+impl ContributingContexts {
+    /// Records `ctx` as a contributor, unless it's already tracked (free to re-observe) or the cap
+    /// is already full (dropped and counted, never silently grown).
+    fn observe(&mut self, ctx: TraceContext) {
+        if self.seen.contains(&ctx) {
+            return;
+        }
+        if self.seen.len() >= MAX_CONTRIBUTING_CONTEXTS_PER_SERIES {
+            self.dropped += 1;
+            return;
+        }
+        self.seen.push(ctx);
+    }
+
+    /// Consumes the tracked set into the `SpanLink`s a flush would attach to whatever span
+    /// eventually represents this series (not built yet -- `docs/known-gaps.md`'s internal-spans
+    /// entry, item 2), plus how many distinct contexts the cap rejected.
+    fn into_links(self) -> (Vec<SpanLink>, u64) {
+        let links = self
+            .seen
+            .into_iter()
+            .map(|ctx| SpanLink {
+                trace_id: ctx.trace_id,
+                span_id: ctx.span_id,
+                attributes: AttrMap::new(),
+            })
+            .collect();
+        (links, self.dropped)
+    }
+}
 
 /// One tumbling-window aggregator, owned by one pipeline stage. `process` accumulates what it can
 /// and passes everything else straight through; `flush` drains every window it's holding, resetting
@@ -30,11 +89,22 @@ pub struct Aggregator {
     groups: Vec<ResourceGroup>,
     diag: Diagnostics,
     telemetry: Telemetry,
+    /// The most recent batch's `TraceContext`, per `observe_batch_context` -- rolling state, not
+    /// reset by `flush` (it isn't part of any one window). Mirrors `run_lua`'s `last_resource`
+    /// precedent (`crates/logit-pipeline/src/runtime.rs`): default until the first batch arrives.
+    current_batch_context: TraceContext,
 }
 
 struct ResourceGroup {
     resource: Arc<Resource>,
-    series: HashMap<SeriesKey, Accumulator>,
+    series: HashMap<SeriesKey, SeriesState>,
+}
+
+/// One series' accumulated value, paired with which batches contributed to it since the last
+/// flush.
+struct SeriesState {
+    accumulator: Accumulator,
+    contexts: ContributingContexts,
 }
 
 enum Accumulator {
@@ -55,7 +125,14 @@ impl Aggregator {
             groups: Vec::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
+            current_batch_context: TraceContext::default(),
         }
+    }
+
+    /// Records `ctx` as the context of the batch about to be `process`ed -- see
+    /// `Transform::observe_batch_context`'s doc comment for why this is per-batch, not per-event.
+    pub fn observe_batch_context(&mut self, ctx: TraceContext) {
+        self.current_batch_context = ctx;
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
@@ -92,6 +169,10 @@ impl Aggregator {
             return Some(event);
         }
 
+        // Read once, not once per metric -- `observe_batch_context` fires once per incoming
+        // batch, so every metric on every event of that batch shares the same value.
+        let ctx = self.current_batch_context;
+
         // Taken as an owned list, not filtered in place with `retain`: a `retain` closure would
         // need `&event.attributes`/`&event.timestamp` at the same time `self.group_for(resource)`
         // needs `&mut self`, and those two borrows can't coexist. Owning the metrics up front
@@ -115,8 +196,11 @@ impl Aggregator {
                 attributes: event.attributes.clone(),
             };
             let group = self.group_for(resource);
-            let acc = group.series.entry(key).or_insert_with(|| Accumulator::new_for(&record.kind));
-            let accumulated = match (acc, &record.kind) {
+            let state = group.series.entry(key).or_insert_with(|| SeriesState {
+                accumulator: Accumulator::new_for(&record.kind),
+                contexts: ContributingContexts::default(),
+            });
+            let accumulated = match (&mut state.accumulator, &record.kind) {
                 (Accumulator::Counter(sum), MetricKind::Counter(v)) => {
                     *sum += v;
                     true
@@ -145,6 +229,11 @@ impl Aggregator {
                 // event that *does* merge cleanly is still absorbed.
                 _ => false,
             };
+            if accumulated {
+                // Only on an actual merge -- a kind-conflicted metric didn't touch this series'
+                // accumulator, so it shouldn't be recorded as one of its contributors either.
+                state.contexts.observe(ctx);
+            }
             if !accumulated {
                 self.diag.warn_throttled(
                     "kind_conflict",
@@ -174,10 +263,12 @@ impl Aggregator {
         }
     }
 
-    /// Drains every window: one `Vec<Event>` per resource group that had any series, each series
-    /// becoming one emitted event stamped with `now`. Resets all state -- the next window starts
-    /// empty, per the tumbling design in ADR 0008.
-    pub fn flush(&mut self, now: i64) -> Vec<(Arc<Resource>, Vec<Event>)> {
+    /// Drains every window: one group per resource that had any series, each series becoming one
+    /// emitted event stamped with `now`, paired with the `SpanLink`s
+    /// `ContributingContexts::into_links` built for it. Resets all per-series state -- the next
+    /// window starts empty, per the tumbling design in ADR 0008. `current_batch_context` is *not*
+    /// reset here -- it isn't part of any one window (see its own field doc comment).
+    pub fn flush(&mut self, now: i64) -> FlushOutput {
         // Sampled before `drain` consumes `self.groups` -- the peak-of-window value, at the one
         // point this aggregator already visits every series it holds. `aggregate`'s own
         // `SeriesKey` includes an event's whole attribute set (this module's doc comment), so an
@@ -188,24 +279,43 @@ impl Aggregator {
         self.telemetry.gauge("logit.transform.series.active", active_series as f64, &[]);
         self.telemetry.gauge("logit.transform.resource.groups", self.groups.len() as f64, &[]);
 
-        self.groups
-            .drain(..)
-            .filter(|g| !g.series.is_empty())
-            .map(|g| {
-                let events = g
-                    .series
-                    .into_iter()
-                    .map(|(key, acc)| {
-                        Event::metric(
-                            now,
-                            key.attributes,
-                            MetricRecord { name: key.name, kind: acc.into_kind(), unit: key.unit },
-                        )
-                    })
-                    .collect();
-                (g.resource, events)
-            })
-            .collect()
+        // A loop, not a `.drain().filter().map().collect()` chain, so the dropped-context total
+        // (summed across every series in every group this tick) can be tracked as it goes, then
+        // reported once -- the same per-drain (not per-key) granularity
+        // `ComponentBuffer::drain`'s own `logit.internal.points.dropped` uses.
+        let mut total_dropped: u64 = 0;
+        let mut result = Vec::new();
+        for group in self.groups.drain(..) {
+            if group.series.is_empty() {
+                continue;
+            }
+            let mut events = Vec::with_capacity(group.series.len());
+            for (key, state) in group.series {
+                let (links, dropped) = state.contexts.into_links();
+                total_dropped += dropped;
+                let event = Event::metric(
+                    now,
+                    key.attributes,
+                    MetricRecord {
+                        name: key.name,
+                        kind: state.accumulator.into_kind(),
+                        unit: key.unit,
+                    },
+                );
+                events.push((event, links));
+            }
+            result.push((group.resource, events));
+        }
+
+        if total_dropped > 0 {
+            self.telemetry.count(
+                "logit.transform.links.dropped",
+                total_dropped as f64,
+                &[("reason", "cardinality")],
+            );
+        }
+
+        result
     }
 }
 
@@ -217,11 +327,15 @@ impl Transform for Aggregator {
         Aggregator::process(self, resource, event)
     }
 
+    fn observe_batch_context(&mut self, ctx: TraceContext) {
+        Aggregator::observe_batch_context(self, ctx)
+    }
+
     fn flush_interval(&self) -> Option<Duration> {
         Some(self.interval())
     }
 
-    fn flush(&mut self, now: i64) -> Vec<(Arc<Resource>, Vec<Event>)> {
+    fn flush(&mut self, now: i64) -> FlushOutput {
         Aggregator::flush(self, now)
     }
 }
@@ -391,6 +505,20 @@ mod tests {
         Arc::new(Resource::default())
     }
 
+    /// Most existing assertions below don't care about the per-event `SpanLink` set `flush` now
+    /// returns alongside each `Event` (`Transform::flush`'s doc comment) -- this flattens it away
+    /// so those assertions keep the same shape they had before flush-side linking landed. Tests
+    /// that *do* care about links call `agg.flush(...)` directly instead (see the
+    /// `contributing_context`-prefixed tests below).
+    fn flush_events(agg: &mut Aggregator, now: i64) -> Vec<(Arc<Resource>, Vec<Event>)> {
+        agg.flush(now)
+            .into_iter()
+            .map(|(resource, events)| {
+                (resource, events.into_iter().map(|(event, _links)| event).collect())
+            })
+            .collect()
+    }
+
     fn kind_of(event: &Event) -> &MetricKind {
         &event
             .metrics
@@ -420,7 +548,7 @@ mod tests {
             .process(&resource, metric_event("hits", MetricKind::Counter(3.0), 2))
             .is_none());
 
-        let flushed = agg.flush(100);
+        let flushed = flush_events(&mut agg, 100);
         assert_eq!(flushed.len(), 1);
         let (_, events) = &flushed[0];
         assert_eq!(events.len(), 1);
@@ -436,7 +564,8 @@ mod tests {
         agg.process(&resource, metric_event("temp", MetricKind::Gauge(5.0), 50));
         agg.process(&resource, metric_event("temp", MetricKind::Gauge(1.0), 10));
 
-        let (_, events) = &agg.flush(100)[0];
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
         assert_eq!(events.len(), 1);
         match kind_of(&events[0]) {
             MetricKind::Gauge(v) => assert_eq!(*v, 5.0, "should keep the value stamped at t=50"),
@@ -454,7 +583,8 @@ mod tests {
             agg.process(&resource, metric_event("latency", MetricKind::Distribution(sketch), 0));
         }
 
-        let (_, events) = &agg.flush(100)[0];
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
         assert_eq!(events.len(), 1);
         match kind_of(&events[0]) {
             MetricKind::Distribution(sketch) => {
@@ -525,7 +655,8 @@ mod tests {
             metric_event_with_tags("hits", MetricKind::Counter(1.0), 0, &[("host", "b")]),
         );
 
-        let (_, events) = &agg.flush(100)[0];
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
         assert_eq!(events.len(), 2, "different tag values should be different series");
     }
 
@@ -552,7 +683,8 @@ mod tests {
             ),
         );
 
-        let (_, events) = &agg.flush(100)[0];
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
         assert_eq!(events.len(), 1, "AttrMap keeps sorted order regardless of insertion order");
         assert_eq!(counter_value(kind_of(&events[0])), 2.0);
     }
@@ -584,7 +716,8 @@ mod tests {
         agg.process(&resource, e1);
         agg.process(&resource, e2);
 
-        let (_, events) = &agg.flush(100)[0];
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
         assert_eq!(events.len(), 1, "two NaN-tagged events should key into the same series");
         assert_eq!(counter_value(kind_of(&events[0])), 2.0);
     }
@@ -603,7 +736,8 @@ mod tests {
         assert!(passed.is_some(), "the conflicting event should be forwarded, not absorbed");
 
         // The counter accumulator should be untouched by the conflicting event.
-        let (_, events) = &agg.flush(100)[0];
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
         assert_eq!(events.len(), 1);
         assert_eq!(counter_value(kind_of(&events[0])), 1.0);
     }
@@ -637,7 +771,8 @@ mod tests {
             Value::str("hello")
         );
 
-        let (_, events) = &agg.flush(100)[0];
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
         assert_eq!(events.len(), 1);
         assert_eq!(counter_value(kind_of(&events[0])), 1.0);
     }
@@ -658,7 +793,8 @@ mod tests {
         assert_eq!(passed.metrics.len(), 1, "only the unmergeable histogram should remain");
         assert!(matches!(passed.metrics[0].kind, MetricKind::Histogram { .. }));
 
-        let (_, events) = &agg.flush(100)[0];
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
         assert_eq!(events.len(), 1);
         assert_eq!(counter_value(kind_of(&events[0])), 1.0);
     }
@@ -693,7 +829,8 @@ mod tests {
 
         assert!(agg.process(&resource, event).is_none());
 
-        let (_, events) = &agg.flush(100)[0];
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
         assert_eq!(events.len(), 1, "both metrics should key into the same series");
         assert_eq!(counter_value(kind_of(&events[0])), 3.0);
     }
@@ -716,9 +853,111 @@ mod tests {
         assert_eq!(passed.metrics.len(), 1, "the absorbed counter should not also be forwarded");
         assert!(matches!(passed.metrics[0].kind, MetricKind::Gauge(v) if v == 5.0));
 
-        let (_, events) = &agg.flush(100)[0];
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
         assert_eq!(events.len(), 1);
         assert_eq!(counter_value(kind_of(&events[0])), 2.0, "both counters should have merged");
+    }
+
+    /// Two batches, two different `TraceContext`s, both contributing to the same series --
+    /// `flush` should link both, per `ContributingContexts`' whole point.
+    #[test]
+    fn flush_links_every_distinct_context_that_contributed_to_a_series() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+
+        let ctx_a = TraceContext::new_root();
+        agg.observe_batch_context(ctx_a);
+        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+
+        let ctx_b = TraceContext::new_root();
+        agg.observe_batch_context(ctx_b);
+        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+
+        let flushed = agg.flush(100);
+        let (_, events) = &flushed[0];
+        assert_eq!(events.len(), 1);
+        let (_, links) = &events[0];
+        assert_eq!(links.len(), 2, "both contributing traces should be linked");
+        let trace_ids: Vec<[u8; 16]> = links.iter().map(|l| l.trace_id).collect();
+        assert!(trace_ids.contains(&ctx_a.trace_id));
+        assert!(trace_ids.contains(&ctx_b.trace_id));
+    }
+
+    /// The same context observed twice (e.g. two events from the same batch touching the same
+    /// series) shouldn't produce two links -- `ContributingContexts::observe`'s `contains` check.
+    #[test]
+    fn repeat_events_under_the_same_context_dont_duplicate_a_link() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        agg.observe_batch_context(TraceContext::new_root());
+        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+
+        let flushed = agg.flush(100);
+        let (_, events) = &flushed[0];
+        let (_, links) = &events[0];
+        assert_eq!(links.len(), 1, "the same context observed twice should still be one link");
+    }
+
+    /// Nine distinct contributing contexts on one series: the cap (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`,
+    /// 8) admits the first 8, the 9th is dropped and counted -- the same "bound and count the
+    /// drop, never silently grow" shape `ComponentBuffer::upsert`'s own cardinality cap uses.
+    #[test]
+    fn a_series_fed_by_more_than_the_cap_drops_and_counts_the_rest() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_telemetry(telemetry);
+        let resource = default_resource();
+
+        for _ in 0..9 {
+            agg.observe_batch_context(TraceContext::new_root());
+            agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+        }
+
+        let flushed = agg.flush(100);
+        let (_, events) = &flushed[0];
+        let (_, links) = &events[0];
+        assert_eq!(links.len(), 8, "capped at MAX_CONTRIBUTING_CONTEXTS_PER_SERIES");
+
+        let drained = registry.drain(0);
+        let dropped = drained.iter().find_map(|e| {
+            e.metrics.iter().find_map(|m| match &m.kind {
+                MetricKind::Counter(v)
+                    if logit_core::interner::resolve(m.name) == "logit.transform.links.dropped" =>
+                {
+                    Some(*v)
+                }
+                _ => None,
+            })
+        });
+        assert_eq!(dropped, Some(1.0), "the 9th distinct context should be dropped and counted");
+    }
+
+    /// Tumbling, not sliding (ADR 0008): a series' contributing-context set resets with the rest
+    /// of its accumulator state at flush, exactly like `a_second_flush_after_the_first_emits_nothing`
+    /// already pins for the accumulated value itself.
+    #[test]
+    fn contributing_contexts_reset_after_a_flush() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        let ctx_a = TraceContext::new_root();
+        agg.observe_batch_context(ctx_a);
+        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+        agg.flush(100); // first window's links discarded along with its accumulator
+
+        let ctx_b = TraceContext::new_root();
+        agg.observe_batch_context(ctx_b);
+        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+
+        let flushed = agg.flush(200);
+        let (_, events) = &flushed[0];
+        let (_, links) = &events[0];
+        assert_eq!(links.len(), 1, "tumbling: the first window's context shouldn't carry over");
+        assert_eq!(
+            links[0].trace_id, ctx_b.trace_id,
+            "only the second window's context should be linked"
+        );
     }
 
     // Takes already-drained `events`, not a `&Registry` -- `Registry::drain` is consuming (it

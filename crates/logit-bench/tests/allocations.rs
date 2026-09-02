@@ -280,6 +280,15 @@ fn aggregate_absorb_without_keep() {
     expect_allocs("aggregate: absorb 1 event (no keep)", stats, 4);
 }
 
+/// 6, not the pre-flush-linking 2 -- re-measured, not assumed, when `Transform::flush` widened to
+/// carry each series' `Vec<SpanLink>` (`docs/adr/0020-trace-context-propagation-on-delivered.md`'s
+/// flush-side linking). The 4 new allocations are exactly the 4 series: this fixture never calls
+/// `observe_batch_context`, so every absorbed event records the same (default, all-zero)
+/// `TraceContext`, and each series' `ContributingContexts` ends up with exactly one distinct
+/// context -- one `SpanLink` -- which `into_links()`'s `.collect()` allocates its own `Vec<SpanLink>`
+/// for. One allocation per series, unavoidable even at the minimum (a non-empty `Vec` always
+/// allocates), so this is the honest floor for a flush where every series has any contributor at
+/// all.
 #[test]
 fn aggregate_flush_100_series() {
     let resource = fixtures::resource();
@@ -293,7 +302,7 @@ fn aggregate_flush_100_series() {
     let (flushed, stats) = measure(|| agg.flush(1_000_000_000));
     let series: usize = flushed.iter().map(|(_, events)| events.len()).sum();
     assert_eq!(series, 4, "one series per metric name -- keep bounds the tag set");
-    expect_allocs("aggregate: flush 4 series", stats, 2);
+    expect_allocs("aggregate: flush 4 series", stats, 6);
 }
 
 // ---------------------------------------------------------------------------------------------
