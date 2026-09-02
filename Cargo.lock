@@ -764,6 +764,7 @@ dependencies = [
  "logit-core",
  "logit-pipeline",
  "logit-proto",
+ "logit-transforms",
  "tokio",
 ]
 
