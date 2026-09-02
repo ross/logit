@@ -1,25 +1,28 @@
 //! `MetricRecord` ↔ OTLP `Metric` -- the hard direction, both ways.
 //!
-//! **Encode.** Temporality is always `DELTA`: `aggregate` produces tumbling deltas per
+//! **Encode.** Temporality is `DELTA` by default: `aggregate` produces tumbling deltas per
 //! [ADR 0008](../../../../docs/adr/0008-aggregation-window-semantics.md), and `internal`'s own
-//! buffer coalesces since the last drain -- nothing in this codebase produces a cumulative running
-//! total. `start_time_unix_nano` and `time_unix_nano` are both stamped with `Event::timestamp`:
-//! nothing upstream of this codec tracks a series' own start time separately from its latest point.
-//! Event attributes become the data point's attributes; the metric name/unit come from the
-//! `MetricRecord` itself. One `MetricRecord` becomes exactly one OTLP `Metric` with exactly one
-//! data point -- this does **not** coalesce same-named metrics across events into one wire-level
-//! `Metric.data_points` list the way a canonical OTLP producer would. That's spec-legal (multiple
-//! `Metric` entries sharing a name is explicitly permitted; most consumers -- including this
-//! crate's own decoder -- treat them as more points of the same series) and keeps this mapping a
-//! pure per-record function instead of a batch-wide grouping pass.
+//! buffer coalesces since the last drain -- neither produces a cumulative running total on its own.
+//! The one exception is a `Histogram` whose event carries `otel.temporality = "cumulative"` (the
+//! same attribute the decode side stamps below, round-tripped rather than silently dropped back to
+//! `DELTA`) -- see the `Histogram` row. `start_time_unix_nano` and `time_unix_nano` are both
+//! stamped with `Event::timestamp`: nothing upstream of this codec tracks a series' own start time
+//! separately from its latest point. Event attributes become the data point's attributes; the
+//! metric name/unit come from the `MetricRecord` itself. One `MetricRecord` becomes exactly one
+//! OTLP `Metric` with exactly one data point -- this does **not** coalesce same-named metrics
+//! across events into one wire-level `Metric.data_points` list the way a canonical OTLP producer
+//! would. That's spec-legal (multiple `Metric` entries sharing a name is explicitly permitted; most
+//! consumers -- including this crate's own decoder -- treat them as more points of the same series)
+//! and keeps this mapping a pure per-record function instead of a batch-wide grouping pass.
 //!
 //! | `MetricKind` | Encodes to | Fidelity |
 //! |---|---|---|
 //! | `Counter(v)` | `Sum{DELTA, monotonic}` | exact |
 //! | `Gauge(v)` | `Gauge` | exact |
-//! | `Histogram{buckets}` | `Histogram{DELTA}` | exact -- `buckets` is already per-bucket, not
-//! |   |   | cumulative (`metric.rs`'s doc comment); a trailing `f64::INFINITY` bound becomes the
-//! |   |   | implicit final bucket OTLP's `explicit_bounds` convention expects. |
+//! | `Histogram{buckets}` | `Histogram{DELTA, or CUMULATIVE if `otel.temporality = "cumulative"`}` | exact -- `buckets` is already per-bucket, not
+//! |   |   | cumulative (`metric.rs`'s doc comment, which describes the *count per bucket*, not the
+//! |   |   | series' own temporality); a trailing `f64::INFINITY` bound becomes the implicit final
+//! |   |   | bucket OTLP's `explicit_bounds` convention expects. |
 //! | `Summary{quantiles}` | `Summary` | `count`/`sum` have no source → `0`/`0.0`, documented |
 //! | `Distribution(sketch)` | `Summary` of 5 fixed quantiles (p50/p75/p90/p95/p99) | **Lossy,
 //! |   |   | deliberately** -- see the module doc's "Lossy metric kinds" note below. Counted via
@@ -37,16 +40,40 @@
 //! with an `otel.temporality = "cumulative"` attribute, not `Counter` -- summing a running total
 //! would double-count, and last-write-wins on a monotone series is an honest representation of what
 //! we actually received. Non-monotonic `Sum` → `Gauge` (same temporality attribute if cumulative).
-//! `Histogram` → `Histogram{buckets}`, reconstructing the trailing infinite bucket when
-//! `bucket_counts` has one more entry than `explicit_bounds` (the OTLP-mandated shape).
-//! `Summary` → `Summary`, `count`/`sum` dropped. `ExponentialHistogram` → `Histogram{buckets}` with
-//! bounds materialized from `scale`/`offset` (`base = 2^(2^-scale)`) -- **exact, not lossy**: an
-//! exponential histogram is a fixed-bucket histogram with geometric bounds, so this is a change of
-//! representation, not a loss of information. Capped at [`MAX_DERIVED_BUCKETS`]; a point wider than
-//! that is skipped and counted rather than materializing an unbounded `Vec`. Any point with
-//! `flags & DATA_POINT_FLAGS_NO_RECORDED_VALUE_MASK` set is skipped and counted, never fails the
-//! whole request -- OTLP has its own channel for reporting this back (`partial_success`), wired in
-//! PR3.
+//! `Histogram`/`ExponentialHistogram` → `Histogram{buckets}`, **also** stamping
+//! `otel.temporality = "cumulative"` when the wire point is cumulative -- the same reasoning as
+//! `Sum`: a cumulative histogram's bucket counts are running totals, and encoding them back out
+//! unconditionally as `DELTA` (as an earlier version of this codec did) would tell a downstream
+//! consumer to treat a running total as a fresh increment, double-counting on every re-export. The
+//! attribute is preserved through a decode → re-encode round trip (see the `Encode` section above),
+//! not silently dropped.
+//!
+//! `Histogram` reconstructs the trailing infinite bucket when `bucket_counts` has one more entry
+//! than `explicit_bounds` (the OTLP-mandated shape). `Summary` → `Summary`, `count`/`sum` dropped.
+//!
+//! `ExponentialHistogram` → `Histogram{buckets}` with bounds materialized from `scale`/`offset`/
+//! `zero_threshold` (`base = 2^(2^-scale)`; bucket `index`'s positive-range value range is
+//! `(base^index, base^(index+1)]`, mirrored on the negative side; the zero bucket spans
+//! `[-zero_threshold, zero_threshold]`) -- **exact** for the ranges an exponential histogram
+//! actually reports: each real bucket's boundary is computed from its own `scale`/`offset`/index,
+//! never approximated, and the result always closes both ends explicitly (a leading zero-count
+//! bucket at the outermost reported edge, a trailing `f64::INFINITY` one) rather than letting this
+//! codebase's own `Histogram` convention -- bucket 0 implicitly means `(-infinity, bound]` -- claim
+//! a wider range than what the peer actually reported. The one narrower-than-"exact" residual: the
+//! negative range's half-open convention (closed at the far-from-zero edge, open at the near-zero
+//! edge) is the mirror image of this codebase's own `(prev, bound]` convention, so a value landing
+//! on *exactly* a negative bucket boundary is attributed to the neighboring bucket instead of the
+//! spec-correct one -- a single-point, measure-zero mislabeling for continuous-valued data, not a
+//! range or count error, and not counted (nothing was mis-ranged or lost, only one boundary point's
+//! label). See [`decode_exponential_buckets`] for the construction and [`BucketError`] for when it
+//! gives up instead: [`MAX_DERIVED_BUCKETS`] (an upper bound against a hostile `scale`/`offset`
+//! forcing a huge allocation) or a derived bound that isn't finite (an extreme `scale`) or isn't
+//! strictly increasing (e.g. `zero_threshold` overlapping an adjacent exponential bucket) -- both
+//! skip and count the point rather than materializing a bogus or silently-too-wide range.
+//!
+//! Any point with `flags & DATA_POINT_FLAGS_NO_RECORDED_VALUE_MASK` set is skipped and counted,
+//! never fails the whole request -- OTLP has its own channel for reporting this back
+//! (`partial_success`), wired in PR3.
 //!
 //! Decode-side skips count via `logit.input.metrics.skipped{metric_kind, reason}` -- distinct
 //! names from the encode side's `logit.output.metrics.{degraded,skipped}` since these are the two
@@ -121,6 +148,16 @@ pub(crate) fn encode_metric(
             let explicit_bounds: Vec<f64> =
                 buckets.iter().filter(|(b, _)| b.is_finite()).map(|(b, _)| *b).collect();
             let count = bucket_counts.iter().sum();
+            // Honor a decoded `otel.temporality = "cumulative"` attribute instead of hardcoding
+            // DELTA unconditionally -- see the module doc's Decode section for why silently
+            // flipping a cumulative histogram to DELTA on re-encode would double-count downstream.
+            let cumulative = event.attributes.get("otel.temporality").and_then(|v| v.as_str())
+                == Some("cumulative");
+            let aggregation_temporality = if cumulative {
+                pb::AggregationTemporality::Cumulative
+            } else {
+                pb::AggregationTemporality::Delta
+            } as i32;
             pb::metric::Data::Histogram(pb::Histogram {
                 data_points: vec![pb::HistogramDataPoint {
                     attributes,
@@ -135,7 +172,7 @@ pub(crate) fn encode_metric(
                     min: None,
                     max: None,
                 }],
-                aggregation_temporality: pb::AggregationTemporality::Delta as i32,
+                aggregation_temporality,
             })
         }
         MetricKind::Summary { quantiles } => pb::metric::Data::Summary(pb::Summary {
@@ -209,43 +246,141 @@ fn distribution_summary_point(
 }
 
 /// `base = 2^(2^-scale)` (OTLP's own formula, `metrics.proto`'s `ExponentialHistogramDataPoint`
-/// doc comment). Bucket `index`'s positive-range value range is `(base^index, base^(index+1)]`.
+/// doc comment), computed entirely in `f64`. `scale` is a peer-controlled `sint32` the spec leaves
+/// unrestricted -- negating it as an `i32` (`-scale`) panics in a debug build for
+/// `scale == i32::MIN` (there is no positive `i32` to represent `-i32::MIN`). Casting to `f64`
+/// first sidesteps that entirely: every operation below saturates to `f64::INFINITY`/`0.0` instead
+/// of panicking, for any `scale`/`index`. The caller ([`decode_exponential_buckets`], via
+/// [`push_bucket`]/[`bridge_to`]) rejects a non-finite result rather than treating it as a real
+/// bound.
 fn exponential_bound(scale: i32, index: i64) -> f64 {
-    let base = 2f64.powf(2f64.powi(-scale));
+    let inner = 2f64.powf(-(scale as f64));
+    let base = 2f64.powf(inner);
     base.powf(index as f64)
 }
 
-/// Materializes an `ExponentialHistogramDataPoint`'s positive/zero/negative buckets into the same
-/// `(bound, count)` shape `MetricKind::Histogram` uses, ascending by bound (most negative first).
-/// `None` if the point would exceed [`MAX_DERIVED_BUCKETS`] -- the caller skips and counts it.
+/// Why an `ExponentialHistogram` data point's buckets couldn't be materialized -- both cases are
+/// skip-and-count ([`decode_metric`]'s `ExponentialHistogram` arm), never a panic and never a
+/// silently-too-wide range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BucketError {
+    /// Would exceed [`MAX_DERIVED_BUCKETS`].
+    OverCap,
+    /// A derived bound was non-finite (an extreme `scale` overflowed `f64`'s range) or the
+    /// resulting sequence wasn't strictly increasing (e.g. `zero_threshold` overlaps an adjacent
+    /// exponential bucket) -- either way, the range this point claims can't be trusted.
+    Inconsistent,
+}
+
+/// Appends `(bound, count)`, rejecting a bound that isn't finite or doesn't strictly exceed the
+/// last one pushed. A non-strictly-increasing sequence would make a re-encode's `explicit_bounds`
+/// invalid (OTLP requires it strictly increasing) or silently claim a zero-/negative-width range.
+fn push_bucket(buckets: &mut Vec<(f64, u64)>, bound: f64, count: u64) -> Result<(), BucketError> {
+    if !bound.is_finite() {
+        return Err(BucketError::Inconsistent);
+    }
+    if let Some(&(last, _)) = buckets.last() {
+        if bound <= last {
+            return Err(BucketError::Inconsistent);
+        }
+    }
+    buckets.push((bound, count));
+    Ok(())
+}
+
+/// Closes the gap between whatever was pushed last (or, if nothing has been pushed yet, the
+/// implicit `-infinity` this codebase's own `Histogram` convention starts every bucket list at)
+/// and `target`, with an explicit zero-count bucket -- e.g. the range below the outermost reported
+/// exponential bucket, or between the zero region and the smallest positive bucket, that nothing
+/// was actually recorded in. Without this, the *first* real bucket pushed would inherit the
+/// implicit `-infinity` start and silently claim everything below it too (the bug this function
+/// exists to close: `scale=0, offset=0, bucket_counts=[5]` must decode to "(1, 2] = 5", not
+/// "(-infinity, 2] = 5"). A no-op if `target` already equals the last bound (already contiguous);
+/// rejects a `target` that would go *backwards* -- an overlap is exactly the "can't be expressed"
+/// case [`decode_exponential_buckets`] gives up on.
+fn bridge_to(buckets: &mut Vec<(f64, u64)>, target: f64) -> Result<(), BucketError> {
+    if !target.is_finite() {
+        return Err(BucketError::Inconsistent);
+    }
+    match buckets.last() {
+        None => buckets.push((target, 0)),
+        Some(&(last, _)) if target > last => buckets.push((target, 0)),
+        Some(&(last, _)) if target == last => {}
+        Some(_) => return Err(BucketError::Inconsistent),
+    }
+    Ok(())
+}
+
+/// Materializes an `ExponentialHistogramDataPoint`'s negative/zero/positive buckets into the same
+/// `(bound, count)` shape `MetricKind::Histogram` uses -- ascending by bound, most-negative first,
+/// always closed at both ends: a leading zero-count bucket at the outermost edge actually reported
+/// (rather than the implicit `-infinity` this codebase's own `Histogram` convention would
+/// otherwise apply to the first real entry) and a trailing `f64::INFINITY` one, so a re-encode
+/// always produces a valid `bucket_counts.len() == explicit_bounds.len() + 1` histogram
+/// (`encode_metric`'s `Histogram` arm only treats a *trailing* infinite bound as the implicit
+/// overflow bucket; every other entry becomes a real, finite `explicit_bounds` value). See the
+/// module doc for the residual single-point boundary caveat on the negative side.
 ///
-/// The negative range's bound is the near-zero edge of its own magnitude bucket (`-base^(offset+i)`
-/// for `bucket_counts[i]`) -- exact for the positive range (which the required tests exercise);
-/// documented as an approximation on the negative side, since OTLP's negative-range half-open
-/// convention (closed at the far-from-zero end) is the mirror image of this codebase's own
-/// `Histogram` convention (closed at the near bound, open below).
-fn decode_exponential_buckets(dp: &pb::ExponentialHistogramDataPoint) -> Option<Vec<(f64, u64)>> {
+/// `Err(BucketError::OverCap)` past [`MAX_DERIVED_BUCKETS`] (an upper bound on the number of
+/// entries this can push, including the bridge/terminal ones -- computed before construction so a
+/// hostile `scale`/`offset` can't force a large allocation first and get rejected only after).
+/// `Err(BucketError::Inconsistent)` for a non-finite derived bound or a non-monotonic sequence.
+fn decode_exponential_buckets(
+    dp: &pb::ExponentialHistogramDataPoint,
+) -> Result<Vec<(f64, u64)>, BucketError> {
     let positive = dp.positive.clone().unwrap_or_default();
     let negative = dp.negative.clone().unwrap_or_default();
-    let has_zero = dp.zero_count > 0;
-    let total = negative.bucket_counts.len() + usize::from(has_zero) + positive.bucket_counts.len();
+    let has_zero = dp.zero_count > 0 || dp.zero_threshold > 0.0;
+    // Upper bound on pushes: each real bucket, plus up to 4 zero-count entries this function can
+    // add (a leading bridge before the negative range, a bridge into the zero region, the zero
+    // region's own entry, a bridge into the positive range) plus the trailing infinite terminal --
+    // deliberately generous rather than tracking exactly which bridges fire, since this only needs
+    // to be a safe upper bound for the cap check, not a tight allocation estimate.
+    let total =
+        negative.bucket_counts.len() + positive.bucket_counts.len() + usize::from(has_zero) + 4;
     if total > MAX_DERIVED_BUCKETS {
-        return None;
+        return Err(BucketError::OverCap);
     }
 
-    let mut buckets = Vec::with_capacity(total);
-    for (i, count) in negative.bucket_counts.iter().enumerate().rev() {
-        let index = negative.offset as i64 + i as i64;
-        buckets.push((-exponential_bound(dp.scale, index), *count));
+    let scale = dp.scale;
+    let mut buckets: Vec<(f64, u64)> = Vec::with_capacity(total);
+
+    // Negative range, most-negative bucket first (ascending value). `push_bucket`'s empty-buckets
+    // case handles the very first entry here directly (no separate placeholder needed) -- but that
+    // would use *this* bucket's own near edge as the implicit `-infinity` start, which is exactly
+    // the bug being fixed, so `bridge_to` establishes the true outer edge first.
+    if !negative.bucket_counts.is_empty() {
+        let far =
+            -exponential_bound(scale, negative.offset as i64 + negative.bucket_counts.len() as i64);
+        bridge_to(&mut buckets, far)?;
+        for (i, count) in negative.bucket_counts.iter().enumerate().rev() {
+            let index = negative.offset as i64 + i as i64;
+            let bound = -exponential_bound(scale, index);
+            push_bucket(&mut buckets, bound, *count)?;
+        }
     }
+
     if has_zero {
-        buckets.push((0.0, dp.zero_count));
+        let low = -dp.zero_threshold;
+        let high = dp.zero_threshold;
+        bridge_to(&mut buckets, low)?;
+        push_bucket(&mut buckets, high, dp.zero_count)?;
     }
-    for (i, count) in positive.bucket_counts.iter().enumerate() {
-        let index = positive.offset as i64 + i as i64 + 1;
-        buckets.push((exponential_bound(dp.scale, index), *count));
+
+    if !positive.bucket_counts.is_empty() {
+        let near = exponential_bound(scale, positive.offset as i64);
+        bridge_to(&mut buckets, near)?;
+        for (i, count) in positive.bucket_counts.iter().enumerate() {
+            let index = positive.offset as i64 + i as i64 + 1;
+            let bound = exponential_bound(scale, index);
+            push_bucket(&mut buckets, bound, *count)?;
+        }
     }
-    Some(buckets)
+
+    if !buckets.is_empty() {
+        buckets.push((f64::INFINITY, 0));
+    }
+    Ok(buckets)
 }
 
 /// Decodes one OTLP `Metric` into zero or more `Event`s (one per data point). Never fails the
@@ -314,33 +449,42 @@ pub(crate) fn decode_metric(
                 ))
             })
             .collect(),
-        Some(pb::metric::Data::Histogram(hist)) => hist
-            .data_points
-            .into_iter()
-            .filter_map(|dp| {
-                if no_recorded_value(dp.flags) {
-                    telemetry.count(
-                        "logit.input.metrics.skipped",
-                        1.0,
-                        &[("metric_kind", "histogram"), ("reason", "no_recorded_value")],
-                    );
-                    return None;
-                }
-                let mut attrs = base_attrs.clone();
-                let ts = dp.time_unix_nano as i64;
-                let mut buckets = Vec::with_capacity(dp.bucket_counts.len());
-                for (i, count) in dp.bucket_counts.iter().enumerate() {
-                    let bound = dp.explicit_bounds.get(i).copied().unwrap_or(f64::INFINITY);
-                    buckets.push((bound, *count));
-                }
-                common::key_values_into_attrs(dp.attributes, &mut attrs);
-                Some(Event::metric(
-                    ts,
-                    attrs,
-                    MetricRecord { name, kind: MetricKind::Histogram { buckets }, unit },
-                ))
-            })
-            .collect(),
+        Some(pb::metric::Data::Histogram(hist)) => {
+            // Preserved as an `otel.temporality` attribute, the same shape `Sum` already uses --
+            // see the module doc's Decode section for why re-encoding a cumulative histogram as
+            // DELTA unconditionally would double-count downstream.
+            let cumulative =
+                hist.aggregation_temporality == pb::AggregationTemporality::Cumulative as i32;
+            hist.data_points
+                .into_iter()
+                .filter_map(|dp| {
+                    if no_recorded_value(dp.flags) {
+                        telemetry.count(
+                            "logit.input.metrics.skipped",
+                            1.0,
+                            &[("metric_kind", "histogram"), ("reason", "no_recorded_value")],
+                        );
+                        return None;
+                    }
+                    let mut attrs = base_attrs.clone();
+                    let ts = dp.time_unix_nano as i64;
+                    let mut buckets = Vec::with_capacity(dp.bucket_counts.len());
+                    for (i, count) in dp.bucket_counts.iter().enumerate() {
+                        let bound = dp.explicit_bounds.get(i).copied().unwrap_or(f64::INFINITY);
+                        buckets.push((bound, *count));
+                    }
+                    common::key_values_into_attrs(dp.attributes, &mut attrs);
+                    if cumulative {
+                        attrs.insert("otel.temporality", "cumulative");
+                    }
+                    Some(Event::metric(
+                        ts,
+                        attrs,
+                        MetricRecord { name, kind: MetricKind::Histogram { buckets }, unit },
+                    ))
+                })
+                .collect()
+        }
         Some(pb::metric::Data::Summary(summary)) => summary
             .data_points
             .into_iter()
@@ -364,39 +508,62 @@ pub(crate) fn decode_metric(
                 ))
             })
             .collect(),
-        Some(pb::metric::Data::ExponentialHistogram(eh)) => eh
-            .data_points
-            .into_iter()
-            .filter_map(|dp| {
-                if no_recorded_value(dp.flags) {
-                    telemetry.count(
-                        "logit.input.metrics.skipped",
-                        1.0,
-                        &[
-                            ("metric_kind", "exponential_histogram"),
-                            ("reason", "no_recorded_value"),
-                        ],
-                    );
-                    return None;
-                }
-                let Some(buckets) = decode_exponential_buckets(&dp) else {
-                    telemetry.count(
-                        "logit.input.metrics.skipped",
-                        1.0,
-                        &[("metric_kind", "exponential_histogram"), ("reason", "bucket_cap")],
-                    );
-                    return None;
-                };
-                let mut attrs = base_attrs.clone();
-                let ts = dp.time_unix_nano as i64;
-                common::key_values_into_attrs(dp.attributes, &mut attrs);
-                Some(Event::metric(
-                    ts,
-                    attrs,
-                    MetricRecord { name, kind: MetricKind::Histogram { buckets }, unit },
-                ))
-            })
-            .collect(),
+        Some(pb::metric::Data::ExponentialHistogram(eh)) => {
+            let cumulative =
+                eh.aggregation_temporality == pb::AggregationTemporality::Cumulative as i32;
+            eh.data_points
+                .into_iter()
+                .filter_map(|dp| {
+                    if no_recorded_value(dp.flags) {
+                        telemetry.count(
+                            "logit.input.metrics.skipped",
+                            1.0,
+                            &[
+                                ("metric_kind", "exponential_histogram"),
+                                ("reason", "no_recorded_value"),
+                            ],
+                        );
+                        return None;
+                    }
+                    let buckets = match decode_exponential_buckets(&dp) {
+                        Ok(buckets) => buckets,
+                        Err(BucketError::OverCap) => {
+                            telemetry.count(
+                                "logit.input.metrics.skipped",
+                                1.0,
+                                &[
+                                    ("metric_kind", "exponential_histogram"),
+                                    ("reason", "bucket_cap"),
+                                ],
+                            );
+                            return None;
+                        }
+                        Err(BucketError::Inconsistent) => {
+                            telemetry.count(
+                                "logit.input.metrics.skipped",
+                                1.0,
+                                &[
+                                    ("metric_kind", "exponential_histogram"),
+                                    ("reason", "inconsistent_bounds"),
+                                ],
+                            );
+                            return None;
+                        }
+                    };
+                    let mut attrs = base_attrs.clone();
+                    let ts = dp.time_unix_nano as i64;
+                    common::key_values_into_attrs(dp.attributes, &mut attrs);
+                    if cumulative {
+                        attrs.insert("otel.temporality", "cumulative");
+                    }
+                    Some(Event::metric(
+                        ts,
+                        attrs,
+                        MetricRecord { name, kind: MetricKind::Histogram { buckets }, unit },
+                    ))
+                })
+                .collect()
+        }
         None => Vec::new(),
     }
 }
@@ -615,36 +782,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_exponential_histogram_decodes_to_explicit_bounds_derived_from_its_scale_and_offset() {
-        // scale = 0 -> base = 2. offset = 0, bucket_counts = [5, 7] -> positive buckets at
-        // indices 1, 2 with bounds base^1 = 2.0 and base^2 = 4.0.
-        let dp = pb::ExponentialHistogramDataPoint {
-            attributes: Vec::new(),
-            start_time_unix_nano: 0,
-            time_unix_nano: 1000,
-            count: 12,
-            sum: None,
-            scale: 0,
-            zero_count: 0,
-            positive: Some(pb::exponential_histogram_data_point::Buckets {
-                offset: 0,
-                bucket_counts: vec![5, 7],
-            }),
-            negative: None,
-            flags: 0,
-            exemplars: Vec::new(),
-            min: None,
-            max: None,
-            zero_threshold: 0.0,
-        };
-        let buckets = decode_exponential_buckets(&dp).expect("within the bucket cap");
-        assert_eq!(buckets, vec![(2.0, 5), (4.0, 7)]);
-    }
-
-    #[test]
-    fn an_exponential_histogram_wider_than_the_bucket_cap_is_skipped_and_counted() {
-        let dp = pb::ExponentialHistogramDataPoint {
+    /// A minimal `ExponentialHistogramDataPoint` with everything but `positive`/`negative`/
+    /// `zero_count`/`zero_threshold` at a harmless default, so each test only sets what it's
+    /// actually exercising.
+    fn exponential_dp() -> pb::ExponentialHistogramDataPoint {
+        pb::ExponentialHistogramDataPoint {
             attributes: Vec::new(),
             start_time_unix_nano: 0,
             time_unix_nano: 1000,
@@ -652,19 +794,107 @@ mod tests {
             sum: None,
             scale: 0,
             zero_count: 0,
-            positive: Some(pb::exponential_histogram_data_point::Buckets {
-                offset: 0,
-                bucket_counts: vec![1; MAX_DERIVED_BUCKETS + 1],
-            }),
+            positive: None,
             negative: None,
             flags: 0,
             exemplars: Vec::new(),
             min: None,
             max: None,
             zero_threshold: 0.0,
+        }
+    }
+
+    #[test]
+    fn an_exponential_histogram_decodes_to_explicit_bounds_derived_from_its_scale_and_offset() {
+        // scale = 0 -> base = 2. offset = 0, bucket_counts = [5, 7] -> positive buckets at OTLP
+        // indices 0, 1, covering (1, 2] and (2, 4] respectively -- the exact numeric case a
+        // reviewer flagged as wrong: the old code returned [(2.0, 5), (4.0, 7)], whose meaning
+        // under this codebase's own Histogram convention is "(-infinity, 2] = 5", not "(1, 2] = 5".
+        // The leading (1.0, 0) closes that off, and the trailing (+inf, 0) is the terminal bucket
+        // every non-empty result carries so a re-encode stays a valid OTLP histogram.
+        let dp = pb::ExponentialHistogramDataPoint {
+            positive: Some(pb::exponential_histogram_data_point::Buckets {
+                offset: 0,
+                bucket_counts: vec![5, 7],
+            }),
+            ..exponential_dp()
         };
+        let buckets = decode_exponential_buckets(&dp).expect("within the bucket cap");
+        assert_eq!(buckets, vec![(1.0, 0), (2.0, 5), (4.0, 7), (f64::INFINITY, 0)]);
+    }
+
+    #[test]
+    fn a_single_positive_bucket_decodes_to_exactly_the_range_the_reviewer_named() {
+        // The reviewer's own minimal repro: scale=0, offset=0, bucket_counts=[5] must mean
+        // "(1, 2] = 5", not the far wider "(-infinity, 2] = 5" the old code produced.
+        let dp = pb::ExponentialHistogramDataPoint {
+            positive: Some(pb::exponential_histogram_data_point::Buckets {
+                offset: 0,
+                bucket_counts: vec![5],
+            }),
+            ..exponential_dp()
+        };
+        let buckets = decode_exponential_buckets(&dp).expect("within the bucket cap");
+        assert_eq!(buckets, vec![(1.0, 0), (2.0, 5), (f64::INFINITY, 0)]);
+    }
+
+    #[test]
+    fn a_re_encoded_exponential_histogram_is_a_valid_otlp_histogram_shape() {
+        let dp = pb::ExponentialHistogramDataPoint {
+            positive: Some(pb::exponential_histogram_data_point::Buckets {
+                offset: 0,
+                bucket_counts: vec![5, 7],
+            }),
+            ..exponential_dp()
+        };
+        let buckets = decode_exponential_buckets(&dp).unwrap();
+        let metric = encode(MetricKind::Histogram { buckets }).unwrap();
+        match metric.data.unwrap() {
+            pb::metric::Data::Histogram(h) => {
+                let point = &h.data_points[0];
+                assert_eq!(
+                    point.bucket_counts.len(),
+                    point.explicit_bounds.len() + 1,
+                    "OTLP requires bucket_counts.len() == explicit_bounds.len() + 1, got \
+                     bucket_counts={:?} explicit_bounds={:?}",
+                    point.bucket_counts,
+                    point.explicit_bounds
+                );
+            }
+            other => panic!("expected Histogram, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_zero_bucket_uses_the_real_zero_threshold_not_a_hardcoded_zero() {
+        // zero_threshold = 0.5, zero_count = 3 must decode with a zero band of width 1.0
+        // (-0.5, 0.5] -- closed with an explicit (-0.5, 0) entry marking "nothing below -0.5" --
+        // not collapse to a single (0.0, 3) point that loses the band's width entirely.
+        let dp = pb::ExponentialHistogramDataPoint {
+            zero_count: 3,
+            zero_threshold: 0.5,
+            ..exponential_dp()
+        };
+        let buckets = decode_exponential_buckets(&dp).expect("within the bucket cap");
+        assert_eq!(buckets, vec![(-0.5, 0), (0.5, 3), (f64::INFINITY, 0)]);
         assert!(
-            decode_exponential_buckets(&dp).is_none(),
+            !buckets.iter().any(|(b, _)| *b == 0.0),
+            "the zero bucket's bound must be the real zero_threshold, not a hardcoded 0.0"
+        );
+    }
+
+    #[test]
+    fn an_exponential_histogram_wider_than_the_bucket_cap_is_skipped_and_counted() {
+        let dp = pb::ExponentialHistogramDataPoint {
+            positive: Some(pb::exponential_histogram_data_point::Buckets {
+                offset: 0,
+                bucket_counts: vec![1; MAX_DERIVED_BUCKETS + 1],
+            }),
+            ..exponential_dp()
+        };
+        assert_eq!(
+            decode_exponential_buckets(&dp),
+            Err(BucketError::OverCap),
             "should refuse to materialize past the cap"
         );
 
@@ -686,6 +916,166 @@ mod tests {
         assert!(drained
             .iter()
             .any(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("bucket_cap")));
+    }
+
+    #[test]
+    fn a_scale_of_i32_min_is_rejected_gracefully_instead_of_panicking() {
+        // -scale as a plain i32 negation panics for scale == i32::MIN; this must not panic, and
+        // must not silently produce a bogus bound either.
+        let dp = pb::ExponentialHistogramDataPoint {
+            scale: i32::MIN,
+            positive: Some(pb::exponential_histogram_data_point::Buckets {
+                offset: 0,
+                bucket_counts: vec![1],
+            }),
+            ..exponential_dp()
+        };
+        assert_eq!(decode_exponential_buckets(&dp), Err(BucketError::Inconsistent));
+
+        // The same, through the full decode_metric path: skipped and counted, not a panic and not
+        // a garbage event.
+        let metric = pb::Metric {
+            name: "m".to_string(),
+            description: String::new(),
+            unit: String::new(),
+            metadata: Vec::new(),
+            data: Some(pb::metric::Data::ExponentialHistogram(pb::ExponentialHistogram {
+                data_points: vec![dp],
+                aggregation_temporality: pb::AggregationTemporality::Delta as i32,
+            })),
+        };
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let events = decode_metric(metric, &AttrMap::new(), &telemetry);
+        assert!(events.is_empty());
+        let drained = registry.drain(0);
+        assert!(drained
+            .iter()
+            .any(|e| e.attributes.get("reason").and_then(|v| v.as_str())
+                == Some("inconsistent_bounds")));
+    }
+
+    #[test]
+    fn a_scale_of_i32_max_does_not_panic_either() {
+        // The other extreme -- exercised the same way, since the formula's every step (2f64.powf
+        // twice, then a further powf) has its own saturation behavior worth pinning against a
+        // panic regardless of which direction scale is extreme in.
+        let dp = pb::ExponentialHistogramDataPoint {
+            scale: i32::MAX,
+            positive: Some(pb::exponential_histogram_data_point::Buckets {
+                offset: 0,
+                bucket_counts: vec![1, 1],
+            }),
+            ..exponential_dp()
+        };
+        let _ = decode_exponential_buckets(&dp); // must not panic, whatever it returns
+    }
+
+    #[test]
+    fn a_cumulative_histogram_decodes_with_the_cumulative_temporality_attribute() {
+        let metric = pb::Metric {
+            name: "m".to_string(),
+            description: String::new(),
+            unit: String::new(),
+            metadata: Vec::new(),
+            data: Some(pb::metric::Data::Histogram(pb::Histogram {
+                data_points: vec![pb::HistogramDataPoint {
+                    attributes: Vec::new(),
+                    start_time_unix_nano: 0,
+                    time_unix_nano: 1000,
+                    count: 10,
+                    sum: None,
+                    bucket_counts: vec![4, 6],
+                    explicit_bounds: vec![5.0],
+                    exemplars: Vec::new(),
+                    flags: 0,
+                    min: None,
+                    max: None,
+                }],
+                aggregation_temporality: pb::AggregationTemporality::Cumulative as i32,
+            })),
+        };
+        let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].attributes.get("otel.temporality").and_then(|v| v.as_str()),
+            Some("cumulative"),
+            "a cumulative Histogram must be marked, not silently treated as delta"
+        );
+    }
+
+    #[test]
+    fn a_cumulative_histogram_re_encodes_as_cumulative_not_delta() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("otel.temporality", "cumulative");
+        let event = Event::metric(
+            1000,
+            attrs,
+            MetricRecord {
+                name: intern("m"),
+                kind: MetricKind::Histogram { buckets: vec![(5.0, 4), (f64::INFINITY, 6)] },
+                unit: None,
+            },
+        );
+        let mut diag = Diagnostics::default();
+        let metric =
+            encode_metric(&event, &event.metrics[0], &Telemetry::default(), &mut diag).unwrap();
+        match metric.data.unwrap() {
+            pb::metric::Data::Histogram(h) => assert_eq!(
+                h.aggregation_temporality,
+                pb::AggregationTemporality::Cumulative as i32,
+                "re-encoding a decoded cumulative histogram must not silently flip it to delta"
+            ),
+            other => panic!("expected Histogram, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_delta_histogram_has_no_temporality_attribute_and_re_encodes_as_delta() {
+        let events = decode_metric(
+            encode(MetricKind::Histogram { buckets: vec![(1.0, 1), (f64::INFINITY, 0)] }).unwrap(),
+            &AttrMap::new(),
+            &Telemetry::default(),
+        );
+        assert_eq!(events[0].attributes.get("otel.temporality"), None);
+
+        let mut diag = Diagnostics::default();
+        let metric =
+            encode_metric(&events[0], &events[0].metrics[0], &Telemetry::default(), &mut diag)
+                .unwrap();
+        match metric.data.unwrap() {
+            pb::metric::Data::Histogram(h) => {
+                assert_eq!(h.aggregation_temporality, pb::AggregationTemporality::Delta as i32)
+            }
+            other => panic!("expected Histogram, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cumulative_exponential_histogram_decodes_with_the_cumulative_temporality_attribute() {
+        let dp = pb::ExponentialHistogramDataPoint {
+            positive: Some(pb::exponential_histogram_data_point::Buckets {
+                offset: 0,
+                bucket_counts: vec![5],
+            }),
+            ..exponential_dp()
+        };
+        let metric = pb::Metric {
+            name: "m".to_string(),
+            description: String::new(),
+            unit: String::new(),
+            metadata: Vec::new(),
+            data: Some(pb::metric::Data::ExponentialHistogram(pb::ExponentialHistogram {
+                data_points: vec![dp],
+                aggregation_temporality: pb::AggregationTemporality::Cumulative as i32,
+            })),
+        };
+        let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].attributes.get("otel.temporality").and_then(|v| v.as_str()),
+            Some("cumulative")
+        );
     }
 
     #[test]
