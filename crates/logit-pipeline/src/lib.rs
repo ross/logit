@@ -13,12 +13,15 @@ pub mod graph;
 pub mod input;
 pub mod output;
 pub mod runtime;
+pub mod sink_queue;
 pub mod transform;
 
 pub use fanout::{Delivered, Fanout};
 pub use input::Input;
-pub use output::Output;
+pub use output::{classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fault, Output};
 pub use runtime::{
     process_batch, run, run_with_shutdown, run_with_telemetry, send_batch, unwrap_batch, NodeSpec,
+    RetryConfig, WriteLoopConfig,
 };
+pub use sink_queue::{OverflowPolicy, SinkQueue, SinkQueueConfig};
 pub use transform::Transform;

@@ -1,0 +1,35 @@
+# Tempo 2.10.x, monolithic, local filesystem backend, OTLP receivers only. Nothing writes to
+# Tempo yet -- `logit` has no `otlp_out` and no span producer (demo/logit.yaml's commented-out
+# `trace_out`) -- this exists so the trace path is provisioned and ready the day both land.
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  log_level: warn
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 1h
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+usage_report:
+  reporting_enabled: false

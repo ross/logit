@@ -1,0 +1,23 @@
+#!/bin/bash
+# Usage: script/validate
+# Runs `logit validate` over every shipped config -- demo/logit.yaml and every examples/*.yaml --
+# so a component field rename or a new validation rule doesn't silently leave a config broken.
+# Part of script/cibuild. Needs INFLUXDB_TOKEN resolvable (every shipped config's `influxdb_out`
+# uses `!env INFLUXDB_TOKEN`, ADR 0011).
+#
+# Defaulted here, not left to compose.yaml's `dev` service `environment:` -- common.sh's `run()`
+# execs directly in CI (no `docker compose run`, so that default never applies there), only going
+# through the `dev` service locally. Exporting it here works either way: locally it's what compose
+# interpolates `${INFLUXDB_TOKEN:-logit-dev-token}` from, in CI it's just a plain env var `run`'s
+# direct exec sees.
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+export INFLUXDB_TOKEN="${INFLUXDB_TOKEN:-logit-dev-token}"
+
+for config in demo/logit.yaml examples/*.yaml; do
+    echo "-- ${config}"
+    run cargo run -q -p logit-cli -- validate "${config}"
+done

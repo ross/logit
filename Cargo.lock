@@ -790,6 +790,7 @@ dependencies = [
  "async-trait",
  "logit-config",
  "logit-core",
+ "logit-proto",
  "logit-script",
  "thiserror 1.0.69",
  "tokio",

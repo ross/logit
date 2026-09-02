@@ -11,7 +11,7 @@
 
 use crate::config;
 use anyhow::Context;
-use logit_config::{Config, StdioTarget};
+use logit_config::{BufferConfig, Config, StdioTarget};
 use logit_core::{Diagnostics, Registry, Telemetry};
 use logit_inputs::internal::InternalInput;
 use logit_inputs::statsd::StatsdInput;
@@ -19,7 +19,7 @@ use logit_inputs::syslog::SyslogInput;
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::stdio::StdioOutput;
 use logit_pipeline::graph::{self, ResolvedComponent};
-use logit_pipeline::NodeSpec;
+use logit_pipeline::{NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
 use logit_transforms::{
     Aggregator, JsonParser, Keep as KeepTransform, KvMetrics as KvMetricsTransform,
     Remove as RemoveTransform,
@@ -228,11 +228,15 @@ fn build_spec(
             RemoveTransform::new(fields.clone()).with_telemetry(telemetry.clone()),
         )),
 
-        InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(Box::new(
-            InfluxDbOutput::new(url.clone(), org.clone(), bucket.clone(), token.clone())
-                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone()),
-        )),
+        InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(
+            Box::new(
+                InfluxDbOutput::new(url.clone(), org.clone(), bucket.clone(), token.clone())
+                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                    .with_telemetry(telemetry.clone()),
+            ),
+            queue_config(&component.buffer),
+            write_config(&component.buffer),
+        ),
         StdioOut { target } => {
             let output = match target {
                 StdioTarget::Stdout => StdioOutput::stdout(),
@@ -247,12 +251,59 @@ fn build_spec(
                 // promises).
                 StdioTarget::Path(path) => StdioOutput::open_path(base_dir.join(path))?,
             };
-            NodeSpec::Output(Box::new(output.with_telemetry(telemetry.clone())))
+            NodeSpec::Output(
+                Box::new(output.with_telemetry(telemetry.clone())),
+                queue_config(&component.buffer),
+                write_config(&component.buffer),
+            )
         }
 
         other => unreachable!("graph::resolve already rejected any unimplemented kind: {other:?}"),
     };
     Ok((spec, telemetry))
+}
+
+/// Builds a sink's `SinkQueueConfig` from its `BufferConfig` (`docs/adr/0020-buffered-sink-
+/// delivery.md`, workstream F) -- the sole place `logit_config::OverflowPolicy` is converted to
+/// `logit_pipeline::OverflowPolicy`, since neither config nor pipeline crate can see both types
+/// without violating the dependency direction (`logit-pipeline` depends on `logit-config`, never
+/// the reverse; `docs/design/pipeline-graph.md`'s crate layout).
+fn queue_config(buffer: &BufferConfig) -> SinkQueueConfig {
+    SinkQueueConfig {
+        max_batches: buffer.max_batches,
+        max_bytes: buffer.max_bytes,
+        overflow: overflow_policy(buffer.overflow),
+    }
+}
+
+/// Builds a sink's `WriteLoopConfig` from its `BufferConfig`. `base_delay` (the initial backoff)
+/// is deliberately not exposed in `BufferConfig` -- only `retry_budget`/`retry_max_delay` are
+/// operator-tunable for now -- so it keeps `RetryConfig::default()`'s value.
+fn write_config(buffer: &BufferConfig) -> WriteLoopConfig {
+    WriteLoopConfig {
+        retry: RetryConfig {
+            total_budget: buffer.retry_budget,
+            base_delay: RetryConfig::default().base_delay,
+            max_delay: buffer.retry_max_delay,
+        },
+        shutdown_grace: buffer.shutdown_grace,
+        delivery_override: buffer.delivery.map(delivery_posture),
+    }
+}
+
+fn overflow_policy(cfg: logit_config::OverflowPolicy) -> logit_pipeline::OverflowPolicy {
+    match cfg {
+        logit_config::OverflowPolicy::Block => logit_pipeline::OverflowPolicy::Block,
+        logit_config::OverflowPolicy::DropOldest => logit_pipeline::OverflowPolicy::DropOldest,
+        logit_config::OverflowPolicy::DropNewest => logit_pipeline::OverflowPolicy::DropNewest,
+    }
+}
+
+fn delivery_posture(cfg: logit_config::DeliveryPosture) -> logit_pipeline::DeliveryPosture {
+    match cfg {
+        logit_config::DeliveryPosture::AtLeastOnce => logit_pipeline::DeliveryPosture::AtLeastOnce,
+        logit_config::DeliveryPosture::AtMostOnce => logit_pipeline::DeliveryPosture::AtMostOnce,
+    }
 }
 
 /// Converts config's `MetricSpec` (`logit-config`, which `logit-transforms` deliberately doesn't
@@ -278,6 +329,7 @@ mod tests {
 
     fn statsd_in() -> Component {
         Component {
+            buffer: logit_config::BufferConfig::default(),
             sources: vec![],
             kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
         }
@@ -285,6 +337,7 @@ mod tests {
 
     fn influxdb_out(sources: Vec<&str>) -> Component {
         Component {
+            buffer: logit_config::BufferConfig::default(),
             sources: sources.into_iter().map(String::from).collect(),
             kind: ComponentKind::InfluxDbOut {
                 url: "http://localhost:8086".to_string(),
@@ -332,6 +385,7 @@ mod tests {
             (
                 "branch_a",
                 Component {
+                    buffer: logit_config::BufferConfig::default(),
                     sources: vec!["in".to_string()],
                     kind: ComponentKind::Lua { script: "".to_string(), interval: None },
                 },
@@ -339,6 +393,7 @@ mod tests {
             (
                 "branch_b",
                 Component {
+                    buffer: logit_config::BufferConfig::default(),
                     sources: vec!["in".to_string()],
                     kind: ComponentKind::Lua { script: "".to_string(), interval: None },
                 },
@@ -355,6 +410,7 @@ mod tests {
             (
                 "enrich",
                 Component {
+                    buffer: logit_config::BufferConfig::default(),
                     sources: vec!["in".to_string()],
                     kind: ComponentKind::LuaFile {
                         lua_file: "does-not-exist.lua".to_string(),
@@ -385,6 +441,7 @@ mod tests {
             (
                 "self",
                 Component {
+                    buffer: logit_config::BufferConfig::default(),
                     sources: vec![],
                     kind: ComponentKind::Internal { interval: Duration::from_secs(10) },
                 },
@@ -402,6 +459,7 @@ mod tests {
     fn build_spec_builds_an_internal_input() {
         let registry = Registry::new();
         let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
             sources: vec![],
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Internal { interval: Duration::from_secs(10) },
@@ -415,6 +473,7 @@ mod tests {
     #[test]
     fn build_spec_builds_an_aggregate_transform() {
         let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Aggregate { interval: Duration::from_secs(10) },
@@ -430,6 +489,7 @@ mod tests {
     #[test]
     fn build_spec_builds_an_influxdb_sink() {
         let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec![],
             kind: ComponentKind::InfluxDbOut {
@@ -441,13 +501,60 @@ mod tests {
         };
         assert!(matches!(
             build_spec("out", &component, Path::new(""), None).unwrap().0,
-            NodeSpec::Output(_)
+            NodeSpec::Output(_, _, _)
         ));
+    }
+
+    /// The wiring this workstream adds: a non-default `buffer:` on the component actually reaches
+    /// the built `NodeSpec::Output`'s `SinkQueueConfig`/`WriteLoopConfig`, not just
+    /// `SinkQueueConfig::default()`/`WriteLoopConfig::default()` as before.
+    #[test]
+    fn build_spec_wires_a_non_default_buffer_config_into_the_sink_queue_and_write_loop() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig {
+                max_batches: 4096,
+                max_bytes: 128 * 1024 * 1024,
+                overflow: logit_config::OverflowPolicy::DropOldest,
+                delivery: Some(logit_config::DeliveryPosture::AtLeastOnce),
+                retry_budget: Duration::from_secs(120),
+                retry_max_delay: Duration::from_secs(20),
+                shutdown_grace: Duration::from_secs(10),
+            },
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::InfluxDbOut {
+                url: "http://localhost:8086".to_string(),
+                org: "org".to_string(),
+                bucket: "bucket".to_string(),
+                token: "test-token".to_string(),
+            },
+        };
+        let NodeSpec::Output(_, queue_config, write_config) =
+            build_spec("out", &component, Path::new(""), None).unwrap().0
+        else {
+            panic!("expected NodeSpec::Output");
+        };
+        assert_eq!(queue_config.max_batches, 4096);
+        assert_eq!(queue_config.max_bytes, 128 * 1024 * 1024);
+        assert_eq!(queue_config.overflow, logit_pipeline::OverflowPolicy::DropOldest);
+        assert_eq!(write_config.retry.total_budget, Duration::from_secs(120));
+        assert_eq!(write_config.retry.max_delay, Duration::from_secs(20));
+        assert_eq!(
+            write_config.retry.base_delay,
+            logit_pipeline::RetryConfig::default().base_delay,
+            "base_delay is not config-exposed -- always the default"
+        );
+        assert_eq!(write_config.shutdown_grace, Duration::from_secs(10));
+        assert_eq!(
+            write_config.delivery_override,
+            Some(logit_pipeline::DeliveryPosture::AtLeastOnce)
+        );
     }
 
     #[test]
     fn build_spec_builds_a_json_transform() {
         let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Json { skip_to_brace: true },
@@ -460,6 +567,7 @@ mod tests {
 
     fn stdio_out_component(target: StdioTarget) -> ResolvedComponent {
         ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec![],
             kind: ComponentKind::StdioOut { target },
@@ -471,7 +579,7 @@ mod tests {
         let component = stdio_out_component(StdioTarget::Stdout);
         assert!(matches!(
             build_spec("tap", &component, Path::new(""), None).unwrap().0,
-            NodeSpec::Output(_)
+            NodeSpec::Output(_, _, _)
         ));
     }
 
@@ -480,7 +588,7 @@ mod tests {
         let component = stdio_out_component(StdioTarget::Stderr);
         assert!(matches!(
             build_spec("tap", &component, Path::new(""), None).unwrap().0,
-            NodeSpec::Output(_)
+            NodeSpec::Output(_, _, _)
         ));
     }
 
@@ -493,7 +601,7 @@ mod tests {
         let component = stdio_out_component(StdioTarget::Path(path.display().to_string()));
         assert!(matches!(
             build_spec("tap", &component, Path::new(""), None).unwrap().0,
-            NodeSpec::Output(_)
+            NodeSpec::Output(_, _, _)
         ));
 
         std::fs::remove_file(&path).ok();
@@ -516,7 +624,7 @@ mod tests {
         let component = stdio_out_component(StdioTarget::Path(relative.to_string()));
         assert!(matches!(
             build_spec("tap", &component, &base_dir, None).unwrap().0,
-            NodeSpec::Output(_)
+            NodeSpec::Output(_, _, _)
         ));
         assert!(
             expected_path.exists(),
@@ -545,6 +653,7 @@ mod tests {
     #[test]
     fn build_spec_builds_a_kv_metrics_transform() {
         let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec!["out".to_string()],
             kind: ComponentKind::KvMetrics {
@@ -566,6 +675,7 @@ mod tests {
     #[test]
     fn build_spec_builds_a_keep_transform() {
         let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Keep { fields: vec!["status".to_string()] },
@@ -579,6 +689,7 @@ mod tests {
     #[test]
     fn build_spec_builds_a_remove_transform() {
         let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Remove { fields: vec!["client_ip".to_string()] },

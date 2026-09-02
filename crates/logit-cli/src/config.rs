@@ -228,6 +228,70 @@ mod tests {
         resolve(value, lookup, &mut Vec::new(), &mut Vec::new())
     }
 
+    /// `BufferConfig`'s `human_bytes`/`humantime_serde_duration` codecs are unit-tested against
+    /// `serde_json` in `logit-config` itself, a different `Deserializer` impl whose
+    /// `deserialize_any` behavior isn't guaranteed to match `serde_norway`'s -- this confirms they
+    /// also work through the actual production path (`parse`, via `serde_norway::from_value`),
+    /// not just in isolation.
+    #[test]
+    fn buffer_config_round_trips_through_the_real_yaml_path() {
+        let yaml = r#"
+components:
+  in:
+    type: statsd_in
+    bind: 127.0.0.1:8125
+  out:
+    type: influxdb_out
+    sources: [in]
+    url: http://localhost:8086
+    org: o
+    bucket: b
+    token: t
+    buffer:
+      max_batches: 4096
+      max_bytes: 64MiB
+      overflow: drop_oldest
+      delivery: at_least_once
+      retry_budget: 120s
+      retry_max_delay: 20s
+      shutdown_grace: 10s
+"#;
+        let config = parse(yaml, &env(&[])).expect("should parse");
+        let out = &config.components["out"];
+        assert_eq!(out.buffer.max_batches, 4096);
+        assert_eq!(out.buffer.max_bytes, 64 * 1024 * 1024, "64MiB should parse via serde_norway");
+        assert_eq!(out.buffer.overflow, logit_config::OverflowPolicy::DropOldest);
+        assert_eq!(out.buffer.delivery, Some(logit_config::DeliveryPosture::AtLeastOnce));
+        assert_eq!(out.buffer.retry_budget, std::time::Duration::from_secs(120));
+        assert_eq!(out.buffer.retry_max_delay, std::time::Duration::from_secs(20));
+        assert_eq!(out.buffer.shutdown_grace, std::time::Duration::from_secs(10));
+    }
+
+    /// The quoted-bare-number form of `max_bytes` (as opposed to `"64MiB"` above) through the
+    /// same real YAML path. `human_bytes` is string-only, both directions (an unquoted YAML
+    /// integer is rejected -- see `crates/logit-config/src/lib.rs`'s `human_bytes` module doc
+    /// comment for why), so this must be quoted.
+    #[test]
+    fn buffer_config_quoted_bare_number_max_bytes_round_trips_through_the_real_yaml_path() {
+        let yaml = r#"
+components:
+  in:
+    type: statsd_in
+    bind: 127.0.0.1:8125
+  out:
+    type: influxdb_out
+    sources: [in]
+    url: http://localhost:8086
+    org: o
+    bucket: b
+    token: t
+    buffer:
+      max_bytes: "134217728"
+"#;
+        let config = parse(yaml, &env(&[])).expect("should parse");
+        assert_eq!(config.components["out"].buffer.max_bytes, 134_217_728);
+    }
+
     #[test]
     fn substitutes_a_variable_into_a_string_field() {
         let value = resolve_yaml("url: !env URL", &env(&[("URL", "http://x")])).unwrap();

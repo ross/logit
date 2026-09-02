@@ -17,30 +17,41 @@ already built that have a known, accepted rough edge.
   actual encode/decode, no connection/handshake, no dictionary encoding. The `rkyv`-vs-hand-rolled
   encoding choice is an explicit open, benchmark-gated decision
   ([wire-protocol.md](design/wire-protocol.md)).
-- **Output buffering** (`crates/logit-proto/src/buffer.rs`) — the `Buffer` trait exists (deliberately
-  defined ahead of any implementation, since retrofitting it onto call sites that assumed an
-  in-memory queue is the expensive direction); no in-memory implementation yet, no ack/retry hooks,
-  no at-least-once delivery. Bounded retry now exists in `InfluxDbOutput::send`
-  ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md)) — a single transient failure no
-  longer ends `logit run` outright — but that's a narrower fix than this gap: it rides out a blip or
-  one bad response within a tight (~5s) budget, not a real outage, and a persistent failure still
-  ends the process today exactly as before. `Buffer` (this entry) is what closes the rest of the
-  gap, still unimplemented.
-- **Delivery I/O is not decoupled from event processing within a node** — each component is its own
-  tokio task, but *within* one node, I/O and processing share a single sequential path: `run_output`
-  (`crates/logit-pipeline/src/runtime.rs`) awaits `Output::send` inline in its drain loop, so a slow
-  or retrying sink stops draining its own inbox for as long as `send` takes; `StatsdInput::run`
-  (`crates/logit-inputs/src/statsd.rs`) likewise interleaves `recv_from`, decode, and `Fanout::send`
-  in one loop, so downstream backpressure stops it reading its socket, and the kernel silently drops
-  datagrams with no signal anywhere in `logit` that it happened. This is why `InfluxDbOutput`'s
-  retry budget above is tight rather than generous ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md)):
-  without decoupling, every second spent retrying is a second of dropped intake. Worth exploring: a
-  bounded ring buffer (or similar) between a sink's drain loop and its actual delivery, so a sink
-  keeps accepting while a write is in flight or backing off, with retry moving behind that boundary
-  and an explicit overflow policy (`logit_proto::buffer::OverflowPolicy` already names
-  `DropOldest`/`DropNewest`/`Block`). Related to, but distinct from, the output-buffering entry
-  above: that one is about *what* to buffer and delivery guarantees; this one is about the threading
-  shape that would make buffering actually useful.
+- **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
+  `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`), and
+  every sink now sits behind a bounded, byte-aware `SinkQueue`
+  (`crates/logit-pipeline/src/sink_queue.rs`) that keeps accepting while a delivery attempt is in
+  flight or backing off, with retry (`RetryConfig`, up to 60s by default) and fault-classification-
+  driven duplicate-safety (`Fault`/`DeliveryPosture`, `crates/logit-pipeline/src/output.rs`) moved
+  behind that boundary ([ADR 0021](adr/0021-buffered-sink-delivery.md)). A persistent failure no
+  longer ends `logit run` by default — it degrades to dropping the offending batch and continuing,
+  exiting only after a sustained ~60s window of nothing but configuration-error (`Fault::Permanent`)
+  failures. What's left, genuinely open:
+  - **No durable (disk-backed) buffering** — the queue is in-memory only; a process restart loses
+    whatever it was holding. Plausibly config-optional even once it lands, since not every
+    deployment needs cross-restart durability; blocked on the `rkyv`-vs-hand-rolled wire encoding
+    decision ([wire-protocol.md](design/wire-protocol.md)), which this deliberately does not settle
+    in passing.
+  - **No end-to-end acknowledgement** — delivery is confirmed only as far as the immediate
+    destination accepting the write; nothing tracks whether the data survives past that point.
+  - **No out-of-order/credit-based acknowledgement** — `SinkQueue` is deliberately in-order and
+    single-in-flight (one queue, one writer, `peek`-then-`commit`-the-head only). Several in-flight
+    batches acknowledged out of order is real future scope for the native wire protocol's
+    credit-based flow control, not built or designed yet.
+- **Delivery I/O is not decoupled from event processing within a node: listener half only, sink half
+  closed.** Each component is its own tokio task, but *within* one node, I/O and processing used to
+  share a single sequential path on both the sink and the listener side. The sink half is fixed
+  ([ADR 0021](adr/0021-buffered-sink-delivery.md), directly above): `run_output`
+  (`crates/logit-pipeline/src/runtime.rs`) now splits into a drain half (`drain_inbox`) and a writer
+  half (`write_loop`) sharing the `SinkQueue`, so a slow or retrying sink no longer stops draining
+  its own inbox. **The listener half remains fully open**: `StatsdInput::run`
+  (`crates/logit-inputs/src/statsd.rs`, and `syslog_in`'s equivalent loop) still interleaves
+  `recv_from`, decode, and `Fanout::send` in one path, so downstream backpressure still stops a
+  listener from reading its socket, and the kernel still drops datagrams silently and uncounted.
+  Decoupling the sink side makes that backpressure rarer — a slow InfluxDB no longer stalls the
+  whole chain behind it — but does not remove the listener-side hazard itself, which needs its own
+  design (likely the same drain/writer split, applied to `Input::run` instead of `Output::send`) and
+  its own plan once there's a reason to prioritize it over other gaps here.
 - **Relative gauge adjustment (`+`/`-`) and sample-rate extrapolation for distributions** — the
   aggregator that would hold the needed state now exists (`crates/logit-transforms`), but the statsd
   decoder still has no representation for "this is a delta, not an absolute value" to hand it, and
@@ -63,15 +74,20 @@ already built that have a known, accepted rough edge.
 - **Closed for SIGTERM/SIGINT** ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md)) — a
   signal handler now closes every listener's inbox normally
   (`logit_pipeline::run_with_shutdown`, `crates/logit-pipeline/src/runtime.rs`), triggering the
-  same close-time flush a listener's own natural completion always has. Two residual gaps left
-  open by that fix, not oversights:
+  same close-time flush a listener's own natural completion always has. One residual gap left open
+  by that fix, not an oversight (the other, `Output`'s missing close/flush hook, is now closed too
+  — see below):
   - **A datagram in flight when the signal lands is lost.** Cancelling a listener's `run` future
     drops whatever it was mid-`recv_from`/decode on. Accepted: UDP is lossy by contract already;
     the aggregation window (which this fix does protect) is not.
-  - **`Output` still has no close/flush hook of its own** — only `Transform`/Lua nodes with a
-    configured `flush_interval` get a close-time flush; a sink has nothing analogous to flush on
-    shutdown, because none needs one yet (`InfluxDbOutput::send` writes synchronously, nothing
-    buffered internally to lose).
+
+  ~~`Output` still has no close/flush hook of its own.~~ **Closed**
+  ([ADR 0021](adr/0021-buffered-sink-delivery.md)): `Output` gains `async fn flush(&mut self)`
+  (default no-op, so no existing sink needed to change), called once `write_loop`
+  (`crates/logit-pipeline/src/runtime.rs`) stops delivering — either because its queue drained to
+  closed-and-empty, or because a bounded shutdown grace (default 5s) expired first with batches
+  still undelivered. Now load-bearing rather than purely aspirational, since a sink can genuinely
+  hold unwritten data at shutdown once buffering exists (the entry above).
 - **Fan-out/fan-in is unbuffered/uncoordinated** — the component graph (ADR 0009,
   [pipeline-graph.md](design/pipeline-graph.md)) makes arbitrary fan-out/fan-in the normal case (a
   sink shared by two branches, one listener feeding several filters), but a stalled sink backs up
@@ -344,12 +360,14 @@ already built that have a known, accepted rough edge.
   - **`json`'s parse-outcome counts** — its two real failure modes (`no_brace`, `parse_failure`)
     already ride the `Diagnostics` bridge for free (`logit.component.diagnostics{key=...}`), so a
     dedicated metric would mostly restate what's already visible.
-  - **`logit-proto`'s buffer/frame metrics** — both `buffer.rs` and `frame.rs` are still stubs (see
-    the entries above), nothing to instrument until an implementation exists. Candidate names,
-    pre-committed so whoever builds it doesn't have to re-derive them: `logit.buffer.depth`,
-    `logit.buffer.events.dropped{reason="overflow_oldest"|"overflow_newest"}`,
-    `logit.buffer.push.blocked.duration`, `logit.proto.frames{direction,codec,compression}`,
+  - **`logit-proto`'s `frame.rs` metrics** — still a stub (see the entries above), nothing to
+    instrument until an implementation exists. Candidate names, pre-committed so whoever builds it
+    doesn't have to re-derive them: `logit.proto.frames{direction,codec,compression}`,
     `logit.proto.frame.bytes`, `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated"}`.
+    (`buffer.rs`'s own metrics are no longer on this list — implemented at the `SinkQueue` layer,
+    `docs/adr/0021-buffered-sink-delivery.md`, as `logit.component.buffer.batches`/`.bytes`/
+    `.utilization`/`.push.blocked.duration` and new `reason` values on `batches.dropped`/
+    `events.dropped`, per `docs/design/internal-telemetry.md`'s catalog.)
   - **Lua per-call latency, error classification, flush-tick-empty tracking** — a per-event
     `ScriptWorker::process` timing distribution would isolate one pathological event from a big
     batch (today's `logit.component.process.duration` is whole-batch), but costs a clock read per
