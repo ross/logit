@@ -182,9 +182,19 @@ impl Aggregator {
         for record in metrics {
             // No merge rule defined for these (docs/design/data-model.md) -- leave them on the
             // event rather than absorbing or dropping them.
+            //
+            // `GaugeDelta` is routed through this same pass-through arm only in this workstream
+            // (`docs/adr/0024-relative-gauge-adjustments.md`, workstream A) -- workstream B
+            // replaces this with real resolution against a running `Accumulator::Gauge`. Left
+            // here unresolved for now would otherwise defeat the whole feature silently, which is
+            // why `crates/logit-transforms/tests` guards it with a named test rather than a
+            // comment alone.
             if matches!(
                 record.kind,
-                MetricKind::Set(_) | MetricKind::Histogram { .. } | MetricKind::Summary { .. }
+                MetricKind::GaugeDelta(_)
+                    | MetricKind::Set(_)
+                    | MetricKind::Histogram { .. }
+                    | MetricKind::Summary { .. }
             ) {
                 event.metrics.push(record);
                 continue;
@@ -346,7 +356,13 @@ impl Accumulator {
             MetricKind::Counter(_) => Accumulator::Counter(0.0),
             MetricKind::Gauge(_) => Accumulator::Gauge { value: 0.0, at: i64::MIN },
             MetricKind::Distribution(_) => Accumulator::Distribution(logit_core::DdSketch::new()),
-            MetricKind::Set(_) | MetricKind::Histogram { .. } | MetricKind::Summary { .. } => {
+            // `GaugeDelta` is a pass-through kind in this workstream only (see `process`'s own
+            // comment) -- workstream B gives it `Accumulator::Gauge { value: 0.0, at: i64::MIN }`,
+            // the same accumulator `Gauge` uses, making this mapping non-injective on purpose.
+            MetricKind::GaugeDelta(_)
+            | MetricKind::Set(_)
+            | MetricKind::Histogram { .. }
+            | MetricKind::Summary { .. } => {
                 unreachable!("process() never creates an accumulator for a pass-through kind")
             }
         }
@@ -640,6 +656,23 @@ mod tests {
             );
         }
         assert!(agg.flush(100).is_empty());
+    }
+
+    /// Guards `process`'s pass-through `matches!` directly, not just by implication: as of this
+    /// workstream (A, `docs/adr/0024-relative-gauge-adjustments.md`), `GaugeDelta` has no real
+    /// resolution yet and must come back out unchanged rather than being silently absorbed as
+    /// though it were an ordinary `Gauge`. **Workstream B replaces this test's expectation** --
+    /// once `aggregate` resolves deltas, this exact input should be absorbed (`is_none()`), not
+    /// passed through. A comment alone on the `matches!` wouldn't catch a future change that
+    /// silently defeated the whole feature by leaving `GaugeDelta` in that list; a test does.
+    #[test]
+    fn gauge_delta_passes_through_untouched_in_this_workstream() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        let event = metric_event("temp", MetricKind::GaugeDelta(5.0), 0);
+        let passed = agg.process(&resource, event).expect("GaugeDelta has no resolution yet");
+        assert!(matches!(passed.metrics[0].kind, MetricKind::GaugeDelta(v) if v == 5.0));
+        assert!(agg.flush(100).is_empty(), "nothing should have been accumulated");
     }
 
     #[test]

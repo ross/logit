@@ -233,6 +233,17 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
             out.push_str("gauge=");
             let _ = write!(out, "{v}");
         }
+        MetricKind::GaugeDelta(v) => {
+            // Rendered distinguishably from a resolved `Gauge` (`gauge_delta`, not `gauge`), and
+            // with an explicit sign, so an operator can see at a glance that this is an
+            // *unresolved* relative adjustment (`docs/adr/0024-relative-gauge-adjustments.md`) --
+            // a debug sink must never silently print it as though it were an absolute value.
+            out.push_str("gauge_delta=");
+            if *v >= 0.0 {
+                out.push('+');
+            }
+            let _ = write!(out, "{v}");
+        }
         MetricKind::Distribution(sketch) => {
             out.push_str("distribution count=");
             let _ = write!(out, "{}", sketch.count());
@@ -792,6 +803,18 @@ mod tests {
         let out =
             encode(vec![metric_event(0, "unique.users", MetricKind::Set(HyperLogLog::default()))]);
         assert!(out.contains("unique.users set=<unrepresentable>"), "got: {out}");
+    }
+
+    /// `gauge_delta`, not `gauge` -- an unresolved relative adjustment must be visually
+    /// distinguishable from a resolved absolute value (`docs/adr/0024-relative-gauge-adjustments.md`),
+    /// with an explicit sign so a positive delta doesn't read as a bare number.
+    #[test]
+    fn gauge_delta_renders_distinguishably_with_an_explicit_sign() {
+        let out = encode(vec![metric_event(0, "conns", MetricKind::GaugeDelta(5.0))]);
+        assert!(out.contains("conns gauge_delta=+5"), "got: {out}");
+
+        let out = encode(vec![metric_event(0, "conns", MetricKind::GaugeDelta(-5.0))]);
+        assert!(out.contains("conns gauge_delta=-5"), "got: {out}");
     }
 
     #[test]
