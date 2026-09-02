@@ -63,6 +63,14 @@ window this change protects is not — but it is a real, deliberate behavior, no
 Recorded in `docs/known-gaps.md`.
 
 ### Retry: a tight wall-clock budget, not an attempt count
+
+> **Revised by [ADR 0021](0021-buffered-sink-delivery.md).** The ~5s default budget below is
+> deliberately tight *because* delivery isn't decoupled from the drain loop at this point — see
+> that ADR's "Retry moves behind the queue boundary and its budget widens" section. Once a sink
+> holds its own queue, the same reasoning argues for a much larger default. This section's
+> narrative and the retryable/permanent classification it establishes are otherwise unaffected and
+> still describe how `InfluxDbOutput` classifies a failure; only the budget's size and the retry
+> loop's location move.
 `InfluxDbOutput::send` (`crates/logit-outputs/src/influxdb.rs`) runs *inline* in `run_output`'s
 drain loop — one `send` per batch, awaited directly, nothing decoupling delivery from the pipeline
 that feeds it. That shape rules out an attempt-count-only retry policy: five attempts at up to a

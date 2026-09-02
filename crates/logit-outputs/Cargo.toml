@@ -14,8 +14,9 @@ anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 reqwest.workspace = true
-# Was dev-only; now a real dependency -- InfluxDbOutput::send's retry loop needs
-# tokio::time::{Instant, sleep} (docs/adr/0013-service-lifecycle-and-output-retry.md).
+# A real (non-dev) dependency: `StdioOutput` (`stdio.rs`) writes via `tokio::io`/`tokio::fs`.
+# `InfluxDbOutput::send` no longer retries on its own (that moved to `logit-pipeline`'s generic
+# writer, `docs/adr/0021-buffered-sink-delivery.md`) and so no longer needs `tokio::time` itself.
 tokio.workspace = true
 
 [dev-dependencies]

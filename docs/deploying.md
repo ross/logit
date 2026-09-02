@@ -68,15 +68,72 @@ summary:
 - **A second signal during a wedged drain exits immediately**, with status 130 — a drain that's
   stuck stays killable by the same signal that started it, which matters once a restart policy,
   not a person at a terminal, is what's waiting on the process to exit.
-- **A transient InfluxDB failure no longer ends the process outright.** `influxdb_out` now retries
-  within a bounded (~5 second) wall-clock budget before giving up — long enough to ride out a blip
-  or an isolated 5xx/429, short enough that a stalled sink doesn't back up the pipeline behind it
-  for more than about one aggregation window. What it does *not* cover: a real, extended InfluxDB
-  outage still exhausts the budget and ends the process, exactly as before retry existed, for your
-  restart policy to bring it back — see
-  [`docs/known-gaps.md`](known-gaps.md)'s output-buffering entry for why (delivery isn't decoupled
-  from event processing within a node yet, so a generous retry budget would just relocate data loss
-  rather than prevent it).
+- **A sink failure — transient or extended — no longer ends the process by default.** Every sink
+  now sits behind a decoupled delivery buffer with its own retry budget
+  ([ADR 0021](adr/0021-buffered-sink-delivery.md), revising ADR 0013's retry-budget rationale
+  without superseding its other decisions); see [Sink delivery buffering](#sink-delivery-buffering)
+  below for the full failure and sizing story, including the one case that still exits the process
+  (a sustained, purely-configuration-error failure).
+
+## Sink delivery buffering
+
+Every sink (`influxdb_out`, `stdio_out`, ...) sits behind a per-component, in-memory delivery
+queue that decouples receiving events from delivering them
+([ADR 0021](adr/0021-buffered-sink-delivery.md)). This is what lets a slow or temporarily-down
+destination be ridden out instead of stalling or killing the whole pipeline. It's tunable per sink
+via a `buffer:` block on that component (`buffer:` is rejected at validation time on anything but a
+sink) — see the commented example in
+[`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml). Every field defaults, so
+an omitted `buffer:` is the values below.
+
+### Failure semantics: degrade to dropping, don't exit
+
+Unlike the pre-0020 behavior, a sink that can't reach its destination no longer ends `logit run`:
+
+- A **retryable** failure (per the sink's fault classification and delivery posture) is retried
+  within `retry_budget` (60s by default) before the batch is dropped and counted.
+- A **non-retryable** failure (including retry-budget exhaustion) drops the batch, counts it, and
+  logs a throttled warning — the writer moves on to the next batch. The rest of the pipeline, and
+  every other sink, keeps running.
+- **The one exception:** if a sink sees *nothing but* configuration-error failures (a bad token, a
+  bad bucket — the kind no amount of retrying fixes) for a sustained ~60-second window with no
+  intervening success, `logit run` exits. This is deliberate — a genuinely misconfigured sink
+  should still fail loudly enough for a restart-policy supervisor to notice, rather than silently
+  dropping every batch forever. A destination that's merely slow or temporarily down never trips
+  this; only a failure `logit` can tell is a configuration problem does.
+- On SIGTERM/SIGINT, each sink gets up to `shutdown_grace` (5s by default) to drain its queue
+  before the process exits; whatever's still queued past that deadline is dropped and counted, not
+  held onto indefinitely.
+
+### Sizing: `max_bytes` × number of sinks
+
+`buffer.max_bytes` (64MiB default) bounds *one sink's* queue — a config with several sinks (or
+several `influxdb_out`/`stdio_out` components fed by different branches) multiplies that by however
+many sinks it defines when you're sizing the container's memory limit. `buffer.max_batches` (1024
+default) is the second, independent bound — whichever of the two trips first governs. Size for the
+worst case you actually intend to ride out: `max_bytes` deep enough to hold a real destination
+outage's worth of buffered data, weighed against the memory budget you're willing to commit to a
+sink that's doing nothing but holding data no one can currently accept.
+
+`buffer.overflow` decides what happens once both bounds are full: `block` (the default) applies
+backpressure all the way back to intake rather than losing data silently; `drop_oldest`/
+`drop_newest` trade data loss for keeping intake unblocked — pick one deliberately per sink rather
+than leaving the default in place for a destination you know is unreliable.
+
+### What to watch
+
+Every component already exposes its own delivery metrics once telemetry is wired to `internal`
+(`docs/design/internal-telemetry.md`) — no separate opt-in beyond adding an `internal` component to
+the config. The two most directly actionable for buffering:
+
+- `logit.component.buffer.utilization` (gauge) — the fill ratio of whichever of `max_batches`/
+  `max_bytes` is closer to tripping. Sustained values near 1.0 mean a sink is falling behind its
+  destination; under `block`, that's also back-pressuring intake.
+- `logit.component.batches.dropped` (count, tagged `reason`) — `overflow_oldest`/`overflow_newest`
+  (a `drop_*` policy actually dropped something), `send_failed` (retry gave up on a batch),
+  `shutdown` (the queue still held data when `shutdown_grace` expired). Any sustained nonzero rate
+  here is data loss worth alerting on; which `reason` tells you whether the cause is an overflowing
+  queue, a failing destination, or a slow drain racing shutdown.
 
 ## The nginx-side recipe
 
