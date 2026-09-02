@@ -20,7 +20,12 @@ Lua enrichment stage, InfluxDB 2.x out, via `logit run <config>` (see
 `ComponentKind`s — [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises all
 of them together against a real nginx (`examples/nginx/`), and
 [docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside
-the dev stack. Config is a flat graph of named components (ADR 0009,
+the dev stack. `examples/` is contributor-facing fixtures the dev stack (`script/server`) runs
+against, kept real because other things in the repo depend on them (`compose.yaml`'s `nginx`
+service, `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE`) — `demo/` is the answer to
+"let me see this work" for anyone else, a self-contained `docker compose up` against the release
+image, and the forcing function for `syslog_out`/`otlp_out` next
+([docs/plans/0003-demo-stack.md](docs/plans/0003-demo-stack.md)). Config is a flat graph of named components (ADR 0009,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively
@@ -54,11 +59,13 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/lint` | `cargo clippy --workspace --all-targets -- -D warnings` |
 | `script/format [--check]` | `cargo fmt --all` |
 | `script/schema` | Regenerate `schema/logit.schema.json` — run after any `logit-config` type change, and commit the result |
+| `script/validate` | `logit validate` over every shipped config (`demo/`, `examples/`) — part of `cibuild` |
 | `script/bench [filter]` | `cargo bench -p logit-bench` — throughput + per-benchmark allocation counts. Not part of `cibuild` |
 | `script/audit` | `cargo-deny` + `cargo-audit` |
 | `script/cibuild` | The exact sequence CI runs, in order — run this before opening a PR |
 | `script/console` | Interactive shell in the dev container, for anything not covered above |
 | `script/image [tag]` | Build the production runtime image (`Dockerfile`, not `Dockerfile.dev`) |
+| `script/demo [compose args]` | Run the self-contained demo stack (`demo/`) — the release image, no dev container |
 
 All default to `sudo docker`; `DOCKER=docker` or `DOCKER=podman` overrides. See
 [ADR 0005](docs/adr/0005-containerized-development.md) and
