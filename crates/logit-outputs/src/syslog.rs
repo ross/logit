@@ -77,7 +77,7 @@
 //!
 //! ## Sizing
 //!
-//! `max_message_bytes` bounds one whole encoded message (PRI + header + BOM + MSG), defaulting to
+//! `max_message_bytes` bounds one whole encoded message (PRI + header + MSG), defaulting to
 //! 8192 -- Grafana Alloy's own `loki.source.syslog` `max_message_length` default, the receiver the
 //! demo stack points this at, rather than RFC 3164 §4.1's traditional 1024 (which would truncate
 //! a JSON-bodied message on every modern relay chain). An oversize MSG is truncated on a UTF-8
@@ -280,11 +280,14 @@ impl SyslogEncoder {
         let msg = sanitize_msg(&msg);
         if !msg.is_empty() {
             out.push(' ');
-            if self.format == Format::Rfc5424 {
-                // RFC 5424 section 6.4: a leading BOM on MSG signals `MSG-UTF8`. `syslog_in`
-                // strips one on the way in; emitting one here is the symmetric choice.
-                out.push('\u{feff}');
-            }
+            // **No RFC 5424 §6.4 BOM.** An earlier version emitted one (the symmetric choice to
+            // `syslog_in` stripping one on the way in), on the assumption that Alloy's receiver
+            // would tolerate it. Verified against the real demo stack that it does not: Loki's
+            // `| json` LogQL stage uses Go's `encoding/json`, which does not skip a leading BOM,
+            // so every relayed line silently failed to parse as JSON and every `| json`-filtered
+            // dashboard panel came back empty despite lines actually landing in Loki. Confirmed
+            // by re-running the same query with the BOM removed. See `docs/adr/0022-syslog-
+            // output.md`.
             let mut msg = msg;
             let truncated = if out.len() >= self.max_message_bytes {
                 msg.clear();
@@ -910,8 +913,16 @@ mod tests {
         let (msgs, stats) = encode(vec![log_event(0, "hello world", Some(Severity::Info))]);
         assert_eq!(stats, EncodeStats::default());
         assert_eq!(msgs.len(), 1);
-        // <134>1 1970-01-01T00:00:00.000000Z - - - - - \u{FEFF}hello world
-        assert_eq!(msgs[0], "<134>1 1970-01-01T00:00:00.000000Z - - - - - \u{feff}hello world");
+        assert_eq!(msgs[0], "<134>1 1970-01-01T00:00:00.000000Z - - - - - hello world");
+    }
+
+    /// No RFC 5424 §6.4 BOM before MSG -- verified against the real demo stack (`docs/adr/0022-
+    /// syslog-output.md`) that Loki's `| json` LogQL stage silently fails to parse a BOM-prefixed
+    /// JSON body, so every relayed line's fields would be unqueryable despite landing in Loki.
+    #[test]
+    fn no_bom_precedes_the_message_even_though_rfc_5424_section_6_4_allows_one() {
+        let (msgs, _) = encode(vec![log_event(0, "hello", None)]);
+        assert!(!msgs[0].contains('\u{feff}'), "a leading BOM breaks Loki's `| json` LogQL stage");
     }
 
     #[test]

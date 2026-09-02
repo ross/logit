@@ -128,6 +128,17 @@ forbid `:`/`[`/`]`, matching `syslog_in`'s own two-token header rule (a `:` in H
 that parser misread the token as TAG) and the same "must not end in `:`" constraint
 `demo/hello/app.py` already documents by construction.
 
+**No RFC 5424 §6.4 BOM before MSG, despite the RFC allowing one.** A first version emitted one —
+the symmetric choice to `syslog_in` stripping a leading BOM on the way in — on the untested
+assumption that Alloy's receiver would tolerate it. Verified against the real demo stack that it
+does not: Loki's `| json` LogQL stage uses Go's `encoding/json`, which does not skip a leading
+BOM, so every relayed line silently failed to parse as JSON — `count_over_time({job="demo"} |
+json | status >= 500 [...])` returned zero matches despite the underlying lines genuinely being in
+Loki (confirmed via a direct `query_range` against Loki's own API, both with and without the BOM).
+Dropped entirely rather than made configurable — there is no receiver in this repo's own stack
+that benefits from it, and "off by default, on for a receiver we've never tested against" would be
+speculative.
+
 ### Sizing
 
 `max_message_bytes` (default **8192**) bounds one whole encoded message. The default matches
