@@ -262,7 +262,7 @@ the process's own interner (`interner::resolve(interner::intern(s))`, which genu
 `&'static str`) — reusing existing, already-accepted infrastructure rather than a new leak
 mechanism, at the cost that a script author (not the compiler) is now the one responsible for not
 building a metric name or tag value out of per-event data. Full reasoning, including the
-alternatives considered: [ADR 0020](../adr/0019-lua-authored-telemetry-cardinality.md). See
+alternatives considered: [ADR 0019](../adr/0019-lua-authored-telemetry-cardinality.md). See
 `docs/design/lua-api.md`'s "Emitting telemetry from a script" for the script-author-facing version
 of this same warning.
 

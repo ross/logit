@@ -36,7 +36,7 @@
           "minimum": 0.0
         },
         "max_bytes": {
-          "description": "Byte bound on the buffer's estimated heap footprint (`EventBatch::estimated_heap_bytes`), checked alongside `max_batches` -- whichever trips first. Human-readable in YAML (`64MiB`, `134217728`) via the [`human_bytes`] codec below, not a bare byte count.",
+          "description": "Byte bound on the buffer's estimated heap footprint (`EventBatch::estimated_heap_bytes`), checked alongside `max_batches` -- whichever trips first. A quoted string in YAML -- `\"64MiB\"` or a plain `\"134217728\"` -- via the [`human_bytes`] codec below, string-only in both directions to match this field's published schema exactly (an unquoted number is rejected, not silently accepted).",
           "default": "67108864",
           "type": "string"
         },

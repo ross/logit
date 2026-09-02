@@ -367,9 +367,10 @@ logit-core   logit-config   logit-script
   adds the `Transform` trait discussed above.
 - Owns `Fanout` and the graph resolution/validation module (pure, no channels or threads — see
   below) and the node runtime.
-- Depends on `logit-core` (for `EventBatch`) and `logit-config` (for `ComponentKind`), but *not* on
-  `logit-inputs`/`logit-transforms`/`logit-outputs` — those depend on it instead, for the trait
-  definitions. `logit-cli` is the one place that depends on everything and holds the
+- Depends on `logit-core` (for `EventBatch`), `logit-config` (for `ComponentKind`), and `logit-proto`
+  (for `Buffer`/`InMemoryBuffer`, which `SinkQueue` wraps — `docs/adr/0020-buffered-sink-delivery.md`),
+  but *not* on `logit-inputs`/`logit-transforms`/`logit-outputs` — those depend on it instead, for
+  the trait definitions. `logit-cli` is the one place that depends on everything and holds the
   kind-to-trait-object registry (today's `build_input`/`build_output`, generalized).
 - Keeps the channel type out of `logit-core`, whose doc comment states "no I/O, no pipeline" —
   weakening that would blur a boundary the crate exists to hold.

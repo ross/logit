@@ -86,7 +86,7 @@ slower/intermittent consumer, with an ack shape rather than a plain pop — see
 ```rust
 pub trait Buffer<T> {
     fn push(&mut self, item: T, weight: u64) -> PushOutcome<T>;
-    fn peek(&self) -> Option<&T>;      // does not remove
+    fn peek(&mut self) -> Option<&T>;  // does not remove, but reserves the head against eviction
     fn commit(&mut self) -> Option<T>; // removes the head, only once delivery succeeded
     fn len(&self) -> usize;
     fn weight(&self) -> u64;

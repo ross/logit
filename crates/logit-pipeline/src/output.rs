@@ -42,8 +42,8 @@ pub trait Output {
 
     /// Whether re-delivering an already-delivered batch is safe for this destination. Drives the
     /// default delivery posture (see [`DeliveryPosture`]); config can still override it per
-    /// component (workstream F, not this one). Default `false` -- the safer default for a sink
-    /// that hasn't opted in.
+    /// component (`logit_config::BufferConfig::delivery`, resolved in `write_loop`). Default
+    /// `false` -- the safer default for a sink that hasn't opted in.
     fn duplicate_safe(&self) -> bool {
         false
     }
@@ -108,7 +108,8 @@ pub fn is_explicitly_permanent(err: &anyhow::Error) -> bool {
 
 /// Whether re-delivering an already-delivered batch is an acceptable risk for a sink's
 /// destination. Drives which [`Fault`]s are worth retrying (see [`is_retryable`]); config can
-/// override the derived default per component (workstream F, not yet built).
+/// override the derived default per component (`logit_config::BufferConfig::delivery`, resolved
+/// into `WriteLoopConfig::delivery_override` by `logit-cli::pipeline::write_config`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryPosture {
     AtLeastOnce,

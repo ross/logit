@@ -24,8 +24,8 @@ pub enum PushOutcome<T> {
 
 /// What to do when a bounded buffer is full and another item arrives. `Block` is deliberately
 /// NOT a variant here -- a synchronous trait can't block usefully, so `Block` is a concern of the
-/// async wrapper built on top of this (`logit_pipeline::SinkQueue`, not yet built), not of
-/// `Buffer` or its impls. This trait implements only the two dropping policies.
+/// async wrapper built on top of this (`logit_pipeline::SinkQueue`), not of `Buffer` or its impls.
+/// This trait implements only the two dropping policies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverflowPolicy {
     DropOldest,

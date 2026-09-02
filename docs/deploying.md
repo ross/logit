@@ -86,7 +86,7 @@ an omitted `buffer:` is the values below.
 
 ### Failure semantics: degrade to dropping, don't exit
 
-Unlike the pre-0019 behavior, a sink that can't reach its destination no longer ends `logit run`:
+Unlike the pre-0020 behavior, a sink that can't reach its destination no longer ends `logit run`:
 
 - A **retryable** failure (per the sink's fault classification and delivery posture) is retried
   within `retry_budget` (60s by default) before the batch is dropped and counted.

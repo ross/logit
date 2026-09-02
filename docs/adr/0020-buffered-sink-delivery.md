@@ -55,8 +55,8 @@ already gone. The reshaped trait separates looking at the head from removing it:
 
 ```rust
 pub trait Buffer<T> {
-    fn push(&mut self, item: T) -> PushOutcome<T>;
-    fn peek(&self) -> Option<&T>;      // does not remove
+    fn push(&mut self, item: T, weight: u64) -> PushOutcome<T>;
+    fn peek(&mut self) -> Option<&T>;  // does not remove, but reserves the head against eviction
     fn commit(&mut self) -> Option<T>; // removes the head, only once delivery succeeded
     fn len(&self) -> usize;
     fn weight(&self) -> u64;
@@ -64,14 +64,18 @@ pub trait Buffer<T> {
 ```
 
 This is the whole of the "ack/retry hooks" the trait's existing `TODO` names, and the whole of
-in-process at-least-once: a batch stays at the head, retried, until `send` returns `Ok`. It is
+in-process at-least-once: a batch stays at the head, retried, until `send` returns `Ok`. `peek`
+takes `&mut self`, not `&self`, because it also reserves the head against a concurrent
+`DropOldest` eviction until `commit()` releases it — otherwise an eviction landing between `peek`
+and `commit` could remove a different item than the one the caller actually acted on. It is
 deliberately in-order and single-in-flight (one queue, one head) — out-of-order acks across
 several in-flight batches are a real future need for the native wire protocol's credit-based flow
 control (`docs/design/wire-protocol.md`), but there is exactly one writer per sink queue here, so
 building that generality now would be speculative. `push` also changes shape:
 `Result<(), EventBatch>` cannot express a `DropOldest` eviction (the evicted item vanishes with no
-way to count it), so it becomes a three-way `PushOutcome<T> { Accepted, Evicted(T), Rejected(T) }`.
-`OverflowPolicy::Block` leaves the trait entirely — a sync trait cannot block usefully — and
+way to count it), so it becomes a three-way `PushOutcome<T> { Accepted, Evicted(Vec<T>), Rejected(T) }`
+-- `Evicted` carries every item a single push had to evict to fit (a loop, not a single eviction),
+not just one. `OverflowPolicy::Block` leaves the trait entirely — a sync trait cannot block usefully — and
 becomes a `SinkQueue`-level concern layered on top of a trait that implements only the two
 dropping policies.
 

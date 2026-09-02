@@ -320,7 +320,7 @@ already built that have a known, accepted rough edge.
   fixed constant, not configurable — revisit if a legitimate component ever needs more than 1024
   distinct points between drains.
 - **Lua-authored telemetry (`crates/logit-script/src/telemetry.rs`,
-  [ADR 0020](adr/0019-lua-authored-telemetry-cardinality.md)) trades the type-system cardinality
+  [ADR 0019](adr/0019-lua-authored-telemetry-cardinality.md)) trades the type-system cardinality
   guarantee the rest of `internal-telemetry.md` relies on for a convention-enforced one** — a
   script's metric name/tag value is round-tripped through the process interner rather than
   required to be a Rust `&'static str`, so nothing stops a script from building one out of per-event

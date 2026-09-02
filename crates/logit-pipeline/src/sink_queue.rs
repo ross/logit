@@ -30,11 +30,13 @@ pub struct SinkQueueConfig {
     pub overflow: OverflowPolicy,
 }
 
-/// Config-file exposure of these knobs is workstream F, not this one -- this is the hardcoded
-/// default every production `NodeSpec::Output` gets until then. 1024 batches / 64 MiB is deep
-/// enough to ride out a real destination hiccup without being a meaningfully unbounded queue;
-/// `Block` is the default overflow behavior because losing data silently should be an explicit
-/// per-sink opt-in (`DropOldest`/`DropNewest`), not the out-of-the-box posture.
+/// What a production sink gets when its component omits a `buffer:` block entirely
+/// (`logit_config::BufferConfig::default()` mirrors these same values, and `logit-cli::pipeline`
+/// builds this `SinkQueueConfig` from whatever the config actually resolved to -- see
+/// `queue_config` there). 1024 batches / 64 MiB is deep enough to ride out a real destination
+/// hiccup without being a meaningfully unbounded queue; `Block` is the default overflow behavior
+/// because losing data silently should be an explicit per-sink opt-in (`DropOldest`/`DropNewest`),
+/// not the out-of-the-box posture.
 impl Default for SinkQueueConfig {
     fn default() -> Self {
         Self { max_batches: 1024, max_bytes: 64 * 1024 * 1024, overflow: OverflowPolicy::Block }
