@@ -19,6 +19,7 @@ use divan::{AllocProfiler, Bencher};
 use logit_bench::fixtures;
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::stdio::{EventDump, Format};
+use logit_outputs::syslog::{Format as SyslogFormat, MessageBuf, SyslogEncoder};
 use logit_pipeline::Transform;
 use logit_proto::{Decoder, Encoder};
 use logit_script::ScriptWorker;
@@ -140,6 +141,14 @@ mod encode {
         let batch = fixtures::nginx_batch(events);
         let dump = EventDump::new(Format::Human);
         bencher.bench_local(|| dump.encode(divan::black_box(&batch)));
+    }
+
+    #[divan::bench(args = [1, 100])]
+    fn syslog(bencher: Bencher, events: usize) {
+        let batch = fixtures::nginx_batch(events);
+        let mut encoder = SyslogEncoder::new(SyslogFormat::Rfc5424, 16);
+        let mut out = MessageBuf::default();
+        bencher.bench_local(|| encoder.encode_into(divan::black_box(&batch), &mut out));
     }
 }
 

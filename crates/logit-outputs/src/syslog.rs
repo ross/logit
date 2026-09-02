@@ -180,6 +180,21 @@ pub struct SyslogEncoder {
     default_app_name: Option<String>,
     max_message_bytes: usize,
     diag: Diagnostics,
+    /// The header/message text being built for the event currently being encoded -- reused
+    /// across every event *and* across every `encode_into` call (a struct field, not a local, is
+    /// what makes the second half of that true: a function-local recreated on every call regrows
+    /// from empty capacity every time, which is exactly why an earlier version of this encoder
+    /// showed real reallocation cost even with `encode_into` warmed once before measurement --
+    /// warming a local's very first call doesn't help its *next* call, only within-call reuse
+    /// across events did). Cleared, never reallocated, at the top of each event.
+    line: String,
+    /// `render_message`'s pre-sanitize rendering of `log.message`, reused the same way as `line`.
+    raw_msg: String,
+    /// Reused for every per-field sanitize call in a header (`sanitize_5424_field`/
+    /// `sanitize_3164_token`, once each for hostname/app-name/msgid) *and* for `sanitize_msg`'s
+    /// output afterward -- safe because every use within one event is read-immediately-into-
+    /// `line`-then-cleared before the next use, never overlapping in time.
+    scratch: String,
 }
 
 impl SyslogEncoder {
@@ -191,6 +206,9 @@ impl SyslogEncoder {
             default_app_name: None,
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             diag: Diagnostics::default(),
+            line: String::new(),
+            raw_msg: String::new(),
+            scratch: String::new(),
         }
     }
 
@@ -221,22 +239,18 @@ impl SyslogEncoder {
     pub fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf) -> EncodeStats {
         out.clear();
         let mut stats = EncodeStats::default();
-        // Reused across every event in this call -- a local, not a field, so `encode_event` can
-        // take `&mut self` without a second borrow of `self` for scratch space (the same reason
-        // `InfluxLineEncoder::encode` holds its scratch buffers on itself but never needs to pass
-        // `self` and one of its own fields as two separate `&mut` arguments at once).
-        let mut msg = String::new();
         for event in &batch.events {
-            msg.clear();
-            if self.encode_event(event, &mut msg, &mut stats) {
-                out.push(&msg);
+            self.line.clear();
+            if self.encode_event(event, &mut stats) {
+                out.push(&self.line);
             }
         }
         stats
     }
 
-    /// Encodes one event into `out`, returning whether it produced a message at all.
-    fn encode_event(&mut self, event: &Event, out: &mut String, stats: &mut EncodeStats) -> bool {
+    /// Encodes one event into `self.line` (already cleared by the caller), returning whether it
+    /// produced a message at all.
+    fn encode_event(&mut self, event: &Event, stats: &mut EncodeStats) -> bool {
         let Some(log) = &event.log else {
             stats.skipped_no_log += 1;
             return false;
@@ -252,18 +266,31 @@ impl SyslogEncoder {
         let msgid = resolve_str(attrs, "syslog.msgid");
 
         match self.format {
-            Format::Rfc5424 => {
-                write_rfc5424_header(out, pri, event.timestamp, hostname, app_name, pid, msgid)
-            }
-            Format::Rfc3164 => {
-                write_rfc3164_header(out, pri, event.timestamp, hostname, app_name, pid)
-            }
+            Format::Rfc5424 => write_rfc5424_header(
+                &mut self.line,
+                &mut self.scratch,
+                pri,
+                event.timestamp,
+                hostname,
+                app_name,
+                pid,
+                msgid,
+            ),
+            Format::Rfc3164 => write_rfc3164_header(
+                &mut self.line,
+                &mut self.scratch,
+                pri,
+                event.timestamp,
+                hostname,
+                app_name,
+                pid,
+            ),
         }
 
         // Header alone exceeds the bound: drop the message entirely rather than truncate a
         // header field and emit something a receiver would misparse (module doc's "Sizing").
-        if out.len() > self.max_message_bytes {
-            out.clear();
+        if self.line.len() > self.max_message_bytes {
+            self.line.clear();
             stats.dropped_oversize_header += 1;
             self.diag.warn_throttled(
                 "oversize_header",
@@ -275,37 +302,47 @@ impl SyslogEncoder {
             return false;
         }
 
-        let mut msg = String::new();
-        render_message(&mut msg, &log.message);
-        let msg = sanitize_msg(&msg);
-        if !msg.is_empty() {
-            out.push(' ');
-            // **No RFC 5424 §6.4 BOM.** An earlier version emitted one (the symmetric choice to
-            // `syslog_in` stripping one on the way in), on the assumption that Alloy's receiver
-            // would tolerate it. Verified against the real demo stack that it does not: Loki's
-            // `| json` LogQL stage uses Go's `encoding/json`, which does not skip a leading BOM,
-            // so every relayed line silently failed to parse as JSON and every `| json`-filtered
-            // dashboard panel came back empty despite lines actually landing in Loki. Confirmed
-            // by re-running the same query with the BOM removed. See `docs/adr/0022-syslog-
-            // output.md`.
-            let mut msg = msg;
-            let truncated = if out.len() >= self.max_message_bytes {
-                msg.clear();
-                true
-            } else {
-                truncate_on_char_boundary(&mut msg, self.max_message_bytes - out.len())
-            };
-            if truncated {
+        self.raw_msg.clear();
+        render_message(&mut self.raw_msg, &log.message);
+        sanitize_msg(&mut self.scratch, &self.raw_msg);
+        // **No RFC 5424 §6.4 BOM.** An earlier version emitted one (the symmetric choice to
+        // `syslog_in` stripping one on the way in), on the assumption that Alloy's receiver
+        // would tolerate it. Verified against the real demo stack that it does not: Loki's
+        // `| json` LogQL stage uses Go's `encoding/json`, which does not skip a leading BOM,
+        // so every relayed line silently failed to parse as JSON and every `| json`-filtered
+        // dashboard panel came back empty despite lines actually landing in Loki. Confirmed
+        // by re-running the same query with the BOM removed. See `docs/adr/0022-syslog-
+        // output.md`.
+        if !self.scratch.is_empty() {
+            // The separator itself counts against `max_message_bytes` -- pushing it
+            // unconditionally, then only clearing the message on overflow, left the separator on
+            // the wire even when there was no room for it at all, one byte over the configured
+            // cap when the header alone exactly filled the budget. Only push it when there's room.
+            if self.line.len() >= self.max_message_bytes {
                 stats.truncated += 1;
                 self.diag.warn_throttled(
                     "message_truncated",
                     format_args!(
-                        "syslog_out: message exceeded max_message_bytes ({}); truncated",
+                        "syslog_out: no room left for a message after the header ({} bytes); \
+                         message dropped",
                         self.max_message_bytes
                     ),
                 );
+            } else {
+                self.line.push(' ');
+                let budget = self.max_message_bytes - self.line.len();
+                if truncate_on_char_boundary(&mut self.scratch, budget) {
+                    stats.truncated += 1;
+                    self.diag.warn_throttled(
+                        "message_truncated",
+                        format_args!(
+                            "syslog_out: message exceeded max_message_bytes ({}); truncated",
+                            self.max_message_bytes
+                        ),
+                    );
+                }
+                self.line.push_str(&self.scratch);
             }
-            out.push_str(&msg);
         }
         true
     }
@@ -371,6 +408,7 @@ fn resolve_pid(attrs: &AttrMap) -> Option<u64> {
 #[allow(clippy::too_many_arguments)]
 fn write_rfc5424_header(
     out: &mut String,
+    scratch: &mut String,
     pri: u8,
     timestamp: i64,
     hostname: Option<&str>,
@@ -381,9 +419,9 @@ fn write_rfc5424_header(
     let _ = write!(out, "<{pri}>1 ");
     push_rfc5424_timestamp(out, timestamp);
     out.push(' ');
-    push_5424_field(out, hostname, 255);
+    push_5424_field(out, scratch, hostname, 255);
     out.push(' ');
-    push_5424_field(out, app_name, 48);
+    push_5424_field(out, scratch, app_name, 48);
     out.push(' ');
     match pid {
         Some(p) => {
@@ -392,39 +430,51 @@ fn write_rfc5424_header(
         None => out.push('-'),
     }
     out.push(' ');
-    push_5424_field(out, msgid, 32);
+    push_5424_field(out, scratch, msgid, 32);
     out.push(' ');
     out.push('-'); // STRUCTURED-DATA NILVALUE
 }
 
-fn push_5424_field(out: &mut String, value: Option<&str>, max_len: usize) {
-    match value.map(|v| sanitize_5424_field(v, max_len)) {
-        Some(s) if !s.is_empty() => out.push_str(&s),
-        _ => out.push('-'),
+/// Sanitizes `value` into `scratch` (a reused buffer -- see [`SyslogEncoder::scratch`]'s doc
+/// comment) and appends the result to `out`, or `-` (NILVALUE) if `value` is absent or sanitizes
+/// to nothing.
+fn push_5424_field(out: &mut String, scratch: &mut String, value: Option<&str>, max_len: usize) {
+    match value {
+        Some(v) => {
+            sanitize_5424_field(scratch, v, max_len);
+            if scratch.is_empty() {
+                out.push('-');
+            } else {
+                out.push_str(scratch);
+            }
+        }
+        None => out.push('-'),
     }
 }
 
 /// RFC 5424 section 6: HOSTNAME/APP-NAME/PROCID/MSGID are all `PRINTUSASCII` (`%d33-126`), with a
 /// per-field length cap. Every non-conforming character (including a raw space, which sits below
 /// the `PRINTUSASCII` range) becomes `_` rather than being dropped, so the result is always pure
-/// ASCII and stays a fixed number of bytes per character for the subsequent byte-length truncation.
-fn sanitize_5424_field(s: &str, max_len: usize) -> String {
-    let mut out = String::with_capacity(s.len().min(max_len));
+/// ASCII and stays a fixed number of bytes per character for the subsequent byte-length
+/// truncation. Writes into `scratch` (cleared first) rather than returning a fresh `String`.
+fn sanitize_5424_field(scratch: &mut String, s: &str, max_len: usize) {
+    scratch.clear();
     for c in s.chars() {
-        if out.len() >= max_len {
+        if scratch.len() >= max_len {
             break;
         }
-        out.push(if is_printusascii(c) { c } else { '_' });
+        scratch.push(if is_printusascii(c) { c } else { '_' });
     }
-    out
 }
 
 /// `Mmm dd hh:mm:ss ` (space-padded day), UTC -- RFC 3164's header, no structured data, no
 /// trailing separator (`encode_event`/`write_rfc3164_header`'s callers add exactly the separators
 /// they need). HOSTNAME/TAG are omitted entirely when absent or empty after sanitization, rather
 /// than emitting an RFC 5424-style NILVALUE RFC 3164 has no concept of.
+#[allow(clippy::too_many_arguments)]
 fn write_rfc3164_header(
     out: &mut String,
+    scratch: &mut String,
     pri: u8,
     timestamp: i64,
     hostname: Option<&str>,
@@ -434,17 +484,17 @@ fn write_rfc3164_header(
     let _ = write!(out, "<{pri}>");
     push_rfc3164_timestamp(out, timestamp);
     if let Some(h) = hostname {
-        let s = sanitize_3164_token(h, 255);
-        if !s.is_empty() {
+        sanitize_3164_token(scratch, h, 255);
+        if !scratch.is_empty() {
             out.push(' ');
-            out.push_str(&s);
+            out.push_str(scratch);
         }
     }
     if let Some(t) = tag {
-        let s = sanitize_3164_token(t, 32);
-        if !s.is_empty() {
+        sanitize_3164_token(scratch, t, 32);
+        if !scratch.is_empty() {
             out.push(' ');
-            out.push_str(&s);
+            out.push_str(scratch);
             if let Some(p) = pid {
                 let _ = write!(out, "[{p}]");
             }
@@ -458,16 +508,15 @@ fn write_rfc3164_header(
 /// that parser misread the token as TAG instead, and `demo/hello/app.py` carries the same warning
 /// about a trailing `:`. A raw space (below `PRINTUSASCII`) already becomes `_`, which is what
 /// keeps a token free of whitespace a receiver's token scanner could misread as a field boundary.
-fn sanitize_3164_token(s: &str, max_len: usize) -> String {
-    let mut out = String::with_capacity(s.len().min(max_len));
+fn sanitize_3164_token(scratch: &mut String, s: &str, max_len: usize) {
+    scratch.clear();
     for c in s.chars() {
-        if out.len() >= max_len {
+        if scratch.len() >= max_len {
             break;
         }
         let forbidden = matches!(c, ':' | '[' | ']');
-        out.push(if is_printusascii(c) && !forbidden { c } else { '_' });
+        scratch.push(if is_printusascii(c) && !forbidden { c } else { '_' });
     }
-    out
 }
 
 fn is_printusascii(c: char) -> bool {
@@ -560,9 +609,10 @@ fn render_message(out: &mut String, value: &Value) {
 
 /// Neutralizes `\n`/`\r`/NUL and every other C0 control character (plus DEL) in a rendered
 /// message -- see the module doc's "Injection safety" section for why, and for why a literal
-/// backslash is deliberately left untouched.
-fn sanitize_msg(msg: &str) -> String {
-    let mut out = String::with_capacity(msg.len());
+/// backslash is deliberately left untouched. Writes into `out` (cleared first) rather than
+/// returning a fresh `String`.
+fn sanitize_msg(out: &mut String, msg: &str) {
+    out.clear();
     for c in msg.chars() {
         match c {
             '\n' => out.push_str("\\n"),
@@ -574,7 +624,6 @@ fn sanitize_msg(msg: &str) -> String {
             c => out.push(c),
         }
     }
-    out
 }
 
 /// Truncates `s` in place to at most `budget` bytes, on a UTF-8 character boundary. Returns
@@ -676,23 +725,6 @@ impl SyslogOutput {
         self.telemetry = telemetry;
         self
     }
-
-    /// Ensures `stream` is connected, reconnecting if necessary. Only ever called from `send`.
-    async fn ensure_connected<'a>(
-        stream: &'a mut Option<TcpStream>,
-        endpoint: &str,
-        connect_timeout: Duration,
-    ) -> Result<&'a mut TcpStream, anyhow::Error> {
-        if stream.is_none() {
-            let connected = tokio::time::timeout(connect_timeout, TcpStream::connect(endpoint))
-                .await
-                .context("connecting to syslog_out endpoint timed out")
-                .and_then(|r| r.context("connecting to syslog_out endpoint"))
-                .context(Fault::Clean)?;
-            *stream = Some(connected);
-        }
-        Ok(stream.as_mut().expect("just set to Some above"))
-    }
 }
 
 #[async_trait::async_trait]
@@ -773,8 +805,15 @@ impl SyslogOutput {
     /// MTU or send buffer) is a per-message data condition, not a sink failure: dropped and
     /// counted, never classified as a `Fault` -- doing so would risk tripping
     /// `docs/adr/0021-buffered-sink-delivery.md`'s sustained-permanent-failure exit window on an
-    /// otherwise healthy sink. Any other `send_to` error means the datagram never left this host,
-    /// so it's `Fault::Clean`.
+    /// otherwise healthy sink. A failure on the *first* message this call attempts is
+    /// `Fault::Clean` -- nothing in this batch has left the host yet. Any later message's
+    /// failure, after at least one earlier datagram in the same batch already went out
+    /// (`sent > 0`), is `Fault::Ambiguous` instead: `Clean` is a whole-batch promise that the
+    /// destination saw none of it, and claiming that after a partial send would make the generic
+    /// writer resend the whole batch under `at_most_once`, duplicating whatever already landed
+    /// (`docs/adr/0021-buffered-sink-delivery.md`'s duplicate-safety argument depends on `Clean`
+    /// never over-claiming this way, exactly as `influxdb_out`'s own `classify_transport_error`
+    /// doc comment stresses for its own `Clean`/`Ambiguous` split).
     async fn send_udp(
         socket: &UdpSocket,
         endpoint: &str,
@@ -798,17 +837,39 @@ impl SyslogOutput {
                         format_args!("syslog_out: message too large for one UDP datagram: {err}"),
                     );
                 }
-                Err(err) => return Err(anyhow::Error::new(err).context(Fault::Clean)),
+                Err(err) => return Err(anyhow::Error::new(err).context(udp_send_fault(sent))),
             }
         }
         Ok(sent)
     }
 
-    /// One `write_all` per **batch** (all frames concatenated), not per message -- one syscall
-    /// per batch on the happy path. See [`Conn`]'s doc comment for the reconnect story: an
-    /// inherited connection that resets before any byte of *this* call was written reconnects
-    /// once and retries the whole frame, since a reset-before-write means the peer discarded its
-    /// connection state and nothing has been duplicated.
+    /// One frame (all messages octet-counted and concatenated) per **batch**, written with at
+    /// most one internal reconnect-and-retry. Two correctness properties this is built around,
+    /// both raised in review of an earlier version that got them wrong:
+    ///
+    /// - **Cancellation safety.** `deliver_with_retry` races every attempt against
+    ///   `tokio::time::timeout` (`docs/adr/0021-buffered-sink-delivery.md`), and
+    ///   [`AsyncWriteExt::write_all`] is explicitly documented as not cancel-safe: if the timeout
+    ///   fires mid-write, the future is dropped with an unknown number of bytes already on the
+    ///   wire. This function always `stream.take()`s the connection into a local before writing
+    ///   to it, never writing through `*stream` directly -- so a cancelled write simply drops
+    ///   (and closes) the local `TcpStream`, leaving `*stream` as `None` for the next `send` to
+    ///   reconnect fresh, rather than resuming writes into a connection whose framing this
+    ///   process can no longer account for.
+    /// - **Never resend once any byte has gone out.** The first write of each connect attempt is
+    ///   a single, non-`write_all` [`AsyncWriteExt::write`] call, which either returns `Ok(n)`
+    ///   with `n > 0` (proof delivery has *started* -- from here, any later failure is
+    ///   `Fault::Ambiguous` and the frame is never resent, since resending would duplicate
+    ///   whatever the peer already accepted) or fails having written nothing at all (proof
+    ///   nothing left this host on this attempt -- safe to reconnect once and retry the entire
+    ///   frame from scratch, and safe to classify `Fault::Clean` if that retry also fails). The
+    ///   previous version instead ran a single `write_all` per attempt and inferred "nothing was
+    ///   written" from "the connection was merely inherited from an earlier `send` call" -- which
+    ///   `write_all` cannot support: it can complete several of its own inner writes, including
+    ///   an entire earlier *message* in a multi-message batch, before a later one fails.
+    ///
+    /// [`AsyncWriteExt::write_all`]: tokio::io::AsyncWriteExt::write_all
+    /// [`AsyncWriteExt::write`]: tokio::io::AsyncWriteExt::write
     async fn send_tcp(
         stream: &mut Option<TcpStream>,
         endpoint: &str,
@@ -818,42 +879,76 @@ impl SyslogOutput {
     ) -> anyhow::Result<usize> {
         frame_octet_counting(messages, frame_buf);
 
-        let inherited = stream.is_some();
-        let conn = Self::ensure_connected(stream, endpoint, connect_timeout).await?;
-        match conn.write_all(frame_buf).await {
-            Ok(()) => Ok(messages.len()),
-            Err(err) if inherited && is_reset(&err) => {
-                // The connection was inherited from a previous `send`, and nothing in this call
-                // has been written yet -- reconnect once and retry the whole frame.
-                *stream = None;
-                let conn = Self::ensure_connected(stream, endpoint, connect_timeout).await?;
-                conn.write_all(frame_buf)
+        let mut retried_after_a_zero_byte_failure = false;
+        loop {
+            // Always taken out of `*stream`, never written through it directly -- see this
+            // function's doc comment's cancellation-safety point.
+            let mut conn = match stream.take() {
+                Some(conn) => conn,
+                None => tokio::time::timeout(connect_timeout, TcpStream::connect(endpoint))
                     .await
-                    .map(|_| messages.len())
-                    .map_err(|err| anyhow::Error::new(err).context(Fault::Ambiguous))
-            }
-            Err(err) => {
-                *stream = None;
-                Err(anyhow::Error::new(err).context(Fault::Ambiguous))
+                    .context("connecting to syslog_out endpoint timed out")
+                    .and_then(|r| r.context("connecting to syslog_out endpoint"))
+                    .context(Fault::Clean)?,
+            };
+
+            // `Ok(0)` from `write()` on a non-empty buffer is, in practice, as good as an error
+            // here (the stream is not accepting writes) -- normalized to a real `io::Error` so
+            // the rest of this match only has one "nothing was written" case to handle.
+            let first_write = match conn.write(frame_buf).await {
+                Ok(0) if !frame_buf.is_empty() => {
+                    Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "wrote zero bytes"))
+                }
+                Ok(n) => Ok(n),
+                Err(err) => Err(err),
+            };
+
+            match first_write {
+                Ok(n) => {
+                    let rest_result = if n < frame_buf.len() {
+                        conn.write_all(&frame_buf[n..]).await
+                    } else {
+                        Ok(())
+                    };
+                    return match rest_result {
+                        Ok(()) => {
+                            *stream = Some(conn);
+                            Ok(messages.len())
+                        }
+                        // At least one byte of this frame reached the peer -- resending would
+                        // duplicate it, and `*stream` is deliberately left `None` (this
+                        // now-partially-written connection is not reusable).
+                        Err(err) => Err(anyhow::Error::new(err).context(Fault::Ambiguous)),
+                    };
+                }
+                Err(_) if !retried_after_a_zero_byte_failure => {
+                    // Nothing left this host on this attempt -- `*stream` is already `None`
+                    // (taken above), so the next loop iteration connects fresh and retries the
+                    // whole frame exactly once.
+                    retried_after_a_zero_byte_failure = true;
+                    continue;
+                }
+                Err(err) => return Err(anyhow::Error::new(err).context(Fault::Clean)),
             }
         }
+    }
+}
+
+/// `Fault::Clean` only when nothing in this batch has left the host yet -- pulled out of
+/// `send_udp` as a pure, directly-testable function since the real network condition it encodes
+/// (a `send_to` failure *after* an earlier datagram in the same batch already went out) isn't
+/// something a unit test can reliably provoke over a real UDP socket.
+fn udp_send_fault(sent: usize) -> Fault {
+    if sent > 0 {
+        Fault::Ambiguous
+    } else {
+        Fault::Clean
     }
 }
 
 fn is_message_too_large(err: &std::io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc_emsgsize) if libc_emsgsize == 90 /* EMSGSIZE, Linux */)
         || err.kind() == std::io::ErrorKind::InvalidInput
-}
-
-fn is_reset(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::NotConnected
-            | std::io::ErrorKind::UnexpectedEof
-    )
 }
 
 #[cfg(test)]
@@ -1174,6 +1269,30 @@ mod tests {
         assert_eq!(stats.dropped_oversize_header, 1);
     }
 
+    /// Regression test: `max_message_bytes` exactly equal to the header's own length used to
+    /// still push a trailing separator before noticing there was no room for it, emitting one
+    /// byte over the configured cap. The RFC 5424 header for facility 16, an epoch timestamp, and
+    /// no hostname/app_name/pid/msgid attributes is exactly 44 bytes:
+    /// `<134>1 1970-01-01T00:00:00.000000Z - - - - -`.
+    #[test]
+    fn max_message_bytes_exactly_at_the_header_length_never_overflows_the_cap() {
+        let mut encoder = SyslogEncoder::new(Format::Rfc5424, 16).with_max_message_bytes(44);
+        let (msgs, stats) = encode_with(&mut encoder, vec![log_event(0, "nonempty", None)]);
+        assert_eq!(msgs[0], "<134>1 1970-01-01T00:00:00.000000Z - - - - -");
+        assert_eq!(msgs[0].len(), 44, "must never exceed max_message_bytes: {:?}", msgs[0]);
+        assert_eq!(stats.truncated, 1);
+    }
+
+    /// One byte more than the header's own length leaves room for exactly the separator and
+    /// nothing else -- still must never exceed the cap.
+    #[test]
+    fn max_message_bytes_one_byte_larger_than_the_header_fits_only_the_separator() {
+        let mut encoder = SyslogEncoder::new(Format::Rfc5424, 16).with_max_message_bytes(45);
+        let (msgs, stats) = encode_with(&mut encoder, vec![log_event(0, "nonempty", None)]);
+        assert_eq!(msgs[0].len(), 45, "must never exceed max_message_bytes: {:?}", msgs[0]);
+        assert_eq!(stats.truncated, 1);
+    }
+
     // -- MessageBuf / framing ----------------------------------------------------------------
 
     #[test]
@@ -1234,6 +1353,20 @@ mod tests {
         // reactor and so needs a runtime context, even though this test never awaits anything.
         let output = SyslogOutput::udp("127.0.0.1:0").unwrap();
         assert!(!output.duplicate_safe());
+    }
+
+    /// Regression test for a review finding: a `send_to` failure partway through a batch used to
+    /// be classified `Fault::Clean` unconditionally, which would make the generic writer resend
+    /// (and so duplicate) whatever earlier datagrams in the same batch already reached the wire.
+    /// `Clean` is a whole-batch promise the destination saw *none* of it -- only true when
+    /// nothing has sent yet. A real `send_to` failure partway through a batch isn't reliably
+    /// provokable over a loopback UDP socket in a unit test, so this pins the pure classification
+    /// function directly instead.
+    #[test]
+    fn udp_send_fault_is_clean_only_before_anything_in_the_batch_has_sent() {
+        assert_eq!(udp_send_fault(0), Fault::Clean);
+        assert_eq!(udp_send_fault(1), Fault::Ambiguous);
+        assert_eq!(udp_send_fault(5), Fault::Ambiguous);
     }
 
     // -- Sink: TCP ------------------------------------------------------------------------------
