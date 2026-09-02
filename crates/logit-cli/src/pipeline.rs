@@ -148,7 +148,7 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<()> {
 
 /// Turns one resolved component's kind into the boxed implementation the node runtime actually
 /// runs. The single source of truth for which `ComponentKind`s this binary can build --
-/// `graph::resolve` already rejected every kind `is_implemented` doesn't recognize (rule 7), so
+/// `graph::resolve` already rejected every kind `is_implemented` doesn't recognize (rule 8), so
 /// the fallback arm below is unreachable in practice, not a silent gap.
 ///
 /// `id` attaches a [`Diagnostics`] to every component that emits one (`docs/adr/0013-service-
@@ -303,7 +303,7 @@ fn build_spec(
     Ok((spec, telemetry))
 }
 
-/// Builds a sink's `SinkQueueConfig` from its `BufferConfig` (`docs/adr/0020-buffered-sink-
+/// Builds a sink's `SinkQueueConfig` from its `BufferConfig` (`docs/adr/0021-buffered-sink-
 /// delivery.md`, workstream F) -- the sole place `logit_config::OverflowPolicy` is converted to
 /// `logit_pipeline::OverflowPolicy`, since neither config nor pipeline crate can see both types
 /// without violating the dependency direction (`logit-pipeline` depends on `logit-config`, never
