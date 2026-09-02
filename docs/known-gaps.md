@@ -52,12 +52,55 @@ already built that have a known, accepted rough edge.
   whole chain behind it — but does not remove the listener-side hazard itself, which needs its own
   design (likely the same drain/writer split, applied to `Input::run` instead of `Output::send`) and
   its own plan once there's a reason to prioritize it over other gaps here.
-- **Relative gauge adjustment (`+`/`-`) and sample-rate extrapolation for distributions** — the
-  aggregator that would hold the needed state now exists (`crates/logit-transforms`), but the statsd
-  decoder still has no representation for "this is a delta, not an absolute value" to hand it, and
-  any leading sign is ambiguous with a plain negative number at the wire level regardless. Relative
-  gauges are explicitly rejected with a clear decode error rather than silently miscoded
-  (`crates/logit-inputs/src/statsd.rs`).
+- ~~**Relative gauge adjustment (`+`/`-`) and sample-rate extrapolation for distributions**~~ —
+  **closed, both halves**, independently (`docs/adr/0024-relative-gauge-adjustments.md`).
+
+  **Relative gauge adjustments.** `statsd_in` decodes any leading `+`/`-` on a `g` value into
+  `MetricKind::GaugeDelta` — explicitly *unresolved*; it must never reach a sink. `aggregate`
+  resolves it against the running gauge value: an absolute keeps today's last-write-wins-by-
+  source-timestamp rule, a delta applies in arrival order and never advances the LWW timestamp
+  (asymmetric on purpose — mixing the two orderings is undefined the moment they interleave
+  otherwise). Resolving a delta in a *later* window than the absolute it should apply against
+  needs the gauge's value to survive a flush, which `aggregate` now does for gauge series
+  specifically, bounded by two independent mechanisms
+  (`docs/adr/0008-aggregation-window-semantics.md`'s amendment): `gauge_retention` (a windows-count
+  TTL per series, on by default at `5` windows — a feature whose entire point is making "resolves
+  against 0.0" rare shouldn't default to guaranteeing it; `0` opts out entirely, reproducing the
+  strictly-tumbling behavior every config had before this existed) and `max_retained_gauge_series`
+  (a hard cardinality cap, since the TTL alone bounds only the tail of the retained set, not its
+  peak).
+
+  What's left open, by design, not oversight:
+  - **A delta after eviction (the cardinality cap) or after a process restart resolves against
+    0.0.** The eviction case is counted and reported (`logit.transform.gauge.delta.unseeded`,
+    `logit.transform.series.evicted{reason="cardinality"}`) — never silent. The restart case is
+    unfixable without durable aggregator state, which this project has already declined once for
+    the same underlying reason: ADR 0008's own rejection of cumulative counters ("state grows
+    unbounded with series cardinality and a process restart resets every series to zero with no
+    way to detect that from the emitted stream") applies just as much to a retained gauge as to a
+    cumulative counter. Retention narrows the window this can happen in; it does not close it.
+  - **A `GaugeDelta` reaching a sink with no `aggregate` on its path degrades to a throttled,
+    per-metric drop, not a config-time error.** `influxdb_out`'s encoder reports it under its own
+    `gauge_delta_unresolved` diagnostic key (not the generic `encode_error`) and skips just that
+    metric, same as `Set`. A `logit validate` graph check ("a statsd input reaches an output with
+    no `aggregate` on the path") is implementable — `logit-pipeline::graph` already walks the
+    resolved graph — but has a real false-positive case (resolving downstream in a separate
+    collector this instance forwards to is legitimate) and `logit validate` has no warning channel
+    today, only pass/fail. Deferred, not silently skipped.
+
+  **Sample-rate extrapolation for distributions.** `DdSketch::add_weighted(value, count)`
+  (`crates/logit-core/src/metric.rs`) inserts `count` weighted samples via repeated `add` rather
+  than a binary-doubling `merge`, specifically because the latter is O(log count) allocations on
+  `statsd_decode_one_line`'s exact-equality allocation path, which this project's own convention
+  forbids relaxing. `statsd_in`'s `ms`/`h`/`d` decoding now extrapolates `100|ms|@0.1` into 10
+  weighted samples instead of one unweighted one, the same way a `c` (counter) already extrapolates
+  via `value / sample_rate`. Weight is `(1.0 / sample_rate).round().max(1.0)`, **clamped** at
+  `MAX_SAMPLE_WEIGHT` (1000, i.e. `@0.001`) rather than extrapolated without bound — a DoS guard
+  (one crafted `@0.0000001` on a single UDP datagram would otherwise be a ten-million-iteration
+  loop), not a tuning knob, matching `aggregate.rs`'s `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`
+  stance. A clamp is counted (`logit.input.samples.clamped`) and throttle-reported
+  (`sample_rate_clamped`), never silent. A sample rate on `g` (gauge) or `s` (set) stays ignored —
+  extrapolating an absolute or a cardinality-estimator value is meaningless, unlike a count.
 - **`eprintln!` instead of a real diagnostics facility** — every component's diagnostic now goes
   through `logit_core::diag::Diagnostics` ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md)),
   which closes the two concrete hazards this entry used to name: every message is prefixed with its

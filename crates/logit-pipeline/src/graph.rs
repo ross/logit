@@ -167,7 +167,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
 fn interval(kind: &ComponentKind) -> Option<Duration> {
     match kind {
         ComponentKind::Lua { interval, .. } | ComponentKind::LuaFile { interval, .. } => *interval,
-        ComponentKind::Aggregate { interval } | ComponentKind::Internal { interval } => {
+        ComponentKind::Aggregate { interval, .. } | ComponentKind::Internal { interval } => {
             Some(*interval)
         }
         _ => None,
@@ -658,7 +658,15 @@ mod tests {
     fn zero_interval_is_rejected() {
         let err = expect_err(cfg(vec![
             ("in", vec![], listener()),
-            ("agg", vec!["in"], ComponentKind::Aggregate { interval: Duration::ZERO }),
+            (
+                "agg",
+                vec!["in"],
+                ComponentKind::Aggregate {
+                    interval: Duration::ZERO,
+                    gauge_retention: 5,
+                    max_retained_gauge_series: 10_000,
+                },
+            ),
             ("out", vec!["agg"], sink()),
         ]));
         assert!(err.contains("0s"), "got: {err}");
@@ -895,7 +903,11 @@ mod tests {
             (
                 "agg",
                 vec!["in"],
-                ComponentKind::Aggregate { interval: Duration::from_secs(10) },
+                ComponentKind::Aggregate {
+                    interval: Duration::from_secs(10),
+                    gauge_retention: 5,
+                    max_retained_gauge_series: 10_000,
+                },
                 non_default_buffer(),
             ),
             ("out", vec!["agg"], sink(), BufferConfig::default()),

@@ -216,9 +216,19 @@ Worked examples, one per shipped component:
 - `syslog_in` (`crates/logit-inputs/src/syslog.rs`): the same pair, `logit.input.datagrams`/
   `.datagram.bytes` — direct parity with `statsd_in`, the other UDP listener.
 - `aggregate` (`crates/logit-transforms/src/aggregate.rs`): `logit.transform.series.active` and
-  `logit.transform.resource.groups`, sampled at the top of `flush` before it drains its own state
+  `logit.transform.resource.groups`, sampled at the top of `flush` before it touches its own state
   — the peak-of-window series count, which is the visible signal for the cardinality blow-up
-  `crate::keep`'s own module doc already warns `aggregate` is exposed to.
+  `crate::keep`'s own module doc already warns `aggregate` is exposed to. Gauge retention across
+  the window boundary (`docs/adr/0008-aggregation-window-semantics.md`'s amendment) adds three
+  more: `logit.transform.series.retained` (gauge — the idle-but-carried population; `.active`
+  itself keeps its original "series updated this window" meaning, not silently widened to include
+  these), `logit.transform.series.evicted{reason="idle"|"cardinality"}` (count — a TTL expiry vs.
+  the hard `max_retained_gauge_series` cap; a non-zero `cardinality` count means a later delta is
+  about to resolve against 0.0), and `logit.transform.gauge.delta.unseeded` (count — a
+  `GaugeDelta` opened a brand-new series and resolved against 0.0, statsd's own rule for an
+  unseeded gauge, but indistinguishable from a real 0.0 without this). The last two also each fire
+  a throttled `logit.component.diagnostics{key="gauge_retention_full"|"gauge_delta_unseeded"}`
+  point via the `Diagnostics` bridge.
 - `kv_metrics` (`crates/logit-transforms/src/kv_metrics.rs`): `logit.transform.derived{metric_
   kind}` / `.derived.skipped{metric_kind}` — makes the documented silent-skip path (a missing or
   non-numeric field, deliberately never a diagnostic) visible as a rate instead of invisible.
@@ -240,7 +250,11 @@ Worked examples, one per shipped component:
   Lua scripts" below and `docs/design/lua-api.md`.
 - `influxdb_out` (`crates/logit-outputs/src/influxdb.rs`): `logit.output.requests{class="2xx|
   4xx|5xx|network_error"}`, `logit.output.request.duration` (per attempt), `logit.output.batch.bytes`
-  — the encode/HTTP-response detail a generic `send.duration` timer can't distinguish. **Not**
+  — the encode/HTTP-response detail a generic `send.duration` timer can't distinguish. A
+  `MetricKind::GaugeDelta` reaching this encoder unresolved (`docs/adr/0024-relative-gauge-adjustments.md`
+  — means the pipeline is missing an `aggregate` component) reports under its own
+  `logit.component.diagnostics{key="gauge_delta_unresolved"}`, not the generic `encode_error` every
+  other unrepresentable kind uses, specifically so it's greppable on its own. **Not**
   `logit.output.retries` — retry moved out of this sink entirely
   (`docs/adr/0021-buffered-sink-delivery.md`) into the generic `deliver_with_retry` every sink now
   shares, so retry counting is a Layer 2 metric (`logit.component.retries`, above), not something

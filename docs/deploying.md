@@ -135,6 +135,36 @@ the config. The two most directly actionable for buffering:
   here is data loss worth alerting on; which `reason` tells you whether the cause is an overflowing
   queue, a failing destination, or a slow drain racing shutdown.
 
+## Gauge retention
+
+`aggregate` normally drains every series on every flush (tumbling). A statsd gauge is an
+exception: the sender transmits only on change and expects the last value to persist, and a
+relative adjustment (`+`/`-`, `docs/adr/0024-relative-gauge-adjustments.md`) sent in a later window
+needs the gauge's last-known value to apply against. `gauge_retention` (on by default, `5`
+windows) and `max_retained_gauge_series` (on by default, `10,000` series) on an `aggregate`
+component control this — see the field doc comments in the schema (`logit schema`) for the exact
+semantics. `gauge_retention: 0` opts out entirely, reproducing the strictly-tumbling behavior every
+config had before this existed; both fields are additive and optional, so no existing config needs
+updating to keep validating.
+
+**What retention does not fix:** a delta against a series evicted by the cardinality cap, or a
+delta sent after a process restart, resolves against `0.0` — reported (`logit.transform.gauge
+.delta.unseeded`, `logit.transform.series.evicted{reason="cardinality"}`), never silent, but not
+prevented. The restart case is unfixable without durable aggregator state, which this project has
+deliberately not built (`docs/adr/0008-aggregation-window-semantics.md`'s rejection of cumulative
+counters, for the same underlying reason). If a config's gauges see relative adjustments and an
+operator needs the post-restart value to be exact rather than "resolves against 0 until the next
+absolute," the sending side's own zero-then-set convention (send an absolute periodically, not only
+deltas) is the mitigation, not `logit` itself.
+
+**What to watch:** `logit.transform.series.retained` (gauge) — how many gauge series are currently
+carried idle; a number that keeps climbing past what `gauge_retention × <series churn per window>`
+would predict is a sign of a leak (each series' name/tags never repeating) worth investigating with
+`keep` the same way unbounded `series.active` growth already is.
+`logit.transform.series.evicted{reason="cardinality"}` — any sustained nonzero rate here means
+`max_retained_gauge_series` is undersized for this pipeline's actual gauge cardinality, and deltas
+are silently resolving against 0 as a result.
+
 ## The nginx-side recipe
 
 Concrete, working reference config lives in this repo: [`examples/nginx/nginx.conf`](../examples/nginx/nginx.conf)

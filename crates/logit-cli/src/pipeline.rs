@@ -204,11 +204,14 @@ fn build_spec(
                 .with_context(|| format!("reading lua_file {}", script_path.display()))?;
             NodeSpec::Lua { script, interval: *interval }
         }
-        Aggregate { interval } => NodeSpec::Transform(Box::new(
-            Aggregator::new(*interval)
-                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone()),
-        )),
+        Aggregate { interval, gauge_retention, max_retained_gauge_series } => {
+            NodeSpec::Transform(Box::new(
+                Aggregator::new(*interval)
+                    .with_gauge_retention(*gauge_retention, *max_retained_gauge_series)
+                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                    .with_telemetry(telemetry.clone()),
+            ))
+        }
         Json { skip_to_brace } => NodeSpec::Transform(Box::new(
             JsonParser::new(*skip_to_brace)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
@@ -526,7 +529,11 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec!["out".to_string()],
-            kind: ComponentKind::Aggregate { interval: Duration::from_secs(10) },
+            kind: ComponentKind::Aggregate {
+                interval: Duration::from_secs(10),
+                gauge_retention: 5,
+                max_retained_gauge_series: 10_000,
+            },
         };
         assert!(matches!(
             build_spec("windowed", &component, Path::new(""), None).unwrap().0,

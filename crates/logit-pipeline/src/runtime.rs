@@ -1638,7 +1638,11 @@ mod tests {
             Component {
                 buffer: logit_config::BufferConfig::default(),
                 sources: vec!["in".to_string()],
-                kind: ComponentKind::Aggregate { interval: Duration::from_secs(3600) },
+                kind: ComponentKind::Aggregate {
+                    interval: Duration::from_secs(3600),
+                    gauge_retention: 5,
+                    max_retained_gauge_series: 10_000,
+                },
             },
         );
         components.insert(
