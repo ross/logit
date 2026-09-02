@@ -19,7 +19,7 @@ use logit_inputs::syslog::SyslogInput;
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::stdio::StdioOutput;
 use logit_pipeline::graph::{self, ResolvedComponent};
-use logit_pipeline::{NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
+use logit_pipeline::{InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
 use logit_transforms::{
     Aggregator, JsonParser, Keep as KeepTransform, KvMetrics as KvMetricsTransform,
     Remove as RemoveTransform,
@@ -175,25 +175,39 @@ fn build_spec(
         .map(|r| r.telemetry_for(id, component.kind_name(), component.role().as_str()))
         .unwrap_or_default();
     let spec = match &component.kind {
-        StatsdIn { bind } => NodeSpec::Input(Box::new(
-            StatsdInput::new(bind.clone())
-                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone()),
-        )),
-        SyslogIn { bind } => NodeSpec::Input(Box::new(
-            SyslogInput::new(bind.clone())
-                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone()),
-        )),
+        // TODO(docs/adr/0022-decoupled-listener-io.md, workstream F): `InputRuntimeConfig`
+        // should derive its `shutdown_grace` from the component's `receive:` block, the same way
+        // `queue_config`/`write_config` below derive from `buffer:` -- `logit_config::ReceiveConfig`
+        // doesn't exist yet, so every listener gets the default (`Duration::ZERO`, i.e. no change
+        // from today's cancel-by-drop) until that workstream lands.
+        StatsdIn { bind } => NodeSpec::Input(
+            Box::new(
+                StatsdInput::new(bind.clone())
+                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                    .with_telemetry(telemetry.clone()),
+            ),
+            InputRuntimeConfig::default(),
+        ),
+        SyslogIn { bind } => NodeSpec::Input(
+            Box::new(
+                SyslogInput::new(bind.clone())
+                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                    .with_telemetry(telemetry.clone()),
+            ),
+            InputRuntimeConfig::default(),
+        ),
         Internal { interval } => {
             let registry = registry
                 .cloned()
                 .expect("graph::resolve's rule 13 guarantees a Registry whenever an 'internal' component does");
-            NodeSpec::Input(Box::new(
-                InternalInput::new(*interval, registry)
-                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                    .with_telemetry(telemetry.clone()),
-            ))
+            NodeSpec::Input(
+                Box::new(
+                    InternalInput::new(*interval, registry)
+                        .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                        .with_telemetry(telemetry.clone()),
+                ),
+                InputRuntimeConfig::default(),
+            )
         }
 
         Lua { script, interval } => NodeSpec::Lua { script: script.clone(), interval: *interval },
@@ -466,7 +480,7 @@ mod tests {
         };
         let (spec, telemetry) =
             build_spec("self", &component, Path::new(""), Some(&registry)).unwrap();
-        assert!(matches!(spec, NodeSpec::Input(_)));
+        assert!(matches!(spec, NodeSpec::Input(..)));
         assert!(telemetry.is_enabled());
     }
 

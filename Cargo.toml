@@ -39,6 +39,11 @@ thiserror = "1"
 anyhow = "1"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "io-std", "time", "signal", "fs"] }
+# For SO_RCVBUF on a UDP listener (docs/adr/0022-decoupled-listener-io.md) -- tokio::net::UdpSocket
+# exposes no socket-option setters, so binding goes through socket2 and converts afterward.
+# Already present transitively (via tokio/hyper) at this exact version -- pinning it as a direct
+# dependency doesn't add a new entry to the dependency tree.
+socket2 = "0.6.5"
 clap = { version = "4", features = ["derive"] }
 serde_norway = "0.9"
 sketches-ddsketch = "0.4"

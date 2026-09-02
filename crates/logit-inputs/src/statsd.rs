@@ -20,42 +20,58 @@
 //! metric name don't need this treatment -- both only ever reach [`logit_core::interner::intern`],
 //! which hashes/copies into its own table regardless of where the `&str` it's given points.
 
+use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use bytes::Bytes;
 use logit_core::{
-    interner::intern, AttrMap, DdSketch, Diagnostics, Event, EventBatch, MetricKind, MetricRecord,
-    Resource, Telemetry, Value,
+    interner::intern, AttrMap, DdSketch, Diagnostics, Event, MetricKind, MetricRecord, Resource,
+    Telemetry, Value,
 };
 use logit_pipeline::Fanout;
 use logit_proto::{CodecError, Decoder};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::net::UdpSocket;
+use tokio::sync::watch;
 
+/// Thin wrapper over [`UdpListener<StatsdDecoder>`] -- the read/decode split and datagram-\>batch
+/// assembly all live there (`docs/adr/0022-decoupled-listener-io.md`); this type is just the
+/// decoder choice plus the public constructor/builder surface `logit-cli::pipeline` and this
+/// module's own tests already depend on.
 pub struct StatsdInput {
-    pub bind: String,
-    diag: Diagnostics,
-    /// Component-specific detail beyond the runtime's uniform layer-2 metrics (`docs/design/
-    /// internal-telemetry.md`'s "layer 3") -- how many datagrams and bytes actually arrived on
-    /// the wire, which is `Fanout`-level `events.sent` can't tell apart from a single busy client.
-    telemetry: Telemetry,
+    inner: UdpListener<StatsdDecoder>,
 }
 
 impl StatsdInput {
     pub fn new(bind: impl Into<String>) -> Self {
-        Self { bind: bind.into(), diag: Diagnostics::default(), telemetry: Telemetry::default() }
+        Self {
+            inner: UdpListener::new(
+                bind,
+                StatsdDecoder::new(Arc::new(Resource::default())),
+                UdpListenerConfig::default(),
+            ),
+        }
     }
 
     /// Attaches a component id to this listener's diagnostics -- and to the [`StatsdDecoder`] it
-    /// constructs in `run`, so both report under the same id.
+    /// wraps, so both report under the same id.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.diag = diag;
+        self.inner = self.inner.with_diagnostics(diag);
         self
     }
 
-    /// Attaches a telemetry handle -- see the `telemetry` field's doc comment.
+    /// Attaches a telemetry handle -- component-specific detail beyond the runtime's uniform
+    /// layer-2 metrics (`docs/design/internal-telemetry.md`'s "layer 3"): how many datagrams and
+    /// bytes actually arrived on the wire, which `Fanout`-level `events.sent` can't tell apart
+    /// from a single busy client.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.telemetry = telemetry;
+        self.inner = self.inner.with_telemetry(telemetry);
+        self
+    }
+
+    /// Overrides the receive-queue/batching/shutdown-grace knobs a `receive:` config block sets
+    /// (`docs/adr/0022-decoupled-listener-io.md`). Defaults to [`UdpListenerConfig::default`] --
+    /// today's behaviour -- when never called.
+    pub fn with_receive(mut self, config: UdpListenerConfig) -> Self {
+        self.inner = self.inner.with_config(config);
         self
     }
 }
@@ -63,30 +79,15 @@ impl StatsdInput {
 #[async_trait::async_trait]
 impl Input for StatsdInput {
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
-        let socket = UdpSocket::bind(&self.bind).await?;
-        let mut decoder =
-            StatsdDecoder::new(Arc::new(Resource::default())).with_diagnostics(self.diag.clone());
-        // The largest possible UDP payload (65535 minus the 8-byte UDP header).
-        let mut buf = vec![0u8; 65_507];
-        loop {
-            let (n, _peer) = socket.recv_from(&mut buf).await?;
-            self.telemetry.count("logit.input.datagrams", 1.0, &[]);
-            self.telemetry.count("logit.input.datagram.bytes", n as f64, &[]);
-            let bytes = Bytes::copy_from_slice(&buf[..n]);
-            match decoder.decode(bytes) {
-                Ok(batch) if !batch.events.is_empty() => {
-                    // `Fanout::send` has no per-consumer failure signal to react to -- a closed
-                    // consumer is silently skipped (`docs/design/pipeline-graph.md`'s backpressure
-                    // section notes this as a named open question, not solved here).
-                    sink.send(batch).await;
-                }
-                Ok(_) => {} // empty datagram
-                Err(err) => {
-                    // A malformed line from one client shouldn't take the whole listener down.
-                    self.diag.warn_throttled("bad_datagram", err);
-                }
-            }
-        }
+        self.inner.run(sink).await
+    }
+
+    async fn run_until_shutdown(
+        &mut self,
+        sink: Fanout,
+        shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        self.inner.run_until_shutdown(sink, shutdown).await
     }
 }
 
@@ -109,11 +110,14 @@ impl StatsdDecoder {
 }
 
 impl Decoder for StatsdDecoder {
-    fn decode(&mut self, bytes: Bytes) -> Result<EventBatch, CodecError> {
+    fn decode_into(
+        &mut self,
+        bytes: Bytes,
+        received_at: i64,
+        out: &mut Vec<Event>,
+    ) -> Result<Arc<Resource>, CodecError> {
         let text = std::str::from_utf8(&bytes)
             .map_err(|e| CodecError::Malformed(format!("invalid utf-8: {e}")))?;
-        let timestamp = now_nanos();
-        let mut events = Vec::new();
         for line in text.split('\n') {
             let line = line.trim_end_matches('\r').trim();
             if line.is_empty() {
@@ -123,19 +127,15 @@ impl Decoder for StatsdDecoder {
             // datagram -- StatsD clients routinely pack several independent metrics into one
             // packet, so treating the datagram as atomic would let a single bad line take down
             // everything alongside it. Isolate per line: keep what parsed, report what didn't.
-            match parse_line(&bytes, text, line, timestamp) {
-                Ok(mut line_events) => events.append(&mut line_events),
+            match parse_line(&bytes, text, line, received_at) {
+                Ok(mut line_events) => out.append(&mut line_events),
                 Err(err) => {
                     self.diag.warn_throttled("bad_line", err);
                 }
             }
         }
-        Ok(EventBatch { resource: self.resource.clone(), events })
+        Ok(self.resource.clone())
     }
-}
-
-fn now_nanos() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64
 }
 
 /// Reconstructs a `Bytes` sharing the datagram's underlying allocation for `sub`, a substring
@@ -297,6 +297,35 @@ mod tests {
     fn decode(line: &str) -> Vec<Event> {
         let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
         decoder.decode(Bytes::from(line.to_string())).expect("decode should succeed").events
+    }
+
+    /// `decode_into` must stamp every event with the caller's `received_at`, not a fresh
+    /// call-time clock read -- the property `docs/adr/0022-decoupled-listener-io.md` exists for:
+    /// once decode runs on its own loop, "now" at decode time can be arbitrarily later than
+    /// arrival under backlog.
+    #[test]
+    fn decode_into_stamps_events_with_the_callers_received_at_not_the_current_time() {
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
+        let deliberately_not_now: i64 = 123;
+        let mut out = Vec::new();
+        decoder
+            .decode_into(Bytes::from_static(b"hits:1|c"), deliberately_not_now, &mut out)
+            .expect("decode should succeed");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].timestamp, deliberately_not_now);
+    }
+
+    /// `decode_into` appends to `out` rather than replacing it -- the property that lets a caller
+    /// accumulate several datagrams' events into one reused buffer
+    /// (`logit_pipeline::BatchAccumulator`) instead of allocating fresh per datagram.
+    #[test]
+    fn decode_into_appends_to_an_already_populated_out_buffer_rather_than_replacing_it() {
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
+        let mut out = vec![Event::empty(0, AttrMap::new())];
+        decoder
+            .decode_into(Bytes::from_static(b"hits:1|c"), 1, &mut out)
+            .expect("decode should succeed");
+        assert_eq!(out.len(), 2, "the pre-existing event must survive, plus the newly decoded one");
     }
 
     fn only_metric(events: Vec<Event>) -> MetricRecord {

@@ -9,5 +9,6 @@
 pub mod internal;
 pub mod statsd;
 pub mod syslog;
+pub mod udp;
 
 pub use logit_pipeline::Input;
