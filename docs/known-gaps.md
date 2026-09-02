@@ -351,7 +351,8 @@ already built that have a known, accepted rough edge.
   [ADR 0018](adr/0018-internal-telemetry-as-pipeline-events.md)) covers metrics only** — the
   framework (the `internal` component, the per-component buffer, the emit API) is built to extend,
   but three extensions are deliberately not part of this first cut:
-  - **Internal spans — emission and sampling are now built; three narrower residuals remain (below).**
+  - **Internal spans — emission, sampling, and export are now built and proven end to end; three
+    narrower residuals remain (below).**
     `internal`'s name (not `internal_metrics`) deliberately left room for this without a rename.
     History: `crates/logit-bench/tests/allocations.rs`/`benches/pipeline.rs`'s node-runtime
     coverage closed the gap where nothing measured what `run_transform`/`run_output`/`Fanout::send`
@@ -392,6 +393,33 @@ already built that have a known, accepted rough edge.
     `TraceContext`/`Delivered`. See `docs/design/internal-telemetry.md`'s "Spans" section for the
     full account, and `docs/design/pipeline-graph.md`'s "Trace context propagation" table for the
     resulting per-node-kind span record.
+
+    **[docs/plans/0005-otlp-end-to-end.md](plans/0005-otlp-end-to-end.md) (the OTLP series' fourth
+    PR) is what actually closes this item, not ADR 0025 alone.** Everything above built a real
+    `SpanRecord` inside `logit`'s own process; nothing tested whether the result was a span *any
+    other system would recognize*. `otlp_out` (ADR 0023's codec, ADR 0024's hand-rolled gRPC
+    transport) is that proof: `demo/logit.yaml`'s `trace_out` exports `internal`'s spans to a real
+    Tempo over OTLP/gRPC, and Grafana's Tempo panel shows the actual parent/child tree a config's
+    topology produces -- a listener root with transform/sink children, matching
+    `pipeline-graph.md`'s table exactly. That is the end-to-end proof this entry was missing: not
+    "a span exists," but "a span leaves the process, decodes correctly on the wire, and reconstructs
+    the right shape on the other end."
+
+    **What sampling does and doesn't do, now that it's exercised for real.** `span_sample_rate`
+    (default `0.1`, `1.0` in the demo) decides, once per `trace_id`, whether *this* trace's internal
+    spans exist at all inside `logit` -- an unsampled trace never becomes a `SpanRecord`, never
+    occupies a slot in the bounded per-component buffer, and costs nothing beyond the sampler's own
+    branch (`Telemetry::span`'s doc comment). It is a volume control on `logit`'s own
+    self-observability, deliberately independent of the traffic it's observing: raising or lowering
+    it changes how much of the internal pipeline you can see, never what the pipeline does to an
+    event. What it does *not* do: it doesn't sample the events themselves (a dropped trace's events
+    still flow through the pipeline and reach every configured sink, untouched); it doesn't
+    propagate to or from a peer (no `sampled` flag crosses `otlp_in`/`otlp_out`'s wire boundary, so
+    a `logit` downstream of another `logit` -- or of any other OTLP producer -- makes its own
+    independent keep/drop decision on the same `trace_id`, per ADR 0025's "no propagated bit"
+    decision); and it doesn't thin the *metrics* signal at all -- `internal`'s point-side buffer and
+    `otlp_out`'s metrics encoding are entirely unaffected by this knob, which is why the demo's
+    InfluxDB dashboard populates identically whether `span_sample_rate` is `0.1` or `1.0`.
 
     **What's still open, deliberately, not oversights:**
     1. **The listener span's window is the `send` call only, not decode-to-send.** `Fanout::send`
@@ -542,6 +570,54 @@ already built that have a known, accepted rough edge.
     `otlp_in`'s response *does* reflect today. Threading a real per-call count through would be a
     `SignalDecoder` API change (`crates/logit-proto`), out of scope for the PR that added `otlp_in`
     itself — a natural next step whenever OTLP input volume makes the gap worth closing.
+
+- **`otlp_out` aborts an entire batch's `send` on the first signal request that fails -- pointed at
+  a signal-partial backend fed by a mixed-signal source, that's not just noise, it can end the
+  process.** Discovered running `demo/`'s `trace_out` against Tempo
+  ([docs/plans/0005-otlp-end-to-end.md](plans/0005-otlp-end-to-end.md)), not anticipated by that
+  plan. `internal` (`self`, observing `logit`'s own pipeline) doesn't distinguish signals -- every
+  drain carries both spans and this process's own `logit.*` metrics (all `Counter`/`Gauge`/
+  `Distribution`, all mergeable). `OtlpOutput::send` (`crates/logit-outputs/src/otlp.rs`) issues
+  one request per non-empty signal, sequentially (traces before metrics, per `encode_signals`'
+  fixed ordering), and `?`-propagates the first failure without attempting the rest. Tempo is a
+  traces-only OTLP receiver -- it registers a `TraceService` but no `MetricsService` -- so a batch
+  mixing both sees its traces request succeed and its metrics request that follows fail with
+  `grpc-status: 12` (`UNIMPLEMENTED`, correctly classified `Fault::Permanent`, correctly not
+  retried). `write_loop` sees one failed `send` and drops the whole batch -- a batch whose trace
+  payload had already, successfully, separately reached Tempo moments earlier, confirmed directly
+  against Tempo's `/api/search`/`/api/traces` endpoints.
+
+  **That alone is recoverable noise. Pointed straight at `self` with nothing in between, it is not
+  recoverable at all.** `self`'s 10s drain interval meant *every* `trace_out` batch mixed both
+  signals, so `send` never once returned `Ok`, `last_success` never advanced, and `write_loop`'s
+  ~60s sustained-permanent-failure guard
+  ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md), revised by
+  [ADR 0021](adr/0021-buffered-sink-delivery.md)) killed the entire `logit` process about a minute
+  after startup -- taking the InfluxDB metrics path down with it, not just Tempo. That guard exists
+  specifically to end a process stuck on a genuine misconfiguration (a bad token, a bad bucket); a
+  demo whose "misconfiguration" is actually two signals correctly reaching a backend that only
+  wants one is exactly the false-positive case it wasn't built to distinguish. `demo/logit.yaml`
+  works around this at the config layer: a dedicated `aggregate` node (`trace_windowed`) sits
+  between `self` and `trace_out`, absorbing every mergeable metric into window state and
+  forwarding a metric-less event -- a pure span -- untouched and immediately
+  (`crates/logit-transforms/src/aggregate.rs`'s `process` doc comment). That makes the overwhelming
+  majority of `trace_out`'s batches traces-only, so `send` succeeds and the guard's streak keeps
+  resetting; `trace_windowed`'s own periodic `flush` still occasionally emits a real metrics-only
+  batch that fails the same way, but the many successful pure-span deliveries surrounding it (every
+  ~10s, against one `flush` per 60s) reset the guard long before it reaches 60s.
+
+  This is specific to pointing `otlp_out` at a mixed-signal source feeding a signal-partial
+  backend -- a production `otlp_out` scoped to a source that only ever carries the signals its
+  destination accepts would never hit either half of this. Not fixed at the source here
+  (`docs/plans/0005-otlp-end-to-end.md` is config/docs only, no new Rust) -- the real fix is a
+  config-layer way to filter an event stream by which payload it carries (no existing transform
+  does this directly; `keep`/`remove` filter attributes, not `event.metrics`/`event.log`/
+  `event.span` themselves -- `aggregate` only does it as a side effect of absorbing metrics for a
+  different purpose) or a per-signal partial-failure mode on `OtlpOutput::send` that doesn't abort
+  sibling signals already in flight and doesn't let one incompatible signal alone trip the
+  sustained-failure guard for signals that are succeeding. `demo/logit.yaml`'s `trace_windowed`/
+  `trace_out` components carry this same explanation inline.
+
 - **`otlp_out`'s gRPC transport opens a fresh connection per request, never pooled.** Every gRPC
   `send` (`crates/logit-outputs/src/otlp.rs`'s `grpc_roundtrip`) connects, performs a fresh HTTP/2
   handshake, sends exactly one framed request, reads the response, then drops the connection —
