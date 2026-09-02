@@ -184,7 +184,7 @@ impl Aggregator {
             // event rather than absorbing or dropping them.
             //
             // `GaugeDelta` is routed through this same pass-through arm only in this workstream
-            // (`docs/adr/0024-relative-gauge-adjustments.md`, workstream A) -- workstream B
+            // (`docs/adr/0026-relative-gauge-adjustments.md`, workstream A) -- workstream B
             // replaces this with real resolution against a running `Accumulator::Gauge`. Left
             // here unresolved for now would otherwise defeat the whole feature silently, which is
             // why `crates/logit-transforms/tests` guards it with a named test rather than a
@@ -659,7 +659,7 @@ mod tests {
     }
 
     /// Guards `process`'s pass-through `matches!` directly, not just by implication: as of this
-    /// workstream (A, `docs/adr/0024-relative-gauge-adjustments.md`), `GaugeDelta` has no real
+    /// workstream (A, `docs/adr/0026-relative-gauge-adjustments.md`), `GaugeDelta` has no real
     /// resolution yet and must come back out unchanged rather than being silently absorbed as
     /// though it were an ordinary `Gauge`. **Workstream B replaces this test's expectation** --
     /// once `aggregate` resolves deltas, this exact input should be absorbed (`is_none()`), not

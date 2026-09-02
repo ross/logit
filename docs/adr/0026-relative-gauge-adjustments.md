@@ -1,4 +1,4 @@
-# 0024 — Relative gauge adjustments (`+`/`-` in statsd)
+# 0026 — Relative gauge adjustments (`+`/`-` in statsd)
 
 ## Status
 Proposed
@@ -22,10 +22,13 @@ this record is scoped to the *representation* question — what a decoded relati
 like on the wire between `statsd_in` and `aggregate` — and to the resolution semantics `aggregate`
 applies to it.
 
-Note: `docs/adr/` already has an ADR numbered `0023`
-(`0023-committed-pregenerated-otlp-protobuf.md`), and a separate, earlier collision at `0020`
-(`0020-demo-stack-separate-from-dev-stack.md` and `0020-trace-context-propagation-on-delivered.md`).
-`0024` is simply the next free number; resolving either collision is not this record's job.
+Note: this record was drafted as `0024`, the next free number at the time, alongside `docs/adr/`'s
+pre-existing collision at `0020` (`0020-demo-stack-separate-from-dev-stack.md` and
+`0020-trace-context-propagation-on-delivered.md`). By the time this branch merged with `main`,
+`0024` had independently been taken by `0024-hand-rolled-grpc-over-hyper.md` (and `0023` by
+`0023-committed-pregenerated-otlp-protobuf.md`) — a second instance of the same numbering-collision
+pattern, resolved the same way as the `0020` one: renumbered to the next free number, `0026`, after
+the merge. Resolving the `0020` collision remains not this record's job.
 
 ## Decision
 
