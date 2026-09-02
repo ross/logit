@@ -85,7 +85,7 @@ const MAX_LINKS_PER_SPAN: usize = 32;
 /// `internal` component doesn't set one. Below `1.0` deliberately: span volume is a different
 /// shape than metric volume -- one span per node-visit per batch, where a metric point coalesces
 /// between drains -- so keeping everything by default would multiply internal telemetry's own
-/// volume in a way metrics never do. See `docs/adr/0022-internal-span-emission-and-deterministic-sampling.md`.
+/// volume in a way metrics never do. See `docs/adr/0023-internal-span-emission-and-deterministic-sampling.md`.
 pub const DEFAULT_SPAN_SAMPLE_RATE: f64 = 0.1;
 
 /// Deterministic on `trace_id`, so every node -- and every `logit` process in a split-collection
@@ -210,7 +210,7 @@ impl Telemetry {
     }
 
     /// Opens a span for this component's one visit to one unit of work -- see
-    /// `docs/adr/0022-internal-span-emission-and-deterministic-sampling.md` for what "one unit of
+    /// `docs/adr/0023-internal-span-emission-and-deterministic-sampling.md` for what "one unit of
     /// work" means per node kind. The sample decision (`trace_is_sampled`) is made here, from
     /// `trace_id` alone, before any span-shaped state exists at all: an unsampled trace gets the
     /// same `SpanGuard::disabled()` a disabled handle's [`Telemetry::timer`] returns, so every

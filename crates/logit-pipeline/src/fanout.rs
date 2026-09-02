@@ -21,7 +21,7 @@
 //! per `docs/adr/0020-trace-context-propagation-on-delivered.md` on the measured evidence of a
 //! costing exercise that came before it (`docs/known-gaps.md`). Real span emission -- turning
 //! that context into an actual `SpanRecord`-carrying `Event` -- landed in
-//! `docs/adr/0022-internal-span-emission-and-deterministic-sampling.md`: `Fanout::send`/
+//! `docs/adr/0023-internal-span-emission-and-deterministic-sampling.md`: `Fanout::send`/
 //! `send_blocking` (below) record this node's own listener span around the send. See
 //! [`TraceContext`]'s own doc comment for the propagation model, and
 //! `docs/design/pipeline-graph.md`'s "Trace context propagation" section for the account of which
@@ -41,7 +41,7 @@ use tokio::sync::mpsc;
 /// `trace_id`. `span_id` changes at *every* hop: [`TraceContext::child`] keeps `trace_id` and mints
 /// a fresh `span_id`, so a hop's own `span_id` is what the *next* hop's span records as its own
 /// `parent_span_id` -- the actual `SpanRecord` this builds into is real now
-/// (`docs/adr/0022-internal-span-emission-and-deterministic-sampling.md`; see the module doc above).
+/// (`docs/adr/0023-internal-span-emission-and-deterministic-sampling.md`; see the module doc above).
 ///
 /// **Not every node can produce a `child`.** A node with exactly one incoming batch per emission (a
 /// listener producing its first batch, `Transform::process`/`ScriptWorker::process`'s per-batch
@@ -196,7 +196,7 @@ impl Fanout {
     /// to inherit). See [`Fanout::send_with_own_context`] for everything about delivery mechanics.
     ///
     /// **This is the one place a listener's own `SpanKind::Producer` span is recorded** --
-    /// `docs/adr/0022-internal-span-emission-and-deterministic-sampling.md`'s per-node-kind table.
+    /// `docs/adr/0023-internal-span-emission-and-deterministic-sampling.md`'s per-node-kind table.
     /// Its window is deliberately just this call, not "however long the listener spent building
     /// `batch`": `Fanout::send` has no visibility into that (`Input::run` is a free-form loop), so
     /// this doesn't fabricate a start time it can't actually know. Once `run_flush`/`run_lua`'s
@@ -517,7 +517,7 @@ mod tests {
 
     /// `send` mints a root and records exactly one `SpanKind::Producer` span for it -- the
     /// drained span's own `span_id` must be the same id the delivered batch actually went out
-    /// under, not some unrelated id minted separately (`docs/adr/0022-internal-span-emission-and-
+    /// under, not some unrelated id minted separately (`docs/adr/0023-internal-span-emission-and-
     /// deterministic-sampling.md`'s "the span's `span_id` and the outgoing `Delivered`'s `span_id`
     /// must be the same id").
     #[tokio::test]

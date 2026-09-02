@@ -28,7 +28,7 @@ image, and the forcing function for `syslog_out`/`otlp_out`
 ([docs/plans/0003-demo-stack.md](docs/plans/0003-demo-stack.md)). `syslog_out` (RFC 3164/5424 over
 UDP or TCP, header fields round-tripped from an event's `syslog.*` attributes,
 [ADR 0022](docs/adr/0022-syslog-output.md)) has since landed too, live in `demo/logit.yaml`'s
-`log_out` — `otlp_out` and a span producer are what's left. Config is a flat graph of named components (ADR 0009,
+`log_out` — `otlp_out` is what's left. Config is a flat graph of named components (ADR 0009,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively
@@ -57,7 +57,7 @@ child of its parent for the two node kinds with an unambiguous one to propagate
 context is now turned into real spans: every node kind records a `SpanRecord`-carrying `Event` for
 its own visit to a unit of work (a listener's send, a transform's process-or-flush, a sink's
 delivery), sampled deterministically on `trace_id` (`span_sample_rate` on the `internal` component,
-default 0.1); see [ADR 0022](docs/adr/0022-internal-span-emission-and-deterministic-sampling.md)
+default 0.1); see [ADR 0023](docs/adr/0023-internal-span-emission-and-deterministic-sampling.md)
 and [internal-telemetry.md](docs/design/internal-telemetry.md)'s "Spans" section. `docs/known-gaps.md`'s
 internal-spans entry tracks what's still open (the listener span's window, Lua `flush()`'s
 link-less root).

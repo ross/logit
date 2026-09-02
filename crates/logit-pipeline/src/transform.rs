@@ -58,7 +58,7 @@ pub trait Transform: Send {
     /// than a parallel same-length array so there's no index correspondence to get wrong.
     /// `run_flush` (`crates/logit-pipeline/src/runtime.rs`) unions every group's links onto the
     /// one flush span it records for this call
-    /// (`docs/adr/0022-internal-span-emission-and-deterministic-sampling.md`), bounded the same
+    /// (`docs/adr/0023-internal-span-emission-and-deterministic-sampling.md`), bounded the same
     /// way any other span's links are (`MAX_LINKS_PER_SPAN`).
     fn flush(&mut self, now: i64) -> FlushOutput {
         let _ = now;

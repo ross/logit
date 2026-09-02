@@ -366,7 +366,7 @@ already built that have a known, accepted rough edge.
     contributing batch as "the" parent, for either case, was considered and rejected (silently
     wrong is worse than visibly incomplete).
 
-    **[ADR 0022](adr/0022-internal-span-emission-and-deterministic-sampling.md) closed both items
+    **[ADR 0023](adr/0023-internal-span-emission-and-deterministic-sampling.md) closed both items
     this entry used to list as open: emission and sampling.** `Telemetry::span`/`SpanGuard` (mirroring
     `Timer`'s disabled-is-free shape) turn a `(context, node, batch)` visit into a real
     `SpanRecord`-carrying `Event`, drained by `ComponentBuffer::drain`'s new span pass alongside the
@@ -386,7 +386,7 @@ already built that have a known, accepted rough edge.
        has no visibility into how long a listener spent building the batch it's about to send
        (`Input::run` is a free-form loop) — the still-open listener-side half of "delivery I/O is
        not decoupled from event processing" (below).
-    2. **Lua `flush()` still gets a link-less root.** It gets a real span now (ADR 0022), but no
+    2. **Lua `flush()` still gets a link-less root.** It gets a real span now (ADR 0023), but no
        links — there is still no accumulator on the Lua side to inspect, same limitation as the
        `Resource`-staleness gap above.
     3. **A `SinkQueue` entry is 24 bytes larger.** `TraceContext` now rides inline in every queue

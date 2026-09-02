@@ -134,7 +134,7 @@ pub enum ComponentKind {
         /// traces rather than a representative sample would set this explicitly. Named
         /// `span_sample_rate`, not `sample_rate` -- there is already a `ComponentKind::Sample`
         /// transform, and `internal` may grow other sampling knobs later. See
-        /// `docs/adr/0022-internal-span-emission-and-deterministic-sampling.md`.
+        /// `docs/adr/0023-internal-span-emission-and-deterministic-sampling.md`.
         #[serde(default = "default_span_sample_rate")]
         span_sample_rate: f64,
     },

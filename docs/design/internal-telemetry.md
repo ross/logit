@@ -101,7 +101,7 @@ compile-time-constant tag values a component's code contains, not by traffic.
 
 ## Spans
 
-Closes the emission half of what was, until [ADR 0022](../adr/0022-internal-span-emission-and-deterministic-sampling.md),
+Closes the emission half of what was, until [ADR 0023](../adr/0023-internal-span-emission-and-deterministic-sampling.md),
 an open item: [ADR 0020](../adr/0020-trace-context-propagation-on-delivered.md) put a real
 `TraceContext` on every `Delivered` and gave the two unambiguous node kinds a real parent to
 propagate; a follow-up gave `Transform::flush` a bounded `Vec<SpanLink>` per emitted event. Neither
