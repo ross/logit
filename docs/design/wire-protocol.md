@@ -81,7 +81,7 @@ throughput.
 
 `Buffer<T>` (`logit_proto::buffer`) is a bounded, in-process queue between a producer and a
 slower/intermittent consumer, with an ack shape rather than a plain pop — see
-`docs/adr/0020-buffered-sink-delivery.md` for the reasoning:
+`docs/adr/0021-buffered-sink-delivery.md` for the reasoning:
 
 ```rust
 pub trait Buffer<T> {

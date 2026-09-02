@@ -132,7 +132,7 @@ in parallel. F (config/schema) needs D and E landed. G (telemetry + known-gaps) 
 
 **Depends on:** nothing.
 
-**Decisions to record:** draft **ADR 0020** here (Status: Proposed) so later workstreams can cite
+**Decisions to record:** draft **ADR 0021** here (Status: Proposed) so later workstreams can cite
 it; rewrite `docs/design/wire-protocol.md`'s §Buffering to the reshaped trait.
 
 **The change.** `crates/logit-proto/src/buffer.rs`:
@@ -177,7 +177,7 @@ deliberately absent: a sync trait cannot block, so `OverflowPolicy::Block` is a 
 (workstream C) concept layered on top, not a variant this trait's impl has to understand.
 
 **Files:** `crates/logit-proto/src/buffer.rs`, `crates/logit-proto/src/lib.rs`,
-`docs/design/wire-protocol.md`, `docs/adr/0020-buffered-sink-delivery.md` (new, drafted here).
+`docs/design/wire-protocol.md`, `docs/adr/0021-buffered-sink-delivery.md` (new, drafted here).
 
 **Test list:** push/peek/commit ordering; peek does not remove; commit on an empty buffer is a
 no-op returning `None`; `DropOldest` evicts the head and returns it via `PushOutcome::Evicted`;
@@ -244,7 +244,7 @@ policies return immediately after taking the lock once. `peek`/`commit` are the 
 `run_output` (`crates/logit-pipeline/src/runtime.rs`) becomes:
 
 > **Superseded below, as shipped:** this sketch predates implementation and gets two things
-> wrong, both corrected during review and recorded in `docs/adr/0020-buffered-sink-delivery.md`'s
+> wrong, both corrected during review and recorded in `docs/adr/0021-buffered-sink-delivery.md`'s
 > Consequences section — `run_output` races `drain_inbox`/`write_loop` via `tokio::select!`, not
 > `tokio::join!` (a `join!` would hang the task forever if `write_loop` returns early while the
 > inbox is still open, which every real listener's is), and the real signature also threads a
@@ -315,8 +315,8 @@ shutdown hook; bound how long a dead sink can hold up process exit.
 
 **Depends on:** C.
 
-**Decisions to record:** finalize **ADR 0020** to Accepted, including the failure-handling
-decision below; add a short "Revised by ADR 0020" note to ADR 0013's retry section (0013 is not
+**Decisions to record:** finalize **ADR 0021** to Accepted, including the failure-handling
+decision below; add a short "Revised by ADR 0021" note to ADR 0013's retry section (0013 is not
 superseded — its shutdown and diagnostics decisions stand unchanged).
 
 **The change.**
@@ -379,7 +379,7 @@ rather than silently risking a duplicate.
 
 **Files:** `crates/logit-pipeline/src/runtime.rs`, `crates/logit-pipeline/src/output.rs`,
 `crates/logit-outputs/src/influxdb.rs`, `crates/logit-outputs/src/stdio.rs`,
-`docs/adr/0020-buffered-sink-delivery.md`, `docs/adr/0013-service-lifecycle-and-output-retry.md`.
+`docs/adr/0021-buffered-sink-delivery.md`, `docs/adr/0013-service-lifecycle-and-output-retry.md`.
 
 **Test list:** influx's existing in-process `TcpListener` retry tests adapt to assert
 *classification* (429/503 → `Ambiguous`, connection-refused → `Clean`, 400/401 →

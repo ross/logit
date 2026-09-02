@@ -29,7 +29,7 @@ use tokio::task::JoinSet;
 /// restart-policy supervisor to notice; one malformed batch cannot kill an otherwise-healthy
 /// pipeline. Fixed, not config-exposed -- workstream F's `logit_config::BufferConfig` deliberately
 /// does not surface this window; revisit if a real deployment ever needs to tune it.
-/// See `docs/adr/0020-buffered-sink-delivery.md`'s "Failure handling" section.
+/// See `docs/adr/0021-buffered-sink-delivery.md`'s "Failure handling" section.
 const PERMANENT_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Bounded channel capacity between two graph nodes. Small and arbitrary -- just enough to smooth
@@ -203,7 +203,7 @@ pub async fn run_with_telemetry(
     // On the first error (from either arm below), record it and trigger the same shutdown signal
     // SIGTERM already drives -- every remaining task then gets the graceful-shutdown treatment it
     // already knows how to handle (a listener's inbox closes normally, cascading through to
-    // `write_loop`'s shutdown-grace drain, `docs/adr/0020-buffered-sink-delivery.md`) instead of
+    // `write_loop`'s shutdown-grace drain, `docs/adr/0021-buffered-sink-delivery.md`) instead of
     // being aborted mid-flight by dropping `tasks` early, which would silently discard a healthy
     // sibling's buffered, not-yet-delivered work. Keep `join_next`ing until every task has actually
     // exited (the loop condition, unchanged) rather than breaking -- only the *first* error is kept
@@ -249,7 +249,7 @@ async fn run_input(
 }
 
 /// A sink node's drain-and-deliver pair, decoupled through a [`SinkQueue`]
-/// (`docs/adr/0020-buffered-sink-delivery.md`): [`drain_inbox`] moves every `Delivered` off this
+/// (`docs/adr/0021-buffered-sink-delivery.md`): [`drain_inbox`] moves every `Delivered` off this
 /// component's inbox into the queue as fast as the queue's own bounds allow, while [`write_loop`]
 /// delivers from the queue independently -- so a slow or backing-off `Output::send` no longer
 /// stops this sink's own inbox from moving batches into its (deeper, byte-bounded) queue, the way
@@ -418,7 +418,7 @@ fn unwrap_batch_arc(delivered: Delivered) -> Arc<EventBatch> {
 
 /// Retry budget for [`write_loop`]'s generic `deliver_with_retry`, driving every sink -- moved
 /// here from `logit-outputs::influxdb::RetryPolicy`, which owned its own retry loop before
-/// `docs/adr/0020-buffered-sink-delivery.md`; now every sink gets retry for free instead of
+/// `docs/adr/0021-buffered-sink-delivery.md`; now every sink gets retry for free instead of
 /// reimplementing it.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryConfig {
@@ -437,7 +437,7 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         // Widened from ADR 0013's ~5s default: a stall here no longer reaches the drain loop or
-        // the listener behind it (docs/adr/0020-buffered-sink-delivery.md), since the queue
+        // the listener behind it (docs/adr/0021-buffered-sink-delivery.md), since the queue
         // absorbs it instead -- so a much larger budget, enough to ride out a real destination
         // restart, is now affordable.
         Self {
@@ -456,10 +456,10 @@ pub struct WriteLoopConfig {
     /// Once the shutdown signal fires, `write_loop`'s remaining allowed drain time is capped at
     /// this, measured from the moment shutdown first fired (not reset per batch) -- so a
     /// permanently-down sink can't hang process exit indefinitely under SIGTERM. See
-    /// `docs/adr/0020-buffered-sink-delivery.md`'s "shutdown grace" section.
+    /// `docs/adr/0021-buffered-sink-delivery.md`'s "shutdown grace" section.
     pub shutdown_grace: Duration,
     /// Overrides the delivery posture `write_loop` would otherwise derive from
-    /// `output.duplicate_safe()` (`docs/adr/0020-buffered-sink-delivery.md`'s three-layer posture
+    /// `output.duplicate_safe()` (`docs/adr/0021-buffered-sink-delivery.md`'s three-layer posture
     /// design: sink fact -> runtime default -> this config override). `None` -- the default --
     /// means "use the derived default"; workstream F's `logit-config::BufferConfig::delivery`
     /// is what sets this per component.
@@ -495,7 +495,7 @@ enum Delivery {
 /// Attempts to deliver `batch` via `output.send`, retrying per `posture`/[`is_retryable`] until
 /// either it succeeds, a failure isn't retryable, or `retry.total_budget` (a fresh budget for this
 /// call) is exhausted. Moved here from `logit-outputs::influxdb::InfluxDbOutput::send`'s own retry
-/// loop (`docs/adr/0020-buffered-sink-delivery.md`) -- every sink gets this for free now, driven by
+/// loop (`docs/adr/0021-buffered-sink-delivery.md`) -- every sink gets this for free now, driven by
 /// its own `Fault` classification and `duplicate_safe` fact rather than reimplementing the loop.
 ///
 /// **Every attempt, including the first, is raced against the remaining budget** via
@@ -551,7 +551,7 @@ async fn deliver_with_retry(
 /// The backoff before retry attempt `attempt + 1`: `base_delay` doubled `attempt - 1` times via
 /// repeated `saturating_mul`, stopping early once it's already at or past `max_delay` -- correct
 /// for *any* `base_delay`/`max_delay` pair, not just `RetryConfig::default`'s. Moved here from
-/// `logit-outputs::influxdb` verbatim (`docs/adr/0020-buffered-sink-delivery.md`) -- it was never
+/// `logit-outputs::influxdb` verbatim (`docs/adr/0021-buffered-sink-delivery.md`) -- it was never
 /// InfluxDB-specific, just historically homed on the one sink that had a retry loop at all. See
 /// that module's history for why the loop is bounded at 128 iterations and why a single
 /// `base_delay * 2u32.pow(shift)` with a fixed shift cap doesn't work for every `base_delay`/
@@ -653,7 +653,7 @@ async fn finish_and_flush(
 /// and empty -- see [`SinkQueue::peek`]) or shutdown grace expires. Per batch: attempt delivery via
 /// [`deliver_with_retry`], per the posture resolved from `write_config.delivery_override` (config,
 /// workstream F) falling back to `output.duplicate_safe()`'s derived default
-/// (`docs/adr/0020-buffered-sink-delivery.md`). On success, commit and reset the permanent-failure
+/// (`docs/adr/0021-buffered-sink-delivery.md`). On success, commit and reset the permanent-failure
 /// streak. On failure (not retryable, or retryable but the budget ran out), commit anyway (the
 /// process no longer exits on an ordinary sink failure), count and warn -- *except*: a run of
 /// nothing but *explicitly classified* `Fault::Permanent` outcomes (see
@@ -1036,7 +1036,7 @@ fn run_lua(
 ///
 /// **An `Output` sibling on the same fan-out doesn't change this into a guarantee either way --
 /// it's still genuinely racy, just against a different clock than it used to be.** Before
-/// `docs/adr/0020-buffered-sink-delivery.md` split `run_output` into `drain_inbox`/`write_loop`,
+/// `docs/adr/0021-buffered-sink-delivery.md` split `run_output` into `drain_inbox`/`write_loop`,
 /// the `Output` branch held its `Delivered` handle for the full duration of `output.send`, which
 /// typically does real I/O -- slower than a `Transform`'s local processing, making a clone (cost
 /// 6) the likelier practical outcome even though a free unwrap (cost 1) was reachable. That's no
@@ -1965,7 +1965,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // `run_output`'s drain/write split (`docs/adr/0020-buffered-sink-delivery.md`)
+    // `run_output`'s drain/write split (`docs/adr/0021-buffered-sink-delivery.md`)
     // -----------------------------------------------------------------------------------------
 
     /// A minimal one-shot gate for tests: `wait()` blocks until `open()` is called, from anywhere,
@@ -2085,7 +2085,7 @@ mod tests {
     }
 
     /// The property this whole workstream exists to deliver
-    /// (`docs/adr/0020-buffered-sink-delivery.md`, `docs/plans/0003-buffered-sink-delivery.md`
+    /// (`docs/adr/0021-buffered-sink-delivery.md`, `docs/plans/0004-buffered-sink-delivery.md`
     /// section C): a slow/backing-off `Output::send` no longer stops its own component's inbox
     /// from draining. Proven directly: while the sink's very first delivery attempt is parked on a
     /// gate, several more batches sent right behind it still make it off the inbox and into the
@@ -2181,7 +2181,7 @@ mod tests {
     }
 
     /// **Behavior change from before this workstream, deliberate**
-    /// (`docs/adr/0020-buffered-sink-delivery.md`'s "Failure handling" section): an isolated,
+    /// (`docs/adr/0021-buffered-sink-delivery.md`'s "Failure handling" section): an isolated,
     /// unclassified send failure (defaults to `Fault::Permanent`, see `output::classify`) used to
     /// end `run` outright the moment it happened. It no longer does -- `write_loop` drops the
     /// batch, counts it, and moves on; only a *sustained* run of nothing but `Permanent` failures
@@ -2356,7 +2356,7 @@ mod tests {
 
     // -----------------------------------------------------------------------------------------
     // `write_loop`'s retry/posture/failure-handling/shutdown-grace logic
-    // (`docs/adr/0020-buffered-sink-delivery.md`, workstream D)
+    // (`docs/adr/0021-buffered-sink-delivery.md`, workstream D)
     // -----------------------------------------------------------------------------------------
 
     /// A sink whose `send` fails with a `fault`-tagged error for its first `fail_times` calls,
@@ -3140,8 +3140,8 @@ mod tests {
 
     // -----------------------------------------------------------------------------------------
     // `run_with_telemetry`'s join loop: drain every task on the first error instead of aborting
-    // (`docs/plans/0003-buffered-sink-delivery.md` workstream E,
-    // `docs/adr/0020-buffered-sink-delivery.md`)
+    // (`docs/plans/0004-buffered-sink-delivery.md` workstream E,
+    // `docs/adr/0021-buffered-sink-delivery.md`)
     // -----------------------------------------------------------------------------------------
 
     /// An `Input` fully driven by the test: every batch handed to the paired `UnboundedSender`

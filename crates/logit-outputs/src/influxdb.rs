@@ -39,7 +39,7 @@ pub struct InfluxDbOutput {
     client: reqwest::Client,
     encoder: InfluxLineEncoder,
     /// This attempt's request timeout. `send` makes exactly one attempt per call now
-    /// (`docs/adr/0020-buffered-sink-delivery.md` -- retry timing moved to the generic writer in
+    /// (`docs/adr/0021-buffered-sink-delivery.md` -- retry timing moved to the generic writer in
     /// `logit-pipeline`), so there's no "remaining retry budget" left to clamp this against any
     /// more; it's simply what `with_timeout` set (or [`DEFAULT_TIMEOUT`]), applied to `client` at
     /// build time and passed again per-request for clarity.
@@ -74,7 +74,7 @@ impl InfluxDbOutput {
 
     /// Attaches a component id to this output's encoder diagnostics (per-metric encode failures).
     /// `InfluxDbOutput` itself no longer has any diagnostics of its own to attribute -- it stopped
-    /// retrying (`docs/adr/0020-buffered-sink-delivery.md`), and the generic writer that now owns
+    /// retrying (`docs/adr/0021-buffered-sink-delivery.md`), and the generic writer that now owns
     /// retry timing gets its own `Diagnostics` handle from `logit-pipeline::runtime::write_loop`.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.encoder = self.encoder.with_diagnostics(diag);
@@ -111,7 +111,7 @@ fn build_client(timeout: Duration) -> reqwest::Client {
 #[async_trait::async_trait]
 impl Output for InfluxDbOutput {
     /// Exactly one attempt per call -- no loop, no sleep. Retry timing/budget now belongs to the
-    /// generic writer in `logit-pipeline` (`docs/adr/0020-buffered-sink-delivery.md`); this only
+    /// generic writer in `logit-pipeline` (`docs/adr/0021-buffered-sink-delivery.md`); this only
     /// classifies what happened and reports it via [`Fault`] (`.context(fault)`).
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let body = self.encoder.encode(batch)?;
@@ -177,7 +177,7 @@ impl Output for InfluxDbOutput {
     /// of every `encode` call -- so re-encoding and re-sending a buffered batch on retry produces
     /// byte-for-byte the same body as the first attempt, and InfluxDB treats an identical
     /// `(measurement, tag set, timestamp)` write as an idempotent overwrite, not a second point.
-    /// See `docs/adr/0020-buffered-sink-delivery.md`.
+    /// See `docs/adr/0021-buffered-sink-delivery.md`.
     fn duplicate_safe(&self) -> bool {
         true
     }
@@ -1134,7 +1134,7 @@ mod tests {
     }
 
     /// `send` now makes exactly one attempt per call -- retry timing moved to `logit-pipeline`'s
-    /// generic writer (`docs/adr/0020-buffered-sink-delivery.md`). A success is still a plain
+    /// generic writer (`docs/adr/0021-buffered-sink-delivery.md`). A success is still a plain
     /// `Ok(())`, single attempt.
     #[tokio::test]
     async fn a_successful_response_returns_ok_on_the_first_attempt() {

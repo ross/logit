@@ -23,7 +23,7 @@ already built that have a known, accepted rough edge.
   (`crates/logit-pipeline/src/sink_queue.rs`) that keeps accepting while a delivery attempt is in
   flight or backing off, with retry (`RetryConfig`, up to 60s by default) and fault-classification-
   driven duplicate-safety (`Fault`/`DeliveryPosture`, `crates/logit-pipeline/src/output.rs`) moved
-  behind that boundary ([ADR 0020](adr/0020-buffered-sink-delivery.md)). A persistent failure no
+  behind that boundary ([ADR 0021](adr/0021-buffered-sink-delivery.md)). A persistent failure no
   longer ends `logit run` by default — it degrades to dropping the offending batch and continuing,
   exiting only after a sustained ~60s window of nothing but configuration-error (`Fault::Permanent`)
   failures. What's left, genuinely open:
@@ -41,7 +41,7 @@ already built that have a known, accepted rough edge.
 - **Delivery I/O is not decoupled from event processing within a node: listener half only, sink half
   closed.** Each component is its own tokio task, but *within* one node, I/O and processing used to
   share a single sequential path on both the sink and the listener side. The sink half is fixed
-  ([ADR 0020](adr/0020-buffered-sink-delivery.md), directly above): `run_output`
+  ([ADR 0021](adr/0021-buffered-sink-delivery.md), directly above): `run_output`
   (`crates/logit-pipeline/src/runtime.rs`) now splits into a drain half (`drain_inbox`) and a writer
   half (`write_loop`) sharing the `SinkQueue`, so a slow or retrying sink no longer stops draining
   its own inbox. **The listener half remains fully open**: `StatsdInput::run`
@@ -82,7 +82,7 @@ already built that have a known, accepted rough edge.
     the aggregation window (which this fix does protect) is not.
 
   ~~`Output` still has no close/flush hook of its own.~~ **Closed**
-  ([ADR 0020](adr/0020-buffered-sink-delivery.md)): `Output` gains `async fn flush(&mut self)`
+  ([ADR 0021](adr/0021-buffered-sink-delivery.md)): `Output` gains `async fn flush(&mut self)`
   (default no-op, so no existing sink needed to change), called once `write_loop`
   (`crates/logit-pipeline/src/runtime.rs`) stops delivering — either because its queue drained to
   closed-and-empty, or because a bounded shutdown grace (default 5s) expired first with batches
@@ -346,7 +346,7 @@ already built that have a known, accepted rough edge.
     doesn't have to re-derive them: `logit.proto.frames{direction,codec,compression}`,
     `logit.proto.frame.bytes`, `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated"}`.
     (`buffer.rs`'s own metrics are no longer on this list — implemented at the `SinkQueue` layer,
-    `docs/adr/0020-buffered-sink-delivery.md`, as `logit.component.buffer.batches`/`.bytes`/
+    `docs/adr/0021-buffered-sink-delivery.md`, as `logit.component.buffer.batches`/`.bytes`/
     `.utilization`/`.push.blocked.duration` and new `reason` values on `batches.dropped`/
     `events.dropped`, per `docs/design/internal-telemetry.md`'s catalog.)
   - **Lua per-call latency, error classification, flush-tick-empty tracking** — a per-event

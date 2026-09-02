@@ -35,7 +35,7 @@ components:
     org: logit
     bucket: metrics
     token: !env INFLUXDB_TOKEN
-    # Every field below defaults (docs/adr/0020-buffered-sink-delivery.md) -- an omitted `buffer:`
+    # Every field below defaults (docs/adr/0021-buffered-sink-delivery.md) -- an omitted `buffer:`
     # block is exactly the values shown here, commented out purely as a reference for tuning a
     # real deployment. `buffer:` is meaningful only on a sink; `logit-pipeline`'s graph validation
     # rejects it on any other component kind.

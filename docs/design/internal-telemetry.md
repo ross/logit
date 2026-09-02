@@ -177,7 +177,7 @@ receive/processing side from their own loops, which already see every batch and 
 | `logit.script.events.emitted{outcome="emit"\|"emit_many"}` | count | `run_lua`, per `ProcessOutcome` — distinguishes a 1:1 script from a fan-out one |
 
 **Every sink also gets a `SinkQueue`** (`crates/logit-pipeline/src/sink_queue.rs`,
-`docs/adr/0020-buffered-sink-delivery.md`) sitting between its inbox drain and delivery — its own
+`docs/adr/0021-buffered-sink-delivery.md`) sitting between its inbox drain and delivery — its own
 uniform layer, same reasoning as `Fanout`'s: instrumenting the one choke point every sink's batches
 pass through gives every sink these for free, no per-sink code:
 
@@ -242,7 +242,7 @@ Worked examples, one per shipped component:
   4xx|5xx|network_error"}`, `logit.output.request.duration` (per attempt), `logit.output.batch.bytes`
   — the encode/HTTP-response detail a generic `send.duration` timer can't distinguish. **Not**
   `logit.output.retries` — retry moved out of this sink entirely
-  (`docs/adr/0020-buffered-sink-delivery.md`) into the generic `deliver_with_retry` every sink now
+  (`docs/adr/0021-buffered-sink-delivery.md`) into the generic `deliver_with_retry` every sink now
   shares, so retry counting is a Layer 2 metric (`logit.component.retries`, above), not something
   each sink tracks for itself.
 

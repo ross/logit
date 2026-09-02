@@ -1,7 +1,7 @@
 //! The `Output` trait -- moved here from `logit-outputs`, same reasoning as [`crate::input`]. Also
 //! home to [`Fault`]/[`DeliveryPosture`]/[`is_retryable`], the classification and policy pieces the
 //! generic writer (`crate::runtime::write_loop`) needs to decide whether a failed `send` is worth
-//! retrying. See `docs/adr/0020-buffered-sink-delivery.md`.
+//! retrying. See `docs/adr/0021-buffered-sink-delivery.md`.
 
 use logit_core::EventBatch;
 
@@ -9,7 +9,7 @@ use logit_core::EventBatch;
 /// and delivery is the **runtime's** responsibility, not this trait's -- `run_output`
 /// (`runtime.rs`) splits into a drain half and a writer half joined around a `SinkQueue`
 /// (`sink_queue.rs`), so a sink's own inbox keeps draining while a slow or backing-off delivery
-/// attempt is in flight. See `docs/adr/0020-buffered-sink-delivery.md`. `Output::send` itself
+/// attempt is in flight. See `docs/adr/0021-buffered-sink-delivery.md`. `Output::send` itself
 /// only ever sees one batch at a time, exactly as before this existed. A sink has at least one
 /// source and is never itself a source of anything else (`docs/design/pipeline-graph.md`'s arity
 /// table).
@@ -35,7 +35,7 @@ pub trait Output {
     /// Default no-op -- most sinks (e.g. `InfluxDbOutput`, which writes synchronously with nothing
     /// buffered internally) need nothing here; this exists for a sink that does. Closes ADR 0013's
     /// residual "no `Output` close hook" gap, now load-bearing since a sink can hold unwritten data
-    /// at shutdown (`docs/adr/0020-buffered-sink-delivery.md`'s shutdown-grace section).
+    /// at shutdown (`docs/adr/0021-buffered-sink-delivery.md`'s shutdown-grace section).
     async fn flush(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -52,7 +52,7 @@ pub trait Output {
 /// What a `send` failure means about whether the destination actually received the batch -- only
 /// the sink can tell, so it travels back out of `send` as `anyhow` context rather than a signature
 /// change (`.context(Fault::Ambiguous)`, read back via [`classify`] -- see that function's doc
-/// comment for exactly how). See `docs/adr/0020-buffered-sink-delivery.md`.
+/// comment for exactly how). See `docs/adr/0021-buffered-sink-delivery.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
     /// The destination provably never saw the batch (connect refused, DNS failure). Safe to retry
@@ -78,7 +78,7 @@ impl std::fmt::Display for Fault {
 
 /// Reads `err` for an attached [`Fault`] marker (a sink's `.context(fault)`), defaulting to
 /// [`Fault::Permanent`] when none is found -- never retry a failure the sink didn't recognize
-/// (`docs/adr/0020-buffered-sink-delivery.md`).
+/// (`docs/adr/0021-buffered-sink-delivery.md`).
 ///
 /// **Not** `err.chain().find_map(|e| e.downcast_ref::<Fault>())`, even though that's the more
 /// obvious-looking spelling: each link `chain()` yields is a `&dyn std::error::Error` whose
@@ -130,7 +130,7 @@ impl DeliveryPosture {
 }
 
 /// Whether `fault` is worth retrying under `posture` -- the crux of the whole duplicate-safety
-/// argument (`docs/adr/0020-buffered-sink-delivery.md`'s table, reproduced here):
+/// argument (`docs/adr/0021-buffered-sink-delivery.md`'s table, reproduced here):
 ///
 /// | `Fault` | `AtMostOnce` | `AtLeastOnce` |
 /// |---|---|---|
@@ -156,7 +156,7 @@ mod tests {
     use super::*;
 
     /// Exhaustive, all 6 `(Fault, DeliveryPosture)` combinations -- this table is the crux of the
-    /// whole duplicate-safety argument (`docs/adr/0020-buffered-sink-delivery.md`), so it's pinned
+    /// whole duplicate-safety argument (`docs/adr/0021-buffered-sink-delivery.md`), so it's pinned
     /// directly rather than trusted to a handful of spot checks.
     #[test]
     fn is_retryable_matches_the_adr_table_exhaustively() {

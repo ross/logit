@@ -373,7 +373,7 @@ tests that manually pin each ordering
 
 **A further hop past `Fanout::send` exists for an `Output` branch, and it is not free.** The table
 above measures `Fanout::send` alone; a sink's batch then takes one more step,
-`drain_inbox` (`runtime.rs`, [ADR 0020](../adr/0020-buffered-sink-delivery.md)), which moves it off
+`drain_inbox` (`runtime.rs`, [ADR 0021](../adr/0021-buffered-sink-delivery.md)), which moves it off
 the component's inbox into its `SinkQueue`. For a single-consumer edge, `Fanout::send` itself costs
 0 (the table's first row) — but `drain_inbox` always needs an `Arc<EventBatch>` to hand to the
 queue, so a `Delivered::Owned` batch costs exactly one `Arc::new` there, previously paid nowhere on
@@ -382,7 +382,7 @@ this path at all. `drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc
 rather than through a full `run`. A `Delivered::Shared` batch (a real fan-out) already carries its
 `Arc`, so this hop costs `drain_inbox` nothing further beyond what the table above already counts.
 
-**This likelihood flipped with [ADR 0020](../adr/0020-buffered-sink-delivery.md).** Before it,
+**This likelihood flipped with [ADR 0021](../adr/0021-buffered-sink-delivery.md).** Before it,
 `run_output` held its `Arc` handle for the full duration of `output.send` — typically real I/O,
 measurably slower than a `Transform`'s local processing — so 6 was the likelier practical outcome
 despite 1 being reachable. After the drain/write split, `drain_inbox` drops its handle the instant
@@ -550,7 +550,7 @@ is an admission-control estimate, not an allocator-accounting figure — unlike 
 exact-equality discipline: a `MetricKind::Distribution`'s `DDSketch` is approximated with a fixed
 constant rather than walked bin-by-bin, and `Value`'s numeric/bool/null variants (stored inline, no
 heap component) contribute nothing. It is consumed by the buffered sink-delivery work
-(`docs/plans/0003-buffered-sink-delivery.md`, `docs/adr/0020-buffered-sink-delivery.md`): every
+(`docs/plans/0004-buffered-sink-delivery.md`, `docs/adr/0021-buffered-sink-delivery.md`): every
 sink's `SinkQueue` (`crates/logit-pipeline/src/sink_queue.rs`) bounds itself on both batch count
 and this estimate, whichever trips first.
 

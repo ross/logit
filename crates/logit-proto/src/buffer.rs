@@ -1,7 +1,7 @@
 //! The output buffering trait. See `docs/design/wire-protocol.md`: this boundary is cheap to add
 //! now and expensive to retrofit onto call sites that assumed an in-memory queue, so it's defined
 //! even though only an in-memory implementation ships initially. See
-//! `docs/adr/0020-buffered-sink-delivery.md` for why the ack shape is `peek`/`commit` rather than
+//! `docs/adr/0021-buffered-sink-delivery.md` for why the ack shape is `peek`/`commit` rather than
 //! `push`/`pop`, and why `Block` is not a variant of [`OverflowPolicy`].
 
 use std::collections::VecDeque;
@@ -34,7 +34,7 @@ pub enum OverflowPolicy {
 
 /// A bounded, in-process queue between a producer and a slower/intermittent consumer, with an
 /// ack-based removal so a consumer can retry a not-yet-confirmed delivery without losing it
-/// (`peek`/`commit`, not `pop`) -- see `docs/adr/0020-buffered-sink-delivery.md`.
+/// (`peek`/`commit`, not `pop`) -- see `docs/adr/0021-buffered-sink-delivery.md`.
 pub trait Buffer<T> {
     /// Push `item`, weighing `weight` bytes for the buffer's byte-aware bound (see
     /// `EventBatch::estimated_heap_bytes`, `logit-core`; impls that don't bound by weight can

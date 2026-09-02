@@ -1,4 +1,4 @@
-# 0020 — Buffered, decoupled sink delivery
+# 0021 — Buffered, decoupled sink delivery
 
 ## Status
 Accepted
@@ -23,7 +23,7 @@ and calling it *"the actual fix for the retry-vs-backpressure tension."* This AD
 scoped to the sink side of the decoupling gap — the listener side (`StatsdInput::run` still
 interleaving `recv_from`/decode/`Fanout::send`) is untouched and stays a documented, open gap.
 
-`docs/plans/0003-buffered-sink-delivery.md` is the workstream breakdown; this ADR records the
+`docs/plans/0004-buffered-sink-delivery.md` is the workstream breakdown; this ADR records the
 decisions that breakdown depends on.
 
 ## Decision

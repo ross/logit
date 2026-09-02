@@ -42,7 +42,7 @@ fn non_empty_components_schema(generator: &mut SchemaGenerator) -> Schema {
 pub struct Component {
     #[serde(default)]
     pub sources: Vec<String>,
-    /// Per-sink delivery buffer (`docs/adr/0020-buffered-sink-delivery.md`). Meaningful only on a
+    /// Per-sink delivery buffer (`docs/adr/0021-buffered-sink-delivery.md`). Meaningful only on a
     /// sink -- graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value
     /// on any other kind. A sibling field of `kind`, not nested inside every sink
     /// `ComponentKind` variant, so a future fifth sink kind costs nothing extra here.
@@ -297,7 +297,7 @@ impl JsonSchema for StdioTarget {
     }
 }
 
-/// Per-sink delivery buffer (`docs/adr/0020-buffered-sink-delivery.md`). Meaningful only on a
+/// Per-sink delivery buffer (`docs/adr/0021-buffered-sink-delivery.md`). Meaningful only on a
 /// sink; graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on
 /// any other kind. Every field defaults, so an omitted `buffer:` block is exactly today's
 /// behavior.
@@ -315,7 +315,7 @@ pub struct BufferConfig {
     pub max_bytes: u64,
     pub overflow: OverflowPolicy,
     /// `None` -- the default -- means "derive from the sink's own `duplicate_safe()` fact"
-    /// (`docs/adr/0020-buffered-sink-delivery.md`'s three-layer posture design). `Some(_)`
+    /// (`docs/adr/0021-buffered-sink-delivery.md`'s three-layer posture design). `Some(_)`
     /// overrides that default for this component specifically.
     #[serde(default)]
     pub delivery: Option<DeliveryPosture>,
