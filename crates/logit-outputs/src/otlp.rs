@@ -1,0 +1,1078 @@
+//! OTLP output -- exports logs, metrics, and traces to any OTLP-speaking backend, over either
+//! OTLP/HTTP (protobuf-over-POST) or OTLP/gRPC, selected by `protocol` in config
+//! (`logit_config::OtlpProtocol`). See `docs/adr/0024-hand-rolled-grpc-over-hyper.md` for why the
+//! gRPC transport is a ~150-line hand-rolled client over `hyper` rather than `tonic`.
+//!
+//! **One `send` call, several HTTP/gRPC requests.** `logit`'s [`EventBatch`] mixes logs, metrics,
+//! and spans on one `Event` (ADR 0012), but OTLP is three separate services -- so `send` calls
+//! [`logit_proto::SignalEncoder::encode_signals`] once and issues one request per non-empty
+//! signal it returns, sequentially, in whatever order `encode_signals` produced them. A batch with
+//! only metrics issues exactly one request; a mixed batch issues up to three. This is also why
+//! [`OtlpOutput::duplicate_safe`] is `false` -- see that method's doc comment.
+//!
+//! **`Fault` classification is this output's own**, not shared with [`crate::influxdb`]'s
+//! `classify_transport_error`/`is_retryable_status` -- OTLP's status vocabulary (gRPC status codes
+//! alongside HTTP ones) doesn't fit either helper as-is, and reusing them by coincidence would tie
+//! two independently-evolving protocols' retry semantics together for no reason. The table:
+//!
+//! | Condition | `Fault` |
+//! |---|---|
+//! | Connect refused, DNS failure (the request never reached anything) | `Clean` |
+//! | Request timeout | `Ambiguous` |
+//! | HTTP 429 or any 5xx; gRPC `UNAVAILABLE`/`RESOURCE_EXHAUSTED`/`DEADLINE_EXCEEDED`/`ABORTED`/`INTERNAL` | `Ambiguous` |
+//! | Any other HTTP 4xx; gRPC `INVALID_ARGUMENT`/`UNAUTHENTICATED`/`PERMISSION_DENIED`/`UNIMPLEMENTED` | `Permanent` |
+//! | Any other gRPC status | `Permanent` (never retry a code this sink doesn't positively recognize) |
+//!
+//! **Partial success.** A 2xx/`OK` response can still say "I only accepted part of this" via OTLP's
+//! own `Export*ServiceResponse.partial_success` field (`rejected_<signal>` + `error_message`) --
+//! this output parses that by hand ([`parse_partial_success`]) rather than pulling in the generated
+//! collector-service types `logit-proto` deliberately doesn't generate (see that crate's `otlp`
+//! module doc: the wire shape is identical across all three signals, so one hand-rolled parser
+//! covers it). A partial rejection still counts as a successful `send` -- the accepted portion
+//! already landed, and retrying would duplicate it -- but is counted
+//! (`logit.output.records.rejected{signal}`) and throttle-warned with the server's own message.
+
+use crate::Output;
+use anyhow::Context;
+use bytes::Bytes;
+use http::{HeaderMap, Method};
+use http_body_util::{BodyExt, Full};
+use hyper::client::conn::http2;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use logit_core::{Diagnostics, EventBatch, Telemetry};
+use logit_pipeline::Fault;
+use logit_proto::otlp::OtlpEncoder;
+use logit_proto::{Signal, SignalEncoder};
+use std::time::Duration;
+use tokio::net::TcpStream;
+
+/// See [`crate::influxdb::DEFAULT_TIMEOUT`]'s doc comment -- same reasoning, a separate constant
+/// because these are two unrelated outputs, not because the value differs.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Which OTLP wire transport this sink speaks. Mirrors `logit_config::OtlpProtocol` -- this crate
+/// doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), so
+/// `logit-cli::pipeline::build_spec` translates one into the other at construction time, the same
+/// way it already turns `StdioTarget` into calls on `StdioOutput`'s own constructors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtlpTransport {
+    Http,
+    Grpc,
+}
+
+pub struct OtlpOutput {
+    endpoint: String,
+    transport: OtlpTransport,
+    client: reqwest::Client,
+    request_timeout: Duration,
+    encoder: OtlpEncoder,
+    telemetry: Telemetry,
+    diag: Diagnostics,
+}
+
+impl OtlpOutput {
+    /// Fails construction outright for a `protocol: grpc` endpoint written with an `https://`
+    /// scheme -- see [`reject_insecure_grpc_endpoint`] for why that can't be treated as a friendly
+    /// alternate spelling the way `http://`/`grpc://` are.
+    pub fn new(endpoint: String, transport: OtlpTransport) -> anyhow::Result<Self> {
+        reject_insecure_grpc_endpoint(&endpoint, transport)?;
+        Ok(Self {
+            endpoint,
+            transport,
+            client: build_client(DEFAULT_TIMEOUT),
+            request_timeout: DEFAULT_TIMEOUT,
+            encoder: OtlpEncoder::new(),
+            telemetry: Telemetry::default(),
+            diag: Diagnostics::default(),
+        })
+    }
+
+    /// Overrides the default 10s request timeout (HTTP transport: `reqwest`'s own timeout; gRPC
+    /// transport: the whole connect+handshake+request+response round trip, via
+    /// `tokio::time::timeout`).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.client = build_client(timeout);
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Attaches a component id to this output's own diagnostics and, via
+    /// [`OtlpEncoder::with_diagnostics`], to its encoder's lossy-metric-path diagnostics.
+    pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.diag = diag.clone();
+        self.encoder = self.encoder.with_diagnostics(diag);
+        self
+    }
+
+    /// Attaches a telemetry handle -- see [`crate::influxdb::InfluxDbOutput`]'s `telemetry` field
+    /// for the layer-3 rationale. Also threaded into the encoder, for the lossy-metric-path
+    /// counters (`docs/design/wire-protocol.md`... see `logit-proto`'s `otlp::metrics` module doc).
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry.clone();
+        self.encoder = self.encoder.with_telemetry(telemetry);
+        self
+    }
+
+    fn record_partial_success(&mut self, signal: Signal, rejected: i64, error_message: &str) {
+        if rejected > 0 {
+            self.telemetry.count(
+                "logit.output.records.rejected",
+                rejected as f64,
+                &[("signal", signal.as_str())],
+            );
+            self.diag.warn_throttled(
+                "otlp_partial_success",
+                format_args!(
+                    "OTLP {} export partially rejected ({rejected} record(s)): {error_message}",
+                    signal.as_str()
+                ),
+            );
+        }
+    }
+
+    async fn send_http(&mut self, signal: Signal, payload: Bytes) -> anyhow::Result<()> {
+        let url = format!("{}{}", self.endpoint.trim_end_matches('/'), signal.path());
+        let result = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/x-protobuf")
+            .timeout(self.request_timeout)
+            .body(payload)
+            .send()
+            .await;
+
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                self.telemetry.count(
+                    "logit.output.requests",
+                    1.0,
+                    &[("signal", signal.as_str()), ("class", status_class(resp.status()))],
+                );
+                let body = resp.bytes().await.unwrap_or_default();
+                let (rejected, message) = parse_partial_success(&body);
+                self.record_partial_success(signal, rejected, &message);
+                Ok(())
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                self.telemetry.count(
+                    "logit.output.requests",
+                    1.0,
+                    &[("signal", signal.as_str()), ("class", status_class(status))],
+                );
+                let text = resp.text().await.unwrap_or_default();
+                let fault = if is_retryable_http_status(status) {
+                    Fault::Ambiguous
+                } else {
+                    Fault::Permanent
+                };
+                Err(anyhow::anyhow!(
+                    "OTLP/HTTP {} write failed ({status}): {text}",
+                    signal.as_str()
+                ))
+                .context(fault)
+            }
+            Err(err) => {
+                self.telemetry.count(
+                    "logit.output.requests",
+                    1.0,
+                    &[("signal", signal.as_str()), ("class", "network_error")],
+                );
+                let fault = classify_reqwest_error(&err);
+                Err(anyhow::Error::new(err)).context(fault)
+            }
+        }
+    }
+
+    async fn send_grpc(&mut self, signal: Signal, payload: Bytes) -> anyhow::Result<()> {
+        let authority = grpc_authority(&self.endpoint).to_string();
+        let outcome =
+            tokio::time::timeout(self.request_timeout, grpc_roundtrip(&authority, signal, payload))
+                .await;
+
+        let (code, message, body) = match outcome {
+            Ok(Ok(v)) => v,
+            Ok(Err((fault, err))) => {
+                self.telemetry.count(
+                    "logit.output.requests",
+                    1.0,
+                    &[("signal", signal.as_str()), ("class", "network_error")],
+                );
+                return Err(err).context(fault);
+            }
+            Err(_) => {
+                self.telemetry.count(
+                    "logit.output.requests",
+                    1.0,
+                    &[("signal", signal.as_str()), ("class", "network_error")],
+                );
+                return Err(anyhow::anyhow!(
+                    "OTLP/gRPC {} request to {authority} timed out",
+                    signal.as_str()
+                ))
+                .context(Fault::Ambiguous);
+            }
+        };
+
+        self.telemetry.count(
+            "logit.output.requests",
+            1.0,
+            &[("signal", signal.as_str()), ("class", grpc_status_class(code))],
+        );
+
+        if code == 0 {
+            let (rejected, err_msg) = parse_partial_success(&body);
+            self.record_partial_success(signal, rejected, &err_msg);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "OTLP/gRPC {} write failed (grpc-status {code}): {message}",
+                signal.as_str()
+            ))
+            .context(grpc_fault(code))
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Output for OtlpOutput {
+    /// Exactly one attempt per request, same "no retry in a sink" contract every other output
+    /// follows (`docs/adr/0021-buffered-sink-delivery.md`) -- but here that's per-*request*, not
+    /// per-`send` call: a batch producing three signals issues three requests, and the first
+    /// failure aborts the rest without attempting them. `write_loop` sees this as one failed
+    /// `send` and retries the whole batch, which is exactly what makes duplicate-safety a real
+    /// question here (see [`OtlpOutput::duplicate_safe`]).
+    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let payloads = self.encoder.encode_signals(batch)?;
+        for (signal, payload) in payloads {
+            match self.transport {
+                OtlpTransport::Http => self.send_http(signal, payload).await?,
+                OtlpTransport::Grpc => self.send_grpc(signal, payload).await?,
+            }
+        }
+        Ok(())
+    }
+
+    /// `false`, unlike [`crate::influxdb::InfluxDbOutput`] -- for two independent reasons, either
+    /// one sufficient on its own:
+    ///
+    /// 1. **A batch carrying more than one signal issues more than one request.** If the second of
+    ///    three requests fails, `write_loop`'s retry re-sends the *whole batch* -- including the
+    ///    first signal's request, which already succeeded. That request is not idempotent (see
+    ///    the next point), so the retry duplicates it.
+    /// 2. **OTLP has no idempotency identity at all.** A span has no "already delivered" marker a
+    ///    backend can dedupe on, so replaying one creates a second, distinct span in the trace. A
+    ///    delta `Sum`/`Counter` has no identity either, so replaying one double-counts it at the
+    ///    backend -- unlike InfluxDB line protocol's `(measurement, tag set, timestamp)` identity,
+    ///    which makes a re-sent InfluxDB point an idempotent overwrite rather than a duplicate.
+    ///
+    /// `AtMostOnce` (this method's `false`) is therefore the correct default. An operator who
+    /// wants at-least-once delivery anyway already has `buffer: { delivery: at_least_once }` --
+    /// no new code needed for that override.
+    fn duplicate_safe(&self) -> bool {
+        false
+    }
+}
+
+fn build_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("reqwest client should build with default TLS settings")
+}
+
+/// A coarse HTTP response-status bucket -- see `crate::influxdb::status_class`'s identical
+/// reasoning; duplicated rather than shared because these are two independently-evolving outputs.
+fn status_class(status: reqwest::StatusCode) -> &'static str {
+    match status.as_u16() / 100 {
+        1 => "1xx",
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        5 => "5xx",
+        _ => "other",
+    }
+}
+
+/// 429 and any 5xx are transient (`Fault::Ambiguous`); every other 4xx is a configuration error
+/// (`Fault::Permanent`) -- see this module's doc comment table.
+fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status.as_u16() == 429
+}
+
+/// See `crate::influxdb::classify_transport_error`'s doc comment -- same underlying
+/// `reqwest::Error::is_connect()` distinction, duplicated (not shared) per this module's own doc
+/// comment on why `Fault` classification isn't shared between the two outputs.
+fn classify_reqwest_error(err: &reqwest::Error) -> Fault {
+    if err.is_connect() {
+        Fault::Clean
+    } else {
+        Fault::Ambiguous
+    }
+}
+
+/// A telemetry-tag-friendly name for a gRPC status code -- only the codes this module's Fault
+/// table cares about get their own name; anything else (a code that's valid gRPC but not one
+/// `otlp_out` treats specially) buckets as `"other"`, mirroring `status_class`'s `"other"` arm.
+fn grpc_status_class(code: u32) -> &'static str {
+    match code {
+        0 => "ok",
+        3 => "invalid_argument",
+        4 => "deadline_exceeded",
+        7 => "permission_denied",
+        8 => "resource_exhausted",
+        10 => "aborted",
+        12 => "unimplemented",
+        13 => "internal",
+        14 => "unavailable",
+        16 => "unauthenticated",
+        _ => "other",
+    }
+}
+
+/// Maps a gRPC status code to a [`Fault`] -- this module's doc comment table. Anything not
+/// explicitly listed defaults to `Fault::Permanent`, the same reasoning
+/// `logit_pipeline::classify`'s own unclassified-error default uses: never retry a status this
+/// sink doesn't positively recognize as transient.
+fn grpc_fault(code: u32) -> Fault {
+    match code {
+        14 | 8 | 4 | 10 | 13 => Fault::Ambiguous, // UNAVAILABLE, RESOURCE_EXHAUSTED,
+        // DEADLINE_EXCEEDED, ABORTED, INTERNAL
+        _ => Fault::Permanent, // INVALID_ARGUMENT, UNAUTHENTICATED, PERMISSION_DENIED,
+                               // UNIMPLEMENTED, and every other/unrecognized code
+    }
+}
+
+/// Rejects a `protocol: grpc` endpoint written with an `https://` scheme, as a hard
+/// construction-time error rather than a silent downgrade. This output's gRPC transport has no
+/// TLS support at all (`docs/adr/0024-hand-rolled-grpc-over-hyper.md` -- unary gRPC over plain
+/// `hyper`, nothing more) -- so unlike `grpc_authority`'s deliberate `http://`/`grpc://`
+/// equivalence (an operator copying one component's endpoint to the other, where both spellings
+/// genuinely mean the same plaintext connection), treating `https://` as one more friendly
+/// alternate spelling would silently export every log line, span, and attribute value over the
+/// network **unencrypted** -- no error, no diagnostic, just a config typo turning into a real
+/// interception risk. Checked once, here, rather than inside `grpc_authority` itself, so an
+/// `https://` endpoint can never reach a live `TcpStream::connect` call at all: even if some
+/// future call site skipped this check, `grpc_authority` no longer strips `https://`, so the
+/// connect attempt would fail loudly on an invalid hostname rather than quietly succeed in
+/// plaintext.
+fn reject_insecure_grpc_endpoint(endpoint: &str, transport: OtlpTransport) -> anyhow::Result<()> {
+    if transport == OtlpTransport::Grpc && endpoint.to_ascii_lowercase().starts_with("https://") {
+        anyhow::bail!(
+            "otlp_out: endpoint {endpoint:?} has protocol: grpc, but this output's gRPC \
+             transport has no TLS support (docs/adr/0024-hand-rolled-grpc-over-hyper.md) -- an \
+             https:// endpoint would silently be exported in plaintext. Use protocol: http for a \
+             TLS-terminated OTLP endpoint, or a plaintext http://... / grpc://... endpoint for \
+             gRPC"
+        );
+    }
+    Ok(())
+}
+
+/// Strips a leading URL scheme from `endpoint`, if present, leaving a bare `host:port` --
+/// `TcpStream::connect` (the gRPC transport's connection primitive; there is no higher-level
+/// client to hand a full URL to, unlike the HTTP transport's `reqwest::Client`) wants an
+/// authority, not a URL. Config's `endpoint` is written either way (`tempo:4317` in the demo,
+/// following the HTTP transport's `http://host:port` habit if an operator copies one config to
+/// the other) -- accepting both means a typo'd `grpc://`/`http://` scheme on a `protocol: grpc`
+/// component fails at connect time with a clear error, not a confusing "invalid DNS name" one.
+///
+/// **Deliberately does not strip `https://`** -- see [`reject_insecure_grpc_endpoint`], which
+/// every `OtlpOutput` construction runs before this function can ever see an endpoint. An
+/// `https://`-prefixed authority reaching `TcpStream::connect` unstripped fails as an invalid
+/// hostname, which is the correct, loud failure mode if that guard is ever bypassed -- silently
+/// treating `https://` the same as `http://`/`grpc://` here is exactly the insecure-downgrade
+/// this function must never do.
+fn grpc_authority(endpoint: &str) -> &str {
+    endpoint
+        .strip_prefix("grpc://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+        .unwrap_or(endpoint)
+        .trim_end_matches('/')
+}
+
+/// Connects to `authority`, classifying an outright failure to establish the TCP connection at all
+/// -- connection refused, DNS/name-resolution failure, network unreachable, all of it -- as
+/// [`Fault::Clean`]: none of those cases got as far as a real destination seeing a byte, so
+/// there's nothing to duplicate on retry. Unlike `crate::influxdb::classify_transport_error`,
+/// there's no `reqwest::Error::is_connect()` to lean on here -- this output drives a raw
+/// `TcpStream` itself for the gRPC transport -- so the distinction is drawn at the call site
+/// instead: any error from this call happened before a single application byte could have been
+/// sent, and a *slow* (rather than outright failing) connect attempt is caught by
+/// `send_grpc`'s overall per-request timeout instead, which classifies as `Fault::Ambiguous`.
+async fn connect(authority: &str) -> Result<TcpStream, Fault> {
+    TcpStream::connect(authority).await.map_err(|_| Fault::Clean)
+}
+
+/// One full gRPC unary round trip: connect, HTTP/2 handshake, send one framed request, and read
+/// back the framed response payload plus its `grpc-status`/`grpc-message` -- checked in the
+/// response's headers first (a "Trailers-Only" response, the shape a server sends for an
+/// immediate failure with no message body -- e.g. Tempo rejecting an unknown method) and its
+/// trailers second (the shape a successful, or gracefully-failed-after-a-response, unary call
+/// uses). `send_grpc` is the only caller, and owns turning an `Err` here into telemetry plus the
+/// final classified `anyhow::Result` -- this only ever returns `(fault, err)` pairs, never
+/// classifies on its own.
+async fn grpc_roundtrip(
+    authority: &str,
+    signal: Signal,
+    payload: Bytes,
+) -> Result<(u32, String, Bytes), (Fault, anyhow::Error)> {
+    let stream = connect(authority).await.map_err(|fault| {
+        (
+            fault,
+            anyhow::anyhow!("connecting to {authority} for OTLP/gRPC {} failed", signal.as_str()),
+        )
+    })?;
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) =
+        http2::Builder::new(TokioExecutor::new()).handshake(io).await.map_err(|e| {
+            (Fault::Ambiguous, anyhow::Error::new(e).context("OTLP/gRPC handshake failed"))
+        })?;
+    // Drives the HTTP/2 connection's background I/O -- `sender.send_request` below only queues a
+    // request onto it. Aborted implicitly once `sender` (and every clone) drops and this future
+    // sees the connection close; nothing here needs to await it.
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let body = Full::new(Bytes::from(grpc_frame(&payload)));
+    let req = http::Request::builder()
+        .method(Method::POST)
+        .uri(signal.grpc_method())
+        .header("content-type", "application/grpc+proto")
+        .header("te", "trailers")
+        .header("grpc-accept-encoding", "identity")
+        .body(body)
+        .expect("a well-formed request always builds");
+
+    let res = sender.send_request(req).await.map_err(|e| {
+        (Fault::Ambiguous, anyhow::Error::new(e).context("OTLP/gRPC request failed"))
+    })?;
+
+    let header_status = grpc_status_from(res.headers());
+    let collected = res.into_body().collect().await.map_err(|e| {
+        (Fault::Ambiguous, anyhow::Error::new(e).context("reading the OTLP/gRPC response failed"))
+    })?;
+    let trailer_status = collected.trailers().and_then(grpc_status_from);
+    let Some((code, message)) = header_status.or(trailer_status) else {
+        return Err((
+            Fault::Ambiguous,
+            anyhow::anyhow!("OTLP/gRPC {} response carried no grpc-status", signal.as_str()),
+        ));
+    };
+
+    let framed = collected.to_bytes();
+    let response_payload = grpc_unframe(&framed).unwrap_or(&[]);
+    Ok((code, message, Bytes::copy_from_slice(response_payload)))
+}
+
+/// Reads `grpc-status`/`grpc-message` out of a header map (either a response's own headers, for a
+/// Trailers-Only failure, or its real trailers). `None` if `grpc-status` is absent or not a valid
+/// unsigned integer -- the caller treats that as "no status here," not "status 0."
+fn grpc_status_from(headers: &HeaderMap) -> Option<(u32, String)> {
+    let status = headers.get("grpc-status")?.to_str().ok()?.parse::<u32>().ok()?;
+    let message =
+        headers.get("grpc-message").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    Some((status, message))
+}
+
+/// Frames `payload` as one unary gRPC message: `[compressed:u8=0][len:u32 BE][payload]` -- the
+/// wire shape every gRPC-over-HTTP/2 message body uses, request or response
+/// (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`). The compressed flag is always `0`: this
+/// output never sets `grpc-encoding` on a request, so there is never anything to mark compressed.
+fn grpc_frame(payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(5 + payload.len());
+    buf.push(0u8);
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// The mirror of [`grpc_frame`]: strips the 5-byte header and returns the payload slice. `None`
+/// for anything short of one complete, uncompressed frame -- a body shorter than 5 bytes, a
+/// compressed-flag byte other than `0` (this output never asked for compression, so a peer that
+/// sends one anyway is either broken or lying about its own `grpc-encoding` response header), or a
+/// declared length longer than what's actually present.
+fn grpc_unframe(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < 5 || bytes[0] != 0 {
+        return None;
+    }
+    let len = u32::from_be_bytes(bytes[1..5].try_into().expect("checked len >= 5 above")) as usize;
+    bytes.get(5..5 + len)
+}
+
+/// Reads a protobuf varint starting at `buf[*pos]`, advancing `*pos` past it. `None` on a
+/// truncated or pathologically long (more than 10 bytes -- the most a 64-bit varint ever needs)
+/// varint, either of which means malformed input rather than a real field.
+fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    loop {
+        let byte = *buf.get(*pos)?;
+        *pos += 1;
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+}
+
+/// Parses just enough of an `Export*ServiceResponse` (the OTLP collector wire shape --
+/// `crates/logit-proto/proto/opentelemetry/proto/collector/*/v1/*_service.proto`, none of which
+/// `logit-proto` generates types for -- see that crate's `otlp` module doc for why) to read back
+/// `partial_success.rejected_<signal>`/`.error_message`. All three signals' response messages are
+/// wire-identical in the one respect this cares about: field 1 is `partial_success`
+/// (length-delimited), itself field 1 a varint count and field 2 a string message -- so one
+/// hand-rolled parser covers logs, metrics, and traces alike. An empty, absent, or malformed
+/// `partial_success` decodes as `(0, "")` -- "no partial success" -- matching proto3's own
+/// "an unset field reads back as its default" semantics rather than failing the whole response
+/// over a field this output only ever uses for a warning, never a hard failure.
+fn parse_partial_success(bytes: &[u8]) -> (i64, String) {
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let Some(tag) = read_varint(bytes, &mut pos) else { break };
+        let field = tag >> 3;
+        let wire_type = tag & 0x7;
+        match (field, wire_type) {
+            (1, 2) => {
+                let Some(len) = read_varint(bytes, &mut pos) else { break };
+                let Some(end) = pos.checked_add(len as usize) else { break };
+                let Some(sub) = bytes.get(pos..end) else { break };
+                return parse_partial_success_message(sub);
+            }
+            _ => {
+                if skip_field(bytes, &mut pos, wire_type).is_none() {
+                    break;
+                }
+            }
+        }
+    }
+    (0, String::new())
+}
+
+fn parse_partial_success_message(bytes: &[u8]) -> (i64, String) {
+    let mut pos = 0;
+    let mut rejected = 0i64;
+    let mut message = String::new();
+    while pos < bytes.len() {
+        let Some(tag) = read_varint(bytes, &mut pos) else { break };
+        let field = tag >> 3;
+        let wire_type = tag & 0x7;
+        match (field, wire_type) {
+            (1, 0) => match read_varint(bytes, &mut pos) {
+                Some(v) => rejected = v as i64,
+                None => break,
+            },
+            (2, 2) => {
+                let Some(len) = read_varint(bytes, &mut pos) else { break };
+                let Some(end) = pos.checked_add(len as usize) else { break };
+                let Some(s) = bytes.get(pos..end) else { break };
+                pos = end;
+                message = String::from_utf8_lossy(s).into_owned();
+            }
+            _ => {
+                if skip_field(bytes, &mut pos, wire_type).is_none() {
+                    break;
+                }
+            }
+        }
+    }
+    (rejected, message)
+}
+
+/// Advances `pos` past one field's value, given its wire type, without interpreting it -- for a
+/// field number this parser doesn't care about. `None` on a length-delimited field whose declared
+/// length runs past the end of `bytes` (malformed), or a group-encoded field (wire types 3/4,
+/// deprecated in proto3 and never emitted by anything this parser reads).
+fn skip_field(bytes: &[u8], pos: &mut usize, wire_type: u64) -> Option<()> {
+    match wire_type {
+        0 => read_varint(bytes, pos).map(|_| ()),
+        1 => {
+            *pos += 8;
+            (*pos <= bytes.len()).then_some(())
+        }
+        2 => {
+            let len = read_varint(bytes, pos)? as usize;
+            let end = pos.checked_add(len)?;
+            if end > bytes.len() {
+                return None;
+            }
+            *pos = end;
+            Some(())
+        }
+        5 => {
+            *pos += 4;
+            (*pos <= bytes.len()).then_some(())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use logit_core::{AttrMap, Event, MetricKind, MetricRecord, Registry, Resource};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn metric_batch() -> EventBatch {
+        EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![Event::metric(
+                1,
+                AttrMap::new(),
+                MetricRecord {
+                    name: logit_core::interner::intern("x"),
+                    kind: MetricKind::Counter(1.0),
+                    unit: None,
+                },
+            )],
+        }
+    }
+
+    fn all_three_signals_batch() -> EventBatch {
+        let log = Event::log(
+            1,
+            AttrMap::new(),
+            logit_core::LogRecord {
+                message: logit_core::Value::str("hi"),
+                severity: None,
+                body_format: logit_core::BodyFormat::Raw,
+            },
+        );
+        let metric = Event::metric(
+            2,
+            AttrMap::new(),
+            MetricRecord {
+                name: logit_core::interner::intern("m"),
+                kind: MetricKind::Counter(1.0),
+                unit: None,
+            },
+        );
+        let span = Event::span(
+            3,
+            AttrMap::new(),
+            logit_core::SpanRecord {
+                trace_id: [1; 16],
+                span_id: [2; 8],
+                parent_span_id: None,
+                name: logit_core::Value::str("s"),
+                kind: logit_core::SpanKind::Internal,
+                status: logit_core::SpanStatus::Ok,
+                events: Vec::new(),
+                links: Vec::new(),
+                end_timestamp: 4,
+            },
+        );
+        EventBatch { resource: Arc::new(Resource::default()), events: vec![log, metric, span] }
+    }
+
+    // ---- HTTP transport: a bare HTTP/1.1 canned-response peer, `influxdb.rs`'s pattern ----
+
+    async fn canned_http_server(
+        responses: Vec<&'static str>,
+    ) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_task = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let i = count_task.fetch_add(1, Ordering::SeqCst);
+                let response = responses.get(i).or(responses.last()).copied().unwrap_or("");
+                let mut buf = [0u8; 8192];
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await;
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (addr, count)
+    }
+
+    const RESP_200_EMPTY: &str =
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const RESP_400: &str =
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const RESP_429: &str =
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const RESP_503: &str =
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    fn http_output(addr: std::net::SocketAddr) -> OtlpOutput {
+        OtlpOutput::new(format!("http://{addr}"), OtlpTransport::Http).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_metrics_only_batch_issues_exactly_one_request_to_v1_metrics() {
+        let (addr, count) = canned_http_server(vec![RESP_200_EMPTY]).await;
+        let mut output = http_output(addr);
+        output.send(&metric_batch()).await.expect("should succeed");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_batch_with_all_three_signals_issues_exactly_three_requests() {
+        let (addr, count) =
+            canned_http_server(vec![RESP_200_EMPTY, RESP_200_EMPTY, RESP_200_EMPTY]).await;
+        let mut output = http_output(addr);
+        output.send(&all_three_signals_batch()).await.expect("should succeed");
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_503_response_is_classified_ambiguous() {
+        let (addr, _count) = canned_http_server(vec![RESP_503]).await;
+        let mut output = http_output(addr);
+        let err = output.send(&metric_batch()).await.expect_err("a 503 should fail send");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+    }
+
+    #[tokio::test]
+    async fn a_429_response_is_classified_ambiguous() {
+        let (addr, _count) = canned_http_server(vec![RESP_429]).await;
+        let mut output = http_output(addr);
+        let err = output.send(&metric_batch()).await.expect_err("a 429 should fail send");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+    }
+
+    #[tokio::test]
+    async fn a_400_response_is_classified_permanent() {
+        let (addr, _count) = canned_http_server(vec![RESP_400]).await;
+        let mut output = http_output(addr);
+        let err = output.send(&metric_batch()).await.expect_err("a 400 should fail send");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+    }
+
+    #[tokio::test]
+    async fn connect_refused_is_classified_clean() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let mut output = http_output(addr);
+        let err = output.send(&metric_batch()).await.expect_err("should fail");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+    }
+
+    #[tokio::test]
+    async fn a_request_timeout_is_classified_ambiguous() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                std::mem::forget(stream);
+            }
+        });
+        let mut output = http_output(addr).with_timeout(Duration::from_millis(50));
+        let err = output.send(&metric_batch()).await.expect_err("should time out");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+    }
+
+    #[tokio::test]
+    async fn a_partial_success_response_is_counted_not_failed() {
+        // partial_success { rejected_data_points: 2, error_message: "bad" }
+        let mut sub = vec![0x08, 2, 0x12, 3]; // rejected = 2 (fits in one varint byte), len 3
+        sub.extend_from_slice(b"bad");
+        let mut body = vec![0x0a, sub.len() as u8];
+        body.extend_from_slice(&sub);
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let mut buf = [0u8; 8192];
+            let _ = tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await;
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "otlp_out", "sink");
+        let mut output = http_output(addr).with_telemetry(telemetry);
+        output.send(&metric_batch()).await.expect("a partial success is still Ok");
+
+        let events = registry.drain(0);
+        let rejected = events
+            .iter()
+            .find_map(|e| {
+                e.metrics.iter().find_map(|m| match &m.kind {
+                    MetricKind::Counter(v)
+                        if logit_core::interner::resolve(m.name)
+                            == "logit.output.records.rejected" =>
+                    {
+                        Some(*v)
+                    }
+                    _ => None,
+                })
+            })
+            .unwrap_or(0.0);
+        assert_eq!(rejected, 2.0, "the rejected count should be counted, not silently dropped");
+    }
+
+    #[test]
+    fn otlp_output_reports_itself_not_duplicate_safe() {
+        let output =
+            OtlpOutput::new("http://localhost:4318".to_string(), OtlpTransport::Http).unwrap();
+        assert!(
+            !output.duplicate_safe(),
+            "a multi-signal batch issues several requests (a mid-batch failure would re-send an \
+             already-delivered signal on retry) and OTLP itself has no idempotency identity to \
+             make a re-sent request a safe overwrite -- see this module's doc comment"
+        );
+    }
+
+    // ---- gRPC transport: a raw HTTP/2 peer built with `hyper::server::conn::http2`. ----
+
+    /// Starts a bare gRPC-shaped HTTP/2 peer on an ephemeral port that always replies to any
+    /// unary call with the given `grpc-status`/`grpc-message`/response payload -- the gRPC
+    /// analogue of `canned_http_server` above.
+    async fn canned_grpc_server(
+        status: u32,
+        message: &'static str,
+        payload: Vec<u8>,
+    ) -> std::net::SocketAddr {
+        use hyper::service::service_fn;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let io = TokioIo::new(stream);
+                let payload = payload.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: http::Request<hyper::body::Incoming>| {
+                        let payload = payload.clone();
+                        async move {
+                            let mut trailers = HeaderMap::new();
+                            trailers.insert("grpc-status", status.to_string().parse().unwrap());
+                            trailers.insert("grpc-message", message.parse().unwrap());
+                            let frame = grpc_frame(&payload);
+                            let body = TestGrpcBody {
+                                data: Some(Bytes::from(frame)),
+                                trailers: Some(trailers),
+                            };
+                            Ok::<_, std::convert::Infallible>(
+                                http::Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/grpc+proto")
+                                    .body(body)
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Duplicated, minimal test-only twin of `logit_inputs::otlp::GrpcBody` -- a response body
+    /// that yields one data frame then one trailers frame. Kept local rather than shared: this is
+    /// the only place in this crate a *server*-shaped body is ever needed at all.
+    struct TestGrpcBody {
+        data: Option<Bytes>,
+        trailers: Option<HeaderMap>,
+    }
+
+    impl hyper::body::Body for TestGrpcBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            if let Some(data) = self.data.take() {
+                return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(data))));
+            }
+            if let Some(trailers) = self.trailers.take() {
+                return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::trailers(trailers))));
+            }
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    fn grpc_output(addr: std::net::SocketAddr) -> OtlpOutput {
+        OtlpOutput::new(addr.to_string(), OtlpTransport::Grpc).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_grpc_ok_status_succeeds() {
+        let addr = canned_grpc_server(0, "", Vec::new()).await;
+        let mut output = grpc_output(addr);
+        output.send(&metric_batch()).await.expect("grpc-status 0 should succeed");
+    }
+
+    #[tokio::test]
+    async fn grpc_unavailable_is_classified_ambiguous() {
+        let addr = canned_grpc_server(14, "unavailable", Vec::new()).await;
+        let mut output = grpc_output(addr);
+        let err = output.send(&metric_batch()).await.expect_err("should fail");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+    }
+
+    #[tokio::test]
+    async fn grpc_resource_exhausted_is_classified_ambiguous() {
+        let addr = canned_grpc_server(8, "resource exhausted", Vec::new()).await;
+        let mut output = grpc_output(addr);
+        let err = output.send(&metric_batch()).await.expect_err("should fail");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+    }
+
+    #[tokio::test]
+    async fn grpc_invalid_argument_is_classified_permanent() {
+        let addr = canned_grpc_server(3, "invalid argument", Vec::new()).await;
+        let mut output = grpc_output(addr);
+        let err = output.send(&metric_batch()).await.expect_err("should fail");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+    }
+
+    #[tokio::test]
+    async fn grpc_unimplemented_is_classified_permanent() {
+        let addr = canned_grpc_server(12, "unimplemented", Vec::new()).await;
+        let mut output = grpc_output(addr);
+        let err = output.send(&metric_batch()).await.expect_err("should fail");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+    }
+
+    #[tokio::test]
+    async fn grpc_partial_success_is_counted_not_failed() {
+        let sub = vec![0x08, 1]; // rejected = 1
+        let mut body = vec![0x0a, sub.len() as u8];
+        body.extend_from_slice(&sub);
+
+        let addr = canned_grpc_server(0, "", body).await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "otlp_out", "sink");
+        let mut output = grpc_output(addr).with_telemetry(telemetry);
+        output.send(&metric_batch()).await.expect("partial success is still Ok");
+
+        let events = registry.drain(0);
+        let rejected = events
+            .iter()
+            .find_map(|e| {
+                e.metrics.iter().find_map(|m| match &m.kind {
+                    MetricKind::Counter(v)
+                        if logit_core::interner::resolve(m.name)
+                            == "logit.output.records.rejected" =>
+                    {
+                        Some(*v)
+                    }
+                    _ => None,
+                })
+            })
+            .unwrap_or(0.0);
+        assert_eq!(rejected, 1.0);
+    }
+
+    #[test]
+    fn grpc_frame_and_unframe_round_trip() {
+        let payload = b"hello world";
+        let framed = grpc_frame(payload);
+        assert_eq!(framed[0], 0, "uncompressed flag");
+        assert_eq!(grpc_unframe(&framed), Some(&payload[..]));
+    }
+
+    #[test]
+    fn grpc_unframe_rejects_a_short_buffer() {
+        assert_eq!(grpc_unframe(&[0, 0, 0]), None);
+    }
+
+    #[test]
+    fn grpc_unframe_rejects_a_set_compressed_flag() {
+        let mut framed = grpc_frame(b"x");
+        framed[0] = 1;
+        assert_eq!(grpc_unframe(&framed), None);
+    }
+
+    #[test]
+    fn parse_partial_success_on_an_empty_body_is_zero_and_empty() {
+        assert_eq!(parse_partial_success(&[]), (0, String::new()));
+    }
+
+    /// A backend replying with a maximal (10-byte) varint length on the `partial_success` field
+    /// must not panic via `pos + len` overflowing `usize` -- `checked_add` should reject it as
+    /// malformed (the declared length runs past the end of `bytes` regardless) and fall back to
+    /// "no partial success," the same as any other truncated/malformed body.
+    #[test]
+    fn parse_partial_success_does_not_panic_on_an_overflowing_declared_length() {
+        // field 1 (partial_success), length-delimited, with the largest encodable varint length.
+        let mut bytes = vec![0x0a];
+        bytes.extend_from_slice(&[0xff; 9]);
+        bytes.push(0x01); // 10-byte varint, decodes to a huge u64
+        assert_eq!(parse_partial_success(&bytes), (0, String::new()));
+    }
+
+    /// The same overflow hazard one level down, inside the `partial_success` submessage's own
+    /// `error_message` field.
+    #[test]
+    fn parse_partial_success_message_does_not_panic_on_an_overflowing_declared_length() {
+        let mut bytes = vec![0x12]; // field 2 (error_message), length-delimited
+        bytes.extend_from_slice(&[0xff; 9]);
+        bytes.push(0x01);
+        assert_eq!(parse_partial_success_message(&bytes), (0, String::new()));
+    }
+
+    #[test]
+    fn grpc_authority_strips_every_scheme_it_recognizes() {
+        assert_eq!(grpc_authority("grpc://tempo:4317"), "tempo:4317");
+        assert_eq!(grpc_authority("http://tempo:4317"), "tempo:4317");
+        assert_eq!(grpc_authority("tempo:4317"), "tempo:4317");
+        assert_eq!(grpc_authority("http://tempo:4317/"), "tempo:4317");
+    }
+
+    /// `grpc_authority` must never treat `https://` as one more friendly alternate spelling --
+    /// see [`reject_insecure_grpc_endpoint`], which is what actually stops an `https://` endpoint
+    /// from reaching this function in normal use. Pinned here too, directly, so a future edit to
+    /// `grpc_authority` alone can't quietly reintroduce the downgrade even if the earlier guard
+    /// stays intact.
+    #[test]
+    fn grpc_authority_does_not_strip_https() {
+        assert_eq!(grpc_authority("https://tempo:4317"), "https://tempo:4317");
+    }
+
+    #[test]
+    fn constructing_an_otlp_output_with_https_and_protocol_grpc_is_rejected() {
+        // `OtlpOutput` isn't `Debug` (it embeds a `reqwest::Client`), so `Result::expect_err` --
+        // which needs `Debug` on the `Ok` side to format its panic message -- doesn't work here.
+        // Same reasoning `logit-cli::pipeline`'s own `build_spec` tests already follow.
+        let err = match OtlpOutput::new("https://tempo:4317".to_string(), OtlpTransport::Grpc) {
+            Ok(_) => panic!("an https:// endpoint under protocol: grpc must be a hard error"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("https"), "got: {msg}");
+        assert!(msg.contains("grpc"), "got: {msg}");
+    }
+
+    #[test]
+    fn constructing_an_otlp_output_with_https_and_protocol_http_succeeds() {
+        // `protocol: http` genuinely does support TLS (it's plain `reqwest`) -- only the gRPC
+        // transport is the problem.
+        OtlpOutput::new("https://tempo:4318".to_string(), OtlpTransport::Http)
+            .expect("https:// is exactly what protocol: http is for");
+    }
+
+    #[test]
+    fn constructing_an_otlp_output_with_http_and_protocol_grpc_succeeds() {
+        // The one legitimate alternate spelling `grpc_authority` still accepts.
+        OtlpOutput::new("http://tempo:4317".to_string(), OtlpTransport::Grpc)
+            .expect("http:// under protocol: grpc is a plaintext connection, not a downgrade");
+    }
+}

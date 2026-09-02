@@ -24,7 +24,11 @@ pub enum MetricKind {
     GaugeDelta(f64),
     Set(HyperLogLog),
     Distribution(DdSketch),
-    /// Fixed-bucket histogram, e.g. a Prometheus-style scrape input.
+    /// Fixed-bucket histogram, e.g. a Prometheus-style scrape input. Each `(bound, count)` pair is
+    /// that bucket's own count, not a cumulative running total up to `bound` -- safe to state
+    /// plainly since nothing in this codebase produces a `Histogram` yet (`crates/logit-proto/src/
+    /// otlp/metrics.rs` is the first, decoding OTLP's `HistogramDataPoint`/`ExponentialHistogramDataPoint`,
+    /// both of which are per-bucket on the wire too).
     Histogram {
         buckets: Vec<(f64, u64)>,
     },

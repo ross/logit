@@ -1,0 +1,14 @@
+[package]
+name = "protogen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Deliberately its own, empty workspace -- not a member of the root Cargo.toml workspace (see
+# crates/logit-proto/proto/README.md and docs/adr/0023-committed-pregenerated-otlp-protobuf.md).
+# `cargo build --workspace` from the repo root never touches this crate, and `prost-build`/
+# `protoc` never enter any build-time or CI dependency graph.
+[workspace]
+
+[dependencies]
+prost-build = "0.14"

@@ -7,6 +7,7 @@
 //! concrete protocol.
 
 pub mod internal;
+pub mod otlp;
 pub mod statsd;
 pub mod syslog;
 

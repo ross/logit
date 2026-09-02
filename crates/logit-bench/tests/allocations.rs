@@ -371,6 +371,48 @@ fn fanout_send_one_consumer_costs_nothing() {
     expect_allocs("fanout: send + receive, 1 consumer", stats, 0);
 }
 
+/// The test above proves the *disabled*-telemetry path is free, but `Fanout::send` now opens a
+/// span too (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`), and a
+/// disabled `Telemetry` handle (`Telemetry::default()`, `Option::None` inside) never reaches
+/// `Telemetry::span`'s sample-decision branch at all -- it can't stand in for the *live-but-
+/// unsampled* path a production pipeline with an `internal` component and the default (0.1, never
+/// 0.0 by default, but a rate below `1.0` is the common case) sample rate actually runs.
+/// This is that path, proven directly: a real `Registry` (`with_span_sampling(0.0)`, so every
+/// trace is dropped deterministically -- see `trace_is_sampled`), attached the same way
+/// `crates/logit-cli/src/pipeline.rs::prepare` attaches one in production. `SpanGuard::disabled()`
+/// is what `Telemetry::span` returns once `trace_is_sampled` says no, exactly like the
+/// `Option::None` case -- same expected count, 0, now actually exercising the branch that decides
+/// it rather than skipping it.
+#[test]
+fn fanout_send_one_consumer_with_a_live_unsampled_registry_costs_nothing() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let registry = logit_core::Registry::with_span_sampling(0.0);
+    let telemetry = registry.telemetry_for("in", "statsd_in", "listener");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let fanout = Fanout::new(vec![tx]).with_telemetry(telemetry);
+
+    // Warms both the usual first-call cost (`CountingAlloc`'s own module doc) and this
+    // `ComponentBuffer`'s point map -- `logit.component.batches.sent`/`.events.sent`/
+    // `.send.blocked.duration` all need their first-insert growth to happen here, not inside the
+    // measured region below, same reasoning as `docs/design/memory.md`'s "first call after a
+    // drain" cost: an update to an already-resident map key is free, a fresh insert isn't.
+    let warm = fixtures::nginx_batch(1);
+    rt.block_on(async {
+        fanout.send(warm).await;
+        drop(unwrap_delivered(rx.recv().await.expect("should receive")));
+    });
+
+    let batch = fixtures::nginx_batch(1);
+    let (received, stats) = measure(|| {
+        rt.block_on(async {
+            fanout.send(batch).await;
+            unwrap_delivered(rx.recv().await.expect("should receive"))
+        })
+    });
+    assert_eq!(received.events.len(), 1);
+    expect_allocs("fanout: send + receive, 1 consumer, live unsampled registry", stats, 0);
+}
+
 /// The other half of the same story, measured honestly rather than assumed: a real fan-out (two
 /// consumers here) still costs *one* branch a full `EventBatch` deep clone -- one `Vec<Event>`
 /// allocation plus the 4 allocations [`clone_one_event`] measures for the one nginx-shaped event
@@ -525,7 +567,7 @@ fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
             Delivered::Owned(batch, _ctx) => Arc::new(batch),
             Delivered::Shared(shared, _ctx) => shared,
         };
-        queue.push(warmed).await;
+        queue.push(warmed, TraceContext::default()).await;
         queue.commit();
     });
 
