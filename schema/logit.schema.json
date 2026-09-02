@@ -116,6 +116,14 @@
             "bind": {
               "type": "string"
             },
+            "protocol": {
+              "default": "http",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OtlpProtocol"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -567,6 +575,14 @@
             "endpoint": {
               "type": "string"
             },
+            "protocol": {
+              "default": "http",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OtlpProtocol"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -680,6 +696,24 @@
           ]
         }
       }
+    },
+    "OtlpProtocol": {
+      "description": "Which OTLP transport a component speaks -- both `otlp_in` and `otlp_out` carry identical protobuf payloads (`crates/logit-proto/src/otlp`), differing only in framing and endpoint shape (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`).",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "grpc"
+          ]
+        },
+        {
+          "description": "OTLP/HTTP, protobuf body, one POST per signal. Default: it's what an `http://host:4318`-shaped endpoint already implies, and a bare `endpoint: http://tempo:4318` would be silently wrong under any other default.",
+          "type": "string",
+          "enum": [
+            "http"
+          ]
+        }
+      ]
     },
     "OverflowPolicy": {
       "description": "What a sink's `SinkQueue` does once both its bounds (`max_batches`/`max_bytes`) are full. `logit-config`'s own copy -- `logit-config` must not depend on `logit-pipeline` (`docs/design/pipeline-graph.md`'s crate layout), so `crates/logit-cli/src/pipeline.rs` converts this to `logit_pipeline::OverflowPolicy` when building a `NodeSpec::Output`.",

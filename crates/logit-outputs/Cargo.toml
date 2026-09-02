@@ -14,6 +14,12 @@ anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 reqwest.workspace = true
+# otlp_out's hand-rolled gRPC-over-HTTP/2 client (docs/adr/0024-hand-rolled-grpc-over-hyper.md);
+# HTTP framing itself rides on `reqwest`, above.
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
 # A real (non-dev) dependency: `StdioOutput` (`stdio.rs`) writes via `tokio::io`/`tokio::fs`.
 # `InfluxDbOutput::send` no longer retries on its own (that moved to `logit-pipeline`'s generic
 # writer, `docs/adr/0021-buffered-sink-delivery.md`) and so no longer needs `tokio::time` itself.

@@ -70,6 +70,20 @@ pub struct MetricSpec {
     pub unit: Option<String>,
 }
 
+/// Which OTLP transport a component speaks -- both `otlp_in` and `otlp_out` carry identical
+/// protobuf payloads (`crates/logit-proto/src/otlp`), differing only in framing and endpoint
+/// shape (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OtlpProtocol {
+    /// OTLP/HTTP, protobuf body, one POST per signal. Default: it's what an
+    /// `http://host:4318`-shaped endpoint already implies, and a bare `endpoint: http://tempo:4318`
+    /// would be silently wrong under any other default.
+    #[default]
+    Http,
+    Grpc,
+}
+
 /// A component's kind, tagged by `type` in config. Every protocol kind is suffixed `_in`/`_out`
 /// uniformly (`docs/design/pipeline-graph.md`'s naming rationale) so a listener and a sink for the
 /// same protocol never collide on one tag value; transform kinds take no suffix, since there's
@@ -88,6 +102,8 @@ pub enum ComponentKind {
     /// OpenTelemetry Protocol (logs, metrics, and/or traces).
     OtlpIn {
         bind: String,
+        #[serde(default)]
+        protocol: OtlpProtocol,
     },
     /// Tail one or more files as a log source, rotation- and checkpoint-aware.
     FileTail {
@@ -217,6 +233,8 @@ pub enum ComponentKind {
     },
     OtlpOut {
         endpoint: String,
+        #[serde(default)]
+        protocol: OtlpProtocol,
     },
     /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
     LogitOut {
@@ -757,6 +775,36 @@ mod tests {
         .unwrap();
         assert_eq!(component.sources, vec!["enrich".to_string()]);
         assert!(matches!(component.kind, ComponentKind::InfluxDbOut { .. }));
+    }
+
+    #[test]
+    fn otlp_out_without_protocol_defaults_to_http() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_out", "sources": ["in"], "endpoint": "http://tempo:4318"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpOut { endpoint, protocol } => {
+                assert_eq!(endpoint, "http://tempo:4318");
+                assert_eq!(protocol, OtlpProtocol::Http);
+            }
+            other => panic!("expected OtlpOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otlp_in_with_protocol_grpc_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_in", "bind": "0.0.0.0:4317", "protocol": "grpc"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpIn { bind, protocol } => {
+                assert_eq!(bind, "0.0.0.0:4317");
+                assert_eq!(protocol, OtlpProtocol::Grpc);
+            }
+            other => panic!("expected OtlpIn, got {other:?}"),
+        }
     }
 
     #[test]
