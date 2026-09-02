@@ -28,7 +28,13 @@ image, and the forcing function for `syslog_out`/`otlp_out`
 ([docs/plans/0003-demo-stack.md](docs/plans/0003-demo-stack.md)). `syslog_out` (RFC 3164/5424 over
 UDP or TCP, header fields round-tripped from an event's `syslog.*` attributes,
 [ADR 0022](docs/adr/0022-syslog-output.md)) has since landed too, live in `demo/logit.yaml`'s
-`log_out` — `otlp_out` is what's left. Config is a flat graph of named components (ADR 0009,
+`log_out`. `otlp_in`/`otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`, OTLP for logs,
+metrics, and traces, both OTLP/HTTP and a hand-rolled OTLP/gRPC transport,
+[ADR 0023](docs/adr/0023-committed-pregenerated-otlp-protobuf.md)/
+[ADR 0024](docs/adr/0024-hand-rolled-grpc-over-hyper.md)) have landed too, as real, implemented
+`ComponentKind`s — not yet wired into `demo/logit.yaml`'s commented-out `trace_out` stanza, though
+(with spans now real too, below) nothing but that wiring is left before traces flow end to end in
+the demo. Config is a flat graph of named components (ADR 0009,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively

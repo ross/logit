@@ -173,16 +173,17 @@ already built that have a known, accepted rough edge.
   not a leak, but it's gone now regardless: `get`/`remove` use `interner::lookup`, a non-interning
   probe, falling through to the existing search only on a hit.
 
-  **`otlp_in` (PR3) will be the sharpest form of the growth premise yet, when it lands.**
+  **`otlp_in` is the sharpest form of the growth premise yet, now that it's landed (PR3).**
   Every earlier listener's attribute *keys* come from `logit`'s own config or a fixed protocol
   grammar (statsd's `#tag:value`, syslog's structured-data field names) — a bounded set by
   construction. `crates/logit-proto/src/otlp/common.rs`'s `key_values_into_attrs` interns every
   OTLP `KeyValue.key` it decodes, and OTLP attribute keys are arbitrary peer-supplied strings with
   no `logit`-side grammar bounding them at all — the first listener where "a metric name that
   never repeats" (this entry's stated retrofit trigger, above) could plausibly come from something
-  other than a user's own naming mistake. `otlp_in` doesn't exist until PR3, so this is a note for
-  that PR's own review, not a live gap yet: budget a `keep`-in-front recommendation for `otlp_in`
-  in `docs/deploying.md`, mirroring the mitigation this entry already names.
+  other than a user's own naming mistake. The mitigation this entry already names is documented for
+  real now: [`docs/deploying.md`](deploying.md) has a `keep`-in-front recommendation specifically
+  for `otlp_in`, not just the general `aggregate`-cardinality one
+  [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml) already demonstrates.
 - ~~**`statsd_in` copies tag values instead of slicing them**~~ — **closed.** It used to build
   attribute values with `attributes.insert(k, v)` on a `&str`, routing through
   `Value::str` → `Bytes::from(String)` (copying bytes already in the datagram buffer), then
@@ -514,3 +515,44 @@ already built that have a known, accepted rough edge.
   [ADR 0023](adr/0023-committed-pregenerated-otlp-protobuf.md)'s Consequences section for that
   qualification stated plainly, and `crates/logit-proto/src/otlp/metrics.rs`'s module doc for the
   full encode/decode tables this summarizes.
+
+- **`otlp_in` doesn't support compressed requests, and its `partial_success` response is always
+  empty.** Two separate, deliberate gaps in `crates/logit-inputs/src/otlp.rs`
+  ([ADR 0024](adr/0024-hand-rolled-grpc-over-hyper.md)):
+  - **Compression.** `Content-Encoding: gzip` (OTLP/HTTP) and `grpc-encoding: gzip` (OTLP/gRPC) are
+    both rejected outright (`415`/`grpc-status: 12`) rather than silently mishandled — `flate2`
+    isn't a dependency, and decompressing untrusted input unboundedly is real, security-relevant
+    surface (a compression-bomb-shaped request) this PR deliberately didn't take on. The practical
+    consequence: the OTel Collector's own default OTLP exporter sends gzip, so pointing a real
+    Collector at `otlp_in` fails on day one even though `otlp_out → otlp_in` (this PR's own
+    round-trip tests, which never set either header) works fine, and `otlp_out → Tempo` (PR4's demo
+    path) is unaffected since Tempo's own OTLP receiver doesn't require compression. Revisit with
+    `flate2` if a real deployment needs it.
+  - **`partial_success` accounting.** OTLP's `Export*ServiceResponse.partial_success` field exists
+    so a receiver can accept most of a request while reporting which records it rejected —
+    `otlp_out` (`crates/logit-outputs/src/otlp.rs`) fully implements the *reading* half of this (see
+    its `a_partial_success_response_is_counted_not_failed` tests). But
+    `logit_proto::SignalDecoder::decode_signal` doesn't return a per-call skip/reject count today —
+    only a self-telemetry counter (`logit.input.metrics.skipped{metric_kind, reason}`) — so there's
+    nothing for `otlp_in` to echo back into the wire response yet: every successful decode replies
+    with an empty (all-default, meaning "fully accepted") `partial_success`, even when the request
+    silently skipped a metric point internally (an over-cap exponential histogram, a
+    `NO_RECORDED_VALUE`-flagged point). A fully malformed request (bad protobuf, an invalid span id)
+    still correctly fails the *whole* request (`400`/`grpc-status: 3`), which is the one shape
+    `otlp_in`'s response *does* reflect today. Threading a real per-call count through would be a
+    `SignalDecoder` API change (`crates/logit-proto`), out of scope for the PR that added `otlp_in`
+    itself — a natural next step whenever OTLP input volume makes the gap worth closing.
+- **`otlp_out`'s gRPC transport opens a fresh connection per request, never pooled.** Every gRPC
+  `send` (`crates/logit-outputs/src/otlp.rs`'s `grpc_roundtrip`) connects, performs a fresh HTTP/2
+  handshake, sends exactly one framed request, reads the response, then drops the connection —
+  leaving its spawned connection-driver task to exit once the drop is observed. A mixed-signal
+  batch pays connect+handshake three times; a steady stream of batches pays it once per signal per
+  batch, where the HTTP transport gets `reqwest`'s connection pooling for free. Deliberate for this
+  PR, not an oversight: [ADR 0024](adr/0024-hand-rolled-grpc-over-hyper.md) is explicit about
+  keeping the hand-rolled gRPC surface minimal (the three unary `Export` RPCs, nothing else), and a
+  real connection pool — reuse keyed by endpoint, handling a server-initiated GOAWAY, concurrent
+  in-flight streams over one connection — is real infrastructure `tonic`/`hyper-util`'s own client
+  pooling would normally supply. Worth revisiting if `otlp_out`'s gRPC transport shows up as a
+  bottleneck under sustained load (connect+TLS-less-handshake cost per request, not per batch of
+  requests); until then this is a documented, deliberate simplicity-over-throughput trade, not a
+  silent one.

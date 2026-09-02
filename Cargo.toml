@@ -48,6 +48,15 @@ sketches-ddsketch = "0.4"
 # rustls, not the default native-tls/OpenSSL backend -- keeps "no host toolchain needed"
 # (ADR 0005) intact, since rustls has no system OpenSSL to link against.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# otlp_in/otlp_out's hand-rolled unary gRPC transport (docs/adr/0024-hand-rolled-grpc-over-hyper.md)
+# -- direct deps at the exact versions `reqwest` already pins in Cargo.lock, so pulling them in
+# adds no new version of any of the four to the dependency graph. `reqwest` itself stays the OTLP/
+# HTTP client (otlp_out's HTTP transport); these are for otlp_in's server (both transports) and
+# otlp_out's gRPC client.
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+http = "1"
+http-body-util = "0.1"
 
 [profile.release]
 lto = true

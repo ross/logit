@@ -135,6 +135,28 @@ the config. The two most directly actionable for buffering:
   here is data loss worth alerting on; which `reason` tells you whether the cause is an overflowing
   queue, a failing destination, or a slow drain racing shutdown.
 
+## `otlp_in`: put `keep` in front of it
+
+`otlp_in`'s attribute *keys* are arbitrary peer-supplied strings, not something `logit`'s own
+config or a fixed protocol grammar bounds — unlike every other listener here (statsd's
+`#tag:value`, syslog's structured-data field names), where the set of possible attribute keys is
+fixed by `logit`'s own decoder, not by whatever a remote OTLP exporter happens to send.
+`crates/logit-proto/src/otlp/common.rs`'s `key_values_into_attrs` interns every OTLP
+`KeyValue.key` it decodes into the process-wide interner (`crates/logit-core/src/interner.rs`),
+which never evicts (`docs/known-gaps.md`'s interner entry) — so a client that sends a *different*
+attribute key on every request (an id embedded in a key name, a misbehaving or malicious exporter)
+grows that table for the life of the process, with nothing here to stop it.
+
+The existing mitigation for that gap applies directly: put a `keep` component immediately
+downstream of `otlp_in`, naming only the attribute keys you actually intend to keep. That turns an
+unbounded, peer-controlled key set into the fixed, `logit`-controlled one every other listener
+already gets for free — the same reasoning [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml)
+already applies ahead of `aggregate`, extended here to cover interning too, not just series
+cardinality. This matters most for a deployment where `otlp_in` faces something other than
+`logit`'s own trusted fleet (a third-party exporter, a multi-tenant ingest path) — see
+`docs/known-gaps.md`'s interner entry for when the underlying "listeners are private by deployment
+shape" premise is worth re-checking at all.
+
 ## The nginx-side recipe
 
 Concrete, working reference config lives in this repo: [`examples/nginx/nginx.conf`](../examples/nginx/nginx.conf)
