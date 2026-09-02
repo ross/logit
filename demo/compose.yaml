@@ -45,10 +45,9 @@ services:
       - grafana_data:/var/lib/grafana
     networks: [demo]
 
-  # Log backend -- up and provisioned in Grafana, but genuinely empty: nothing reaches it through
-  # `logit` yet (`syslog_out` doesn't exist), and unlike the old demo writer, `hello` below
-  # doesn't work around that by writing to Loki directly. See demo/README.md's "What isn't wired
-  # yet" section.
+  # Log backend -- receives `logit`'s own relayed log lines over syslog/UDP from `log_out`
+  # (demo/logit.yaml) via the `alloy` shim below. Unlike the old demo writer, `hello` below
+  # doesn't also write to Loki directly -- `logit`'s own `syslog_out` is the only path in.
   loki:
     image: docker.io/grafana/loki:3.7.7
     command: ["-config.file=/etc/loki/loki.yaml"]
@@ -69,8 +68,8 @@ services:
     networks: [demo]
 
   # Trace backend -- receives `logit`'s own internal spans over OTLP/gRPC from `trace_out`
-  # (demo/logit.yaml), provisioned in Grafana with `tracesToLogsV2` pointed at Loki for the day
-  # `syslog_out` lands too (demo/grafana/provisioning/datasources/datasources.yaml).
+  # (demo/logit.yaml), provisioned in Grafana with `tracesToLogsV2` pointed at Loki -- both Loki
+  # and Tempo receive real data now (demo/grafana/provisioning/datasources/datasources.yaml).
   tempo:
     # Pinned to 2.10.x, not the current 3.0.x: Tempo 3.0 removed the legacy ingester write path
     # and reworked config wholesale (docs/plans/0003-demo-stack.md). 2.10's monolithic mode is
@@ -85,10 +84,9 @@ services:
       - "4318:4318" # OTLP/HTTP
     networks: [demo]
 
-  # syslog -> Loki shim (demo/alloy/config.alloy). Nothing feeds it today -- pure scaffolding for
-  # `syslog_out`, which doesn't exist yet: once it lands, `logit` can point straight at this
-  # listener. Loki has no syslog receiver of its own, and promtail (the historical answer) is
-  # EOL, which is why this is Alloy rather than nothing at all.
+  # syslog -> Loki shim (demo/alloy/config.alloy). Fed by `logit`'s own `log_out` (`syslog_out`,
+  # demo/logit.yaml) over UDP RFC 5424. Loki has no syslog receiver of its own, and promtail (the
+  # historical answer) is EOL, which is why this is Alloy rather than nothing at all.
   alloy:
     image: docker.io/grafana/alloy:v1.19.2
     command:
@@ -192,7 +190,9 @@ services:
   # own real requests plus a background stream of synthetic ones, the same RFC 3164 + JSON-body
   # shape crates/logit-bench/src/fixtures.rs measures (NGINX_SYSLOG_LINE), so this exercises a
   # workload someone actually runs, not a made-up one. Replaces the old writer service's bash
-  # loop; unlike it, this doesn't also write to `alloy` -- Loki stays empty by design, like Tempo.
+  # loop; unlike it, this doesn't also write to `alloy` directly -- `logit`'s own `log_out` is
+  # what relays there now, the same way `influx_out`/`trace_out` are the only paths into InfluxDB
+  # and Tempo.
   #
   # A stock image plus a bind-mounted script, not a Dockerfile: it's stdlib-only Python, so
   # there's nothing to install and nothing to rebuild after an edit.

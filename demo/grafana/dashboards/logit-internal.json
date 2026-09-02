@@ -167,7 +167,7 @@
       "id": 11,
       "type": "traces",
       "title": "Tempo: logit's own internal spans",
-      "description": "logit observing itself as *traces*, not just metrics (docs/adr/0022-internal-span-emission-and-deterministic-sampling.md, docs/plans/0005-otlp-end-to-end.md) -- one span per node-visit (listener send, transform process/flush, sink deliver), exported over OTLP/gRPC by demo/logit.yaml's `trace_out`. Open a trace to see the pipeline's real shape: a syslog_in root with json/kv_metrics/keep/aggregate children, or an internal-only root for `self`'s own drain. `{}` matches everything -- `logit` is the only thing sending to this Tempo.",
+      "description": "logit observing itself as *traces*, not just metrics (docs/adr/0025-internal-span-emission-and-deterministic-sampling.md, docs/plans/0005-otlp-end-to-end.md) -- one span per node-visit (listener send, transform process/flush, sink deliver), exported over OTLP/gRPC by demo/logit.yaml's `trace_out`. Open a trace to see the pipeline's real shape: a syslog_in root with json/kv_metrics/keep/aggregate children, or an internal-only root for `self`'s own drain. `{}` matches everything -- `logit` is the only thing sending to this Tempo.",
       "gridPos": { "h": 10, "w": 24, "x": 0, "y": 36 },
       "datasource": { "type": "tempo", "uid": "tempo" },
       "targets": [
