@@ -23,9 +23,12 @@ too, provisioned and empty, ready for traces `logit` can't send yet — see
 
 **Status:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a Lua
 enrichment stage, InfluxDB 2.x out, via `logit run <config>`. Since then, `syslog_in` (RFC 3164/5424
-over UDP), `stdio_out`, and `syslog_out` (RFC 3164/5424 over UDP or TCP,
-[ADR 0022](docs/adr/0022-syslog-output.md)) have joined statsd/InfluxDB as implemented protocols,
-and `json`,
+over UDP), `stdio_out`, `syslog_out` (RFC 3164/5424 over UDP or TCP,
+[ADR 0022](docs/adr/0022-syslog-output.md)), and `otlp_in`/`otlp_out` (OpenTelemetry Protocol for
+logs, metrics, and traces, over OTLP/HTTP or a hand-rolled OTLP/gRPC transport,
+[ADR 0023](docs/adr/0023-committed-pregenerated-otlp-protobuf.md)/
+[ADR 0024](docs/adr/0024-hand-rolled-grpc-over-hyper.md)) have joined statsd/InfluxDB as implemented
+protocols, and `json`,
 `kv_metrics`, `keep`, and `remove` have joined `aggregate` as implemented native transforms — `logit
 run` rejects a config referencing any other unimplemented kind with a clear error. Config is a flat
 graph of named components, each declaring its own `sources` ([ADR 0009](docs/adr/0009-component-graph-configuration.md),
