@@ -193,6 +193,16 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     (`docs/adr/0021-buffered-sink-delivery.md`) configures a sink's delivery queue, which only a
     sink has, so a listener or transform carrying one is almost certainly a misplaced block rather
     than a meaningful setting silently ignored.
+15. A sink's `buffer.max_batches` or `buffer.max_bytes` of `0` is rejected — an impossible bound
+    (no batch could ever be queued) rather than a small one.
+16. A non-default `receive:` block is rejected on any kind that is not a **datagram listener**
+    (`docs/adr/0022-decoupled-listener-io.md`), today `statsd_in`/`syslog_in`. Deliberately not
+    "any non-listener": `internal` is a listener by role but has no socket, no queue, and no
+    decoder, so `receive:` on it would be exactly the silently-ignored-setting failure rule 14
+    guards against on the sink side.
+17. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, or `receive.batch_max_events`
+    of `0` is rejected — the twin of rule 15. `receive.batch_flush_interval: 0s` is **not**
+    rejected — it means "no flush timer," a meaningful setting, unlike the count bounds.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that
@@ -344,11 +354,22 @@ is a plausible future answer; out of scope for the initial graph implementation.
 slow or backing-off sink stopped draining its own inbox for as long as delivery took — backpressure
 from that sink reached its upstream almost immediately. It now splits into a drain half that moves
 batches off the inbox into a `SinkQueue` and a writer half that delivers from that queue
-independently (`crates/logit-pipeline/src/sink_queue.rs`), so a slow sink no longer stalls its own
+independently (`crates/logit-pipeline/src/queue.rs`), so a slow sink no longer stalls its own
 inbox just because delivery is slow. Backpressure doesn't disappear — a `SinkQueue` under `Block`
 still applies it once the queue itself fills — it just surfaces later and deeper than the inbox's
 `CHANNEL_CAPACITY=64`, and it's now visible ahead of time via
 `logit.component.buffer.utilization` rather than only as a stalled inbox.
+
+**Listener-side receive decoupling does the same thing one hop earlier**
+(`docs/adr/0022-decoupled-listener-io.md`). A UDP listener's `recv_from`, decode, and
+`Fanout::send` used to share one loop, so downstream backpressure stopped the socket being read and
+the kernel dropped datagrams silently and uncounted. `logit-inputs::udp::UdpListener` splits into a
+read half that moves datagrams off the socket into a `ReceiveQueue` (`BoundedQueue<Datagram>`, the
+same generalized type `SinkQueue` is an instance of, `crates/logit-pipeline/src/queue.rs`) and a
+decode half that pops, decodes, accumulates, and sends independently. Unlike `SinkQueue`, the
+receive queue defaults to `drop_oldest`, not `Block` — a UDP reader's producer is the kernel socket
+buffer, which cannot be asked to wait, so blocking here would relocate loss into the kernel instead
+of preventing it. See that ADR for the field research behind the default.
 
 ## `logit graph`: visualizing the resolved DAG
 
@@ -409,8 +430,14 @@ logit-core   logit-config   logit-script
   kind-to-trait-object registry (today's `build_input`/`build_output`, generalized).
 - Keeps the channel type out of `logit-core`, whose doc comment states "no I/O, no pipeline" —
   weakening that would blur a boundary the crate exists to hold.
+- Owns `BoundedQueue<T: Queued>` and `BatchAccumulator` (`docs/adr/0022-decoupled-listener-io.md`)
+  alongside `Fanout` and the node runtime — both are transport-agnostic (nothing in either type
+  mentions a socket or a decoder). The UDP socket bind, `SO_RCVBUF` setsockopt, and `recv_from` loop
+  that *uses* them (`logit-inputs::udp::UdpListener`) stay in `logit-inputs`, following the same
+  "traits and generic machinery here, concrete protocol impls there" split the crate already
+  applies everywhere else.
 
-`graph.rs` (resolution + the fifteen validation rules + topo-sort) is a **pure function over
+`graph.rs` (resolution + the seventeen validation rules + topo-sort) is a **pure function over
 `Config`** — no channels, no threads, no tokio — mirroring how `apply_transforms` in today's
 `pipeline.rs` was deliberately kept pure specifically so it's unit-testable without spinning up
 real I/O. `logit run`, `logit validate`, and `logit graph` are three different things layered on

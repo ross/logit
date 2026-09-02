@@ -187,7 +187,9 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `syslog_in` decode 1 line | **1** | just the `Vec<Event>`; every field slices the datagram |
 | `syslog_in` decode 100 lines | **1** | + 5 reallocs from `Vec` growth |
 | `syslog_in` decode 1 logs-only line | **1** | plain-text message, no JSON -- same zero-copy shape |
+| `syslog_in` `decode_into` into a warm buffer | **0** | ADR 0022 -- see below |
 | `statsd_in` decode 1 line | **2** | fixed -- see below, tag values now slice the datagram too |
+| `statsd_in` `decode_into` into a warm buffer | **1** | ADR 0022 -- see below |
 | `json` parse + merge (nginx shape) | **1** | fixed -- see below, was 7 |
 | `json` parse + merge (wide-JSON, 28 keys) | **1** | same fix, confirmed to generalize past a small field count |
 | `kv_metrics` derive 4 metrics | **3** | `MetricList` spill + one `bins` Vec per sketch |
@@ -202,6 +204,8 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `Event::clone` (span shape) | **2** | 1 per `Vec` (`events`, `links`) -- every `AttrMap` here stays inline |
 | `stdio_out` encode 100 events | **101** | ~1/event -- fixed, see below, was 1801 |
 | `influxdb_out` encode 100 events | **30** | ~0.3/event — see below |
+| receive queue: push then pop, warm | **0** | `BoundedQueue<Datagram>`, ADR 0022 -- see below |
+| accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR 0022 -- see below |
 
 And the corresponding times:
 
@@ -224,6 +228,36 @@ And the corresponding times:
 > invent differences that aren't there. Compare rows within the table freely; treat absolute values
 > as this machine on this day. This table was refreshed once, in one sitting, after landing the
 > `json`/`statsd_in`/`stdio_out`/Lua-boundary fixes below -- every row reflects the current code.
+
+### Listener I/O decoupling: the `decode_into` buffer-reuse win (ADR 0022)
+
+Two numbers for the same decoder look contradictory at first glance and aren't: `statsd_in decode
+1 line` (2) and `statsd_in decode_into into a warm buffer` (1) measure two different call paths.
+`decode()` (the trait's provided default, used by every existing test and benchmark, and the only
+path that existed before [ADR 0022](../adr/0022-decoupled-listener-io.md)) always hands
+`decode_into` a fresh `Vec::new()` — that allocation is real and unavoidable *for that call shape*,
+so the original numbers stand unchanged. `decode_into` called directly against a buffer the caller
+*reuses* across datagrams — `logit-inputs::udp::decode_loop`'s actual hot path — is a strictly
+cheaper call shape, because the one thing `decode()` couldn't avoid (allocating the output buffer)
+is exactly what the reused buffer removes. `statsd_in` drops from 2 to 1 (`parse_line`'s per-line
+`Vec<Event>` is still real -- internal to `decode_into`, not something the caller's buffer can
+absorb); `syslog_in` drops from 1 to 0 (nothing else was allocating).
+
+This is the plan's one strict *improvement* to the hot path, not a neutral refactor, and it exists
+*because* `BatchAccumulator::absorb` needed it: `absorb` takes `&mut Vec<Event>` and merges via
+`Vec::append` rather than taking an owned `EventBatch` and merging via `std::mem::take` specifically
+so that draining the caller's buffer leaves its capacity intact rather than replacing it with a
+fresh, capacity-0 one — `accumulator: absorb into a warm buffer`'s own 0-allocation measurement
+above is the direct proof. `receive queue: push then pop, warm` (also 0) confirms the other half:
+`BoundedQueue<Datagram>`'s `push`/`pop` move the datagram through `VecDeque` backing storage that
+`InMemoryBuffer::new`'s `with_capacity(max_len.min(4096))` presizes, so the hop itself costs
+nothing once warm. Together these three measurements are the empirical basis for the whole
+decode-loop's steady-state cost: read the socket (1 allocation, `Bytes::copy_from_slice`, §7's
+`datagram_copy_is_one_right_sized_allocation`), queue it (0), decode it into a reused buffer
+(0 or 1, decoder-dependent), accumulate it (0). Not measured end-to-end as one pipeline number here
+— `logit-inputs`' own test module (`crates/logit-inputs/src/udp.rs`) covers the loop's *behavior*
+(the reader keeps reading under backpressure, shutdown drains a backlog); this crate's job is only
+ever the per-stage allocation cost, per this section's own scope.
 
 ### `aggregate` flush now costs one allocation per series, for real trace links
 
@@ -723,8 +757,21 @@ exact-equality discipline: a `MetricKind::Distribution`'s `DDSketch` is approxim
 constant rather than walked bin-by-bin, and `Value`'s numeric/bool/null variants (stored inline, no
 heap component) contribute nothing. It is consumed by the buffered sink-delivery work
 (`docs/plans/0004-buffered-sink-delivery.md`, `docs/adr/0021-buffered-sink-delivery.md`): every
-sink's `SinkQueue` (`crates/logit-pipeline/src/sink_queue.rs`) bounds itself on both batch count
-and this estimate, whichever trips first.
+sink's `SinkQueue` (`crates/logit-pipeline/src/queue.rs`) bounds itself on both batch count and this
+estimate, whichever trips first.
+
+**A second consumer of the same byte-aware bounding idea, on the listener side.**
+[ADR 0022](../adr/0022-decoupled-listener-io.md) generalizes `SinkQueue` into `BoundedQueue<T:
+Queued>` and gives a UDP listener's receive queue (`logit-inputs::udp::ReceiveQueue`) its own
+weight: `Datagram::weight()` is `bytes.len()` plus the struct's own inline footprint, bounding
+*undecoded* bytes rather than `estimated_heap_bytes()`'s decoded-event estimate. `receive.
+max_bytes` (default 32 MiB) is the config-visible bound on that. `receive.batch_max_bytes` (default
+1 MiB) is a second, independent bound one layer downstream: it caps `BatchAccumulator`'s
+accumulated-but-not-yet-sent events, which is the first thing in the codebase to address this
+section's opening complaint ("batch size is unbounded... one 65 KB syslog datagram can decode to
+hundreds of events") *at the listener edge itself*, rather than only downstream of it via
+`SinkQueue`. The `CHANNEL_CAPACITY = 64` gap this section names — an ordinary transform-to-transform
+edge still has no byte bound, only a batch-count one — is unchanged and stays open.
 
 ## 6. The allocator
 

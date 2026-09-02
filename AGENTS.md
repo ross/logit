@@ -52,6 +52,12 @@ a child of its parent for the two node kinds with an unambiguous one to propagat
 for internal spans, not spans themselves yet; see
 [ADR 0020](docs/adr/0020-trace-context-propagation-on-delivered.md) and
 [pipeline-graph.md](docs/design/pipeline-graph.md)'s "Trace context propagation" section.
+`statsd_in`/`syslog_in` (`crates/logit-inputs/src/statsd.rs`/`syslog.rs`) are now thin wrappers over
+a shared `logit-inputs::udp::UdpListener` driver: a UDP listener's socket read and its decode/
+batch-assembly loop run decoupled through a `ReceiveQueue`, the listener-side mirror of
+`SinkQueue`'s sink-side decoupling, so a stalled downstream no longer stops the socket being read;
+see [ADR 0022](docs/adr/0022-decoupled-listener-io.md) and the `receive:` config block it
+introduces.
 
 ## Environment
 

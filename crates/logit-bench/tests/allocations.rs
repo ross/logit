@@ -134,6 +134,108 @@ fn syslog_decode_one_logs_only_line() {
     expect_allocs("syslog_in: decode 1 logs-only line", stats, 1);
 }
 
+/// The measurement `syslog_decode_one_line` above deliberately doesn't cover
+/// (`docs/adr/0022-decoupled-listener-io.md`): `decode_into` called against a buffer the caller
+/// *reuses* across datagrams -- `logit-inputs::udp::decode_loop`'s actual hot path -- rather than
+/// `decode()`'s convenience default, which always hands `decode_into` a fresh `Vec::new()` and so
+/// can never show this. Zero, not one: the `Vec<Event>` is cleared (keeping capacity), not
+/// replaced, between calls, so pushing into it costs nothing once warm. Not the same claim as
+/// `syslog_decode_one_line` -- that one is a real, unavoidable per-datagram cost when nothing
+/// downstream reuses the output buffer; this one exists only because a caller can.
+#[test]
+fn syslog_decode_into_a_warm_reused_buffer_costs_nothing() {
+    let mut decoder = fixtures::syslog_decoder();
+    let datagram = fixtures::nginx_syslog_datagram(1);
+    let mut out = Vec::new();
+    decoder.decode_into(datagram.clone(), 0, &mut out).expect("should decode"); // warm: grows `out`
+    out.clear(); // capacity intact -- this is the property under test
+
+    let (_resource, stats) =
+        measure(|| decoder.decode_into(datagram.clone(), 0, &mut out).expect("should decode"));
+    assert_eq!(out.len(), 1);
+    expect_allocs("syslog_in: decode_into into a warm buffer", stats, 0);
+}
+
+/// The statsd analogue of the syslog test above -- drops from 2 (via `decode()`, unchanged and
+/// still asserted by `statsd_decode_one_line`) to 1 once the caller reuses its output buffer: the
+/// per-line `Vec<Event>` `parse_line` collects into is still a real, unavoidable allocation (it's
+/// internal to `decode_into`, not something this caller's buffer can absorb), but the *outer*
+/// `Vec::new()` `decode()` pays on top of that is the one this measurement shows going away.
+#[test]
+fn statsd_decode_into_a_warm_reused_buffer_costs_one_not_two() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_datagram(1);
+    let mut out = Vec::new();
+    decoder.decode_into(datagram.clone(), 0, &mut out).expect("should decode");
+    out.clear();
+
+    let (_resource, stats) =
+        measure(|| decoder.decode_into(datagram.clone(), 0, &mut out).expect("should decode"));
+    assert_eq!(out.len(), 1);
+    expect_allocs("statsd_in: decode_into into a warm buffer", stats, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Listener receive queue and batch accumulator (docs/adr/0022-decoupled-listener-io.md)
+// ---------------------------------------------------------------------------------------------
+
+/// A push immediately followed by a pop, once the underlying `VecDeque` is warm (past its initial
+/// `with_capacity` sizing, `crates/logit-proto/src/buffer.rs`) -- the steady-state cost
+/// `read_loop`/`decode_loop` actually pay per datagram, not counting the datagram's own
+/// `Bytes::copy_from_slice` (a separate, already-measured cost, `datagram_copy_is_one_right_sized_
+/// allocation` below).
+///
+/// A `current_thread` runtime, not a bare hand-rolled poll: neither `push` (room available) nor
+/// `pop` (an item present) actually suspends here, but driving a real `Future` still needs a real
+/// executor to call `.await` from a non-`async` `measure()` closure.
+#[test]
+fn receive_queue_push_then_pop_costs_nothing() {
+    use logit_inputs::udp::{Datagram, RECEIVE_QUEUE_METRICS};
+    use logit_pipeline::{BoundedQueue, OverflowPolicy, QueueConfig};
+
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let queue = BoundedQueue::with_metrics(
+        QueueConfig { max_items: 16, max_weight: u64::MAX, overflow: OverflowPolicy::DropOldest },
+        &RECEIVE_QUEUE_METRICS,
+        Telemetry::default(),
+    );
+    // Built once, outside the measured region -- `Bytes::clone()` is a refcount bump, not a copy,
+    // so cloning this per push measures the queue, not `fixtures::statsd_datagram`'s own
+    // `String::with_capacity` allocation (which the fixture call itself pays every invocation).
+    let payload = fixtures::statsd_datagram(1);
+    let warm = || Datagram { bytes: payload.clone(), received_at: 0 };
+    rt.block_on(queue.push(warm()));
+    rt.block_on(queue.pop()); // warm: past InMemoryBuffer's initial with_capacity sizing
+
+    let (popped, stats) = measure(|| {
+        rt.block_on(queue.push(warm()));
+        rt.block_on(queue.pop())
+    });
+    assert!(popped.is_some());
+    expect_allocs("receive queue: push then pop, warm", stats, 0);
+}
+
+/// `BatchAccumulator::absorb`'s own doc comment names this as the whole point of taking `&mut
+/// Vec<Event>` rather than an owned `EventBatch`: `Vec::append` drains the caller's buffer while
+/// leaving its capacity intact, so a second `absorb` call against the same (now-empty-but-still-
+/// allocated) buffer costs nothing -- unlike `std::mem::take`, which would silently replace it
+/// with a fresh, capacity-0 `Vec` and reintroduce exactly the allocation this exists to avoid.
+#[test]
+fn accumulator_absorb_into_a_warm_buffer_costs_nothing() {
+    use logit_core::{AttrMap, Event, Resource};
+    use logit_pipeline::BatchAccumulator;
+
+    let mut acc = BatchAccumulator::new(1_000, u64::MAX);
+    let resource = Arc::new(Resource::default());
+    let mut events = vec![Event::empty(0, AttrMap::new())];
+    assert!(acc.absorb(Arc::clone(&resource), &mut events).is_none()); // warm: grows acc's own Vec
+    events.push(Event::empty(0, AttrMap::new())); // re-fill the (now-empty, still-capacity) buffer
+
+    let (flushed, stats) = measure(|| acc.absorb(Arc::clone(&resource), &mut events));
+    assert!(flushed.is_none());
+    expect_allocs("accumulator: absorb into a warm buffer", stats, 0);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Transforms
 // ---------------------------------------------------------------------------------------------
