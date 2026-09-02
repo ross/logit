@@ -109,6 +109,17 @@ rather than the generic `encode_error`) once this lands. See Consequences.
   codebase; a future metric kind consumer that pattern-matches `MetricKind` without a wildcard will
   be forced to decide what a relative gauge adjustment means to it, the same way this change was
   forced to decide for the four existing ones.
+- **`logit.transform.gauge.delta.unseeded` fires every window, not just once, for a delta-only
+  series until gauge retention across the window boundary lands** (a separate, later change to
+  `aggregate`'s flush behavior). `aggregate` today drains its whole series map on every flush; a
+  series fed only by `GaugeDelta` (a client relying on statsd's sticky-gauge semantics and never
+  sending an absolute) opens a brand-new, empty accumulator every window and resolves against 0.0
+  every time. This is expected steady-state behavior for that traffic shape under the current
+  tumbling-only implementation, not a bug or a leak, but it reads like one from the metric alone --
+  an operator seeing a permanently-incrementing `unseeded` counter has no way to tell "this series
+  has always been delta-only" from "something is actually wrong" until retention exists to make the
+  distinction real. Retention is expected to make this fire only for a genuinely new series or one
+  aged out, at which point the counter becomes the anomaly signal it reads as today.
 - A misconfigured pipeline (a `statsd_in` reaching an output with no `aggregate` on the path) now
   fails later and more quietly than before this change: at the encoder, per metric, throttled —
   instead of at decode, for the whole line, with a message naming statsd directly. The encoder-side

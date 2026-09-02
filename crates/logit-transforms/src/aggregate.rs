@@ -259,6 +259,16 @@ impl Aggregator {
                     // rule for an unseeded gauge) -- correct per spec, but indistinguishable from
                     // a real 0.0 in the emitted number, so this is counted and reported rather
                     // than left silent.
+                    //
+                    // In this workstream (B) every flush still drains the whole series map --
+                    // gauge retention across the window boundary is workstream C, not yet landed
+                    // -- so a series fed *only* by deltas (a client relying on statsd's sticky-
+                    // gauge semantics, never sending an absolute) opens a brand-new, empty
+                    // accumulator every single window and this fires every time, not once at
+                    // startup. That is expected, current-workstream behavior, not a leak or a
+                    // bug: once C lands, a gauge series survives an idle window and this only
+                    // fires for a genuinely new series or one that's aged out of retention. See
+                    // `docs/adr/0026-relative-gauge-adjustments.md`'s Consequences.
                     self.telemetry.count("logit.transform.gauge.delta.unseeded", 1.0, &[]);
                     self.diag.warn_throttled(
                         "gauge_delta_unseeded",
