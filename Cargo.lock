@@ -831,6 +831,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "logit-core",
+ "logit-inputs",
  "logit-pipeline",
  "logit-proto",
  "logit-script",

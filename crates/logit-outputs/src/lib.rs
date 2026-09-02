@@ -8,5 +8,6 @@
 pub mod influxdb;
 pub mod otlp;
 pub mod stdio;
+pub mod syslog;
 
 pub use logit_pipeline::Output;
