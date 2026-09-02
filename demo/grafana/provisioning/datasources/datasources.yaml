@@ -1,0 +1,51 @@
+# Pre-provisioned datasources so `docker compose up` gives a working Grafana with no manual
+# clicking. Matches demo/compose.yaml's service names and demo-token values. Separate from (not
+# an edit of) the dev stack's deploy/grafana/provisioning/datasources/influxdb.yaml -- this stack
+# is self-contained.
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB
+    uid: influxdb
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    isDefault: true
+    jsonData:
+      version: Flux
+      organization: logit
+      defaultBucket: metrics
+      httpHeaderName1: Authorization
+    secureJsonData:
+      httpHeaderValue1: Token logit-demo-token
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # A `trace_id=<hex>` in a log line becomes a click-through to Tempo. Costs nothing today --
+      # nothing emits a matching log line yet -- and lights up the moment something does.
+      derivedFields:
+        - name: TraceID
+          datasourceUid: tempo
+          matcherRegex: '(?:trace_id|traceID|traceid)[=":\s]+([a-fA-F0-9]{16,32})'
+          # `$$` (not `$`): Grafana's *provisioning* loader interpolates `${VAR}` as an
+          # environment variable first -- `${__value.raw}` is the derived field's own runtime
+          # templating syntax, evaluated later, and silently resolves to "" if written unescaped
+          # here (confirmed empirically: the API showed url: "" until this was doubled).
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View trace"
+
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        filterByTraceID: true
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"

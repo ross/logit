@@ -182,6 +182,13 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 12. A `kv_metrics` counter, gauge, or distribution entry with an empty `name` is rejected — the
     implemented `influxdb_out` sink can't encode a metric with no measurement name
     (`docs/adr/0014-kv-metrics-semantics.md`).
+13. At most one `internal` component — two would each drain (and so split) the same process-wide
+    telemetry `Registry`, silently halving whichever one a downstream consumer happened not to be
+    reading from rather than failing clearly.
+14. A non-default `buffer:` block on a non-sink component is rejected — `buffer:`
+    (`docs/adr/0021-buffered-sink-delivery.md`) configures a sink's delivery queue, which only a
+    sink has, so a listener or transform carrying one is almost certainly a misplaced block rather
+    than a meaningful setting silently ignored.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that
@@ -328,6 +335,17 @@ a send on a closed downstream (`let _ = tx.blocking_send(...)`). Under a DAG tha
 really propagate as a shutdown signal rather than vanish. A per-edge `on_full: block | drop` policy
 is a plausible future answer; out of scope for the initial graph implementation.
 
+**Sink-side buffering decouples a sink's own inbox from its delivery**
+(`docs/adr/0021-buffered-sink-delivery.md`). `run_output` used to await `Output::send` inline, so a
+slow or backing-off sink stopped draining its own inbox for as long as delivery took — backpressure
+from that sink reached its upstream almost immediately. It now splits into a drain half that moves
+batches off the inbox into a `SinkQueue` and a writer half that delivers from that queue
+independently (`crates/logit-pipeline/src/sink_queue.rs`), so a slow sink no longer stalls its own
+inbox just because delivery is slow. Backpressure doesn't disappear — a `SinkQueue` under `Block`
+still applies it once the queue itself fills — it just surfaces later and deeper than the inbox's
+`CHANNEL_CAPACITY=64`, and it's now visible ahead of time via
+`logit.component.buffer.utilization` rather than only as a stalled inbox.
+
 ## `logit graph`: visualizing the resolved DAG
 
 `logit graph <config>` prints the resolved component graph as graphviz DOT to stdout — the natural
@@ -380,9 +398,10 @@ logit-core   logit-config   logit-script
   adds the `Transform` trait discussed above.
 - Owns `Fanout` and the graph resolution/validation module (pure, no channels or threads — see
   below) and the node runtime.
-- Depends on `logit-core` (for `EventBatch`) and `logit-config` (for `ComponentKind`), but *not* on
-  `logit-inputs`/`logit-transforms`/`logit-outputs` — those depend on it instead, for the trait
-  definitions. `logit-cli` is the one place that depends on everything and holds the
+- Depends on `logit-core` (for `EventBatch`), `logit-config` (for `ComponentKind`), and `logit-proto`
+  (for `Buffer`/`InMemoryBuffer`, which `SinkQueue` wraps — `docs/adr/0021-buffered-sink-delivery.md`),
+  but *not* on `logit-inputs`/`logit-transforms`/`logit-outputs` — those depend on it instead, for
+  the trait definitions. `logit-cli` is the one place that depends on everything and holds the
   kind-to-trait-object registry (today's `build_input`/`build_output`, generalized).
 - Keeps the channel type out of `logit-core`, whose doc comment states "no I/O, no pipeline" —
   weakening that would blur a boundary the crate exists to hold.

@@ -22,8 +22,10 @@ use logit_bench::fixtures;
 use logit_core::{EventBatch, Registry, Telemetry, Value};
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::stdio::{EventDump, Format};
+use logit_pipeline::runtime::drain_inbox;
 use logit_pipeline::{
-    process_batch, send_batch, unwrap_batch, Delivered, Fanout, TraceContext, Transform,
+    process_batch, send_batch, unwrap_batch, Delivered, Fanout, SinkQueue, SinkQueueConfig,
+    TraceContext, Transform,
 };
 use logit_proto::{Decoder, Encoder};
 use logit_script::{ProcessOutcome, ScriptWorker};
@@ -482,6 +484,55 @@ fn fanout_send_two_output_consumers_costs_only_the_arc() {
     assert_eq!(a_len, 1);
     assert_eq!(b_len, 1);
     expect_allocs("fanout: send + receive, 2 Output consumers (borrow only)", stats, 1);
+}
+
+/// Residual item from workstream C (`docs/plans/0004-buffered-sink-delivery.md`): the
+/// `fanout_send_*` tests above measure `Fanout::send` alone, stopping short of the actual
+/// `run_output`/`drain_inbox` hop a sink's `Delivered` batch takes next
+/// (`docs/adr/0021-buffered-sink-delivery.md`). Drives `drain_inbox` directly (not through a full
+/// `run`) against a single-consumer `Delivered::Owned` batch: exactly one allocation, the
+/// `Arc::new` `drain_inbox` performs to hand the batch to its `SinkQueue`
+/// (`crates/logit-pipeline/src/runtime.rs`) -- previously zero on this path, since a
+/// single-consumer `Fanout::send` alone never allocates (`fanout_send_one_consumer_costs_nothing`
+/// above) and nothing between there and this hop used to exist at all.
+#[test]
+fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let telemetry = logit_core::Telemetry::default();
+    let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+    // Warm: one full push+commit round trip through the exact same `SinkQueue`, so its `VecDeque`
+    // backing allocation (and the interner, etc.) is already grown before the measured run --
+    // otherwise the queue's first-ever push would fold its own one-time allocation into the
+    // `Arc::new` this test means to isolate.
+    let warm = fixtures::nginx_batch(1);
+    rt.block_on(async {
+        tx.send(Delivered::Owned(warm, TraceContext::default()))
+            .await
+            .expect("send should succeed");
+        let warmed = match rx.recv().await.expect("should receive") {
+            Delivered::Owned(batch, _ctx) => Arc::new(batch),
+            Delivered::Shared(shared, _ctx) => shared,
+        };
+        queue.push(warmed).await;
+        queue.commit();
+    });
+
+    let batch = fixtures::nginx_batch(1);
+    let queue_for_measure = Arc::clone(&queue);
+    let telemetry_for_measure = telemetry.clone();
+    let ((), stats) = measure(|| {
+        rt.block_on(async move {
+            tx.send(Delivered::Owned(batch, TraceContext::default()))
+                .await
+                .expect("send should succeed");
+            drop(tx); // closes the inbox, so `drain_inbox` returns after this one batch
+            drain_inbox(&mut rx, queue_for_measure, telemetry_for_measure).await;
+        })
+    });
+
+    expect_allocs("drain_inbox: single-consumer Delivered::Owned batch (the Arc::new)", stats, 1);
 }
 
 /// The actually-common shape (the nginx reference config's `tap` (`stdio_out`)/`trimmed`

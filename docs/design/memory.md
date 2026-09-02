@@ -517,14 +517,33 @@ clone" saving originally claimed, delivered — for this shape.
 **What's genuinely racy, not deterministic in either direction**: a fan-out with one `Output`
 branch and one mutating (`Transform`/`ScriptWorker`) branch — the actually-common shape, matching
 the nginx reference config's `tap`/`trimmed` split — costs **1 or 6**, decided by real tokio
-scheduling, never something in between and never `main`'s flat 5. `run_output` drops its own `Arc`
-handle the instant `output.send()` returns, before its next receive; whether the mutating sibling's
-`unwrap_batch` call finds that handle already gone (free, cost 1) or still alive (clone, cost 6)
-depends on which finishes first — genuinely reachable both ways, confirmed by two tests that
-manually pin each ordering (`fanout_send_mixed_output_and_transform_consumers[_when_output_finishes_first]`).
-In production, `Output::send` typically does real I/O, measurably slower than a `Transform`'s local
-processing, so 6 is the likelier practical outcome — but that's an expectation about typical
-latencies, not something the design guarantees.
+scheduling, never something in between and never `main`'s flat 5. Whether the mutating sibling's
+`unwrap_batch` call finds the `Output` branch's handle already gone (free, cost 1) or still alive
+(clone, cost 6) depends on which finishes first — genuinely reachable both ways, confirmed by two
+tests that manually pin each ordering
+(`fanout_send_mixed_output_and_transform_consumers[_when_output_finishes_first]`).
+
+**A further hop past `Fanout::send` exists for an `Output` branch, and it is not free.** The table
+above measures `Fanout::send` alone; a sink's batch then takes one more step,
+`drain_inbox` (`runtime.rs`, [ADR 0021](../adr/0021-buffered-sink-delivery.md)), which moves it off
+the component's inbox into its `SinkQueue`. For a single-consumer edge, `Fanout::send` itself costs
+0 (the table's first row) — but `drain_inbox` always needs an `Arc<EventBatch>` to hand to the
+queue, so a `Delivered::Owned` batch costs exactly one `Arc::new` there, previously paid nowhere on
+this path at all. `drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc`
+(`crates/logit-bench/tests/allocations.rs`) pins this directly, driving `drain_inbox` on its own
+rather than through a full `run`. A `Delivered::Shared` batch (a real fan-out) already carries its
+`Arc`, so this hop costs `drain_inbox` nothing further beyond what the table above already counts.
+
+**This likelihood flipped with [ADR 0021](../adr/0021-buffered-sink-delivery.md).** Before it,
+`run_output` held its `Arc` handle for the full duration of `output.send` — typically real I/O,
+measurably slower than a `Transform`'s local processing — so 6 was the likelier practical outcome
+despite 1 being reachable. After the drain/write split, `drain_inbox` drops its handle the instant
+it matches the received `Delivered`, immediately on receipt and entirely decoupled from how long
+the paired `write_loop`'s `output.send` takes — so the race is now between two comparably cheap,
+local operations on each side, no longer one side waiting on I/O. **1 is now the likelier practical
+outcome**, though — as before — this is an expectation about typical scheduling, not something the
+design guarantees; the two pinned-ordering tests above still exist specifically because both
+outcomes remain genuinely reachable.
 
 **What doesn't close at all**: a fan-out with no `Output` branch — two `Transform`s, or a
 `Transform` and a Lua stage, sharing one node. Both sides need to mutate, so neither can borrow;
@@ -668,8 +687,24 @@ number of graph edges.
 
 This has not bitten anything yet because the datagram size caps batch size in practice. It becomes
 a real problem with a TCP or file-tail input, where nothing caps how many events one read produces.
-A byte- or event-aware bound is the eventual answer; recorded here and in
-[known-gaps.md](../known-gaps.md) rather than designed now.
+
+The byte-aware bound is `EventBatch::estimated_heap_bytes()` (`crates/logit-core/src/event.rs`): a
+deliberately approximate, O(events) walk. The dominant term, added after an initial pass
+undercounted it, is the `Vec<Event>` backing storage itself --
+`events.capacity() * size_of::<Event>()` -- which every event pays (776 bytes each, §1) *before*
+any nested heap payload; a batch of numeric-only metrics with no string attributes would otherwise
+estimate close to zero despite genuinely holding hundreds of bytes per event. On top of that: a
+batch's attribute keys/values, log bodies, span-owned data (name, and every `SpanEvent`/`SpanLink`'s
+own backing storage and attributes), and metric records, plus its `Resource`'s attributes counted
+once per batch rather than once per event (the resource is `Arc`-shared, not copied per event). It
+is an admission-control estimate, not an allocator-accounting figure — unlike §1's numbers, it is
+*not* asserted exactly anywhere, and is deliberately exempt from `type_sizes.rs`/`allocations.rs`'s
+exact-equality discipline: a `MetricKind::Distribution`'s `DDSketch` is approximated with a fixed
+constant rather than walked bin-by-bin, and `Value`'s numeric/bool/null variants (stored inline, no
+heap component) contribute nothing. It is consumed by the buffered sink-delivery work
+(`docs/plans/0004-buffered-sink-delivery.md`, `docs/adr/0021-buffered-sink-delivery.md`): every
+sink's `SinkQueue` (`crates/logit-pipeline/src/sink_queue.rs`) bounds itself on both batch count
+and this estimate, whichever trips first.
 
 ## 6. The allocator
 

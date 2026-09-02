@@ -1,0 +1,167 @@
+{
+  "id": null,
+  "uid": "logit-internal",
+  "title": "logit internals",
+  "description": "logit observing itself (docs/design/internal-telemetry.md, ADR 0018) alongside the demo's synthetic web traffic. Provisioned by demo/grafana/provisioning/dashboards/dashboards.yaml.",
+  "schemaVersion": 39,
+  "editable": true,
+  "graphTooltip": 1,
+  "time": { "from": "now-15m", "to": "now" },
+  "refresh": "10s",
+  "tags": ["logit", "demo"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "web.requests (demo traffic)",
+      "description": "Requests from the hello-world app -- real visits plus a background synthetic loop -- by status code, proving syslog_in -> json -> kv_metrics -> keep -> aggregate end to end.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb" },
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.requests\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> group(columns: [\"status\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "web.request_time (p50 / p99)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb" },
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.request_time\")\n  |> filter(fn: (r) => r._field == \"p50\" or r._field == \"p99\")"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "logit.component.events.{sent,received,dropped}",
+      "description": "The uniform per-component runtime instrumentation every component gets for free (Fanout::send / run_transform / run_output).",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb" },
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"logit.component.events.sent\" or r._measurement == \"logit.component.events.received\" or r._measurement == \"logit.component.events.dropped\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> group(columns: [\"_measurement\", \"component\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "logit.component.process.duration (p99, by component)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb" },
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"logit.component.process.duration\")\n  |> filter(fn: (r) => r._field == \"p99\")\n  |> group(columns: [\"component\"])"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "logit.output.requests (influxdb_out, by class)",
+      "description": "influxdb_out's own retry-loop detail -- 2xx/4xx/5xx/network_error -- that run_output's single send.duration timer can't distinguish.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb" },
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"logit.output.requests\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> group(columns: [\"class\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "logit.process.uptime",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 16 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb" },
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"logit.process.uptime\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> last()"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "logit.process.interner.strings",
+      "description": "docs/known-gaps.md's interner-size observability hook -- the interner never evicts, so this only ever grows.",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 16 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb" },
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"logit.process.interner.strings\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> last()"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "logs",
+      "title": "Loki: raw demo traffic ({job=\"demo\"}) -- empty by design",
+      "description": "Nothing feeds Loki today -- `logit` has no `syslog_out` yet, and the demo doesn't work around that. This panel is a sample LogQL query, ready for the day something writes here (demo/alloy/config.alloy is unfed scaffolding for exactly that). See demo/README.md's \"What isn't wired yet\".",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "{job=\"demo\"}",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Loki: lines/sec, by host (LogQL count_over_time)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum by (host) (count_over_time({job=\"demo\"}[$__interval]))",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Loki: 5xx lines/sec (LogQL | json filter)",
+      "description": "LogQL parsing the JSON message body itself, not just matching stream labels -- `| json` extracts `status` from each line, then filters on it.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum(count_over_time({job=\"demo\"} | json | status >= 500 [$__interval]))",
+          "queryType": "range"
+        }
+      ]
+    }
+  ]
+}

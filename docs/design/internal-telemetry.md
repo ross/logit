@@ -169,11 +169,31 @@ receive/processing side from their own loops, which already see every batch and 
 | `logit.component.events.dropped{reason="absorbed"}` | count | `Transform::process` returned `None` |
 | `logit.component.events.dropped{reason="script_drop"}` | count | Lua `ProcessOutcome::Drop` |
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |
-| `logit.component.send.duration` | timing | `Output::send` |
-| `logit.component.errors` | count | `Output::send` failed, or a Lua script error |
+| `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`) |
+| `logit.component.retries` | count | a retried delivery attempt, `deliver_with_retry` (`write_loop`) |
+| `logit.component.errors` | count | `Output::send` failed (any attempt), or a Lua script error |
 | `logit.component.diagnostics{key=...}` | count | every `Diagnostics::warn_throttled` occurrence, throttled or not |
 | `logit.script.vm.memory` | gauge | `run_lua`, once per batch — the strongest signal a stateful script is leaking Lua-side state |
 | `logit.script.events.emitted{outcome="emit"\|"emit_many"}` | count | `run_lua`, per `ProcessOutcome` — distinguishes a 1:1 script from a fan-out one |
+
+**Every sink also gets a `SinkQueue`** (`crates/logit-pipeline/src/sink_queue.rs`,
+`docs/adr/0021-buffered-sink-delivery.md`) sitting between its inbox drain and delivery — its own
+uniform layer, same reasoning as `Fanout`'s: instrumenting the one choke point every sink's batches
+pass through gives every sink these for free, no per-sink code:
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.component.buffer.batches` | gauge | batches currently queued, sampled on every push/commit |
+| `logit.component.buffer.bytes` | gauge | `EventBatch::estimated_heap_bytes` summed over what's queued |
+| `logit.component.buffer.utilization` | gauge | `max(batches ratio, bytes ratio)` against the two configured bounds |
+| `logit.component.buffer.push.blocked.duration` | timing | how long a `Block`-policy push waited for room; only recorded when a push actually had to wait |
+| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`SinkQueue` eviction), `send_failed` (`write_loop`: not retryable, or retryable but the budget ran out), `shutdown` (`write_loop`: shutdown grace expired with the queue still non-empty) |
+
+Two metrics named in this doc's original design were not built in the pass that shipped
+`SinkQueue`: a per-batch `buffer.wait.duration` (push-to-commit latency) and an
+`outcome`-tagged `send.attempts{outcome="ok"|"retryable"|"permanent"}` breakdown. `buffer.batches`/
+`.bytes`/`.utilization` already answer "is this sink's queue backing up," which was the operative
+question; the finer breakdowns are a plausible future addition, not a gap blocking anything today.
 
 This set never needs updating when a new component kind lands — it comes from `ComponentKind`'s
 role and the node runtime alone, the same way arity and thread-vs-task dispatch already do. The
@@ -219,9 +239,12 @@ Worked examples, one per shipped component:
   (`telemetry.count(...)`/`.gauge(...)`), for domain facts only the script knows. See "Metrics from
   Lua scripts" below and `docs/design/lua-api.md`.
 - `influxdb_out` (`crates/logit-outputs/src/influxdb.rs`): `logit.output.requests{class="2xx|
-  4xx|5xx|network_error"}`, `logit.output.request.duration` (per attempt), `logit.output.retries`,
-  `logit.output.batch.bytes` — the retry loop's internal detail `run_output`'s single
-  `send.duration` timer can't distinguish.
+  4xx|5xx|network_error"}`, `logit.output.request.duration` (per attempt), `logit.output.batch.bytes`
+  — the encode/HTTP-response detail a generic `send.duration` timer can't distinguish. **Not**
+  `logit.output.retries` — retry moved out of this sink entirely
+  (`docs/adr/0021-buffered-sink-delivery.md`) into the generic `deliver_with_retry` every sink now
+  shares, so retry counting is a Layer 2 metric (`logit.component.retries`, above), not something
+  each sink tracks for itself.
 
 ## Metrics from Lua scripts
 

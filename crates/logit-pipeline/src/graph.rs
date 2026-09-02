@@ -24,12 +24,18 @@
 //! 13. At most one `internal` component -- two would each drain (and so split) the same
 //!     process-wide telemetry `Registry`, silently halving whichever one a downstream consumer
 //!     happened not to be reading from rather than failing clearly.
+//! 14. A non-default `buffer:` block on a non-sink component is rejected -- `buffer:`
+//!     (`docs/adr/0021-buffered-sink-delivery.md`) configures a sink's delivery queue, which only a
+//!     sink has, so a listener or transform carrying one is almost certainly a misplaced block
+//!     rather than a meaningful setting silently ignored.
+//! 15. A sink's `buffer.max_batches` or `buffer.max_bytes` of `0` is rejected -- an impossible
+//!     bound (no batch could ever be queued) rather than a small one.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
 //! it is required (by 7) to have a consumer, so the chain can only terminate at a sink.
 
-use logit_config::{Component, ComponentKind, Config};
+use logit_config::{BufferConfig, Component, ComponentKind, Config};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
@@ -166,6 +172,10 @@ pub struct ResolvedComponent {
     pub sources: Vec<String>,
     pub consumers: Vec<String>,
     pub kind: ComponentKind,
+    /// Per-sink delivery buffer config (`docs/adr/0021-buffered-sink-delivery.md`). Validated as
+    /// sink-only by [`resolve`] (rule 14); meaningless on any other role, so a non-sink component's
+    /// value here is always [`BufferConfig::default`] once resolution has succeeded.
+    pub buffer: BufferConfig,
 }
 
 impl ResolvedComponent {
@@ -319,11 +329,44 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         );
     }
 
+    // Rule 14: `buffer:` is a sink-only concept -- a non-default value on any other role is
+    // almost certainly a misplaced block, not a setting that would be silently honored.
+    for (id, component) in &components {
+        if component.buffer != BufferConfig::default() && role(&component.kind) != Role::Sink {
+            anyhow::bail!(
+                "component '{id}': 'buffer' is only meaningful on a sink, but '{id}' is a {}",
+                role(&component.kind).as_str()
+            );
+        }
+    }
+
+    // Rule 15: `max_batches: 0` or `max_bytes: 0` is an impossible bound, not a small one -- it
+    // makes every push overflow unconditionally, even against an empty queue, with nothing a
+    // concurrent commit could ever do to free room (`SinkQueue::push`'s "impossible to ever fit"
+    // check tolerates this at runtime rather than hanging, but a config that can never accept a
+    // single batch is a mistake worth catching here, not something to silently degrade around).
+    for (id, component) in &components {
+        if role(&component.kind) == Role::Sink {
+            if component.buffer.max_batches == 0 {
+                anyhow::bail!(
+                    "component '{id}': 'buffer.max_batches' must be at least 1 -- 0 means no \
+                     batch can ever be queued"
+                );
+            }
+            if component.buffer.max_bytes == 0 {
+                anyhow::bail!(
+                    "component '{id}': 'buffer.max_bytes' must be at least 1 -- 0 means no batch \
+                     can ever be queued"
+                );
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
-        let Component { sources, kind } = component;
+        let Component { sources, buffer, kind } = component;
         let node_consumers = consumers.remove(&id).unwrap_or_default();
-        resolved.insert(id, ResolvedComponent { sources, consumers: node_consumers, kind });
+        resolved.insert(id, ResolvedComponent { sources, consumers: node_consumers, kind, buffer });
     }
 
     Ok(Graph { components: resolved, topological_order })
@@ -385,7 +428,27 @@ mod tests {
         for (id, sources, kind) in components {
             map.insert(
                 id.to_string(),
-                Component { sources: sources.into_iter().map(String::from).collect(), kind },
+                Component {
+                    sources: sources.into_iter().map(String::from).collect(),
+                    buffer: BufferConfig::default(),
+                    kind,
+                },
+            );
+        }
+        Config { components: map }
+    }
+
+    /// Same as [`cfg`], but with an explicit `buffer` on one component -- for rule 14's tests.
+    fn cfg_with_buffer(components: Vec<(&str, Vec<&str>, ComponentKind, BufferConfig)>) -> Config {
+        let mut map = Map::new();
+        for (id, sources, kind, buffer) in components {
+            map.insert(
+                id.to_string(),
+                Component {
+                    sources: sources.into_iter().map(String::from).collect(),
+                    buffer,
+                    kind,
+                },
             );
         }
         Config { components: map }
@@ -741,5 +804,89 @@ mod tests {
             ("out", vec!["self"], sink()),
         ]));
         assert!(err.contains("flush interval of 0s"), "got: {err}");
+    }
+
+    fn non_default_buffer() -> BufferConfig {
+        BufferConfig { max_batches: 4096, ..BufferConfig::default() }
+    }
+
+    #[test]
+    fn a_non_default_buffer_on_a_listener_is_rejected() {
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), non_default_buffer()),
+            ("out", vec!["in"], sink(), BufferConfig::default()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("'buffer' is only meaningful on a sink"), "got: {err}");
+    }
+
+    #[test]
+    fn a_non_default_buffer_on_a_transform_is_rejected() {
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            (
+                "agg",
+                vec!["in"],
+                ComponentKind::Aggregate { interval: Duration::from_secs(10) },
+                non_default_buffer(),
+            ),
+            ("out", vec!["agg"], sink(), BufferConfig::default()),
+        ]));
+        assert!(err.contains("'agg'"), "got: {err}");
+        assert!(err.contains("'buffer' is only meaningful on a sink"), "got: {err}");
+    }
+
+    #[test]
+    fn a_non_default_buffer_on_a_lua_component_is_rejected() {
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("enrich", vec!["in"], lua(), non_default_buffer()),
+            ("out", vec!["enrich"], sink(), BufferConfig::default()),
+        ]));
+        assert!(err.contains("'enrich'"), "got: {err}");
+        assert!(err.contains("'buffer' is only meaningful on a sink"), "got: {err}");
+    }
+
+    #[test]
+    fn a_non_default_buffer_on_a_sink_validates_fine() {
+        let graph = resolve(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], sink(), non_default_buffer()),
+        ]))
+        .expect("a buffer block on a sink should validate fine");
+        assert_eq!(graph.components["out"].buffer.max_batches, 4096);
+    }
+
+    #[test]
+    fn a_sinks_buffer_with_zero_max_batches_is_rejected() {
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], sink(), BufferConfig { max_batches: 0, ..BufferConfig::default() }),
+        ]));
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(err.contains("max_batches"), "got: {err}");
+    }
+
+    #[test]
+    fn a_sinks_buffer_with_zero_max_bytes_is_rejected() {
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], sink(), BufferConfig { max_bytes: 0, ..BufferConfig::default() }),
+        ]));
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(err.contains("max_bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn a_default_buffer_on_a_non_sink_validates_fine() {
+        // An explicitly-written but all-default `buffer: {}` on a non-sink is indistinguishable
+        // from an omitted block -- rule 14 only rejects a genuinely *non-default* value.
+        let graph = resolve(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("enrich", vec!["in"], lua(), BufferConfig::default()),
+            ("out", vec!["enrich"], sink(), BufferConfig::default()),
+        ]))
+        .expect("a default buffer block on a non-sink should validate fine");
+        assert_eq!(graph.components["enrich"].buffer, BufferConfig::default());
     }
 }

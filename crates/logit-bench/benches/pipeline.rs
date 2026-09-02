@@ -176,6 +176,60 @@ mod lua {
     }
 }
 
+/// Direct-call benches for `logit_proto::buffer::InMemoryBuffer` -- the sync buffer
+/// `logit_pipeline::SinkQueue` wraps (`docs/adr/0021-buffered-sink-delivery.md`). Called directly,
+/// never through `SinkQueue`/tokio, for the same reason every other bench in this file calls its
+/// subject directly: `divan::AllocProfiler` only counts allocations on threads Divan controls, and
+/// a bench that hops through a channel or a tokio task would misreport.
+mod sink_queue {
+    use super::*;
+    use logit_core::EventBatch;
+    use logit_proto::buffer::{Buffer, InMemoryBuffer, OverflowPolicy};
+    use std::sync::Arc;
+
+    fn item() -> Arc<EventBatch> {
+        Arc::new(fixtures::nginx_batch(1))
+    }
+
+    /// The common case: a queue nowhere near its bound, so every push is a plain
+    /// `VecDeque::push_back` and every commit a plain `pop_front`, never the eviction path.
+    #[divan::bench]
+    fn push_commit_steady_state(bencher: Bencher) {
+        let mut buf: InMemoryBuffer<Arc<EventBatch>> =
+            InMemoryBuffer::new(1024, u64::MAX, OverflowPolicy::DropOldest);
+        let batch = item();
+        bencher.bench_local(|| {
+            let weight = batch.estimated_heap_bytes();
+            drop(buf.push(Arc::clone(&batch), weight));
+            drop(buf.commit());
+        });
+    }
+
+    #[divan::bench]
+    fn peek(bencher: Bencher) {
+        let mut buf: InMemoryBuffer<Arc<EventBatch>> =
+            InMemoryBuffer::new(1024, u64::MAX, OverflowPolicy::DropOldest);
+        let batch = item();
+        drop(buf.push(Arc::clone(&batch), batch.estimated_heap_bytes()));
+        bencher.bench_local(|| divan::black_box(buf.peek().is_some()));
+    }
+
+    /// The worst case for `DropOldest`: the buffer is held exactly at its bound (one slot, never
+    /// committed), so every push evicts the current head -- isolates what the eviction path itself
+    /// costs, on top of steady-state push/commit above.
+    #[divan::bench]
+    fn push_drop_oldest_always_evicting(bencher: Bencher) {
+        let mut buf: InMemoryBuffer<Arc<EventBatch>> =
+            InMemoryBuffer::new(1, u64::MAX, OverflowPolicy::DropOldest);
+        let batch = item();
+        drop(buf.push(Arc::clone(&batch), batch.estimated_heap_bytes()));
+        bencher.bench_local(|| {
+            let weight = batch.estimated_heap_bytes();
+            drop(buf.push(Arc::clone(&batch), weight));
+        });
+    }
+}
+
 /// Decode through aggregation for one access-log line -- the number that bounds ingest throughput
 /// for the reference config.
 #[divan::bench]

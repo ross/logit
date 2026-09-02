@@ -79,20 +79,41 @@ throughput.
 
 ## Buffering
 
-Define a `Buffer` trait now, even though only one implementation ships initially:
+`Buffer<T>` (`logit_proto::buffer`) is a bounded, in-process queue between a producer and a
+slower/intermittent consumer, with an ack shape rather than a plain pop — see
+`docs/adr/0021-buffered-sink-delivery.md` for the reasoning:
 
 ```rust
-trait Buffer {
-    fn push(&mut self, batch: EventBatch) -> Result<()>;
-    fn pop(&mut self) -> Option<EventBatch>;
-    // ack/retry hooks land here once at-least-once delivery is implemented
+pub trait Buffer<T> {
+    fn push(&mut self, item: T, weight: u64) -> PushOutcome<T>;
+    fn peek(&mut self) -> Option<&T>;  // does not remove, but reserves the head against eviction
+    fn commit(&mut self) -> Option<T>; // removes the head, only once delivery succeeded
+    fn len(&self) -> usize;
+    fn weight(&self) -> u64;
 }
 ```
 
-Ship an in-memory implementation first (bounded, with a documented overflow policy — drop-oldest by
-default). A disk-backed implementation (for surviving a restart or a downstream outage without data
-loss) is a real future need but not a v1 blocker — the trait boundary is what's cheap to add now and
-expensive to retrofit onto call sites that assumed an in-memory queue.
+`peek`/`commit`, not `push`/`pop`, is the ack mechanism: `Buffer::pop` would remove an item before
+delivery is confirmed, so a failed send would already have lost the batch. Instead the head stays
+in place across `peek`, retried until whatever the caller does with it succeeds, and only then
+removed via `commit`. This is the whole of in-process at-least-once delivery — deliberately
+in-order and single-in-flight (one queue, one head); out-of-order acks across several in-flight
+batches are a real future need for this native protocol's credit-based flow control, but not
+something worth building speculatively ahead of a second caller that needs it.
+
+`push` takes the pushed item's weight in bytes alongside it, so a bounded buffer can weigh a
+byte-aware bound (e.g. `EventBatch::estimated_heap_bytes`) as well as an item-count one, and never
+has to recompute it later. Overflow is one of two dropping policies (`OverflowPolicy::DropOldest`,
+`DropNewest`); `push` returns a `PushOutcome<T>` so an eviction is never silent —
+`PushOutcome::Evicted` hands back the displaced item, `PushOutcome::Rejected` hands back the
+pushed item unchanged. A third overflow behavior, blocking until space frees up, is deliberately
+not a variant here: a synchronous trait can't block usefully, so that's a concern of an async
+wrapper layered on top of `Buffer`, not of the trait or its implementations.
+
+`InMemoryBuffer<T>` is the one shipping implementation, ships first, and is what `Buffer<T>` is
+currently defined against. A disk-backed implementation (for surviving a restart or a downstream
+outage without data loss) is a real future need but not a v1 blocker — the trait boundary is what's
+cheap to add now and expensive to retrofit onto call sites that assumed an in-memory queue.
 
 ## Open question
 
