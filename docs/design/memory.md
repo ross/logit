@@ -537,14 +537,19 @@ This has not bitten anything yet because the datagram size caps batch size in pr
 a real problem with a TCP or file-tail input, where nothing caps how many events one read produces.
 
 The byte-aware bound is `EventBatch::estimated_heap_bytes()` (`crates/logit-core/src/event.rs`): a
-deliberately approximate, O(events) walk over a batch's attribute keys/values, log bodies, and
-metric records, plus its `Resource`'s attributes counted once per batch rather than once per event
-(the resource is `Arc`-shared, not copied per event). It is an admission-control estimate, not an
-allocator-accounting figure — unlike §1's numbers, it is *not* asserted exactly anywhere, and is
-deliberately exempt from `type_sizes.rs`/`allocations.rs`'s exact-equality discipline: a
-`MetricKind::Distribution`'s `DDSketch` is approximated with a fixed constant rather than walked
-bin-by-bin, and `Value`'s numeric/bool/null variants (stored inline, no heap component) contribute
-nothing. It is consumed by the buffered sink-delivery work
+deliberately approximate, O(events) walk. The dominant term, added after an initial pass
+undercounted it, is the `Vec<Event>` backing storage itself --
+`events.capacity() * size_of::<Event>()` -- which every event pays (776 bytes each, §1) *before*
+any nested heap payload; a batch of numeric-only metrics with no string attributes would otherwise
+estimate close to zero despite genuinely holding hundreds of bytes per event. On top of that: a
+batch's attribute keys/values, log bodies, span-owned data (name, and every `SpanEvent`/`SpanLink`'s
+own backing storage and attributes), and metric records, plus its `Resource`'s attributes counted
+once per batch rather than once per event (the resource is `Arc`-shared, not copied per event). It
+is an admission-control estimate, not an allocator-accounting figure — unlike §1's numbers, it is
+*not* asserted exactly anywhere, and is deliberately exempt from `type_sizes.rs`/`allocations.rs`'s
+exact-equality discipline: a `MetricKind::Distribution`'s `DDSketch` is approximated with a fixed
+constant rather than walked bin-by-bin, and `Value`'s numeric/bool/null variants (stored inline, no
+heap component) contribute nothing. It is consumed by the buffered sink-delivery work
 (`docs/plans/0003-buffered-sink-delivery.md`, `docs/adr/0020-buffered-sink-delivery.md`): every
 sink's `SinkQueue` (`crates/logit-pipeline/src/sink_queue.rs`) bounds itself on both batch count
 and this estimate, whichever trips first.

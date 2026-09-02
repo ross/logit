@@ -1,5 +1,7 @@
 use crate::interner::Symbol;
-use crate::{AttrMap, LogRecord, MetricKind, MetricRecord, Resource, SpanRecord, Value};
+use crate::{
+    AttrMap, LogRecord, MetricKind, MetricRecord, Resource, SpanEvent, SpanLink, SpanRecord, Value,
+};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
@@ -13,27 +15,37 @@ pub struct EventBatch {
 }
 
 impl EventBatch {
-    /// Approximate heap bytes held by this batch: attribute keys/values, log bodies, metric
-    /// records, and the batch's resource. Deliberately approximate -- an O(events) walk for
-    /// admission control (bounding an in-memory delivery buffer, see
-    /// `docs/adr/0020-buffered-sink-delivery.md`), NOT an allocator-accounting figure. Exempt from
-    /// this crate's exact-size/exact-allocation-count discipline (`tests/type_sizes.rs`,
-    /// `crates/logit-bench/tests/allocations.rs`) on purpose -- don't add this to either of those.
+    /// Approximate heap bytes held by this batch: the `Vec<Event>` backing allocation itself,
+    /// attribute keys/values, log bodies, span-owned data, metric records, and the batch's
+    /// resource. Deliberately approximate -- an O(events) walk for admission control (bounding an
+    /// in-memory delivery buffer, see `docs/adr/0020-buffered-sink-delivery.md`), NOT an
+    /// allocator-accounting figure. Exempt from this crate's exact-size/exact-allocation-count
+    /// discipline (`tests/type_sizes.rs`, `crates/logit-bench/tests/allocations.rs`) on purpose --
+    /// don't add this to either of those.
     ///
-    /// What gets counted, per event: every attribute key's and value's byte length
+    /// What gets counted: the dominant term first -- `events.capacity() * size_of::<Event>()`,
+    /// the batch's own backing storage, which every event pays (776 bytes each, `memory.md` §1)
+    /// *before* any nested heap payload -- a batch of numeric-only metrics with no string
+    /// attributes would otherwise estimate close to zero despite genuinely holding hundreds of
+    /// bytes per event. Then, per event: every attribute key's and value's byte length
     /// (`value_heap_bytes` below), the log body's `Value` the same way if `event.log` is `Some`,
-    /// and a per-metric-record contribution for `event.metrics` (`metric_record_heap_bytes`
-    /// below). `Null`/`Bool`/`I64`/`U64`/`F64`/`Timestamp` values are stored inline in `Value`
-    /// with no heap component of their own (see `tests/type_sizes.rs`'s
+    /// every span-owned `Value`/`AttrMap`/nested `Vec` if `event.span` is `Some`
+    /// (`span_heap_bytes` below), and a per-metric-record contribution for `event.metrics`
+    /// (`metric_record_heap_bytes` below). `Null`/`Bool`/`I64`/`U64`/`F64`/`Timestamp` values are
+    /// stored inline in `Value` with no heap component of their own (see `tests/type_sizes.rs`'s
     /// `value_is_bytes_plus_a_discriminant_word`), so they contribute nothing -- only
     /// `Bytes`/`Str`/`Array`/`Map` do. The batch's `resource` is counted once, not once per event
     /// -- it's `Arc`-shared across every event in the batch, not copied per event.
     pub fn estimated_heap_bytes(&self) -> u64 {
-        let mut total = attr_map_heap_bytes(&self.resource.attributes);
+        let mut total = attr_map_heap_bytes(&self.resource.attributes)
+            + (self.events.capacity() * std::mem::size_of::<Event>()) as u64;
         for event in &self.events {
             total += attr_map_heap_bytes(&event.attributes);
             if let Some(log) = &event.log {
                 total += value_heap_bytes(&log.message);
+            }
+            if let Some(span) = &event.span {
+                total += span_heap_bytes(span);
             }
             for metric in &event.metrics {
                 total += metric_record_heap_bytes(metric);
@@ -41,6 +53,25 @@ impl EventBatch {
         }
         total
     }
+}
+
+/// Heap bytes owned by one `SpanRecord` beyond its own inline 136 bytes (`memory.md` §1): its
+/// `name`, plus every `SpanEvent`/`SpanLink`'s own `Vec` backing storage and owned data. Unlike
+/// `Event`'s outer `Vec` (which every batch has regardless of shape), a span's `events`/`links`
+/// are typically empty, so their `capacity() * size_of::<T>()` terms are usually zero in
+/// practice -- included anyway since a span that *does* carry several span-events (a common OTLP
+/// shape) would otherwise be undercounted the same way the outer batch was before this fix.
+fn span_heap_bytes(span: &SpanRecord) -> u64 {
+    let name = value_heap_bytes(&span.name);
+    let events = (span.events.capacity() * std::mem::size_of::<SpanEvent>()) as u64
+        + span
+            .events
+            .iter()
+            .map(|e| value_heap_bytes(&e.name) + attr_map_heap_bytes(&e.attributes))
+            .sum::<u64>();
+    let links = (span.links.capacity() * std::mem::size_of::<SpanLink>()) as u64
+        + span.links.iter().map(|l| attr_map_heap_bytes(&l.attributes)).sum::<u64>();
+    name + events + links
 }
 
 /// A rough per-record stand-in for `MetricKind::Distribution`'s inlined `DDSketch`. The sketch
@@ -179,10 +210,58 @@ mod tests {
         let attrs = attrs_with(&[("host", Value::str("web-1")), ("env", Value::str("prod"))]);
         let bytes = default_batch(vec![Event::empty(0, attrs)]).estimated_heap_bytes();
 
-        // "host" + "web-1" + "env" + "prod" is 16 bytes of actual string data; the estimate
-        // should at least cover that and stay in the same ballpark, not blow up to kilobytes.
-        assert!(bytes >= 16, "estimate should cover the raw string bytes: {bytes}");
-        assert!(bytes < 1024, "estimate should stay roughly proportional to the input: {bytes}");
+        // "host" + "web-1" + "env" + "prod" is 16 bytes of actual string data, on top of the one
+        // event's own Vec<Event> backing-storage floor (size_of::<Event>()) every event pays
+        // regardless of shape -- the estimate should cover at least both, and stay in the same
+        // ballpark rather than blowing up to kilobytes.
+        let floor = std::mem::size_of::<Event>() as u64;
+        assert!(bytes >= floor + 16, "estimate should cover the per-event floor plus the raw string bytes: {bytes} (floor {floor})");
+        assert!(
+            bytes < floor + 1024,
+            "estimate should stay roughly proportional to the input beyond the floor: {bytes}"
+        );
+    }
+
+    #[test]
+    fn a_purely_numeric_metric_event_is_not_undercounted_to_near_zero() {
+        // The exact scenario a review finding named: a numeric-only event (no strings anywhere)
+        // used to estimate at only a few bytes (the metric name symbol's length) despite Event
+        // itself costing 776 bytes before any nested allocation -- the dominant term for a
+        // metrics-heavy batch. Must now be at least one Event's worth of backing storage.
+        let record = MetricRecord {
+            name: crate::interner::intern("numeric_only_test_counter"),
+            kind: MetricKind::Counter(1.0),
+            unit: None,
+        };
+        let bytes =
+            default_batch(vec![Event::metric(0, AttrMap::new(), record)]).estimated_heap_bytes();
+        let floor = std::mem::size_of::<Event>() as u64;
+        assert!(bytes >= floor, "a numeric-only event must count at least its own Event-sized backing storage, got {bytes}, floor {floor}");
+    }
+
+    #[test]
+    fn a_spans_own_data_contributes_to_the_estimate() {
+        let span_event = SpanEvent {
+            timestamp: 0,
+            name: Value::str("a span event name long enough to matter"),
+            attributes: attrs_with(&[("k", Value::str("a fairly long attribute value here"))]),
+        };
+        let span = SpanRecord {
+            trace_id: [0; 16],
+            span_id: [0; 8],
+            parent_span_id: None,
+            name: Value::str("span name"),
+            kind: crate::SpanKind::Internal,
+            status: crate::SpanStatus::Unset,
+            events: vec![span_event],
+            links: vec![],
+            end_timestamp: 0,
+        };
+        let without_span =
+            default_batch(vec![Event::empty(0, AttrMap::new())]).estimated_heap_bytes();
+        let with_span =
+            default_batch(vec![Event::span(0, AttrMap::new(), span)]).estimated_heap_bytes();
+        assert!(with_span > without_span, "a span's own name/events/links must add weight, got with_span={with_span} without_span={without_span}");
     }
 
     #[test]
@@ -267,9 +346,14 @@ mod tests {
         );
 
         assert!(resource_only_bytes > 0, "fixture should carry a nonzero resource cost");
-        // An empty event with no attributes/log/metrics adds nothing of its own, so both batches
-        // should equal exactly the resource's contribution, counted once -- not twice.
-        assert_eq!(one_event.estimated_heap_bytes(), resource_only_bytes);
-        assert_eq!(two_events.estimated_heap_bytes(), resource_only_bytes);
+        // An empty event with no attributes/log/metrics adds nothing of its own beyond the
+        // Vec<Event> backing storage every event pays regardless of shape -- so the marginal cost
+        // of a second event is exactly one more Event-sized slot, never the resource's cost
+        // repeated (that's what "counted once, not twice" actually means once the per-event floor
+        // exists: the resource term is the same additive constant in both expressions below,
+        // not something that scales with event count the way the floor deliberately does).
+        let event_size = std::mem::size_of::<Event>() as u64;
+        assert_eq!(one_event.estimated_heap_bytes(), resource_only_bytes + event_size);
+        assert_eq!(two_events.estimated_heap_bytes(), resource_only_bytes + 2 * event_size);
     }
 }
