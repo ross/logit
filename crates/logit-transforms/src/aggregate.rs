@@ -181,20 +181,11 @@ impl Aggregator {
         let metrics = std::mem::take(&mut event.metrics);
         for record in metrics {
             // No merge rule defined for these (docs/design/data-model.md) -- leave them on the
-            // event rather than absorbing or dropping them.
-            //
-            // `GaugeDelta` is routed through this same pass-through arm only in this workstream
-            // (`docs/adr/0024-relative-gauge-adjustments.md`, workstream A) -- workstream B
-            // replaces this with real resolution against a running `Accumulator::Gauge`. Left
-            // here unresolved for now would otherwise defeat the whole feature silently, which is
-            // why `crates/logit-transforms/tests` guards it with a named test rather than a
-            // comment alone.
+            // event rather than absorbing or dropping them. `GaugeDelta` is *not* here -- it has
+            // a real resolution below, unlike these three (docs/adr/0024-relative-gauge-adjustments.md).
             if matches!(
                 record.kind,
-                MetricKind::GaugeDelta(_)
-                    | MetricKind::Set(_)
-                    | MetricKind::Histogram { .. }
-                    | MetricKind::Summary { .. }
+                MetricKind::Set(_) | MetricKind::Histogram { .. } | MetricKind::Summary { .. }
             ) {
                 event.metrics.push(record);
                 continue;
@@ -206,7 +197,15 @@ impl Aggregator {
                 attributes: event.attributes.clone(),
             };
             let group = self.group_for(resource);
-            let state = group.series.entry(key).or_insert_with(|| SeriesState {
+            let entry = group.series.entry(key);
+            // Whether this metric opened a brand-new series -- not derivable from the
+            // accumulator's `at`/`value` afterward, since a genuine `Gauge(0.0)` at `at:
+            // i64::MIN` looks identical to an unseeded delta's result. Only meaningful for
+            // `GaugeDelta` below; a fresh `Counter`/`Distribution` series has no equivalent
+            // "resolved against a placeholder" hazard, since there's no prior value to have
+            // wanted.
+            let was_vacant = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
+            let state = entry.or_insert_with(|| SeriesState {
                 accumulator: Accumulator::new_for(&record.kind),
                 contexts: ContributingContexts::default(),
             });
@@ -227,6 +226,17 @@ impl Aggregator {
                     }
                     true
                 }
+                (Accumulator::Gauge { value, .. }, MetricKind::GaugeDelta(d)) => {
+                    // Asymmetric on purpose (docs/adr/0024-relative-gauge-adjustments.md,
+                    // verbatim there): a delta applies to the running value in *arrival* order
+                    // and never advances `at` -- note the `..`. Mixing "deltas in arrival order"
+                    // with "absolutes by last-write-wins" is undefined the moment they interleave
+                    // unless one of the two rules is pinned independently of the other's
+                    // tiebreak; leaving `at` untouched here is what keeps an absolute's LWW rule
+                    // meaningful regardless of how many deltas land between two absolutes.
+                    *value += d;
+                    true
+                }
                 (Accumulator::Distribution(sketch), MetricKind::Distribution(incoming)) => {
                     sketch.merge(incoming);
                     true
@@ -236,13 +246,29 @@ impl Aggregator {
                 // gauge). No correct merge exists for that -- leave this one metric on the event
                 // rather than silently dropping it or corrupting the existing accumulator with a
                 // type-punned value. Per-metric now, not per-event: a sibling metric on the same
-                // event that *does* merge cleanly is still absorbed.
+                // event that *does* merge cleanly is still absorbed. A `GaugeDelta` against a
+                // `Counter`/`Distribution` series lands here too, same as `Gauge` always has.
                 _ => false,
             };
             if accumulated {
                 // Only on an actual merge -- a kind-conflicted metric didn't touch this series'
                 // accumulator, so it shouldn't be recorded as one of its contributors either.
                 state.contexts.observe(ctx);
+                if was_vacant && matches!(record.kind, MetricKind::GaugeDelta(_)) {
+                    // A delta that opened a brand-new series resolved against 0.0 (statsd's own
+                    // rule for an unseeded gauge) -- correct per spec, but indistinguishable from
+                    // a real 0.0 in the emitted number, so this is counted and reported rather
+                    // than left silent.
+                    self.telemetry.count("logit.transform.gauge.delta.unseeded", 1.0, &[]);
+                    self.diag.warn_throttled(
+                        "gauge_delta_unseeded",
+                        format_args!(
+                            "gauge delta for '{}' opened a new series and resolved against 0.0 \
+                             -- no prior absolute value seen for this series",
+                            logit_core::interner::resolve(record.name)
+                        ),
+                    );
+                }
             }
             if !accumulated {
                 self.diag.warn_throttled(
@@ -354,15 +380,17 @@ impl Accumulator {
     fn new_for(kind: &MetricKind) -> Self {
         match kind {
             MetricKind::Counter(_) => Accumulator::Counter(0.0),
-            MetricKind::Gauge(_) => Accumulator::Gauge { value: 0.0, at: i64::MIN },
+            // `Gauge` and `GaugeDelta` share one accumulator -- they're not a kind conflict, just
+            // two different ways to update the same running value (`docs/adr/
+            // 0024-relative-gauge-adjustments.md`). This makes `new_for` non-injective on
+            // purpose: two different `MetricKind`s map to the same `Accumulator` variant, which
+            // would otherwise be easy to miss given the `unreachable!()` arm below makes the rest
+            // of this mapping look total-and-one-to-one.
+            MetricKind::Gauge(_) | MetricKind::GaugeDelta(_) => {
+                Accumulator::Gauge { value: 0.0, at: i64::MIN }
+            }
             MetricKind::Distribution(_) => Accumulator::Distribution(logit_core::DdSketch::new()),
-            // `GaugeDelta` is a pass-through kind in this workstream only (see `process`'s own
-            // comment) -- workstream B gives it `Accumulator::Gauge { value: 0.0, at: i64::MIN }`,
-            // the same accumulator `Gauge` uses, making this mapping non-injective on purpose.
-            MetricKind::GaugeDelta(_)
-            | MetricKind::Set(_)
-            | MetricKind::Histogram { .. }
-            | MetricKind::Summary { .. } => {
+            MetricKind::Set(_) | MetricKind::Histogram { .. } | MetricKind::Summary { .. } => {
                 unreachable!("process() never creates an accumulator for a pass-through kind")
             }
         }
@@ -658,21 +686,161 @@ mod tests {
         assert!(agg.flush(100).is_empty());
     }
 
-    /// Guards `process`'s pass-through `matches!` directly, not just by implication: as of this
-    /// workstream (A, `docs/adr/0024-relative-gauge-adjustments.md`), `GaugeDelta` has no real
-    /// resolution yet and must come back out unchanged rather than being silently absorbed as
-    /// though it were an ordinary `Gauge`. **Workstream B replaces this test's expectation** --
-    /// once `aggregate` resolves deltas, this exact input should be absorbed (`is_none()`), not
-    /// passed through. A comment alone on the `matches!` wouldn't catch a future change that
-    /// silently defeated the whole feature by leaving `GaugeDelta` in that list; a test does.
+    /// Guards `process`'s pass-through `matches!` directly, not just by implication
+    /// (`docs/adr/0024-relative-gauge-adjustments.md`): a `GaugeDelta` must be absorbed, not
+    /// forwarded, now that workstream B gives it a real resolution -- the opposite of what
+    /// workstream A's version of this test pinned. A comment alone on the `matches!` wouldn't
+    /// catch a future change that silently defeated the whole feature by adding `GaugeDelta`
+    /// back to that list; a test does.
     #[test]
-    fn gauge_delta_passes_through_untouched_in_this_workstream() {
+    fn gauge_delta_is_not_in_the_pass_through_matches() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
         let event = metric_event("temp", MetricKind::GaugeDelta(5.0), 0);
-        let passed = agg.process(&resource, event).expect("GaugeDelta has no resolution yet");
-        assert!(matches!(passed.metrics[0].kind, MetricKind::GaugeDelta(v) if v == 5.0));
-        assert!(agg.flush(100).is_empty(), "nothing should have been accumulated");
+        assert!(agg.process(&resource, event).is_none(), "a GaugeDelta-only event should absorb");
+    }
+
+    /// A delta opening a brand-new series resolves against 0.0 (statsd's own rule for an
+    /// unseeded gauge) and fires the `gauge_delta_unseeded` counter -- correct per spec, but
+    /// indistinguishable from a real 0.0 in the emitted number unless reported.
+    #[test]
+    fn a_delta_into_an_empty_window_resolves_against_zero_and_fires_the_unseeded_counter() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_telemetry(telemetry);
+        let resource = default_resource();
+
+        assert!(agg
+            .process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 0))
+            .is_none());
+
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
+        match kind_of(&events[0]) {
+            MetricKind::Gauge(v) => assert_eq!(*v, 5.0, "unseeded delta resolves against 0.0"),
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+
+        let drained = registry.drain(0);
+        let unseeded = drained.iter().find_map(|e| {
+            e.metrics.iter().find_map(|m| match &m.kind {
+                MetricKind::Counter(v)
+                    if logit_core::interner::resolve(m.name)
+                        == "logit.transform.gauge.delta.unseeded" =>
+                {
+                    Some(*v)
+                }
+                _ => None,
+            })
+        });
+        assert_eq!(unseeded, Some(1.0), "the unseeded delta should be counted");
+    }
+
+    #[test]
+    fn absolute_then_delta_adds_to_the_absolute() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 1));
+
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
+        match kind_of(&events[0]) {
+            MetricKind::Gauge(v) => assert_eq!(*v, 15.0),
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+    }
+
+    /// The delta is subsumed by the later absolute, not added underneath it -- an absolute always
+    /// *replaces* the running value, never adds to it.
+    #[test]
+    fn delta_then_absolute_is_subsumed_by_the_absolute() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 0));
+        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 1));
+
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
+        match kind_of(&events[0]) {
+            MetricKind::Gauge(v) => assert_eq!(*v, 10.0, "the absolute should win outright"),
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+    }
+
+    /// Pins the `..` on `at`: a delta must never advance the last-write-wins timestamp. Sequence:
+    /// an absolute at t=50 sets `at` to 50; a delta at t=60 must apply (arrival order) but must
+    /// leave `at` at 50; a second absolute, also stamped t=50, then arrives -- it only wins the
+    /// `event.timestamp >= *at` tiebreak if `at` is still 50. If the delta had incorrectly
+    /// advanced `at` to 60, this final absolute (50 >= 60 is false) would be silently dropped and
+    /// the flushed value would stay 15, not become 99 -- so asserting 99 is what actually pins
+    /// this, not just an assertion that *some* value came out.
+    #[test]
+    fn a_delta_never_advances_the_last_write_wins_timestamp() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 50));
+        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 60));
+        agg.process(&resource, metric_event("conns", MetricKind::Gauge(99.0), 50));
+
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
+        match kind_of(&events[0]) {
+            MetricKind::Gauge(v) => assert_eq!(*v, 99.0),
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_deltas_accumulate() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 1));
+        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(-3.0), 2));
+
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
+        match kind_of(&events[0]) {
+            MetricKind::Gauge(v) => assert_eq!(*v, 12.0),
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+    }
+
+    /// A `GaugeDelta` against an already-accumulating `Counter` series is a real kind conflict --
+    /// the same `_ => false` / `kind_conflict` path a `Gauge` vs. `Counter` conflict always took.
+    #[test]
+    fn gauge_delta_against_a_counter_series_is_a_kind_conflict_and_is_forwarded() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        assert!(agg.process(&resource, metric_event("m", MetricKind::Counter(1.0), 0)).is_none());
+
+        let conflicting = metric_event("m", MetricKind::GaugeDelta(5.0), 0);
+        let passed = agg.process(&resource, conflicting);
+        assert!(passed.is_some(), "the conflicting delta should be forwarded, not absorbed");
+        assert!(matches!(passed.unwrap().metrics[0].kind, MetricKind::GaugeDelta(v) if v == 5.0));
+
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
+        assert_eq!(counter_value(kind_of(&events[0])), 1.0, "the counter should be untouched");
+    }
+
+    /// `into_kind` always emits `MetricKind::Gauge`, never `MetricKind::GaugeDelta` -- a delta
+    /// never survives `aggregate`, however it entered.
+    #[test]
+    fn a_gauge_delta_never_survives_aggregate() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 0));
+
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
+        assert_eq!(events.len(), 1);
+        assert!(
+            !matches!(kind_of(&events[0]), MetricKind::GaugeDelta(_)),
+            "GaugeDelta must never be the kind of a flushed event"
+        );
+        assert!(matches!(kind_of(&events[0]), MetricKind::Gauge(_)));
     }
 
     #[test]

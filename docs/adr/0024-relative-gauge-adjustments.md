@@ -1,7 +1,7 @@
 # 0024 — Relative gauge adjustments (`+`/`-` in statsd)
 
 ## Status
-Proposed
+Accepted
 
 ## Context
 
