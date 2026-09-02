@@ -18,6 +18,7 @@ use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::stdio::StdioOutput;
+use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
 use logit_transforms::{
@@ -152,7 +153,7 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<()> {
 
 /// Turns one resolved component's kind into the boxed implementation the node runtime actually
 /// runs. The single source of truth for which `ComponentKind`s this binary can build --
-/// `graph::resolve` already rejected every kind `is_implemented` doesn't recognize (rule 7), so
+/// `graph::resolve` already rejected every kind `is_implemented` doesn't recognize (rule 8), so
 /// the fallback arm below is unreachable in practice, not a silent gap.
 ///
 /// `id` attaches a [`Diagnostics`] to every component that emits one (`docs/adr/0013-service-
@@ -266,12 +267,51 @@ fn build_spec(
             )
         }
 
+        SyslogOut {
+            endpoint,
+            transport,
+            format,
+            facility,
+            hostname,
+            app_name,
+            max_message_bytes,
+            connect_timeout,
+        } => {
+            // Eager for UDP (a bad local bind is a config error, `StdioOutput::open_path`'s
+            // precedent) -- requires an active tokio runtime, which holds here since `build_spec`
+            // only ever runs from inside `logit run`'s `runtime.block_on` (`main.rs`), never from
+            // `validate`/`graph`. Lazy for TCP -- see `logit_outputs::syslog::Conn`'s doc comment.
+            let mut output = match transport {
+                logit_config::SyslogTransport::Udp => SyslogOutput::udp(endpoint.clone())?,
+                logit_config::SyslogTransport::Tcp => {
+                    SyslogOutput::tcp(endpoint.clone(), *connect_timeout)
+                }
+            };
+            let mut encoder = SyslogEncoder::new(syslog_format(*format), facility.as_u8())
+                .with_max_message_bytes(*max_message_bytes as usize);
+            if let Some(hostname) = hostname {
+                encoder = encoder.with_hostname(hostname.clone());
+            }
+            if let Some(app_name) = app_name {
+                encoder = encoder.with_app_name(app_name.clone());
+            }
+            output = output
+                .with_encoder(encoder)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer),
+                write_config(&component.buffer),
+            )
+        }
+
         other => unreachable!("graph::resolve already rejected any unimplemented kind: {other:?}"),
     };
     Ok((spec, telemetry))
 }
 
-/// Builds a sink's `SinkQueueConfig` from its `BufferConfig` (`docs/adr/0020-buffered-sink-
+/// Builds a sink's `SinkQueueConfig` from its `BufferConfig` (`docs/adr/0021-buffered-sink-
 /// delivery.md`, workstream F) -- the sole place `logit_config::OverflowPolicy` is converted to
 /// `logit_pipeline::OverflowPolicy`, since neither config nor pipeline crate can see both types
 /// without violating the dependency direction (`logit-pipeline` depends on `logit-config`, never
@@ -311,6 +351,16 @@ fn delivery_posture(cfg: logit_config::DeliveryPosture) -> logit_pipeline::Deliv
     match cfg {
         logit_config::DeliveryPosture::AtLeastOnce => logit_pipeline::DeliveryPosture::AtLeastOnce,
         logit_config::DeliveryPosture::AtMostOnce => logit_pipeline::DeliveryPosture::AtMostOnce,
+    }
+}
+
+/// The sole place `logit_config::SyslogFormat` crosses into `logit_outputs::syslog::Format` --
+/// `logit-outputs` never depends on `logit-config` (`docs/design/pipeline-graph.md`'s crate
+/// layout), mirroring `overflow_policy`/`delivery_posture` above.
+fn syslog_format(cfg: logit_config::SyslogFormat) -> logit_outputs::syslog::Format {
+    match cfg {
+        logit_config::SyslogFormat::Rfc3164 => logit_outputs::syslog::Format::Rfc3164,
+        logit_config::SyslogFormat::Rfc5424 => logit_outputs::syslog::Format::Rfc5424,
     }
 }
 

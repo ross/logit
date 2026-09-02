@@ -23,7 +23,7 @@ get-started instructions and shows this stack's own pipeline, rendered live.
 | Hello-world app | http://localhost:8080 | Start here. Landing page, Grafana link, and the demo's traffic source. |
 | Grafana | http://localhost:3000 | Anonymous admin access. Open the "logit" folder for the pre-built dashboard. |
 | InfluxDB | http://localhost:8086 | `logit`/`logit-demo-password`. Bucket `metrics`, org `logit`. |
-| Loki | http://localhost:3100 | Provisioned as a Grafana datasource; see below for what's actually in it. |
+| Loki | http://localhost:3100 | Provisioned as a Grafana datasource; receiving logs via `alloy`. |
 | Tempo | http://localhost:3200 (query), :4317/:4318 (OTLP) | Provisioned as a Grafana datasource; empty. |
 
 `docker compose logs -f logit` shows every decoded event as a `stdio_out` block — the fastest way
@@ -35,10 +35,15 @@ The hello-world app at `:8080` ([`hello/app.py`](hello/app.py), stdlib Python, n
 both the front door and the traffic source: it logs every real visit, plus a background stream of
 synthetic requests every half-second so the dashboard has something to show immediately — the same
 RFC 3164 + JSON-body shape `../crates/logit-bench/src/fixtures.rs` measures — to `logit`'s
-`syslog_in` listener. [`logit.yaml`](logit.yaml) runs it through `json` → `kv_metrics` → `keep` →
-`aggregate` → `influxdb_out`, plus `logit` observing its own pipeline via `internal`
-(`../docs/design/internal-telemetry.md`) into the same InfluxDB bucket. **Metrics are the one
-signal that works end to end today** — that's what the shipped Grafana dashboard shows.
+`syslog_in` listener. [`logit.yaml`](logit.yaml) runs it through `json`, then fans out to
+`stdio_out` (the `docker compose logs` tap) and to a metrics leg (`kv_metrics` → `keep` →
+`aggregate` → `influxdb_out`) and a logs leg (`log_out`, `syslog_out` over UDP RFC 5424 to
+`alloy:5141`), plus `logit` observing its own pipeline via `internal`
+(`../docs/design/internal-telemetry.md`) into the same InfluxDB bucket. **Metrics and logs both
+work end to end today** — the shipped Grafana dashboard shows both, and `log_out` round-trips
+`access_in`'s own `syslog.hostname`/`syslog.tag` attributes onto every relayed message
+(`../docs/adr/0022-syslog-output.md`), so Loki gets real `host`/`app` stream labels with no extra
+config.
 
 The pipeline diagram on the landing page (and at `:8080/graph.svg` directly) is rendered at
 startup, not hand-drawn: `graph-dot` runs `logit graph logit.yaml` against the actual config this
@@ -52,14 +57,8 @@ up — the SVG is read fresh on every request, nothing is cached.)
 
 ## What isn't wired yet
 
-Loki and Tempo are up, healthy, and provisioned as Grafana datasources — but `logit` can't write
-to either of them yet, and nothing in this stack works around that anymore:
+Tempo is up, healthy, and provisioned as a Grafana datasource — but `logit` can't write to it yet:
 
-- **Logs → Loki** need a `syslog_out` output, which doesn't exist (not implemented, not even a
-  declared config kind). Loki is genuinely empty — no scaffolding double-write, same honest
-  "provisioned, nothing lands here yet" story as Tempo below. `alloy` (the syslog → Loki shim) is
-  still up, unfed, ready for `logit` to point at it once `syslog_out` lands — see `logit.yaml`'s
-  commented-out `log_out` component.
 - **Traces → Tempo** need both an `otlp_out` output (declared in config, rejected at validation
   today — no OTLP code exists) and something that actually produces spans (`bench/internal-spans-
   costing`, PR #39, measured the cost of carrying trace context through the pipeline and reverted

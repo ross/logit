@@ -36,7 +36,7 @@
 //! it is required (by 7) to have a consumer, so the chain can only terminate at a sink.
 
 use logit_config::{BufferConfig, Component, ComponentKind, Config};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
 /// A component's arity class, fixed by its `kind` (`docs/design/pipeline-graph.md`'s arity
@@ -90,7 +90,11 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Sample { .. }
         | Throttle { .. }
         | Dedup { .. } => Role::Transform,
-        InfluxDbOut { .. } | OtlpOut { .. } | LogitOut { .. } | StdioOut { .. } => Role::Sink,
+        InfluxDbOut { .. }
+        | OtlpOut { .. }
+        | LogitOut { .. }
+        | StdioOut { .. }
+        | SyslogOut { .. } => Role::Sink,
     }
 }
 
@@ -130,6 +134,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         OtlpOut { .. } => "otlp_out",
         LogitOut { .. } => "logit_out",
         StdioOut { .. } => "stdio_out",
+        SyslogOut { .. } => "syslog_out",
     }
 }
 
@@ -151,12 +156,13 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Remove { .. }
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::StdioOut { .. }
+            | ComponentKind::SyslogOut { .. }
     )
 }
 
 /// `Some(interval)` for a kind with an `interval` field, `Aggregate`'s always populated,
 /// `Lua`/`LuaFile`'s only when set. `None` either means no `interval` field on this kind, or a
-/// `Lua`/`LuaFile` component that left it unset -- both are "never flushes", so rule 8 treats
+/// `Lua`/`LuaFile` component that left it unset -- both are "never flushes", so rule 9 treats
 /// them the same: nothing to reject.
 fn interval(kind: &ComponentKind) -> Option<Duration> {
     match kind {
@@ -395,8 +401,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
 /// Kahn's algorithm over the `sources` edges (a source's data flows *into* the component that
 /// names it, so indegree is `sources.len()`). Returns a listener-first order, or a cycle error
-/// naming every component still unresolved once no more zero-indegree nodes remain -- exactly
-/// the ones on or feeding into the cycle.
+/// naming one concrete cycle recovered from the components still unresolved once no more
+/// zero-indegree nodes remain -- that residual set is the cycle *and* everything downstream of
+/// it (a node fed by a cycle never reaches indegree 0 either), so it is walked back down to a
+/// single cycle rather than reported as-is.
 fn topological_order(components: &HashMap<String, Component>) -> anyhow::Result<Vec<String>> {
     let mut indegree: HashMap<&str, usize> =
         components.iter().map(|(id, c)| (id.as_str(), c.sources.len())).collect();
@@ -431,10 +439,44 @@ fn topological_order(components: &HashMap<String, Component>) -> anyhow::Result<
     }
 
     if order.len() != components.len() {
-        let mut stuck: Vec<&str> =
+        // Residual indegree marks the cycle *and* everything downstream of it -- a node fed by a
+        // cycle never reaches indegree 0 either. Naming that whole set would blame components
+        // that are merely downstream victims, so walk `sources` backwards inside it to recover
+        // one real cycle instead. Every stuck node has a stuck source (that's what non-zero
+        // residual indegree means), so the walk can't dead-end, and it must revisit a node within
+        // `stuck.len()` steps.
+        let stuck: BTreeSet<&str> =
             indegree.iter().filter(|(_, &deg)| deg > 0).map(|(&id, _)| id).collect();
-        stuck.sort_unstable();
-        anyhow::bail!("component graph has a cycle involving: {}", stuck.join(", "));
+        let mut path: Vec<&str> = Vec::new();
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        let mut current = *stuck.iter().next().expect("order.len() < components.len()");
+        let start = loop {
+            if let Some(&at) = seen.get(current) {
+                break at;
+            }
+            seen.insert(current, path.len());
+            path.push(current);
+            current = components[current]
+                .sources
+                .iter()
+                .map(String::as_str)
+                .filter(|s| stuck.contains(s))
+                .min()
+                .expect("a stuck node always has a stuck source");
+        };
+        // `path` was built walking against the flow (consumer -> source); reverse the cycle
+        // portion so the message reads as data flow. The discarded prefix `path[..start]` is the
+        // tail that led into the cycle, not part of it.
+        let mut cycle: Vec<&str> = path[start..].to_vec();
+        cycle.reverse();
+        // Rotate so the lexicographically smallest id leads -- a cosmetic step only (any
+        // rotation names the same cycle), but it keeps the message independent of which stuck
+        // node the backward walk happened to start from.
+        let min_idx = cycle.iter().enumerate().min_by_key(|(_, id)| *id).map(|(i, _)| i).expect(
+            "cycle is non-empty: the loop above always pushes at least one node before repeating",
+        );
+        cycle.rotate_left(min_idx);
+        anyhow::bail!("component graph has a cycle: {} -> {}", cycle.join(" -> "), cycle[0]);
     }
     Ok(order)
 }
@@ -556,6 +598,32 @@ mod tests {
             ("c", vec!["b"], lua()),
         ]));
         assert!(err.contains("cycle"), "got: {err}");
+    }
+
+    #[test]
+    fn a_cycle_is_reported_as_a_concrete_path() {
+        let err = expect_err(cfg(vec![
+            ("a", vec!["c"], lua()),
+            ("b", vec!["a"], lua()),
+            ("c", vec!["b"], lua()),
+        ]));
+        assert!(err.contains("cycle: a -> b -> c -> a"), "got: {err}");
+    }
+
+    /// The regression this exists for: residual indegree marks the cycle *and* everything
+    /// downstream of it, since a node fed by a cycle never reaches indegree 0 either. The message
+    /// must name only the cycle, not `out`, which is merely a downstream victim.
+    #[test]
+    fn a_cycle_error_does_not_name_components_downstream_of_it() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("a", vec!["in", "b"], lua()),
+            ("b", vec!["a"], lua()),
+            ("out", vec!["b"], sink()),
+        ]));
+        assert!(err.contains("cycle: a -> b -> a"), "got: {err}");
+        assert!(!err.contains("out"), "got: {err}");
+        assert!(!err.contains("in"), "got: {err}");
     }
 
     #[test]

@@ -208,6 +208,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `Event::clone` (span shape) | **2** | 1 per `Vec` (`events`, `links`) -- every `AttrMap` here stays inline |
 | `stdio_out` encode 100 events | **101** | ~1/event -- fixed, see below, was 1801 |
 | `influxdb_out` encode 100 events | **30** | ~0.3/event — see below |
+| `syslog_out` encode_into 100 events | **100** | ~1/event -- reused struct-held scratch buffers, was 401, see below |
 
 And the corresponding times:
 
@@ -223,6 +224,7 @@ And the corresponding times:
 | `Event::clone` (nginx / statsd / distribution) | 228 / 87 / 51 ns | |
 | `stdio_out` encode, 100 events | 124 µs | 1.24 µs |
 | `influxdb_out` encode, 100 events | 159 µs | 1.59 µs |
+| `syslog_out` encode_into, 100 events | 41.5 µs | 415 ns |
 | `lua` (proxy / `to_table`) | 1.07 / 2.02 µs | |
 
 > Every row above comes from **one** `script/bench` run, deliberately: runs on a busier machine have
@@ -230,6 +232,10 @@ And the corresponding times:
 > invent differences that aren't there. Compare rows within the table freely; treat absolute values
 > as this machine on this day. This table was refreshed once, in one sitting, after landing the
 > `json`/`statsd_in`/`stdio_out`/Lua-boundary fixes below -- every row reflects the current code.
+> The `syslog_out` row is the one exception, added in a later, separate `script/bench` run rather
+> than refreshing the whole table again for one new row -- its allocation count is exact and
+> comparable regardless (deterministic, not machine-dependent), but don't read its wall-clock
+> figure as directly comparable to the others' down to the nanosecond, per this same caveat.
 
 ### `aggregate` flush now costs one allocation per series, for real trace links
 
@@ -293,6 +299,17 @@ always in the direction the allocation count would suggest**: in the run §2's t
 ~3.4× more — a reminder that allocation count and wall-clock time are related, not interchangeable,
 and this doc tracks both for exactly that reason. Don't read either single run as a settled ranking
 between the two encoders.
+
+**`syslog_out` got a narrower version of the same treatment, caught by review rather than found
+independently.** A first version measured at 401 allocations per 100 events (~4/event): the
+encoder's header/message text, the pre-sanitize render, the sanitized-message copy, and each
+sanitized header field were all fresh `String`s allocated per event, three of them as
+function-locals recreated on *every* `encode_into` call — which is why warming the call once (per
+this file's own discipline) didn't help: the very next call's locals started from empty capacity
+again, the same mistake a plain local makes that a struct field doesn't. Hoisting those into
+`SyslogEncoder`'s own `line`/`raw_msg`/`scratch` fields — mirroring `InfluxLineEncoder`'s existing
+scratch buffers rather than inventing a new pattern — brought it to 100 (exactly 1/event), the same
+`format_rfc3339_utc`-per-call residual `stdio_out` already carries and already documents above.
 
 **With the encoder no longer dominant, the ingest chain is the cost again — and it dropped too**:
 `json`'s own fix (item 4) took the full ingest chain from 11 allocations to 5. `kv_metrics` is now
@@ -968,6 +985,11 @@ might regress a workload the fixtures don't cover.
     rare case the byte saving alone would suggest trading for.
 11. ~~**Enable smallvec's `union` feature.**~~ **Done** — 16 bytes off every `Event`, no tradeoff,
     exactly as predicted. `Event`: 792 → 776 bytes.
+12. ~~**Give `syslog_out` the same treatment `influxdb_out`/`stdio_out` got.**~~ **Done** — 401 →
+    100 allocations per 100 events, ~4× (§2). `SyslogEncoder` now holds `line`/`raw_msg`/`scratch`
+    as reused struct fields instead of allocating fresh `String`s per event (three of them as
+    function-locals recreated on every call, the same mistake the other two encoders had already
+    moved past). Found by review, not independently — see §2's own writeup for the mechanism.
 
 ### Deferred — needs real production data, not more synthetic measurement
 

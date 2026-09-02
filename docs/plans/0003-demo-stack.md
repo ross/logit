@@ -29,9 +29,9 @@ eventual `syslog_out` and `otlp_out` work somewhere to land on day one.
 | What runs `logit` | The production image (`Dockerfile`), built by compose — no published image exists yet ([docs/deploying.md](../deploying.md)). |
 | Data source | A hello-world Python app (stdlib only) that's also the demo's landing page — real visits plus a background synthetic loop. No nginx in the demo — `examples/nginx/` stays a dev-stack fixture. |
 | Log line shape | The same RFC 3164 + JSON-body shape `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE` already measures. |
-| Log backend | Loki, up and provisioned — genuinely empty, no scaffolding double-write, until `syslog_out` exists. |
+| Log backend | Loki, up and provisioned. **Now live** — `syslog_out` (`docs/adr/0022-syslog-output.md`) relays `access_json`'s events through `alloy` into Loki. |
 | Trace backend | Tempo, up and provisioned — no data until `otlp_out` and a span producer both exist. |
-| syslog → Loki shim | Grafana Alloy (`loki.source.syslog`, confirmed to accept UDP and RFC 3164) stays up as unfed scaffolding for `syslog_out`. Loki has no syslog receiver of its own; promtail is EOL. |
+| syslog → Loki shim | Grafana Alloy (`loki.source.syslog`, confirmed to accept UDP and both RFC 3164/5424). **Now fed** by `log_out`. Loki has no syslog receiver of its own; promtail is EOL. |
 | Pipeline visualization | `logit graph demo/logit.yaml`, piped through real Graphviz at startup (two chained one-shot containers), served as an SVG on the landing page — not hand-drawn, always reflects the running config. |
 | This plan writes no Rust | No new `ComponentKind`, no new sink, no span emission. The log and trace legs ship as commented-out config plus a documented pointer to what has to be built. |
 
@@ -39,7 +39,7 @@ eventual `syslog_out` and `otlp_out` work somewhere to land on day one.
 
 | Gap | Consequence |
 |---|---|
-| No `syslog_out` | Not implemented, not even a declared `ComponentKind` — anticipated as precedent in `docs/design/pipeline-graph.md`'s naming rationale, never built. Logs can't leave `logit` at all. |
+| ~~No `syslog_out`~~ | **Closed** — implemented, UDP and TCP, RFC 3164/5424 (`docs/adr/0022-syslog-output.md`), and wired live into `demo/logit.yaml`'s `log_out`. |
 | `otlp_out` rejected at validation | Declared in `logit-config`, but `graph::is_implemented` rejects it. No OTLP code, no wire protocol chosen (ADR 0004 leaves gRPC-vs-HTTP open). |
 | No span producer | `bench/internal-spans-costing` (PR #39, draft) added a `TraceContext` prototype to `Fanout`'s `Delivered`, measured its cost, and reverted it in full — only the size-guard test and `docs/design/memory.md`'s "Costing internal spans" section remain. Nothing emits a span anywhere. |
 | `examples/` doubles as both dev fixtures and the onboarding story | Someone trying `logit` for the first time hits `script/server`'s dev-container dependency before seeing anything work. |
@@ -66,7 +66,7 @@ self (internal) --> self_windowed (aggregate) ------+
                                                       v
                                                 influx_out --> InfluxDB --> Grafana
 
-alloy (loki.source.syslog) --> Loki --> Grafana   [unfed scaffolding, see below]
+access_json --> log_out (syslog_out) --> alloy (loki.source.syslog) --> Loki --> Grafana
 
                                                         Tempo --> Grafana   [empty, provisioned]
 ```
@@ -182,13 +182,15 @@ dashboards.yaml` (the file provider), `demo/grafana/dashboards/logit-internal.js
 `web.requests`/`web.request_time` to show the pipeline working end to end).
 
 The syslog → Loki path itself is `demo/alloy/config.alloy`: Alloy's `loki.source.syslog` (promtail
-is EOL) listening on UDP with `syslog_format = "rfc3164"` (matching `syslog_in`'s own format),
-promoting the `__syslog_*` labels Alloy strips by default (`host`, `app`) so Loki always has a
-stream label, and `loki.write` to Loki's push API.
+is EOL) listening on UDP with `syslog_format = "rfc5424"` (matching `log_out`'s own default format
+-- unambiguous timestamps, `docs/adr/0022-syslog-output.md`), promoting the `__syslog_*` labels
+Alloy strips by default (`host`, `app`) so Loki always has a stream label, and `loki.write` to
+Loki's push API. **Now live** -- `syslog_out` (`docs/adr/0022-syslog-output.md`) feeds it.
 
 **Done when:** all three datasources show healthy in Grafana, the dashboard renders real series,
-and Loki/Tempo both return clean, error-free empty results in Grafana Explore — provisioned and
-reachable is the bar, not populated (see workstream C: nothing feeds either of them by design).
+Loki returns real data (`log_out` is live), and Tempo returns clean, error-free empty results in
+Grafana Explore — provisioned and reachable is the bar there, not populated (see workstream C:
+nothing feeds it yet, pending `otlp_out` and a span producer).
 
 ## E. Reset `examples/`
 
@@ -251,8 +253,10 @@ with the repo can follow `README.md` alone to a working Grafana dashboard.
 - Grafana at `localhost:3000`: the shipped dashboard populates; a Flux query against bucket
   `metrics` returns `web.requests`/`web.request_time` tagged exactly `host`/`request_method`/
   `status`.
-- Loki and Tempo show healthy in Grafana's datasource check; both return clean, error-free empty
-  results — genuinely nothing lands in either.
+- Loki and Tempo both show healthy in Grafana's datasource check. Loki returns real data — `{job=
+  "demo"}` in Explore shows lines labeled `host="demo-hello"`/`app="demoapp"`, and `{job="demo"} |
+  json | status >= 500` returns the synthetic 5xx lines. Tempo still returns a clean, error-free
+  empty result — genuinely nothing lands there yet (see workstream C).
 - `docker compose down && up` twice over — `hello` keeps serving and logging, no volume permission
   errors from Loki's, Tempo's, or `graph_data`'s directories.
 - `script/cibuild` passes, including `script/validate`.

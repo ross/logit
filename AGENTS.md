@@ -24,8 +24,11 @@ the dev stack. `examples/` is contributor-facing fixtures the dev stack (`script
 against, kept real because other things in the repo depend on them (`compose.yaml`'s `nginx`
 service, `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE`) — `demo/` is the answer to
 "let me see this work" for anyone else, a self-contained `docker compose up` against the release
-image, and the forcing function for `syslog_out`/`otlp_out` next
-([docs/plans/0003-demo-stack.md](docs/plans/0003-demo-stack.md)). Config is a flat graph of named components (ADR 0009,
+image, and the forcing function for `syslog_out`/`otlp_out`
+([docs/plans/0003-demo-stack.md](docs/plans/0003-demo-stack.md)). `syslog_out` (RFC 3164/5424 over
+UDP or TCP, header fields round-tripped from an event's `syslog.*` attributes,
+[ADR 0022](docs/adr/0022-syslog-output.md)) has since landed too, live in `demo/logit.yaml`'s
+`log_out` — `otlp_out` and a span producer are what's left. Config is a flat graph of named components (ADR 0009,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively
@@ -166,7 +169,7 @@ crates/
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, internal (self-telemetry)
-  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio
+  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, syslog
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)

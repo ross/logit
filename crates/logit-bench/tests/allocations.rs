@@ -22,6 +22,7 @@ use logit_bench::fixtures;
 use logit_core::{EventBatch, Registry, Telemetry, Value};
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::stdio::{EventDump, Format};
+use logit_outputs::syslog::{Format as SyslogFormat, MessageBuf, SyslogEncoder};
 use logit_pipeline::runtime::drain_inbox;
 use logit_pipeline::{
     process_batch, send_batch, unwrap_batch, Delivered, Fanout, SinkQueue, SinkQueueConfig,
@@ -1198,6 +1199,30 @@ fn stdio_encode_100_events() {
     let (text, stats) = measure(|| dump.encode(&batch));
     assert!(!text.is_empty());
     expect_allocs("stdio_out: encode 100 events", stats, 101);
+}
+
+/// First measured at 401 (~4/event): `encode_event`'s header/message text, the pre-sanitize
+/// render, the sanitized-message copy, and each sanitized header field (hostname/app-name) were
+/// all fresh per-event `String` allocations -- three of those four were function-locals recreated
+/// on *every* call, so even warming `encode_into` once (per this file's own discipline) didn't
+/// help, since the very next call's locals started from empty capacity again. `SyslogEncoder`
+/// now holds `line`/`raw_msg`/`scratch` as reused struct fields instead (mirroring
+/// `InfluxLineEncoder`'s own scratch buffers), which is what brought this down to 100 (exactly
+/// 1/event). What's left is `format_rfc3339_utc`'s own per-call allocation
+/// (`push_rfc5424_timestamp`, `logit_core::time`) -- the same shared, already-accepted cost
+/// `stdio_out`'s own encoder documents for its own timestamp line, out of this encoder's scope to
+/// avoid without changing that function's signature. See `docs/design/memory.md`.
+#[test]
+fn syslog_encode_into_100_events() {
+    let mut encoder = SyslogEncoder::new(SyslogFormat::Rfc5424, 16);
+    let batch = fixtures::nginx_batch(100);
+    let mut out = MessageBuf::default();
+    let _ = encoder.encode_into(&batch, &mut out); // warm-up call; EncodeStats is Copy
+
+    let (stats_out, stats) = measure(|| encoder.encode_into(&batch, &mut out));
+    assert_eq!(out.len(), 100);
+    assert_eq!(stats_out.skipped_no_log, 0);
+    expect_allocs("syslog_out: encode_into 100 events", stats, 100);
 }
 
 // ---------------------------------------------------------------------------------------------

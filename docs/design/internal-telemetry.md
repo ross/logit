@@ -350,6 +350,14 @@ Worked examples, one per shipped component:
   (`docs/adr/0021-buffered-sink-delivery.md`) into the generic `deliver_with_retry` every sink now
   shares, so retry counting is a Layer 2 metric (`logit.component.retries`, above), not something
   each sink tracks for itself.
+- `syslog_out` (`crates/logit-outputs/src/syslog.rs`): `logit.output.batch.bytes`,
+  `logit.output.request.duration`, `logit.output.requests{class="ok"|"error"}` — the same shape as
+  `influxdb_out`'s, minus the HTTP-specific status classes, since there's no response to classify.
+  Plus detail neither of the other two sinks needs: `logit.output.events.skipped` (events with no
+  `log` record — nothing to render as a syslog message, ADR 0012), `logit.output.messages.
+  truncated` and `logit.output.messages.dropped{reason="oversize_header"|"oversize_datagram"}`
+  (per-message size handling, `docs/adr/0022-syslog-output.md`'s "Sizing" section). Retry stays a
+  Layer 2 metric here too, for the same reason as `influxdb_out`.
 
 ## Metrics from Lua scripts
 
