@@ -784,6 +784,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "logit-core",
+ "logit-inputs",
  "logit-pipeline",
  "logit-proto",
  "logit-script",

@@ -24,3 +24,7 @@ tokio.workspace = true
 # attribute's InfluxDB tag-inclusion behavior -- see
 # bytes_attribute_stays_excluded_from_tags_after_a_lua_enrichment_stage below.
 logit-script.workspace = true
+# Only for `syslog.rs`'s relay test, which decodes a real line with `SyslogDecoder` rather than
+# hand-building an event, so the attribute names/types it asserts against can't drift from what
+# `syslog_in` actually produces.
+logit-inputs.workspace = true

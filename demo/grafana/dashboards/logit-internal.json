@@ -118,8 +118,8 @@
     {
       "id": 8,
       "type": "logs",
-      "title": "Loki: raw demo traffic ({job=\"demo\"}) -- empty by design",
-      "description": "Nothing feeds Loki today -- `logit` has no `syslog_out` yet, and the demo doesn't work around that. This panel is a sample LogQL query, ready for the day something writes here (demo/alloy/config.alloy is unfed scaffolding for exactly that). See demo/README.md's \"What isn't wired yet\".",
+      "title": "Loki: raw demo traffic ({job=\"demo\"})",
+      "description": "`log_out` (`syslog_out`, docs/adr/0022-syslog-output.md) relays access_json's events as RFC 5424 syslog to Alloy (demo/alloy/config.alloy), which pushes them into Loki -- `host`/`app` stream labels come from the event's own `syslog.hostname`/`syslog.tag` attributes, round-tripped from `access_in`'s syslog_in decode, not from any syslog_out config field.",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
       "datasource": { "type": "loki", "uid": "loki" },
       "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true },

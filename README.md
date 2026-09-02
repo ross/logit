@@ -17,13 +17,15 @@ cd demo && docker compose up --build
 Then open **http://localhost:8080** — a small hello-world app that's both the landing page and the
 demo's traffic source, with a link to Grafana (dashboard already provisioned) and this stack's own
 pipeline rendered live via `logit graph | dot`. No Rust toolchain, no clone-and-build, nothing else
-in this repo required. Loki and Tempo come up too, provisioned and empty, ready for the logs and
-traces `logit` can't send yet — see [demo/README.md](demo/README.md) for what's flowing and what
-isn't.
+in this repo required. Logs and metrics both flow end to end (Loki and InfluxDB); Tempo comes up
+too, provisioned and empty, ready for traces `logit` can't send yet — see
+[demo/README.md](demo/README.md) for what's flowing and what isn't.
 
 **Status:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a Lua
 enrichment stage, InfluxDB 2.x out, via `logit run <config>`. Since then, `syslog_in` (RFC 3164/5424
-over UDP) and `stdio_out` have joined statsd/InfluxDB as implemented protocols, and `json`,
+over UDP), `stdio_out`, and `syslog_out` (RFC 3164/5424 over UDP or TCP,
+[ADR 0022](docs/adr/0022-syslog-output.md)) have joined statsd/InfluxDB as implemented protocols,
+and `json`,
 `kv_metrics`, `keep`, and `remove` have joined `aggregate` as implemented native transforms — `logit
 run` rejects a config referencing any other unimplemented kind with a clear error. Config is a flat
 graph of named components, each declaring its own `sources` ([ADR 0009](docs/adr/0009-component-graph-configuration.md),
@@ -94,7 +96,7 @@ crates/
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution, the node runtime
   logit-inputs      per-protocol listeners; statsd, syslog
-  logit-outputs     per-protocol sinks; InfluxDB, stdio
+  logit-outputs     per-protocol sinks; InfluxDB, stdio, syslog
   logit-transforms  built-in native transform components; aggregate, json, kv_metrics, keep, remove
   logit-cli         the `logit` binary
   logit-bench       dev-only: allocation-count tests and throughput benchmarks
