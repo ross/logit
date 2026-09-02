@@ -9,6 +9,16 @@
 //! `has_span` already has. Two primitive byte arrays cross this boundary, not `TraceContext`
 //! itself: `logit-script` doesn't depend on `logit-pipeline` (where that type lives), and there's
 //! nothing this module needs from it beyond the two arrays.
+//!
+//! **Installed *before* the script's source runs, not after like `telemetry`.** `telemetry`
+//! getting away with installing late relies on a real but narrow property: a *function body's*
+//! global lookup resolves at call time, so `telemetry.count(...)` inside `process()` sees it
+//! correctly however late `install` ran, right up until the first call. A script's top-level code
+//! (which runs once, during `Lua::load(source).exec()`) doesn't get that -- an ordinary top-level
+//! alias like `local ctx = trace` captures whatever `trace` *is at that instant*, once, forever.
+//! `ScriptWorker::new` installs this before `.exec()` specifically because of that: installing
+//! after would make every such alias permanently `nil`, caught in review by exactly that script
+//! shape failing on every event.
 
 use mlua::{Lua, RegistryKey, Table};
 use std::fmt::Write;
