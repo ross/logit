@@ -172,6 +172,17 @@ already built that have a known, accepted rough edge.
   literals (a bounded set), so this was a wasted hash plus concurrent-map probe on the hot path,
   not a leak, but it's gone now regardless: `get`/`remove` use `interner::lookup`, a non-interning
   probe, falling through to the existing search only on a hit.
+
+  **`otlp_in` (PR3) will be the sharpest form of the growth premise yet, when it lands.**
+  Every earlier listener's attribute *keys* come from `logit`'s own config or a fixed protocol
+  grammar (statsd's `#tag:value`, syslog's structured-data field names) — a bounded set by
+  construction. `crates/logit-proto/src/otlp/common.rs`'s `key_values_into_attrs` interns every
+  OTLP `KeyValue.key` it decodes, and OTLP attribute keys are arbitrary peer-supplied strings with
+  no `logit`-side grammar bounding them at all — the first listener where "a metric name that
+  never repeats" (this entry's stated retrofit trigger, above) could plausibly come from something
+  other than a user's own naming mistake. `otlp_in` doesn't exist until PR3, so this is a note for
+  that PR's own review, not a live gap yet: budget a `keep`-in-front recommendation for `otlp_in`
+  in `docs/deploying.md`, mirroring the mitigation this entry already names.
 - ~~**`statsd_in` copies tag values instead of slicing them**~~ — **closed.** It used to build
   attribute values with `attributes.insert(k, v)` on a `&str`, routing through
   `Value::str` → `Bytes::from(String)` (copying bytes already in the datagram buffer), then
@@ -469,3 +480,37 @@ already built that have a known, accepted rough edge.
   the pipeline currently relies on. Real work either way, with no forcing function yet — this
   entry is that forcing function, for whenever the output path's allocation cost becomes worth
   chasing.
+- **Cross-protocol semantic gaps.** OTLP (`crates/logit-proto/src/otlp/`) is `logit`'s first
+  *second* wire model, and its codec is the first place "our internal model can't cleanly express
+  what a peer protocol expects" shows up as more than a one-line doc-comment footnote. Filed as its
+  own entry, meant to grow as more codecs and more of OTLP's own surface (exemplars, profiles,
+  OTLP's log `event_name`, ...) get real mappings, rather than re-discovered by grepping doc
+  comments across encoders each time. Every mapping below is deliberate, counted, and documented at
+  its own call site — this entry exists so the list is in one place too:
+
+  | Direction | Mapping | Counter | Why |
+  |---|---|---|---|
+  | encode | `MetricKind::Distribution` (a `DDSketch`) → OTLP `Summary` of 5 fixed quantiles (p50/p75/p90/p95/p99) | `logit.output.metrics.degraded{metric_kind="distribution"}` | OTLP has no mergeable-sketch metric type; `ExponentialHistogram` is the nearest shape, but `DDSketch` exposes no bin iteration to convert from (`crates/logit-core/src/metric.rs`), and fabricating one would repeat the "non-mergeable HyperLogLog" mistake AGENTS.md already warns against (`crates/logit-proto/src/otlp/metrics.rs`'s module doc). |
+  | encode | `MetricKind::Set` (a `HyperLogLog`) → skipped entirely | `logit.output.metrics.skipped{metric_kind="set"}` | `HyperLogLog` is still a stub with no cardinality to read (this file's own first entry) — matches `crates/logit-outputs/src/influxdb.rs`'s existing precedent for the same kind. |
+  | encode | `Value::U64` above `i64::MAX` → OTLP `AnyValue.DoubleValue` | none (numeric, not a metric point) | OTLP's only integer type is signed 64-bit; exact up to `f64`'s 2^53 range, approximate above it. Any `Value::U64` (even in range) also loses the "this was unsigned" fact on decode, coming back as `Value::I64` — `otlp/common.rs`'s module doc has the full case list. |
+  | encode | `Value::Timestamp` → OTLP `AnyValue.IntValue` | none | OTLP's `AnyValue` has no timestamp variant at all; decodes back as `Value::I64`, indistinguishable from a value that was always an integer. |
+  | decode | OTLP `ExponentialHistogramDataPoint` wider than 512 derived buckets → skipped | `logit.input.metrics.skipped{metric_kind="exponential_histogram", reason="bucket_cap"}` | The *mapping itself* is exact (an exponential histogram is a fixed-bucket histogram with geometric bounds, not lossy) — this is a volume bound against a peer-chosen `scale`/`offset` producing an unbounded `Vec`, the same "bound and count" shape every buffer in this codebase uses for its own overflow. |
+  | decode | any OTLP data point with `flags & DATA_POINT_FLAGS_NO_RECORDED_VALUE_MASK` → skipped | `logit.input.metrics.skipped{metric_kind, reason="no_recorded_value"}` | Never fails the whole request — OTLP has its own channel for reporting rejected points back (`partial_success`), wired in PR3, not invented here as a second one. |
+
+  Two residual, narrower gaps in the same codec, not yet worth their own table row:
+  `BodyFormat`/a span's `Status.message` have no OTLP field of their own and round-trip through a
+  reserved attribute (`logit.body_format`, `otel.status_message`) instead — lossless, just an
+  attribute-shaped workaround, documented in `otlp/logs.rs`'s and `otlp/traces.rs`'s own module
+  docs. And a bare `LogRecord`'s OTLP `trace_id`/`span_id` fields (correlating a log to a trace
+  without carrying the span itself) are dropped on both directions — `logit_core::LogRecord` has no
+  field for them, since this codebase's own correlation mechanism is a log and its span sharing one
+  `Event`, not a pair of IDs living on the log alone.
+
+  Both `Distribution`→`Summary` and `Set`→skip are a real, if narrow, qualification of
+  [ADR 0004](adr/0004-native-wire-format-with-otlp-bridge.md)'s claim that the internal model "must
+  be a superset of what OTLP can express, or the OTLP codec becomes lossy": here it's `logit`'s own
+  model — a mergeable sketch, a cardinality stub — that can't be losslessly re-expressed *as* OTLP,
+  the direction ADR 0004 didn't anticipate. See
+  [ADR 0023](adr/0023-committed-pregenerated-otlp-protobuf.md)'s Consequences section for that
+  qualification stated plainly, and `crates/logit-proto/src/otlp/metrics.rs`'s module doc for the
+  full encode/decode tables this summarizes.
