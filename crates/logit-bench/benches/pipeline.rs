@@ -268,7 +268,9 @@ fn full_chain(bencher: Bencher) {
 mod runtime {
     use super::*;
     use logit_core::{EventBatch, Telemetry};
-    use logit_pipeline::{process_batch, send_batch, unwrap_batch, Delivered, Fanout};
+    use logit_pipeline::{
+        process_batch, send_batch, unwrap_batch, Delivered, Fanout, TraceContext,
+    };
 
     /// `run_transform`'s per-batch body (`logit_pipeline::process_batch`), with no channel or
     /// runtime involved at all -- a plain synchronous call, so both of this bench's columns are
@@ -340,15 +342,15 @@ mod runtime {
             tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
         let mut output = NoopOutput;
         let telemetry = Telemetry::default();
-        bencher.with_inputs(|| Delivered::Owned(fixtures::nginx_batch(1))).bench_local_values(
-            |delivered| {
+        bencher
+            .with_inputs(|| Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default()))
+            .bench_local_values(|delivered| {
                 rt.block_on(async {
                     send_batch("out", &mut output, &delivered, &telemetry)
                         .await
                         .expect("noop output never errors")
                 })
-            },
-        );
+            });
     }
 
     /// Always fails, matching `tests/allocations.rs`'s own -- the throughput counterpart to
@@ -369,12 +371,12 @@ mod runtime {
             tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
         let mut output = FailingOutput;
         let telemetry = Telemetry::default();
-        bencher.with_inputs(|| Delivered::Owned(fixtures::nginx_batch(1))).bench_local_values(
-            |delivered| {
+        bencher
+            .with_inputs(|| Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default()))
+            .bench_local_values(|delivered| {
                 rt.block_on(async {
                     drop(send_batch("out", &mut output, &delivered, &telemetry).await)
                 })
-            },
-        );
+            });
     }
 }

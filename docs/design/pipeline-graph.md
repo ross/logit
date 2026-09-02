@@ -268,6 +268,37 @@ transforms implement, letting the node runtime hold `Box<dyn Transform + Send>` 
 per node kind. Lua nodes stay the one hand-special-cased kind, for the `!Send` reason above — a
 trait object doesn't fix that, and shouldn't try to.
 
+### Trace context propagation
+
+Every `Delivered` (the channel payload one `Fanout` edge carries, `crates/logit-pipeline/src/fanout.rs`)
+carries a `TraceContext { trace_id: [u8; 16], span_id: [u8; 8] }` — the substrate for internal
+spans, decided and built per [ADR 0020](../adr/0020-trace-context-propagation-on-delivered.md) on
+the measured evidence [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md) required. No
+`SpanRecord` is emitted anywhere yet (that's a separate, still-open piece — see `docs/known-gaps.md`'s
+internal-spans entry) — this is only the plumbing that gets the *right* context to the *right*
+place once something does.
+
+**Which node kinds propagate a real parent, and which mint a fresh root, is not uniform — it's
+exactly the 1-to-1-vs-*n*-to-1 distinction the rest of this doc already draws between a node's
+per-batch processing and its flush:**
+
+| Node kind | Context of what it emits |
+|---|---|
+| A listener's own batches | Always a fresh root — `Input::run` never receives a `Delivered` (arity rules out a `sources` entry pointing at one), so there is no parent to inherit. |
+| `Transform::process`/`ScriptWorker::process` (the non-flush path) | A [`TraceContext::child`] of the one incoming batch that produced it — 1-to-1, unambiguous. |
+| `Transform::flush`/Lua's timer-driven `flush()` | A fresh root, deliberately — an *n*-to-1 relationship (however many batches were absorbed since the last tick), with no single correct parent to propagate. Tracked as an open gap, not silently approximated; see ADR 0020's "What this doesn't do." |
+| `run_output` | Emits nothing further downstream — nothing to propagate *to*. It already borrows the incoming `Delivered` without unwrapping (`Output::send(&EventBatch)`, [ADR 0016](../adr/0016-arc-eventbatch-copy-on-write.md)), so the context is there to read (`Delivered::context()`) once something needs it. |
+
+Mechanically: `Fanout::send`/`send_blocking` (mint a root) are unchanged in signature and behavior;
+`Fanout::send_with_context`/`send_blocking_with_context` (mint a child of a given parent) are new,
+additive methods used only by the two propagating call sites above. `Delivered::context()` is a
+cheap `&self` accessor — read it *before* `unwrap_batch` consumes the batch, since `unwrap_batch`
+itself still discards the context (changing its return type to include one would force every
+existing caller, most of which don't propagate anything, to thread a value through unused).
+
+A fan-out (one batch, several downstream branches) gives every branch the *identical* child
+context — one emission forking into several consumers is still one hop, not several.
+
 ## Backpressure: diamonds are the normal shape now
 
 With filter components as the only branching mechanism (ADR 0009), a config where one listener feeds

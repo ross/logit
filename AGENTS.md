@@ -45,7 +45,13 @@ is `logit` observing itself — a listener like any other, draining `logit_core:
 per-component buffers into ordinary events on its own `interval`; see
 [ADR 0018](docs/adr/0018-internal-telemetry-as-pipeline-events.md) and
 [internal-telemetry.md](docs/design/internal-telemetry.md) for the framework, and
-[examples/internal-telemetry.yaml](examples/internal-telemetry.yaml) for a runnable config.
+[examples/internal-telemetry.yaml](examples/internal-telemetry.yaml) for a runnable config. Every
+`Delivered` (one `Fanout` edge's channel payload) now carries a real `TraceContext`, propagated as
+a child of its parent for the two node kinds with an unambiguous one to propagate
+(`Transform::process`/`ScriptWorker::process`'s non-flush path, and `run_output`) — the substrate
+for internal spans, not spans themselves yet; see
+[ADR 0020](docs/adr/0020-trace-context-propagation-on-delivered.md) and
+[pipeline-graph.md](docs/design/pipeline-graph.md)'s "Trace context propagation" section.
 
 ## Environment
 
