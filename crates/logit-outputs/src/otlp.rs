@@ -71,8 +71,12 @@ pub struct OtlpOutput {
 }
 
 impl OtlpOutput {
-    pub fn new(endpoint: String, transport: OtlpTransport) -> Self {
-        Self {
+    /// Fails construction outright for a `protocol: grpc` endpoint written with an `https://`
+    /// scheme -- see [`reject_insecure_grpc_endpoint`] for why that can't be treated as a friendly
+    /// alternate spelling the way `http://`/`grpc://` are.
+    pub fn new(endpoint: String, transport: OtlpTransport) -> anyhow::Result<Self> {
+        reject_insecure_grpc_endpoint(&endpoint, transport)?;
+        Ok(Self {
             endpoint,
             transport,
             client: build_client(DEFAULT_TIMEOUT),
@@ -80,7 +84,7 @@ impl OtlpOutput {
             encoder: OtlpEncoder::new(),
             telemetry: Telemetry::default(),
             diag: Diagnostics::default(),
-        }
+        })
     }
 
     /// Overrides the default 10s request timeout (HTTP transport: `reqwest`'s own timeout; gRPC
@@ -339,17 +343,49 @@ fn grpc_fault(code: u32) -> Fault {
     }
 }
 
+/// Rejects a `protocol: grpc` endpoint written with an `https://` scheme, as a hard
+/// construction-time error rather than a silent downgrade. This output's gRPC transport has no
+/// TLS support at all (`docs/adr/0024-hand-rolled-grpc-over-hyper.md` -- unary gRPC over plain
+/// `hyper`, nothing more) -- so unlike `grpc_authority`'s deliberate `http://`/`grpc://`
+/// equivalence (an operator copying one component's endpoint to the other, where both spellings
+/// genuinely mean the same plaintext connection), treating `https://` as one more friendly
+/// alternate spelling would silently export every log line, span, and attribute value over the
+/// network **unencrypted** -- no error, no diagnostic, just a config typo turning into a real
+/// interception risk. Checked once, here, rather than inside `grpc_authority` itself, so an
+/// `https://` endpoint can never reach a live `TcpStream::connect` call at all: even if some
+/// future call site skipped this check, `grpc_authority` no longer strips `https://`, so the
+/// connect attempt would fail loudly on an invalid hostname rather than quietly succeed in
+/// plaintext.
+fn reject_insecure_grpc_endpoint(endpoint: &str, transport: OtlpTransport) -> anyhow::Result<()> {
+    if transport == OtlpTransport::Grpc && endpoint.to_ascii_lowercase().starts_with("https://") {
+        anyhow::bail!(
+            "otlp_out: endpoint {endpoint:?} has protocol: grpc, but this output's gRPC \
+             transport has no TLS support (docs/adr/0024-hand-rolled-grpc-over-hyper.md) -- an \
+             https:// endpoint would silently be exported in plaintext. Use protocol: http for a \
+             TLS-terminated OTLP endpoint, or a plaintext http://... / grpc://... endpoint for \
+             gRPC"
+        );
+    }
+    Ok(())
+}
+
 /// Strips a leading URL scheme from `endpoint`, if present, leaving a bare `host:port` --
 /// `TcpStream::connect` (the gRPC transport's connection primitive; there is no higher-level
 /// client to hand a full URL to, unlike the HTTP transport's `reqwest::Client`) wants an
 /// authority, not a URL. Config's `endpoint` is written either way (`tempo:4317` in the demo,
 /// following the HTTP transport's `http://host:port` habit if an operator copies one config to
-/// the other) -- accepting both means a typo'd scheme on a `protocol: grpc` component fails at
-/// connect time with a clear error, not a confusing "invalid DNS name" one.
+/// the other) -- accepting both means a typo'd `grpc://`/`http://` scheme on a `protocol: grpc`
+/// component fails at connect time with a clear error, not a confusing "invalid DNS name" one.
+///
+/// **Deliberately does not strip `https://`** -- see [`reject_insecure_grpc_endpoint`], which
+/// every `OtlpOutput` construction runs before this function can ever see an endpoint. An
+/// `https://`-prefixed authority reaching `TcpStream::connect` unstripped fails as an invalid
+/// hostname, which is the correct, loud failure mode if that guard is ever bypassed -- silently
+/// treating `https://` the same as `http://`/`grpc://` here is exactly the insecure-downgrade
+/// this function must never do.
 fn grpc_authority(endpoint: &str) -> &str {
     endpoint
         .strip_prefix("grpc://")
-        .or_else(|| endpoint.strip_prefix("https://"))
         .or_else(|| endpoint.strip_prefix("http://"))
         .unwrap_or(endpoint)
         .trim_end_matches('/')
@@ -504,7 +540,8 @@ fn parse_partial_success(bytes: &[u8]) -> (i64, String) {
         match (field, wire_type) {
             (1, 2) => {
                 let Some(len) = read_varint(bytes, &mut pos) else { break };
-                let Some(sub) = bytes.get(pos..pos + len as usize) else { break };
+                let Some(end) = pos.checked_add(len as usize) else { break };
+                let Some(sub) = bytes.get(pos..end) else { break };
                 return parse_partial_success_message(sub);
             }
             _ => {
@@ -532,8 +569,9 @@ fn parse_partial_success_message(bytes: &[u8]) -> (i64, String) {
             },
             (2, 2) => {
                 let Some(len) = read_varint(bytes, &mut pos) else { break };
-                let Some(s) = bytes.get(pos..pos + len as usize) else { break };
-                pos += len as usize;
+                let Some(end) = pos.checked_add(len as usize) else { break };
+                let Some(s) = bytes.get(pos..end) else { break };
+                pos = end;
                 message = String::from_utf8_lossy(s).into_owned();
             }
             _ => {
@@ -668,7 +706,7 @@ mod tests {
         "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
     fn http_output(addr: std::net::SocketAddr) -> OtlpOutput {
-        OtlpOutput::new(format!("http://{addr}"), OtlpTransport::Http)
+        OtlpOutput::new(format!("http://{addr}"), OtlpTransport::Http).unwrap()
     }
 
     #[tokio::test]
@@ -785,7 +823,8 @@ mod tests {
 
     #[test]
     fn otlp_output_reports_itself_not_duplicate_safe() {
-        let output = OtlpOutput::new("http://localhost:4318".to_string(), OtlpTransport::Http);
+        let output =
+            OtlpOutput::new("http://localhost:4318".to_string(), OtlpTransport::Http).unwrap();
         assert!(
             !output.duplicate_safe(),
             "a multi-signal batch issues several requests (a mid-batch failure would re-send an \
@@ -870,7 +909,7 @@ mod tests {
     }
 
     fn grpc_output(addr: std::net::SocketAddr) -> OtlpOutput {
-        OtlpOutput::new(addr.to_string(), OtlpTransport::Grpc)
+        OtlpOutput::new(addr.to_string(), OtlpTransport::Grpc).unwrap()
     }
 
     #[tokio::test]
@@ -967,12 +1006,73 @@ mod tests {
         assert_eq!(parse_partial_success(&[]), (0, String::new()));
     }
 
+    /// A backend replying with a maximal (10-byte) varint length on the `partial_success` field
+    /// must not panic via `pos + len` overflowing `usize` -- `checked_add` should reject it as
+    /// malformed (the declared length runs past the end of `bytes` regardless) and fall back to
+    /// "no partial success," the same as any other truncated/malformed body.
+    #[test]
+    fn parse_partial_success_does_not_panic_on_an_overflowing_declared_length() {
+        // field 1 (partial_success), length-delimited, with the largest encodable varint length.
+        let mut bytes = vec![0x0a];
+        bytes.extend_from_slice(&[0xff; 9]);
+        bytes.push(0x01); // 10-byte varint, decodes to a huge u64
+        assert_eq!(parse_partial_success(&bytes), (0, String::new()));
+    }
+
+    /// The same overflow hazard one level down, inside the `partial_success` submessage's own
+    /// `error_message` field.
+    #[test]
+    fn parse_partial_success_message_does_not_panic_on_an_overflowing_declared_length() {
+        let mut bytes = vec![0x12]; // field 2 (error_message), length-delimited
+        bytes.extend_from_slice(&[0xff; 9]);
+        bytes.push(0x01);
+        assert_eq!(parse_partial_success_message(&bytes), (0, String::new()));
+    }
+
     #[test]
     fn grpc_authority_strips_every_scheme_it_recognizes() {
         assert_eq!(grpc_authority("grpc://tempo:4317"), "tempo:4317");
         assert_eq!(grpc_authority("http://tempo:4317"), "tempo:4317");
-        assert_eq!(grpc_authority("https://tempo:4317"), "tempo:4317");
         assert_eq!(grpc_authority("tempo:4317"), "tempo:4317");
         assert_eq!(grpc_authority("http://tempo:4317/"), "tempo:4317");
+    }
+
+    /// `grpc_authority` must never treat `https://` as one more friendly alternate spelling --
+    /// see [`reject_insecure_grpc_endpoint`], which is what actually stops an `https://` endpoint
+    /// from reaching this function in normal use. Pinned here too, directly, so a future edit to
+    /// `grpc_authority` alone can't quietly reintroduce the downgrade even if the earlier guard
+    /// stays intact.
+    #[test]
+    fn grpc_authority_does_not_strip_https() {
+        assert_eq!(grpc_authority("https://tempo:4317"), "https://tempo:4317");
+    }
+
+    #[test]
+    fn constructing_an_otlp_output_with_https_and_protocol_grpc_is_rejected() {
+        // `OtlpOutput` isn't `Debug` (it embeds a `reqwest::Client`), so `Result::expect_err` --
+        // which needs `Debug` on the `Ok` side to format its panic message -- doesn't work here.
+        // Same reasoning `logit-cli::pipeline`'s own `build_spec` tests already follow.
+        let err = match OtlpOutput::new("https://tempo:4317".to_string(), OtlpTransport::Grpc) {
+            Ok(_) => panic!("an https:// endpoint under protocol: grpc must be a hard error"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("https"), "got: {msg}");
+        assert!(msg.contains("grpc"), "got: {msg}");
+    }
+
+    #[test]
+    fn constructing_an_otlp_output_with_https_and_protocol_http_succeeds() {
+        // `protocol: http` genuinely does support TLS (it's plain `reqwest`) -- only the gRPC
+        // transport is the problem.
+        OtlpOutput::new("https://tempo:4318".to_string(), OtlpTransport::Http)
+            .expect("https:// is exactly what protocol: http is for");
+    }
+
+    #[test]
+    fn constructing_an_otlp_output_with_http_and_protocol_grpc_succeeds() {
+        // The one legitimate alternate spelling `grpc_authority` still accepts.
+        OtlpOutput::new("http://tempo:4317".to_string(), OtlpTransport::Grpc)
+            .expect("http:// under protocol: grpc is a plaintext connection, not a downgrade");
     }
 }

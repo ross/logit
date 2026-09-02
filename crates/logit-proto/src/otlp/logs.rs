@@ -11,11 +11,19 @@
 //! (`"raw" | "json" | "structured"`), inserted on encode and consumed (removed) on decode -- the
 //! same "reserved key rides as an attribute" idiom `traces.rs` uses for a span's status message.
 //!
+//! **`time_unix_nano == 0` falls back to `observed_time_unix_nano`,** per OTLP's own contract for
+//! a consumer that (like this one) keeps a single timestamp: `time_unix_nano == 0` means "unknown
+//! or missing" (`logs.proto`'s own doc comment), not literally the Unix epoch -- a real collector
+//! commonly sends exactly that when the original event time wasn't available, and treating it as
+//! epoch would silently corrupt ordering and could push the record outside a downstream retention
+//! window. If `observed_time_unix_nano` is also `0`, `Event::timestamp` is `0`; there is no third
+//! fallback to reach for.
+//!
 //! **Dropped, documented, not errors** (mirrors `traces.rs`'s precedent for `Span`):
-//! `observed_time_unix_nano`, `trace_id`/`span_id` (a log and its span correlate today only by
-//! sharing one `Event` -- `logit_core::LogRecord` has no field of its own to carry a peer's
-//! correlation IDs when they arrive on a separate signal or a bare log-only record), `flags`,
-//! `dropped_attributes_count`, `event_name`.
+//! `trace_id`/`span_id` (a log and its span correlate today only by sharing one `Event` --
+//! `logit_core::LogRecord` has no field of its own to carry a peer's correlation IDs when they
+//! arrive on a separate signal or a bare log-only record), `flags`, `dropped_attributes_count`,
+//! `event_name`.
 
 use crate::otlp::common;
 use crate::otlp::generated::opentelemetry::proto::logs::v1 as pb;
@@ -123,7 +131,14 @@ pub(crate) fn decode_log_record(record: pb::LogRecord, mut attrs: AttrMap) -> Ev
     let body_format = decode_body_format(&mut attrs);
     let severity = decode_severity(record.severity_number, &record.severity_text);
     let message = record.body.map(common::any_value_to_value).unwrap_or(Value::Null);
-    Event::log(record.time_unix_nano as i64, attrs, LogRecord { message, severity, body_format })
+    // See the module doc: 0 means "unknown", not literally the epoch -- prefer the observed time
+    // over silently treating a missing original timestamp as 1970-01-01.
+    let timestamp = if record.time_unix_nano != 0 {
+        record.time_unix_nano as i64
+    } else {
+        record.observed_time_unix_nano as i64
+    };
+    Event::log(timestamp, attrs, LogRecord { message, severity, body_format })
 }
 
 #[cfg(test)]
@@ -184,6 +199,48 @@ mod tests {
                 "body_format {format:?} should survive an encode/decode round trip"
             );
         }
+    }
+
+    #[test]
+    fn a_zero_time_unix_nano_falls_back_to_observed_time_unix_nano() {
+        let record = pb::LogRecord {
+            time_unix_nano: 0,
+            observed_time_unix_nano: 4_200,
+            severity_number: 0,
+            severity_text: String::new(),
+            body: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            flags: 0,
+            trace_id: Vec::new(),
+            span_id: Vec::new(),
+            event_name: String::new(),
+        };
+        let decoded = decode_log_record(record, AttrMap::new());
+        assert_eq!(
+            decoded.timestamp, 4_200,
+            "a missing time_unix_nano (0, OTLP's own 'unknown' sentinel) must fall back to \
+             observed_time_unix_nano rather than becoming the literal Unix epoch"
+        );
+    }
+
+    #[test]
+    fn a_present_time_unix_nano_is_preferred_over_observed_time_unix_nano() {
+        let record = pb::LogRecord {
+            time_unix_nano: 100,
+            observed_time_unix_nano: 4_200,
+            severity_number: 0,
+            severity_text: String::new(),
+            body: None,
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            flags: 0,
+            trace_id: Vec::new(),
+            span_id: Vec::new(),
+            event_name: String::new(),
+        };
+        let decoded = decode_log_record(record, AttrMap::new());
+        assert_eq!(decoded.timestamp, 100);
     }
 
     #[test]

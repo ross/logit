@@ -173,16 +173,17 @@ already built that have a known, accepted rough edge.
   not a leak, but it's gone now regardless: `get`/`remove` use `interner::lookup`, a non-interning
   probe, falling through to the existing search only on a hit.
 
-  **`otlp_in` (PR3) will be the sharpest form of the growth premise yet, when it lands.**
+  **`otlp_in` is the sharpest form of the growth premise yet, now that it's landed (PR3).**
   Every earlier listener's attribute *keys* come from `logit`'s own config or a fixed protocol
   grammar (statsd's `#tag:value`, syslog's structured-data field names) — a bounded set by
   construction. `crates/logit-proto/src/otlp/common.rs`'s `key_values_into_attrs` interns every
   OTLP `KeyValue.key` it decodes, and OTLP attribute keys are arbitrary peer-supplied strings with
   no `logit`-side grammar bounding them at all — the first listener where "a metric name that
   never repeats" (this entry's stated retrofit trigger, above) could plausibly come from something
-  other than a user's own naming mistake. `otlp_in` doesn't exist until PR3, so this is a note for
-  that PR's own review, not a live gap yet: budget a `keep`-in-front recommendation for `otlp_in`
-  in `docs/deploying.md`, mirroring the mitigation this entry already names.
+  other than a user's own naming mistake. The mitigation this entry already names is documented for
+  real now: [`docs/deploying.md`](deploying.md) has a `keep`-in-front recommendation specifically
+  for `otlp_in`, not just the general `aggregate`-cardinality one
+  [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml) already demonstrates.
 - ~~**`statsd_in` copies tag values instead of slicing them**~~ — **closed.** It used to build
   attribute values with `attributes.insert(k, v)` on a `&str`, routing through
   `Value::str` → `Bytes::from(String)` (copying bytes already in the datagram buffer), then
@@ -586,3 +587,18 @@ already built that have a known, accepted rough edge.
   sibling signals already in flight and doesn't let one incompatible signal alone trip the
   sustained-failure guard for signals that are succeeding. `demo/logit.yaml`'s `trace_windowed`/
   `trace_out` components carry this same explanation inline.
+
+- **`otlp_out`'s gRPC transport opens a fresh connection per request, never pooled.** Every gRPC
+  `send` (`crates/logit-outputs/src/otlp.rs`'s `grpc_roundtrip`) connects, performs a fresh HTTP/2
+  handshake, sends exactly one framed request, reads the response, then drops the connection —
+  leaving its spawned connection-driver task to exit once the drop is observed. A mixed-signal
+  batch pays connect+handshake three times; a steady stream of batches pays it once per signal per
+  batch, where the HTTP transport gets `reqwest`'s connection pooling for free. Deliberate for this
+  PR, not an oversight: [ADR 0024](adr/0024-hand-rolled-grpc-over-hyper.md) is explicit about
+  keeping the hand-rolled gRPC surface minimal (the three unary `Export` RPCs, nothing else), and a
+  real connection pool — reuse keyed by endpoint, handling a server-initiated GOAWAY, concurrent
+  in-flight streams over one connection — is real infrastructure `tonic`/`hyper-util`'s own client
+  pooling would normally supply. Worth revisiting if `otlp_out`'s gRPC transport shows up as a
+  bottleneck under sustained load (connect+TLS-less-handshake cost per request, not per batch of
+  requests); until then this is a documented, deliberate simplicity-over-throughput trade, not a
+  silent one.

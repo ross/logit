@@ -81,6 +81,10 @@ pub enum OtlpProtocol {
     /// would be silently wrong under any other default.
     #[default]
     Http,
+    /// Unary gRPC over plaintext HTTP/2 -- `crates/logit-outputs/src/otlp.rs`'s hand-rolled gRPC
+    /// transport has no TLS support at all (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`), so an
+    /// `otlp_out` component's `endpoint` under this protocol is rejected at construction time if
+    /// it's written with an `https://` scheme, rather than silently exporting in plaintext.
     Grpc,
 }
 
