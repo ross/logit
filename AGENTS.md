@@ -15,17 +15,20 @@ something that looks broken — it's likely a documented, deliberate gap, not an
 **Current state:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a
 Lua enrichment stage, InfluxDB 2.x out, via `logit run <config>` (see
 [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml), `script/server`). Since then,
-`syslog_in` and `stdio_out` (`crates/logit-inputs`/`crates/logit-outputs`) and `json`, `kv_metrics`,
-`keep`, and `remove` (`crates/logit-transforms`) have all landed as real, implemented
-`ComponentKind`s — [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises all
-of them together against a real nginx (`examples/nginx/`), and
+`syslog_in`, `stdio_out`, `otlp_in`, and `otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`,
+`crates/logit-proto`'s `otlp` codec) and `json`, `kv_metrics`, `keep`, and `remove`
+(`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —
+[examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises the syslog/InfluxDB
+side together against a real nginx (`examples/nginx/`), and
 [docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside
 the dev stack. `examples/` is contributor-facing fixtures the dev stack (`script/server`) runs
 against, kept real because other things in the repo depend on them (`compose.yaml`'s `nginx`
 service, `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE`) — `demo/` is the answer to
 "let me see this work" for anyone else, a self-contained `docker compose up` against the release
-image, and the forcing function for `syslog_out`/`otlp_out` next
-([docs/plans/0003-demo-stack.md](docs/plans/0003-demo-stack.md)). Config is a flat graph of named components (ADR 0009,
+image. Metrics and traces both flow through it end to end now, InfluxDB and Tempo alike; `syslog_out`
+and the demo's Loki/Alloy leg are what's left
+([docs/plans/0003-demo-stack.md](docs/plans/0003-demo-stack.md),
+[docs/plans/0005-otlp-end-to-end.md](docs/plans/0005-otlp-end-to-end.md)). Config is a flat graph of named components (ADR 0009,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively
@@ -46,12 +49,21 @@ per-component buffers into ordinary events on its own `interval`; see
 [ADR 0018](docs/adr/0018-internal-telemetry-as-pipeline-events.md) and
 [internal-telemetry.md](docs/design/internal-telemetry.md) for the framework, and
 [examples/internal-telemetry.yaml](examples/internal-telemetry.yaml) for a runnable config. Every
-`Delivered` (one `Fanout` edge's channel payload) now carries a real `TraceContext`, propagated as
-a child of its parent for the two node kinds with an unambiguous one to propagate
-(`Transform::process`/`ScriptWorker::process`'s non-flush path, and `run_output`) — the substrate
-for internal spans, not spans themselves yet; see
+`Delivered` (one `Fanout` edge's channel payload) carries a real `TraceContext`, propagated as a
+child of its parent for the two node kinds with an unambiguous one to propagate
+(`Transform::process`/`ScriptWorker::process`'s non-flush path, and `run_output`); see
 [ADR 0020](docs/adr/0020-trace-context-propagation-on-delivered.md) and
-[pipeline-graph.md](docs/design/pipeline-graph.md)'s "Trace context propagation" section.
+[pipeline-graph.md](docs/design/pipeline-graph.md)'s "Trace context propagation" section. That
+context is now a real `SpanRecord` too, not just substrate -- every node visit (a listener's send,
+a transform's process/flush, a sink's deliver) mints exactly one span, deterministically sampled on
+`trace_id` (`span_sample_rate`, default `0.1`, `1.0` in the demo) so every `logit` process in a
+split-collection topology reaches the same keep/drop verdict independently with no propagated bit;
+see [ADR 0022](docs/adr/0022-internal-span-emission-and-deterministic-sampling.md) and
+`internal-telemetry.md`'s "Spans" section. `otlp_out` is what carries those spans, and the `internal`
+metrics alongside them, out over the wire (both OTLP/HTTP and OTLP/gRPC, a hand-rolled unary gRPC
+client/server over `hyper` rather than `tonic`, [ADR 0024](docs/adr/0024-hand-rolled-grpc-over-hyper.md));
+`otlp_in` is the mirror, implemented and tested but not yet exercised by the demo. `demo/`'s
+`trace_out` proves the whole chain against a real Tempo.
 
 ## Environment
 

@@ -17,14 +17,19 @@ cd demo && docker compose up --build
 Then open **http://localhost:8080** — a small hello-world app that's both the landing page and the
 demo's traffic source, with a link to Grafana (dashboard already provisioned) and this stack's own
 pipeline rendered live via `logit graph | dot`. No Rust toolchain, no clone-and-build, nothing else
-in this repo required. Loki and Tempo come up too, provisioned and empty, ready for the logs and
-traces `logit` can't send yet — see [demo/README.md](demo/README.md) for what's flowing and what
-isn't.
+in this repo required. Metrics and traces both flow end to end — InfluxDB dashboards and real spans
+in Tempo, `logit` observing its own pipeline as both signals at once. Loki comes up too, provisioned
+and still empty, ready for the logs `logit` can't send yet — see [demo/README.md](demo/README.md)
+for what's flowing and what isn't.
 
 **Status:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a Lua
 enrichment stage, InfluxDB 2.x out, via `logit run <config>`. Since then, `syslog_in` (RFC 3164/5424
-over UDP) and `stdio_out` have joined statsd/InfluxDB as implemented protocols, and `json`,
-`kv_metrics`, `keep`, and `remove` have joined `aggregate` as implemented native transforms — `logit
+over UDP), `stdio_out`, `otlp_in`, and `otlp_out` have joined statsd/InfluxDB as implemented
+protocols — `otlp_out` is what carries `logit`'s own internal spans to Tempo in the demo above, and
+`logit` now emits those spans itself, one per pipeline node-visit, deterministically sampled on
+`trace_id` ([ADR 0022](docs/adr/0022-internal-span-emission-and-deterministic-sampling.md),
+[docs/plans/0005-otlp-end-to-end.md](docs/plans/0005-otlp-end-to-end.md)). `json`, `kv_metrics`,
+`keep`, and `remove` have joined `aggregate` as implemented native transforms — `logit
 run` rejects a config referencing any other unimplemented kind with a clear error. Config is a flat
 graph of named components, each declaring its own `sources` ([ADR 0009](docs/adr/0009-component-graph-configuration.md),
 [docs/design/pipeline-graph.md](docs/design/pipeline-graph.md)) — `logit graph <config>` prints the

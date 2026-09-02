@@ -24,10 +24,17 @@ get-started instructions and shows this stack's own pipeline, rendered live.
 | Grafana | http://localhost:3000 | Anonymous admin access. Open the "logit" folder for the pre-built dashboard. |
 | InfluxDB | http://localhost:8086 | `logit`/`logit-demo-password`. Bucket `metrics`, org `logit`. |
 | Loki | http://localhost:3100 | Provisioned as a Grafana datasource; see below for what's actually in it. |
-| Tempo | http://localhost:3200 (query), :4317/:4318 (OTLP) | Provisioned as a Grafana datasource; empty. |
+| Tempo | http://localhost:3200 (query), :4317/:4318 (OTLP) | Provisioned as a Grafana datasource; receives `logit`'s own internal spans over OTLP/gRPC. |
 
 `docker compose logs -f logit` shows every decoded event as a `stdio_out` block — the fastest way
-to see the pipeline doing something.
+to see the pipeline doing something. You may occasionally see a `component 'trace_out': batch
+dropped after a permanent send failure` warning (at most once a minute) — real and harmless, not a
+sign anything is broken: `trace_windowed` (`logit.yaml`) periodically flushes a metrics-only batch
+that Tempo (a traces-only backend) rejects, the same way it would reject any OTLP metrics request;
+the far more frequent traces-only batches in between all succeed. See
+[docs/known-gaps.md](../docs/known-gaps.md)'s "`otlp_out` aborts an entire batch's `send`..." entry
+for the full account, including why `trace_windowed` exists at all — without it, this interaction
+doesn't just log a warning, it stops `logit` a minute after startup.
 
 ## What's actually flowing
 
@@ -37,8 +44,12 @@ synthetic requests every half-second so the dashboard has something to show imme
 RFC 3164 + JSON-body shape `../crates/logit-bench/src/fixtures.rs` measures — to `logit`'s
 `syslog_in` listener. [`logit.yaml`](logit.yaml) runs it through `json` → `kv_metrics` → `keep` →
 `aggregate` → `influxdb_out`, plus `logit` observing its own pipeline via `internal`
-(`../docs/design/internal-telemetry.md`) into the same InfluxDB bucket. **Metrics are the one
-signal that works end to end today** — that's what the shipped Grafana dashboard shows.
+(`../docs/design/internal-telemetry.md`) into the same InfluxDB bucket *and* over OTLP/gRPC into
+Tempo, as real spans — one per node-visit, at `span_sample_rate: 1.0` so nothing is thinned out
+(`../docs/adr/0022-internal-span-emission-and-deterministic-sampling.md`,
+`../docs/adr/0024-hand-rolled-grpc-over-hyper.md`). **Metrics and traces both work end to end
+today** — that's what the shipped Grafana dashboard shows, side by side: the `logit.*` InfluxDB
+panels and a Tempo traces panel over the same pipeline.
 
 The pipeline diagram on the landing page (and at `:8080/graph.svg` directly) is rendered at
 startup, not hand-drawn: `graph-dot` runs `logit graph logit.yaml` against the actual config this
@@ -52,19 +63,19 @@ up — the SVG is read fresh on every request, nothing is cached.)
 
 ## What isn't wired yet
 
-Loki and Tempo are up, healthy, and provisioned as Grafana datasources — but `logit` can't write
-to either of them yet, and nothing in this stack works around that anymore:
+Traces now work end to end (`logit` emits real spans and exports them to Tempo over OTLP/gRPC —
+see the previous section). One leg is still open:
 
 - **Logs → Loki** need a `syslog_out` output, which doesn't exist (not implemented, not even a
-  declared config kind). Loki is genuinely empty — no scaffolding double-write, same honest
-  "provisioned, nothing lands here yet" story as Tempo below. `alloy` (the syslog → Loki shim) is
-  still up, unfed, ready for `logit` to point at it once `syslog_out` lands — see `logit.yaml`'s
-  commented-out `log_out` component.
-- **Traces → Tempo** need both an `otlp_out` output (declared in config, rejected at validation
-  today — no OTLP code exists) and something that actually produces spans (`bench/internal-spans-
-  costing`, PR #39, measured the cost of carrying trace context through the pipeline and reverted
-  the prototype — nothing emits a span anywhere yet). Tempo's OTLP receiver is up and will accept
-  data the moment both exist; `logit.yaml`'s commented-out `trace_out` is the shape it'll take.
+  declared config kind). Loki is genuinely empty — no scaffolding double-write, an honest
+  "provisioned, nothing lands here yet" story. `alloy` (the syslog → Loki shim) is still up,
+  unfed, ready for `logit` to point at it once `syslog_out` lands — see `logit.yaml`'s
+  commented-out `log_out` component. This was dropped deliberately from the session that landed
+  OTLP (`../docs/plans/0005-otlp-end-to-end.md`'s "Out of scope"), not an oversight — OTLP alone
+  was large enough to warrant the whole session. Grafana's Loki datasource is already wired for
+  the day it lands: `tracesToLogsV2` on the Tempo datasource and a `derivedFields` link on Loki
+  (`grafana/provisioning/datasources/datasources.yaml`) mean a `trace_id=<hex>` in a log line will
+  click straight through to the matching Tempo trace with no further provisioning work.
 
 ## Stopping
 

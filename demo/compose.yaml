@@ -68,8 +68,9 @@ services:
       - loki_data:/loki
     networks: [demo]
 
-  # Trace backend -- up and provisioned, fully empty until `otlp_out` exists *and* something
-  # emits spans (see demo/logit.yaml's commented-out `trace_out`).
+  # Trace backend -- receives `logit`'s own internal spans over OTLP/gRPC from `trace_out`
+  # (demo/logit.yaml), provisioned in Grafana with `tracesToLogsV2` pointed at Loki for the day
+  # `syslog_out` lands too (demo/grafana/provisioning/datasources/datasources.yaml).
   tempo:
     # Pinned to 2.10.x, not the current 3.0.x: Tempo 3.0 removed the legacy ingester write path
     # and reworked config wholesale (docs/plans/0003-demo-stack.md). 2.10's monolithic mode is
@@ -117,6 +118,14 @@ services:
       # demo's first several seconds visibly doing that.
       influxdb:
         condition: service_healthy
+      # `service_started`, not `service_healthy` -- `tempo` (above) declares no healthcheck at
+      # all, so `service_started` is the honest limit anyway (same reasoning as `hello`'s
+      # dependency on `logit` below). Unlike `influxdb_out`, `trace_out` doesn't need Tempo up
+      # first for a clean start: it retries through `write_loop` like any other sink (ADR 0013's
+      # bounded output retry), so a `logit` that starts before Tempo finishes booting just retries
+      # its first few span exports rather than failing.
+      tempo:
+        condition: service_started
     volumes:
       - ./logit.yaml:/config.yaml:ro
     environment:

@@ -1,5 +1,12 @@
 # Enabling plan: a user-facing demo stack
 
+> **The `otlp_out` gap this plan scheduled is closed.** [docs/plans/0005-otlp-end-to-end.md](0005-otlp-end-to-end.md)
+> built real span emission, the OTLP codec, and both `otlp_in`/`otlp_out`, then wired `demo/logit.yaml`'s
+> `trace_out` at Tempo over OTLP/gRPC -- Tempo now holds real traces, not the empty-but-provisioned
+> placeholder this plan describes below. The `syslog_out` gap (and the demo's Loki/Alloy leg) is
+> unaffected and stays open; this plan's narrative and every other decision it records are otherwise
+> unchanged and still describe how the demo stack is built.
+
 `logit`'s examples are developer scratch material — `examples/statsd-to-influxdb.yaml`,
 `examples/nginx-to-influxdb.yaml`, each landed alongside the feature it exercises, all of them
 pointed at the *dev* stack (`compose.yaml`, `script/server`), whose entrypoint execs `cargo run`
@@ -10,7 +17,9 @@ through `logit` and land in Grafana. No Rust toolchain, no `script/*`, no knowle
 It is also the forcing function for what's missing, the same way
 [0002-nginx-integration.md](0002-nginx-integration.md) used a real nginx to schedule `syslog_in`,
 `stdio_out`, and `kv_metrics`: standing Loki and Tempo up now, provisioned and empty, gives the
-eventual `syslog_out` and `otlp_out` work somewhere to land on day one.
+eventual `syslog_out` and `otlp_out` work somewhere to land on day one. (`otlp_out` has since landed
+and now writes real traces to Tempo — see the notice at the top of this file. `syslog_out` and
+Loki remain the one open leg.)
 
 ## The target, generically
 
@@ -30,7 +39,7 @@ eventual `syslog_out` and `otlp_out` work somewhere to land on day one.
 | Data source | A hello-world Python app (stdlib only) that's also the demo's landing page — real visits plus a background synthetic loop. No nginx in the demo — `examples/nginx/` stays a dev-stack fixture. |
 | Log line shape | The same RFC 3164 + JSON-body shape `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE` already measures. |
 | Log backend | Loki, up and provisioned — genuinely empty, no scaffolding double-write, until `syslog_out` exists. |
-| Trace backend | Tempo, up and provisioned — no data until `otlp_out` and a span producer both exist. |
+| Trace backend | Tempo, up and provisioned — no data until `otlp_out` and a span producer both exist. **Closed**: both now exist ([docs/plans/0005-otlp-end-to-end.md](0005-otlp-end-to-end.md)), and `demo/logit.yaml`'s `trace_out` sends real spans there over OTLP/gRPC. |
 | syslog → Loki shim | Grafana Alloy (`loki.source.syslog`, confirmed to accept UDP and RFC 3164) stays up as unfed scaffolding for `syslog_out`. Loki has no syslog receiver of its own; promtail is EOL. |
 | Pipeline visualization | `logit graph demo/logit.yaml`, piped through real Graphviz at startup (two chained one-shot containers), served as an SVG on the landing page — not hand-drawn, always reflects the running config. |
 | This plan writes no Rust | No new `ComponentKind`, no new sink, no span emission. The log and trace legs ship as commented-out config plus a documented pointer to what has to be built. |
@@ -40,8 +49,8 @@ eventual `syslog_out` and `otlp_out` work somewhere to land on day one.
 | Gap | Consequence |
 |---|---|
 | No `syslog_out` | Not implemented, not even a declared `ComponentKind` — anticipated as precedent in `docs/design/pipeline-graph.md`'s naming rationale, never built. Logs can't leave `logit` at all. |
-| `otlp_out` rejected at validation | Declared in `logit-config`, but `graph::is_implemented` rejects it. No OTLP code, no wire protocol chosen (ADR 0004 leaves gRPC-vs-HTTP open). |
-| No span producer | `bench/internal-spans-costing` (PR #39, draft) added a `TraceContext` prototype to `Fanout`'s `Delivered`, measured its cost, and reverted it in full — only the size-guard test and `docs/design/memory.md`'s "Costing internal spans" section remain. Nothing emits a span anywhere. |
+| ~~`otlp_out` rejected at validation~~ **Closed** | Was: declared in `logit-config`, but `graph::is_implemented` rejected it, no OTLP code, no wire protocol chosen (ADR 0004 left gRPC-vs-HTTP open). [docs/plans/0005-otlp-end-to-end.md](0005-otlp-end-to-end.md) shipped both transports, both directions ([ADR 0023](../adr/0023-committed-pregenerated-otlp-protobuf.md), [ADR 0024](../adr/0024-hand-rolled-grpc-over-hyper.md)). |
+| ~~No span producer~~ **Closed** | Was: `bench/internal-spans-costing` (PR #39, draft) added a `TraceContext` prototype to `Fanout`'s `Delivered`, measured its cost, and reverted it in full — only the size-guard test and `docs/design/memory.md`'s "Costing internal spans" section remained. [ADR 0022](../adr/0022-internal-span-emission-and-deterministic-sampling.md) built real emission on top of that measurement: one deterministically-sampled span per pipeline node-visit. |
 | `examples/` doubles as both dev fixtures and the onboarding story | Someone trying `logit` for the first time hits `script/server`'s dev-container dependency before seeing anything work. |
 | No config-drift guard | A component field rename can silently break every shipped example; nothing runs `logit validate` over them. |
 
@@ -232,7 +241,9 @@ not silently in someone's demo.
   contributor convenience, not the primary path.
 - `demo/README.md` — quick start, the URL table, the first-build-is-slow warning (a full release
   build, no dependency-layer caching by design — `Dockerfile`'s own comment), and an explicit
-  "what isn't wired yet" section naming `syslog_out` and `otlp_out`.
+  "what isn't wired yet" section naming `syslog_out` and `otlp_out`. (As of
+  [docs/plans/0005-otlp-end-to-end.md](0005-otlp-end-to-end.md), that section names only
+  `syslog_out` — `otlp_out` is wired and demonstrated.)
 - This plan, committed as `docs/plans/0003-demo-stack.md`.
 
 **Done when:** `script/cibuild` fails if a shipped config stops validating, and someone unfamiliar
@@ -251,8 +262,10 @@ with the repo can follow `README.md` alone to a working Grafana dashboard.
 - Grafana at `localhost:3000`: the shipped dashboard populates; a Flux query against bucket
   `metrics` returns `web.requests`/`web.request_time` tagged exactly `host`/`request_method`/
   `status`.
-- Loki and Tempo show healthy in Grafana's datasource check; both return clean, error-free empty
-  results — genuinely nothing lands in either.
+- Loki and Tempo show healthy in Grafana's datasource check. At the time this plan's workstreams
+  were built, both returned clean, error-free empty results — genuinely nothing landed in either.
+  Since [docs/plans/0005-otlp-end-to-end.md](0005-otlp-end-to-end.md), Tempo holds real traces;
+  Loki is still genuinely empty, pending `syslog_out`.
 - `docker compose down && up` twice over — `hello` keeps serving and logging, no volume permission
   errors from Loki's, Tempo's, or `graph_data`'s directories.
 - `script/cibuild` passes, including `script/validate`.

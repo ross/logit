@@ -1,7 +1,8 @@
-# The demo pipeline (demo/README.md, docs/plans/0003-demo-stack.md). Exercises exactly what
-# `logit` implements today -- syslog in, json + kv_metrics + keep + aggregate, InfluxDB out, plus
-# `internal` observing the pipeline itself (ADR 0018) -- against the traffic `demo/compose.yaml`'s
-# `hello` service emits (real visits plus a background synthetic loop).
+# The demo pipeline (demo/README.md, docs/plans/0003-demo-stack.md, docs/plans/
+# 0005-otlp-end-to-end.md). Exercises exactly what `logit` implements today -- syslog in, json +
+# kv_metrics + keep + aggregate, InfluxDB out, OTLP/gRPC out, plus `internal` observing the
+# pipeline itself (ADR 0018, ADR 0022) -- against the traffic `demo/compose.yaml`'s `hello` service
+# emits (real visits plus a background synthetic loop).
 #
 # Topology:
 #
@@ -19,9 +20,9 @@
 #                                          v
 #                                    windowed (aggregate)
 #                                          |
-#   self (internal) --> self_windowed (aggregate) --+
-#                                                    v
-#                                              influx_out
+#   self (internal) --+-> self_windowed (aggregate) --> influx_out
+#                      |
+#                      +-> trace_windowed (aggregate) --> trace_out (otlp_out, gRPC) --> tempo
 components:
   access_in:
     type: syslog_in
@@ -61,10 +62,14 @@ components:
     interval: 10s
 
   # `logit` observing itself (docs/design/internal-telemetry.md, ADR 0018) -- the dashboard's
-  # `logit.*` panels come from here.
+  # `logit.*` panels come from here. `span_sample_rate` set explicitly to `1.0` rather than left at
+  # its `0.1` default (docs/adr/0022-internal-span-emission-and-deterministic-sampling.md) -- this
+  # is a demo meant to show every span it can, not a production deployment weighing span volume
+  # against storage cost.
   self:
     type: internal
     interval: 10s
+    span_sample_rate: 1.0
 
   self_windowed:
     type: aggregate
@@ -79,25 +84,55 @@ components:
     bucket: metrics
     token: !env INFLUXDB_TOKEN
 
+  # `self` is `internal` observing *all* of `logit`'s own telemetry, not just spans -- every drain
+  # also carries this process's own `logit.*` metrics (Counter/Gauge/Distribution, every one of
+  # them mergeable). `trace_windowed` exists to strip those out before `trace_out` ever sees them:
+  # `aggregate` absorbs every mergeable metric into its window state and forwards a metric-less
+  # event -- a pure span, here -- untouched and immediately, on every `process` call, without
+  # waiting for its own `flush` (`crates/logit-transforms/src/aggregate.rs`'s `process` doc
+  # comment). So on the (overwhelming) majority of ticks, only spans reach `trace_out` at all.
+  #
+  # This isn't pipeline hygiene, it's load-bearing: `otlp_out` issues one request per signal and
+  # aborts the rest of a `send` call on the first failing one
+  # (`crates/logit-outputs/src/otlp.rs`'s module doc), and Tempo is a traces-only gRPC server (it
+  # registers no `MetricsService`) -- a batch mixing spans and metrics would see its traces
+  # request succeed and its metrics request fail with `grpc-status: 12` (UNIMPLEMENTED), correctly
+  # classified `Fault::Permanent` and correctly not retried. That alone is recoverable noise (the
+  # spans already landed). What isn't recoverable: confirmed directly against a first version of
+  # this config that skipped `trace_windowed` -- `self`'s 10s drain interval meant *every* batch
+  # failed this way, `send` never once returned `Ok` for `trace_out`, and `write_loop`'s ~60s
+  # sustained-permanent-failure guard (`docs/adr/0013-service-lifecycle-and-output-retry.md`,
+  # revised by `docs/adr/0021-buffered-sink-delivery.md`) killed the whole `logit` process a
+  # minute after startup -- taking the InfluxDB metrics path down with it. `trace_windowed`'s own
+  # `flush` (every 60s here) still occasionally emits a real metrics-only batch that fails the same
+  # way, but the many successful pure-span deliveries in between (every ~10s) reset that guard's
+  # streak long before it reaches 60s -- see `docs/known-gaps.md`'s "`otlp_out` aborts an entire
+  # batch's `send`..." entry for the full account, including why this is specific to a mixed-signal
+  # source feeding a signal-partial backend, not a general `otlp_out` problem.
+  trace_windowed:
+    type: aggregate
+    sources: [self]
+    interval: 60s
+
+  # Deliberately gRPC, not HTTP (docs/adr/0024-hand-rolled-grpc-over-hyper.md) -- Tempo's `:4317`
+  # receiver, to exercise the transport the rest of this config doesn't otherwise touch;
+  # `endpoint` is a bare `host:port` authority for gRPC, not a URL (see
+  # `crates/logit-outputs/src/otlp.rs`'s `grpc_authority`).
+  trace_out:
+    type: otlp_out
+    sources: [trace_windowed]
+    protocol: grpc
+    endpoint: tempo:4317
+
   # -- Pending, not runnable yet --
   #
   # Logs to Loki: needs a `syslog_out` ComponentKind, which doesn't exist (docs/plans/
   # 0003-demo-stack.md). It would mirror `syslog_in` -- UDP, RFC 3164 -- and point at the `alloy`
   # service's syslog listener (demo/alloy/config.alloy), which is already up and provisioned in
-  # Grafana as the Loki datasource, waiting.
+  # Grafana as the Loki datasource, waiting. Deliberately left out of this session
+  # (docs/plans/0005-otlp-end-to-end.md's "Out of scope") -- OTLP was large enough on its own.
   #
   # log_out:
   #   type: syslog_out
   #   sources: [access_json]
   #   endpoint: alloy:5141
-  #
-  # Traces to Tempo: needs `otlp_out` implemented (declared in logit-config, rejected at
-  # validation today) *and* something that actually produces spans -- `bench/internal-spans-
-  # costing` (PR #39) measured the cost of carrying trace context through the pipeline and
-  # reverted the prototype; no span is emitted anywhere yet. `tempo`'s OTLP receiver
-  # (demo/tempo/tempo.yaml) is already up, waiting.
-  #
-  # trace_out:
-  #   type: otlp_out
-  #   sources: [self]
-  #   endpoint: http://tempo:4318
