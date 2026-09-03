@@ -344,6 +344,44 @@ fn aggregate_flush_100_series() {
     expect_allocs("aggregate: flush 4 series", stats, 6);
 }
 
+/// The retention path's own allocation cost, isolated on purpose from the fixture above:
+/// `flush`'s retain branch (`gauge_retention > 0`, `crates/logit-transforms/src/aggregate.rs`)
+/// clones `key.attributes` for a retained series -- unlike the default tumbling path, which
+/// moves it -- because the series' key has to survive to become its own map key again for the
+/// next window. `aggregate_flush_100_series` never exercises this branch at all
+/// (`gauge_retention: 0` there, the fixture-default `Aggregator`), and its `keep`-trimmed
+/// attributes fit inline, so it couldn't pin this cost even if it did. This fixture is
+/// deliberately *not* `keep`-trimmed (12 attributes, past `AttrMap`'s 8-slot inline capacity),
+/// specifically so the clone this measures is a real heap allocation, not a memcpy that would
+/// hide the cost the plan asked this test to pin.
+///
+/// Measured over a *second* flush, after a warm-up flush has already retained all 100 series once
+/// -- the steady-state cost of continuously updating-and-retaining the same series indefinitely,
+/// not the one-time cost of the first window these series were ever seen in.
+#[test]
+fn aggregate_flush_retained_gauges() {
+    let resource = fixtures::resource();
+    let mut agg = fixtures::aggregator_with_gauge_retention(5, 1_000);
+    for i in 0..100 {
+        drop(agg.process(&resource, fixtures::wide_gauge_event(&format!("gauge{i}"), i as f64)));
+    }
+    drop(agg.flush(1_000_000_000)); // warm: interns every series name, grows every buffer once
+
+    for i in 0..100 {
+        drop(
+            agg.process(
+                &resource,
+                fixtures::wide_gauge_event(&format!("gauge{i}"), (i + 1) as f64),
+            ),
+        );
+    }
+
+    let (flushed, stats) = measure(|| agg.flush(2_000_000_000));
+    let series: usize = flushed.iter().map(|(_, events)| events.len()).sum();
+    assert_eq!(series, 100, "every series was updated again before this flush");
+    expect_allocs("aggregate: flush 100 retained gauge series (spilled attrs)", stats, 209);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Fan-out
 // ---------------------------------------------------------------------------------------------

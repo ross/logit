@@ -210,6 +210,23 @@ pub(crate) fn encode_metric(
             );
             return None;
         }
+        // A `GaugeDelta` reaching a sink means the pipeline is missing an `aggregate` component --
+        // it is explicitly unresolved (`docs/adr/0026-relative-gauge-adjustments.md`) and must not
+        // be encoded as though it were an absolute value. Uses the same greppable
+        // `gauge_delta_unresolved` diagnostic key `influxdb_out` reports under, not the generic
+        // skip key above, so an operator can find every sink's occurrence of this one failure mode
+        // with a single grep.
+        MetricKind::GaugeDelta(_) => {
+            telemetry.count("logit.output.metrics.skipped", 1.0, &[("metric_kind", "gauge_delta")]);
+            diagnostics.warn_throttled(
+                "gauge_delta_unresolved",
+                format_args!(
+                    "a relative gauge adjustment reached a sink unresolved -- add an `aggregate` \
+                     component between the statsd input and this output"
+                ),
+            );
+            return None;
+        }
     };
 
     Some(pb::Metric {
@@ -687,6 +704,36 @@ mod tests {
             .iter()
             .find(|e| e.attributes.get("metric_kind").and_then(|v| v.as_str()) == Some("set"));
         assert!(skipped.is_some(), "should count logit.output.metrics.skipped{{metric_kind}}");
+    }
+
+    /// A `GaugeDelta` reaching this encoder means the pipeline is missing an `aggregate`
+    /// component (`docs/adr/0026-relative-gauge-adjustments.md`) -- it must be dropped, not
+    /// encoded as though it were an absolute value, and reported under the same greppable
+    /// `gauge_delta_unresolved` diagnostic key `influxdb_out` uses, not the generic `set`-style
+    /// per-kind skip key.
+    #[test]
+    fn a_gauge_delta_is_skipped_and_reports_its_own_diagnostic_key() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
+        let diag_registry = Registry::new();
+        let mut diag = Diagnostics::new("otlp_out")
+            .with_telemetry(diag_registry.telemetry_for("otlp_out", "otlp_out", "diag"));
+        let result =
+            encode_metric(&event(), &record(MetricKind::GaugeDelta(5.0)), &telemetry, &mut diag);
+        assert!(result.is_none(), "a GaugeDelta metric must not produce a Metric at all");
+        let events = registry.drain(0);
+        let skipped = events.iter().find(|e| {
+            e.attributes.get("metric_kind").and_then(|v| v.as_str()) == Some("gauge_delta")
+        });
+        assert!(skipped.is_some(), "should count logit.output.metrics.skipped{{metric_kind}}");
+        let diag_events = diag_registry.drain(0);
+        let reported = diag_events.iter().find(|e| {
+            e.attributes.get("key").and_then(|v| v.as_str()) == Some("gauge_delta_unresolved")
+        });
+        assert!(
+            reported.is_some(),
+            "should report under the gauge_delta_unresolved diagnostic key"
+        );
     }
 
     #[test]

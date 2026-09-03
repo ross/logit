@@ -108,6 +108,7 @@ pub struct MetricRecord {
 pub enum MetricKind {
     Counter(f64),
     Gauge(f64),
+    GaugeDelta(f64),  // unresolved relative adjustment; resolved into Gauge by `aggregate` only
     Set(HyperLogLog),
     Distribution(DdSketch),
     Histogram { buckets: Vec<(f64, u64)> },   // fixed-bucket, e.g. Prometheus-style input
@@ -137,6 +138,14 @@ downstream, and that has to be correct, not approximate-and-hope:
   whole distributed-aggregation story, not a nice-to-have.
 - `Set` uses a **HyperLogLog**, which merges (union) exactly by construction.
 - `Counter`/`Gauge` merge trivially (sum / last-write-wins by timestamp).
+- `GaugeDelta` is not mergeable on its own terms — it's statsd/DogStatsD's relative gauge
+  adjustment (a leading `+`/`-`), decoded by `statsd_in` but left explicitly **unresolved**: it
+  must never reach a sink. Only `aggregate` resolves it, applying it to a `Gauge`'s running value
+  in arrival order (never touching the value's last-write-wins timestamp, asymmetric on purpose —
+  see [ADR 0026](../adr/0026-relative-gauge-adjustments.md)). This is the one metric kind whose
+  aggregation state genuinely needs to survive a flush to be correct — see
+  [ADR 0008](../adr/0008-aggregation-window-semantics.md)'s amendment for why that's true for
+  gauges specifically and not for `Counter`.
 
 A `Distribution`'s `count()` becomes a **population estimate**, not a count of received
 datagrams, wherever sample-rate extrapolation is in play: `statsd_in`'s `ms`/`h`/`d` decoding

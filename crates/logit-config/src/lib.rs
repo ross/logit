@@ -182,6 +182,22 @@ pub enum ComponentKind {
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         interval: Duration,
+        /// How many consecutive windows a gauge series with no new data is retained past its
+        /// last update, so a relative gauge adjustment (`docs/adr/0026-relative-gauge-adjustments.md`)
+        /// arriving in a later window can still resolve against the value it last held. `0`
+        /// disables retention entirely -- every gauge series is drained every window exactly like
+        /// a counter, matching this field's absence before it existed. See the
+        /// `docs/adr/0008-aggregation-window-semantics.md` amendment for the full design.
+        #[serde(default = "default_gauge_retention")]
+        gauge_retention: u32,
+        /// A hard cap on how many gauge series may be retained across this component's whole
+        /// window at once -- a DoS/cardinality guard, not a tuning knob. `gauge_retention` alone
+        /// bounds only how long one series survives; without this, a sustained stream of
+        /// never-repeating series names would hold unboundedly many retained series regardless of
+        /// how short the retention window is. Least-recently-updated series are evicted first
+        /// once exceeded.
+        #[serde(default = "default_max_retained_gauge_series")]
+        max_retained_gauge_series: usize,
     },
     /// Parses a log record's message as JSON, merging the resulting key/values into the event's
     /// attributes. See `docs/adr/0010-json-parsing-into-attributes.md`.
@@ -321,6 +337,20 @@ pub enum ComponentKind {
 
 fn default_max_message_bytes() -> u64 {
     8192
+}
+
+/// `Aggregate::gauge_retention`'s default: retention is on by default, at a modest depth --
+/// `0` (the pre-existing, always-tumbling behavior) is an explicit opt-out, not the default,
+/// since a relative gauge adjustment silently resolving against 0.0 every time (what `0` means)
+/// is the wrong default for a feature whose entire point is making that case rare.
+fn default_gauge_retention() -> u32 {
+    5
+}
+
+/// `Aggregate::max_retained_gauge_series`'s default -- a DoS/cardinality guard, not a tuning
+/// knob (see the field's own doc comment).
+fn default_max_retained_gauge_series() -> usize {
+    10_000
 }
 
 /// Mirrors `logit_outputs::syslog::DEFAULT_CONNECT_TIMEOUT` -- can't reference it directly
@@ -800,7 +830,29 @@ mod tests {
             serde_json::from_str(r#"{"type": "aggregate", "sources": ["in"], "interval": "10s"}"#)
                 .unwrap();
         match component.kind {
-            ComponentKind::Aggregate { interval } => assert_eq!(interval, Duration::from_secs(10)),
+            ComponentKind::Aggregate { interval, gauge_retention, max_retained_gauge_series } => {
+                assert_eq!(interval, Duration::from_secs(10));
+                // Additive fields: an existing config with no `gauge_retention`/
+                // `max_retained_gauge_series` at all still deserializes, defaulting to both
+                // (proves the config change is additive, per script/validate over demo/examples).
+                assert_eq!(gauge_retention, 5);
+                assert_eq!(max_retained_gauge_series, 10_000);
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_component_can_override_gauge_retention() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "aggregate", "sources": ["in"], "interval": "10s", "gauge_retention": 0, "max_retained_gauge_series": 100}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Aggregate { gauge_retention, max_retained_gauge_series, .. } => {
+                assert_eq!(gauge_retention, 0);
+                assert_eq!(max_retained_gauge_series, 100);
+            }
             other => panic!("expected Aggregate, got {other:?}"),
         }
     }
