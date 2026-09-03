@@ -164,7 +164,9 @@ Surfaced while checking Loki compatibility; none block the demo, all block a rea
   against a reserved protocol-owned set — see
   `docs/plans/signal-filtering-and-otlp-out-config-gaps.md`'s workstream 2.)
 - No compression support (`crates/logit-outputs/src/otlp.rs:479-482` — the frame's compressed flag
-  is always `0`).
+  is always `0`). (Landed: `compression: gzip` on `otlp_out`, both transports, paired with matching
+  bounded decode on `otlp_in` — see ADR `otlp-compression-and-decompression-bounds` and
+  `docs/plans/signal-filtering-and-otlp-out-config-gaps.md`'s workstream 4.)
 - No TLS configuration for gRPC — `reject_insecure_grpc_endpoint`
   (`crates/logit-outputs/src/otlp.rs:359-370`) hard-rejects an `https://` endpoint under
   `protocol: grpc` at construction time, rather than supporting it.

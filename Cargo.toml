@@ -62,6 +62,11 @@ hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 http = "1"
 http-body-util = "0.1"
+# otlp_out's optional gzip request compression and otlp_in's matching decode
+# (docs/adr/otlp-compression-and-decompression-bounds.md) -- default features only, which pulls in
+# the pure-Rust `miniz_oxide` backend rather than a C zlib, keeping "no host toolchain needed"
+# intact (ADR `containerized-development`).
+flate2 = "1"
 
 [profile.release]
 lto = true

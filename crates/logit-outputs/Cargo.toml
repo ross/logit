@@ -20,6 +20,8 @@ hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+# otlp_out's optional gzip request compression (docs/adr/otlp-compression-and-decompression-bounds.md).
+flate2.workspace = true
 # A real (non-dev) dependency: `StdioOutput` (`stdio.rs`) writes via `tokio::io`/`tokio::fs`.
 # `InfluxDbOutput::send` no longer retries on its own (that moved to `logit-pipeline`'s generic
 # writer, `docs/adr/buffered-sink-delivery.md`) and so no longer needs `tokio::time` itself.

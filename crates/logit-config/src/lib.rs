@@ -94,6 +94,21 @@ pub enum OtlpProtocol {
     Grpc,
 }
 
+/// Whether `otlp_out` gzips its request bodies -- both transports (HTTP `Content-Encoding: gzip`,
+/// gRPC's per-message compressed-frame flag plus `grpc-encoding: gzip`). Default `none`,
+/// deliberately: flipping it would change an existing pipeline's wire behavior in a patch, and
+/// would break `otlp_out -> otlp_in` across two `logit` versions where only one side has learned
+/// gzip. `otlp_out` never advertises accepting a compressed *response* regardless of this setting
+/// (`docs/adr/otlp-compression-and-decompression-bounds.md`) -- this only ever compresses what it
+/// sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OtlpCompression {
+    #[default]
+    None,
+    Gzip,
+}
+
 /// A signal an event's payload may carry -- OTLP's vocabulary (`logit_proto::Signal`), not
 /// `Event`'s field names, since that's the vocabulary `has_signal`/`keep_signals`/`drop_signals`
 /// are meant to be read against. `Traces` corresponds to `event.span`.
@@ -379,6 +394,12 @@ pub enum ComponentKind {
         /// ignored, since gRPC method names aren't a mount point an operator can move.
         #[serde(default)]
         paths: OtlpPaths,
+        /// Gzips request bodies on both transports -- see [`OtlpCompression`]. Defaults to
+        /// `none`: a receiver has to opt into decoding it, and most (the OTel Collector's own
+        /// receiver included) accept both, so there's rarely a reason to change this except
+        /// against a bandwidth-constrained link.
+        #[serde(default)]
+        compression: OtlpCompression,
     },
     /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
     LogitOut {
@@ -1307,11 +1328,27 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::OtlpOut { endpoint, protocol, headers, paths } => {
+            ComponentKind::OtlpOut { endpoint, protocol, headers, paths, compression } => {
                 assert_eq!(endpoint, "http://tempo:4318");
                 assert_eq!(protocol, OtlpProtocol::Http);
                 assert!(headers.is_empty());
                 assert!(paths.is_empty());
+                assert_eq!(compression, OtlpCompression::None);
+            }
+            other => panic!("expected OtlpOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otlp_out_compression_defaults_to_none_and_can_be_set_to_gzip() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_out", "sources": ["in"], "endpoint": "http://loki:3100",
+                "compression": "gzip"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpOut { compression, .. } => {
+                assert_eq!(compression, OtlpCompression::Gzip);
             }
             other => panic!("expected OtlpOut, got {other:?}"),
         }

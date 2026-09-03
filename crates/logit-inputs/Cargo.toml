@@ -21,6 +21,8 @@ hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+# otlp_in's matching gzip request decode (docs/adr/otlp-compression-and-decompression-bounds.md).
+flate2.workspace = true
 
 [dev-dependencies]
 # Test-only: the end-to-end statsd -> aggregate integration test

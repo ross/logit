@@ -659,32 +659,23 @@ already built that have a known, accepted rough edge.
   qualification stated plainly, and `crates/logit-proto/src/otlp/metrics.rs`'s module doc for the
   full encode/decode tables this summarizes.
 
-- **`otlp_in` doesn't support compressed requests, and its `partial_success` response is always
-  empty.** Two separate, deliberate gaps in `crates/logit-inputs/src/otlp.rs`
-  ([ADR `hand-rolled-grpc-over-hyper`](adr/hand-rolled-grpc-over-hyper.md)):
-  - **Compression.** `Content-Encoding: gzip` (OTLP/HTTP) and `grpc-encoding: gzip` (OTLP/gRPC) are
-    both rejected outright (`415`/`grpc-status: 12`) rather than silently mishandled — `flate2`
-    isn't a dependency, and decompressing untrusted input unboundedly is real, security-relevant
-    surface (a compression-bomb-shaped request) this PR deliberately didn't take on. The practical
-    consequence: the OTel Collector's own default OTLP exporter sends gzip, so pointing a real
-    Collector at `otlp_in` fails on day one even though `otlp_out → otlp_in` (this PR's own
-    round-trip tests, which never set either header) works fine, and `otlp_out → Tempo` (PR4's demo
-    path) is unaffected since Tempo's own OTLP receiver doesn't require compression. Revisit with
-    `flate2` if a real deployment needs it.
-  - **`partial_success` accounting.** OTLP's `Export*ServiceResponse.partial_success` field exists
-    so a receiver can accept most of a request while reporting which records it rejected —
-    `otlp_out` (`crates/logit-outputs/src/otlp.rs`) fully implements the *reading* half of this (see
-    its `a_partial_success_response_is_counted_not_failed` tests). But
-    `logit_proto::SignalDecoder::decode_signal` doesn't return a per-call skip/reject count today —
-    only a self-telemetry counter (`logit.input.metrics.skipped{metric_kind, reason}`) — so there's
-    nothing for `otlp_in` to echo back into the wire response yet: every successful decode replies
-    with an empty (all-default, meaning "fully accepted") `partial_success`, even when the request
-    silently skipped a metric point internally (an over-cap exponential histogram, a
-    `NO_RECORDED_VALUE`-flagged point). A fully malformed request (bad protobuf, an invalid span id)
-    still correctly fails the *whole* request (`400`/`grpc-status: 3`), which is the one shape
-    `otlp_in`'s response *does* reflect today. Threading a real per-call count through would be a
-    `SignalDecoder` API change (`crates/logit-proto`), out of scope for the PR that added `otlp_in`
-    itself — a natural next step whenever OTLP input volume makes the gap worth closing.
+- **`otlp_in`'s `partial_success` response is always empty.** OTLP's
+  `Export*ServiceResponse.partial_success` field exists so a receiver can accept most of a request
+  while reporting which records it rejected — `otlp_out` (`crates/logit-outputs/src/otlp.rs`) fully
+  implements the *reading* half of this (see its `a_partial_success_response_is_counted_not_failed`
+  tests). But `logit_proto::SignalDecoder::decode_signal` doesn't return a per-call skip/reject
+  count today — only a self-telemetry counter (`logit.input.metrics.skipped{metric_kind, reason}`)
+  — so there's nothing for `otlp_in` to echo back into the wire response yet: every successful
+  decode replies with an empty (all-default, meaning "fully accepted") `partial_success`, even when
+  the request silently skipped a metric point internally (an over-cap exponential histogram, a
+  `NO_RECORDED_VALUE`-flagged point). A fully malformed request (bad protobuf, an invalid span id)
+  still correctly fails the *whole* request (`400`/`grpc-status: 3`), which is the one shape
+  `otlp_in`'s response *does* reflect today. Threading a real per-call count through would be a
+  `SignalDecoder` API change (`crates/logit-proto`), out of scope for the PR that added `otlp_in`
+  itself — a natural next step whenever OTLP input volume makes the gap worth closing.
+  (Compression was the other half of this entry — `otlp_in` now decodes gzip on both transports,
+  bounded the same way `otlp_out` bounds it on encode; see
+  [ADR `otlp-compression-and-decompression-bounds`](adr/otlp-compression-and-decompression-bounds.md).)
 
 - **`otlp_out` aborts an entire batch's `send` on the first signal request that fails -- pointed at
   a signal-partial backend fed by a mixed-signal source, that's not just noise, it can end the
@@ -729,18 +720,19 @@ already built that have a known, accepted rough edge.
   itself. `demo/logit.yaml`'s `trace_only`/`trace_out` components carry this same explanation
   inline.
 
-- **`otlp_out` has no compression and no gRPC TLS** —
+- **`otlp_out` has no gRPC TLS** —
   found evaluating whether it could replace the demo's `syslog_out` → Alloy → Loki log leg
   ([docs/plans/otlp-logs-and-resource-identity.md](plans/otlp-logs-and-resource-identity.md)'s
-  workstream E; its per-signal-filter half is fixed, see
-  [ADR `signal-filtering-components`](adr/signal-filtering-components.md), and custom headers are
-  fixed too — `headers:` on `otlp_out`, validated case-insensitively against a reserved,
-  protocol-owned set by `logit-pipeline::graph::resolve`'s rule 20).
-  `crates/logit-outputs/src/otlp.rs`'s frame encoder never sets the compressed flag;
-  `reject_insecure_grpc_endpoint` hard-rejects `https://` under `protocol: grpc` rather than
-  supporting it. Neither blocks the demo (single-tenant, plaintext gRPC to
-  Tempo); both block a real deployment. The compression half of this mirrors the `otlp_in`
-  gap above but was never itself filed until now.
+  workstream E; every other item that entry found — the per-signal filter, custom headers,
+  configurable per-signal paths, `observed_time_unix_nano`, and compression — is fixed; see
+  [docs/plans/signal-filtering-and-otlp-out-config-gaps.md](plans/signal-filtering-and-otlp-out-config-gaps.md)).
+  `reject_insecure_grpc_endpoint` (`crates/logit-outputs/src/otlp.rs`) hard-rejects `https://`
+  under `protocol: grpc` rather than supporting it — this output's hand-rolled gRPC transport has
+  no TLS support at all ([ADR `hand-rolled-grpc-over-hyper`](adr/hand-rolled-grpc-over-hyper.md)).
+  Doesn't block the demo (single-tenant, plaintext gRPC to Tempo); blocks a real deployment against
+  any gRPC endpoint that requires TLS. A `tokio-rustls` layer in the hand-rolled client (already a
+  transitive dependency via `reqwest`, per that ADR's precedent for promoting one to direct) would
+  close this — its own workstream, not attempted here.
 
 - **No mechanism exists anywhere in `logit` to attach a static attribute to a batch's resource** —
   found in the same investigation

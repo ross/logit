@@ -18,7 +18,10 @@ use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_outputs::influxdb::InfluxDbOutput;
-use logit_outputs::otlp::{OtlpOutput, OtlpTransport as OtlpOutTransport, SignalPaths};
+use logit_outputs::otlp::{
+    OtlpCompression as OtlpOutCompression, OtlpOutput, OtlpTransport as OtlpOutTransport,
+    SignalPaths,
+};
 use logit_outputs::stdio::StdioOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
@@ -281,10 +284,11 @@ fn build_spec(
             queue_config(&component.buffer),
             write_config(&component.buffer),
         ),
-        OtlpOut { endpoint, protocol, headers, paths } => {
+        OtlpOut { endpoint, protocol, headers, paths, compression } => {
             let output = OtlpOutput::new(endpoint.clone(), otlp_out_transport(*protocol))?
                 .with_headers(headers)?
                 .with_paths(to_signal_paths(paths))
+                .with_compression(to_otlp_compression(*compression))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
             NodeSpec::Output(
@@ -401,6 +405,15 @@ fn otlp_out_transport(protocol: logit_config::OtlpProtocol) -> OtlpOutTransport 
     match protocol {
         logit_config::OtlpProtocol::Http => OtlpOutTransport::Http,
         logit_config::OtlpProtocol::Grpc => OtlpOutTransport::Grpc,
+    }
+}
+
+/// Translates config's `OtlpCompression` into `logit-outputs`'s own copy of the same choice --
+/// same reasoning as `otlp_out_transport`.
+fn to_otlp_compression(compression: logit_config::OtlpCompression) -> OtlpOutCompression {
+    match compression {
+        logit_config::OtlpCompression::None => OtlpOutCompression::None,
+        logit_config::OtlpCompression::Gzip => OtlpOutCompression::Gzip,
     }
 }
 
@@ -745,6 +758,7 @@ mod tests {
                     protocol,
                     headers: HashMap::new(),
                     paths: logit_config::OtlpPaths::default(),
+                    compression: logit_config::OtlpCompression::default(),
                 },
             };
             assert!(
@@ -773,6 +787,7 @@ mod tests {
                 protocol: logit_config::OtlpProtocol::Grpc,
                 headers: HashMap::new(),
                 paths: logit_config::OtlpPaths::default(),
+                compression: logit_config::OtlpCompression::default(),
             },
         };
         let err = match build_spec("out", &component, Path::new(""), None) {

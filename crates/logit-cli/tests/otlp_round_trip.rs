@@ -12,7 +12,7 @@ use logit_core::{
     SpanKind, SpanRecord, SpanStatus, Value,
 };
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as InTransport};
-use logit_outputs::otlp::{OtlpOutput, OtlpTransport as OutTransport};
+use logit_outputs::otlp::{OtlpCompression, OtlpOutput, OtlpTransport as OutTransport};
 use logit_pipeline::{Fanout, Input, Output};
 use std::sync::Arc;
 use std::time::Duration;
@@ -122,6 +122,33 @@ async fn otlp_output_to_otlp_input_round_trips_a_batch_through_grpc() {
     let addr = ephemeral_addr().await;
     let input = OtlpInput::new(addr.clone(), InTransport::Grpc);
     let output = OtlpOutput::new(addr.clone(), OutTransport::Grpc).unwrap();
+
+    let received = round_trip(input, output, &mixed_signal_batch()).await;
+    assert_round_tripped(&received);
+}
+
+/// The pair `docs/adr/otlp-compression-and-decompression-bounds.md` exists for: proves
+/// `otlp_out`'s gzip compression and `otlp_in`'s matching decode landed together, not just that
+/// each side's own unit tests pass in isolation.
+#[tokio::test]
+async fn otlp_output_to_otlp_input_round_trips_a_gzip_compressed_batch_through_http() {
+    let addr = ephemeral_addr().await;
+    let input = OtlpInput::new(addr.clone(), InTransport::Http);
+    let output = OtlpOutput::new(format!("http://{addr}"), OutTransport::Http)
+        .unwrap()
+        .with_compression(OtlpCompression::Gzip);
+
+    let received = round_trip(input, output, &mixed_signal_batch()).await;
+    assert_round_tripped(&received);
+}
+
+#[tokio::test]
+async fn otlp_output_to_otlp_input_round_trips_a_gzip_compressed_batch_through_grpc() {
+    let addr = ephemeral_addr().await;
+    let input = OtlpInput::new(addr.clone(), InTransport::Grpc);
+    let output = OtlpOutput::new(addr.clone(), OutTransport::Grpc)
+        .unwrap()
+        .with_compression(OtlpCompression::Gzip);
 
     let received = round_trip(input, output, &mixed_signal_batch()).await;
     assert_round_tripped(&received);

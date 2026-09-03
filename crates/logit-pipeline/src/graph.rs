@@ -1104,6 +1104,7 @@ mod tests {
             protocol: logit_config::OtlpProtocol::Http,
             headers: headers.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             paths: logit_config::OtlpPaths::default(),
+            compression: logit_config::OtlpCompression::default(),
         }
     }
 
@@ -1116,6 +1117,7 @@ mod tests {
             protocol,
             headers: Map::new(),
             paths,
+            compression: logit_config::OtlpCompression::default(),
         }
     }
 
