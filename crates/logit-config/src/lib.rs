@@ -76,6 +76,25 @@ pub struct MetricSpec {
     pub unit: Option<String>,
 }
 
+/// One value a `set` component (`ComponentKind::Set`) can stamp onto an attribute or a resource
+/// attribute. `#[serde(untagged)]`: YAML's own scalar types decide the variant, so
+/// `resource: {service.name: nginx, retries: 3, ratio: 0.5, sampled: true}` reads exactly as
+/// written, no `!i64`/`!f64` tag needed.
+///
+/// **`I64` must stay ordered before `F64`.** `serde`'s untagged enum deserializer tries variants
+/// in declaration order and keeps the first that parses; `3` parses as both an `i64` and an
+/// `f64`, so `F64` before `I64` would silently turn every whole-number YAML scalar into a float.
+/// `Bool`/`Str` are unambiguous against the others (a YAML boolean/string never also parses as a
+/// number) so their position doesn't matter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum SetValue {
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    Str(String),
+}
+
 /// Which OTLP transport a component speaks -- both `otlp_in` and `otlp_out` carry identical
 /// protobuf payloads (`crates/logit-proto/src/otlp`), differing only in framing and endpoint
 /// shape (`docs/adr/hand-rolled-grpc-over-hyper.md`).
@@ -238,6 +257,21 @@ pub enum ComponentKind {
     /// Drops the named attributes, keeping the rest.
     Remove {
         fields: Vec<String>,
+    },
+    /// Stamps constant values onto every event's attributes and/or the batch's resource --
+    /// the operator-declared counterpart to a wire-carried identity
+    /// (`docs/adr/operator-declared-resource-attributes.md`). Overwrites on key collision in
+    /// both maps: a configured value wins over whatever the wire carried. At least one of
+    /// `resource`/`attributes` must be non-empty -- rejected at graph-validation time otherwise,
+    /// the same "can only ever be a no-op" rule `KvMetrics` already has.
+    Set {
+        /// Applied once per batch, to the batch's `Resource` -- every event in the batch shares
+        /// it (`docs/design/data-model.md`'s "`Resource` is `Arc`-shared" note).
+        #[serde(default)]
+        resource: std::collections::BTreeMap<String, SetValue>,
+        /// Applied per event, to `event.attributes`.
+        #[serde(default)]
+        attributes: std::collections::BTreeMap<String, SetValue>,
     },
     // The rest of the built-in native transforms -- not implemented yet (`logit-transforms`),
     // carried over as unimplemented `ComponentKind` variants so config referencing one gets a
@@ -1135,6 +1169,49 @@ mod tests {
             }
             other => panic!("expected Remove, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_component_deserializes_resource_and_attributes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "set", "sources": ["in"],
+                "resource": {"service.name": "nginx"},
+                "attributes": {"env": "prod", "tier": 3}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Set { resource, attributes } => {
+                assert_eq!(resource.get("service.name"), Some(&SetValue::Str("nginx".to_string())));
+                assert_eq!(attributes.get("env"), Some(&SetValue::Str("prod".to_string())));
+                assert_eq!(attributes.get("tier"), Some(&SetValue::I64(3)));
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    /// Pins `SetValue`'s untagged-variant order: a whole-number YAML/JSON scalar must decode as
+    /// `I64`, not `F64` (the enum lists `I64` before `F64` specifically so `serde`'s
+    /// first-match-wins untagged search finds it first) -- and a quoted number must stay `Str`,
+    /// never coerced into either numeric variant.
+    #[test]
+    fn set_value_untagged_variant_selection() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "set", "sources": ["in"], "attributes":
+                {"s": "nginx", "i": 3, "f": 1.5, "b": true, "q": "3"}}"#,
+        )
+        .unwrap();
+        let ComponentKind::Set { attributes, .. } = component.kind else {
+            panic!("expected Set");
+        };
+        assert_eq!(attributes.get("s"), Some(&SetValue::Str("nginx".to_string())));
+        assert_eq!(attributes.get("i"), Some(&SetValue::I64(3)), "a whole number must stay I64");
+        assert_eq!(attributes.get("f"), Some(&SetValue::F64(1.5)));
+        assert_eq!(attributes.get("b"), Some(&SetValue::Bool(true)));
+        assert_eq!(
+            attributes.get("q"),
+            Some(&SetValue::Str("3".to_string())),
+            "a quoted number must stay a string, not be coerced into I64"
+        );
     }
 
     #[test]

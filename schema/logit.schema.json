@@ -393,6 +393,37 @@
           }
         },
         {
+          "description": "Stamps constant values onto every event's attributes and/or the batch's resource -- the operator-declared counterpart to a wire-carried identity (`docs/adr/operator-declared-resource-attributes.md`). Overwrites on key collision in both maps: a configured value wins over whatever the wire carried. At least one of `resource`/`attributes` must be non-empty -- rejected at graph-validation time otherwise, the same \"can only ever be a no-op\" rule `KvMetrics` already has.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "attributes": {
+              "description": "Applied per event, to `event.attributes`.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/SetValue"
+              }
+            },
+            "resource": {
+              "description": "Applied once per batch, to the batch's `Resource` -- every event in the batch shares it (`docs/design/data-model.md`'s \"`Resource` is `Arc`-shared\" note).",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/SetValue"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "set"
+              ]
+            }
+          }
+        },
+        {
           "type": "object",
           "required": [
             "type"
@@ -890,6 +921,25 @@
         }
       },
       "additionalProperties": false
+    },
+    "SetValue": {
+      "description": "One value a `set` component (`ComponentKind::Set`) can stamp onto an attribute or a resource attribute. `#[serde(untagged)]`: YAML's own scalar types decide the variant, so `resource: {service.name: nginx, retries: 3, ratio: 0.5, sampled: true}` reads exactly as written, no `!i64`/`!f64` tag needed.\n\n**`I64` must stay ordered before `F64`.** `serde`'s untagged enum deserializer tries variants in declaration order and keeps the first that parses; `3` parses as both an `i64` and an `f64`, so `F64` before `I64` would silently turn every whole-number YAML scalar into a float. `Bool`/`Str` are unambiguous against the others (a YAML boolean/string never also parses as a number) so their position doesn't matter.",
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "type": "number",
+          "format": "double"
+        },
+        {
+          "type": "string"
+        }
+      ]
     },
     "StdioTarget": {
       "type": "string"

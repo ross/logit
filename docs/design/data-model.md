@@ -32,7 +32,11 @@ event with none of the three is legal and representable. A sink emits whatever i
 `influxdb_out` writes every metric on an event and ignores its log/span.
 
 `Resource` is `Arc`-shared rather than copied onto every event — a batch typically comes from one
-socket/file/OTLP request and shares one origin.
+socket/file/OTLP request and shares one origin. It's per-batch, not immutable, though: a transform
+or Lua script may substitute it for the batch currently in hand by minting a new `Arc`, the
+mechanism an operator uses to declare a resource identity `logit`'s own code won't invent on its
+own (`logit_pipeline::Transform::map_resource`,
+[ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md)).
 
 **`Event` is 792 bytes**, and that size is paid unconditionally — a statsd counter with three tags
 costs exactly as much to move as a fully-populated nginx access log, because `AttrMap`'s inline

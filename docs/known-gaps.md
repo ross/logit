@@ -195,11 +195,15 @@ already built that have a known, accepted rough edge.
   improvement under the current design. See [memory.md](design/memory.md) §3 for the complete,
   shape-by-shape account — there is no single number for "what fan-out costs now."
 - **A Lua component's `flush()` has no resource of its own at a timer tick** — unlike an `aggregate`
-  component, which tracks its own per-resource windows, a Lua component's flushed events are
-  stamped with whichever resource it most recently saw on a real batch
+  component, which tracks its own per-resource windows, a Lua component's flushed events default to
+  whichever resource it most recently saw on a real batch
   (`crates/logit-pipeline/src/runtime.rs`, see [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)).
-  Fine for every config today (one listener, one resource); would need a real answer once a
-  component has more than one upstream resource.
+  A script can now override that default explicitly by writing `resource` inside `flush()` itself
+  (`crates/logit-script/src/resource.rs`, [ADR `operator-declared-resource-attributes`](adr/operator-declared-resource-attributes.md)) —
+  a workaround available to the script author, not a fix to the underlying gap: `logit` still has
+  no way to attribute a flush-driven emission to a *specific* one of several upstream resources on
+  its own. Fine for every config today (one listener, one resource); would need a real answer once
+  a component has more than one upstream resource and no script-side override.
 - **A Lua component's `flush()` sees a stale trace context, for the same reason.** `trace.trace_id`/
   `trace.span_id` (`docs/design/lua-api.md`'s "Reading trace context") reflect whichever batch
   `process()` most recently saw, not any single batch a flush-driven emission could correctly
@@ -743,19 +747,6 @@ already built that have a known, accepted rough edge.
   batch's events happen to carry. None of these block the demo (single-tenant, plaintext gRPC to
   Tempo); all of them block a real deployment. The compression half of this mirrors the `otlp_in`
   gap above but was never itself filed until now.
-
-- **No mechanism exists anywhere in `logit` to attach a static attribute to a batch's resource** —
-  found in the same investigation
-  ([docs/plans/otlp-logs-and-resource-identity.md](plans/otlp-logs-and-resource-identity.md),
-  workstream A). Not config (no `attributes`/`labels`/`tags`/`resource` field on any input), not any
-  transform (`keep`/`json`/`kv_metrics`/`aggregate` only filter or derive), and Lua can mutate only
-  *event* attributes (`crates/logit-script/src/proxy.rs`'s `AttrsProxy`), never a resource. This is
-  what blocks giving `syslog_in`/`statsd_in` traffic a real `service.name` for OTLP-native backends
-  (Loki's index labels among them) without the just-landed rule that `logit`'s own code must not
-  invent one. The plan's workstream A sketches the fix — an operator-declared `resource:` config
-  field, landing on a new ADR distinguishing "code invents an identity" (still forbidden) from "an
-  operator configuring the pipeline declares one" (fine, same category as `syslog_out`'s existing
-  `hostname`/`app_name` fields) — plus the demo-stack workstreams (B, C, D) it would unblock.
 
 - **`otlp_out`'s gRPC transport opens a fresh connection per request, never pooled.** Every gRPC
   `send` (`crates/logit-outputs/src/otlp.rs`'s `grpc_roundtrip`) connects, performs a fresh HTTP/2

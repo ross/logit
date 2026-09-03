@@ -25,7 +25,7 @@ use logit_inputs::statsd::StatsdDecoder;
 use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
 use logit_proto::Decoder;
-use logit_transforms::{Aggregator, JsonParser, Keep, KvMetrics, MetricSpec};
+use logit_transforms::{Aggregator, JsonParser, Keep, KvMetrics, MetricSpec, Set};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -152,6 +152,19 @@ pub fn keep() -> Keep {
     Keep::new(vec!["host".to_string(), "request_method".to_string(), "status".to_string()])
 }
 
+/// A `set` configured with one attribute pair and no resource pairs -- the per-event-only path
+/// (`crates/logit-bench/tests/allocations.rs`'s `set_attributes_one_event`).
+pub fn set_attributes() -> Set {
+    Set::new(vec![], vec![("env".to_string(), Value::str("prod"))])
+}
+
+/// A `set` configured with one resource pair and no attribute pairs -- for measuring
+/// `map_resource`'s one-entry cache (`crates/logit-bench/tests/allocations.rs`'s
+/// `set_resource_cached_batch_costs_nothing`).
+pub fn set_resource() -> Set {
+    Set::new(vec![("service.name".to_string(), Value::str("nginx"))], vec![])
+}
+
 pub fn aggregator() -> Aggregator {
     Aggregator::new(Duration::from_secs(10))
 }
@@ -240,6 +253,17 @@ function process(event)
   if event.attributes.host ~= nil then
     event.attributes.env = "prod"
   end
+  return event
+end
+"#;
+
+/// Writes `resource` on every call -- for measuring what a script that stamps a resource identity
+/// (`crates/logit-script/src/resource.rs`, `docs/adr/operator-declared-resource-attributes.md`)
+/// costs over [`LUA_ENRICH_SCRIPT`]'s baseline (`crates/logit-bench/tests/allocations.rs`'s
+/// `lua_process_one_event_writing_resource`).
+pub const LUA_RESOURCE_WRITE_SCRIPT: &str = r#"
+function process(event)
+  resource["service.name"] = "nginx"
   return event
 end
 "#;

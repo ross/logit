@@ -25,7 +25,7 @@ use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
 use logit_transforms::{
     Aggregator, JsonParser, Keep as KeepTransform, KvMetrics as KvMetricsTransform,
-    Remove as RemoveTransform,
+    Remove as RemoveTransform, Set as SetTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -260,6 +260,10 @@ fn build_spec(
         Remove { fields } => NodeSpec::Transform(Box::new(
             RemoveTransform::new(fields.clone()).with_telemetry(telemetry.clone()),
         )),
+        Set { resource, attributes } => NodeSpec::Transform(Box::new(
+            SetTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
+                .with_telemetry(telemetry.clone()),
+        )),
 
         InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(
             Box::new(
@@ -458,6 +462,29 @@ fn to_metric_specs(specs: &[logit_config::MetricSpec]) -> Vec<logit_transforms::
             name: s.name.clone(),
             field: s.field.clone(),
             unit: s.unit.clone(),
+        })
+        .collect()
+}
+
+/// Converts `logit-config`'s `SetValue` map (`ComponentKind::Set`'s `resource`/`attributes`
+/// fields) into the plain `(String, logit_core::Value)` pairs `logit_transforms::Set::new` takes
+/// -- `logit-transforms` doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate
+/// layout), same reasoning as [`to_metric_specs`] above. A `BTreeMap` iterates in key order, which
+/// is why `Set`'s own tests don't need to assert an order beyond "whatever `AttrMap`'s sorted
+/// `Symbol` order ends up being" -- the interning happens once, at construction, inside `Set::new`.
+fn to_set_pairs(
+    values: &std::collections::BTreeMap<String, logit_config::SetValue>,
+) -> Vec<(String, logit_core::Value)> {
+    values
+        .iter()
+        .map(|(k, v)| {
+            let value = match v {
+                logit_config::SetValue::Bool(b) => logit_core::Value::Bool(*b),
+                logit_config::SetValue::I64(i) => logit_core::Value::I64(*i),
+                logit_config::SetValue::F64(f) => logit_core::Value::F64(*f),
+                logit_config::SetValue::Str(s) => logit_core::Value::str(s.clone()),
+            };
+            (k.clone(), value)
         })
         .collect()
 }
@@ -931,6 +958,27 @@ mod tests {
         };
         assert!(matches!(
             build_spec("remove", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_set_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Set {
+                resource: std::collections::BTreeMap::from([(
+                    "service.name".to_string(),
+                    logit_config::SetValue::Str("nginx".to_string()),
+                )]),
+                attributes: std::collections::BTreeMap::new(),
+            },
+        };
+        assert!(matches!(
+            build_spec("identity", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
     }

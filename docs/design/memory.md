@@ -202,6 +202,9 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `json` parse + merge (wide-JSON, 28 keys) | **1** | same fix, confirmed to generalize past a small field count |
 | `kv_metrics` derive 4 metrics | **3** | `MetricList` spill + one `bins` Vec per sketch |
 | `keep` filter to 3 attrs | **0** | 3 attributes fit inline |
+| `set` through `process_batch`, attributes only | **1** | `process_batch`'s own `Vec::with_capacity` -- `map_resource` returns `None` immediately, same as `keep` |
+| `set.map_resource`, cached (same input `Arc`) | **0** | the one-entry `Arc::ptr_eq` cache hits -- see below |
+| `set.map_resource`, cache miss (distinct input `Arc`) | **1** | `Arc::new(Resource { .. })` -- the `AttrMap` clone/insert itself stays inline on an empty resource |
 | `aggregate` absorb (after `keep`) | **0** | `SeriesKey` clone stays inline |
 | `aggregate` absorb (no `keep`) | **4** | one per metric — the map no longer fits inline |
 | `aggregate` flush 4 series | **6** | +4 since flush-side trace linking landed (ADR `trace-context-propagation-on-delivered`) — one `Vec<SpanLink>` per series, see below |
@@ -403,6 +406,11 @@ draft actually established:
 | Path | allocs | Notes |
 |---|---:|---|
 | `process_batch` through `keep`, telemetry disabled | **1** | `Vec::with_capacity(batch.events.len())` for `out` — this is the whole cost |
+| `process_batch` through `set` (attributes only) | **1** | identical to `keep` — `Transform::map_resource`'s default `None` return costs nothing beyond the call itself (`crates/logit-pipeline/src/transform.rs`) |
+| `set.map_resource`, cached (same input `Arc`) | **0** | the one-entry `Arc::ptr_eq` cache (`crates/logit-transforms/src/set.rs`) hits |
+| `set.map_resource`, cache miss (distinct input `Arc`) | **1** | `Arc::new(Resource { .. })` only — cloning/inserting into the fixture's empty, inline `AttrMap` never touches the heap |
+| `run_lua`: `set_resource` + `process` + `take_resource`, script never writes `resource` | **9** | identical to plain `process` (below) — `set_resource`/`take_resource` are field assignments, no allocation |
+| `run_lua`: `set_resource` + `process` + `take_resource`, script writes `resource` | **7** | see `crates/logit-script/src/resource.rs` — lower than the row above because this script (unlike `LUA_ENRICH_SCRIPT`) never touches `event.attributes`, skipping its `AttrsProxy` cost; the `+1` here is `take_resource`'s `Arc::new(Resource { .. })` commit |
 | `process_batch`, fully absorbed (`aggregate`) | **1** | the same `Vec`, built before any event is processed, thrown away unused when nothing survives |
 | `process_batch` through `keep`, telemetry live, **steady state** | **1** | identical to disabled — `count`/`timer` update an existing `ComponentBuffer` entry in place, no allocation of their own |
 | `process_batch`, **first call after an `internal` drain** | **3** | the `out` `Vec` (1) + a `HashMap` table rebuild (1) + a fresh `DdSketch` (1) — see below |

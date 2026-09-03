@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-02
+updated: 2026-09-03
 ---
 
 # Enabling plan: operator-declared resource identity, and a Loki-direct log leg
@@ -37,42 +37,46 @@ where it's the one thing not verified by direct observation).
 
 ## Gaps this plan exists to schedule
 
-### A. Operator-declared resource attributes — the actual blocker
+### A. Operator-declared resource attributes — done
 
-**Finding:** there is no mechanism anywhere in `logit` to attach static attributes to a batch's
-resource. Not config (`crates/logit-config/src/lib.rs`, `schema/logit.schema.json` — grepped for
-`attributes`/`labels`/`tags`/`resource` on every input variant, no hits); not any transform
-(`keep`/`json`/`kv_metrics`/`aggregate` in `crates/logit-transforms/src/` only filter or derive,
-never insert a constant); and Lua can mutate only *event* attributes
-(`crates/logit-script/src/proxy.rs:194-238` `AttrsProxy`), never a resource.
+**Status: landed.** What was originally a finding-plus-sketch is now a shipped `set` transform,
+`Transform::map_resource`, and a read/write Lua `resource` global — see
+[ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md) for
+the design and rationale, [lua-api.md](../design/lua-api.md)'s "Reading and writing `resource`"
+section for the script-facing contract, and [data-model.md](../design/data-model.md) for the
+one-line model update (a batch's `Resource` was already dynamic — `Arc`-swappable, not
+immutable — the gap was a *mutation surface*, not the data model). Kept here, in past tense, as the
+record of what workstream A originally found and how it was resolved; the finding itself is no
+longer filed in `docs/known-gaps.md`.
 
-This matters beyond the demo: every OTLP-native backend keys behavior off resource attributes.
-Every future OTLP sink hits this same wall.
+An operator now writes, for example:
 
-**Design sketch, for whoever picks this up:**
-- Cheaper than it looks. `SyslogDecoder` already *holds* an `Arc<Resource>` field
-  (`crates/logit-inputs/src/syslog.rs:155`, returned unchanged on every decode at `:220`); only
-  `SyslogInput::new` (`:99-104`) hardcodes `Resource::default()`. The plumbing exists; the config
-  surface doesn't.
-- Touch points: a config field (e.g. `resource: BTreeMap<String, String>` on `syslog_in`),
-  regenerated `schema/logit.schema.json` (`script/schema`; `script/cibuild` fails the build on
-  drift), a builder on the input, threading through `crates/logit-cli/src/pipeline.rs`, tests, docs.
-- **Needs an ADR.** Written down badly, this reads as a contradiction of the rule PR #60 just
-  landed. Written down correctly: *`logit`'s code may not invent a resource identity for data it
-  didn't produce; an operator configuring the pipeline may declare one.* An operator writing
-  `resource: {service.name: demo-hello}` on a listener is declaring what that specific socket
-  receives — the same category of knowledge as `syslog_out`'s existing `hostname`/`app_name` config
-  fields, not a violation of "code doesn't guess." Suggested slug:
-  `operator-declared-resource-attributes`.
-- **Open questions to research before implementing:**
-  - Which inputs get the field first. `syslog_in` is the immediate motivator; `otlp_in` arguably
-    should never get one, since it already receives a real resource on the wire.
-  - Value types: strings only (simplest, matches what backends actually key on), or the full
-    `logit_core::Value` set (more expressive, more schema surface).
-  - Per-input only, or also a config-root default inherited by every input that doesn't override it.
-  - Interaction with `BatchAccumulator`'s flush-on-resource-change behavior
-    (`crates/logit-pipeline/src/accumulator.rs:88-95`) — a per-input constant resource should be a
-    non-issue (one static value, no mid-stream changes), but worth confirming before relying on it.
+```yaml
+web_identity:
+  type: set
+  sources: [web_logs]
+  resource:
+    service.name: nginx
+    service.namespace: demo
+```
+
+**Why a `set` graph component, not the per-input `resource:` field this plan originally
+sketched:** one mechanism composes anywhere in the graph (several inputs feeding one `set`, or one
+input feeding several differently-configured `set`s), covers event attributes the same way it
+covers the resource (a second thing this plan's original sketch would have needed its own
+mechanism for regardless), and needs no per-input schema surface — `otlp_in` in particular needs
+no special-casing, since an operator simply never puts a `set` after it. See the ADR's
+"Alternatives considered" for the full comparison.
+
+**The `BatchAccumulator` interaction this plan's original sketch worried about doesn't arise.**
+`BatchAccumulator` (`crates/logit-pipeline/src/accumulator.rs`) is listener-side batching, upstream
+of every transform — `set`'s `map_resource` runs downstream of it, on an already-accumulated
+batch, so its `Arc::ptr_eq` resource-change flush logic never sees or interacts with `set` at all.
+
+Value types settled as scalars (string/int/float/bool via `SetValue`, an untagged enum) rather than
+strings-only — a per-event setter that couldn't write a number would have been a wart from day
+one. No config-root default was added; per-component configuration (insert a `set` wherever it's
+needed) covers the same ground without a second inheritance mechanism to reason about.
 
 ### B. A Loki-direct log leg, dropping `alloy`
 
@@ -94,10 +98,10 @@ endpoint: `service.name`, `service.namespace`, `service.instance.id`, `deploymen
 explicitly configured otherwise.
 
 **Consequence:** without A, every OTLP log line lands in Loki as `{service_name="unknown_service"}`
-with no `host`/`app`/`job`-equivalent label at all — a demo that looks broken. With A, setting
-`service.name`/`service.namespace` in `syslog_in`'s new `resource:` config is enough on its own —
-both are already in Loki's default index-label set, so **no `demo/loki/loki.yaml` change would be
-needed**.
+with no `host`/`app`/`job`-equivalent label at all — a demo that looks broken. With A landed,
+setting `service.name`/`service.namespace` via a `set` component after `syslog_in` is enough on its
+own — both are already in Loki's default index-label set, so **no `demo/loki/loki.yaml` change
+would be needed**.
 
 **Where today's labels actually come from — entirely Alloy, nothing else:**
 `demo/alloy/config.alloy:13-16` sets static `job="demo"`, `protocol="udp"`; `:33-41` relabels

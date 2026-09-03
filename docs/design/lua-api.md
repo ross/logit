@@ -202,14 +202,58 @@ of its events reach `process()`, so every event in one call to `process()` sees 
 Both start at the all-zero placeholder (`"00...0"`) before any batch has arrived.
 
 **Stale during `flush()`.** `trace` is *not* updated around a `flush()` call -- it keeps whatever
-the most recently processed batch set, the same staleness `event.attributes`'s resource has at a
-flush tick (see this crate's own known-gaps entry for both). A `flush()`-driven emission has no
-single incoming batch to attribute itself to -- however many batches contributed to whatever a
-stateful script is about to flush, `logit` has no way to know, and doesn't try to guess. A script
-that wants better than "whichever batch was last seen" needs to track contributing contexts itself,
-inside its own `process()` -- the values are genuinely there to read, `logit` just doesn't
-aggregate them on the script's behalf the way `docs/adr/trace-context-propagation-on-delivered.md`'s
-flush-side linking does for the native `aggregate` transform.
+the most recently processed batch set (see this crate's own known-gaps entry). A `flush()`-driven
+emission has no single incoming batch to attribute itself to -- however many batches contributed to
+whatever a stateful script is about to flush, `logit` has no way to know, and doesn't try to guess.
+A script that wants better than "whichever batch was last seen" needs to track contributing
+contexts itself, inside its own `process()` -- the values are genuinely there to read, `logit` just
+doesn't aggregate them on the script's behalf the way
+`docs/adr/trace-context-propagation-on-delivered.md`'s flush-side linking does for the native
+`aggregate` transform. `resource`, below, has the same default staleness at a flush tick, but --
+unlike `trace` -- a script can override it explicitly.
+
+## Reading and writing `resource`
+
+A `resource` global gives `process()` (and `flush()`) read *and write* access to the incoming
+batch's resource -- the same `Arc<Resource>` `EventBatch::resource` carries
+([data-model.md](data-model.md)), proxied the same way `event.attributes` is:
+
+```lua
+function process(event)
+  resource["service.name"] = "nginx"
+  resource["service.namespace"] = "demo"
+  return event
+end
+```
+
+Reads and writes go through `resource["key"]` exactly like `event.attributes["key"]`; enumerate
+every key with `resource:to_table()` (no `__pairs` under LuaJIT, same reason `event.attributes`
+needs `event:to_table()`). Assigning `nil` stores a null value, not a removal -- there is no way to
+delete a resource attribute from Lua, the same rule `event.attributes` follows.
+
+**Per batch, not per event.** A write inside `process()` applies to the whole outgoing batch,
+including any events already processed earlier in the same batch -- `resource` is batch-scoped
+state, not per-event. A script that wants a per-event identity uses `event.attributes` instead.
+Writes made at a script's top level, before any batch has arrived, are silently discarded once the
+first batch's `set_resource` call resets `resource` -- write inside `process()`/`flush()`, not at
+load time. `resource` starts empty, the same all-clear starting point `trace` has.
+
+**Copy-on-write, so a script that never touches `resource` costs nothing.** Reading or writing
+`event.attributes` on an event a script doesn't otherwise touch is already the common case this
+proxy design exists to keep cheap; `resource` follows the identical shape
+(`crates/logit-script/src/resource.rs`) -- see [memory.md](memory.md) for the measured cost of both
+the no-write and write paths.
+
+**A write inside `flush()` gives a stateful script's flush-driven emission a real identity**,
+where `trace` (above) has none to offer -- the one asymmetry between the two globals. It doesn't
+resolve the underlying *n*-to-1 problem (`logit` still can't attribute a flush automatically to one
+of several upstream resources), it just gives the script a way to state the answer itself when it
+knows one. See `docs/known-gaps.md`'s entry and
+[ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md).
+
+The `set` native transform (`logit_config::ComponentKind::Set`) offers the same capability without
+writing Lua at all, for the common case of stamping a handful of constant values -- see that ADR
+for why an operator reaches for a graph component here rather than a per-input config field.
 
 ## Config shape
 

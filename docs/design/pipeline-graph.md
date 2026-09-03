@@ -285,6 +285,11 @@ transforms implement, letting the node runtime hold `Box<dyn Transform + Send>` 
 per node kind. Lua nodes stay the one hand-special-cased kind, for the `!Send` reason above — a
 trait object doesn't fix that, and shouldn't try to.
 
+`Transform` later grew a second per-batch hook alongside `process`: `map_resource`, called once per
+incoming batch before any event reaches `process`, letting a transform substitute the batch's
+resource (`logit-transforms::Set` is the first implementer) — see
+[ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md).
+
 ### Trace context propagation
 
 Every `Delivered` (the channel payload one `Fanout` edge carries, `crates/logit-pipeline/src/fanout.rs`)

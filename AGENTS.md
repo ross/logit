@@ -16,7 +16,7 @@ something that looks broken — it's likely a documented, deliberate gap, not an
 Lua enrichment stage, InfluxDB 2.x out, via `logit run <config>` (see
 [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml), `script/server`). Since then,
 `syslog_in`, `stdio_out`, `otlp_in`, and `otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`,
-`crates/logit-proto`'s `otlp` codec) and `json`, `kv_metrics`, `keep`, and `remove`
+`crates/logit-proto`'s `otlp` codec) and `json`, `kv_metrics`, `keep`, `remove`, and `set`
 (`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises the syslog/InfluxDB
 side together against a real nginx (`examples/nginx/`), and
@@ -191,7 +191,7 @@ crates/
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, internal (self-telemetry)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, syslog
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove, set
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
 ```
