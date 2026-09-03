@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-02
+updated: 2026-09-03
 ---
 
 # Enabling plan: operator-declared resource identity, and a Loki-direct log leg
