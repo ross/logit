@@ -48,7 +48,7 @@ pub struct Component {
     /// `ComponentKind` variant, so a future fifth sink kind costs nothing extra here.
     #[serde(default)]
     pub buffer: BufferConfig,
-    /// Per-listener receive queue and batching (`docs/adr/0026-decoupled-listener-io.md`).
+    /// Per-listener receive queue and batching (`docs/adr/0027-decoupled-listener-io.md`).
     /// Meaningful only on a datagram listener -- graph validation rejects a non-default value on
     /// any other kind, `internal` included. A sibling field of `kind`, mirroring `buffer`'s own
     /// placement.
@@ -188,6 +188,22 @@ pub enum ComponentKind {
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         interval: Duration,
+        /// How many consecutive windows a gauge series with no new data is retained past its
+        /// last update, so a relative gauge adjustment (`docs/adr/0026-relative-gauge-adjustments.md`)
+        /// arriving in a later window can still resolve against the value it last held. `0`
+        /// disables retention entirely -- every gauge series is drained every window exactly like
+        /// a counter, matching this field's absence before it existed. See the
+        /// `docs/adr/0008-aggregation-window-semantics.md` amendment for the full design.
+        #[serde(default = "default_gauge_retention")]
+        gauge_retention: u32,
+        /// A hard cap on how many gauge series may be retained across this component's whole
+        /// window at once -- a DoS/cardinality guard, not a tuning knob. `gauge_retention` alone
+        /// bounds only how long one series survives; without this, a sustained stream of
+        /// never-repeating series names would hold unboundedly many retained series regardless of
+        /// how short the retention window is. Least-recently-updated series are evicted first
+        /// once exceeded.
+        #[serde(default = "default_max_retained_gauge_series")]
+        max_retained_gauge_series: usize,
     },
     /// Parses a log record's message as JSON, merging the resulting key/values into the event's
     /// attributes. See `docs/adr/0010-json-parsing-into-attributes.md`.
@@ -327,6 +343,20 @@ pub enum ComponentKind {
 
 fn default_max_message_bytes() -> u64 {
     8192
+}
+
+/// `Aggregate::gauge_retention`'s default: retention is on by default, at a modest depth --
+/// `0` (the pre-existing, always-tumbling behavior) is an explicit opt-out, not the default,
+/// since a relative gauge adjustment silently resolving against 0.0 every time (what `0` means)
+/// is the wrong default for a feature whose entire point is making that case rare.
+fn default_gauge_retention() -> u32 {
+    5
+}
+
+/// `Aggregate::max_retained_gauge_series`'s default -- a DoS/cardinality guard, not a tuning
+/// knob (see the field's own doc comment).
+fn default_max_retained_gauge_series() -> usize {
+    10_000
 }
 
 /// Mirrors `logit_outputs::syslog::DEFAULT_CONNECT_TIMEOUT` -- can't reference it directly
@@ -537,18 +567,18 @@ pub enum DeliveryPosture {
 }
 
 /// Per-listener receive queue and datagram-\>batch assembly
-/// (`docs/adr/0026-decoupled-listener-io.md`). Meaningful only on a datagram listener (today
+/// (`docs/adr/0027-decoupled-listener-io.md`). Meaningful only on a datagram listener (today
 /// `statsd_in`/`syslog_in`); graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a
 /// non-default value on any other kind, including `internal` (a listener by role, but one with no
 /// socket, no queue, and no decoder). Flat, following [`BufferConfig`]'s own
 /// `retry_budget`/`retry_max_delay` precedent rather than nesting a `batch:` sub-block -- two
 /// levels of optional-with-defaults is harder to scan in YAML than a flat prefix. Every field
 /// defaults, so a `receive:` block is never required -- **but an omitted block is not byte-for-
-/// byte the pre-ADR-0026 behavior**, and isn't meant to be: `batch_max_events: 1_000` and
+/// byte the pre-ADR-0027 behavior**, and isn't meant to be: `batch_max_events: 1_000` and
 /// `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into
 /// batches (up to 1000 events, or up to 100ms of added latency before a send) rather than sending
 /// one batch per datagram immediately, matching what every established UDP listener researched
-/// for ADR 0026 does out of the box. A deployment that genuinely needs the old one-send-per-
+/// for ADR 0027 does out of the box. A deployment that genuinely needs the old one-send-per-
 /// datagram, no-added-latency behavior gets it back explicitly with `batch_max_events: 1`, not by
 /// omitting `receive:`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -569,7 +599,7 @@ pub struct ReceiveConfig {
     /// Telegraf, gostatsd) treats this the same way.
     pub overflow: OverflowPolicy,
     /// Events to accumulate across datagrams before one send downstream. `1` means one send per
-    /// datagram -- the behavior before ADR 0026 -- since the accumulator flushes on a bound
+    /// datagram -- the behavior before ADR 0027 -- since the accumulator flushes on a bound
     /// *reached or exceeded* and never splits a single decode's output. `0` is rejected as an
     /// impossible bound (graph rule 18, the twin of rule 15's `buffer.max_batches: 0` check).
     pub batch_max_events: usize,
@@ -589,7 +619,7 @@ pub struct ReceiveConfig {
     #[schemars(with = "Option<String>")]
     pub receive_buffer_bytes: Option<u64>,
     /// How long a listener keeps draining a cooperative shutdown before being cancelled by drop
-    /// (`docs/adr/0026-decoupled-listener-io.md`, revising ADR 0013's unconditional cancel-by-drop
+    /// (`docs/adr/0027-decoupled-listener-io.md`, revising ADR 0013's unconditional cancel-by-drop
     /// into a bounded one). Matches `buffer.shutdown_grace`'s default so both ends of the
     /// pipeline drain on the same number.
     #[serde(with = "humantime_serde_duration")]
@@ -598,7 +628,7 @@ pub struct ReceiveConfig {
 }
 
 /// Defaults, justified against established UDP listeners' own tuning figures -- see
-/// `docs/adr/0026-decoupled-listener-io.md` for the full numeric derivation (Telegraf, gostatsd,
+/// `docs/adr/0027-decoupled-listener-io.md` for the full numeric derivation (Telegraf, gostatsd,
 /// DogStatsD, rsyslog, syslog-ng).
 impl Default for ReceiveConfig {
     fn default() -> Self {
@@ -766,7 +796,7 @@ mod human_bytes {
 
     /// The same codec, for `Option<u64>` fields (`#[serde(default, with =
     /// "human_bytes::option")]`) -- used by `ReceiveConfig::receive_buffer_bytes`
-    /// (`docs/adr/0026-decoupled-listener-io.md`), where `None` means "leave the kernel default
+    /// (`docs/adr/0027-decoupled-listener-io.md`), where `None` means "leave the kernel default
     /// alone" rather than a byte count of zero. Mirrors `humantime_serde_duration::option`'s
     /// shape exactly: a nested module because `#[serde(with = "...")]` on an `Option<u64>` field
     /// calls *this* module's `serialize`/`deserialize` with `Option<u64>`, not the parent's `u64`
@@ -963,7 +993,29 @@ mod tests {
             serde_json::from_str(r#"{"type": "aggregate", "sources": ["in"], "interval": "10s"}"#)
                 .unwrap();
         match component.kind {
-            ComponentKind::Aggregate { interval } => assert_eq!(interval, Duration::from_secs(10)),
+            ComponentKind::Aggregate { interval, gauge_retention, max_retained_gauge_series } => {
+                assert_eq!(interval, Duration::from_secs(10));
+                // Additive fields: an existing config with no `gauge_retention`/
+                // `max_retained_gauge_series` at all still deserializes, defaulting to both
+                // (proves the config change is additive, per script/validate over demo/examples).
+                assert_eq!(gauge_retention, 5);
+                assert_eq!(max_retained_gauge_series, 10_000);
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_component_can_override_gauge_retention() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "aggregate", "sources": ["in"], "interval": "10s", "gauge_retention": 0, "max_retained_gauge_series": 100}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Aggregate { gauge_retention, max_retained_gauge_series, .. } => {
+                assert_eq!(gauge_retention, 0);
+                assert_eq!(max_retained_gauge_series, 100);
+            }
             other => panic!("expected Aggregate, got {other:?}"),
         }
     }

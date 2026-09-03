@@ -13,7 +13,7 @@ components:
   statsd_in:
     type: statsd_in
     bind: 0.0.0.0:8125
-    # Every field below defaults (docs/adr/0026-decoupled-listener-io.md) -- an omitted `receive:`
+    # Every field below defaults (docs/adr/0027-decoupled-listener-io.md) -- an omitted `receive:`
     # block is exactly the values shown here, commented out purely as a reference for tuning a
     # real deployment. `receive:` is meaningful only on a datagram listener (statsd_in, syslog_in);
     # `logit-pipeline`'s graph validation rejects it on any other component kind.
@@ -24,7 +24,7 @@ components:
     #                               # drop_oldest (not buffer:'s block) is the default here on purpose -- blocking a
     #                               # UDP reader relocates loss into the kernel where nothing counts it
     #   batch_max_events: 1000      # events accumulated across datagrams before one send downstream; 1 means
-    #                               # one send per datagram, today's pre-ADR-0026 behavior
+    #                               # one send per datagram, today's pre-ADR-0027 behavior
     #   batch_max_bytes: "1MiB"     # the other accumulation bound -- whichever trips first
     #   batch_flush_interval: 100ms # longest an accumulated batch waits before being sent regardless of size;
     #                               # 0s disables the timer, leaving the two bounds above as the only trigger

@@ -1,7 +1,7 @@
 //! [`BoundedQueue`]: the async wrapper around `logit_proto::buffer::Buffer` that decouples a
 //! node's own I/O from whatever's downstream of it -- see
 //! `docs/adr/0021-buffered-sink-delivery.md` (the sink side, `SinkQueue`) and
-//! `docs/adr/0026-decoupled-listener-io.md` (the listener side, `ReceiveQueue`). `Buffer` itself
+//! `docs/adr/0027-decoupled-listener-io.md` (the listener side, `ReceiveQueue`). `Buffer` itself
 //! is sync (no `.await` in a critical section), so this type owns the one thing a sync trait
 //! can't express: `Block`, which awaits room rather than dropping.
 //!
@@ -60,7 +60,7 @@ impl Queued for (Arc<EventBatch>, TraceContext) {
 /// formatted -- `docs/design/internal-telemetry.md`'s cardinality convention requires every name
 /// to be a compile-time constant, and a name built at runtime (`format!("logit.{kind}...")`)
 /// would be exactly the mistake that convention exists to prevent. [`SINK_QUEUE_METRICS`] is the
-/// one instance today; `logit-inputs`' receive queue (`docs/adr/0026-decoupled-listener-io.md`)
+/// one instance today; `logit-inputs`' receive queue (`docs/adr/0027-decoupled-listener-io.md`)
 /// adds a second.
 pub struct QueueMetrics {
     /// Gauge: items currently queued.
@@ -91,7 +91,7 @@ pub static SINK_QUEUE_METRICS: QueueMetrics = QueueMetrics {
 /// -- it's this type's own addition, layered on top of the two dropping policies that trait can
 /// express synchronously (see `logit_proto::buffer::OverflowPolicy`'s doc comment for why). Shared
 /// between the sink and receive sides: both need the same three-way choice, only the *default*
-/// differs (`docs/adr/0026-decoupled-listener-io.md`'s core argument for why a UDP listener's
+/// differs (`docs/adr/0027-decoupled-listener-io.md`'s core argument for why a UDP listener's
 /// default must not be `Block`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverflowPolicy {
@@ -102,7 +102,7 @@ pub enum OverflowPolicy {
 
 /// Bounds and overflow behavior for one [`BoundedQueue`], in the queue's own generic terms
 /// (items/weight rather than a domain-specific unit). [`SinkQueueConfig`]/`ReceiveQueueConfig`
-/// (`logit-inputs`, `docs/adr/0026-decoupled-listener-io.md`) each convert into this rather than
+/// (`logit-inputs`, `docs/adr/0027-decoupled-listener-io.md`) each convert into this rather than
 /// being this directly -- a sink operator reasons in batches, a listener operator in datagrams,
 /// and each config type's own field names and doc comments should say so.
 #[derive(Debug, Clone, Copy)]
@@ -145,7 +145,7 @@ impl From<SinkQueueConfig> for QueueConfig {
 /// The async wrapper around `logit_proto::buffer::InMemoryBuffer<T>` that sits between a node's
 /// own I/O and whatever it's decoupled from, letting the two proceed independently -- a sink's
 /// inbox drain and its writer (`docs/adr/0021-buffered-sink-delivery.md`, `SinkQueue`), or a UDP
-/// listener's socket read and its decode loop (`docs/adr/0026-decoupled-listener-io.md`,
+/// listener's socket read and its decode loop (`docs/adr/0027-decoupled-listener-io.md`,
 /// `logit-inputs`' `ReceiveQueue`). Not `Clone` -- exactly one value exists per node, wrapped in
 /// `Arc` by its two callers, each holding their own `Arc::clone`.
 ///

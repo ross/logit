@@ -29,12 +29,12 @@ pub enum CodecError {
 pub trait Decoder {
     /// Decodes one datagram, appending its events to `out` rather than returning a fresh `Vec` --
     /// a caller accumulating across many datagrams (`logit_pipeline::BatchAccumulator`,
-    /// `docs/adr/0026-decoupled-listener-io.md`) can then reuse one buffer via `Vec::drain`
+    /// `docs/adr/0027-decoupled-listener-io.md`) can then reuse one buffer via `Vec::drain`
     /// instead of allocating and immediately discarding one per datagram
     /// (`docs/design/memory.md` §2).
     ///
     /// `received_at` is when the datagram was taken off the socket, not when this runs -- once a
-    /// listener's own I/O is decoupled from its decode loop (ADR 0026), the two can diverge by the
+    /// listener's own I/O is decoupled from its decode loop (ADR 0027), the two can diverge by the
     /// receive queue's own latency under backlog, and every emitted event's `timestamp` must be
     /// the former: this is what keeps a syslog/statsd event's `timestamp` meaning *receipt* time
     /// regardless of how far behind decode is running.

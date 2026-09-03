@@ -33,7 +33,7 @@
 //! 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` -- a config error, not
 //!     something to clamp silently.
 //! 17. A non-default `receive:` block is rejected on any kind that is not a datagram listener
-//!     (today `statsd_in`/`syslog_in`) -- `receive:` (`docs/adr/0026-decoupled-listener-io.md`)
+//!     (today `statsd_in`/`syslog_in`) -- `receive:` (`docs/adr/0027-decoupled-listener-io.md`)
 //!     configures a listener's socket-side receive queue, which only a datagram listener has.
 //!     Deliberately **not** `role(&kind) != Role::Listener`: `internal` is a listener by role but
 //!     has no socket, no queue, and no decoder, so `receive:` on it would be a silently-ignored
@@ -183,7 +183,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
 fn interval(kind: &ComponentKind) -> Option<Duration> {
     match kind {
         ComponentKind::Lua { interval, .. } | ComponentKind::LuaFile { interval, .. } => *interval,
-        ComponentKind::Aggregate { interval } | ComponentKind::Internal { interval, .. } => {
+        ComponentKind::Aggregate { interval, .. } | ComponentKind::Internal { interval, .. } => {
             Some(*interval)
         }
         _ => None,
@@ -198,7 +198,7 @@ pub struct ResolvedComponent {
     /// sink-only by [`resolve`] (rule 14); meaningless on any other role, so a non-sink component's
     /// value here is always [`BufferConfig::default`] once resolution has succeeded.
     pub buffer: BufferConfig,
-    /// Per-listener receive queue/batching config (`docs/adr/0026-decoupled-listener-io.md`).
+    /// Per-listener receive queue/batching config (`docs/adr/0027-decoupled-listener-io.md`).
     /// Validated as datagram-listener-only by [`resolve`] (rule 17); meaningless on any other
     /// kind, so its value here is always [`ReceiveConfig::default`] once resolution has succeeded.
     pub receive: ReceiveConfig,
@@ -468,7 +468,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 }
 
 /// The predicate rule 17 needs: which `ComponentKind`s the UDP listener driver
-/// (`docs/adr/0026-decoupled-listener-io.md`, `logit-inputs::udp::UdpListener`) actually backs.
+/// (`docs/adr/0027-decoupled-listener-io.md`, `logit-inputs::udp::UdpListener`) actually backs.
 /// Kept explicit rather than derived from [`Role`] -- see rule 17's own doc comment -- so a new
 /// listener kind rejects `receive:` until it is actually wired to that driver.
 fn is_datagram_listener(kind: &ComponentKind) -> bool {
@@ -777,7 +777,15 @@ mod tests {
     fn zero_interval_is_rejected() {
         let err = expect_err(cfg(vec![
             ("in", vec![], listener()),
-            ("agg", vec!["in"], ComponentKind::Aggregate { interval: Duration::ZERO }),
+            (
+                "agg",
+                vec!["in"],
+                ComponentKind::Aggregate {
+                    interval: Duration::ZERO,
+                    gauge_retention: 5,
+                    max_retained_gauge_series: 10_000,
+                },
+            ),
             ("out", vec!["agg"], sink()),
         ]));
         assert!(err.contains("0s"), "got: {err}");
@@ -1058,7 +1066,11 @@ mod tests {
             (
                 "agg",
                 vec!["in"],
-                ComponentKind::Aggregate { interval: Duration::from_secs(10) },
+                ComponentKind::Aggregate {
+                    interval: Duration::from_secs(10),
+                    gauge_retention: 5,
+                    max_retained_gauge_series: 10_000,
+                },
                 non_default_buffer(),
             ),
             ("out", vec!["agg"], sink(), BufferConfig::default()),
@@ -1132,7 +1144,11 @@ mod tests {
             (
                 "agg",
                 vec!["in"],
-                ComponentKind::Aggregate { interval: Duration::from_secs(10) },
+                ComponentKind::Aggregate {
+                    interval: Duration::from_secs(10),
+                    gauge_retention: 5,
+                    max_retained_gauge_series: 10_000,
+                },
                 non_default_receive(),
             ),
             ("out", vec!["agg"], sink(), ReceiveConfig::default()),

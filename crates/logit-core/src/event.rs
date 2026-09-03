@@ -98,14 +98,17 @@ fn value_heap_bytes(value: &Value) -> u64 {
 }
 
 /// Heap bytes owned by one `MetricRecord`: its name/unit symbols, plus a kind-dependent
-/// contribution. `Counter`/`Gauge`/`Set` are effectively free (no heap payload of their own --
-/// `HyperLogLog` is still a stub, see `metric.rs`); `Histogram`/`Summary` count their actual
-/// bucket/quantile `Vec`s exactly, since those are plain `Vec`s and doing so costs nothing extra;
-/// `Distribution` uses [`ESTIMATED_DISTRIBUTION_HEAP_BYTES`] rather than walking the sketch.
+/// contribution. `Counter`/`Gauge`/`GaugeDelta`/`Set` are effectively free (no heap payload of
+/// their own -- `HyperLogLog` is still a stub, see `metric.rs`); `Histogram`/`Summary` count their
+/// actual bucket/quantile `Vec`s exactly, since those are plain `Vec`s and doing so costs nothing
+/// extra; `Distribution` uses [`ESTIMATED_DISTRIBUTION_HEAP_BYTES`] rather than walking the sketch.
 fn metric_record_heap_bytes(record: &MetricRecord) -> u64 {
     let symbols = symbol_heap_bytes(record.name) + record.unit.map(symbol_heap_bytes).unwrap_or(0);
     let kind = match &record.kind {
-        MetricKind::Counter(_) | MetricKind::Gauge(_) | MetricKind::Set(_) => 0,
+        MetricKind::Counter(_)
+        | MetricKind::Gauge(_)
+        | MetricKind::GaugeDelta(_)
+        | MetricKind::Set(_) => 0,
         MetricKind::Distribution(_) => ESTIMATED_DISTRIBUTION_HEAP_BYTES,
         MetricKind::Histogram { buckets } => {
             (buckets.len() * std::mem::size_of::<(f64, u64)>()) as u64

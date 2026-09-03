@@ -42,7 +42,7 @@ const CHANNEL_CAPACITY: usize = 64;
 pub enum NodeSpec {
     /// `InputRuntimeConfig` mirrors `Output`'s own runtime knobs below: production call sites
     /// (`logit-cli::pipeline::build_spec`) derive `shutdown_grace` from the listener's `receive:`
-    /// block (`docs/adr/0026-decoupled-listener-io.md`), defaulting to
+    /// block (`docs/adr/0027-decoupled-listener-io.md`), defaulting to
     /// `InputRuntimeConfig::default()` (`Duration::ZERO` -- cancel-by-drop immediately, ADR
     /// 0013's original behaviour) for a listener with no `receive:` block; a test can pass a
     /// short grace to keep a shutdown test fast.
@@ -245,7 +245,7 @@ pub async fn run_with_telemetry(
 }
 
 /// Drives one listener via [`Input::run_until_shutdown`], racing it against a *grace-delayed*
-/// backstop rather than `shutdown` itself (`docs/adr/0026-decoupled-listener-io.md`, revising
+/// backstop rather than `shutdown` itself (`docs/adr/0027-decoupled-listener-io.md`, revising
 /// ADR 0013's "no `Input` trait change" rationale, not its cancel-by-drop mechanism -- see the
 /// trait's own doc comment).
 ///
@@ -1313,7 +1313,7 @@ fn now_unix_nanos() -> i64 {
 ///
 /// `pub(crate)` rather than private: [`crate::accumulator::BatchAccumulator`] reuses this exact
 /// cadence math for its own interval-driven flush rather than a second copy
-/// (`docs/adr/0026-decoupled-listener-io.md`).
+/// (`docs/adr/0027-decoupled-listener-io.md`).
 pub(crate) fn advance_flush_deadline(
     deadline: tokio::time::Instant,
     now: tokio::time::Instant,
@@ -1788,7 +1788,11 @@ mod tests {
                 buffer: logit_config::BufferConfig::default(),
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
-                kind: ComponentKind::Aggregate { interval: Duration::from_secs(3600) },
+                kind: ComponentKind::Aggregate {
+                    interval: Duration::from_secs(3600),
+                    gauge_retention: 5,
+                    max_retained_gauge_series: 10_000,
+                },
             },
         );
         components.insert(
@@ -1859,7 +1863,7 @@ mod tests {
     }
 
     // -- `Input::run_until_shutdown` and `run_input`'s grace backstop
-    //    (`docs/adr/0026-decoupled-listener-io.md`). --
+    //    (`docs/adr/0027-decoupled-listener-io.md`). --
 
     /// Never returns on its own -- the shape that makes the default `run_until_shutdown`'s
     /// `select!` the *only* way this input can ever stop.
@@ -2414,7 +2418,10 @@ mod tests {
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
             "in".to_string(),
-            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) }), InputRuntimeConfig::default()),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
         );
         specs.insert(
             "enrich".to_string(),
@@ -2511,7 +2518,10 @@ mod tests {
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
             "in".to_string(),
-            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) }), InputRuntimeConfig::default()),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
         );
         specs.insert("enrich".to_string(), NodeSpec::Lua { script, interval: None });
         specs.insert(

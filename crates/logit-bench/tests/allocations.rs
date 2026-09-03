@@ -114,6 +114,44 @@ fn statsd_decode_one_line() {
     expect_allocs("statsd_in: decode 1 line", stats, 2);
 }
 
+/// Pins the unsampled baseline that sample-rate extrapolation on the decode path
+/// (`DdSketch::add_weighted`, `crates/logit-core/src/metric.rs`) must add zero allocations over --
+/// which its delegation to `sketches_ddsketch::DDSketch::add_with_count` satisfies regardless of
+/// weight. [`statsd_decode_one_sampled_distribution_line`] pins the sampled case at the same
+/// count.
+#[test]
+fn statsd_decode_one_distribution_line() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_distribution_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    expect_allocs("statsd_in: decode 1 distribution line", stats, 3);
+}
+
+/// Same line as [`statsd_decode_one_distribution_line`], sampled at `@0.1` -- ten weighted
+/// `DdSketch::add_weighted` samples instead of one unweighted `add`. Must match that test's
+/// allocation count exactly: the bin `Vec` a `DdSketch` allocates on its first sample is the same
+/// single allocation whether that first sample carries a weight of one or ten, because
+/// `add_with_count` computes the bin index once and increments its stored count directly.
+#[test]
+fn statsd_decode_one_sampled_distribution_line() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_sampled_distribution_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    match &batch.events[0].metrics[0].kind {
+        logit_core::MetricKind::Distribution(sketch) => {
+            assert_eq!(sketch.count(), 10, "@0.1 should extrapolate to 10 weighted samples")
+        }
+        other => panic!("expected Distribution, got {other:?}"),
+    }
+    expect_allocs("statsd_in: decode 1 sampled distribution line", stats, 3);
+}
+
 /// The logs-only workload `docs/design/memory.md` §0 names as unmeasured: a plain-text syslog
 /// line with no JSON body anywhere in the pipeline (`fixtures::SSHD_SYSLOG_LINE`). Same zero-copy
 /// decode as [`syslog_decode_one_line`] -- one allocation for the `Vec<Event>`, nothing per
@@ -136,7 +174,7 @@ fn syslog_decode_one_logs_only_line() {
 }
 
 /// The measurement `syslog_decode_one_line` above deliberately doesn't cover
-/// (`docs/adr/0026-decoupled-listener-io.md`): `decode_into` called against a buffer the caller
+/// (`docs/adr/0027-decoupled-listener-io.md`): `decode_into` called against a buffer the caller
 /// *reuses* across datagrams -- `logit-inputs::udp::decode_loop`'s actual hot path -- rather than
 /// `decode()`'s convenience default, which always hands `decode_into` a fresh `Vec::new()` and so
 /// can never show this. Zero, not one: the `Vec<Event>` is cleared (keeping capacity), not
@@ -177,7 +215,7 @@ fn statsd_decode_into_a_warm_reused_buffer_costs_one_not_two() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Listener receive queue and batch accumulator (docs/adr/0026-decoupled-listener-io.md)
+// Listener receive queue and batch accumulator (docs/adr/0027-decoupled-listener-io.md)
 // ---------------------------------------------------------------------------------------------
 
 /// A push immediately followed by a pop, once the underlying `VecDeque` is warm (past its initial
@@ -406,6 +444,44 @@ fn aggregate_flush_100_series() {
     let series: usize = flushed.iter().map(|(_, events)| events.len()).sum();
     assert_eq!(series, 4, "one series per metric name -- keep bounds the tag set");
     expect_allocs("aggregate: flush 4 series", stats, 6);
+}
+
+/// The retention path's own allocation cost, isolated on purpose from the fixture above:
+/// `flush`'s retain branch (`gauge_retention > 0`, `crates/logit-transforms/src/aggregate.rs`)
+/// clones `key.attributes` for a retained series -- unlike the default tumbling path, which
+/// moves it -- because the series' key has to survive to become its own map key again for the
+/// next window. `aggregate_flush_100_series` never exercises this branch at all
+/// (`gauge_retention: 0` there, the fixture-default `Aggregator`), and its `keep`-trimmed
+/// attributes fit inline, so it couldn't pin this cost even if it did. This fixture is
+/// deliberately *not* `keep`-trimmed (12 attributes, past `AttrMap`'s 8-slot inline capacity),
+/// specifically so the clone this measures is a real heap allocation, not a memcpy that would
+/// hide the cost the plan asked this test to pin.
+///
+/// Measured over a *second* flush, after a warm-up flush has already retained all 100 series once
+/// -- the steady-state cost of continuously updating-and-retaining the same series indefinitely,
+/// not the one-time cost of the first window these series were ever seen in.
+#[test]
+fn aggregate_flush_retained_gauges() {
+    let resource = fixtures::resource();
+    let mut agg = fixtures::aggregator_with_gauge_retention(5, 1_000);
+    for i in 0..100 {
+        drop(agg.process(&resource, fixtures::wide_gauge_event(&format!("gauge{i}"), i as f64)));
+    }
+    drop(agg.flush(1_000_000_000)); // warm: interns every series name, grows every buffer once
+
+    for i in 0..100 {
+        drop(
+            agg.process(
+                &resource,
+                fixtures::wide_gauge_event(&format!("gauge{i}"), (i + 1) as f64),
+            ),
+        );
+    }
+
+    let (flushed, stats) = measure(|| agg.flush(2_000_000_000));
+    let series: usize = flushed.iter().map(|(_, events)| events.len()).sum();
+    assert_eq!(series, 100, "every series was updated again before this flush");
+    expect_allocs("aggregate: flush 100 retained gauge series (spilled attrs)", stats, 209);
 }
 
 // ---------------------------------------------------------------------------------------------

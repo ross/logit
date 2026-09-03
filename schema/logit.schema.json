@@ -267,8 +267,22 @@
             "type"
           ],
           "properties": {
+            "gauge_retention": {
+              "description": "How many consecutive windows a gauge series with no new data is retained past its last update, so a relative gauge adjustment (`docs/adr/0026-relative-gauge-adjustments.md`) arriving in a later window can still resolve against the value it last held. `0` disables retention entirely -- every gauge series is drained every window exactly like a counter, matching this field's absence before it existed. See the `docs/adr/0008-aggregation-window-semantics.md` amendment for the full design.",
+              "default": 5,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
             "interval": {
               "type": "string"
+            },
+            "max_retained_gauge_series": {
+              "description": "A hard cap on how many gauge series may be retained across this component's whole window at once -- a DoS/cardinality guard, not a tuning knob. `gauge_retention` alone bounds only how long one series survives; without this, a sustained stream of never-repeating series names would hold unboundedly many retained series regardless of how short the retention window is. Least-recently-updated series are evicted first once exceeded.",
+              "default": 10000,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
             },
             "type": {
               "type": "string",
@@ -730,7 +744,7 @@
           ]
         },
         "receive": {
-          "description": "Per-listener receive queue and batching (`docs/adr/0026-decoupled-listener-io.md`). Meaningful only on a datagram listener -- graph validation rejects a non-default value on any other kind, `internal` included. A sibling field of `kind`, mirroring `buffer`'s own placement.",
+          "description": "Per-listener receive queue and batching (`docs/adr/0027-decoupled-listener-io.md`). Meaningful only on a datagram listener -- graph validation rejects a non-default value on any other kind, `internal` included. A sibling field of `kind`, mirroring `buffer`'s own placement.",
           "default": {
             "batch_flush_interval": "0.1s",
             "batch_max_bytes": "1048576",
@@ -821,7 +835,7 @@
       ]
     },
     "ReceiveConfig": {
-      "description": "Per-listener receive queue and datagram-\\>batch assembly (`docs/adr/0026-decoupled-listener-io.md`). Meaningful only on a datagram listener (today `statsd_in`/`syslog_in`); graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind, including `internal` (a listener by role, but one with no socket, no queue, and no decoder). Flat, following [`BufferConfig`]'s own `retry_budget`/`retry_max_delay` precedent rather than nesting a `batch:` sub-block -- two levels of optional-with-defaults is harder to scan in YAML than a flat prefix. Every field defaults, so a `receive:` block is never required -- **but an omitted block is not byte-for- byte the pre-ADR-0026 behavior**, and isn't meant to be: `batch_max_events: 1_000` and `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into batches (up to 1000 events, or up to 100ms of added latency before a send) rather than sending one batch per datagram immediately, matching what every established UDP listener researched for ADR 0026 does out of the box. A deployment that genuinely needs the old one-send-per- datagram, no-added-latency behavior gets it back explicitly with `batch_max_events: 1`, not by omitting `receive:`.",
+      "description": "Per-listener receive queue and datagram-\\>batch assembly (`docs/adr/0027-decoupled-listener-io.md`). Meaningful only on a datagram listener (today `statsd_in`/`syslog_in`); graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind, including `internal` (a listener by role, but one with no socket, no queue, and no decoder). Flat, following [`BufferConfig`]'s own `retry_budget`/`retry_max_delay` precedent rather than nesting a `batch:` sub-block -- two levels of optional-with-defaults is harder to scan in YAML than a flat prefix. Every field defaults, so a `receive:` block is never required -- **but an omitted block is not byte-for- byte the pre-ADR-0027 behavior**, and isn't meant to be: `batch_max_events: 1_000` and `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into batches (up to 1000 events, or up to 100ms of added latency before a send) rather than sending one batch per datagram immediately, matching what every established UDP listener researched for ADR 0027 does out of the box. A deployment that genuinely needs the old one-send-per- datagram, no-added-latency behavior gets it back explicitly with `batch_max_events: 1`, not by omitting `receive:`.",
       "type": "object",
       "properties": {
         "batch_flush_interval": {
@@ -834,7 +848,7 @@
           "type": "string"
         },
         "batch_max_events": {
-          "description": "Events to accumulate across datagrams before one send downstream. `1` means one send per datagram -- the behavior before ADR 0026 -- since the accumulator flushes on a bound *reached or exceeded* and never splits a single decode's output. `0` is rejected as an impossible bound (graph rule 18, the twin of rule 15's `buffer.max_batches: 0` check).",
+          "description": "Events to accumulate across datagrams before one send downstream. `1` means one send per datagram -- the behavior before ADR 0027 -- since the accumulator flushes on a bound *reached or exceeded* and never splits a single decode's output. `0` is rejected as an impossible bound (graph rule 18, the twin of rule 15's `buffer.max_batches: 0` check).",
           "default": 1000,
           "type": "integer",
           "format": "uint",
@@ -870,7 +884,7 @@
           ]
         },
         "shutdown_grace": {
-          "description": "How long a listener keeps draining a cooperative shutdown before being cancelled by drop (`docs/adr/0026-decoupled-listener-io.md`, revising ADR 0013's unconditional cancel-by-drop into a bounded one). Matches `buffer.shutdown_grace`'s default so both ends of the pipeline drain on the same number.",
+          "description": "How long a listener keeps draining a cooperative shutdown before being cancelled by drop (`docs/adr/0027-decoupled-listener-io.md`, revising ADR 0013's unconditional cancel-by-drop into a bounded one). Matches `buffer.shutdown_grace`'s default so both ends of the pipeline drain on the same number.",
           "default": "5s",
           "type": "string"
         }

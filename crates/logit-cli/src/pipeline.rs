@@ -233,11 +233,14 @@ fn build_spec(
                 .with_context(|| format!("reading lua_file {}", script_path.display()))?;
             NodeSpec::Lua { script, interval: *interval }
         }
-        Aggregate { interval } => NodeSpec::Transform(Box::new(
-            Aggregator::new(*interval)
-                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone()),
-        )),
+        Aggregate { interval, gauge_retention, max_retained_gauge_series } => {
+            NodeSpec::Transform(Box::new(
+                Aggregator::new(*interval)
+                    .with_gauge_retention(*gauge_retention, *max_retained_gauge_series)
+                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                    .with_telemetry(telemetry.clone()),
+            ))
+        }
         Json { skip_to_brace } => NodeSpec::Transform(Box::new(
             JsonParser::new(*skip_to_brace)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
@@ -397,7 +400,7 @@ fn overflow_policy(cfg: logit_config::OverflowPolicy) -> logit_pipeline::Overflo
 }
 
 /// Builds a UDP listener's `UdpListenerConfig` from its `ReceiveConfig`
-/// (`docs/adr/0026-decoupled-listener-io.md`) -- the receive-side mirror of `queue_config`/
+/// (`docs/adr/0027-decoupled-listener-io.md`) -- the receive-side mirror of `queue_config`/
 /// `write_config` above.
 fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::UdpListenerConfig {
     logit_inputs::udp::UdpListenerConfig {
@@ -629,7 +632,11 @@ mod tests {
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec!["out".to_string()],
-            kind: ComponentKind::Aggregate { interval: Duration::from_secs(10) },
+            kind: ComponentKind::Aggregate {
+                interval: Duration::from_secs(10),
+                gauge_retention: 5,
+                max_retained_gauge_series: 10_000,
+            },
         };
         assert!(matches!(
             build_spec("windowed", &component, Path::new(""), None).unwrap().0,

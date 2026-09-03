@@ -21,3 +21,11 @@ hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+
+[dev-dependencies]
+# Test-only: the end-to-end statsd -> aggregate integration test
+# (tests/statsd_to_aggregate.rs) needs a real `Aggregator` to prove a decoded `GaugeDelta`
+# actually resolves, not just that it decodes correctly in isolation. Not a production
+# dependency -- `logit-inputs` still doesn't depend on `logit-transforms` for the library itself
+# (AGENTS.md's crate layout).
+logit-transforms.workspace = true

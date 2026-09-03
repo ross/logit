@@ -28,7 +28,7 @@ already built that have a known, accepted rough edge.
   exiting only after a sustained ~60s window of nothing but configuration-error (`Fault::Permanent`)
   failures. What's left, genuinely open:
   - **No durable (disk-backed) buffering** — both the sink's `SinkQueue` and (since
-    [ADR 0026](adr/0026-decoupled-listener-io.md)) a UDP listener's `ReceiveQueue` are in-memory
+    [ADR 0027](adr/0027-decoupled-listener-io.md)) a UDP listener's `ReceiveQueue` are in-memory
     only; a process restart, SIGKILL, or a shutdown grace that expires mid-drain loses whatever
     either was holding. Plausibly config-optional even once it lands, since not every deployment
     needs cross-restart durability; blocked on the `rkyv`-vs-hand-rolled wire encoding decision
@@ -37,7 +37,7 @@ already built that have a known, accepted rough edge.
   - **No end-to-end acknowledgement** — delivery is confirmed only as far as the immediate
     destination accepting the write; nothing tracks whether the data survives past that point. The
     receive-side loss this used to also name (a UDP listener losing datagrams before anything
-    reaches a buffer) narrowed with ADR 0026: a listener now counts every datagram it drops itself
+    reaches a buffer) narrowed with ADR 0027: a listener now counts every datagram it drops itself
     (`logit.component.datagrams.dropped`); what remains uncounted is the kernel's own drop, before
     `logit` ever sees the datagram — see the new kernel-drop-visibility entry below.
   - **No out-of-order/credit-based acknowledgement** — `SinkQueue` is deliberately in-order and
@@ -45,7 +45,7 @@ already built that have a known, accepted rough edge.
     batches acknowledged out of order is real future scope for the native wire protocol's
     credit-based flow control, not built or designed yet.
 - **No visibility into the kernel's own UDP receive-buffer drops.** A listener's `ReceiveQueue`
-  ([ADR 0026](adr/0026-decoupled-listener-io.md), directly above) counts every datagram *it* drops,
+  ([ADR 0027](adr/0027-decoupled-listener-io.md), directly above) counts every datagram *it* drops,
   but a datagram the kernel discards before `recv_from` ever returns it is invisible to `logit`
   entirely. Linux exposes this per-socket in `/proc/net/udp[6]`'s `drops` column; sampling it (on a
   timer, keyed by the listener's own bound address) as `logit.input.kernel.drops` would close the
@@ -54,7 +54,7 @@ already built that have a known, accepted rough edge.
   run `netstat -su`/`ss -u` themselves — so building it would put `logit` ahead of the field, not
   merely at parity.
 - **A UDP listener reads one datagram per syscall.** `read_loop` (`logit-inputs::udp`,
-  [ADR 0026](adr/0026-decoupled-listener-io.md)) calls `recv_from` once per datagram. `recvmmsg(2)`
+  [ADR 0027](adr/0027-decoupled-listener-io.md)) calls `recv_from` once per datagram. `recvmmsg(2)`
   amortizes that across a batch — rsyslog's own high-throughput reference config sets `batchSize`
   to 128, gostatsd's `--receive-batch-size` defaults to 50 — and syscall overhead is the read half's
   dominant remaining cost now that a stalled downstream no longer stops it running. Not built:
@@ -76,19 +76,77 @@ already built that have a known, accepted rough edge.
   and the same listener's `read_loop` (pushing) and `decode_loop` (popping) run concurrently against
   the identical lock, so this is genuine cross-task contention on the receive side's two hottest
   loops, not just added per-call overhead. Deliberately not changed here: `BoundedQueue` is one
-  implementation serving both queues by design ([ADR 0026](adr/0026-decoupled-listener-io.md),
+  implementation serving both queues by design ([ADR 0027](adr/0027-decoupled-listener-io.md),
   workstream A), and coalescing or sampling the receive side's gauge updates without also touching
   the sink side would split that implementation's behavior back apart along exactly the seam it was
   built to erase. If this ever shows up as a measured bottleneck (`script/bench`, the same evidence
   bar `docs/design/memory.md`'s "Costing internal spans" section sets for a similar hot-path
   tradeoff), the fix belongs in `BoundedQueue` itself — e.g. gauging on a sampled/coalesced cadence
   for every caller — not as a receive-only special case.
-- **Relative gauge adjustment (`+`/`-`) and sample-rate extrapolation for distributions** — the
-  aggregator that would hold the needed state now exists (`crates/logit-transforms`), but the statsd
-  decoder still has no representation for "this is a delta, not an absolute value" to hand it, and
-  any leading sign is ambiguous with a plain negative number at the wire level regardless. Relative
-  gauges are explicitly rejected with a clear decode error rather than silently miscoded
-  (`crates/logit-inputs/src/statsd.rs`).
+- ~~**Relative gauge adjustment (`+`/`-`) and sample-rate extrapolation for distributions**~~ —
+  **closed, both halves** (`docs/adr/0026-relative-gauge-adjustments.md`). Landed as two
+  independently-reviewed branches — relative gauge adjustment and sample-rate extrapolation had no
+  code dependency on each other — merged together here now that both are on `main`.
+
+  **Relative gauge adjustments.** `statsd_in` decodes any leading `+`/`-` on a `g` value into
+  `MetricKind::GaugeDelta` — explicitly *unresolved*; it must never reach a sink. `aggregate`
+  resolves it against the running gauge value: an absolute keeps today's last-write-wins-by-
+  source-timestamp rule, a delta applies in arrival order and never advances the LWW timestamp
+  (asymmetric on purpose — mixing the two orderings is undefined the moment they interleave
+  otherwise). Resolving a delta in a *later* window than the absolute it should apply against
+  needs the gauge's value to survive a flush, which `aggregate` now does for gauge series
+  specifically, bounded by two independent mechanisms
+  (`docs/adr/0008-aggregation-window-semantics.md`'s amendment): `gauge_retention` (a windows-count
+  TTL per series, on by default at `5` windows — a feature whose entire point is making "resolves
+  against 0.0" rare shouldn't default to guaranteeing it; `0` opts out entirely, reproducing the
+  strictly-tumbling behavior every config had before this existed) and `max_retained_gauge_series`
+  (a hard cardinality cap, since the TTL alone bounds only the tail of the retained set, not its
+  peak).
+
+  What's left open, by design, not oversight:
+  - **Retention is on by default (`gauge_retention: 5`, `max_retained_gauge_series: 10,000`), so
+    upgrading with no config change turns it on for every existing `aggregate` component.**
+    Deliberate — a feature whose entire point is resolving deltas correctly shouldn't ship
+    opt-in, and both fields are additive to the schema so no config fails to validate — but it is
+    a real behavior change: a config with high-cardinality, slowly-churning gauge tags can see its
+    steady-state memory grow purely from the upgrade (up to `max_retained_gauge_series` idle series
+    held for up to `gauge_retention` extra windows per `aggregate` component), with no line in the
+    config saying so. `logit.transform.series.retained` makes the actual number visible;
+    `gauge_retention: 0` opts back out to the exact pre-upgrade behavior.
+  - **A delta after eviction (the cardinality cap) or after a process restart resolves against
+    0.0.** The eviction case is counted and reported (`logit.transform.gauge.delta.unseeded`,
+    `logit.transform.series.evicted{reason="cardinality"}`) — never silent. The restart case is
+    unfixable without durable aggregator state, which this project has already declined once for
+    the same underlying reason: ADR 0008's own rejection of cumulative counters ("state grows
+    unbounded with series cardinality and a process restart resets every series to zero with no
+    way to detect that from the emitted stream") applies just as much to a retained gauge as to a
+    cumulative counter. Retention narrows the window this can happen in; it does not close it.
+  - **A `GaugeDelta` reaching a sink with no `aggregate` on its path degrades to a throttled,
+    per-metric drop, not a config-time error.** `influxdb_out`'s encoder reports it under its own
+    `gauge_delta_unresolved` diagnostic key (not the generic `encode_error`) and skips just that
+    metric, same as `Set`. A `logit validate` graph check ("a statsd input reaches an output with
+    no `aggregate` on the path") is implementable — `logit-pipeline::graph` already walks the
+    resolved graph — but has a real false-positive case (resolving downstream in a separate
+    collector this instance forwards to is legitimate) and `logit validate` has no warning channel
+    today, only pass/fail. Deferred, not silently skipped.
+
+  **Sample-rate extrapolation for distributions.** `DdSketch::add_weighted(value, count)`
+  (`crates/logit-core/src/metric.rs`) delegates to `sketches_ddsketch::DDSketch::add_with_count`
+  (an O(1) native weighted add, not a repeated-`add` loop or a binary-doubling `merge` — both were
+  considered and rejected: the crate does have a native weighted add, and even a repeated-`add`
+  fallback would have been chosen over `merge` specifically because `merge` is O(log count)
+  allocations on `statsd_decode_one_line`'s exact-equality allocation path, which this project's
+  own convention forbids relaxing). `statsd_in`'s `ms`/`h`/`d` decoding now extrapolates
+  `100|ms|@0.1` into 10 weighted samples instead of one unweighted one, the same way a `c` (counter)
+  already extrapolates via `value / sample_rate`. Weight is
+  `(1.0 / sample_rate).round().max(1.0)`, **clamped** at `MAX_SAMPLE_WEIGHT` (1000, i.e. `@0.001`)
+  rather than extrapolated without bound — a bound on the resulting population estimate now that
+  the add itself is O(1), not a CPU-loop guard, matching `aggregate.rs`'s
+  `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES` stance on fixed, non-configurable constants. A clamp is
+  throttle-reported (`sample_rate_clamped`, mirrored into
+  `logit.component.diagnostics{key="sample_rate_clamped"}` by `Diagnostics` for free — no separate
+  counter), never silent. A sample rate on `g` (gauge) or `s` (set) stays ignored — extrapolating
+  an absolute or a cardinality-estimator value is meaningless, unlike a count.
 - **`eprintln!` instead of a real diagnostics facility** — every component's diagnostic now goes
   through `logit_core::diag::Diagnostics` ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md)),
   which closes the two concrete hazards this entry used to name: every message is prefixed with its
@@ -241,7 +299,7 @@ already built that have a known, accepted rough edge.
   [memory.md](design/memory.md)'s recommendations.
 - **Channel depth is bounded in batches, not bytes or events**
   (`CHANNEL_CAPACITY`, `crates/logit-pipeline/src/runtime.rs`) — 64 batches per edge, with
-  unbounded batch size. Narrowed by [ADR 0026](adr/0026-decoupled-listener-io.md) for a UDP
+  unbounded batch size. Narrowed by [ADR 0027](adr/0027-decoupled-listener-io.md) for a UDP
   listener's own outbound edge specifically: `BatchAccumulator` now merges many datagrams into one
   batch under an explicit, config-visible byte bound (`receive.batch_max_bytes`, default 1MiB), so
   what a `statsd_in`/`syslog_in` edge can hold is bounded by config, not just by datagram size. What
@@ -320,7 +378,7 @@ already built that have a known, accepted rough edge.
 - **A syslog event's `timestamp` is receipt time, not the sender's** — every event is stamped with
   the instant its datagram came off the socket (`received_at`, captured by the read half and
   threaded through to `Decoder::decode_into` explicitly since
-  [ADR 0026](adr/0026-decoupled-listener-io.md) decoupled decode from the read loop — not a fresh
+  [ADR 0027](adr/0027-decoupled-listener-io.md) decoupled decode from the read loop — not a fresh
   clock read at decode time, which could otherwise run arbitrarily behind arrival under backlog)
   and preserves the sender's own timestamp separately, as the
   `syslog.timestamp` attribute (a `Value::Timestamp` for RFC 5424's RFC 3339 form, a raw
@@ -586,7 +644,7 @@ already built that have a known, accepted rough edge.
 
 - **`otlp_in` doesn't support compressed requests, and its `partial_success` response is always
   empty.** Two separate, deliberate gaps in `crates/logit-inputs/src/otlp.rs`
-  ([ADR 0024](adr/0024-hand-rolled-grpc-over-hyper.md)):
+  ([ADR 0026](adr/0024-hand-rolled-grpc-over-hyper.md)):
   - **Compression.** `Content-Encoding: gzip` (OTLP/HTTP) and `grpc-encoding: gzip` (OTLP/gRPC) are
     both rejected outright (`415`/`grpc-status: 12`) rather than silently mishandled — `flate2`
     isn't a dependency, and decompressing untrusted input unboundedly is real, security-relevant
@@ -664,7 +722,7 @@ already built that have a known, accepted rough edge.
   leaving its spawned connection-driver task to exit once the drop is observed. A mixed-signal
   batch pays connect+handshake three times; a steady stream of batches pays it once per signal per
   batch, where the HTTP transport gets `reqwest`'s connection pooling for free. Deliberate for this
-  PR, not an oversight: [ADR 0024](adr/0024-hand-rolled-grpc-over-hyper.md) is explicit about
+  PR, not an oversight: [ADR 0026](adr/0024-hand-rolled-grpc-over-hyper.md) is explicit about
   keeping the hand-rolled gRPC surface minimal (the three unary `Export` RPCs, nothing else), and a
   real connection pool — reuse keyed by endpoint, handling a server-initiated GOAWAY, concurrent
   in-flight streams over one connection — is real infrastructure `tonic`/`hyper-util`'s own client

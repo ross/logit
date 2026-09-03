@@ -78,7 +78,7 @@ real Tempo, exactly the way `log_out` proves `syslog_out` against a real Loki. `
 `logit-inputs::udp::UdpListener` driver: a UDP listener's socket read and its decode/batch-assembly
 loop run decoupled through a `ReceiveQueue`, the listener-side mirror of `SinkQueue`'s sink-side
 decoupling, so a stalled downstream no longer stops the socket being read; see
-[ADR 0026](docs/adr/0026-decoupled-listener-io.md) and the `receive:` config block it introduces.
+[ADR 0027](docs/adr/0027-decoupled-listener-io.md) and the `receive:` config block it introduces.
 
 ## Environment
 

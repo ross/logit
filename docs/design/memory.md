@@ -193,9 +193,11 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `syslog_in` decode 1 line | **1** | just the `Vec<Event>`; every field slices the datagram |
 | `syslog_in` decode 100 lines | **1** | + 5 reallocs from `Vec` growth |
 | `syslog_in` decode 1 logs-only line | **1** | plain-text message, no JSON -- same zero-copy shape |
-| `syslog_in` `decode_into` into a warm buffer | **0** | ADR 0026 -- see below |
+| `syslog_in` `decode_into` into a warm buffer | **0** | ADR 0027 -- see below |
 | `statsd_in` decode 1 line | **2** | fixed -- see below, tag values now slice the datagram too |
-| `statsd_in` `decode_into` into a warm buffer | **1** | ADR 0026 -- see below |
+| `statsd_in` `decode_into` into a warm buffer | **1** | ADR 0027 -- see below |
+| `statsd_in` decode 1 distribution line (`ms`/`h`/`d`, unsampled) | **3** | 2 as above + 1 `bins` Vec on the sketch's first sample |
+| `statsd_in` decode 1 sampled distribution line (`@0.1`, 10 weighted samples) | **3** | same as unsampled -- `DdSketch::add_weighted` delegates to `add_with_count`, O(1) and zero extra allocations regardless of weight |
 | `json` parse + merge (nginx shape) | **1** | fixed -- see below, was 7 |
 | `json` parse + merge (wide-JSON, 28 keys) | **1** | same fix, confirmed to generalize past a small field count |
 | `kv_metrics` derive 4 metrics | **3** | `MetricList` spill + one `bins` Vec per sketch |
@@ -203,6 +205,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `aggregate` absorb (after `keep`) | **0** | `SeriesKey` clone stays inline |
 | `aggregate` absorb (no `keep`) | **4** | one per metric — the map no longer fits inline |
 | `aggregate` flush 4 series | **6** | +4 since flush-side trace linking landed (ADR 0020) — one `Vec<SpanLink>` per series, see below |
+| `aggregate` flush 100 retained gauge series (spilled attrs) | **209** | `gauge_retention > 0` only — see below; the default (`0`) tumbling path above is unaffected |
 | **full ingest chain, 1 line** | **5** | decode → aggregate; was 11 before `json`'s fix |
 | `Event::clone` (nginx shape) | **4** | what each extra fan-out branch costs |
 | `Event::clone` (statsd shape) | **0** | fits entirely inline |
@@ -210,8 +213,8 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `Event::clone` (span shape) | **2** | 1 per `Vec` (`events`, `links`) -- every `AttrMap` here stays inline |
 | `stdio_out` encode 100 events | **101** | ~1/event -- fixed, see below, was 1801 |
 | `influxdb_out` encode 100 events | **30** | ~0.3/event — see below |
-| receive queue: push then pop, warm | **0** | `BoundedQueue<Datagram>`, ADR 0026 -- see below |
-| accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR 0026 -- see below |
+| receive queue: push then pop, warm | **0** | `BoundedQueue<Datagram>`, ADR 0027 -- see below |
+| accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR 0027 -- see below |
 | `syslog_out` encode_into 100 events | **100** | ~1/event -- reused struct-held scratch buffers, was 401, see below |
 
 And the corresponding times:
@@ -236,17 +239,21 @@ And the corresponding times:
 > invent differences that aren't there. Compare rows within the table freely; treat absolute values
 > as this machine on this day. This table was refreshed once, in one sitting, after landing the
 > `json`/`statsd_in`/`stdio_out`/Lua-boundary fixes below -- every row reflects the current code.
-> The `syslog_out` row is the one exception, added in a later, separate `script/bench` run rather
+> The `syslog_out` row is one exception, added in a later, separate `script/bench` run rather
 > than refreshing the whole table again for one new row -- its allocation count is exact and
 > comparable regardless (deterministic, not machine-dependent), but don't read its wall-clock
-> figure as directly comparable to the others' down to the nanosecond, per this same caveat.
+> figure as directly comparable to the others' down to the nanosecond, per this same caveat. The
+> two `statsd_in` distribution-decode rows are a second such exception, added for decode-time
+> sample-rate extrapolation (`DdSketch::add_weighted`) without a wall-clock figure at all -- their
+> allocation counts are what `crates/logit-bench/tests/allocations.rs`'s
+> `statsd_decode_one_distribution_line`/`statsd_decode_one_sampled_distribution_line` pin.
 
-### Listener I/O decoupling: the `decode_into` buffer-reuse win (ADR 0026)
+### Listener I/O decoupling: the `decode_into` buffer-reuse win (ADR 0027)
 
 Two numbers for the same decoder look contradictory at first glance and aren't: `statsd_in decode
 1 line` (2) and `statsd_in decode_into into a warm buffer` (1) measure two different call paths.
 `decode()` (the trait's provided default, used by every existing test and benchmark, and the only
-path that existed before [ADR 0026](../adr/0026-decoupled-listener-io.md)) always hands
+path that existed before [ADR 0027](../adr/0027-decoupled-listener-io.md)) always hands
 `decode_into` a fresh `Vec::new()` — that allocation is real and unavoidable *for that call shape*,
 so the original numbers stand unchanged. `decode_into` called directly against a buffer the caller
 *reuses* across datagrams — `logit-inputs::udp::decode_loop`'s actual hot path — is a strictly
@@ -291,7 +298,33 @@ the links on the way out, since nothing turns them into a real `SpanRecord` yet
 `aggregate` flushes any series at all, whether or not a config ever routes anything to look at the
 result.
 
-### The headline result: the output encoder *was* the bottleneck, and has been fixed
+### Gauge retention's own cost, isolated and measured (ADR 0008's amendment)
+
+`gauge_retention > 0` (`docs/adr/0008-aggregation-window-semantics.md`'s amendment) adds a real,
+separate allocation cost on top of the flush numbers above, paid only by series that are actually
+retained -- the default (`gauge_retention: 0`) path above is untouched, confirmed by
+`aggregate_flush_100_series` re-measuring at exactly the same **6** it was before retention existed.
+`aggregate_flush_retained_gauges` isolates the retained path itself: 100 distinct, deliberately
+un-`keep`ed gauge series (12 attributes each, past `AttrMap`'s 8-slot inline capacity) retained
+across a second flush, measured **209** allocations. Two costs stack here, both inherent to what
+retention has to do, not incidental:
+
+- **`key.attributes.clone()`, once per retained series.** A retained series' map key has to survive
+  to become its own key again next window, so (unlike the tumbling path, which moves `key
+  .attributes` into the emitted event and drops the key) the attributes have to be cloned instead.
+  With a spilled (non-inline) map, that clone is a genuine heap allocation -- ~100 of the 209, one
+  per series. `aggregate_flush_100_series`'s `keep`-trimmed fixture never pays this, on purpose: its
+  gauge retention is off, so nothing takes this branch at all.
+- **The per-group `series` `HashMap` rebuilds its backing table on every flush that retains
+  anything.** `flush` takes each group's whole `series` map via `mem::take` and re-inserts survivors
+  into the now-empty replacement -- deliberately, so the *far* more common tumbling/drop path can
+  move `key.attributes` for free (see above) rather than paying a clone on every series, retained or
+  not. The tradeoff is that a `gauge_retention > 0` pipeline pays a full table-growth cost -- several
+  allocations, not just one -- every flush, for as long as it keeps retaining the same series. This
+  is accepted as a real, measured cost of opting into retention (not a bug), and is exactly why this
+  fixture exists as its own measurement rather than folding into the default-path number above.
+
+### `aggregate` flush now costs one allocation per series, for real trace links
 
 As first measured, encoding one event for InfluxDB cost **~180 allocations and 4.96 µs** — roughly
 twice what ingesting it cost end to end, and sixteen times what cloning it for an extra fan-out
@@ -843,7 +876,7 @@ sink's `SinkQueue` (`crates/logit-pipeline/src/queue.rs`) bounds itself on both 
 estimate, whichever trips first.
 
 **A second consumer of the same byte-aware bounding idea, on the listener side.**
-[ADR 0026](../adr/0026-decoupled-listener-io.md) generalizes `SinkQueue` into `BoundedQueue<T:
+[ADR 0027](../adr/0027-decoupled-listener-io.md) generalizes `SinkQueue` into `BoundedQueue<T:
 Queued>` and gives a UDP listener's receive queue (`logit-inputs::udp::ReceiveQueue`) its own
 weight: `Datagram::weight()` is `bytes.len()` plus the struct's own inline footprint, bounding
 *undecoded* bytes rather than `estimated_heap_bytes()`'s decoded-event estimate. `receive.

@@ -288,7 +288,16 @@ impl Encoder for InfluxLineEncoder {
                     &mut self.series,
                     &mut self.visited,
                 ) {
-                    self.diag.warn_throttled("encode_error", err);
+                    // A `GaugeDelta` reaching a sink is a distinct, greppable failure mode from an
+                    // ordinary encode error -- it means the pipeline is missing an `aggregate`
+                    // component, not that this particular metric is malformed. See
+                    // `docs/adr/0026-relative-gauge-adjustments.md`.
+                    let key = if matches!(metric.kind, MetricKind::GaugeDelta(_)) {
+                        "gauge_delta_unresolved"
+                    } else {
+                        "encode_error"
+                    };
+                    self.diag.warn_throttled(key, err);
                 }
             }
         }
@@ -577,6 +586,13 @@ fn render_fields(out: &mut String, kind: &MetricKind) -> Result<bool, CodecError
                 "Set metrics have no line-protocol encoding yet".to_string(),
             ))
         }
+        MetricKind::GaugeDelta(_) => {
+            return Err(CodecError::Malformed(
+                "a relative gauge adjustment reached a sink unresolved -- add an `aggregate` \
+                 component between the statsd input and this output"
+                    .to_string(),
+            ))
+        }
     }
     Ok(!out.is_empty())
 }
@@ -835,6 +851,42 @@ mod tests {
         // The Set line is dropped; the Counter line alongside it still comes through.
         assert!(!out.contains("unique.users"), "got: {out}");
         assert!(out.contains("page.views value=1"), "got: {out}");
+    }
+
+    /// A `GaugeDelta` reaching this encoder means the pipeline is missing an `aggregate`
+    /// component (`docs/adr/0026-relative-gauge-adjustments.md`) -- it must be dropped, not
+    /// written as though it were an absolute value, and its sibling metric in the same batch must
+    /// still come through untouched, matching `set_metrics_are_skipped_not_fatal` above.
+    #[test]
+    fn gauge_delta_is_skipped_not_fatal() {
+        let out = encode(vec![
+            metric_event("conns", MetricKind::GaugeDelta(5.0), &[]),
+            metric_event("page.views", MetricKind::Counter(1.0), &[]),
+        ]);
+        assert!(!out.contains("conns"), "got: {out}");
+        assert!(out.contains("page.views value=1"), "got: {out}");
+    }
+
+    /// The distinct, greppable diagnostic key this workstream's plan calls for --
+    /// `gauge_delta_unresolved`, not the generic `encode_error` every other unrepresentable kind
+    /// reports under.
+    #[test]
+    fn gauge_delta_reports_its_own_diagnostic_key() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
+        let mut encoder = InfluxLineEncoder::default()
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry));
+        let batch = batch_with(vec![metric_event("conns", MetricKind::GaugeDelta(5.0), &[])]);
+        let _ = encoder.encode(&batch);
+
+        let events = registry.drain(0);
+        let has_key = events.iter().any(|e| {
+            e.attributes.get("key").and_then(|v| v.as_str()) == Some("gauge_delta_unresolved")
+        });
+        assert!(
+            has_key,
+            "expected a logit.component.diagnostics{{key=\"gauge_delta_unresolved\"}} point"
+        );
     }
 
     #[test]
