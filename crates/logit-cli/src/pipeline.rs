@@ -329,8 +329,15 @@ fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::U
 /// Builds any listener's `InputRuntimeConfig` from its `ReceiveConfig` -- safe to call
 /// unconditionally for every `NodeSpec::Input` arm, including `internal`: graph validation's rule
 /// 16 already guarantees a non-datagram-listener's `receive` is `ReceiveConfig::default()` by the
-/// time a resolved `Graph` reaches `build_spec`, so `internal` always gets
-/// `InputRuntimeConfig::default()` (`Duration::ZERO` -- unchanged cancel-by-drop) here regardless.
+/// time a resolved `Graph` reaches `build_spec`, so `internal` always gets `shutdown_grace:
+/// ReceiveConfig::default().shutdown_grace` here (5s today, not `Duration::ZERO`) regardless of
+/// what any `receive:` block would otherwise say. That's harmless, not just unused, only because
+/// `InternalInput` never overrides `Input::run_until_shutdown`: the default impl's own `select!`
+/// always resolves at t=shutdown against a non-overriding input, so `run_input`'s grace backstop
+/// -- built from this value -- never gets a chance to matter. If `internal` ever gains a
+/// cooperative drain of its own, this stops being a harmless default and needs its own
+/// `receive.shutdown_grace`-shaped knob rather than inheriting whatever `ReceiveConfig::default`
+/// happens to say.
 fn input_runtime_config(receive: &logit_config::ReceiveConfig) -> InputRuntimeConfig {
     InputRuntimeConfig { shutdown_grace: receive.shutdown_grace }
 }

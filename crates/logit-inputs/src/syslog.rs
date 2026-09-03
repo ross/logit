@@ -105,9 +105,15 @@ impl SyslogInput {
     }
 
     /// Attaches a component id to this listener's diagnostics -- and to the [`SyslogDecoder`] it
-    /// wraps, so both report under the same id.
+    /// wraps, so both report under the same id. Both halves matter: `UdpListener`'s own
+    /// `diag` is what a whole-datagram decode failure reports through
+    /// (`decode_loop`'s `bad_datagram`); the decoder's own `diag` field is what a malformed
+    /// *line* inside an otherwise-valid datagram reports through (`bad_line`) -- two distinct
+    /// `Diagnostics` values that must both carry the same id and telemetry handle, or one class
+    /// of decode failure silently reports under no component id and with telemetry disabled.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.inner = self.inner.with_diagnostics(diag);
+        self.inner =
+            self.inner.with_diagnostics(diag.clone()).map_decoder(|d| d.with_diagnostics(diag));
         self
     }
 
@@ -158,6 +164,13 @@ impl SyslogDecoder {
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
         self
+    }
+
+    /// Test-only: confirms `SyslogInput::with_diagnostics` actually reached this decoder's own
+    /// `diag`, not just `UdpListener`'s.
+    #[cfg(test)]
+    pub(crate) fn diag(&self) -> &Diagnostics {
+        &self.diag
     }
 }
 
@@ -803,6 +816,16 @@ mod tests {
     fn decode(datagram: &str) -> Vec<Event> {
         let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
         decoder.decode(Bytes::from(datagram.to_string())).expect("decode should succeed").events
+    }
+
+    /// Regression: `SyslogInput::with_diagnostics` used to only set `UdpListener`'s own `diag`,
+    /// never reaching the wrapped `SyslogDecoder`'s -- so a malformed *line* (as opposed to a
+    /// whole malformed datagram) reported through a permanently unnamed, telemetry-disabled
+    /// `Diagnostics::default()`, regardless of what the component was actually configured with.
+    #[test]
+    fn with_diagnostics_reaches_the_wrapped_decoder_too() {
+        let input = SyslogInput::new("127.0.0.1:0").with_diagnostics(Diagnostics::new("my-id"));
+        assert_eq!(input.inner.decoder().diag().component_id(), "my-id");
     }
 
     /// `decode_into` must stamp every event with the caller's `received_at`, not a fresh

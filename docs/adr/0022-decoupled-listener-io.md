@@ -103,7 +103,7 @@ cancellation does, see below), that reservation never clears, permanently exempt
 eviction and letting the queue grow past its configured bound. `pop()` never awaits between
 reserving and removing, so a consumer cancelled mid-call can never leave one dangling.
 
-### `BatchAccumulator`: datagram→batch assembly, and why weight isn't tracked incrementally
+### `BatchAccumulator`: datagram→batch assembly, and why weight tracking is exact, not approximate
 
 `crates/logit-pipeline/src/accumulator.rs` amortizes many decoded datagrams into fewer, larger
 batches before one `Fanout::send` — every field tool above does the same, for the same reason: one
@@ -123,14 +123,22 @@ Two design points worth recording:
   **with its allocated capacity intact**. An earlier draft of this design took ownership of a whole
   `EventBatch` and merged via `std::mem::take` — which silently undoes the reuse, since
   `mem::take` on a `Vec` replaces it with a fresh, capacity-0 one, not an emptied one.
-- **Weight (for the byte bound) is recomputed via a zero-copy swap, not tracked incrementally.**
-  `EventBatch::estimated_heap_bytes` operates on a real `&EventBatch`, not a resource and an event
-  slice separately, so `BatchAccumulator::current_weight` temporarily swaps its own `resource`/
-  `events` fields into a throwaway `EventBatch`, calls the one authoritative estimator, and swaps
-  them back — no clone of event data, only an `Arc` refcount bump. `estimated_heap_bytes` is
-  already documented as "a deliberately approximate O(events) walk" (`docs/design/memory.md` §5),
-  so recomputing it once per absorbed datagram is the same asymptotic cost class the design already
-  accepts, bounded by `batch_max_events` regardless.
+- **Weight (for the byte bound) is tracked incrementally, in O(incoming events) per `absorb` —
+  not recomputed from scratch.** An earlier draft recomputed `EventBatch::estimated_heap_bytes`
+  once per `absorb` via a zero-copy swap of the accumulator's own fields into a throwaway
+  `EventBatch`. That was caught in review as a real O(n²) cost over one accumulation cycle — a
+  `batch_max_events: 1000` listener under steady load pays a full O(everything held so far) walk on
+  *every* datagram, not once per flush — and, separately, would have double-counted the resource's
+  own contribution on every call instead of once per batch. `estimated_heap_bytes` is three terms —
+  `resource.estimated_heap_bytes()` (once per batch, unaffected by event count),
+  `events.capacity() * size_of::<Event>()` (`Vec::capacity` is O(1) to read), and a per-event sum
+  (`Event::estimated_heap_bytes()`, additive) — each cheap to reproduce without re-walking events
+  already accounted for, so `BatchAccumulator` caches the first as `resource_weight` (updated only
+  on a resource change), reads the second live off `self.events.capacity()`, and maintains the
+  third as a running `events_weight` updated by adding just the incoming slice's contribution.
+  The three together equal `estimated_heap_bytes` exactly, by construction — this is not the usual
+  approximate-for-speed trade `docs/design/memory.md` §5 describes for the formula itself, just
+  doing the same arithmetic without re-deriving inputs that hadn't changed.
 - **`batch_max_events: 1` is the exact, magic-value-free spelling of "no accumulation."**
   `absorb` flushes once a bound is *reached or exceeded* and never splits a decoded batch, so every
   non-empty decode immediately reaches a `max_events: 1` bound — one send per datagram, byte for

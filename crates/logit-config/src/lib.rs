@@ -380,7 +380,14 @@ pub enum DeliveryPosture {
 /// socket, no queue, and no decoder). Flat, following [`BufferConfig`]'s own
 /// `retry_budget`/`retry_max_delay` precedent rather than nesting a `batch:` sub-block -- two
 /// levels of optional-with-defaults is harder to scan in YAML than a flat prefix. Every field
-/// defaults, so an omitted `receive:` block is exactly today's behavior.
+/// defaults, so a `receive:` block is never required -- **but an omitted block is not byte-for-
+/// byte the pre-ADR-0022 behavior**, and isn't meant to be: `batch_max_events: 1_000` and
+/// `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into
+/// batches (up to 1000 events, or up to 100ms of added latency before a send) rather than sending
+/// one batch per datagram immediately, matching what every established UDP listener researched
+/// for ADR 0022 does out of the box. A deployment that genuinely needs the old one-send-per-
+/// datagram, no-added-latency behavior gets it back explicitly with `batch_max_events: 1`, not by
+/// omitting `receive:`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct ReceiveConfig {

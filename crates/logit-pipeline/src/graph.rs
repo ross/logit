@@ -37,8 +37,9 @@
 //!     has no socket, no queue, and no decoder, so `receive:` on it would be a silently-ignored
 //!     setting -- exactly what this rule exists to catch on the sink side (rule 14). A future
 //!     listener kind rejects `receive:` until it is actually wired to the UDP driver.
-//! 17. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, or
-//!     `receive.batch_max_events` of `0` is rejected -- an impossible bound, the twin of rule 15.
+//! 17. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`,
+//!     `receive.batch_max_events`, or `receive.batch_max_bytes` of `0` is rejected -- an
+//!     impossible bound, the twin of rule 15.
 //!     `receive.batch_flush_interval: 0s` is **not** rejected: it means "no flush timer," a
 //!     meaningful setting, unlike the count bounds.
 //!
@@ -390,7 +391,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 17: the twin of rule 15, for a listener's receive queue -- `0` on any of the three
+    // Rule 17: the twin of rule 15, for a listener's receive queue -- `0` on any of the four
     // count/byte bounds is an impossible bound, never a small one. `batch_flush_interval: 0s` is
     // deliberately not checked here: zero there means "no timer," a meaningful setting.
     for (id, component) in &components {
@@ -411,6 +412,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': 'receive.batch_max_events' must be at least 1 -- 0 means \
                      no datagram could ever be accumulated"
+                );
+            }
+            if component.receive.batch_max_bytes == 0 {
+                anyhow::bail!(
+                    "component '{id}': 'receive.batch_max_bytes' must be at least 1 -- 0 means no \
+                     datagram could ever be accumulated"
                 );
             }
         }
@@ -1146,7 +1153,22 @@ mod tests {
         assert!(err.contains("batch_max_events"), "got: {err}");
     }
 
-    /// Unlike the three count/byte bounds above, `batch_flush_interval: 0s` is a meaningful
+    #[test]
+    fn a_listeners_receive_with_zero_batch_max_bytes_is_rejected() {
+        let err = expect_err(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                listener(),
+                ReceiveConfig { batch_max_bytes: 0, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("batch_max_bytes"), "got: {err}");
+    }
+
+    /// Unlike the four count/byte bounds above, `batch_flush_interval: 0s` is a meaningful
     /// setting ("no flush timer") -- rule 17 must not reject it.
     #[test]
     fn a_listeners_receive_with_a_zero_batch_flush_interval_validates_fine() {

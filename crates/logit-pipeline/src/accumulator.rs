@@ -36,18 +36,34 @@ impl FlushReason {
 /// deadline (see [`BatchAccumulator::next_deadline`]) and calls [`BatchAccumulator::take`] when it
 /// fires; this type only tracks the held events and their resource.
 ///
-/// No `weight` field cached incrementally -- see [`BatchAccumulator::absorb`]'s doc comment for
-/// why, and why that's the right trade rather than an oversight.
+/// `resource_weight`/`events_weight` cache [`EventBatch::estimated_heap_bytes`]'s two per-batch,
+/// non-capacity terms incrementally -- see [`BatchAccumulator::absorb`]'s doc comment for why this
+/// is exact, not approximate, and costs O(incoming events) per call rather than O(everything held
+/// so far).
 pub struct BatchAccumulator {
     resource: Option<Arc<Resource>>,
     events: Vec<Event>,
+    /// [`Resource::estimated_heap_bytes`] of the held resource -- recomputed only when the
+    /// resource changes (rare, and O(that resource's own attributes) regardless), not per absorb.
+    resource_weight: u64,
+    /// The running sum of [`Event::estimated_heap_bytes`] over every event currently held --
+    /// updated by adding just the incoming slice's contribution each `absorb`, never by re-walking
+    /// events already accounted for.
+    events_weight: u64,
     max_events: usize,
     max_bytes: u64,
 }
 
 impl BatchAccumulator {
     pub fn new(max_events: usize, max_bytes: u64) -> Self {
-        Self { resource: None, events: Vec::new(), max_events, max_bytes }
+        Self {
+            resource: None,
+            events: Vec::new(),
+            resource_weight: 0,
+            events_weight: 0,
+            max_events,
+            max_bytes,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -80,15 +96,19 @@ impl BatchAccumulator {
     /// *n*-to-1 hazard `docs/adr/0008-aggregation-window-semantics.md` already documents for a Lua
     /// component's `flush()`.
     ///
-    /// **Why weight isn't tracked incrementally.** The byte bound needs
-    /// `EventBatch::estimated_heap_bytes`, which operates on a real `&EventBatch`, not a resource
-    /// and an event slice separately -- so this recomputes it each call via a zero-copy
-    /// swap-in/swap-out of this accumulator's own fields into a throwaway `EventBatch` (see
-    /// [`BatchAccumulator::current_weight`]), rather than duplicating that formula here to track a
-    /// running total incrementally. `estimated_heap_bytes` is already documented as "a deliberately
-    /// approximate O(events) walk" (`docs/design/memory.md` §5), so recomputing it once per absorbed
-    /// datagram is the same asymptotic cost class the design already accepts, not a new one --
-    /// bounded by `max_events` regardless, so it never grows past one flush cycle's worth of work.
+    /// **Why weight tracking here is exact, not approximate, despite being incremental.**
+    /// `EventBatch::estimated_heap_bytes` is `resource.estimated_heap_bytes() + events.capacity()
+    /// * size_of::<Event>() + events.iter().map(Event::estimated_heap_bytes).sum()` -- three terms,
+    /// each cheap to reproduce without re-walking events already accounted for: the resource term
+    /// only changes when the resource does (`resource_weight`, updated on the rare
+    /// `ResourceChange` path below); the per-event term is a plain running sum, so adding just the
+    /// incoming slice's contribution (`events_weight`) reproduces the same total a full walk would;
+    /// and the capacity term is read live off `self.events.capacity()` in
+    /// [`BatchAccumulator::current_weight`] -- `Vec::capacity` is O(1), so nothing needs to track
+    /// it. The three added together equal `estimated_heap_bytes` exactly, by construction, not
+    /// approximately -- this isn't trading accuracy for speed, the original per-call recomputation
+    /// was simply doing O(everything held) of work to answer a question three O(1)/O(incoming)
+    /// updates already answer.
     ///
     /// An empty `events` (a datagram that decoded to nothing) is absorbed as a no-op: it never
     /// changes the held resource and never triggers a flush on its own.
@@ -107,6 +127,8 @@ impl BatchAccumulator {
             None => false,
         };
 
+        let incoming_weight: u64 = events.iter().map(Event::estimated_heap_bytes).sum();
+
         if resource_changed {
             // Flush whatever was held under the old resource, then start a fresh accumulation
             // with the incoming events -- they are NOT dropped, only deferred to a later
@@ -117,13 +139,19 @@ impl BatchAccumulator {
             // staleness of at most one absorb, not a correctness gap (nothing is ever dropped).
             let flushed =
                 self.take().expect("resource_changed is only true when self.resource is Some");
+            self.resource_weight = resource.estimated_heap_bytes();
             self.resource = Some(resource);
             self.events.append(events);
+            self.events_weight = incoming_weight;
             return Some((flushed, FlushReason::ResourceChange));
         }
 
+        if self.resource.is_none() {
+            self.resource_weight = resource.estimated_heap_bytes();
+        }
         self.resource = Some(resource);
         self.events.append(events);
+        self.events_weight += incoming_weight;
 
         if self.events.len() >= self.max_events {
             return self.take().map(|flushed| (flushed, FlushReason::MaxEvents));
@@ -139,20 +167,19 @@ impl BatchAccumulator {
     pub fn take(&mut self) -> Option<EventBatch> {
         let resource = self.resource.take()?;
         let events = std::mem::take(&mut self.events);
+        self.resource_weight = 0;
+        self.events_weight = 0;
         Some(EventBatch { resource, events })
     }
 
-    /// See `absorb`'s doc comment. Zero-copy: swaps this accumulator's own `resource`/`events`
-    /// into a throwaway `EventBatch` just long enough to call the one authoritative estimator,
-    /// then swaps them back -- no clone of the event data, only an `Arc` refcount bump for
-    /// `resource`.
-    fn current_weight(&mut self) -> u64 {
-        let resource = self.resource.clone().expect("only called once self.resource is Some");
-        let events = std::mem::take(&mut self.events);
-        let probe = EventBatch { resource, events };
-        let weight = probe.estimated_heap_bytes();
-        self.events = probe.events;
-        weight
+    /// See `absorb`'s doc comment: `resource_weight` and `events_weight` are the two non-capacity
+    /// terms of `EventBatch::estimated_heap_bytes`, maintained incrementally; only the capacity
+    /// term is read live here, since `Vec::capacity` is O(1) and changes with every `append` in a
+    /// way not worth shadowing in a separate field.
+    fn current_weight(&self) -> u64 {
+        self.resource_weight
+            + (self.events.capacity() * std::mem::size_of::<Event>()) as u64
+            + self.events_weight
     }
 
     /// The next point on `deadline`'s interval cadence, reusing `run_transform`'s own
@@ -229,6 +256,35 @@ mod tests {
             .expect("a nonzero-weight batch should flush");
         assert_eq!(reason, FlushReason::MaxBytes);
         assert_eq!(flushed.events.len(), 1);
+    }
+
+    #[test]
+    fn incremental_weight_matches_a_full_recompute_after_many_absorbs() {
+        let mut acc = BatchAccumulator::new(usize::MAX, u64::MAX);
+        let r = resource();
+
+        // Absorb varying-weight slices across many calls under one shared resource -- the shape
+        // a real decode loop produces -- to prove `current_weight`'s incrementally-tracked total
+        // never drifts from a full, from-scratch recompute of the merged batch. This is exactly
+        // the case a naive per-call recomputation of the resource's own contribution would get
+        // wrong (double-, triple-, ...-counting it once per absorb instead of once per batch).
+        for i in 0..25 {
+            assert!(acc.absorb(Arc::clone(&r), &mut heavy_events(i * 7)).is_none());
+        }
+
+        let incremental = acc.current_weight();
+
+        // Recompute authoritatively: swap the accumulator's own resource/events into a real
+        // `EventBatch` -- the same `Vec`, not a clone (which would reset capacity to length and
+        // invalidate the comparison's capacity-driven term) -- and ask the one formula both are
+        // supposed to agree with, then swap them back so `acc` is left unchanged.
+        let resource = acc.resource.clone().expect("absorbed at least one non-empty batch");
+        let events = std::mem::take(&mut acc.events);
+        let probe = EventBatch { resource, events };
+        let authoritative = probe.estimated_heap_bytes();
+        acc.events = probe.events;
+
+        assert_eq!(incremental, authoritative);
     }
 
     #[test]

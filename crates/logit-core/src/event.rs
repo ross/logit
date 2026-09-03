@@ -37,19 +37,10 @@ impl EventBatch {
     /// `Bytes`/`Str`/`Array`/`Map` do. The batch's `resource` is counted once, not once per event
     /// -- it's `Arc`-shared across every event in the batch, not copied per event.
     pub fn estimated_heap_bytes(&self) -> u64 {
-        let mut total = attr_map_heap_bytes(&self.resource.attributes)
+        let mut total = self.resource.estimated_heap_bytes()
             + (self.events.capacity() * std::mem::size_of::<Event>()) as u64;
         for event in &self.events {
-            total += attr_map_heap_bytes(&event.attributes);
-            if let Some(log) = &event.log {
-                total += value_heap_bytes(&log.message);
-            }
-            if let Some(span) = &event.span {
-                total += span_heap_bytes(span);
-            }
-            for metric in &event.metrics {
-                total += metric_record_heap_bytes(metric);
-            }
+            total += event.estimated_heap_bytes();
         }
         total
     }
@@ -85,7 +76,7 @@ fn symbol_heap_bytes(symbol: Symbol) -> u64 {
     crate::interner::resolve(symbol).len() as u64
 }
 
-fn attr_map_heap_bytes(attrs: &AttrMap) -> u64 {
+pub(crate) fn attr_map_heap_bytes(attrs: &AttrMap) -> u64 {
     attrs.iter().map(|(key, value)| symbol_heap_bytes(key) + value_heap_bytes(value)).sum()
 }
 
@@ -176,6 +167,28 @@ impl Event {
     /// `let mut e = Event::empty(ts, attrs); e.metrics.push(record); e.log = Some(log);`
     pub fn empty(timestamp: i64, attributes: AttrMap) -> Self {
         Event { timestamp, attributes, log: None, metrics: MetricList::new(), span: None }
+    }
+
+    /// This event's own contribution to [`EventBatch::estimated_heap_bytes`] -- everything that
+    /// formula counts *per event* (attributes, log body, span-owned data, metric records), minus
+    /// the batch-level terms (the resource, counted once via [`Resource::estimated_heap_bytes`],
+    /// and the `Vec<Event>` backing storage itself). Exposed so a caller accumulating events
+    /// incrementally (`logit_pipeline::BatchAccumulator`) can track a running total in O(1) per
+    /// event as they arrive, rather than re-walking every event held so far on every call --
+    /// summing this over a set of events and adding the batch-level terms once reproduces
+    /// `estimated_heap_bytes` exactly, by construction.
+    pub fn estimated_heap_bytes(&self) -> u64 {
+        let mut total = attr_map_heap_bytes(&self.attributes);
+        if let Some(log) = &self.log {
+            total += value_heap_bytes(&log.message);
+        }
+        if let Some(span) = &self.span {
+            total += span_heap_bytes(span);
+        }
+        for metric in &self.metrics {
+            total += metric_record_heap_bytes(metric);
+        }
+        total
     }
 }
 

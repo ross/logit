@@ -68,6 +68,21 @@ already built that have a known, accepted rough edge.
   because N readers each holding their own `Fanout` clone would need its own answer to the
   cancel-by-drop shutdown cascade ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md)) that
   today assumes exactly one `Fanout` per listener.
+- **A `ReceiveQueue`'s depth/bytes/utilization gauges update on every datagram, not every batch.**
+  `BoundedQueue::push`/`pop` (`crates/logit-pipeline/src/queue.rs`) call `update_gauges` — three
+  `Telemetry::gauge` calls, each locking `ComponentBuffer`'s `Mutex<HashMap>`
+  (`crates/logit-core/src/telemetry.rs`) — unconditionally on every accepted item. On a `SinkQueue`
+  that's once per *batch*, an already-accepted cost; on a `ReceiveQueue` it's once per *datagram*,
+  and the same listener's `read_loop` (pushing) and `decode_loop` (popping) run concurrently against
+  the identical lock, so this is genuine cross-task contention on the receive side's two hottest
+  loops, not just added per-call overhead. Deliberately not changed here: `BoundedQueue` is one
+  implementation serving both queues by design ([ADR 0022](adr/0022-decoupled-listener-io.md),
+  workstream A), and coalescing or sampling the receive side's gauge updates without also touching
+  the sink side would split that implementation's behavior back apart along exactly the seam it was
+  built to erase. If this ever shows up as a measured bottleneck (`script/bench`, the same evidence
+  bar `docs/design/memory.md`'s "Costing internal spans" section sets for a similar hot-path
+  tradeoff), the fix belongs in `BoundedQueue` itself — e.g. gauging on a sampled/coalesced cadence
+  for every caller — not as a receive-only special case.
 - **Relative gauge adjustment (`+`/`-`) and sample-rate extrapolation for distributions** — the
   aggregator that would hold the needed state now exists (`crates/logit-transforms`), but the statsd
   decoder still has no representation for "this is a delta, not an absolute value" to hand it, and

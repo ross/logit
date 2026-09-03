@@ -19,7 +19,6 @@ use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
 use logit_pipeline::{BatchAccumulator, FlushReason, Input};
 use logit_pipeline::{BoundedQueue, Fanout, OverflowPolicy, QueueConfig, QueueMetrics, Queued};
 use logit_proto::Decoder;
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
@@ -143,6 +142,16 @@ impl<D: Decoder + Send> UdpListener<D> {
         }
     }
 
+    /// Sets *this listener's own* diagnostics -- the top-level `bad_datagram` diagnostic
+    /// `decode_loop` reports when a whole datagram fails to decode (`udp.rs`'s own
+    /// `diag.warn_throttled("bad_datagram", ...)` call). Does **not** reach `self.decoder`'s own
+    /// diagnostics field, if it has one (`StatsdDecoder`/`SyslogDecoder` each track their own,
+    /// used for the finer-grained `bad_line` diagnostic a malformed line inside an otherwise-valid
+    /// datagram reports) -- `UdpListener` is generic over `D: Decoder`, which has no
+    /// `with_diagnostics` method of its own to call here. `StatsdInput`/`SyslogInput`'s own
+    /// `with_diagnostics` (which know their concrete decoder type) use [`Self::map_decoder`] to
+    /// propagate the same value into the decoder as well -- callers going through this method
+    /// directly on a bare `UdpListener` must do the same if the decoder needs to know it too.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
         self
@@ -150,6 +159,15 @@ impl<D: Decoder + Send> UdpListener<D> {
 
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
+        self
+    }
+
+    /// Applies `f` to the wrapped decoder -- lets a caller that knows the concrete decoder type
+    /// (`StatsdInput`/`SyslogInput`, generic `UdpListener` itself never can) chain the decoder's
+    /// own consuming builder methods, e.g. `with_diagnostics`, through `UdpListener`'s own
+    /// builder-style API.
+    pub fn map_decoder(mut self, f: impl FnOnce(D) -> D) -> Self {
+        self.decoder = f(self.decoder);
         self
     }
 
@@ -166,6 +184,13 @@ impl<D: Decoder + Send> UdpListener<D> {
     /// `SinkQueueConfig`/`WriteLoopConfig` are directly inspectable after `build_spec` runs.
     pub fn config(&self) -> UdpListenerConfig {
         self.config
+    }
+
+    /// Test-only: lets `StatsdInput`/`SyslogInput`'s own tests confirm a `with_diagnostics` call
+    /// actually reached the wrapped decoder, not just `UdpListener`'s own `diag` field.
+    #[cfg(test)]
+    pub(crate) fn decoder(&self) -> &D {
+        &self.decoder
     }
 }
 
@@ -189,7 +214,8 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
             self.config.receive_buffer_bytes,
             &self.telemetry,
             &mut self.diag,
-        )?;
+        )
+        .await?;
         let queue = Arc::new(BoundedQueue::with_metrics(
             self.config.queue_config(),
             &RECEIVE_QUEUE_METRICS,
@@ -236,7 +262,22 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
     }
 }
 
-fn bind_socket(
+/// Resolves `bind` and binds a UDP socket to it, applying `receive_buffer_bytes` if given.
+///
+/// Two properties this must have, both regressions an earlier version of this function had
+/// relative to the `tokio::net::UdpSocket::bind` it replaced:
+///
+/// - **Resolves asynchronously.** `std::net::ToSocketAddrs::to_socket_addrs` performs a
+///   synchronous (and, for a real hostname rather than a bare IP literal, potentially slow)
+///   `getaddrinfo` call; calling it directly here would block whichever tokio worker thread is
+///   running this listener's startup for as long as resolution takes.
+///   [`tokio::net::lookup_host`] does the same resolution off tokio's own blocking thread pool.
+/// - **Tries every resolved address, not just the first.** A `bind:` value that resolves to more
+///   than one candidate (a hostname yielding both an AAAA and an A record, say) must fall through
+///   to a later candidate if an earlier one can't be bound (its address family disabled, that
+///   specific address unavailable) -- exactly `std`/`tokio`'s own `bind` convention for a
+///   multi-address `ToSocketAddrs` target.
+async fn bind_socket(
     bind: &str,
     receive_buffer_bytes: Option<u64>,
     telemetry: &Telemetry,
@@ -244,23 +285,68 @@ fn bind_socket(
 ) -> anyhow::Result<tokio::net::UdpSocket> {
     use anyhow::Context;
 
-    let addr = bind
-        .to_socket_addrs()
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(bind)
+        .await
         .with_context(|| format!("resolving bind address '{bind}'"))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("bind address '{bind}' resolved to no addresses"))?;
+        .collect();
+    bind_first_available(&addrs, receive_buffer_bytes, telemetry, diag)
+        .with_context(|| format!("binding to '{bind}'"))
+}
+
+/// Tries every address in `addrs` in turn, returning the first successful bind -- split out from
+/// [`bind_socket`] specifically so this fallback behavior (and its regression, an earlier version
+/// of `bind_socket` tried only the first candidate) is directly unit-testable against a hand-built
+/// address list, without needing a real hostname that resolves to more than one address.
+fn bind_first_available(
+    addrs: &[std::net::SocketAddr],
+    receive_buffer_bytes: Option<u64>,
+    telemetry: &Telemetry,
+    diag: &mut Diagnostics,
+) -> anyhow::Result<tokio::net::UdpSocket> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for &addr in addrs {
+        match bind_one(addr, receive_buffer_bytes) {
+            Ok(socket) => return finish_bind(socket, receive_buffer_bytes, telemetry, diag),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    match last_err {
+        Some(err) => Err(err),
+        None => anyhow::bail!("resolved to no addresses"),
+    }
+}
+
+/// Creates and binds one UDP socket to `addr` -- the per-candidate half of `bind_socket`'s
+/// try-every-resolved-address loop. Synchronous and cheap (socket syscalls only, no I/O wait),
+/// unlike the DNS resolution `bind_socket` itself awaits before ever calling this.
+fn bind_one(
+    addr: std::net::SocketAddr,
+    receive_buffer_bytes: Option<u64>,
+) -> anyhow::Result<socket2::Socket> {
+    use anyhow::Context;
 
     let domain = if addr.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
         .context("creating a UDP socket")?;
-
     if let Some(requested) = receive_buffer_bytes {
         socket
             .set_recv_buffer_size(requested as usize)
             .with_context(|| format!("setting SO_RCVBUF to {requested} bytes"))?;
     }
     socket.set_nonblocking(true).context("setting the socket non-blocking")?;
-    socket.bind(&addr.into()).with_context(|| format!("binding to '{bind}'"))?;
+    socket.bind(&addr.into())?;
+    Ok(socket)
+}
+
+/// The granted-`SO_RCVBUF` gauging/warning and the final conversion to a tokio socket, run only
+/// once some candidate address has actually bound successfully.
+fn finish_bind(
+    socket: socket2::Socket,
+    receive_buffer_bytes: Option<u64>,
+    telemetry: &Telemetry,
+    diag: &mut Diagnostics,
+) -> anyhow::Result<tokio::net::UdpSocket> {
+    use anyhow::Context;
 
     // Sampled once at bind, not per datagram -- SO_RCVBUF doesn't change after bind.
     let granted = socket.recv_buffer_size().unwrap_or(0) as f64;
@@ -424,6 +510,16 @@ async fn decode_loop<D: Decoder + Send>(
     }
 }
 
+/// `sink.send` mints a fresh [`logit_pipeline::TraceContext::new_root`] here -- once per
+/// *accumulated* batch, not once per datagram that fed it. Before ADR 0022, one datagram was one
+/// `Fanout::send`, so every datagram got its own root; now a `batch_max_events` greater than 1
+/// deliberately correlates however many datagrams the accumulator happened to merge under one
+/// shared root, even though they arrived independently and share no other relationship. This is
+/// not a new hazard class, just a new place `TraceContext`'s own doc comment's already-tracked gap
+/// shows up: a stateful transform's `flush()` has minted one root per flush (covering however many
+/// batches contributed to it) since before this PR, for the identical reason -- no single parent
+/// to attribute a many-to-one emission to. `docs/known-gaps.md`'s internal-spans entry is the one
+/// place this is tracked; not duplicated here.
 async fn emit(sink: &Fanout, telemetry: &Telemetry, batch: EventBatch, reason: FlushReason) {
     telemetry.count("logit.component.receive.flushed", 1.0, &[("reason", reason.as_str())]);
     sink.send(batch).await;
@@ -721,11 +817,49 @@ mod tests {
         let telemetry = Telemetry::default();
         let mut diag = Diagnostics::default();
         let socket = bind_socket("127.0.0.1:0", None, &telemetry, &mut diag)
+            .await
             .expect("binding with no explicit receive_buffer_bytes should succeed");
         // `Telemetry::default()` is the disabled no-op handle, so there's nothing to read the
         // gauge back out of here -- this test's real assertion is simply that `bind_socket`
         // completes and yields a usable socket with no explicit `receive_buffer_bytes`, which is
         // the common (unset) case every other test in this module already relies on implicitly.
         drop(socket);
+    }
+
+    /// The regression `bind_first_available` exists to prevent: a `bind:` target resolving to
+    /// more than one candidate address must fall through to a later one if an earlier one can't
+    /// be bound, not fail outright on the first. Forces a deterministic first-candidate failure
+    /// by occupying a real address with another socket first, rather than relying on a specific
+    /// hostname's DNS records (unavailable/unpredictable in a test environment).
+    #[tokio::test]
+    async fn bind_first_available_falls_through_to_a_later_candidate() {
+        let occupied = bind_ephemeral().await;
+        let occupied_addr = occupied.local_addr().unwrap();
+        let free_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let telemetry = Telemetry::default();
+        let mut diag = Diagnostics::default();
+        let socket = bind_first_available(&[occupied_addr, free_addr], None, &telemetry, &mut diag)
+            .expect("should fall through to the second, unoccupied candidate");
+
+        assert_ne!(
+            socket.local_addr().unwrap(),
+            occupied_addr,
+            "must not have somehow bound the already-occupied address"
+        );
+        drop(occupied); // keep alive until here, so the port stays genuinely occupied throughout
+    }
+
+    #[tokio::test]
+    async fn bind_first_available_with_every_candidate_failing_reports_the_last_error() {
+        let occupied = bind_ephemeral().await;
+        let occupied_addr = occupied.local_addr().unwrap();
+
+        let telemetry = Telemetry::default();
+        let mut diag = Diagnostics::default();
+        let err = bind_first_available(&[occupied_addr], None, &telemetry, &mut diag)
+            .expect_err("the only candidate is already occupied -- must fail, not hang or panic");
+        assert!(!err.to_string().is_empty());
+        drop(occupied);
     }
 }

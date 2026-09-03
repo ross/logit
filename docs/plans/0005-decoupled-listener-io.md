@@ -158,19 +158,27 @@ events across resources.
 > (`absorb_drains_the_callers_buffer_via_append_leaving_its_capacity_intact`) before wiring the real
 > decode loop in workstream E — not by measurement after the fact.
 
-Weight (for the byte bound) is not tracked incrementally: `EventBatch::estimated_heap_bytes`
-operates on a real `&EventBatch`, so `current_weight` temporarily swaps the accumulator's own
-`resource`/`events` into a throwaway `EventBatch`, calls the one authoritative estimator, and swaps
-them back — no clone of event data, one `Arc` refcount bump.
+> **Superseded again, post-review:** the first shipped cut of weight tracking recomputed
+> `EventBatch::estimated_heap_bytes` from scratch on every `absorb`, via a zero-copy swap of the
+> accumulator's own `resource`/`events` into a throwaway `EventBatch`. Code review caught this as a
+> genuine O(n²) cost over one accumulation cycle (a full O(everything held) walk on every datagram,
+> not once per flush) and, independently, a resource-attribute double-count on every call instead
+> of once per batch. Replaced with true incremental tracking: `resource_weight` (cached, updated
+> only on a resource change), the capacity term read live off `self.events.capacity()` (`O(1)`),
+> and `events_weight` (a running sum, updated by adding just the incoming slice's per-event
+> contribution). The three reproduce `estimated_heap_bytes` exactly, by construction — see ADR
+> 0022. Caught by a whitebox test (`incremental_weight_matches_a_full_recompute_after_many_absorbs`)
+> that absorbs many slices under one shared resource and compares the incremental total against a
+> from-scratch recompute of the merged batch.
 
 **Test list, as run:** `max_events: 1` emits once per absorbed batch, never splitting a multi-event
 decode; reaching the bound exactly and exceeding it both emit; the byte bound trips independently;
 `take()` on empty is `None`; a resource-`ptr_eq` mismatch flushes the old batch (carrying the old
 resource) and the new accumulation survives with the new one; two batches sharing one
 `Arc<Resource>` merge into a batch holding that same `Arc`; the buffer-capacity-preservation test
-above.
+above; the incremental-vs-recomputed weight test above.
 
-**Done:** `BatchAccumulator` unit-tested with no tokio, no socket, no `Decoder` — confirmed (8
+**Done:** `BatchAccumulator` unit-tested with no tokio, no socket, no `Decoder` — confirmed (9
 tests, `crates/logit-pipeline/src/accumulator.rs`'s own module).
 
 ## C. `Decoder` timestamp widening
