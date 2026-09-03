@@ -9,7 +9,7 @@
 
 use logit_core::{
     AttrMap, BodyFormat, Event, EventBatch, LogRecord, MetricKind, MetricRecord, Resource,
-    SpanKind, SpanRecord, SpanStatus, Value,
+    SpanKind, SpanRecord, SpanStatus, TraceRef, Value,
 };
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as InTransport};
 use logit_outputs::otlp::{OtlpOutput, OtlpTransport as OutTransport};
@@ -34,7 +34,7 @@ fn mixed_signal_batch() -> EventBatch {
             message: Value::str("hello"),
             severity: None,
             body_format: BodyFormat::Raw,
-            trace: None,
+            trace: Some(TraceRef { trace_id: [5; 16], span_id: Some([9; 8]), flags: 1 }),
         },
     );
     let metric = Event::metric(
@@ -102,9 +102,17 @@ fn assert_round_tripped(received: &[EventBatch]) {
     let has_span = received
         .iter()
         .any(|b| b.events.iter().any(|e| e.span.as_ref().is_some_and(|s| s.trace_id == [7; 16])));
+    let log_trace = received
+        .iter()
+        .find_map(|b| b.events.iter().find_map(|e| e.log.as_ref().and_then(|l| l.trace)));
     assert!(has_log, "the log signal should have round-tripped");
     assert!(has_metric, "the metric signal should have round-tripped");
     assert!(has_span, "the span signal should have round-tripped, with its trace_id intact");
+    assert_eq!(
+        log_trace,
+        Some(TraceRef { trace_id: [5; 16], span_id: Some([9; 8]), flags: 1 }),
+        "the log's own trace context should have round-tripped intact"
+    );
     assert!(
         received.iter().any(|b| b.resource.attributes.get("host").and_then(|v| v.as_str())
             == Some("roundtrip-host")),
