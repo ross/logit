@@ -738,15 +738,16 @@ already built that have a known, accepted rough edge.
   `trace_out` components carry this same explanation inline.
 
 - **`otlp_out` has no custom headers, no compression, no gRPC TLS, and no per-signal filter** —
-  found evaluating whether it could replace the demo's `syslog_out` → Alloy → Loki log leg
+  found evaluating whether it could replace the demo's `syslog_out` → Alloy → Loki log leg, and
+  later used to do exactly that
   ([docs/plans/otlp-logs-and-resource-identity.md](plans/otlp-logs-and-resource-identity.md)'s
   workstream E). No `X-Scope-OrgID`-equivalent header support rules out any multi-tenant Loki/Mimir/
   Grafana Cloud target; `crates/logit-outputs/src/otlp.rs`'s frame encoder never sets the compressed
   flag; `reject_insecure_grpc_endpoint` hard-rejects `https://` under `protocol: grpc` rather than
   supporting it; and there's no way to say "logs only" at the sink — it sends whatever signals a
   batch's events happen to carry. None of these block the demo (single-tenant, plaintext gRPC to
-  Tempo); all of them block a real deployment. The compression half of this mirrors the `otlp_in`
-  gap above but was never itself filed until now.
+  Tempo and plaintext HTTP to Loki); all of them block a real deployment. The compression half of
+  this mirrors the `otlp_in` gap above but was never itself filed until now.
 
 - **`otlp_out`'s gRPC transport opens a fresh connection per request, never pooled.** Every gRPC
   `send` (`crates/logit-outputs/src/otlp.rs`'s `grpc_roundtrip`) connects, performs a fresh HTTP/2

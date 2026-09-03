@@ -106,8 +106,8 @@ never touches it costs nothing. `docs/design/lua-api.md` has the full contract.
 - A Lua `flush()` can now stamp a real resource on its own emission instead of relying purely on
   `last_resource`'s "whichever batch was last seen" approximation — see
   `docs/known-gaps.md`'s Lua-flush-staleness entry, amended, not resolved, by this.
-- Demo-stack workstream B (`docs/plans/otlp-logs-and-resource-identity.md`) can now set
-  `service.name`/`service.namespace` on the log leg via `set`, unblocking real Loki index labels
-  without any `demo/loki/loki.yaml` change (both are already in Loki's default index-label set).
+- Demo-stack workstream B (`docs/plans/otlp-logs-and-resource-identity.md`) landed on this: the
+  demo's log leg now sets `service.name`/`service.namespace` via `set`, giving Loki real index
+  labels with no `demo/loki/loki.yaml` change (both are already in Loki's default index-label set).
 - `otlp_in` gets no special treatment and needs none: an operator simply doesn't put a `set` after
   it, since it already carries a real resource off the wire.

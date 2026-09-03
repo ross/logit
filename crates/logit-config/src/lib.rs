@@ -360,10 +360,10 @@ pub enum ComponentKind {
         #[serde(default)]
         app_name: Option<String>,
         /// Bounds one encoded message (PRI + header + MSG). Defaults to 8192, matching Grafana
-        /// Alloy's `loki.source.syslog` `max_message_length` default -- the receiver the demo
-        /// stack points this at -- rather than RFC 3164 §4.1's traditional 1024, which would
-        /// truncate a JSON-bodied message on every modern relay chain. A string via
-        /// [`human_bytes`], exactly like `BufferConfig::max_bytes`.
+        /// Alloy's `loki.source.syslog` `max_message_length` default -- a real receiver's own
+        /// choice, verified against Alloy v1.19.2 -- rather than RFC 3164 §4.1's traditional
+        /// 1024, which would truncate a JSON-bodied message on every modern relay chain. A string
+        /// via [`human_bytes`], exactly like `BufferConfig::max_bytes`.
         #[serde(default = "default_max_message_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_message_bytes: u64,

@@ -78,69 +78,58 @@ strings-only — a per-event setter that couldn't write a number would have been
 one. No config-root default was added; per-component configuration (insert a `set` wherever it's
 needed) covers the same ground without a second inheritance mechanism to reason about.
 
-### B. A Loki-direct log leg, dropping `alloy`
+### B. A Loki-direct log leg, dropping `alloy` — done
 
-Feasible, and blocked on A for label quality — not blocked technically.
+**Status: landed.** `demo/logit.yaml`'s `log_out` is now `otlp_out` (protocol `http`, endpoint
+`http://loki:3100/otlp`), fed by a new `access_identity` (`set`) component that stamps
+`service.name: demo-hello`/`service.namespace: demo` onto the batch's resource right after
+`access_in`. `demo/alloy/` and the `alloy` service/volume in `demo/compose.yaml` are gone
+entirely; `logit`'s `depends_on` gained `loki: {condition: service_healthy}` so `log_out` doesn't
+spend its first several seconds retrying into a cold Loki. The three Loki dashboard panels
+(`demo/grafana/dashboards/logit-internal.json`) were rewritten from `{job="demo"}`/`by (host)` to
+`{service_name="demo-hello"}`/`by (service_name)` — Loki's OTLP resource-attribute label naming
+(dots become underscores).
 
-**The correction that kills the obvious shortcut:** Loki's `otlp_config` allows the `index_label`
+**No `demo/loki/loki.yaml` change was needed**, confirming the analysis below: `service.name`/
+`service.namespace` are already in Loki's default index-label set.
+
+The analysis that motivated this, kept for the record:
+
+**The correction that killed the obvious shortcut:** Loki's `otlp_config` allows the `index_label`
 action *only* for resource attributes, never for log-record attributes (confirmed against Grafana's
 own docs: "It additionally allows index_label action for Resource Attributes" — log/scope
-attributes are limited to `structured_metadata` or `drop`). `syslog.hostname`/`syslog.tag` are
+attributes are limited to `structured_metadata` or `drop`). `syslog.hostname`/`syslog.tag` were
 encoded as **log**-record attributes by `logit` (`crates/logit-proto/src/otlp/logs.rs:99-104` pushes
 `event.attributes` onto `LogRecord.attributes`), not resource attributes. So no Loki-side
-`otlp_config` change can promote them to index labels — full stop. This makes workstream A a hard
-prerequisite for a demo that doesn't look broken, not an optional enhancement.
+`otlp_config` change could have promoted them to index labels — full stop. This is what made
+workstream A a hard prerequisite for a demo that doesn't look broken, not an optional enhancement.
 
 **Loki's live default index-label set**, captured verbatim from the running demo stack's `/config`
-endpoint: `service.name`, `service.namespace`, `service.instance.id`, `deployment.environment`,
-`deployment.environment.name`, `cloud.region`, `cloud.availability_zone`, and a run of `k8s.*` /
-`container.name` keys. Everything else on the resource → structured metadata, never a label, unless
-explicitly configured otherwise.
+endpoint at the time: `service.name`, `service.namespace`, `service.instance.id`,
+`deployment.environment`, `deployment.environment.name`, `cloud.region`,
+`cloud.availability_zone`, and a run of `k8s.*` / `container.name` keys. Everything else on the
+resource → structured metadata, never a label, unless explicitly configured otherwise.
 
-**Consequence:** without A, every OTLP log line lands in Loki as `{service_name="unknown_service"}`
-with no `host`/`app`/`job`-equivalent label at all — a demo that looks broken. With A landed,
-setting `service.name`/`service.namespace` via a `set` component after `syslog_in` is enough on its
-own — both are already in Loki's default index-label set, so **no `demo/loki/loki.yaml` change
-would be needed**.
+**Where the old labels came from — entirely Alloy, nothing else** (now removed):
+`demo/alloy/config.alloy` set static `job="demo"`, `protocol="udp"`, and relabeled
+`__syslog_message_hostname`→`host`, `__syslog_message_app_name`→`app`.
 
-**Where today's labels actually come from — entirely Alloy, nothing else:**
-`demo/alloy/config.alloy:13-16` sets static `job="demo"`, `protocol="udp"`; `:33-41` relabels
-`__syslog_message_hostname`→`host` and `__syslog_message_app_name`→`app`. All three Loki dashboard
-panels select on `{job="demo"}`
-(`demo/grafana/dashboards/logit-internal.json:130,145,161`) and would need new LogQL once Alloy's
-labels no longer exist.
+### C. What replacing Alloy cost: `syslog_out`'s only demo exercise — accepted
 
-**Removal surface**, if this is executed: `demo/compose.yaml:87-103` (the `alloy` service) plus the
-`alloy_data` volume at `:229`; `demo/alloy/config.alloy` (whole file, plus the now-empty
-`demo/alloy/` directory); `demo/logit.yaml:44-57` (`log_out`) and the topology comment at `:16`; and
-doc references treating Alloy as live in `docs/plans/demo-stack.md`, `demo/README.md`,
-`docs/adr/syslog-output.md`, `docs/adr/demo-stack-separate-from-dev-stack.md`,
-`docs/plans/otlp-end-to-end.md:36,329-330`.
+**Decision: accept the loss, document it, no loop-back.** `syslog_out` is no longer exercised
+end-to-end by anything in the demo — it stays fully covered by its own unit/integration tests and
+by `docs/adr/syslog-output.md`'s decisions, but the demo no longer demonstrates third-party syslog
+receiver interop. This was an explicit choice, not an oversight: the demo was never going to stay
+exhaustive over every `ComponentKind` as more land, and keeping Alloy solely to exercise one
+component, or looping `syslog_out` back into a second `syslog_in` to prove `logit` talks to itself
+(not real third-party interop, Alloy's actual evidentiary value), were both rejected as not worth
+what they'd cost or not actually preserving what mattered.
 
-One operational detail worth remembering: add `loki: {condition: service_healthy}` to `logit`'s
-`depends_on` in `demo/compose.yaml` when this lands. Loki already has a healthcheck (Alloy currently
-depends on it); without it, `log_out` spends its first several seconds retrying into a cold Loki.
-
-### C. What replacing Alloy costs: `syslog_out`'s only demo exercise
-
-`syslog_out` is exercised end-to-end **only** by the Alloy leg — nothing else in the stack speaks
-syslog, which is the entire reason Alloy is there (Loki has no syslog receiver; promtail is EOL).
-Dropping Alloy drops that coverage. This is a decision to make, not one already made. Options:
-
-- **Accept the loss, document it.** Unit/integration tests still cover `syslog_out`; only
-  third-party-receiver interop goes undemoed.
-- **Keep Alloy solely for `syslog_out`.** Defeats the point of this workstream.
-- **Loop `syslog_out` back into a second `syslog_in`** on another port, feeding a `stdio_out`.
-  Exercises the encode path against `logit`'s own decoder, but proves `logit` talks to itself — not
-  that it interoperates with a real third-party syslog receiver, which was Alloy's actual
-  evidentiary value.
-
-Separately, confirm for whoever picks this up: removing Alloy does **not** invalidate
-`docs/adr/syslog-output.md`'s decisions (RFC 6587 octet-counting auto-detect at `:65-68`,
-`idle_timeout` handling at `:80-82`, `syslog.*` attribute round-tripping at `:105-107`). Alloy was
-the *evidence* those choices interoperate with a real receiver, not the *reason* for them. Those
-passages need rewording to cite Alloy as "one receiver, verified against v1.19.2" rather than "the
-demo's receiver" — not rescinding.
+Confirmed: removing Alloy does **not** invalidate `docs/adr/syslog-output.md`'s decisions (RFC 6587
+octet-counting auto-detect, `idle_timeout` handling, `syslog.*` attribute round-tripping). Alloy was
+the *evidence* those choices interoperate with a real receiver, not the *reason* for them — those
+passages still cite Alloy v1.19.2 as the receiver they were verified against; only the ADR's
+now-stale claim that `demo/compose.yaml` has a live `alloy` service was corrected.
 
 ### D. Log↔trace correlation has no native OTLP path yet
 

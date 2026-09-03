@@ -45,9 +45,10 @@ services:
       - grafana_data:/var/lib/grafana
     networks: [demo]
 
-  # Log backend -- receives `logit`'s own relayed log lines over syslog/UDP from `log_out`
-  # (demo/logit.yaml) via the `alloy` shim below. Unlike the old demo writer, `hello` below
-  # doesn't also write to Loki directly -- `logit`'s own `syslog_out` is the only path in.
+  # Log backend -- receives `logit`'s own log lines directly over OTLP/HTTP from `log_out`
+  # (demo/logit.yaml, docs/plans/otlp-logs-and-resource-identity.md's workstream B; no relay
+  # service in between). Unlike the old demo writer, `hello` below doesn't also write to Loki
+  # directly -- `logit`'s own `otlp_out` is the only path in.
   loki:
     image: docker.io/grafana/loki:3.7.7
     command: ["-config.file=/etc/loki/loki.yaml"]
@@ -84,24 +85,6 @@ services:
       - "4318:4318" # OTLP/HTTP
     networks: [demo]
 
-  # syslog -> Loki shim (demo/alloy/config.alloy). Fed by `logit`'s own `log_out` (`syslog_out`,
-  # demo/logit.yaml) over UDP RFC 5424. Loki has no syslog receiver of its own, and promtail (the
-  # historical answer) is EOL, which is why this is Alloy rather than nothing at all.
-  alloy:
-    image: docker.io/grafana/alloy:v1.19.2
-    command:
-      - run
-      - --server.http.listen-addr=0.0.0.0:12345
-      - --storage.path=/var/lib/alloy/data
-      - /etc/alloy/config.alloy
-    depends_on:
-      loki:
-        condition: service_healthy
-    volumes:
-      - ./alloy/config.alloy:/etc/alloy/config.alloy:z,ro
-      - alloy_data:/var/lib/alloy/data
-    networks: [demo]
-
   logit:
     build:
       context: ..
@@ -112,16 +95,20 @@ services:
     image: logit-demo:latest
     command: ["run", "/config.yaml"]
     depends_on:
-      # influxdb_out retries transient failures (ADR `service-lifecycle-and-output-retry`), but there's no reason to spend the
-      # demo's first several seconds visibly doing that.
+      # influxdb_out/otlp_out both retry transient failures (ADR
+      # `service-lifecycle-and-output-retry`), but there's no reason to spend the demo's first
+      # several seconds visibly doing that against a cold InfluxDB/Loki.
       influxdb:
+        condition: service_healthy
+      loki:
         condition: service_healthy
       # `service_started`, not `service_healthy` -- `tempo` (above) declares no healthcheck at
       # all, so `service_started` is the honest limit anyway (same reasoning as `hello`'s
-      # dependency on `logit` below). Unlike `influxdb_out`, `trace_out` doesn't need Tempo up
-      # first for a clean start: it retries through `write_loop` like any other sink (ADR `service-lifecycle-and-output-retry`'s
-      # bounded output retry), so a `logit` that starts before Tempo finishes booting just retries
-      # its first few span exports rather than failing.
+      # dependency on `logit` below). Unlike `influxdb_out`/`otlp_out`'s Loki leg, `trace_out`
+      # doesn't need Tempo up first for a clean start: it retries through `write_loop` like any
+      # other sink (ADR `service-lifecycle-and-output-retry`'s bounded output retry), so a `logit`
+      # that starts before Tempo finishes booting just retries its first few span exports rather
+      # than failing.
       tempo:
         condition: service_started
     volumes:
@@ -190,9 +177,9 @@ services:
   # own real requests plus a background stream of synthetic ones, the same RFC 3164 + JSON-body
   # shape crates/logit-bench/src/fixtures.rs measures (NGINX_SYSLOG_LINE), so this exercises a
   # workload someone actually runs, not a made-up one. Replaces the old writer service's bash
-  # loop; unlike it, this doesn't also write to `alloy` directly -- `logit`'s own `log_out` is
-  # what relays there now, the same way `influx_out`/`trace_out` are the only paths into InfluxDB
-  # and Tempo.
+  # loop; unlike it, this doesn't also write to Loki directly -- `logit`'s own `log_out` is the
+  # only path in, the same way `influx_out`/`trace_out` are the only paths into InfluxDB and
+  # Tempo.
   #
   # A stock image plus a bind-mounted script, not a Dockerfile: it's stdlib-only Python, so
   # there's nothing to install and nothing to rebuild after an edit.
@@ -226,5 +213,4 @@ volumes:
   grafana_data: {}
   loki_data: {}
   tempo_data: {}
-  alloy_data: {}
   graph_data: {}

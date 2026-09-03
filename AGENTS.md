@@ -30,13 +30,16 @@ Loki, InfluxDB, and Tempo respectively
 ([docs/plans/demo-stack.md](docs/plans/demo-stack.md),
 [docs/plans/otlp-end-to-end.md](docs/plans/otlp-end-to-end.md)). `syslog_out` (RFC
 3164/5424 over UDP or TCP, header fields round-tripped from an event's `syslog.*` attributes,
-[ADR `syslog-output`](docs/adr/syslog-output.md)) is live in `demo/logit.yaml`'s `log_out`, writing to
-`alloy` → Loki. `otlp_in`/`otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`, OTLP for logs,
+[ADR `syslog-output`](docs/adr/syslog-output.md)) is implemented and fully covered by its own
+unit/integration tests but no longer exercised by the demo, which moved its log leg onto
+`otlp_out` straight to Loki ([docs/plans/otlp-logs-and-resource-identity.md](docs/plans/otlp-logs-and-resource-identity.md)'s
+workstream B) — the demo isn't meant to stay exhaustive over every component as more land.
+`otlp_in`/`otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`, OTLP for logs,
 metrics, and traces, both OTLP/HTTP and a hand-rolled OTLP/gRPC transport,
 [ADR `committed-pregenerated-otlp-protobuf`](docs/adr/committed-pregenerated-otlp-protobuf.md)/
 [ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md)) are real, implemented `ComponentKind`s —
-`otlp_out` is live in `demo/logit.yaml`'s `trace_out`, writing to Tempo over gRPC; `otlp_in` ships
-tested but unexercised by the demo. Config is a flat graph of named components (ADR `component-graph-configuration`,
+`otlp_out` is live in `demo/logit.yaml`'s both `log_out` (HTTP, straight to Loki) and `trace_out`
+(gRPC, to Tempo); `otlp_in` ships tested but unexercised by the demo. Config is a flat graph of named components (ADR `component-graph-configuration`,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively

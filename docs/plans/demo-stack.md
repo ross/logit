@@ -1,6 +1,6 @@
 ---
 created: 2026-09-01
-updated: 2026-09-02
+updated: 2026-09-03
 ---
 
 # Enabling plan: a user-facing demo stack
@@ -12,6 +12,15 @@ updated: 2026-09-02
 > trace leg. Loki and Tempo now both hold real data, not the empty-but-provisioned placeholders this
 > plan describes below. This plan's narrative and every other decision it records are otherwise
 > unchanged and still describe how the demo stack is built.
+>
+> **Update, later still:** the log leg described above was itself replaced.
+> [docs/plans/otlp-logs-and-resource-identity.md](otlp-logs-and-resource-identity.md)'s workstream
+> B moved `log_out` off `syslog_out`/Alloy onto `otlp_out` straight to Loki (workstream A's `set`
+> component gives it a real `service.name`/`service.namespace` first) and removed `demo/alloy/`
+> and the `alloy` service entirely. `syslog_out` itself is unaffected and still fully implemented —
+> it's just no longer what the demo's log leg uses (workstream C there records that trade-off).
+> Everything below describing Alloy is historical: accurate for what the stack looked like when
+> this plan landed, not for its current shape.
 
 `logit`'s examples are developer scratch material — `examples/statsd-to-influxdb.yaml`,
 `examples/nginx-to-influxdb.yaml`, each landed alongside the feature it exercises, all of them
