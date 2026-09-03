@@ -19,7 +19,10 @@
 //! raw-sample representation, only mergeable ones.
 
 use crate::interner::intern;
-use crate::{AttrMap, DdSketch, Event, MetricKind, MetricRecord};
+use crate::{
+    AttrMap, DdSketch, Event, MetricKind, MetricRecord, SpanKind, SpanLink, SpanRecord, SpanStatus,
+    Value,
+};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,6 +63,58 @@ const RESERVED_TAG_KEYS: [&str; 3] = ["component", "kind", "role"];
 /// discovering the same filter silently applied once a point reaches this buffer.
 pub fn is_reserved_tag_key(key: &str) -> bool {
     RESERVED_TAG_KEYS.contains(&key)
+}
+
+/// Caps the number of spans one component's buffer will hold between drains -- a volume bound,
+/// not a cardinality one: unlike a point, a span never coalesces with another one (two visits to
+/// the same node are two distinct spans, always), so nothing else bounds this except drain
+/// interval × sample rate. Beyond the cap, a new span is dropped and counted
+/// (`ComponentBuffer::drain`'s `logit.internal.spans.dropped{reason="buffer_full"}`), the same
+/// bound-and-count-the-drop shape [`MAX_KEYS_PER_COMPONENT`] uses for points.
+const MAX_SPANS_PER_COMPONENT: usize = 512;
+
+/// Caps the number of [`SpanLink`]s one span will carry -- the same reasoning
+/// `logit-transforms::Aggregator`'s own `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES` bound has (a
+/// flush absorbing an unbounded number of contributing batches shouldn't let one span's own size
+/// grow without limit). Beyond the cap, a link is dropped and counted on the guard itself, as
+/// `logit.internal.span.links.dropped{reason="cardinality"}` -- immediately, not batched to drain
+/// time, since [`SpanGuard`] already holds a live handle back into this same buffer.
+const MAX_LINKS_PER_SPAN: usize = 32;
+
+/// The default `span_sample_rate` (`logit_config::ComponentKind::Internal`) when a config's
+/// `internal` component doesn't set one. Below `1.0` deliberately: span volume is a different
+/// shape than metric volume -- one span per node-visit per batch, where a metric point coalesces
+/// between drains -- so keeping everything by default would multiply internal telemetry's own
+/// volume in a way metrics never do. See `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`.
+pub const DEFAULT_SPAN_SAMPLE_RATE: f64 = 0.1;
+
+/// Deterministic on `trace_id`, so every node -- and every `logit` process in a split-collection
+/// topology (`docs/OVERVIEW.md`) -- reaches the same keep/drop verdict independently, with no
+/// propagation and no extra bytes on `TraceContext`/`Delivered`: a kept trace is kept at every
+/// hop, a dropped one dropped at every hop, without any node ever telling another its answer.
+/// Same shape as OTel's `TraceIdRatioBased` sampler.
+///
+/// The top 53 bits of the low 8 `trace_id` bytes, not all 64: `rate * 2f64.powi(64)` loses
+/// precision near 1.0, which would reject traces it should keep. 53 bits is `f64`'s
+/// exact-integer range, so the comparison below is exact, not an approximation of one.
+pub fn trace_is_sampled(trace_id: &[u8; 16], rate: f64) -> bool {
+    // `!(rate < 1.0)` rather than `rate >= 1.0` -- also catches NaN (every comparison against NaN
+    // is false, so `rate < 1.0` is false and this branch is taken): keep everything rather than
+    // silently drop everything on a malformed rate. Graph validation (rule 16,
+    // `crates/logit-pipeline/src/graph.rs`) is what actually rejects a NaN/out-of-range config
+    // value before this is ever called with one in practice; the negated comparison is what makes
+    // this fn's own behavior correct even if that guarantee is ever bypassed (a direct caller, a
+    // future one), so it's kept as-is rather than rewritten to a `partial_cmp` form that would
+    // lose the "NaN falls through to `true`" property clippy's lint can't see is deliberate here.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    if !(rate < 1.0) {
+        return true;
+    }
+    if rate <= 0.0 {
+        return false;
+    }
+    let x = u64::from_be_bytes(trace_id[8..16].try_into().expect("8 bytes"));
+    (x >> 11) < (rate * (1u64 << 53) as f64) as u64
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +208,72 @@ impl Telemetry {
     pub fn is_enabled(&self) -> bool {
         self.0.is_some()
     }
+
+    /// Opens a span for this component's one visit to one unit of work -- see
+    /// `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md` for what "one unit of
+    /// work" means per node kind. The sample decision (`trace_is_sampled`) is made here, from
+    /// `trace_id` alone, before any span-shaped state exists at all: an unsampled trace gets the
+    /// same `SpanGuard::disabled()` a disabled handle's [`Telemetry::timer`] returns, so every
+    /// method on it is an immediate no-op and nothing about this call allocates or reads the
+    /// clock beyond the one comparison `trace_is_sampled` itself does.
+    ///
+    /// `span_id`/`parent_span_id` are supplied, not minted here -- the caller (`Fanout::send`,
+    /// `run_transform`, ...) already minted the `TraceContext` this span's identity comes from,
+    /// because that same context is also what gets sent downstream (`Fanout::send_with_own_context`).
+    /// Minting a second, unrelated id here would desynchronize the two.
+    pub fn span(
+        &self,
+        op: &'static str,
+        kind: SpanKind,
+        trace_id: [u8; 16],
+        span_id: [u8; 8],
+        parent_span_id: Option<[u8; 8]>,
+    ) -> SpanGuard {
+        let Some(buf) = &self.0 else { return SpanGuard::disabled() };
+        if !trace_is_sampled(&trace_id, buf.span_sample_rate) {
+            return SpanGuard::disabled();
+        }
+        SpanGuard {
+            telemetry: Telemetry(Some(buf.clone())),
+            span: Some(PendingSpan {
+                start: now_unix_nanos(),
+                started_at: Instant::now(),
+                end: 0,
+                trace_id,
+                span_id,
+                parent_span_id,
+                op,
+                kind,
+                status: SpanStatus::Ok,
+                events: 0,
+                links: Vec::new(),
+                tags: SmallVec::new(),
+            }),
+        }
+    }
+}
+
+/// The wall-clock Unix-nanosecond "now" -- read exactly once per span, at
+/// [`Telemetry::span`]'s own call, never again at finish (see [`PendingSpan::started_at`]'s doc
+/// comment for why: a second independent read is what this whole split avoids).
+///
+/// The `#[cfg(test)]` override below exists purely so a test can simulate a wall clock that jumps
+/// (an NTP correction, an admin `date` call) *between* a span's start and its finish, without an
+/// actual multi-second sleep -- see `a_wall_clock_moving_backward_between_start_and_finish_cannot_make_end_precede_start`.
+/// Never compiled into a non-test binary: the thread-local's own overhead (a branch and a
+/// thread-local read) would otherwise be paid on every single span, sampled or not, for a facility
+/// only tests use.
+fn now_unix_nanos() -> i64 {
+    #[cfg(test)]
+    {
+        if let Some(overridden) = tests::CLOCK_OVERRIDE.with(|cell| cell.get()) {
+            return overridden;
+        }
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64
 }
 
 /// See [`Telemetry::timer`].
@@ -191,6 +312,154 @@ impl Drop for Timer {
     }
 }
 
+/// One span, still being built -- everything [`Telemetry::span`] captured plus whatever
+/// [`SpanGuard`]'s own methods add before it is finished. Turned into a real `Event` carrying a
+/// `SpanRecord` only at drain time (`ComponentBuffer::drain`'s span pass), same as a `Pending`
+/// point is only turned into a `MetricRecord` there -- this type never leaves this module.
+#[derive(Debug)]
+struct PendingSpan {
+    /// Unix nanoseconds -- becomes the drained `Event::timestamp`, *not* the drain time
+    /// (`ComponentBuffer::drain`'s doc comment).
+    start: i64,
+    /// Captured alongside `start`, from the same [`Telemetry::span`] call -- a monotonic clock
+    /// reading `end` is derived from at finish time (`started_at.elapsed()`), instead of a second
+    /// independent `SystemTime::now()` read. Two independent wall-clock reads would let the
+    /// *system* clock moving backward between them (an NTP correction, an admin `date` call --
+    /// plausible over a long span, e.g. a retrying sink send) produce `end < start`, an invalid
+    /// duration downstream; `Instant` is guaranteed monotonically non-decreasing on every platform
+    /// this project ships to, so `start + elapsed` can never precede `start`, structurally, by
+    /// construction -- not merely "usually doesn't."
+    started_at: Instant,
+    /// Unix nanoseconds, set when the guard finishes (`SpanGuard::finish`/`Drop`) -- becomes
+    /// `SpanRecord::end_timestamp`. `0` until then; never observed in that state, since nothing
+    /// reads a `PendingSpan` before it's pushed to the buffer, which only ever happens once `end`
+    /// has been set.
+    end: i64,
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+    parent_span_id: Option<[u8; 8]>,
+    /// `"process"|"flush"|"send"|"deliver"` -- half of the drained span's name (the other half is
+    /// this component's own `kind`, joined at drain time: `"aggregate process"`).
+    op: &'static str,
+    kind: SpanKind,
+    status: SpanStatus,
+    /// How many events this node's emission carried -- `0` for a transform visit that absorbed
+    /// everything. Drained as a non-interned `Value::I64` attribute (`events`), never a tag: a
+    /// per-span count has no cardinality to bound.
+    events: u64,
+    links: Vec<SpanLink>,
+    /// Extra `(key, value)` attributes a call site chose to attach (`SpanGuard::tag`, e.g.
+    /// `write_loop`'s `("fault", "ambiguous")` on a failed delivery) -- unlike a point's tags,
+    /// never filtered against [`RESERVED_TAG_KEYS`]: every call site recording a span is this
+    /// project's own Rust code, not untrusted script input, so there's no adversarial caller to
+    /// defend a span's identity attributes against the way point tags must be.
+    tags: SmallVec<[Tag; 2]>,
+}
+
+/// A guard opened by [`Telemetry::span`], recording one [`SpanRecord`]-carrying `Event` when it
+/// finishes -- mirrors [`Timer`]'s shape exactly, including the "disabled/unsampled holds no
+/// state" trick that makes an unsampled span free: every method below is an immediate return
+/// when `span` is `None`.
+#[must_use = "a SpanGuard records nothing until it is dropped or finished"]
+pub struct SpanGuard {
+    /// `Telemetry(Some(_))` back into the same buffer this span will drain into -- reused (rather
+    /// than a bare `Arc<ComponentBuffer>`) so [`SpanGuard::link`] can count an over-cap drop via
+    /// the ordinary `Telemetry::count` path with no second field.
+    telemetry: Telemetry,
+    span: Option<PendingSpan>,
+}
+
+impl SpanGuard {
+    fn disabled() -> Self {
+        SpanGuard { telemetry: Telemetry::default(), span: None }
+    }
+
+    /// Sets the emitted-events count -- see [`PendingSpan::events`]'s doc comment for what this
+    /// means per node kind. Overwrites, rather than adds: every call site calls this at most once,
+    /// with the final count for the one emission this span records.
+    pub fn events(&mut self, n: u64) {
+        if let Some(span) = &mut self.span {
+            span.events = n;
+        }
+    }
+
+    /// Attaches one contributing-context link, dropped and counted
+    /// (`logit.internal.span.links.dropped{reason="cardinality"}`) past [`MAX_LINKS_PER_SPAN`].
+    pub fn link(&mut self, link: SpanLink) {
+        let Some(span) = &mut self.span else { return };
+        if span.links.len() >= MAX_LINKS_PER_SPAN {
+            self.telemetry.count(
+                "logit.internal.span.links.dropped",
+                1.0,
+                &[("reason", "cardinality")],
+            );
+            return;
+        }
+        span.links.push(link);
+    }
+
+    /// [`SpanGuard::link`], for every link in `links` -- each still counted individually against
+    /// the per-span cap, not as one all-or-nothing batch.
+    pub fn links(&mut self, links: impl IntoIterator<Item = SpanLink>) {
+        for link in links {
+            self.link(link);
+        }
+    }
+
+    /// Attaches an extra `(key, value)` attribute, alongside this span's `logit.node.op`/
+    /// `events`/identity attributes at drain time -- e.g. `write_loop`'s `("fault", "ambiguous")`
+    /// on a failed delivery.
+    pub fn tag(&mut self, k: &'static str, v: &'static str) {
+        if let Some(span) = &mut self.span {
+            span.tags.push((k, v));
+        }
+    }
+
+    /// Marks this span's status `Error` -- e.g. a sink's `deliver_with_retry` giving up. A span
+    /// that never calls this or [`SpanGuard::ok`] drains as `Ok` (`PendingSpan`'s status starts
+    /// `Ok`, not `Unset`): a node visit that completes without an explicit error is a success,
+    /// the same default every shipped call site relies on.
+    pub fn error(&mut self) {
+        if let Some(span) = &mut self.span {
+            span.status = SpanStatus::Error;
+        }
+    }
+
+    /// Explicitly marks this span's status `Ok` -- rarely needed (see [`SpanGuard::error`]'s doc
+    /// comment on the default), but available so a call site that computes success/failure from a
+    /// branch can say so directly rather than relying on "didn't call `error`."
+    pub fn ok(&mut self) {
+        if let Some(span) = &mut self.span {
+            span.status = SpanStatus::Ok;
+        }
+    }
+
+    /// Finishes this span now, pushing it to its component's buffer -- explicit alternative to
+    /// letting [`Drop`] do the same at the end of this guard's scope, for a call site that wants
+    /// the finish to happen at a precise point rather than implicitly.
+    pub fn finish(mut self) {
+        self.finish_inner();
+    }
+
+    fn finish_inner(&mut self) {
+        let Some(mut span) = self.span.take() else { return };
+        let Some(buf) = self.telemetry.0.as_ref() else { return };
+        // `start + elapsed`, never a second `now_unix_nanos()` read -- see `PendingSpan::started_at`'s
+        // doc comment. `as i64` after `.min(i64::MAX as u128)` is a saturating conversion: a span
+        // living longer than ~292 years is never real, but this must not panic or wrap negative on
+        // the (impossible in practice) day it happens.
+        let elapsed_nanos = span.started_at.elapsed().as_nanos().min(i64::MAX as u128) as i64;
+        span.end = span.start.saturating_add(elapsed_nanos);
+        buf.push_span(span);
+    }
+}
+
+impl Drop for SpanGuard {
+    fn drop(&mut self) {
+        self.finish_inner();
+    }
+}
+
 /// One component's buffer: every point it has recorded since the last [`Registry::drain`],
 /// keyed and coalesced by `(name, tags)`. Not exported -- reached only through [`Telemetry`]
 /// (write side) and [`Registry`] (drain side).
@@ -202,11 +471,71 @@ pub struct ComponentBuffer {
     points: Mutex<HashMap<PointKey, Pending>>,
     /// Distinct keys rejected by the [`MAX_KEYS_PER_COMPONENT`] cap since the last drain.
     dropped: AtomicU64,
+    /// Every span recorded (`SpanGuard::finish`/`Drop`) since the last drain -- a plain `Vec`, not
+    /// a keyed map like `points`: spans are unique by construction (no two node-visits share a
+    /// `span_id`), so there is nothing here to coalesce.
+    spans: Mutex<Vec<PendingSpan>>,
+    /// Spans rejected by the [`MAX_SPANS_PER_COMPONENT`] cap since the last drain.
+    spans_dropped: AtomicU64,
+    /// Copied from [`Registry`] at construction (never changes after) so [`Telemetry::span`]
+    /// never needs a second lock beyond whichever one this buffer's own state already takes --
+    /// process-wide, set once, per graph validation rule 16 guaranteeing at most one `internal`
+    /// component (`crates/logit-pipeline/src/graph.rs`).
+    span_sample_rate: f64,
 }
 
 impl ComponentBuffer {
-    fn new(id: String, kind: &'static str, role: &'static str) -> Self {
-        Self { id, kind, role, points: Mutex::new(HashMap::new()), dropped: AtomicU64::new(0) }
+    fn new(id: String, kind: &'static str, role: &'static str, span_sample_rate: f64) -> Self {
+        Self {
+            id,
+            kind,
+            role,
+            points: Mutex::new(HashMap::new()),
+            dropped: AtomicU64::new(0),
+            spans: Mutex::new(Vec::new()),
+            spans_dropped: AtomicU64::new(0),
+            span_sample_rate,
+        }
+    }
+
+    /// Pushes `span`, dropping and counting it (`logit.internal.spans.dropped{reason=
+    /// "buffer_full"}`, drained alongside the points-side `logit.internal.points.dropped`) past
+    /// [`MAX_SPANS_PER_COMPONENT`] rather than growing this buffer without bound.
+    fn push_span(&self, span: PendingSpan) {
+        let mut spans = self.spans.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if spans.len() >= MAX_SPANS_PER_COMPONENT {
+            drop(spans);
+            self.spans_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        spans.push(span);
+    }
+
+    /// Turns one finished [`PendingSpan`] into its drained `Event`. `name` is built here, not at
+    /// `SpanGuard` construction -- the one place this touches a `String`, off the hot path, since
+    /// it only happens for a span that both got sampled and survived to a drain.
+    fn span_event(&self, span: PendingSpan) -> Event {
+        let mut attrs = AttrMap::new();
+        for (k, v) in &span.tags {
+            attrs.insert(k, *v);
+        }
+        attrs.insert("logit.node.op", span.op);
+        attrs.insert("events", span.events as i64);
+        attrs.insert("component", self.id.as_str());
+        attrs.insert("kind", self.kind);
+        attrs.insert("role", self.role);
+        let record = SpanRecord {
+            trace_id: span.trace_id,
+            span_id: span.span_id,
+            parent_span_id: span.parent_span_id,
+            name: Value::str(format!("{} {}", self.kind, span.op)),
+            kind: span.kind,
+            status: span.status,
+            events: Vec::new(),
+            links: span.links,
+            end_timestamp: span.end,
+        };
+        Event::span(span.start, attrs, record)
     }
 
     fn upsert(
@@ -239,19 +568,31 @@ impl ComponentBuffer {
         attrs
     }
 
-    /// Takes every point buffered since the last call, emitting one [`Event`] per `(name, tags)`
-    /// key, stamped `now`, plus a `logit.internal.points.dropped` counter naming this component
-    /// (`reason = "cardinality"`) if the cap above rejected any new key meanwhile -- self-
-    /// telemetry reporting its own losses, the same convention every mature statsd client follows
-    /// for its own send failures.
+    /// Takes every point and span buffered since the last call, emitting one [`Event`] per
+    /// `(name, tags)` point key plus one per finished span, stamped `now` -- **with one
+    /// exception: a span event's `Event::timestamp` is the span's own `start`, never `now`.**
+    /// `now` is the drain time, not when the work the span records actually happened, and
+    /// `SpanRecord`'s own doc comment already makes `Event::timestamp` the span's start; stamping
+    /// it with the drain time instead would make every span drift later than reality by however
+    /// long it sat in this buffer. Also emits `logit.internal.points.dropped{reason=
+    /// "cardinality"}` and `logit.internal.spans.dropped{reason="buffer_full"}` if either cap
+    /// rejected anything meanwhile -- self-telemetry reporting its own losses, the same
+    /// convention every mature statsd client follows for its own send failures.
     fn drain(&self, now: i64) -> Vec<Event> {
         let points = {
             let mut points = self.points.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             std::mem::take(&mut *points)
         };
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
+        let spans = {
+            let mut spans = self.spans.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *spans)
+        };
+        let spans_dropped = self.spans_dropped.swap(0, Ordering::Relaxed);
 
-        let mut events = Vec::with_capacity(points.len() + usize::from(dropped > 0));
+        let mut events = Vec::with_capacity(
+            points.len() + spans.len() + usize::from(dropped > 0) + usize::from(spans_dropped > 0),
+        );
         for (key, pending) in points {
             // `key.tags` never holds a reserved key at all (filtered out in `PointKey::new`, so a
             // caller-supplied `kind` tag couldn't fragment cardinality against the real one even
@@ -290,6 +631,22 @@ impl ComponentBuffer {
                 },
             ));
         }
+        for span in spans {
+            events.push(self.span_event(span));
+        }
+        if spans_dropped > 0 {
+            let mut attrs = self.base_attrs();
+            attrs.insert("reason", "buffer_full");
+            events.push(Event::metric(
+                now,
+                attrs,
+                MetricRecord {
+                    name: intern("logit.internal.spans.dropped"),
+                    kind: MetricKind::Counter(spans_dropped as f64),
+                    unit: None,
+                },
+            ));
+        }
         events
     }
 }
@@ -300,14 +657,28 @@ impl ComponentBuffer {
 /// itself drains it on its own configured interval. No config with an `internal` component means
 /// no `Registry` is ever built, and every handle stays [`Telemetry::default`] -- see this crate's
 /// `telemetry` module doc for what that guarantees.
-#[derive(Default)]
 pub struct Registry {
     buffers: Mutex<Vec<Arc<ComponentBuffer>>>,
+    /// The `span_sample_rate` every [`ComponentBuffer`] this registry creates is stamped with --
+    /// see [`Registry::with_span_sampling`].
+    span_sample_rate: f64,
 }
 
 impl Registry {
+    /// Same as [`Registry::with_span_sampling`] at [`DEFAULT_SPAN_SAMPLE_RATE`] -- the rate a
+    /// config's `internal` component gets when it doesn't set `span_sample_rate` explicitly.
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Self::with_span_sampling(DEFAULT_SPAN_SAMPLE_RATE)
+    }
+
+    /// Builds a registry whose every component buffer samples spans at `rate` (`0.0..=1.0`,
+    /// [`trace_is_sampled`]) -- process-wide, since graph validation rule 13
+    /// (`crates/logit-pipeline/src/graph.rs`) already guarantees at most one `internal` component
+    /// per config, so there is only ever one rate to set. `crates/logit-cli/src/pipeline.rs::prepare`
+    /// reads this off the config's `internal` component (`ComponentKind::Internal::span_sample_rate`)
+    /// and calls this instead of [`Registry::new`] whenever one exists.
+    pub fn with_span_sampling(rate: f64) -> Arc<Self> {
+        Arc::new(Self { buffers: Mutex::new(Vec::new()), span_sample_rate: rate })
     }
 
     /// Registers a new buffer for component `id` and returns a live handle to it. `kind`/`role`
@@ -328,7 +699,7 @@ impl Registry {
         if let Some(existing) = buffers.iter().find(|buf| buf.id == id) {
             return Telemetry(Some(existing.clone()));
         }
-        let buf = Arc::new(ComponentBuffer::new(id.to_string(), kind, role));
+        let buf = Arc::new(ComponentBuffer::new(id.to_string(), kind, role, self.span_sample_rate));
         buffers.push(buf.clone());
         Telemetry(Some(buf))
     }
@@ -349,6 +720,26 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    // `now_unix_nanos`'s test-only wall-clock override -- see that fn's own doc comment.
+    // `pub(super)` so `now_unix_nanos` (defined in the parent module) can read it; nothing outside
+    // this crate ever sees it, `#[cfg(test)]` on both this module and the read site keeps it out
+    // of a non-test binary entirely.
+    thread_local! {
+        pub(super) static CLOCK_OVERRIDE: Cell<Option<i64>> = const { Cell::new(None) };
+    }
+
+    /// Sets the wall clock `now_unix_nanos()` will report on this thread until
+    /// [`clear_test_clock`] is called -- thread-local, and `cargo nextest` runs each test in its
+    /// own process, so this can't leak into a sibling test.
+    fn set_test_clock(nanos: i64) {
+        CLOCK_OVERRIDE.with(|cell| cell.set(Some(nanos)));
+    }
+
+    fn clear_test_clock() {
+        CLOCK_OVERRIDE.with(|cell| cell.set(None));
+    }
 
     fn tags(pairs: &[Tag]) -> Vec<Tag> {
         pairs.to_vec()
@@ -609,5 +1000,246 @@ mod tests {
             MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 1),
             other => panic!("expected Distribution, got {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Spans
+    // -------------------------------------------------------------------------------------------
+
+    fn trace_id(seed: u8) -> [u8; 16] {
+        let mut id = [0u8; 16];
+        id[15] = seed;
+        id
+    }
+
+    fn span_id(seed: u8) -> [u8; 8] {
+        let mut id = [0u8; 8];
+        id[7] = seed;
+        id
+    }
+
+    /// Test-only trace id generation -- `next_id_bytes` (`crates/logit-pipeline/src/fanout.rs`) is
+    /// a sibling crate's private helper, not reachable here, so this reimplements "many plausible,
+    /// non-degenerate ids" using nothing more exotic than `RandomState`'s own per-call entropy.
+    /// Fine for a distributional test; not a claim about production id quality.
+    fn random_trace_ids(n: usize) -> Vec<[u8; 16]> {
+        use std::hash::{BuildHasher, Hasher};
+        let state = std::collections::hash_map::RandomState::new();
+        (0..n)
+            .map(|i| {
+                let mut high = state.build_hasher();
+                high.write_usize(i);
+                let mut low = state.build_hasher();
+                low.write_usize(i ^ 0xD1B5_4A32_D192_ED03);
+                let mut id = [0u8; 16];
+                id[..8].copy_from_slice(&high.finish().to_be_bytes());
+                id[8..].copy_from_slice(&low.finish().to_be_bytes());
+                id
+            })
+            .collect()
+    }
+
+    fn find_span_event(events: &[Event]) -> Option<&Event> {
+        events.iter().find(|e| e.span.is_some())
+    }
+
+    #[test]
+    fn a_disabled_handle_opens_a_span_that_records_nothing_and_never_reads_the_clock() {
+        let telemetry = Telemetry::default();
+        let mut span = telemetry.span("send", SpanKind::Producer, trace_id(1), span_id(1), None);
+        // Every method is callable and a no-op -- nothing to assert about a clock read directly
+        // (same reasoning as `Timer`'s own disabled test), so this asserts the observable
+        // consequence instead: dropping the guard records nothing (no panic, and this handle has
+        // no buffer to drain in the first place).
+        span.events(3);
+        span.tag("k", "v");
+        span.error();
+        drop(span);
+    }
+
+    #[test]
+    fn an_unsampled_trace_builds_no_span_record_at_all() {
+        let registry = Registry::with_span_sampling(0.0);
+        let telemetry = registry.telemetry_for("x", "x", "transform");
+        let mut span = telemetry.span("process", SpanKind::Internal, trace_id(1), span_id(1), None);
+        span.events(1);
+        drop(span);
+
+        let events = registry.drain(0);
+        assert!(
+            find_span_event(&events).is_none(),
+            "a rate-0.0 registry should never build a span record, got: {events:?}"
+        );
+    }
+
+    #[test]
+    fn the_sampler_gives_the_same_answer_for_the_same_trace_id_every_time() {
+        let id = trace_id(7);
+        let first = trace_is_sampled(&id, 0.37);
+        for _ in 0..100 {
+            assert_eq!(trace_is_sampled(&id, 0.37), first);
+        }
+    }
+
+    #[test]
+    fn a_rate_of_one_keeps_every_trace_and_a_rate_of_zero_keeps_none() {
+        for id in random_trace_ids(200) {
+            assert!(trace_is_sampled(&id, 1.0), "rate 1.0 should keep every trace");
+            assert!(!trace_is_sampled(&id, 0.0), "rate 0.0 should keep no trace");
+        }
+    }
+
+    #[test]
+    fn the_sampler_keeps_roughly_the_configured_fraction_of_ten_thousand_random_trace_ids() {
+        let ids = random_trace_ids(10_000);
+        let rate = 0.25;
+        let kept = ids.iter().filter(|id| trace_is_sampled(id, rate)).count();
+        let fraction = kept as f64 / ids.len() as f64;
+        assert!(
+            (fraction - rate).abs() <= 0.03,
+            "expected roughly {rate} of 10,000 ids sampled, got {fraction} ({kept} kept)"
+        );
+    }
+
+    #[test]
+    fn a_span_beyond_the_per_component_capacity_is_dropped_and_counted_not_grown() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("noisy", "lua", "transform");
+        for i in 0..MAX_SPANS_PER_COMPONENT + 5 {
+            let seed = (i % 256) as u8;
+            drop(telemetry.span(
+                "process",
+                SpanKind::Internal,
+                trace_id(seed),
+                span_id(seed),
+                None,
+            ));
+        }
+
+        let events = registry.drain(0);
+        let span_count = events.iter().filter(|e| e.span.is_some()).count();
+        assert_eq!(span_count, MAX_SPANS_PER_COMPONENT, "the cap, not one more");
+        let dropped = events
+            .iter()
+            .find(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("buffer_full"))
+            .expect("a buffer_full drop counter event should be present");
+        match &dropped.metrics[0].kind {
+            MetricKind::Counter(v) => assert_eq!(*v, 5.0),
+            other => panic!("expected Counter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_drained_span_event_carries_the_spans_own_start_timestamp_not_the_drain_time() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("x", "x", "transform");
+        let before = now_unix_nanos();
+        drop(telemetry.span("process", SpanKind::Internal, trace_id(1), span_id(1), None));
+        let after = now_unix_nanos();
+
+        let events = registry.drain(1);
+        let span_event = find_span_event(&events).expect("a span event should be present");
+        assert!(
+            span_event.timestamp >= before && span_event.timestamp <= after,
+            "expected the span's own start ({before}..={after}), got {}",
+            span_event.timestamp
+        );
+        assert_ne!(span_event.timestamp, 1, "must not be stamped with the drain time");
+    }
+
+    /// The clock-safety guarantee `PendingSpan::started_at`'s doc comment describes, proven
+    /// directly rather than merely asserted after one lucky run: simulates a wall clock that jumps
+    /// backward between a span's start and its finish (an NTP correction, an admin `date` call) via
+    /// `now_unix_nanos`'s test-only override, and shows `end_timestamp` still can't precede
+    /// `Event::timestamp` (the span's own start) -- because `finish_inner` never reads the wall
+    /// clock a second time at all, only `started_at.elapsed()` (`Instant`, monotonic on every
+    /// platform this project ships to). Against a two-independent-`SystemTime::now()`-reads
+    /// version, the exact backward jump below would produce `end < start` every time, not
+    /// occasionally -- this is a structural guarantee, not a timing-dependent one.
+    #[test]
+    fn a_wall_clock_moving_backward_between_start_and_finish_cannot_make_end_precede_start() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("x", "x", "transform");
+
+        set_test_clock(1_000_000_000); // T0: an arbitrary wall-clock start
+        let span = telemetry.span("deliver", SpanKind::Client, trace_id(1), span_id(1), None);
+        // The wall clock jumps backward by a full second while the span is still open -- far
+        // larger than any real elapsed time this test's own execution could add on its own.
+        set_test_clock(0);
+        drop(span);
+        clear_test_clock();
+
+        let events = registry.drain(0);
+        let span_event = find_span_event(&events).expect("a span event should be present");
+        let record = span_event.span.as_ref().expect("span record");
+        assert!(
+            record.end_timestamp >= span_event.timestamp,
+            "end_timestamp ({}) must never precede the span's own start ({}), even across a \
+             backward wall-clock jump",
+            record.end_timestamp,
+            span_event.timestamp
+        );
+    }
+
+    #[test]
+    fn a_drained_span_event_is_stamped_with_component_kind_and_role_like_every_point() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("my_id", "aggregate", "transform");
+        drop(telemetry.span("flush", SpanKind::Internal, trace_id(1), span_id(1), None));
+
+        let events = registry.drain(0);
+        let span_event = find_span_event(&events).expect("a span event should be present");
+        let attrs = &span_event.attributes;
+        assert_eq!(attrs.get("component").and_then(|v| v.as_str()), Some("my_id"));
+        assert_eq!(attrs.get("kind").and_then(|v| v.as_str()), Some("aggregate"));
+        assert_eq!(attrs.get("role").and_then(|v| v.as_str()), Some("transform"));
+        assert_eq!(attrs.get("logit.node.op").and_then(|v| v.as_str()), Some("flush"));
+    }
+
+    #[test]
+    fn links_beyond_the_per_span_cap_are_dropped_and_counted() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("x", "aggregate", "transform");
+        let mut span = telemetry.span("flush", SpanKind::Internal, trace_id(1), span_id(1), None);
+        for i in 0..MAX_LINKS_PER_SPAN + 3 {
+            let seed = (i % 256) as u8;
+            span.link(SpanLink {
+                trace_id: trace_id(seed),
+                span_id: span_id(seed),
+                attributes: AttrMap::new(),
+            });
+        }
+        drop(span);
+
+        let events = registry.drain(0);
+        let span_event = find_span_event(&events).expect("a span event should be present");
+        let record = span_event.span.as_ref().expect("span record");
+        assert_eq!(record.links.len(), MAX_LINKS_PER_SPAN, "the cap, not one more");
+
+        let dropped_count: f64 = events
+            .iter()
+            .filter_map(|e| {
+                e.metrics.iter().find_map(|m| {
+                    (crate::interner::resolve(m.name) == "logit.internal.span.links.dropped")
+                        .then_some(match m.kind {
+                            MetricKind::Counter(v) => v,
+                            _ => 0.0,
+                        })
+                })
+            })
+            .sum();
+        assert_eq!(dropped_count, 3.0, "3 links beyond the cap should be dropped and counted");
+    }
+
+    #[test]
+    fn spans_and_points_drain_together_in_one_call() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("x", "aggregate", "transform");
+        telemetry.count("m", 1.0, &[]);
+        drop(telemetry.span("process", SpanKind::Internal, trace_id(1), span_id(1), None));
+
+        let events = registry.drain(0);
+        assert!(events.iter().any(|e| !e.metrics.is_empty() && e.span.is_none()), "a metric event");
+        assert!(find_span_event(&events).is_some(), "a span event");
     }
 }

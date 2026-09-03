@@ -5,7 +5,7 @@
 //! `MetricKind::GaugeDelta` event -- neither, on its own, proves the two components actually agree
 //! with each other about what a decoded delta looks like. This is that proof, real decoder into
 //! real transform, no synthetic `MetricKind::GaugeDelta` construction anywhere in this file. See
-//! `docs/adr/0024-relative-gauge-adjustments.md`.
+//! `docs/adr/0026-relative-gauge-adjustments.md`.
 
 use bytes::Bytes;
 use logit_core::{MetricKind, Resource};

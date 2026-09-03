@@ -3,6 +3,7 @@
 //! `Buffer` itself is sync (no `.await` in a critical section), so this type owns the one thing a
 //! sync trait can't express: `Block`, which awaits room rather than dropping.
 
+use crate::fanout::TraceContext;
 use logit_core::{EventBatch, Telemetry};
 use logit_proto::buffer::{Buffer, InMemoryBuffer, OverflowPolicy as DropPolicy, PushOutcome};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,7 +53,15 @@ impl Default for SinkQueueConfig {
 /// `std::sync::Mutex`, not tokio's -- every critical section here is a `VecDeque` push/pop with
 /// no `.await` inside it, so the sync mutex is both simpler and cheaper.
 pub struct SinkQueue {
-    inner: Mutex<InMemoryBuffer<Arc<EventBatch>>>,
+    /// Each entry carries its own [`TraceContext`] alongside the batch -- `TraceContext` is
+    /// `Copy`, 24 bytes, so this rides inline in the existing `(item, weight)` slot
+    /// `InMemoryBuffer` already stores; no new allocation, and `EventBatch::estimated_heap_bytes`
+    /// (the byte bound this queue enforces) is unaffected, since it's computed from the batch
+    /// alone. See `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md` for why
+    /// this exists: `write_loop`'s sink span (the only span that can carry `SpanStatus::Error` and
+    /// a retry count) needs the context that arrived with this batch, and `drain_inbox`/`peek`
+    /// were the last place it was still being discarded.
+    inner: Mutex<InMemoryBuffer<(Arc<EventBatch>, TraceContext)>>,
     /// Woken by `push`/`commit` progress -- signals "there might be something to read now" to
     /// `peek`.
     not_empty: Notify,
@@ -124,7 +133,11 @@ impl SinkQueue {
     /// `logit.component.buffer.push.blocked.duration` around the whole wait -- a push that never
     /// had to wait records no sample at all, so the metric isn't muddied by a stream of ~0
     /// durations from the common case.
-    pub async fn push(&self, batch: Arc<EventBatch>) {
+    ///
+    /// `ctx` rides alongside `batch` in the same queue entry (see this type's own doc comment) --
+    /// `write_loop`'s `peek` reads it back to parent the sink's own delivery span on the context
+    /// that actually produced this batch.
+    pub async fn push(&self, batch: Arc<EventBatch>, ctx: TraceContext) {
         let weight = batch.estimated_heap_bytes();
         let impossible_to_ever_fit = weight > self.max_bytes || self.max_batches == 0;
         let mut waited = false;
@@ -145,7 +158,7 @@ impl SinkQueue {
                 {
                     None
                 } else {
-                    let outcome = inner.push(Arc::clone(&batch), weight);
+                    let outcome = inner.push((Arc::clone(&batch), ctx), weight);
                     Some((outcome, inner.len(), inner.weight()))
                 }
             };
@@ -171,10 +184,10 @@ impl SinkQueue {
             }
         };
 
-        for evicted_batch in &evicted {
+        for (evicted_batch, _ctx) in &evicted {
             self.count_dropped("overflow_oldest", evicted_batch);
         }
-        if let Some(rejected_batch) = &rejected {
+        if let Some((rejected_batch, _ctx)) = &rejected {
             self.count_dropped("overflow_newest", rejected_batch);
         }
 
@@ -185,20 +198,21 @@ impl SinkQueue {
         self.update_gauges(len, total_weight);
     }
 
-    /// The head, without removing it -- a cloned `Arc` (a cheap refcount bump), so the caller
-    /// can act on it and only remove it (via [`SinkQueue::commit`]) once that action succeeds.
-    /// Awaits `not_empty` while the queue is empty and open; returns `None` once the queue is
-    /// both closed and empty, checked together under one lock acquisition so a concurrent
-    /// `close()` can never be observed racing a concurrent `push()` -- either the push landed
-    /// before this check took the lock (and is seen), or it didn't (and `closed` becoming true
-    /// afterward is this call's problem on its *next* iteration, not this one).
-    pub async fn peek(&self) -> Option<Arc<EventBatch>> {
+    /// The head, without removing it -- a cloned `Arc` (a cheap refcount bump) plus the `Copy`
+    /// `TraceContext` it was pushed with, so the caller can act on both and only remove the entry
+    /// (via [`SinkQueue::commit`]) once that action succeeds. Awaits `not_empty` while the queue
+    /// is empty and open; returns `None` once the queue is both closed and empty, checked together
+    /// under one lock acquisition so a concurrent `close()` can never be observed racing a
+    /// concurrent `push()` -- either the push landed before this check took the lock (and is
+    /// seen), or it didn't (and `closed` becoming true afterward is this call's problem on its
+    /// *next* iteration, not this one).
+    pub async fn peek(&self) -> Option<(Arc<EventBatch>, TraceContext)> {
         loop {
             let notified = self.not_empty.notified();
             {
                 let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Some(item) = inner.peek() {
-                    return Some(Arc::clone(item));
+                if let Some((item, ctx)) = inner.peek() {
+                    return Some((Arc::clone(item), *ctx));
                 }
                 if self.closed.load(Ordering::Acquire) {
                     return None;
@@ -208,9 +222,11 @@ impl SinkQueue {
         }
     }
 
-    /// Removes and returns the head (a no-op returning `None` on an empty queue), notifies any
-    /// blocked `push` that room may now be available, and refreshes the depth/utilization
-    /// gauges.
+    /// Removes and returns the head's batch (a no-op returning `None` on an empty queue),
+    /// notifies any blocked `push` that room may now be available, and refreshes the
+    /// depth/utilization gauges. Drops the committed entry's `TraceContext` -- nothing downstream
+    /// of a commit (counting a delivered/dropped batch) needs it; a caller that does should have
+    /// already read it from the matching [`SinkQueue::peek`] first.
     pub fn commit(&self) -> Option<Arc<EventBatch>> {
         let (item, len, weight) = {
             let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -219,7 +235,7 @@ impl SinkQueue {
         };
         self.not_full.notify_one();
         self.update_gauges(len, weight);
-        item
+        item.map(|(batch, _ctx)| batch)
     }
 
     /// Marks the queue closed: no more items will ever arrive, so once it's also empty,
@@ -244,7 +260,11 @@ impl SinkQueue {
         self.not_full.notify_waiters();
     }
 
-    fn would_overflow(&self, inner: &InMemoryBuffer<Arc<EventBatch>>, weight: u64) -> bool {
+    fn would_overflow(
+        &self,
+        inner: &InMemoryBuffer<(Arc<EventBatch>, TraceContext)>,
+        weight: u64,
+    ) -> bool {
         inner.len() >= self.max_batches || inner.weight() + weight > self.max_bytes
     }
 
@@ -306,14 +326,27 @@ mod tests {
         SinkQueue::new(SinkQueueConfig { max_batches, max_bytes, overflow }, Telemetry::default())
     }
 
+    /// Every test in this module pushes under a placeholder context -- none of them exercise
+    /// `TraceContext` propagation itself (`fanout.rs`/`runtime.rs`'s tests do that); this queue
+    /// only needs to carry whatever it was given back out again unchanged, which `push_then_
+    /// peek_then_commit_round_trips_one_batch` below proves directly with a real, non-default one.
+    fn ctx() -> TraceContext {
+        TraceContext::default()
+    }
+
     #[tokio::test]
     async fn push_then_peek_then_commit_round_trips_one_batch() {
         let q = queue(10, u64::MAX, OverflowPolicy::Block);
         let sent = tiny_batch();
-        q.push(Arc::clone(&sent)).await;
+        let sent_ctx = TraceContext::new_root();
+        q.push(Arc::clone(&sent), sent_ctx).await;
 
-        let peeked = q.peek().await.expect("should peek the pushed batch");
+        let (peeked, peeked_ctx) = q.peek().await.expect("should peek the pushed batch");
         assert!(Arc::ptr_eq(&peeked, &sent));
+        assert_eq!(
+            peeked_ctx, sent_ctx,
+            "the context pushed with a batch should come back unchanged"
+        );
 
         let committed = q.commit().expect("should commit the pushed batch");
         assert!(Arc::ptr_eq(&committed, &sent));
@@ -324,10 +357,10 @@ mod tests {
     async fn peek_without_commit_called_twice_returns_the_same_batch_both_times() {
         let q = queue(10, u64::MAX, OverflowPolicy::Block);
         let sent = tiny_batch();
-        q.push(Arc::clone(&sent)).await;
+        q.push(Arc::clone(&sent), ctx()).await;
 
-        let first = q.peek().await.expect("should peek");
-        let second = q.peek().await.expect("should peek again");
+        let (first, _) = q.peek().await.expect("should peek");
+        let (second, _) = q.peek().await.expect("should peek again");
         assert!(Arc::ptr_eq(&first, &sent));
         assert!(Arc::ptr_eq(&second, &sent));
     }
@@ -336,11 +369,11 @@ mod tests {
     async fn under_block_a_push_that_must_wait_for_room_completes_once_a_concurrent_commit_frees_space(
     ) {
         let q = Arc::new(queue(1, u64::MAX, OverflowPolicy::Block));
-        q.push(tiny_batch()).await; // fills the one slot
+        q.push(tiny_batch(), ctx()).await; // fills the one slot
 
         let q2 = Arc::clone(&q);
         let blocked = tokio::spawn(async move {
-            q2.push(tiny_batch()).await;
+            q2.push(tiny_batch(), ctx()).await;
         });
 
         // Give the spawned push a chance to run and park on `not_full`.
@@ -361,9 +394,9 @@ mod tests {
         let a = tiny_batch();
         let b = tiny_batch();
         let c = tiny_batch();
-        q.push(Arc::clone(&a)).await;
-        q.push(Arc::clone(&b)).await;
-        q.push(Arc::clone(&c)).await; // evicts `a`
+        q.push(Arc::clone(&a), ctx()).await;
+        q.push(Arc::clone(&b), ctx()).await;
+        q.push(Arc::clone(&c), ctx()).await; // evicts `a`
 
         let first = q.commit().expect("should commit");
         assert!(Arc::ptr_eq(&first, &b), "the oldest batch (a) should never appear");
@@ -383,13 +416,13 @@ mod tests {
         let a = tiny_batch();
         let b = tiny_batch();
         let c = tiny_batch();
-        q.push(Arc::clone(&a)).await;
-        q.push(Arc::clone(&b)).await;
+        q.push(Arc::clone(&a), ctx()).await;
+        q.push(Arc::clone(&b), ctx()).await;
 
-        let peeked = q.peek().await.expect("should peek a"); // reserves `a`
+        let (peeked, _) = q.peek().await.expect("should peek a"); // reserves `a`
         assert!(Arc::ptr_eq(&peeked, &a));
 
-        q.push(Arc::clone(&c)).await; // must evict `b`, never the reserved `a`
+        q.push(Arc::clone(&c), ctx()).await; // must evict `b`, never the reserved `a`
 
         let committed = q.commit().expect("should commit the batch that was actually peeked/sent");
         assert!(
@@ -411,7 +444,7 @@ mod tests {
         let weight = oversized.estimated_heap_bytes();
         let q = queue(1000, weight - 1, OverflowPolicy::Block); // one byte too small, always
 
-        tokio::time::timeout(Duration::from_secs(5), q.push(oversized))
+        tokio::time::timeout(Duration::from_secs(5), q.push(oversized, ctx()))
             .await
             .expect("a batch that can never fit must be accepted immediately, not block forever");
 
@@ -427,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn under_block_a_zero_max_batches_config_does_not_hang_a_push() {
         let q = queue(0, u64::MAX, OverflowPolicy::Block);
-        tokio::time::timeout(Duration::from_secs(5), q.push(tiny_batch()))
+        tokio::time::timeout(Duration::from_secs(5), q.push(tiny_batch(), ctx()))
             .await
             .expect("max_batches: 0 must not permanently block every push");
     }
@@ -438,9 +471,9 @@ mod tests {
         let a = tiny_batch();
         let b = tiny_batch();
         let c = tiny_batch();
-        q.push(Arc::clone(&a)).await;
-        q.push(Arc::clone(&b)).await;
-        q.push(c).await; // rejected -- queue contents unchanged
+        q.push(Arc::clone(&a), ctx()).await;
+        q.push(Arc::clone(&b), ctx()).await;
+        q.push(c, ctx()).await; // rejected -- queue contents unchanged
 
         let first = q.commit().expect("should commit");
         assert!(Arc::ptr_eq(&first, &a));
@@ -461,9 +494,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(!peeking.is_finished(), "peek should still be waiting on an empty queue");
 
-        q.push(sent2).await;
+        q.push(sent2, ctx()).await;
 
-        let peeked = tokio::time::timeout(Duration::from_secs(1), peeking)
+        let (peeked, _) = tokio::time::timeout(Duration::from_secs(1), peeking)
             .await
             .expect("peek should resolve once a batch is pushed")
             .expect("the spawned task should not panic")
@@ -499,10 +532,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_max_batches_bound_independently_gates_blocks_wait() {
         let q = Arc::new(queue(1, u64::MAX, OverflowPolicy::Block));
-        q.push(tiny_batch()).await;
+        q.push(tiny_batch(), ctx()).await;
 
         let q2 = Arc::clone(&q);
-        let blocked = tokio::spawn(async move { q2.push(tiny_batch()).await });
+        let blocked = tokio::spawn(async move { q2.push(tiny_batch(), ctx()).await });
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(!blocked.is_finished(), "a full batch count alone should be enough to block");
 
@@ -521,10 +554,10 @@ mod tests {
         let first = batch(64);
         let weight = first.estimated_heap_bytes();
         let q = Arc::new(queue(1000, weight, OverflowPolicy::Block));
-        q.push(first).await;
+        q.push(first, ctx()).await;
 
         let q2 = Arc::clone(&q);
-        let blocked = tokio::spawn(async move { q2.push(batch(64)).await });
+        let blocked = tokio::spawn(async move { q2.push(batch(64), ctx()).await });
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(!blocked.is_finished(), "the byte bound alone should be enough to block");
 

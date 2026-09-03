@@ -149,7 +149,7 @@ event summing together; a kind conflict leaving only the conflicting metric behi
 
 ## Amendment: gauge series carry across the window boundary
 
-[ADR 0024](0024-relative-gauge-adjustments.md) adds `MetricKind::GaugeDelta`, a relative gauge
+[ADR 0026](0026-relative-gauge-adjustments.md) adds `MetricKind::GaugeDelta`, a relative gauge
 adjustment (statsd/DogStatsD's leading `+`/`-`) that `aggregate` resolves against a gauge's running
 value. But a statsd gauge is sticky by protocol -- the sender transmits only on change and expects
 the last value to persist -- so a delta arriving in window *N+1* has to apply against window *N*'s

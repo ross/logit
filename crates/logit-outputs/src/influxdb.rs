@@ -291,7 +291,7 @@ impl Encoder for InfluxLineEncoder {
                     // A `GaugeDelta` reaching a sink is a distinct, greppable failure mode from an
                     // ordinary encode error -- it means the pipeline is missing an `aggregate`
                     // component, not that this particular metric is malformed. See
-                    // `docs/adr/0024-relative-gauge-adjustments.md`.
+                    // `docs/adr/0026-relative-gauge-adjustments.md`.
                     let key = if matches!(metric.kind, MetricKind::GaugeDelta(_)) {
                         "gauge_delta_unresolved"
                     } else {
@@ -854,7 +854,7 @@ mod tests {
     }
 
     /// A `GaugeDelta` reaching this encoder means the pipeline is missing an `aggregate`
-    /// component (`docs/adr/0024-relative-gauge-adjustments.md`) -- it must be dropped, not
+    /// component (`docs/adr/0026-relative-gauge-adjustments.md`) -- it must be dropped, not
     /// written as though it were an absolute value, and its sibling metric in the same batch must
     /// still come through untouched, matching `set_metrics_are_skipped_not_fatal` above.
     #[test]
