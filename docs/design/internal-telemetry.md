@@ -45,6 +45,30 @@ components:
 Nothing downstream needs to know it's looking at telemetry rather than user data. `keep`, `lua`,
 any sink — all already work.
 
+## Resource identity
+
+Every batch `internal` sends carries `service.name = logit` on its `Arc<Resource>`
+(`crates/logit-inputs/src/internal.rs`), built once in `InternalInput::new` since the resource is
+batch-level and identical on every tick. This is what lets an OTLP backend (Tempo, in the demo)
+resolve a root span's service — without it, a trace's root span still arrives, but with no
+`service.name` to show, which is a *different* failure than a missing span and easy to mistake for
+one: Grafana's Traces Drilldown renders it as `<root span not yet received>` either way.
+
+`internal` is the one input allowed to make this claim. `service.name` names *the producer* of the
+telemetry, not the source of the data: `internal`'s telemetry genuinely is `logit`'s own, so it can
+honestly say so. `syslog_in`/`statsd_in`, by contrast, always use `Resource::default()` — data they
+ingest belongs to whatever service sent it (one statsd listener may well serve several), so
+stamping `logit` there would misattribute it. `otlp_in` gets this for free: it preserves whatever
+resource the sender attached, rather than manufacturing one.
+
+`influx_out` also sources `self` in the demo, and its encoder folds resource attributes into
+InfluxDB tags (`crates/logit-outputs/src/influxdb.rs`'s `render_tag_suffix`) — so this attribute is
+also a tag on every `logit.*` series. That's why it's `service.name` alone and not
+`service.version`: a constant tag is a one-time, harmless addition to series identity, but a
+version would re-key every series on each release. `otel.scope.version` on the OTLP instrumentation
+scope (`crates/logit-proto/src/otlp/common.rs`'s `logit_scope`) already carries that information on
+the trace side without that cost.
+
 ## The emit API
 
 `logit_core::telemetry::Telemetry` is a component's handle, mirroring `Diagnostics`'s shape:

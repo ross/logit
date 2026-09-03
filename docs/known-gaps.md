@@ -531,6 +531,23 @@ already built that have a known, accepted rough edge.
        entry (`push`/`peek`) so `write_loop` can parent its own sink span on the context a batch
        actually arrived under — the same size-for-a-span trade `Delivered` itself already made and
        measured (`docs/design/memory.md`'s "Costing internal spans" section).
+    4. **`service.name` is the only resource identity `internal` sets** (`docs/design/internal-telemetry.md`'s
+       "Resource identity" section) — its `Resource` has no `host.name`/`service.instance.id`,
+       which would be the semconv-correct next attributes for disambiguating multiple `logit`
+       instances in Tempo. Neither is added yet because there is no OS-hostname source anywhere in
+       the workspace (`SyslogEncoder::default_hostname`, `crates/logit-outputs/src/syslog.rs`, is
+       config-supplied, not OS-derived) — deferred pending that dependency rather than added as a
+       one-off.
+    5. **The demo's Tempo service graph panel has nothing to show.** It needs Tempo's
+       `metrics_generator` (`service-graphs`/`span-metrics` processors) enabled with
+       `remote_write` to a Prometheus-compatible store, that store added as a Grafana datasource,
+       and `serviceMap.datasourceUid` set on the Tempo datasource — none of which
+       `demo/compose.yaml`/`demo/tempo/tempo.yaml` have. Even wired up, today's demo traces are all
+       single-service (`internal`'s own spans; `hello` sends plain syslog, not OTLP), so the graph
+       would show one degenerate node — not worth the added stack pieces until the demo has a real
+       cross-service trace to draw. Worth exploring later whether `logit` itself should compute a
+       service graph as a component, rather than depending on external `metrics_generator`
+       infrastructure to do it — unexplored, no decision made.
   - **Internal logs** — routing `Diagnostics`' stderr output into the graph as `LogRecord` events
     is the natural next layer, and what the still-deferred `tracing` migration (above) should build
     on rather than duplicate.
