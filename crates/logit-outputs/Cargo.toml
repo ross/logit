@@ -22,6 +22,14 @@ http.workspace = true
 http-body-util.workspace = true
 # otlp_out's optional gzip request compression (docs/adr/otlp-compression-and-decompression-bounds.md).
 flate2.workspace = true
+# TLS for otlp_out, both transports (docs/adr/otlp-tls-and-pooled-grpc-client.md): `rustls`/
+# `rustls-pki-types` build a `rustls::ClientConfig` from config-supplied PEM; `hyper-rustls` wraps
+# `hyper-util`'s pooled client (the gRPC transport's connection manager) in it; `webpki-roots` is
+# the same bundled Mozilla trust root the HTTP transport already gets from `reqwest` by default.
+rustls.workspace = true
+rustls-pki-types.workspace = true
+hyper-rustls.workspace = true
+webpki-roots.workspace = true
 # A real (non-dev) dependency: `StdioOutput` (`stdio.rs`) writes via `tokio::io`/`tokio::fs`.
 # `InfluxDbOutput::send` no longer retries on its own (that moved to `logit-pipeline`'s generic
 # writer, `docs/adr/buffered-sink-delivery.md`) and so no longer needs `tokio::time` itself.
@@ -36,3 +44,7 @@ logit-script.workspace = true
 # hand-building an event, so the attribute names/types it asserts against can't drift from what
 # `syslog_in` actually produces.
 logit-inputs.workspace = true
+# otlp.rs's canned TLS test servers -- wraps the existing canned plaintext HTTP/gRPC servers in a
+# `tokio_rustls::TlsAcceptor` so otlp_out's TLS client code has something real to test against
+# with no external service.
+tokio-rustls.workspace = true

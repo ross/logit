@@ -358,7 +358,11 @@ already built that have a known, accepted rough edge.
   that contained a real newline. Accepted in `docs/adr/syslog-output.md`.
 - **`syslog_out` has no TLS** — plaintext UDP/TCP only; RFC 5425 (syslog over TLS) and RFC 6012
   (DTLS) are both out of scope. A `logit -> remote collector` hop over an untrusted network has no
-  transport security today.
+  transport security today. `otlp_out`/`otlp_in` gained `tls:` config
+  ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)) via a
+  `TlsClientConfig`/`TlsServerConfig` pair in `logit-config` designed to be reusable by any other
+  protocol — `syslog_out`'s own TLS support, if it lands, is a config-plumbing exercise against
+  those same types, not a design decision to redo.
 - **`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
   per-message framing** — `syslog_out` needs one UDP datagram or one octet-counted TCP frame per
   *message*, which one opaque `Bytes` per *batch* can't express, so it bypasses the trait entirely
@@ -720,20 +724,6 @@ already built that have a known, accepted rough edge.
   itself. `demo/logit.yaml`'s `trace_only`/`trace_out` components carry this same explanation
   inline.
 
-- **`otlp_out` has no gRPC TLS** —
-  found evaluating whether it could replace the demo's `syslog_out` → Alloy → Loki log leg
-  ([docs/plans/otlp-logs-and-resource-identity.md](plans/otlp-logs-and-resource-identity.md)'s
-  workstream E; every other item that entry found — the per-signal filter, custom headers,
-  configurable per-signal paths, `observed_time_unix_nano`, and compression — is fixed; see
-  [docs/plans/signal-filtering-and-otlp-out-config-gaps.md](plans/signal-filtering-and-otlp-out-config-gaps.md)).
-  `reject_insecure_grpc_endpoint` (`crates/logit-outputs/src/otlp.rs`) hard-rejects `https://`
-  under `protocol: grpc` rather than supporting it — this output's hand-rolled gRPC transport has
-  no TLS support at all ([ADR `hand-rolled-grpc-over-hyper`](adr/hand-rolled-grpc-over-hyper.md)).
-  Doesn't block the demo (single-tenant, plaintext gRPC to Tempo); blocks a real deployment against
-  any gRPC endpoint that requires TLS. A `tokio-rustls` layer in the hand-rolled client (already a
-  transitive dependency via `reqwest`, per that ADR's precedent for promoting one to direct) would
-  close this — its own workstream, not attempted here.
-
 - **No mechanism exists anywhere in `logit` to attach a static attribute to a batch's resource** —
   found in the same investigation
   ([docs/plans/otlp-logs-and-resource-identity.md](plans/otlp-logs-and-resource-identity.md),
@@ -747,17 +737,18 @@ already built that have a known, accepted rough edge.
   operator configuring the pipeline declares one" (fine, same category as `syslog_out`'s existing
   `hostname`/`app_name` fields) — plus the demo-stack workstreams (B, C, D) it would unblock.
 
-- **`otlp_out`'s gRPC transport opens a fresh connection per request, never pooled.** Every gRPC
-  `send` (`crates/logit-outputs/src/otlp.rs`'s `grpc_roundtrip`) connects, performs a fresh HTTP/2
-  handshake, sends exactly one framed request, reads the response, then drops the connection —
-  leaving its spawned connection-driver task to exit once the drop is observed. A mixed-signal
-  batch pays connect+handshake three times; a steady stream of batches pays it once per signal per
-  batch, where the HTTP transport gets `reqwest`'s connection pooling for free. Deliberate for this
-  PR, not an oversight: [ADR `hand-rolled-grpc-over-hyper`](adr/hand-rolled-grpc-over-hyper.md) is explicit about
-  keeping the hand-rolled gRPC surface minimal (the three unary `Export` RPCs, nothing else), and a
-  real connection pool — reuse keyed by endpoint, handling a server-initiated GOAWAY, concurrent
-  in-flight streams over one connection — is real infrastructure `tonic`/`hyper-util`'s own client
-  pooling would normally supply. Worth revisiting if `otlp_out`'s gRPC transport shows up as a
-  bottleneck under sustained load (connect+TLS-less-handshake cost per request, not per batch of
-  requests); until then this is a documented, deliberate simplicity-over-throughput trade, not a
-  silent one.
+- **TLS certificates (`otlp_out`'s `tls:`, `otlp_in`'s `tls:`) are loaded once at startup; rotation
+  needs a restart.** `OtlpOutput::with_tls`/`OtlpInput::with_tls`
+  (`crates/logit-outputs/`/`crates/logit-inputs/src/otlp.rs`) read every PEM file at construction
+  time (`logit run` startup) and build a static `rustls::ClientConfig`/`ServerConfig` from it — a
+  renewed certificate (a 90-day Let's Encrypt cert, a `cert-manager`-issued one) has no effect until
+  the process restarts. [ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)
+  files this as deliberately out of scope; closing it means `rustls::ServerConfig`'s
+  `ResolvesServerCert` (a file-watcher hook) on the server side, or an equivalent reload on the
+  client side, either behind a SIGHUP or a poll.
+- **`otlp_out`'s TLS client has no `server_name` override.** Useful when an endpoint is reached by
+  IP or through a proxy whose certificate names something else (OTel's own
+  `tls.server_name_override` knob). Cheap to add via `hyper-rustls`'s
+  `HttpsConnectorBuilder::with_server_name_resolver` and an equivalent override on the `reqwest`
+  side; left out of the initial TLS work to keep it small
+  ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)).

@@ -87,11 +87,68 @@ pub enum OtlpProtocol {
     /// would be silently wrong under any other default.
     #[default]
     Http,
-    /// Unary gRPC over plaintext HTTP/2 -- `crates/logit-outputs/src/otlp.rs`'s hand-rolled gRPC
-    /// transport has no TLS support at all (`docs/adr/hand-rolled-grpc-over-hyper.md`), so an
-    /// `otlp_out` component's `endpoint` under this protocol is rejected at construction time if
-    /// it's written with an `https://` scheme, rather than silently exporting in plaintext.
+    /// Unary gRPC over HTTP/2 -- plaintext (`http://`/`grpc://`) or TLS (`https://`), selected by
+    /// `endpoint`'s scheme (`docs/adr/otlp-tls-and-pooled-grpc-client.md`). `otlp_out`'s `tls:`
+    /// block tunes the TLS case.
     Grpc,
+}
+
+/// Client-side TLS tuning for `otlp_out` (`tls:` in config). On the HTTP transport, TLS itself is
+/// already selected by the endpoint's `https://` scheme, matching every OTel SDK's
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` convention; on the gRPC transport, an `https://` endpoint now
+/// also means TLS (`docs/adr/otlp-tls-and-pooled-grpc-client.md` -- this used to be rejected
+/// outright, since the hand-rolled gRPC client had no TLS support at all). This block only tunes
+/// an already-TLS connection -- a non-default value under a plain `http://`/`grpc://` endpoint is
+/// rejected at config-validation time (rule 22) rather than silently ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TlsClientConfig {
+    /// PEM bundle of CA certificates to trust *instead of* the bundled Mozilla root set. Path is
+    /// resolved relative to the config file's own directory, same as `lua_file`/`stdio_out`'s
+    /// `path`. A plain string, so `!env` works on it (ADR `env-yaml-tag`) if the certificate
+    /// itself needs to come from the environment rather than a mounted file.
+    #[serde(default)]
+    pub ca_file: Option<String>,
+    /// Client certificate chain (PEM) presented for mutual TLS. Requires `key_file`; rejected at
+    /// config-validation time if set without it (rule 22).
+    #[serde(default)]
+    pub cert_file: Option<String>,
+    /// Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`. Requires `cert_file`.
+    #[serde(default)]
+    pub key_file: Option<String>,
+    /// Disables server-certificate verification entirely -- the connection is still encrypted,
+    /// but accepts any certificate the peer presents, self-signed or otherwise. A startup warning
+    /// is logged whenever this is `true`. Never the default; meant for a throwaway or
+    /// pre-production endpoint, not a real deployment. Contradictory (and rejected) together with
+    /// `ca_file` -- a trusted CA and "trust nothing" can't both be meant at once.
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+}
+
+impl TlsClientConfig {
+    /// `true` if every field is at its default -- rule 22's "did the operator actually set a
+    /// `tls:` block" check, the same shape as [`OtlpPaths::is_empty`].
+    pub fn is_empty(&self) -> bool {
+        self.ca_file.is_none()
+            && self.cert_file.is_none()
+            && self.key_file.is_none()
+            && !self.insecure_skip_verify
+    }
+}
+
+/// Server-side TLS for `otlp_in` (`tls:` in config). Its mere presence on a listener turns TLS on
+/// for that component -- there is no separate on/off flag. See [`TlsClientConfig`] for the file
+/// path resolution rule and `!env` compatibility, both identical here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TlsServerConfig {
+    /// Certificate chain (PEM) this listener presents to every client.
+    pub cert_file: String,
+    /// Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`.
+    pub key_file: String,
+    /// PEM bundle of CAs. When set, every connecting client must present a certificate chaining
+    /// to one of them (mutual TLS) -- absent, any client is accepted once the TLS handshake
+    /// itself completes.
+    #[serde(default)]
+    pub client_ca_file: Option<String>,
 }
 
 /// Whether `otlp_out` gzips its request bodies -- both transports (HTTP `Content-Encoding: gzip`,
@@ -193,6 +250,10 @@ pub enum ComponentKind {
         bind: String,
         #[serde(default)]
         protocol: OtlpProtocol,
+        /// Terminates TLS on this listener (both `protocol: http` and `protocol: grpc`) when
+        /// present; plaintext when omitted. See [`TlsServerConfig`].
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
     },
     /// Tail one or more files as a log source, rotation- and checkpoint-aware.
     FileTail {
@@ -400,6 +461,11 @@ pub enum ComponentKind {
         /// against a bandwidth-constrained link.
         #[serde(default)]
         compression: OtlpCompression,
+        /// Tunes TLS on an `https://` endpoint -- see [`TlsClientConfig`]. A non-default value
+        /// under a plain `http://`/`grpc://` endpoint is a config error (rule 22), not silently
+        /// ignored.
+        #[serde(default)]
+        tls: TlsClientConfig,
     },
     /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
     LogitOut {
@@ -1328,12 +1394,13 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::OtlpOut { endpoint, protocol, headers, paths, compression } => {
+            ComponentKind::OtlpOut { endpoint, protocol, headers, paths, compression, tls } => {
                 assert_eq!(endpoint, "http://tempo:4318");
                 assert_eq!(protocol, OtlpProtocol::Http);
                 assert!(headers.is_empty());
                 assert!(paths.is_empty());
                 assert_eq!(compression, OtlpCompression::None);
+                assert_eq!(tls, TlsClientConfig::default());
             }
             other => panic!("expected OtlpOut, got {other:?}"),
         }
@@ -1393,11 +1460,48 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::OtlpIn { bind, protocol } => {
+            ComponentKind::OtlpIn { bind, protocol, tls } => {
                 assert_eq!(bind, "0.0.0.0:4317");
                 assert_eq!(protocol, OtlpProtocol::Grpc);
+                assert_eq!(tls, None);
             }
             other => panic!("expected OtlpIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otlp_out_tls_defaults_to_empty_and_can_be_set() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_out", "sources": ["in"], "endpoint": "https://tempo:4317",
+                "protocol": "grpc",
+                "tls": {"ca_file": "ca.pem", "cert_file": "client.pem", "key_file": "client.key"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpOut { tls, .. } => {
+                assert_eq!(tls.ca_file, Some("ca.pem".to_string()));
+                assert_eq!(tls.cert_file, Some("client.pem".to_string()));
+                assert_eq!(tls.key_file, Some("client.key".to_string()));
+                assert!(!tls.insecure_skip_verify);
+            }
+            other => panic!("expected OtlpOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otlp_in_tls_defaults_to_none_and_can_be_set() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_in", "bind": "0.0.0.0:4317", "protocol": "grpc",
+                "tls": {"cert_file": "server.pem", "key_file": "server.key"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpIn { tls: Some(tls), .. } => {
+                assert_eq!(tls.cert_file, "server.pem");
+                assert_eq!(tls.key_file, "server.key");
+                assert_eq!(tls.client_ca_file, None);
+            }
+            other => panic!("expected OtlpIn with tls set, got {other:?}"),
         }
     }
 

@@ -38,7 +38,12 @@ The remaining in-scope `otlp_out` items — custom headers, gzip compression, co
 paths, and `observed_time_unix_nano` — are ordinary config surface: none blocks the demo, all block
 a real deployment. **gRPC TLS is out of scope** and stays a filed known gap; it needs a
 `tokio-rustls` layer in the hand-rolled gRPC client and amends ADR `hand-rolled-grpc-over-hyper`,
-which is its own workstream.
+which is its own workstream. **Landed** in
+[docs/plans/otlp-tls.md](otlp-tls.md) / [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md)
+— TLS on both `otlp_out` transports and `otlp_in`, plus mutual TLS; the gRPC client's connection
+management moved to a pooled `hyper-util`/`hyper-rustls` client rather than layering `tokio-rustls`
+onto the per-request hand-rolled connect this plan sketched, closing the "opens a fresh connection
+per request" gap as a side effect.
 
 ## Decisions already settled
 

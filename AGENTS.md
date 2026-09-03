@@ -71,9 +71,13 @@ see [ADR `internal-span-emission-and-deterministic-sampling`](docs/adr/internal-
 `internal-telemetry.md`'s "Spans" section. `docs/known-gaps.md`'s internal-spans entry tracks what's
 still open (the listener span's window, Lua `flush()`'s link-less root). `otlp_out` is what carries
 those spans, and the `internal` metrics alongside them, out over the wire (both OTLP/HTTP and
-OTLP/gRPC, a hand-rolled unary gRPC client/server over `hyper` rather than `tonic`,
-[ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md)); `otlp_in` is the mirror, implemented and
-tested but not yet exercised by the demo. `demo/`'s `trace_out` proves the whole chain against a
+OTLP/gRPC -- gRPC framing is a hand-rolled service over `hyper` rather than `tonic`
+([ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md)), but its client-side
+connection management is a pooled, TLS-capable `hyper-util`/`hyper-rustls` client, not a
+per-request hand-rolled connect; both `otlp_out` and `otlp_in` support TLS (`tls:` in config,
+private CAs and mutual TLS included) on both transports, selected by the endpoint's scheme
+([ADR `otlp-tls-and-pooled-grpc-client`](docs/adr/otlp-tls-and-pooled-grpc-client.md))); `otlp_in`
+is the mirror, implemented and tested but not yet exercised by the demo. `demo/`'s `trace_out` proves the whole chain against a
 real Tempo, exactly the way `log_out` proves `syslog_out` against a real Loki. `statsd_in`/`syslog_in`
 (`crates/logit-inputs/src/statsd.rs`/`syslog.rs`) are now thin wrappers over a shared
 `logit-inputs::udp::UdpListener` driver: a UDP listener's socket read and its decode/batch-assembly

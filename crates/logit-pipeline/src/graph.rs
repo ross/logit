@@ -573,6 +573,39 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 22: `otlp_out`'s `tls:` block. `cert_file`/`key_file` must be set together -- a lone
+    // one is almost certainly a typo, not a deliberate half-configured mTLS. `insecure_skip_verify`
+    // together with `ca_file` is contradictory -- "trust this CA" and "trust nothing, verify
+    // nothing" can't both be meant. And a non-empty `tls:` under a plain `http://`/`grpc://`
+    // endpoint is rejected outright, the same instinct as rule 14's `buffer:` on a non-sink and
+    // rule 21's `paths:` under `protocol: grpc` -- TLS is selected by the endpoint's scheme
+    // (`docs/adr/otlp-tls-and-pooled-grpc-client.md`), so a `tls:` block with nothing to tune
+    // would otherwise be silently ignored rather than caught as a likely mistake.
+    for (id, component) in &components {
+        if let ComponentKind::OtlpOut { endpoint, tls, .. } = &component.kind {
+            if tls.cert_file.is_some() != tls.key_file.is_some() {
+                anyhow::bail!(
+                    "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
+                     mutual TLS, or both omitted -- one alone can't be used"
+                );
+            }
+            if tls.insecure_skip_verify && tls.ca_file.is_some() {
+                anyhow::bail!(
+                    "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both \
+                     be set -- 'insecure_skip_verify' trusts any certificate, which makes a \
+                     specific trusted CA meaningless"
+                );
+            }
+            if !tls.is_empty() && !endpoint.to_ascii_lowercase().starts_with("https://") {
+                anyhow::bail!(
+                    "component '{id}': 'tls' is set, but 'endpoint' ({endpoint:?}) isn't \
+                     'https://' -- TLS is selected by the endpoint's scheme, so a 'tls:' block \
+                     here would have no effect"
+                );
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         let Component { sources, buffer, receive, kind } = component;
@@ -1105,6 +1138,7 @@ mod tests {
             headers: headers.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             paths: logit_config::OtlpPaths::default(),
             compression: logit_config::OtlpCompression::default(),
+            tls: logit_config::TlsClientConfig::default(),
         }
     }
 
@@ -1118,6 +1152,18 @@ mod tests {
             headers: Map::new(),
             paths,
             compression: logit_config::OtlpCompression::default(),
+            tls: logit_config::TlsClientConfig::default(),
+        }
+    }
+
+    fn otlp_out_with_tls(endpoint: &str, tls: logit_config::TlsClientConfig) -> ComponentKind {
+        ComponentKind::OtlpOut {
+            endpoint: endpoint.to_string(),
+            protocol: logit_config::OtlpProtocol::Grpc,
+            headers: Map::new(),
+            paths: logit_config::OtlpPaths::default(),
+            compression: logit_config::OtlpCompression::default(),
+            tls,
         }
     }
 
@@ -1203,6 +1249,87 @@ mod tests {
                     logit_config::OtlpProtocol::Grpc,
                     logit_config::OtlpPaths::default(),
                 ),
+            ),
+        ]))
+        .expect("should resolve");
+    }
+
+    #[test]
+    fn an_otlp_out_with_a_full_tls_block_under_https_resolves_fine() {
+        let tls = logit_config::TlsClientConfig {
+            ca_file: Some("ca.pem".to_string()),
+            cert_file: Some("client.pem".to_string()),
+            key_file: Some("client.key".to_string()),
+            insecure_skip_verify: false,
+        };
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], otlp_out_with_tls("https://tempo:4317", tls)),
+        ]))
+        .expect("should resolve");
+    }
+
+    #[test]
+    fn an_otlp_out_with_cert_file_but_no_key_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            cert_file: Some("client.pem".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], otlp_out_with_tls("https://tempo:4317", tls)),
+        ]));
+        assert!(err.contains("cert_file") && err.contains("key_file"), "got: {err}");
+    }
+
+    #[test]
+    fn an_otlp_out_with_key_file_but_no_cert_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            key_file: Some("client.key".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], otlp_out_with_tls("https://tempo:4317", tls)),
+        ]));
+        assert!(err.contains("cert_file") && err.contains("key_file"), "got: {err}");
+    }
+
+    #[test]
+    fn an_otlp_out_with_insecure_skip_verify_and_ca_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            ca_file: Some("ca.pem".to_string()),
+            insecure_skip_verify: true,
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], otlp_out_with_tls("https://tempo:4317", tls)),
+        ]));
+        assert!(err.contains("insecure_skip_verify") && err.contains("ca_file"), "got: {err}");
+    }
+
+    #[test]
+    fn an_otlp_out_with_a_tls_block_under_a_plaintext_endpoint_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            ca_file: Some("ca.pem".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], otlp_out_with_tls("grpc://tempo:4317", tls)),
+        ]));
+        assert!(err.contains("'tls' is set") && err.contains("https://"), "got: {err}");
+    }
+
+    #[test]
+    fn an_otlp_out_with_no_tls_block_under_a_plaintext_endpoint_resolves_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                otlp_out_with_tls("grpc://tempo:4317", logit_config::TlsClientConfig::default()),
             ),
         ]))
         .expect("should resolve");

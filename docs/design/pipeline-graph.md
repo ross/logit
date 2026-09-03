@@ -219,6 +219,20 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     event, the same silent-black-hole failure rule 7 exists to catch. `keep`'s empty `fields` list
     stays legal by contrast — "drop every attribute" is a real operation, "drop every event" is
     not. See `docs/adr/signal-filtering-components.md`.
+20. An `otlp_out` `headers:` entry may not name a header the protocol itself sets (`content-type`,
+    `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, any
+    `grpc-*` header, an empty name, or an HTTP/2 pseudo-header starting with `:`) — checked
+    case-insensitively.
+21. `otlp_out`'s `paths:` is HTTP-only — gRPC method names are fixed by the `.proto` service
+    definitions, not a mount point an operator can move, so a non-empty `paths:` under
+    `protocol: grpc` is rejected rather than silently ignored (the same instinct as rule 14's
+    `buffer:` on a non-sink).
+22. An `otlp_out` `tls:` block: `cert_file`/`key_file` must be set together (mutual TLS needs
+    both, not one alone); `insecure_skip_verify` together with `ca_file` is contradictory and
+    rejected; and a non-empty `tls:` under a plain `http://`/`grpc://` endpoint is rejected —
+    TLS is selected by `endpoint`'s scheme
+    (`docs/adr/otlp-tls-and-pooled-grpc-client.md`), so a `tls:` block with nothing to tune would
+    otherwise be silently ignored rather than caught as a likely mistake.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

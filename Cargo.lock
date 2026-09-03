@@ -548,6 +548,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
+ "log",
  "rustls",
  "tokio",
  "tokio-rustls",
@@ -845,8 +846,11 @@ dependencies = [
  "logit-pipeline",
  "logit-proto",
  "logit-transforms",
+ "rustls",
+ "rustls-pki-types",
  "socket2",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -860,6 +864,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "logit-core",
  "logit-inputs",
@@ -867,7 +872,11 @@ dependencies = [
  "logit-proto",
  "logit-script",
  "reqwest",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1277,6 +1286,7 @@ version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",

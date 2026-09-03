@@ -1,7 +1,15 @@
 //! OTLP output -- exports logs, metrics, and traces to any OTLP-speaking backend, over either
 //! OTLP/HTTP (protobuf-over-POST) or OTLP/gRPC, selected by `protocol` in config
 //! (`logit_config::OtlpProtocol`). See `docs/adr/hand-rolled-grpc-over-hyper.md` for why the
-//! gRPC transport is a ~150-line hand-rolled client over `hyper` rather than `tonic`.
+//! gRPC transport's *framing* (`grpc_frame`/`grpc_unframe`, trailers/status parsing) is
+//! hand-rolled against `hyper` rather than `tonic`, and
+//! `docs/adr/otlp-tls-and-pooled-grpc-client.md` for why its *connection management* is not: the
+//! gRPC transport's connect/handshake step is a pooled `hyper_util::client::legacy::Client` over a
+//! `hyper-rustls` `HttpsConnector`, the same TLS stack the HTTP transport already gets from
+//! `reqwest`. TLS is selected by `endpoint`'s scheme -- `https://` under either `protocol` means
+//! TLS, `http://`/`grpc://` (or a bare `host:port`, which the gRPC transport treats the same as
+//! `http://`) means plaintext -- and `tls:` in config (see [`TlsClientSettings`]) tunes an
+//! already-TLS connection; it never turns TLS on by itself.
 //!
 //! **One `send` call, several HTTP/gRPC requests.** `logit`'s [`EventBatch`] mixes logs, metrics,
 //! and spans on one `Event` (ADR `multi-payload-events`), but OTLP is three separate services -- so `send` calls
@@ -37,15 +45,20 @@ use anyhow::Context;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use http_body_util::{BodyExt, Full};
-use hyper::client::conn::http2;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client as GrpcClient;
+use hyper_util::rt::TokioExecutor;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::Fault;
 use logit_proto::otlp::OtlpEncoder;
 use logit_proto::{Signal, SignalEncoder};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
 
 /// See [`crate::influxdb::DEFAULT_TIMEOUT`]'s doc comment -- same reasoning, a separate constant
 /// because these are two unrelated outputs, not because the value differs.
@@ -82,10 +95,41 @@ pub enum OtlpCompression {
     Gzip,
 }
 
+/// Mirrors `logit_config::TlsClientConfig` -- this crate doesn't depend on `logit-config`
+/// (`docs/design/pipeline-graph.md`'s crate layout), the same reason [`SignalPaths`]/
+/// [`OtlpCompression`] exist as local copies rather than re-exports. See that type's own doc
+/// comment for what each field means; `logit-cli::pipeline::build_spec` converts one into the
+/// other at construction time.
+#[derive(Debug, Clone, Default)]
+pub struct TlsClientSettings {
+    pub ca_file: Option<String>,
+    pub cert_file: Option<String>,
+    pub key_file: Option<String>,
+    pub insecure_skip_verify: bool,
+}
+
+impl TlsClientSettings {
+    /// `true` if every field is at its default -- [`OtlpOutput::with_tls`]'s "was a `tls:` block
+    /// actually set" check, mirroring `logit_config::TlsClientConfig::is_empty`.
+    pub fn is_empty(&self) -> bool {
+        self.ca_file.is_none()
+            && self.cert_file.is_none()
+            && self.key_file.is_none()
+            && !self.insecure_skip_verify
+    }
+}
+
 pub struct OtlpOutput {
     endpoint: String,
     transport: OtlpTransport,
     client: reqwest::Client,
+    /// The gRPC transport's connection manager (`docs/adr/otlp-tls-and-pooled-grpc-client.md`) --
+    /// a pooled, TLS-capable client replacing what used to be a raw `TcpStream::connect` and
+    /// `hyper::client::conn::http2::handshake` per request. Built once at construction (against a
+    /// default trust store) and rebuilt whenever [`OtlpOutput::with_tls`] sets a non-empty
+    /// `tls:`; used for every gRPC request regardless of TLS, since the pooling benefit applies
+    /// to plaintext gRPC too.
+    grpc_client: GrpcClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
     request_timeout: Duration,
     encoder: OtlpEncoder,
     telemetry: Telemetry,
@@ -95,22 +139,25 @@ pub struct OtlpOutput {
     /// `default_headers`. `with_timeout` rebuilds `client` unconditionally, so headers set via
     /// `default_headers` would silently vanish if `with_timeout` were called afterward -- an
     /// order-dependent bug no type would catch. A plain field sidesteps that entirely: `client`
-    /// stays a pure function of the timeout, exactly the invariant `build_client` already assumes.
+    /// stays a pure function of the timeout (and now TLS settings), exactly the invariant
+    /// `build_client` already assumes.
     headers: HeaderMap,
     paths: SignalPaths,
     compression: OtlpCompression,
+    /// `Some` only once [`OtlpOutput::with_tls`] has set a non-empty `tls:` -- `None` means "use
+    /// each transport's own default" (`reqwest`'s built-in TLS config for HTTP, a fresh
+    /// [`default_client_tls_config`] for gRPC), not "TLS is off." TLS itself is always selected by
+    /// `endpoint`'s scheme, on both transports; this only ever tunes an already-TLS connection.
+    tls: Option<rustls::ClientConfig>,
 }
 
 impl OtlpOutput {
-    /// Fails construction outright for a `protocol: grpc` endpoint written with an `https://`
-    /// scheme -- see [`reject_insecure_grpc_endpoint`] for why that can't be treated as a friendly
-    /// alternate spelling the way `http://`/`grpc://` are.
     pub fn new(endpoint: String, transport: OtlpTransport) -> anyhow::Result<Self> {
-        reject_insecure_grpc_endpoint(&endpoint, transport)?;
         Ok(Self {
             endpoint,
             transport,
-            client: build_client(DEFAULT_TIMEOUT),
+            client: build_client(DEFAULT_TIMEOUT, None),
+            grpc_client: build_grpc_client(&default_client_tls_config()),
             request_timeout: DEFAULT_TIMEOUT,
             encoder: OtlpEncoder::new(),
             telemetry: Telemetry::default(),
@@ -118,16 +165,47 @@ impl OtlpOutput {
             headers: HeaderMap::new(),
             paths: SignalPaths::default(),
             compression: OtlpCompression::default(),
+            tls: None,
         })
     }
 
     /// Overrides the default 10s request timeout (HTTP transport: `reqwest`'s own timeout; gRPC
     /// transport: the whole connect+handshake+request+response round trip, via
-    /// `tokio::time::timeout`).
+    /// `tokio::time::timeout` -- the pooled `grpc_client` itself carries no timeout, so this
+    /// doesn't need to rebuild it).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.client = build_client(timeout);
+        self.client = build_client(timeout, self.tls.as_ref());
         self.request_timeout = timeout;
         self
+    }
+
+    /// Sets client-side TLS tuning (`tls:` in config) -- a private CA, a client certificate for
+    /// mutual TLS, or disabling verification entirely. A no-op if `settings` is empty: both
+    /// transports already default to a working TLS configuration (the bundled Mozilla root set)
+    /// for an `https://` endpoint without this ever being called.
+    /// `logit-pipeline::graph::resolve`'s rule 22 rejects a non-empty `tls:` on a non-`https://`
+    /// endpoint before this ever runs, and requires `cert_file`/`key_file` together -- this method
+    /// still loads and validates every file itself, since `graph::resolve` never touches the
+    /// filesystem.
+    pub fn with_tls(
+        mut self,
+        settings: &TlsClientSettings,
+        base_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        if settings.is_empty() {
+            return Ok(self);
+        }
+        if settings.insecure_skip_verify {
+            self.diag.warn(
+                "tls.insecure_skip_verify is set -- the connection is encrypted, but this \
+                 output will accept any certificate the peer presents, self-signed or otherwise",
+            );
+        }
+        let cfg = build_rustls_client_config(settings, base_dir)?;
+        self.client = build_client(self.request_timeout, Some(&cfg));
+        self.grpc_client = build_grpc_client(&cfg);
+        self.tls = Some(cfg);
+        Ok(self)
     }
 
     /// Sets the extra headers sent on every export request (`headers:` in config) -- e.g.
@@ -281,10 +359,17 @@ impl OtlpOutput {
     }
 
     async fn send_grpc(&mut self, signal: Signal, payload: Bytes) -> anyhow::Result<()> {
-        let authority = grpc_authority(&self.endpoint).to_string();
+        let base = normalize_grpc_endpoint(&self.endpoint);
         let outcome = tokio::time::timeout(
             self.request_timeout,
-            grpc_roundtrip(&authority, signal, payload, &self.headers, self.compression),
+            grpc_roundtrip(
+                &self.grpc_client,
+                &base,
+                signal,
+                payload,
+                &self.headers,
+                self.compression,
+            ),
         )
         .await;
 
@@ -305,7 +390,7 @@ impl OtlpOutput {
                     &[("signal", signal.as_str()), ("class", "network_error")],
                 );
                 return Err(anyhow::anyhow!(
-                    "OTLP/gRPC {} request to {authority} timed out",
+                    "OTLP/gRPC {} request to {base} timed out",
                     signal.as_str()
                 ))
                 .context(Fault::Ambiguous);
@@ -372,11 +457,187 @@ impl Output for OtlpOutput {
     }
 }
 
-fn build_client(timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .expect("reqwest client should build with default TLS settings")
+/// Builds the HTTP transport's client. `tls` is `None` for the common case (no `tls:` block set)
+/// -- `reqwest`'s own default TLS configuration already trusts the bundled Mozilla root set for
+/// an `https://` endpoint, so there's nothing to override. `Some` only once
+/// [`OtlpOutput::with_tls`] has built a customized `rustls::ClientConfig`.
+fn build_client(timeout: Duration, tls: Option<&rustls::ClientConfig>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if let Some(cfg) = tls {
+        builder = builder.use_preconfigured_tls(cfg.clone());
+    }
+    builder.build().expect("reqwest client should build with the configured TLS settings")
+}
+
+/// The gRPC transport's default trust: the same bundled Mozilla root set `reqwest`'s own default
+/// TLS configuration uses for the HTTP transport, via the `ring` crypto provider (never
+/// `aws-lc-rs` -- `docs/adr/otlp-tls-and-pooled-grpc-client.md`). Built once at [`OtlpOutput::new`]
+/// so the gRPC transport's pooled client exists (and can dial an `https://` endpoint) even when no
+/// `tls:` block is ever set; superseded by [`build_rustls_client_config`]'s output once one is.
+/// Infallible: `with_safe_default_protocol_versions` only fails if the provider supports no usable
+/// cipher suite for TLS 1.2/1.3, which `ring`'s bundled suite list never triggers.
+fn default_client_tls_config() -> rustls::ClientConfig {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("the ring crypto provider always supports TLS 1.2/1.3")
+        .with_root_certificates(roots)
+        .with_no_client_auth()
+}
+
+/// Builds a `rustls::ClientConfig` from a non-empty [`TlsClientSettings`] -- the customized
+/// counterpart to [`default_client_tls_config`]. Every path is resolved against `base_dir` (the
+/// config file's own directory) first, exactly as `logit-cli::pipeline::build_spec` resolves
+/// `lua_file`/`stdio_out`'s `path`.
+fn build_rustls_client_config(
+    settings: &TlsClientSettings,
+    base_dir: &Path,
+) -> anyhow::Result<rustls::ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("the ring crypto provider always supports TLS 1.2/1.3");
+
+    // Both arms land in the same `WantsClientCert` builder state -- `with_root_certificates` and
+    // `dangerous().with_custom_certificate_verifier` are just two different ways to supply a
+    // verifier -- so client-cert material (below) is layered on identically either way.
+    // `graph::resolve`'s rule 22 already rejects `insecure_skip_verify` together with `ca_file`,
+    // so this crate doesn't need to re-reject that combination; `insecure_skip_verify` together
+    // with a client certificate is legal (mTLS with no server verification) and reaches the
+    // `with_client_auth_cert` branch below like any other case.
+    let builder = if settings.insecure_skip_verify {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert((*provider).clone())))
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        match &settings.ca_file {
+            Some(ca_file) => {
+                let path = base_dir.join(ca_file);
+                let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&path)
+                    .with_context(|| format!("otlp_out: reading tls.ca_file {}", path.display()))?
+                    .collect::<Result<_, _>>()
+                    .with_context(|| format!("otlp_out: parsing tls.ca_file {}", path.display()))?;
+                roots.add_parsable_certificates(certs);
+            }
+            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+        }
+        builder.with_root_certificates(roots)
+    };
+
+    match (&settings.cert_file, &settings.key_file) {
+        (Some(cert_file), Some(key_file)) => {
+            let cert_path = base_dir.join(cert_file);
+            let key_path = base_dir.join(key_file);
+            let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&cert_path)
+                .with_context(|| {
+                    format!("otlp_out: reading tls.cert_file {}", cert_path.display())
+                })?
+                .collect::<Result<_, _>>()
+                .with_context(|| {
+                    format!("otlp_out: parsing tls.cert_file {}", cert_path.display())
+                })?;
+            let key = PrivateKeyDer::from_pem_file(&key_path).with_context(|| {
+                format!("otlp_out: reading tls.key_file {}", key_path.display())
+            })?;
+            Ok(builder.with_client_auth_cert(chain, key)?)
+        }
+        _ => Ok(builder.with_no_client_auth()),
+    }
+}
+
+/// A [`rustls::client::danger::ServerCertVerifier`] that accepts any certificate the peer
+/// presents -- `tls.insecure_skip_verify`'s implementation. The connection is still encrypted;
+/// only the "is this actually who I meant to talk to" check is skipped. Still verifies the
+/// handshake *signature* itself via `provider`'s own algorithms (`verify_tls12_signature`/
+/// `verify_tls13_signature`) -- only certificate-chain and hostname validation are skipped, not
+/// cryptographic signature verification.
+#[derive(Debug)]
+struct AcceptAnyServerCert(rustls::crypto::CryptoProvider);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Builds the gRPC transport's pooled, TLS-capable connection manager -- `enable_http2` selects
+/// prior-knowledge h2c for a plaintext `http://` target and ALPN `h2` for an `https://` one;
+/// `https_or_http` (not `https_only`) is what lets the same connector serve both, since a single
+/// `OtlpOutput` only fixes its transport (HTTP vs. gRPC), not TLS-vs-plaintext, which is decided
+/// per-endpoint. `tls`'s `alpn_protocols` must be empty when passed in -- `with_tls_config`
+/// panics otherwise -- which both `default_client_tls_config` and `build_rustls_client_config`
+/// satisfy by construction (neither ever sets it); `enable_http2` fills it in.
+fn build_grpc_client(
+    tls: &rustls::ClientConfig,
+) -> GrpcClient<HttpsConnector<HttpConnector>, Full<Bytes>> {
+    let connector = HttpsConnectorBuilder::new()
+        .with_tls_config(tls.clone())
+        .https_or_http()
+        .enable_http2()
+        .build();
+    let mut builder = GrpcClient::builder(TokioExecutor::new());
+    builder.http2_only(true);
+    builder.build(connector)
+}
+
+/// Normalizes a gRPC `endpoint` into an absolute `http://`/`https://` base URI -- what the pooled
+/// `grpc_client` needs to dispatch a request on scheme, unlike the old per-request
+/// `TcpStream::connect`, which only ever needed a bare authority. `grpc://` (this output's own
+/// historical spelling for "plaintext gRPC") and a bare `host:port` with no scheme (the demo's own
+/// habit) both mean plaintext and map to `http://`; `http://`/`https://` are kept as written --
+/// `https://` now means TLS rather than being rejected outright
+/// (`docs/adr/otlp-tls-and-pooled-grpc-client.md`).
+fn normalize_grpc_endpoint(endpoint: &str) -> String {
+    let trimmed = endpoint.trim_end_matches('/');
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") {
+        trimmed.to_string()
+    } else if lower.starts_with("grpc://") {
+        format!("http://{}", &trimmed[7..])
+    } else {
+        format!("http://{trimmed}")
+    }
 }
 
 /// A coarse HTTP response-status bucket -- see `crate::influxdb::status_class`'s identical
@@ -441,100 +702,24 @@ fn grpc_fault(code: u32) -> Fault {
     }
 }
 
-/// Rejects a `protocol: grpc` endpoint written with an `https://` scheme, as a hard
-/// construction-time error rather than a silent downgrade. This output's gRPC transport has no
-/// TLS support at all (`docs/adr/hand-rolled-grpc-over-hyper.md` -- unary gRPC over plain
-/// `hyper`, nothing more) -- so unlike `grpc_authority`'s deliberate `http://`/`grpc://`
-/// equivalence (an operator copying one component's endpoint to the other, where both spellings
-/// genuinely mean the same plaintext connection), treating `https://` as one more friendly
-/// alternate spelling would silently export every log line, span, and attribute value over the
-/// network **unencrypted** -- no error, no diagnostic, just a config typo turning into a real
-/// interception risk. Checked once, here, rather than inside `grpc_authority` itself, so an
-/// `https://` endpoint can never reach a live `TcpStream::connect` call at all: even if some
-/// future call site skipped this check, `grpc_authority` no longer strips `https://`, so the
-/// connect attempt would fail loudly on an invalid hostname rather than quietly succeed in
-/// plaintext.
-fn reject_insecure_grpc_endpoint(endpoint: &str, transport: OtlpTransport) -> anyhow::Result<()> {
-    if transport == OtlpTransport::Grpc && endpoint.to_ascii_lowercase().starts_with("https://") {
-        anyhow::bail!(
-            "otlp_out: endpoint {endpoint:?} has protocol: grpc, but this output's gRPC \
-             transport has no TLS support (docs/adr/hand-rolled-grpc-over-hyper.md) -- an \
-             https:// endpoint would silently be exported in plaintext. Use protocol: http for a \
-             TLS-terminated OTLP endpoint, or a plaintext http://... / grpc://... endpoint for \
-             gRPC"
-        );
-    }
-    Ok(())
-}
-
-/// Strips a leading URL scheme from `endpoint`, if present, leaving a bare `host:port` --
-/// `TcpStream::connect` (the gRPC transport's connection primitive; there is no higher-level
-/// client to hand a full URL to, unlike the HTTP transport's `reqwest::Client`) wants an
-/// authority, not a URL. Config's `endpoint` is written either way (`tempo:4317` in the demo,
-/// following the HTTP transport's `http://host:port` habit if an operator copies one config to
-/// the other) -- accepting both means a typo'd `grpc://`/`http://` scheme on a `protocol: grpc`
-/// component fails at connect time with a clear error, not a confusing "invalid DNS name" one.
-///
-/// **Deliberately does not strip `https://`** -- see [`reject_insecure_grpc_endpoint`], which
-/// every `OtlpOutput` construction runs before this function can ever see an endpoint. An
-/// `https://`-prefixed authority reaching `TcpStream::connect` unstripped fails as an invalid
-/// hostname, which is the correct, loud failure mode if that guard is ever bypassed -- silently
-/// treating `https://` the same as `http://`/`grpc://` here is exactly the insecure-downgrade
-/// this function must never do.
-fn grpc_authority(endpoint: &str) -> &str {
-    endpoint
-        .strip_prefix("grpc://")
-        .or_else(|| endpoint.strip_prefix("http://"))
-        .unwrap_or(endpoint)
-        .trim_end_matches('/')
-}
-
-/// Connects to `authority`, classifying an outright failure to establish the TCP connection at all
-/// -- connection refused, DNS/name-resolution failure, network unreachable, all of it -- as
-/// [`Fault::Clean`]: none of those cases got as far as a real destination seeing a byte, so
-/// there's nothing to duplicate on retry. Unlike `crate::influxdb::classify_transport_error`,
-/// there's no `reqwest::Error::is_connect()` to lean on here -- this output drives a raw
-/// `TcpStream` itself for the gRPC transport -- so the distinction is drawn at the call site
-/// instead: any error from this call happened before a single application byte could have been
-/// sent, and a *slow* (rather than outright failing) connect attempt is caught by
-/// `send_grpc`'s overall per-request timeout instead, which classifies as `Fault::Ambiguous`.
-async fn connect(authority: &str) -> Result<TcpStream, Fault> {
-    TcpStream::connect(authority).await.map_err(|_| Fault::Clean)
-}
-
-/// One full gRPC unary round trip: connect, HTTP/2 handshake, send one framed request, and read
+/// One full gRPC unary round trip over the pooled `client`: send one framed request, and read
 /// back the framed response payload plus its `grpc-status`/`grpc-message` -- checked in the
 /// response's headers first (a "Trailers-Only" response, the shape a server sends for an
 /// immediate failure with no message body -- e.g. Tempo rejecting an unknown method) and its
 /// trailers second (the shape a successful, or gracefully-failed-after-a-response, unary call
 /// uses). `send_grpc` is the only caller, and owns turning an `Err` here into telemetry plus the
 /// final classified `anyhow::Result` -- this only ever returns `(fault, err)` pairs, never
-/// classifies on its own.
+/// classifies on its own. Unlike the old per-request `TcpStream::connect` this replaced
+/// (`docs/adr/otlp-tls-and-pooled-grpc-client.md`), connect/handshake failures (including a TLS
+/// handshake failure) surface through `client.request`'s own `Err` rather than a separate step.
 async fn grpc_roundtrip(
-    authority: &str,
+    client: &GrpcClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    base: &str,
     signal: Signal,
     payload: Bytes,
     headers: &HeaderMap,
     compression: OtlpCompression,
 ) -> Result<(u32, String, Bytes), (Fault, anyhow::Error)> {
-    let stream = connect(authority).await.map_err(|fault| {
-        (
-            fault,
-            anyhow::anyhow!("connecting to {authority} for OTLP/gRPC {} failed", signal.as_str()),
-        )
-    })?;
-    let io = TokioIo::new(stream);
-    let (mut sender, conn) =
-        http2::Builder::new(TokioExecutor::new()).handshake(io).await.map_err(|e| {
-            (Fault::Ambiguous, anyhow::Error::new(e).context("OTLP/gRPC handshake failed"))
-        })?;
-    // Drives the HTTP/2 connection's background I/O -- `sender.send_request` below only queues a
-    // request onto it. Aborted implicitly once `sender` (and every clone) drops and this future
-    // sees the connection close; nothing here needs to await it.
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
     // Built as one `HeaderMap`, custom headers cloned in first and the protocol-owned ones
     // inserted after -- `HeaderMap::insert` unconditionally replaces any prior value for that
     // key, so these three always win even if `graph::resolve`'s reserved-name rule (rule 20)
@@ -562,15 +747,29 @@ async fn grpc_roundtrip(
 
     let framed_payload = if compressed { gzip(&payload) } else { payload.to_vec() };
     let body = Full::new(Bytes::from(grpc_frame(&framed_payload, compressed)));
+    let uri: http::Uri = format!("{base}{}", signal.grpc_method()).parse().map_err(|e| {
+        (
+            Fault::Permanent,
+            anyhow::Error::new(e)
+                .context(format!("building the OTLP/gRPC request URI from endpoint {base:?}")),
+        )
+    })?;
     let mut req = http::Request::builder()
         .method(Method::POST)
-        .uri(signal.grpc_method())
+        .uri(uri)
         .body(body)
         .expect("a well-formed request always builds");
     *req.headers_mut() = req_headers;
 
-    let res = sender.send_request(req).await.map_err(|e| {
-        (Fault::Ambiguous, anyhow::Error::new(e).context("OTLP/gRPC request failed"))
+    let res = client.request(req).await.map_err(|e| {
+        // `is_connect()` covers connect refused, DNS/name-resolution failure, and (since the
+        // `HttpsConnector`'s `call` does connect+TLS-handshake as one step) a TLS handshake
+        // failure -- none of those cases got as far as a real destination seeing an application
+        // byte, so there's nothing to duplicate on retry. A *slow* (rather than outright failing)
+        // attempt is caught by `send_grpc`'s overall per-request timeout instead, which
+        // classifies as `Fault::Ambiguous`.
+        let fault = if e.is_connect() { Fault::Clean } else { Fault::Ambiguous };
+        (fault, anyhow::Error::new(e).context("OTLP/gRPC request failed"))
     })?;
 
     let header_status = grpc_status_from(res.headers());
@@ -752,6 +951,7 @@ fn skip_field(bytes: &[u8], pos: &mut usize, wire_type: u64) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper_util::rt::TokioIo;
     use logit_core::{AttrMap, Event, MetricKind, MetricRecord, Registry, Resource};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1481,49 +1681,271 @@ mod tests {
     }
 
     #[test]
-    fn grpc_authority_strips_every_scheme_it_recognizes() {
-        assert_eq!(grpc_authority("grpc://tempo:4317"), "tempo:4317");
-        assert_eq!(grpc_authority("http://tempo:4317"), "tempo:4317");
-        assert_eq!(grpc_authority("tempo:4317"), "tempo:4317");
-        assert_eq!(grpc_authority("http://tempo:4317/"), "tempo:4317");
+    fn normalize_grpc_endpoint_maps_every_plaintext_spelling_to_http() {
+        assert_eq!(normalize_grpc_endpoint("grpc://tempo:4317"), "http://tempo:4317");
+        assert_eq!(normalize_grpc_endpoint("http://tempo:4317"), "http://tempo:4317");
+        assert_eq!(normalize_grpc_endpoint("tempo:4317"), "http://tempo:4317");
+        assert_eq!(normalize_grpc_endpoint("http://tempo:4317/"), "http://tempo:4317");
+        assert_eq!(normalize_grpc_endpoint("GRPC://tempo:4317"), "http://tempo:4317");
     }
 
-    /// `grpc_authority` must never treat `https://` as one more friendly alternate spelling --
-    /// see [`reject_insecure_grpc_endpoint`], which is what actually stops an `https://` endpoint
-    /// from reaching this function in normal use. Pinned here too, directly, so a future edit to
-    /// `grpc_authority` alone can't quietly reintroduce the downgrade even if the earlier guard
-    /// stays intact.
+    /// `https://` used to be rejected outright under `protocol: grpc` -- it's now the normal way
+    /// to ask for gRPC-over-TLS (`docs/adr/otlp-tls-and-pooled-grpc-client.md`), so
+    /// `normalize_grpc_endpoint` must keep it exactly as written rather than treating it as one
+    /// more plaintext spelling.
     #[test]
-    fn grpc_authority_does_not_strip_https() {
-        assert_eq!(grpc_authority("https://tempo:4317"), "https://tempo:4317");
+    fn normalize_grpc_endpoint_keeps_https_as_written() {
+        assert_eq!(normalize_grpc_endpoint("https://tempo:4317"), "https://tempo:4317");
+        assert_eq!(normalize_grpc_endpoint("https://tempo:4317/"), "https://tempo:4317");
+        assert_eq!(normalize_grpc_endpoint("HTTPS://tempo:4317"), "HTTPS://tempo:4317");
     }
 
     #[test]
-    fn constructing_an_otlp_output_with_https_and_protocol_grpc_is_rejected() {
-        // `OtlpOutput` isn't `Debug` (it embeds a `reqwest::Client`), so `Result::expect_err` --
-        // which needs `Debug` on the `Ok` side to format its panic message -- doesn't work here.
-        // Same reasoning `logit-cli::pipeline`'s own `build_spec` tests already follow.
-        let err = match OtlpOutput::new("https://tempo:4317".to_string(), OtlpTransport::Grpc) {
-            Ok(_) => panic!("an https:// endpoint under protocol: grpc must be a hard error"),
-            Err(err) => err,
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("https"), "got: {msg}");
-        assert!(msg.contains("grpc"), "got: {msg}");
+    fn constructing_an_otlp_output_with_https_and_protocol_grpc_now_succeeds() {
+        // An `https://` endpoint under `protocol: grpc` used to be a hard construction-time
+        // error (the hand-rolled gRPC client had no TLS support at all); it's now the normal way
+        // to ask for gRPC-over-TLS, so construction succeeds like any other endpoint --
+        // `an_https_grpc_endpoint_is_reachable_over_tls` (below) proves it actually negotiates
+        // TLS, not just that construction doesn't fail.
+        OtlpOutput::new("https://tempo:4317".to_string(), OtlpTransport::Grpc)
+            .expect("https:// under protocol: grpc is now a TLS connection, not a hard error");
     }
 
     #[test]
     fn constructing_an_otlp_output_with_https_and_protocol_http_succeeds() {
-        // `protocol: http` genuinely does support TLS (it's plain `reqwest`) -- only the gRPC
-        // transport is the problem.
+        // `protocol: http` genuinely does support TLS (it's plain `reqwest`) -- unaffected by any
+        // of this module's gRPC changes.
         OtlpOutput::new("https://tempo:4318".to_string(), OtlpTransport::Http)
             .expect("https:// is exactly what protocol: http is for");
     }
 
     #[test]
     fn constructing_an_otlp_output_with_http_and_protocol_grpc_succeeds() {
-        // The one legitimate alternate spelling `grpc_authority` still accepts.
+        // The one legitimate alternate spelling `normalize_grpc_endpoint` still accepts.
         OtlpOutput::new("http://tempo:4317".to_string(), OtlpTransport::Grpc)
             .expect("http:// under protocol: grpc is a plaintext connection, not a downgrade");
+    }
+
+    // ---- TLS: canned `tokio-rustls`-wrapped HTTP and gRPC servers. ----
+
+    fn test_tls_settings(overrides: impl FnOnce(&mut TlsClientSettings)) -> TlsClientSettings {
+        let mut settings = TlsClientSettings::default();
+        overrides(&mut settings);
+        settings
+    }
+
+    fn testdata_dir() -> std::path::PathBuf {
+        // `logit-outputs` lives at `crates/logit-outputs`; the fixtures live at the repo root's
+        // `testdata/tls` (`testdata/tls/README.md`) -- two levels up from `CARGO_MANIFEST_DIR`.
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
+    }
+
+    /// Builds a `rustls::ServerConfig` presenting `testdata/tls/server.{pem,key}`, optionally
+    /// requiring a client certificate chaining to `testdata/tls/ca.pem` -- the test-only
+    /// counterpart to `logit_inputs::otlp`'s real `build_rustls_server_config`, kept local since
+    /// this crate has no server-side TLS code of its own to reuse.
+    fn test_server_tls_config(require_client_auth: bool) -> Arc<rustls::ServerConfig> {
+        let dir = testdata_dir();
+        let chain: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_file_iter(dir.join("server.pem"))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        let key = PrivateKeyDer::from_pem_file(dir.join("server.key")).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap();
+        let mut cfg = if require_client_auth {
+            let mut roots = rustls::RootCertStore::empty();
+            let ca: Vec<CertificateDer<'static>> =
+                CertificateDer::pem_file_iter(dir.join("ca.pem"))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+            roots.add_parsable_certificates(ca);
+            let verifier =
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build().unwrap();
+            builder.with_client_cert_verifier(verifier).with_single_cert(chain, key).unwrap()
+        } else {
+            builder.with_no_client_auth().with_single_cert(chain, key).unwrap()
+        };
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Arc::new(cfg)
+    }
+
+    /// The TLS-wrapped twin of `canned_http_server`: replies `200 OK` to any request over a real
+    /// TLS handshake against `testdata/tls/server.pem`.
+    async fn canned_tls_http_server(require_client_auth: bool) -> std::net::SocketAddr {
+        let acceptor = tokio_rustls::TlsAcceptor::from(test_server_tls_config(require_client_auth));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let Ok(tls_stream) = acceptor.accept(stream).await else { continue };
+                let mut tls_stream = tls_stream;
+                let mut buf = [0u8; 4096];
+                let _ = tls_stream.read(&mut buf).await;
+                let _ = tls_stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                let _ = tls_stream.shutdown().await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn an_https_http_endpoint_with_a_trusted_ca_file_succeeds() {
+        let addr = canned_tls_http_server(false).await;
+        let mut output = OtlpOutput::new(format!("https://{addr}"), OtlpTransport::Http)
+            .unwrap()
+            .with_tls(
+                &test_tls_settings(|t| {
+                    t.ca_file = Some("ca.pem".to_string());
+                }),
+                &testdata_dir(),
+            )
+            .unwrap();
+        output.send(&metric_batch()).await.expect("a trusted CA should let the handshake succeed");
+    }
+
+    #[tokio::test]
+    async fn an_https_http_endpoint_with_an_untrusted_ca_is_rejected_cleanly() {
+        let addr = canned_tls_http_server(false).await;
+        let mut output = OtlpOutput::new(format!("https://{addr}"), OtlpTransport::Http)
+            .unwrap()
+            .with_tls(
+                &test_tls_settings(|t| {
+                    t.ca_file = Some("other-ca.pem".to_string());
+                }),
+                &testdata_dir(),
+            )
+            .unwrap();
+        let err = output.send(&metric_batch()).await.expect_err("an untrusted CA should fail");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+    }
+
+    #[tokio::test]
+    async fn an_https_http_endpoint_with_insecure_skip_verify_succeeds_against_an_untrusted_ca() {
+        let addr = canned_tls_http_server(false).await;
+        let output = OtlpOutput::new(format!("https://{addr}"), OtlpTransport::Http)
+            .unwrap()
+            .with_tls(&test_tls_settings(|t| t.insecure_skip_verify = true), &testdata_dir());
+        let mut output = output.unwrap();
+        output.send(&metric_batch()).await.expect("insecure_skip_verify should bypass CA trust");
+    }
+
+    #[tokio::test]
+    async fn an_https_grpc_endpoint_is_reachable_over_tls() {
+        // Reuses `canned_grpc_server`'s framing but wraps its `TcpListener::accept` output in a
+        // TLS handshake first -- proves the gRPC transport actually negotiates TLS (ALPN `h2`
+        // over a real handshake), not just that construction under `https://` no longer errors.
+        let acceptor = tokio_rustls::TlsAcceptor::from(test_server_tls_config(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let Ok(tls_stream) = acceptor.accept(stream).await else { continue };
+                let io = TokioIo::new(tls_stream);
+                let svc = hyper::service::service_fn(
+                    move |_req: http::Request<hyper::body::Incoming>| async move {
+                        let mut trailers = HeaderMap::new();
+                        trailers.insert("grpc-status", "0".parse().unwrap());
+                        let body = TestGrpcBody {
+                            data: Some(Bytes::from(grpc_frame(&[], false))),
+                            trailers: Some(trailers),
+                        };
+                        Ok::<_, std::convert::Infallible>(
+                            http::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc+proto")
+                                .body(body)
+                                .unwrap(),
+                        )
+                    },
+                );
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            }
+        });
+        let mut output = OtlpOutput::new(format!("https://{addr}"), OtlpTransport::Grpc)
+            .unwrap()
+            .with_tls(
+                &test_tls_settings(|t| {
+                    t.ca_file = Some("ca.pem".to_string());
+                }),
+                &testdata_dir(),
+            )
+            .unwrap();
+        output.send(&metric_batch()).await.expect("gRPC over TLS should round-trip");
+    }
+
+    #[tokio::test]
+    async fn mutual_tls_succeeds_with_a_client_certificate_and_fails_without_one() {
+        let addr = canned_tls_http_server(true).await;
+        let with_cert = test_tls_settings(|t| {
+            t.ca_file = Some("ca.pem".to_string());
+            t.cert_file = Some("client.pem".to_string());
+            t.key_file = Some("client.key".to_string());
+        });
+        let mut output = OtlpOutput::new(format!("https://{addr}"), OtlpTransport::Http)
+            .unwrap()
+            .with_tls(&with_cert, &testdata_dir())
+            .unwrap();
+        output.send(&metric_batch()).await.expect("a valid client certificate should be accepted");
+
+        let addr = canned_tls_http_server(true).await;
+        let without_cert = test_tls_settings(|t| t.ca_file = Some("ca.pem".to_string()));
+        let mut output = OtlpOutput::new(format!("https://{addr}"), OtlpTransport::Http)
+            .unwrap()
+            .with_tls(&without_cert, &testdata_dir())
+            .unwrap();
+        output.send(&metric_batch()).await.expect_err("no client certificate should be rejected");
+    }
+
+    #[test]
+    fn with_timeout_after_with_tls_keeps_tls() {
+        // The rebuild-hazard regression test `with_headers`'s own doc comment describes, applied
+        // to `tls`: `with_timeout` rebuilds `client` unconditionally, so it must rebuild it with
+        // the already-set TLS config, not silently drop back to the default one.
+        let output = OtlpOutput::new("https://localhost:4318".to_string(), OtlpTransport::Http)
+            .unwrap()
+            .with_tls(
+                &test_tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
+                &testdata_dir(),
+            )
+            .unwrap()
+            .with_timeout(Duration::from_secs(5));
+        assert!(output.tls.is_some(), "with_timeout must not have cleared the TLS config");
+    }
+
+    #[test]
+    fn with_tls_on_an_empty_settings_value_is_a_no_op() {
+        let output = OtlpOutput::new("https://localhost:4318".to_string(), OtlpTransport::Http)
+            .unwrap()
+            .with_tls(&TlsClientSettings::default(), &testdata_dir())
+            .unwrap();
+        assert!(output.tls.is_none(), "an empty tls: block should not build a custom config");
+    }
+
+    #[test]
+    fn with_tls_reports_a_missing_ca_file_with_the_path_in_the_error() {
+        // `OtlpOutput` isn't `Debug` (it embeds a `reqwest::Client`), so `Result::expect_err`
+        // doesn't work here -- same reasoning every other constructor-failure test in this module
+        // already follows.
+        let err = match OtlpOutput::new("https://localhost:4318".to_string(), OtlpTransport::Http)
+            .unwrap()
+            .with_tls(
+                &test_tls_settings(|t| t.ca_file = Some("does-not-exist.pem".to_string())),
+                &testdata_dir(),
+            ) {
+            Ok(_) => panic!("a missing ca_file should fail construction"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:?}").contains("does-not-exist.pem"), "got: {err:?}");
     }
 }

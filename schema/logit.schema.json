@@ -124,6 +124,18 @@
                 }
               ]
             },
+            "tls": {
+              "description": "Terminates TLS on this listener (both `protocol: http` and `protocol: grpc`) when present; plaintext when omitted. See [`TlsServerConfig`].",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsServerConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -707,6 +719,20 @@
                 }
               ]
             },
+            "tls": {
+              "description": "Tunes TLS on an `https://` endpoint -- see [`TlsClientConfig`]. A non-default value under a plain `http://`/`grpc://` endpoint is a config error (rule 22), not silently ignored.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -964,7 +990,7 @@
           ]
         },
         {
-          "description": "Unary gRPC over plaintext HTTP/2 -- `crates/logit-outputs/src/otlp.rs`'s hand-rolled gRPC transport has no TLS support at all (`docs/adr/hand-rolled-grpc-over-hyper.md`), so an `otlp_out` component's `endpoint` under this protocol is rejected at construction time if it's written with an `https://` scheme, rather than silently exporting in plaintext.",
+          "description": "Unary gRPC over HTTP/2 -- plaintext (`http://`/`grpc://`) or TLS (`https://`), selected by `endpoint`'s scheme (`docs/adr/otlp-tls-and-pooled-grpc-client.md`). `otlp_out`'s `tls:` block tunes the TLS case.",
           "type": "string",
           "enum": [
             "grpc"
@@ -1095,6 +1121,67 @@
         "udp",
         "tcp"
       ]
+    },
+    "TlsClientConfig": {
+      "description": "Client-side TLS tuning for `otlp_out` (`tls:` in config). On the HTTP transport, TLS itself is already selected by the endpoint's `https://` scheme, matching every OTel SDK's `OTEL_EXPORTER_OTLP_ENDPOINT` convention; on the gRPC transport, an `https://` endpoint now also means TLS (`docs/adr/otlp-tls-and-pooled-grpc-client.md` -- this used to be rejected outright, since the hand-rolled gRPC client had no TLS support at all). This block only tunes an already-TLS connection -- a non-default value under a plain `http://`/`grpc://` endpoint is rejected at config-validation time (rule 22) rather than silently ignored.",
+      "type": "object",
+      "properties": {
+        "ca_file": {
+          "description": "PEM bundle of CA certificates to trust *instead of* the bundled Mozilla root set. Path is resolved relative to the config file's own directory, same as `lua_file`/`stdio_out`'s `path`. A plain string, so `!env` works on it (ADR `env-yaml-tag`) if the certificate itself needs to come from the environment rather than a mounted file.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cert_file": {
+          "description": "Client certificate chain (PEM) presented for mutual TLS. Requires `key_file`; rejected at config-validation time if set without it (rule 22).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "insecure_skip_verify": {
+          "description": "Disables server-certificate verification entirely -- the connection is still encrypted, but accepts any certificate the peer presents, self-signed or otherwise. A startup warning is logged whenever this is `true`. Never the default; meant for a throwaway or pre-production endpoint, not a real deployment. Contradictory (and rejected) together with `ca_file` -- a trusted CA and \"trust nothing\" can't both be meant at once.",
+          "default": false,
+          "type": "boolean"
+        },
+        "key_file": {
+          "description": "Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`. Requires `cert_file`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TlsServerConfig": {
+      "description": "Server-side TLS for `otlp_in` (`tls:` in config). Its mere presence on a listener turns TLS on for that component -- there is no separate on/off flag. See [`TlsClientConfig`] for the file path resolution rule and `!env` compatibility, both identical here.",
+      "type": "object",
+      "required": [
+        "cert_file",
+        "key_file"
+      ],
+      "properties": {
+        "cert_file": {
+          "description": "Certificate chain (PEM) this listener presents to every client.",
+          "type": "string"
+        },
+        "client_ca_file": {
+          "description": "PEM bundle of CAs. When set, every connecting client must present a certificate chaining to one of them (mutual TLS) -- absent, any client is accepted once the TLS handshake itself completes.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_file": {
+          "description": "Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`.",
+          "type": "string"
+        }
+      }
     }
   }
 }

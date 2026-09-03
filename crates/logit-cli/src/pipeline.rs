@@ -205,14 +205,15 @@ fn build_spec(
             ),
             input_runtime_config(&component.receive),
         ),
-        OtlpIn { bind, protocol } => NodeSpec::Input(
-            Box::new(
-                OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
-                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                    .with_telemetry(telemetry.clone()),
-            ),
-            input_runtime_config(&component.receive),
-        ),
+        OtlpIn { bind, protocol, tls } => {
+            let mut input = OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
         // `span_sample_rate` is read by `prepare` (above) to build the `Registry` itself, not
         // here -- by the time `build_spec` runs, the `Registry` this handle points at already has
         // it baked in.
@@ -284,13 +285,14 @@ fn build_spec(
             queue_config(&component.buffer),
             write_config(&component.buffer),
         ),
-        OtlpOut { endpoint, protocol, headers, paths, compression } => {
+        OtlpOut { endpoint, protocol, headers, paths, compression, tls } => {
             let output = OtlpOutput::new(endpoint.clone(), otlp_out_transport(*protocol))?
                 .with_headers(headers)?
                 .with_paths(to_signal_paths(paths))
                 .with_compression(to_otlp_compression(*compression))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone());
+                .with_telemetry(telemetry.clone())
+                .with_tls(&to_tls_client_settings(tls), base_dir)?;
             NodeSpec::Output(
                 Box::new(output),
                 queue_config(&component.buffer),
@@ -504,6 +506,31 @@ fn to_signal_paths(paths: &logit_config::OtlpPaths) -> SignalPaths {
         logs: paths.logs.clone(),
         metrics: paths.metrics.clone(),
         traces: paths.traces.clone(),
+    }
+}
+
+/// Converts config's `TlsClientConfig` (`logit-config`, which `logit-outputs` deliberately
+/// doesn't depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the output crate's
+/// own identically-shaped `TlsClientSettings`.
+fn to_tls_client_settings(
+    tls: &logit_config::TlsClientConfig,
+) -> logit_outputs::otlp::TlsClientSettings {
+    logit_outputs::otlp::TlsClientSettings {
+        ca_file: tls.ca_file.clone(),
+        cert_file: tls.cert_file.clone(),
+        key_file: tls.key_file.clone(),
+        insecure_skip_verify: tls.insecure_skip_verify,
+    }
+}
+
+/// The `logit-inputs` mirror of [`to_tls_client_settings`].
+fn to_tls_server_settings(
+    tls: &logit_config::TlsServerConfig,
+) -> logit_inputs::otlp::TlsServerSettings {
+    logit_inputs::otlp::TlsServerSettings {
+        cert_file: tls.cert_file.clone(),
+        key_file: tls.key_file.clone(),
+        client_ca_file: tls.client_ca_file.clone(),
     }
 }
 
@@ -733,7 +760,11 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 consumers: vec!["out".to_string()],
-                kind: ComponentKind::OtlpIn { bind: "127.0.0.1:0".to_string(), protocol },
+                kind: ComponentKind::OtlpIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    protocol,
+                    tls: None,
+                },
             };
             assert!(
                 matches!(
@@ -759,6 +790,7 @@ mod tests {
                     headers: HashMap::new(),
                     paths: logit_config::OtlpPaths::default(),
                     compression: logit_config::OtlpCompression::default(),
+                    tls: logit_config::TlsClientConfig::default(),
                 },
             };
             assert!(
@@ -771,12 +803,12 @@ mod tests {
         }
     }
 
-    /// `OtlpOutput::new`'s https-under-grpc guard (`crates/logit-outputs/src/otlp.rs`) surfaces
-    /// through `build_spec` as a clear config error, not a panic or a silently-downgraded
-    /// connection -- `NodeSpec` isn't `Debug` (see `build_spec_reports_a_clear_path_naming_error_
-    /// for_an_unopenable_stdio_target`'s comment for why this can't use `expect_err` directly).
+    /// An `https://` endpoint under `protocol: grpc` used to be rejected outright (the hand-rolled
+    /// gRPC client had no TLS support at all); it's now the normal way to ask for gRPC-over-TLS
+    /// (`docs/adr/otlp-tls-and-pooled-grpc-client.md`) and `build_spec` builds it like any other
+    /// endpoint.
     #[test]
-    fn build_spec_rejects_an_otlp_sink_with_https_under_grpc() {
+    fn build_spec_builds_an_otlp_sink_with_https_under_grpc() {
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
@@ -788,15 +820,97 @@ mod tests {
                 headers: HashMap::new(),
                 paths: logit_config::OtlpPaths::default(),
                 compression: logit_config::OtlpCompression::default(),
+                tls: logit_config::TlsClientConfig::default(),
             },
         };
-        let err = match build_spec("out", &component, Path::new(""), None) {
-            Ok(_) => {
-                panic!("expected build_spec to reject an https:// endpoint under protocol: grpc")
-            }
+        assert!(matches!(
+            build_spec("out", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    /// `logit-cli`'s own home for `testdata/tls`'s fixtures -- `crates/logit-cli` is two levels
+    /// under the repo root, same as every other crate's `testdata_dir()` test helper.
+    fn testdata_tls_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
+    }
+
+    #[test]
+    fn build_spec_wires_a_tls_client_config_into_an_otlp_sink() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::OtlpOut {
+                endpoint: "https://localhost:4318".to_string(),
+                protocol: logit_config::OtlpProtocol::Http,
+                headers: HashMap::new(),
+                paths: logit_config::OtlpPaths::default(),
+                compression: logit_config::OtlpCompression::default(),
+                tls: logit_config::TlsClientConfig {
+                    ca_file: Some("ca.pem".to_string()),
+                    ..Default::default()
+                },
+            },
+        };
+        assert!(matches!(
+            build_spec("out", &component, &testdata_tls_dir(), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    /// `build_spec` (via `OtlpOutput::with_tls`) is where a bad `tls.ca_file` path actually loads
+    /// the file and fails -- `graph::resolve`'s rule 22 never touches the filesystem, so it can't
+    /// catch this (`docs/deploying.md`'s TLS section documents that `logit validate` doesn't
+    /// either, since `validate_semantics` only runs `graph::resolve`).
+    #[test]
+    fn build_spec_reports_a_missing_tls_ca_file_clearly() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::OtlpOut {
+                endpoint: "https://localhost:4318".to_string(),
+                protocol: logit_config::OtlpProtocol::Http,
+                headers: HashMap::new(),
+                paths: logit_config::OtlpPaths::default(),
+                compression: logit_config::OtlpCompression::default(),
+                tls: logit_config::TlsClientConfig {
+                    ca_file: Some("does-not-exist.pem".to_string()),
+                    ..Default::default()
+                },
+            },
+        };
+        let err = match build_spec("out", &component, &testdata_tls_dir(), None) {
+            Ok(_) => panic!("expected a missing tls.ca_file to fail build_spec"),
             Err(err) => err,
         };
-        assert!(format!("{err:?}").contains("https"), "got: {err:?}");
+        assert!(format!("{err:?}").contains("does-not-exist.pem"), "got: {err:?}");
+    }
+
+    #[test]
+    fn build_spec_wires_a_tls_server_config_into_an_otlp_input() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::OtlpIn {
+                bind: "127.0.0.1:0".to_string(),
+                protocol: logit_config::OtlpProtocol::Http,
+                tls: Some(logit_config::TlsServerConfig {
+                    cert_file: "server.pem".to_string(),
+                    key_file: "server.key".to_string(),
+                    client_ca_file: None,
+                }),
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
     }
 
     /// The wiring this workstream adds: a non-default `buffer:` on the component actually reaches
