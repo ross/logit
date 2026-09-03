@@ -9,7 +9,7 @@
 //! tied to no occurrence, so nothing else would ever push them.
 
 use crate::Input;
-use logit_core::{interner, Diagnostics, EventBatch, Registry, Resource, Telemetry};
+use logit_core::{interner, AttrMap, Diagnostics, EventBatch, Registry, Resource, Telemetry};
 use logit_pipeline::Fanout;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,13 +17,28 @@ use std::time::{Duration, Instant};
 pub struct InternalInput {
     interval: Duration,
     registry: Arc<Registry>,
+    /// Built once here and `Arc`-shared by every batch this input ever sends -- the resource is
+    /// batch-level and identical on every tick, so rebuilding it per drain would re-intern
+    /// `service.name` and reallocate an `AttrMap` for a value that cannot change. `internal` is
+    /// the one input allowed to stamp `service.name = logit`: this is `logit`'s own telemetry,
+    /// unlike `syslog_in`/`statsd_in`, whose ingested data belongs to other services and would be
+    /// misidentified by the same stamp. See `docs/design/internal-telemetry.md`.
+    resource: Arc<Resource>,
     telemetry: Telemetry,
     diag: Diagnostics,
 }
 
 impl InternalInput {
     pub fn new(interval: Duration, registry: Arc<Registry>) -> Self {
-        Self { interval, registry, telemetry: Telemetry::default(), diag: Diagnostics::default() }
+        let mut attributes = AttrMap::new();
+        attributes.insert("service.name", "logit");
+        Self {
+            interval,
+            registry,
+            resource: Arc::new(Resource { attributes }),
+            telemetry: Telemetry::default(),
+            diag: Diagnostics::default(),
+        }
     }
 
     /// Attaches this component's own telemetry handle -- `internal` is a component like any
@@ -96,7 +111,7 @@ impl InternalInput {
             self.telemetry.count("logit.internal.spans.emitted", spans_emitted as f64, &[]);
         }
 
-        sink.send(EventBatch { resource: Arc::new(Resource::default()), events }).await;
+        sink.send(EventBatch { resource: self.resource.clone(), events }).await;
     }
 }
 
@@ -175,6 +190,34 @@ mod tests {
         assert!(names.contains(&"logit.process.interner.strings"));
         assert!(names.contains(&"logit.process.uptime"));
         let _ = rx.try_recv(); // drain any second batch, unasserted
+    }
+
+    /// Tempo (and every other OTLP backend) reads the *root span's resource* for a trace's
+    /// service name -- an empty `Resource` is why Grafana's Traces Drilldown showed
+    /// `<root span not yet received>` against traces whose root span had plainly been received.
+    /// `internal`'s telemetry is `logit`'s own, so unlike `syslog_in`/`statsd_in` (whose data
+    /// belongs to *other* services) it is the one input that can honestly name itself here.
+    #[tokio::test]
+    async fn every_batch_carries_service_name_on_its_resource() {
+        let registry = Registry::new();
+        let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        component_telemetry.count("logit.input.datagrams", 1.0, &[]);
+
+        let input = InternalInput::new(Duration::from_millis(1), registry);
+        let (tx, mut rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]);
+
+        input.tick(Instant::now(), &fanout).await;
+
+        let delivered = rx.try_recv().expect("should have sent a batch");
+        let batch = match delivered {
+            logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
+            logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
+        };
+        assert_eq!(
+            batch.resource.attributes.get("service.name").and_then(|v| v.as_str()),
+            Some("logit")
+        );
     }
 
     #[tokio::test]

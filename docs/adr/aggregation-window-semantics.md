@@ -52,7 +52,9 @@ version only appears at the next flush tick) — inherent to windowed aggregatio
 **Grouped by resource value, not by which pipeline/batch produced it.** Two batches whose
 `Arc<Resource>` are different allocations but equal content describe the same origin and aggregate
 together; `Resource` is `PartialEq`, not `Hash`, so grouping is a linear scan (one group in practice
-today — statsd always uses `Resource::default()`).
+today — `statsd_in` always uses `Resource::default()`, and `internal` always uses its own constant
+`service.name = logit` resource, so `windowed`/`self_windowed`-style aggregators downstream of
+either still see exactly one distinct resource across the batches they receive).
 
 **Emitted timestamp is flush wall-clock**, i.e. when the window closed — not a source event's
 timestamp, and not the gauge's internally-tracked "latest write" timestamp (used only to pick the
