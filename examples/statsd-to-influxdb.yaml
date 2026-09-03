@@ -3,17 +3,17 @@
 # service seeded by compose.yaml for local testing.
 #
 # Config is a flat graph of components (docs/design/pipeline-graph.md,
-# docs/adr/0009-component-graph-configuration.md): each names its own `sources`, rather than
+# docs/adr/component-graph-configuration.md): each names its own `sources`, rather than
 # sitting in a fixed inputs/transforms/outputs pipeline. `aggregate` is the only implemented
-# built-in transform so far (docs/adr/0008-aggregation-window-semantics.md) -- `logit run` rejects
+# built-in transform so far (docs/adr/aggregation-window-semantics.md) -- `logit run` rejects
 # a config referencing any other unimplemented kind with a clear error. `token: !env
 # INFLUXDB_TOKEN` below pulls the token from the environment rather than inlining a secret in the
-# file (docs/adr/0011-env-yaml-tag.md) -- any field on any component can use `!env` the same way.
+# file (docs/adr/env-yaml-tag.md) -- any field on any component can use `!env` the same way.
 components:
   statsd_in:
     type: statsd_in
     bind: 0.0.0.0:8125
-    # Every field below defaults (docs/adr/0027-decoupled-listener-io.md) -- an omitted `receive:`
+    # Every field below defaults (docs/adr/decoupled-listener-io.md) -- an omitted `receive:`
     # block is exactly the values shown here, commented out purely as a reference for tuning a
     # real deployment. `receive:` is meaningful only on a datagram listener (statsd_in, syslog_in);
     # `logit-pipeline`'s graph validation rejects it on any other component kind.
@@ -24,7 +24,7 @@ components:
     #                               # drop_oldest (not buffer:'s block) is the default here on purpose -- blocking a
     #                               # UDP reader relocates loss into the kernel where nothing counts it
     #   batch_max_events: 1000      # events accumulated across datagrams before one send downstream; 1 means
-    #                               # one send per datagram, today's pre-ADR-0027 behavior
+    #                               # one send per datagram, today's pre-ADR `decoupled-listener-io` behavior
     #   batch_max_bytes: "1MiB"     # the other accumulation bound -- whichever trips first
     #   batch_flush_interval: 100ms # longest an accumulated batch waits before being sent regardless of size;
     #                               # 0s disables the timer, leaving the two bounds above as the only trigger
@@ -52,7 +52,7 @@ components:
     org: logit
     bucket: metrics
     token: !env INFLUXDB_TOKEN
-    # Every field below defaults (docs/adr/0021-buffered-sink-delivery.md) -- an omitted `buffer:`
+    # Every field below defaults (docs/adr/buffered-sink-delivery.md) -- an omitted `buffer:`
     # block is exactly the values shown here, commented out purely as a reference for tuning a
     # real deployment. `buffer:` is meaningful only on a sink; `logit-pipeline`'s graph validation
     # rejects it on any other component kind.

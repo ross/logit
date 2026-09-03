@@ -1,7 +1,7 @@
 //! The OTLP codec: `OtlpEncoder`/`OtlpDecoder`, implementing [`crate::SignalEncoder`]/
 //! [`crate::SignalDecoder`] against the vendored, committed protobuf types in `generated/` (see
 //! `crates/logit-proto/proto/README.md` for provenance and
-//! [ADR 0023](../../../../docs/adr/0023-committed-pregenerated-otlp-protobuf.md) for why they're
+//! [ADR `committed-pregenerated-otlp-protobuf`](../../../../docs/adr/committed-pregenerated-otlp-protobuf.md) for why they're
 //! committed rather than generated at build time).
 //!
 //! **This module doc is the mapping table.** The four sibling modules hold one direction/signal

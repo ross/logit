@@ -10,7 +10,7 @@ running `logit`, see [the nginx-side recipe](#the-nginx-side-recipe) below. If y
 ## Getting the image
 
 `script/image [tag]` builds the production runtime image from `Dockerfile` (not `Dockerfile.dev`,
-which is the contributor dev environment — [ADR 0005](adr/0005-containerized-development.md)) and
+which is the contributor dev environment — [ADR `containerized-development`](adr/containerized-development.md)) and
 tags it `logit:<tag>` (default `local`):
 
 ```sh
@@ -35,7 +35,7 @@ docker run --rm \
 ```
 
 Secrets and deployment-specific values (a token, a URL, a bind address) go through `!env VAR_NAME`
-in the config rather than being inlined — see [ADR 0011](adr/0011-env-yaml-tag.md) for the full
+in the config rather than being inlined — see [ADR `env-yaml-tag`](adr/env-yaml-tag.md) for the full
 mechanism and its edge cases (any field on any component can use it, not just `influxdb_out`'s
 `token`). Pass the corresponding environment variables to the container with `-e` or `--env-file`.
 
@@ -58,7 +58,7 @@ same as `run` does, so pass the same environment.
 
 ## Signal and restart behavior
 
-Covered in full by [ADR 0013](adr/0013-service-lifecycle-and-output-retry.md); the operator-facing
+Covered in full by [ADR `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md); the operator-facing
 summary:
 
 - **SIGTERM or SIGINT triggers a graceful drain**, not an immediate kill. Every listener's inbox
@@ -70,7 +70,7 @@ summary:
   not a person at a terminal, is what's waiting on the process to exit.
 - **A sink failure — transient or extended — no longer ends the process by default.** Every sink
   now sits behind a decoupled delivery buffer with its own retry budget
-  ([ADR 0021](adr/0021-buffered-sink-delivery.md), revising ADR 0013's retry-budget rationale
+  ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md), revising ADR `service-lifecycle-and-output-retry`'s retry-budget rationale
   without superseding its other decisions); see [Sink delivery buffering](#sink-delivery-buffering)
   below for the full failure and sizing story, including the one case that still exits the process
   (a sustained, purely-configuration-error failure).
@@ -79,7 +79,7 @@ summary:
 
 Every sink (`influxdb_out`, `stdio_out`, ...) sits behind a per-component, in-memory delivery
 queue that decouples receiving events from delivering them
-([ADR 0021](adr/0021-buffered-sink-delivery.md)). This is what lets a slow or temporarily-down
+([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md)). This is what lets a slow or temporarily-down
 destination be ridden out instead of stalling or killing the whole pipeline. It's tunable per sink
 via a `buffer:` block on that component (`buffer:` is rejected at validation time on anything but a
 sink) — see the commented example in
@@ -139,7 +139,7 @@ the config. The two most directly actionable for buffering:
 
 Every UDP listener (`statsd_in`, `syslog_in`) sits in front of a per-component, in-memory receive
 queue that decouples reading the socket from decoding and batching what it received
-([ADR 0027](adr/0027-decoupled-listener-io.md)) — the listener-side sibling of the sink delivery
+([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md)) — the listener-side sibling of the sink delivery
 buffering above. This is what lets a slow or backed-up destination downstream be ridden out without
 the socket itself going unread. It's tunable per listener via a `receive:` block on that component
 (`receive:` is rejected at validation time on anything but a datagram listener) — see the commented
@@ -208,7 +208,7 @@ kernel default before deciding whether to raise it.
 
 `aggregate` normally drains every series on every flush (tumbling). A statsd gauge is an
 exception: the sender transmits only on change and expects the last value to persist, and a
-relative adjustment (`+`/`-`, `docs/adr/0026-relative-gauge-adjustments.md`) sent in a later window
+relative adjustment (`+`/`-`, `docs/adr/relative-gauge-adjustments.md`) sent in a later window
 needs the gauge's last-known value to apply against. `gauge_retention` (on by default, `5`
 windows) and `max_retained_gauge_series` (on by default, `10,000` series) on an `aggregate`
 component control this — see the field doc comments in the schema (`logit schema`) for the exact
@@ -220,7 +220,7 @@ updating to keep validating.
 delta sent after a process restart, resolves against `0.0` — reported (`logit.transform.gauge
 .delta.unseeded`, `logit.transform.series.evicted{reason="cardinality"}`), never silent, but not
 prevented. The restart case is unfixable without durable aggregator state, which this project has
-deliberately not built (`docs/adr/0008-aggregation-window-semantics.md`'s rejection of cumulative
+deliberately not built (`docs/adr/aggregation-window-semantics.md`'s rejection of cumulative
 counters, for the same underlying reason). If a config's gauges see relative adjustments and an
 operator needs the post-restart value to be exact rather than "resolves against 0 until the next
 absolute," the sending side's own zero-then-set convention (send an absolute periodically, not only

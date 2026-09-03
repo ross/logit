@@ -4,7 +4,7 @@
 //! (`docs/design/pipeline-graph.md`'s "Runtime model").
 //!
 //! The channel payload is [`Delivered`], not a bare `EventBatch`
-//! (`docs/adr/0016-arc-eventbatch-copy-on-write.md`). `send`/`send_blocking` still take an owned
+//! (`docs/adr/arc-eventbatch-copy-on-write.md`). `send`/`send_blocking` still take an owned
 //! `EventBatch` -- callers construct one exactly as before -- but an edge with exactly one
 //! consumer (the common case: a linear chain, and every shipped listener's first hop) moves it
 //! through as `Delivered::Owned`, with no `Arc` involved at all. Only a real fan-out (more than one
@@ -18,10 +18,10 @@
 //! receives a `Delivered` either way.)
 //!
 //! Every `Delivered` also carries a [`TraceContext`] -- the substrate for internal spans, built
-//! per `docs/adr/0020-trace-context-propagation-on-delivered.md` on the measured evidence of a
+//! per `docs/adr/trace-context-propagation-on-delivered.md` on the measured evidence of a
 //! costing exercise that came before it (`docs/known-gaps.md`). Real span emission -- turning
 //! that context into an actual `SpanRecord`-carrying `Event` -- landed in
-//! `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`: `Fanout::send`/
+//! `docs/adr/internal-span-emission-and-deterministic-sampling.md`: `Fanout::send`/
 //! `send_blocking` (below) record this node's own listener span around the send. See
 //! [`TraceContext`]'s own doc comment for the propagation model, and
 //! `docs/design/pipeline-graph.md`'s "Trace context propagation" section for the account of which
@@ -41,7 +41,7 @@ use tokio::sync::mpsc;
 /// `trace_id`. `span_id` changes at *every* hop: [`TraceContext::child`] keeps `trace_id` and mints
 /// a fresh `span_id`, so a hop's own `span_id` is what the *next* hop's span records as its own
 /// `parent_span_id` -- the actual `SpanRecord` this builds into is real now
-/// (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`; see the module doc above).
+/// (`docs/adr/internal-span-emission-and-deterministic-sampling.md`; see the module doc above).
 ///
 /// **Not every node can produce a `child`.** A node with exactly one incoming batch per emission (a
 /// listener producing its first batch, `Transform::process`/`ScriptWorker::process`'s per-batch
@@ -196,7 +196,7 @@ impl Fanout {
     /// to inherit). See [`Fanout::send_with_own_context`] for everything about delivery mechanics.
     ///
     /// **This is the one place a listener's own `SpanKind::Producer` span is recorded** --
-    /// `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`'s per-node-kind table.
+    /// `docs/adr/internal-span-emission-and-deterministic-sampling.md`'s per-node-kind table.
     /// Its window is deliberately just this call, not "however long the listener spent building
     /// `batch`": `Fanout::send` has no visibility into that (`Input::run` is a free-form loop), so
     /// this doesn't fabricate a start time it can't actually know. Once `run_flush`/`run_lua`'s
@@ -517,9 +517,9 @@ mod tests {
 
     /// `send` mints a root and records exactly one `SpanKind::Producer` span for it -- the
     /// drained span's own `span_id` must be the same id the delivered batch actually went out
-    /// under, not some unrelated id minted separately (`docs/adr/0025-internal-span-emission-and-
-    /// deterministic-sampling.md`'s "the span's `span_id` and the outgoing `Delivered`'s `span_id`
-    /// must be the same id").
+    /// under, not some unrelated id minted separately
+    /// (`docs/adr/internal-span-emission-and-deterministic-sampling.md`'s "the span's `span_id`
+    /// and the outgoing `Delivered`'s `span_id` must be the same id").
     #[tokio::test]
     async fn send_records_a_root_span_whose_span_id_is_the_context_it_sent_under() {
         let registry = Registry::with_span_sampling(1.0);

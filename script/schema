@@ -1,6 +1,6 @@
 #!/bin/bash
 # Usage: script/schema
-# Regenerates schema/logit.schema.json from the config types (ADR 0003). Commit the result --
+# Regenerates schema/logit.schema.json from the config types (ADR `config-yaml-jsonschema`). Commit the result --
 # script/cibuild fails if it's stale.
 
 set -e

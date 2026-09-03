@@ -15,8 +15,8 @@ pub trait Input {
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()>;
 
     /// Runs until `shutdown` flips, with the opportunity to drain buffered work first
-    /// (`docs/adr/0027-decoupled-listener-io.md`). The default *is* [`Input::run`] raced against
-    /// the signal -- ADR 0013's original cancel-by-drop shutdown, relocated here: `shutdown`
+    /// (`docs/adr/decoupled-listener-io.md`). The default *is* [`Input::run`] raced against
+    /// the signal -- ADR `service-lifecycle-and-output-retry`'s original cancel-by-drop shutdown, relocated here: `shutdown`
     /// winning drops `run`'s future and the `Fanout` inside it, cascading the close-time flush
     /// through every downstream node exactly as before. An implementation with nothing buffered
     /// needs no override and gets byte-for-byte today's behaviour, including today's latency --
@@ -44,7 +44,7 @@ pub trait Input {
 /// [`crate::NodeSpec::Output`]'s `SinkQueueConfig`/`WriteLoopConfig`: production call sites
 /// (`logit-cli::pipeline::build_spec`) derive `shutdown_grace` from the component's `receive:`
 /// block; a test can pass a short grace to keep a shutdown test fast. `Duration::ZERO` -- the
-/// default -- means "cancel by drop immediately," i.e. no change from ADR 0013's original
+/// default -- means "cancel by drop immediately," i.e. no change from ADR `service-lifecycle-and-output-retry`'s original
 /// behaviour, which is exactly right for a listener with no `receive:` block (nothing overrides
 /// `run_until_shutdown`, so nothing is ever waiting to drain).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

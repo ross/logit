@@ -4,7 +4,7 @@
 //! `!env` is a YAML tag, resolved on the parsed [`serde_norway::Value`] tree *before* serde ever
 //! sees the document -- config types stay untouched by it (no env-specific field like the old
 //! `token_env` needed ever again), and the published JSON Schema needs no widening to admit it on
-//! every field. See `docs/adr/0011-env-yaml-tag.md` for the design rationale and its accepted
+//! every field. See `docs/adr/env-yaml-tag.md` for the design rationale and its accepted
 //! rough edges (also `docs/known-gaps.md`).
 //!
 //! This is the *only* place a config file should be read and parsed -- `logit run`, `logit
@@ -360,7 +360,7 @@ components:
 
     /// `logit graph` used to get a lenient mode that substituted a placeholder for a missing
     /// variable so it could still render a config's shape without every secret set -- reverted:
-    /// see `docs/adr/0011-env-yaml-tag.md`'s Alternatives. Every `!env` reference must resolve,
+    /// see `docs/adr/env-yaml-tag.md`'s Alternatives. Every `!env` reference must resolve,
     /// unconditionally, for all three commands.
     #[test]
     fn a_missing_variable_errors_regardless_of_which_field_it_is_in() {

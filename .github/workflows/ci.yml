@@ -9,7 +9,7 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     container:
-      # Same image family contributors build locally (Dockerfile.dev / ADR 0005); script/common.sh
+      # Same image family contributors build locally (Dockerfile.dev / ADR `containerized-development`); script/common.sh
       # detects $CI (set by GitHub Actions) and runs commands directly against it instead of
       # trying to `docker compose run` from inside a container.
       image: docker.io/library/rust:1-bookworm

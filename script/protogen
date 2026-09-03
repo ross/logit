@@ -5,7 +5,7 @@
 # a throwaway image (tools/protogen/Dockerfile) that carries protoc.
 #
 # Deliberately NOT part of script/cibuild: putting protoc in the CI image is exactly what
-# ADR 0005 rules out, and ADR 0023 settles regeneration as a deliberate, reviewed act instead of a
+# ADR `containerized-development` rules out, and ADR `committed-pregenerated-otlp-protobuf` settles regeneration as a deliberate, reviewed act instead of a
 # CI drift check. Review the diff under crates/logit-proto/src/otlp/generated/ and commit it
 # yourself after running this.
 

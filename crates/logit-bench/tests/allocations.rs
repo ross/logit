@@ -174,7 +174,7 @@ fn syslog_decode_one_logs_only_line() {
 }
 
 /// The measurement `syslog_decode_one_line` above deliberately doesn't cover
-/// (`docs/adr/0027-decoupled-listener-io.md`): `decode_into` called against a buffer the caller
+/// (`docs/adr/decoupled-listener-io.md`): `decode_into` called against a buffer the caller
 /// *reuses* across datagrams -- `logit-inputs::udp::decode_loop`'s actual hot path -- rather than
 /// `decode()`'s convenience default, which always hands `decode_into` a fresh `Vec::new()` and so
 /// can never show this. Zero, not one: the `Vec<Event>` is cleared (keeping capacity), not
@@ -215,7 +215,7 @@ fn statsd_decode_into_a_warm_reused_buffer_costs_one_not_two() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Listener receive queue and batch accumulator (docs/adr/0027-decoupled-listener-io.md)
+// Listener receive queue and batch accumulator (docs/adr/decoupled-listener-io.md)
 // ---------------------------------------------------------------------------------------------
 
 /// A push immediately followed by a pop, once the underlying `VecDeque` is warm (past its initial
@@ -422,7 +422,7 @@ fn aggregate_absorb_without_keep() {
 }
 
 /// 6, not the pre-flush-linking 2 -- re-measured, not assumed, when `Transform::flush` widened to
-/// carry each series' `Vec<SpanLink>` (`docs/adr/0020-trace-context-propagation-on-delivered.md`'s
+/// carry each series' `Vec<SpanLink>` (`docs/adr/trace-context-propagation-on-delivered.md`'s
 /// flush-side linking). The 4 new allocations are exactly the 4 series: this fixture never calls
 /// `observe_batch_context`, so every absorbed event records the same (default, all-zero)
 /// `TraceContext`, and each series' `ContributingContexts` ends up with exactly one distinct
@@ -517,7 +517,7 @@ fn clone_one_statsd_event() {
 }
 
 /// The number behind PR #33's review item 1: `Fanout::send` now takes a fast path for a
-/// single-consumer edge (`docs/adr/0016-arc-eventbatch-copy-on-write.md`) -- no `Arc` at all, the
+/// single-consumer edge (`docs/adr/arc-eventbatch-copy-on-write.md`) -- no `Arc` at all, the
 /// batch moves through as `Delivered::Owned`. This is the common case (every listener's first hop,
 /// and every interior edge of a linear chain like the v0.1 reference config's three
 /// single-consumer edges), so it needs to cost nothing, not just less than a deep clone.
@@ -550,7 +550,7 @@ fn fanout_send_one_consumer_costs_nothing() {
 }
 
 /// The test above proves the *disabled*-telemetry path is free, but `Fanout::send` now opens a
-/// span too (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`), and a
+/// span too (`docs/adr/internal-span-emission-and-deterministic-sampling.md`), and a
 /// disabled `Telemetry` handle (`Telemetry::default()`, `Option::None` inside) never reaches
 /// `Telemetry::span`'s sample-decision branch at all -- it can't stand in for the *live-but-
 /// unsampled* path a production pipeline with an `internal` component and the default (0.1, never
@@ -601,7 +601,7 @@ fn fanout_send_one_consumer_with_a_live_unsampled_registry_costs_nothing() {
 /// pre-`Arc` code would have paid (5), not less. Compare [`fanout_send_one_consumer_costs_nothing`],
 /// which really is a strict improvement; this test exists so that claim isn't quietly assumed to
 /// extend to real fan-outs too, when the numbers say otherwise under the current no-trait-change
-/// design (`docs/adr/0016-arc-eventbatch-copy-on-write.md`'s "What this change actually saves"
+/// design (`docs/adr/arc-eventbatch-copy-on-write.md`'s "What this change actually saves"
 /// section). Six is still far short of two fully independent copies (10, i.e. this same 5 paid by
 /// *both* branches, which is what a naive per-`Event` `Arc` or a design with no sharing at all would
 /// cost), so isolation is not getting more expensive as fan-out width grows -- it just isn't getting
@@ -653,7 +653,7 @@ fn fanout_send_two_consumers_costs_one_clone_plus_one_arc() {
 
 /// The same unwrap `runtime.rs`'s `unwrap_batch` does, duplicated here rather than exposed from
 /// `logit-pipeline` just for this test -- `Delivered`'s two variants and what to do with each are
-/// already public (`docs/adr/0016-arc-eventbatch-copy-on-write.md`).
+/// already public (`docs/adr/arc-eventbatch-copy-on-write.md`).
 fn unwrap_delivered(delivered: Delivered) -> EventBatch {
     match delivered {
         Delivered::Owned(batch, _ctx) => batch,
@@ -716,10 +716,10 @@ fn fanout_send_two_output_consumers_costs_only_the_arc() {
     expect_allocs("fanout: send + receive, 2 Output consumers (borrow only)", stats, 1);
 }
 
-/// Residual item from workstream C (`docs/plans/0004-buffered-sink-delivery.md`): the
+/// Residual item from workstream C (`docs/plans/buffered-sink-delivery.md`): the
 /// `fanout_send_*` tests above measure `Fanout::send` alone, stopping short of the actual
 /// `run_output`/`drain_inbox` hop a sink's `Delivered` batch takes next
-/// (`docs/adr/0021-buffered-sink-delivery.md`). Drives `drain_inbox` directly (not through a full
+/// (`docs/adr/buffered-sink-delivery.md`). Drives `drain_inbox` directly (not through a full
 /// `run`) against a single-consumer `Delivered::Owned` batch: exactly one allocation, the
 /// `Arc::new` `drain_inbox` performs to hand the batch to its `SinkQueue`
 /// (`crates/logit-pipeline/src/runtime.rs`) -- previously zero on this path, since a

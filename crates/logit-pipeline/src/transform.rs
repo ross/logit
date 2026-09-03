@@ -29,7 +29,7 @@ pub trait Transform: Send {
     /// Called once per incoming batch, before any of that batch's events reach `process` -- gives
     /// a transform whose emission spans several batches (only `Aggregator` today) a chance to
     /// record which batch contributed to whatever it's about to absorb, for
-    /// `docs/adr/0020-trace-context-propagation-on-delivered.md`'s flush-side linking
+    /// `docs/adr/trace-context-propagation-on-delivered.md`'s flush-side linking
     /// (`crates/logit-transforms/src/aggregate.rs`). Default no-op: `Json`/`KvMetrics`/`Keep`
     /// never flush, so they have nothing to attribute across batches and never override this.
     /// Deliberately not a `process` parameter -- the context is per-*batch*, and widening the
@@ -41,7 +41,7 @@ pub trait Transform: Send {
 
     /// `Some(interval)` if this transform has a flush contract -- a timer-driven emission
     /// independent of inbound traffic, like `aggregate`'s tumbling windows
-    /// (`docs/adr/0008-aggregation-window-semantics.md`). `None` (the default) means this
+    /// (`docs/adr/aggregation-window-semantics.md`). `None` (the default) means this
     /// transform never flushes.
     fn flush_interval(&self) -> Option<Duration> {
         None
@@ -58,7 +58,7 @@ pub trait Transform: Send {
     /// than a parallel same-length array so there's no index correspondence to get wrong.
     /// `run_flush` (`crates/logit-pipeline/src/runtime.rs`) unions every group's links onto the
     /// one flush span it records for this call
-    /// (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`), bounded the same
+    /// (`docs/adr/internal-span-emission-and-deterministic-sampling.md`), bounded the same
     /// way any other span's links are (`MAX_LINKS_PER_SPAN`).
     fn flush(&mut self, now: i64) -> FlushOutput {
         let _ = now;

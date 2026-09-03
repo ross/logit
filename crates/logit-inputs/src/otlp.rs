@@ -1,6 +1,6 @@
 //! OTLP input -- accepts logs, metrics, and traces over either OTLP/HTTP (protobuf-over-POST) or
 //! OTLP/gRPC, selected by `protocol` in config (`logit_config::OtlpProtocol`). See
-//! `docs/adr/0024-hand-rolled-grpc-over-hyper.md` for why the gRPC server is a ~200-line hand-rolled
+//! `docs/adr/hand-rolled-grpc-over-hyper.md` for why the gRPC server is a ~200-line hand-rolled
 //! `hyper::server::conn::http2` service rather than `tonic`, and why that's budgeted as roughly
 //! half of this whole PR's effort -- HTTP/2 trailers, per-method routing, and gRPC status-code
 //! framing are all things `tonic` gives away for free and this input has to build by hand.
@@ -356,7 +356,7 @@ fn grpc_response(status: u32, message: &str, payload: Option<Vec<u8>>) -> http::
 /// zero-length, for an error response with no payload), followed by the `grpc-status` trailer.
 /// `http_body_util::Full` can't express this -- it has no trailers concept at all -- so this is
 /// hand-rolled directly against [`hyper::body::Body`], the same "small enough to write by hand"
-/// call this whole transport makes (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`).
+/// call this whole transport makes (`docs/adr/hand-rolled-grpc-over-hyper.md`).
 struct GrpcBody {
     data: Option<Bytes>,
     trailers: Option<HeaderMap>,

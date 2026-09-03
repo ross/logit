@@ -24,7 +24,7 @@ pub struct Event {
 }
 ```
 
-**An event is whatever it carries, not a tagged one-of** ([ADR 0012](../adr/0012-multi-payload-events.md)).
+**An event is whatever it carries, not a tagged one-of** ([ADR `multi-payload-events`](../adr/multi-payload-events.md)).
 An access log line is a log record and, once a transform like `kv_metrics` derives request/byte
 counts and latency from its fields, a source of several metrics at once — the same event, not two
 related-but-separate ones. `log`/`span` stay `Option` (an event can have at most one of each); an
@@ -89,7 +89,7 @@ the shape:
 
 ## Record types
 
-The three record types an event can independently carry ([ADR 0012](../adr/0012-multi-payload-events.md)) —
+The three record types an event can independently carry ([ADR `multi-payload-events`](../adr/multi-payload-events.md)) —
 no longer variants of one enum, just three fields on `Event`:
 
 ```rust
@@ -142,9 +142,9 @@ downstream, and that has to be correct, not approximate-and-hope:
   adjustment (a leading `+`/`-`), decoded by `statsd_in` but left explicitly **unresolved**: it
   must never reach a sink. Only `aggregate` resolves it, applying it to a `Gauge`'s running value
   in arrival order (never touching the value's last-write-wins timestamp, asymmetric on purpose —
-  see [ADR 0026](../adr/0026-relative-gauge-adjustments.md)). This is the one metric kind whose
+  see [ADR `relative-gauge-adjustments`](../adr/relative-gauge-adjustments.md)). This is the one metric kind whose
   aggregation state genuinely needs to survive a flush to be correct — see
-  [ADR 0008](../adr/0008-aggregation-window-semantics.md)'s amendment for why that's true for
+  [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment for why that's true for
   gauges specifically and not for `Counter`.
 
 A `Distribution`'s `count()` becomes a **population estimate**, not a count of received
@@ -178,7 +178,7 @@ trait Encoder { fn encode(&mut self, batch: &EventBatch) -> Result<Bytes>; }
 
 statsd, syslog, collectd, OTLP, and the native protocol
 ([docs/design/wire-protocol.md](wire-protocol.md)) are all just implementations of these two
-traits — OTLP has no special status in the core, per [ADR 0004](../adr/0004-native-wire-format-with-otlp-bridge.md).
+traits — OTLP has no special status in the core, per [ADR `native-wire-format-with-otlp-bridge`](../adr/native-wire-format-with-otlp-bridge.md).
 This is also why the model has to be a strict superset of what OTLP can express: anything OTLP can
 carry that `Event` can't represent makes the OTLP codec lossy.
 

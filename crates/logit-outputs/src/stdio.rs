@@ -4,8 +4,8 @@
 //! InfluxDB.
 //!
 //! **This deliberately renders a readable text block, not one JSON object per event.** The
-//! original `docs/plans/0002-nginx-integration.md` sketch called for JSON before workstream A
-//! landed (`Event` carrying `log`/`metrics`/`span` independently, ADR 0012); once building this
+//! original `docs/plans/nginx-integration.md` sketch called for JSON before workstream A
+//! landed (`Event` carrying `log`/`metrics`/`span` independently, ADR `multi-payload-events`); once building this
 //! for real, a block a person can read at a glance in a terminal won -- this is a debugging/
 //! dev-loop sink for a human, not a machine-parseable export format (that's what
 //! `logit-outputs::influxdb`'s line protocol is for, and an NDJSON `Format` variant remains a
@@ -103,7 +103,7 @@ impl EventDump {
 /// One event's block: a timestamp/log line, then `attrs`/`metric`/`span` lines, each omitted when
 /// the event carries nothing for that section. Always ends with `\n` after its last line, and
 /// always emits at least the timestamp line -- a completely empty event (legal under
-/// `docs/adr/0012-multi-payload-events.md`) still gets one, since silently printing nothing would
+/// `docs/adr/multi-payload-events.md`) still gets one, since silently printing nothing would
 /// be worse for a sink whose whole purpose is visibility.
 ///
 /// `attrs` merges `resource`'s attributes underneath the event's own, the same precedence
@@ -236,7 +236,7 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
         MetricKind::GaugeDelta(v) => {
             // Rendered distinguishably from a resolved `Gauge` (`gauge_delta`, not `gauge`), and
             // with an explicit sign, so an operator can see at a glance that this is an
-            // *unresolved* relative adjustment (`docs/adr/0026-relative-gauge-adjustments.md`) --
+            // *unresolved* relative adjustment (`docs/adr/relative-gauge-adjustments.md`) --
             // a debug sink must never silently print it as though it were an absolute value.
             out.push_str("gauge_delta=");
             // `is_sign_positive`, not `*v >= 0.0` -- `-0.0 >= 0.0` is true in IEEE-754 comparison,
@@ -810,7 +810,7 @@ mod tests {
     }
 
     /// `gauge_delta`, not `gauge` -- an unresolved relative adjustment must be visually
-    /// distinguishable from a resolved absolute value (`docs/adr/0026-relative-gauge-adjustments.md`),
+    /// distinguishable from a resolved absolute value (`docs/adr/relative-gauge-adjustments.md`),
     /// with an explicit sign so a positive delta doesn't read as a bare number.
     #[test]
     fn gauge_delta_renders_distinguishably_with_an_explicit_sign() {

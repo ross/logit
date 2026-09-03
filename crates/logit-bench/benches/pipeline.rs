@@ -186,7 +186,7 @@ mod lua {
 }
 
 /// Direct-call benches for `logit_proto::buffer::InMemoryBuffer` -- the sync buffer
-/// `logit_pipeline::SinkQueue` wraps (`docs/adr/0021-buffered-sink-delivery.md`). Called directly,
+/// `logit_pipeline::SinkQueue` wraps (`docs/adr/buffered-sink-delivery.md`). Called directly,
 /// never through `SinkQueue`/tokio, for the same reason every other bench in this file calls its
 /// subject directly: `divan::AllocProfiler` only counts allocations on threads Divan controls, and
 /// a bench that hops through a channel or a tokio task would misreport.

@@ -28,7 +28,7 @@ end
 `event.attributes` is itself a second userdata sharing the same underlying event (not a copy), so
 chained access like the above works without materializing anything beyond what's read or written.
 Since an event can carry a log, several metrics, and a span all at once
-([ADR 0012](../adr/0012-multi-payload-events.md)), the proxy exposes presence, not a classification:
+([ADR `multi-payload-events`](../adr/multi-payload-events.md)), the proxy exposes presence, not a classification:
 `event.has_log` / `event.has_metrics` / `event.has_span` (read-only booleans). There is deliberately
 no `event.type` — an earlier design tried a single `"log"`/`"metric"`/`"span"` string with a
 precedence rule for the multi-payload case, and rejected it: a summary string is strictly lossy
@@ -172,7 +172,7 @@ event data.** `telemetry.count("orders.total", 1)` is fine, called as often as y
 interner entry per distinct order id, forever -- cardinality safety for script-authored telemetry
 is the script author's responsibility, not something the type system checks for you the way it
 does for the Rust call sites `internal-telemetry.md` documents. See
-[ADR 0019](../adr/0019-lua-authored-telemetry-cardinality.md) for the full reasoning.
+[ADR `lua-authored-telemetry-cardinality`](../adr/lua-authored-telemetry-cardinality.md) for the full reasoning.
 
 **Metric names starting with `logit.` are reserved** for `logit`'s own internal metrics
 (`docs/design/internal-telemetry.md`) -- `telemetry.count("logit.component.events.received", 1)`
@@ -197,7 +197,7 @@ end
 
 `trace.trace_id` (32 hex chars, 16 bytes) and `trace.span_id` (16 hex chars, 8 bytes) -- the same
 `TraceContext` every node in the graph carries on its inbound batch
-(`docs/adr/0020-trace-context-propagation-on-delivered.md`), set once per incoming batch before any
+(`docs/adr/trace-context-propagation-on-delivered.md`), set once per incoming batch before any
 of its events reach `process()`, so every event in one call to `process()` sees the same value.
 Both start at the all-zero placeholder (`"00...0"`) before any batch has arrived.
 
@@ -208,13 +208,13 @@ single incoming batch to attribute itself to -- however many batches contributed
 stateful script is about to flush, `logit` has no way to know, and doesn't try to guess. A script
 that wants better than "whichever batch was last seen" needs to track contributing contexts itself,
 inside its own `process()` -- the values are genuinely there to read, `logit` just doesn't
-aggregate them on the script's behalf the way `docs/adr/0020-trace-context-propagation-on-delivered.md`'s
+aggregate them on the script's behalf the way `docs/adr/trace-context-propagation-on-delivered.md`'s
 flush-side linking does for the native `aggregate` transform.
 
 ## Config shape
 
 A Lua transform is one component in the pipeline's component graph
-(`docs/design/pipeline-graph.md`, `docs/adr/0009-component-graph-configuration.md`) — it names its
+(`docs/design/pipeline-graph.md`, `docs/adr/component-graph-configuration.md`) — it names its
 own `sources` and is available as a source to anything downstream, rather than sitting in a fixed
 per-pipeline `transforms:` chain. Lua can be inline in YAML (block scalar) or referenced from a
 file:
@@ -255,7 +255,7 @@ components:
 ```
 
 A `lua`/`lua_file` component's `interval` is optional and drives that component's own `flush()` the
-same way `aggregate`'s does (see `docs/adr/0008-aggregation-window-semantics.md`) -- omitted, the
+same way `aggregate`'s does (see `docs/adr/aggregation-window-semantics.md`) -- omitted, the
 common case, the component never ticks, same as a script with no `flush()` at all. A zero interval
 is rejected at config-validation time, on either kind of component.
 

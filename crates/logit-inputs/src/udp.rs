@@ -1,5 +1,5 @@
 //! The shared UDP listener driver: read/decode decoupling plus datagram-\>batch assembly
-//! (`docs/adr/0027-decoupled-listener-io.md`). `StatsdInput` and `SyslogInput` are both thin
+//! (`docs/adr/decoupled-listener-io.md`). `StatsdInput` and `SyslogInput` are both thin
 //! wrappers over [`UdpListener<D>`] -- their `run` loops used to be byte-for-byte identical apart
 //! from the decoder type, which is exactly what this generalizes over.
 //!
@@ -12,7 +12,7 @@
 //!
 //! **Not used by [`crate::internal::InternalInput`].** `internal` has no socket, no datagram, and
 //! no `receive:` block -- it keeps `Input::run_until_shutdown`'s default (cancel-by-drop,
-//! unchanged from ADR 0013). Don't generalize this module toward it.
+//! unchanged from ADR `service-lifecycle-and-output-retry`). Don't generalize this module toward it.
 
 use bytes::Bytes;
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
@@ -55,7 +55,7 @@ pub static RECEIVE_QUEUE_METRICS: QueueMetrics = QueueMetrics {
 
 pub type ReceiveQueue = BoundedQueue<Datagram>;
 
-/// [`UdpListener`]'s runtime knobs. Workstream F (`docs/adr/0027-decoupled-listener-io.md`) builds
+/// [`UdpListener`]'s runtime knobs. Workstream F (`docs/adr/decoupled-listener-io.md`) builds
 /// this from a component's `logit_config::ReceiveConfig`; a test can build it directly.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UdpListenerConfig {
@@ -65,7 +65,7 @@ pub struct UdpListenerConfig {
     /// `SO_RCVBUF`, requested at bind. `None` leaves the kernel default alone.
     pub receive_buffer_bytes: Option<u64>,
     /// Events to accumulate across datagrams before one `Fanout::send`. `1` means one send per
-    /// datagram -- the pre-ADR-0027 behaviour, exactly (`BatchAccumulator::absorb`'s doc comment).
+    /// datagram -- the pre-ADR `decoupled-listener-io` behaviour, exactly (`BatchAccumulator::absorb`'s doc comment).
     pub batch_max_events: usize,
     pub batch_max_bytes: u64,
     /// `Duration::ZERO` disables the flush timer entirely; bounds are then the only trigger.
@@ -75,7 +75,7 @@ pub struct UdpListenerConfig {
     pub shutdown_grace: Duration,
 }
 
-/// Matches `docs/adr/0027-decoupled-listener-io.md`'s `ReceiveConfig` defaults exactly -- see that
+/// Matches `docs/adr/decoupled-listener-io.md`'s `ReceiveConfig` defaults exactly -- see that
 /// ADR for the numbers' justification against the field's own tuning figures (Telegraf, gostatsd,
 /// DogStatsD, rsyslog, syslog-ng).
 impl Default for UdpListenerConfig {
@@ -121,7 +121,7 @@ struct BatchingConfig {
 }
 
 /// The read/decode split every UDP listener reduces to
-/// (`docs/adr/0027-decoupled-listener-io.md`) -- generic over the decoder because that is the
+/// (`docs/adr/decoupled-listener-io.md`) -- generic over the decoder because that is the
 /// *only* thing `StatsdInput`/`SyslogInput` ever differed in.
 pub struct UdpListener<D: Decoder + Send> {
     bind: String,
@@ -172,7 +172,7 @@ impl<D: Decoder + Send> UdpListener<D> {
     }
 
     /// Overrides the queue/batching/shutdown-grace knobs -- what a `receive:` config block sets
-    /// (`docs/adr/0027-decoupled-listener-io.md`). Defaults to [`UdpListenerConfig::default`]
+    /// (`docs/adr/decoupled-listener-io.md`). Defaults to [`UdpListenerConfig::default`]
     /// when never called.
     pub fn with_config(mut self, config: UdpListenerConfig) -> Self {
         self.config = config;
@@ -246,7 +246,7 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
         // `decode` finishing *before* `read` does. Nothing in today's `read_loop`/`decode_loop`
         // makes that possible (only `read_loop` ever closes `queue`), but if it somehow happened,
         // polling `decode` again after it already resolved would be exactly the double-poll
-        // hazard `docs/adr/0027-decoupled-listener-io.md` calls out -- so this still awaits `read`
+        // hazard `docs/adr/decoupled-listener-io.md` calls out -- so this still awaits `read`
         // in that branch instead, and never touches `decode` again once it's the side that fired.
         let already_finished = tokio::select! {
             result = &mut read => Some(result),
@@ -375,14 +375,14 @@ fn finish_bind(
 /// Reads datagrams off `socket` into `queue` as fast as `queue.push` (governed by its own bounds/
 /// overflow policy) allows -- entirely independent of how far behind `decode_loop`'s current
 /// decode is running. Never blocks on downstream backpressure by default (`drop_oldest`, counted --
-/// `docs/adr/0027-decoupled-listener-io.md`'s core argument for why this differs from a sink
+/// `docs/adr/decoupled-listener-io.md`'s core argument for why this differs from a sink
 /// queue's `block` default); `overflow: block` is the one configuration under which this
 /// genuinely does stop reading, by explicit operator choice.
 ///
 /// Races every `recv_from` *and* every `push` against `shutdown`, so a graceful shutdown stops
 /// this loop immediately rather than only once the next datagram happens to arrive, or (under
 /// `block`) only once downstream makes room. Cancelling a blocked `push` this way drops the one
-/// datagram it was holding, uncounted -- bounded to exactly one, the same scope ADR 0013 already
+/// datagram it was holding, uncounted -- bounded to exactly one, the same scope ADR `service-lifecycle-and-output-retry` already
 /// accepted for "a datagram in flight when the signal lands."
 ///
 /// Closes `queue` in every exit path -- shutdown, or a fatal socket error -- which is what lets
@@ -427,7 +427,7 @@ async fn read_loop(
 /// dropped mid-await by `run_input`'s grace backstop.
 ///
 /// Owns `sink` (the `Fanout`) -- dropping this future is what closes every downstream inbox, the
-/// shutdown cascade `docs/adr/0013-service-lifecycle-and-output-retry.md` established.
+/// shutdown cascade `docs/adr/service-lifecycle-and-output-retry.md` established.
 ///
 /// Flushes the accumulator's final contents (`FlushReason::Shutdown`) only once `pop()` reports
 /// closed-and-empty -- i.e. only after `read_loop` can no longer push anything new, the same
@@ -511,7 +511,7 @@ async fn decode_loop<D: Decoder + Send>(
 }
 
 /// `sink.send` mints a fresh [`logit_pipeline::TraceContext::new_root`] here -- once per
-/// *accumulated* batch, not once per datagram that fed it. Before ADR 0027, one datagram was one
+/// *accumulated* batch, not once per datagram that fed it. Before ADR `decoupled-listener-io`, one datagram was one
 /// `Fanout::send`, so every datagram got its own root; now a `batch_max_events` greater than 1
 /// deliberately correlates however many datagrams the accumulator happened to merge under one
 /// shared root, even though they arrived independently and share no other relationship. This is
@@ -601,7 +601,7 @@ mod tests {
 
     /// The central property this whole workstream exists for: a stalled downstream `Fanout`
     /// consumer must never stop the read half from keeping the socket drained -- unlike the
-    /// pre-ADR-0027 loop, where `recv_from` and `Fanout::send` shared one path.
+    /// pre-ADR `decoupled-listener-io` loop, where `recv_from` and `Fanout::send` shared one path.
     ///
     /// Proven by direct construction rather than a timing guess: the `Fanout`'s one consumer has
     /// channel capacity 1 and is never `.recv()`d, so `decode_loop` blocks forever the moment its

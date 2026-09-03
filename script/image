@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: script/image [tag]
 # Builds the production runtime image (Dockerfile, not Dockerfile.dev) -- what a consumer builds
-# or pulls to actually run `logit` (docs/plans/0002-nginx-integration.md, workstream B). Tags the
+# or pulls to actually run `logit` (docs/plans/nginx-integration.md, workstream B). Tags the
 # result `logit:<tag>` (default: `local`).
 #
 # Builds directly against $DOCKER, not through the `run` helper in common.sh -- `run` executes

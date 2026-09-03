@@ -122,7 +122,7 @@ impl UserData for EventProxy {
                 "attributes" => Ok(LuaValue::UserData(this.attrs_userdata(lua)?)),
                 // Presence flags, not a classification string: an event can carry a log, several
                 // metrics, and a span all at once now, so "what type is this event" has no single
-                // right answer (docs/adr/0012-multi-payload-events.md) -- a script or native
+                // right answer (docs/adr/multi-payload-events.md) -- a script or native
                 // component checks the specific thing it cares about instead. There is
                 // deliberately no `event.type` any more: a single summary label would be lossy at
                 // best and a silent footgun at worst (a script branching on `event.type ==

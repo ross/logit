@@ -1,7 +1,7 @@
 # `logit` demo stack
 
 A self-contained stack for trying `logit`: no Rust toolchain, no `script/*`, no knowledge of the
-rest of this repo. See [docs/plans/0003-demo-stack.md](../docs/plans/0003-demo-stack.md) for why it
+rest of this repo. See [docs/plans/demo-stack.md](../docs/plans/demo-stack.md) for why it
 exists and what's next.
 
 ## Quick start
@@ -48,12 +48,12 @@ to `stdio_out` (the `docker compose logs` tap), to a logs leg (`log_out`, `syslo
 `influxdb_out`) — plus `logit` observing its own pipeline via `internal`
 (`../docs/design/internal-telemetry.md`) into that same InfluxDB bucket *and*, as real spans, over
 OTLP/gRPC into Tempo, one span per node-visit at `span_sample_rate: 1.0` so nothing is thinned out
-(`../docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`,
-`../docs/adr/0024-hand-rolled-grpc-over-hyper.md`). **All three signals work end to end today** —
+(`../docs/adr/internal-span-emission-and-deterministic-sampling.md`,
+`../docs/adr/hand-rolled-grpc-over-hyper.md`). **All three signals work end to end today** —
 that's what the shipped Grafana dashboard shows, side by side: the `logit.*` InfluxDB panels, a Loki
 logs panel, and a Tempo traces panel, all over the same pipeline. `log_out` round-trips `access_in`'s
 own `syslog.hostname`/`syslog.tag` attributes onto every relayed message
-(`../docs/adr/0022-syslog-output.md`), so Loki gets real `host`/`app` stream labels with no extra
+(`../docs/adr/syslog-output.md`), so Loki gets real `host`/`app` stream labels with no extra
 config.
 
 The pipeline diagram on the landing page (and at `:8080/graph.svg` directly) is rendered at
@@ -74,7 +74,7 @@ implemented and tested, but nothing in this stack sends *to* it — `demo/logit.
 `otlp_out`, as a client. The natural next step is reworking [`hello/app.py`](hello/app.py) to use a
 real Python OTLP SDK, which would exercise `otlp_in` with genuine third-party traffic and put
 application spans in Tempo alongside `logit`'s own internal ones
-(`../docs/plans/0005-otlp-end-to-end.md`'s "Follow-ups deliberately left out"). Grafana's Loki
+(`../docs/plans/otlp-end-to-end.md`'s "Follow-ups deliberately left out"). Grafana's Loki
 datasource also carries a `derivedFields` link to Tempo (`tracesToLogsV2` on the Tempo datasource,
 `grafana/provisioning/datasources/datasources.yaml`), so a `trace_id=<hex>` in a log line clicks
 straight through to the matching Tempo trace — `logit`'s own emitted logs don't currently carry one

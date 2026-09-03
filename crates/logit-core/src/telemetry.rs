@@ -1,6 +1,6 @@
 //! Component-level self-telemetry: what a component (and the runtime, on its behalf) records
 //! about its own behavior. See `docs/design/internal-telemetry.md` and
-//! `docs/adr/0018-internal-telemetry-as-pipeline-events.md`.
+//! `docs/adr/internal-telemetry-as-pipeline-events.md`.
 //!
 //! Mirrors [`crate::diag`]'s shape deliberately -- [`Telemetry::default`] is a disabled, no-op
 //! handle, so a component that never receives a live one keeps working with zero added cost: no
@@ -85,7 +85,7 @@ const MAX_LINKS_PER_SPAN: usize = 32;
 /// `internal` component doesn't set one. Below `1.0` deliberately: span volume is a different
 /// shape than metric volume -- one span per node-visit per batch, where a metric point coalesces
 /// between drains -- so keeping everything by default would multiply internal telemetry's own
-/// volume in a way metrics never do. See `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`.
+/// volume in a way metrics never do. See `docs/adr/internal-span-emission-and-deterministic-sampling.md`.
 pub const DEFAULT_SPAN_SAMPLE_RATE: f64 = 0.1;
 
 /// Deterministic on `trace_id`, so every node -- and every `logit` process in a split-collection
@@ -210,7 +210,7 @@ impl Telemetry {
     }
 
     /// Opens a span for this component's one visit to one unit of work -- see
-    /// `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md` for what "one unit of
+    /// `docs/adr/internal-span-emission-and-deterministic-sampling.md` for what "one unit of
     /// work" means per node kind. The sample decision (`trace_is_sampled`) is made here, from
     /// `trace_id` alone, before any span-shaped state exists at all: an unsampled trace gets the
     /// same `SpanGuard::disabled()` a disabled handle's [`Telemetry::timer`] returns, so every

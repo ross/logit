@@ -1,7 +1,7 @@
 //! `MetricRecord` ↔ OTLP `Metric` -- the hard direction, both ways.
 //!
 //! **Encode.** Temporality is `DELTA` by default: `aggregate` produces tumbling deltas per
-//! [ADR 0008](../../../../docs/adr/0008-aggregation-window-semantics.md), and `internal`'s own
+//! [ADR `aggregation-window-semantics`](../../../../docs/adr/aggregation-window-semantics.md), and `internal`'s own
 //! buffer coalesces since the last drain -- neither produces a cumulative running total on its own.
 //! The one exception is a `Histogram` whose event carries `otel.temporality = "cumulative"` (the
 //! same attribute the decode side stamps below, round-tripped rather than silently dropped back to
@@ -31,8 +31,8 @@
 //! |   |   | precedent `crates/logit-outputs/src/influxdb.rs` already sets for the same kind.
 //! |   |   | Counted via `logit.output.metrics.skipped{metric_kind="set"}`, throttled-warned. |
 //!
-//! `Distribution`/`Set` are the qualification [ADR 0023](../../../../docs/adr/0023-committed-pregenerated-otlp-protobuf.md)
-//! spells out against [ADR 0004](../../../../docs/adr/0004-native-wire-format-with-otlp-bridge.md):
+//! `Distribution`/`Set` are the qualification [ADR `committed-pregenerated-otlp-protobuf`](../../../../docs/adr/committed-pregenerated-otlp-protobuf.md)
+//! spells out against [ADR `native-wire-format-with-otlp-bridge`](../../../../docs/adr/native-wire-format-with-otlp-bridge.md):
 //! here it's `logit`'s own model (a mergeable sketch, a cardinality stub) that can't be losslessly
 //! re-expressed *as* OTLP, not the other way around.
 //!
@@ -211,7 +211,7 @@ pub(crate) fn encode_metric(
             return None;
         }
         // A `GaugeDelta` reaching a sink means the pipeline is missing an `aggregate` component --
-        // it is explicitly unresolved (`docs/adr/0026-relative-gauge-adjustments.md`) and must not
+        // it is explicitly unresolved (`docs/adr/relative-gauge-adjustments.md`) and must not
         // be encoded as though it were an absolute value. Uses the same greppable
         // `gauge_delta_unresolved` diagnostic key `influxdb_out` reports under, not the generic
         // skip key above, so an operator can find every sink's occurrence of this one failure mode
@@ -707,7 +707,7 @@ mod tests {
     }
 
     /// A `GaugeDelta` reaching this encoder means the pipeline is missing an `aggregate`
-    /// component (`docs/adr/0026-relative-gauge-adjustments.md`) -- it must be dropped, not
+    /// component (`docs/adr/relative-gauge-adjustments.md`) -- it must be dropped, not
     /// encoded as though it were an absolute value, and reported under the same greppable
     /// `gauge_delta_unresolved` diagnostic key `influxdb_out` uses, not the generic `set`-style
     /// per-kind skip key.

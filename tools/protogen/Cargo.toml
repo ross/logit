@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 # Deliberately its own, empty workspace -- not a member of the root Cargo.toml workspace (see
-# crates/logit-proto/proto/README.md and docs/adr/0023-committed-pregenerated-otlp-protobuf.md).
+# crates/logit-proto/proto/README.md and docs/adr/committed-pregenerated-otlp-protobuf.md).
 # `cargo build --workspace` from the repo root never touches this crate, and `prost-build`/
 # `protoc` never enter any build-time or CI dependency graph.
 [workspace]

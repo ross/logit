@@ -1,11 +1,11 @@
 //! Config types for `logit`.
 //!
-//! Every type here derives both `Deserialize` and `JsonSchema` together (ADR 0003) so the
+//! Every type here derives both `Deserialize` and `JsonSchema` together (ADR `config-yaml-jsonschema`) so the
 //! published JSON Schema (`logit schema`, `schema/logit.schema.json`) can never drift from what
 //! the binary actually accepts. YAML parsing itself (via a maintained `serde_yaml` fork, per
-//! ADR 0003) belongs to `logit-cli`, not here -- this crate only defines the shape.
+//! ADR `config-yaml-jsonschema`) belongs to `logit-cli`, not here -- this crate only defines the shape.
 //!
-//! Config is one flat graph of named [`Component`]s (ADR 0009,
+//! Config is one flat graph of named [`Component`]s (ADR `component-graph-configuration`,
 //! `docs/design/pipeline-graph.md`) -- there is no separate inputs/outputs/pipelines split. A
 //! component's `sources` name the other components it reads from; its `type`-tagged
 //! [`ComponentKind`] fixes its arity (a listener has none, a sink has at least one and is never
@@ -42,13 +42,13 @@ fn non_empty_components_schema(generator: &mut SchemaGenerator) -> Schema {
 pub struct Component {
     #[serde(default)]
     pub sources: Vec<String>,
-    /// Per-sink delivery buffer (`docs/adr/0021-buffered-sink-delivery.md`). Meaningful only on a
+    /// Per-sink delivery buffer (`docs/adr/buffered-sink-delivery.md`). Meaningful only on a
     /// sink -- graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value
     /// on any other kind. A sibling field of `kind`, not nested inside every sink
     /// `ComponentKind` variant, so a future fifth sink kind costs nothing extra here.
     #[serde(default)]
     pub buffer: BufferConfig,
-    /// Per-listener receive queue and batching (`docs/adr/0027-decoupled-listener-io.md`).
+    /// Per-listener receive queue and batching (`docs/adr/decoupled-listener-io.md`).
     /// Meaningful only on a datagram listener -- graph validation rejects a non-default value on
     /// any other kind, `internal` included. A sibling field of `kind`, mirroring `buffer`'s own
     /// placement.
@@ -59,7 +59,7 @@ pub struct Component {
 }
 
 /// One `kv_metrics` entry: a metric `name`, an optional source `field`, and an optional `unit`.
-/// See `ComponentKind::KvMetrics` and `docs/adr/0014-kv-metrics-semantics.md`.
+/// See `ComponentKind::KvMetrics` and `docs/adr/kv-metrics-semantics.md`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct MetricSpec {
     /// The metric's measurement name. An empty name is rejected at graph-validation time --
@@ -78,7 +78,7 @@ pub struct MetricSpec {
 
 /// Which OTLP transport a component speaks -- both `otlp_in` and `otlp_out` carry identical
 /// protobuf payloads (`crates/logit-proto/src/otlp`), differing only in framing and endpoint
-/// shape (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`).
+/// shape (`docs/adr/hand-rolled-grpc-over-hyper.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OtlpProtocol {
@@ -88,7 +88,7 @@ pub enum OtlpProtocol {
     #[default]
     Http,
     /// Unary gRPC over plaintext HTTP/2 -- `crates/logit-outputs/src/otlp.rs`'s hand-rolled gRPC
-    /// transport has no TLS support at all (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`), so an
+    /// transport has no TLS support at all (`docs/adr/hand-rolled-grpc-over-hyper.md`), so an
     /// `otlp_out` component's `endpoint` under this protocol is rejected at construction time if
     /// it's written with an `https://` scheme, rather than silently exporting in plaintext.
     Grpc,
@@ -118,7 +118,7 @@ pub enum ComponentKind {
     /// `crates/logit-inputs/src/syslog.rs`'s own module doc has always said UDP-only (nginx's
     /// `syslog:` writer is UDP-only, so a TCP accept loop would buy this listener nothing;
     /// `docs/known-gaps.md`'s "syslog TCP and structured data" entry tracks it as future,
-    /// additive work). `syslog_out` (the egress side, `docs/adr/0022-syslog-output.md`) supports
+    /// additive work). `syslog_out` (the egress side, `docs/adr/syslog-output.md`) supports
     /// both UDP and TCP -- that asymmetry is deliberate, not a sign this needs fixing to match.
     SyslogIn {
         bind: String,
@@ -143,7 +143,7 @@ pub enum ComponentKind {
     /// `interval` and emits them as ordinary events into the graph, same as any other listener.
     /// Named for the source, not the signal it emits today -- free to grow logs and spans later
     /// without a rename. See `docs/design/internal-telemetry.md` and
-    /// `docs/adr/0018-internal-telemetry-as-pipeline-events.md`.
+    /// `docs/adr/internal-telemetry-as-pipeline-events.md`.
     Internal {
         /// Both the drain cadence for every component's buffered points and the sampling tick for
         /// this component's own process-level gauges (interner size, uptime). Should divide
@@ -160,7 +160,7 @@ pub enum ComponentKind {
         /// traces rather than a representative sample would set this explicitly. Named
         /// `span_sample_rate`, not `sample_rate` -- there is already a `ComponentKind::Sample`
         /// transform, and `internal` may grow other sampling knobs later. See
-        /// `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`.
+        /// `docs/adr/internal-span-emission-and-deterministic-sampling.md`.
         #[serde(default = "default_span_sample_rate")]
         span_sample_rate: f64,
     },
@@ -183,17 +183,17 @@ pub enum ComponentKind {
         interval: Option<Duration>,
     },
     /// The stateful aggregator (counters/gauges/sets/distributions). Runs `flush()` on
-    /// `interval`; see `docs/adr/0008-aggregation-window-semantics.md`.
+    /// `interval`; see `docs/adr/aggregation-window-semantics.md`.
     Aggregate {
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         interval: Duration,
         /// How many consecutive windows a gauge series with no new data is retained past its
-        /// last update, so a relative gauge adjustment (`docs/adr/0026-relative-gauge-adjustments.md`)
+        /// last update, so a relative gauge adjustment (`docs/adr/relative-gauge-adjustments.md`)
         /// arriving in a later window can still resolve against the value it last held. `0`
         /// disables retention entirely -- every gauge series is drained every window exactly like
         /// a counter, matching this field's absence before it existed. See the
-        /// `docs/adr/0008-aggregation-window-semantics.md` amendment for the full design.
+        /// `docs/adr/aggregation-window-semantics.md` amendment for the full design.
         #[serde(default = "default_gauge_retention")]
         gauge_retention: u32,
         /// A hard cap on how many gauge series may be retained across this component's whole
@@ -206,7 +206,7 @@ pub enum ComponentKind {
         max_retained_gauge_series: usize,
     },
     /// Parses a log record's message as JSON, merging the resulting key/values into the event's
-    /// attributes. See `docs/adr/0010-json-parsing-into-attributes.md`.
+    /// attributes. See `docs/adr/json-parsing-into-attributes.md`.
     Json {
         /// Skip everything before the first `{` and parse from there -- for lines with a
         /// non-JSON prefix (`2026-08-29 INFO {"a":1}`). Off by default: the whole line is
@@ -215,7 +215,7 @@ pub enum ComponentKind {
         skip_to_brace: bool,
     },
     /// Turns attributes already on an event (typically merged there by `json`) into metrics on
-    /// that same event. See `docs/adr/0014-kv-metrics-semantics.md` for the skip rules, the
+    /// that same event. See `docs/adr/kv-metrics-semantics.md` for the skip rules, the
     /// numeric coercion rules, and why there is deliberately no `tags:` field here -- tag
     /// selection is `Keep`'s job, since every metrics sink already reads `event.attributes`.
     KvMetrics {
@@ -301,11 +301,11 @@ pub enum ComponentKind {
     /// RFC 3164 / RFC 5424 syslog egress over UDP or TCP -- the mirror of `SyslogIn`, and a real
     /// relay: header fields round-trip from an event's `syslog.*` attributes when present,
     /// falling back to the defaults below only when an event carries none (e.g. one that never
-    /// passed through `syslog_in`). See `docs/adr/0022-syslog-output.md`.
+    /// passed through `syslog_in`). See `docs/adr/syslog-output.md`.
     SyslogOut {
         /// `host:port`. Resolved at connect/bind time, never at config-load time -- a `syslog_out`
         /// pointed at a destination that isn't up yet is not a config error (`!env` still applies
-        /// like any other string field, ADR 0011).
+        /// like any other string field, ADR `env-yaml-tag`).
         endpoint: String,
         #[serde(default)]
         transport: SyslogTransport,
@@ -369,7 +369,7 @@ fn default_syslog_connect_timeout() -> Duration {
 /// `syslog_out`'s transport. UDP (the default) mirrors `syslog_in` and needs no ordering
 /// guarantee against the receiver's startup -- a fire-and-forget `send_to` before the receiver is
 /// up just loses that line, the same honest limit `syslog_in`'s own UDP intake accepts on the way
-/// in. TCP is what makes `Fault` classification (`docs/adr/0021-buffered-sink-delivery.md`)
+/// in. TCP is what makes `Fault` classification (`docs/adr/buffered-sink-delivery.md`)
 /// meaningful for this sink: a connect failure is unambiguously `Fault::Clean`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -496,7 +496,7 @@ impl JsonSchema for StdioTarget {
     }
 }
 
-/// Per-sink delivery buffer (`docs/adr/0021-buffered-sink-delivery.md`). Meaningful only on a
+/// Per-sink delivery buffer (`docs/adr/buffered-sink-delivery.md`). Meaningful only on a
 /// sink; graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on
 /// any other kind. Every field defaults, so an omitted `buffer:` block is exactly today's
 /// behavior.
@@ -514,7 +514,7 @@ pub struct BufferConfig {
     pub max_bytes: u64,
     pub overflow: OverflowPolicy,
     /// `None` -- the default -- means "derive from the sink's own `duplicate_safe()` fact"
-    /// (`docs/adr/0021-buffered-sink-delivery.md`'s three-layer posture design). `Some(_)`
+    /// (`docs/adr/buffered-sink-delivery.md`'s three-layer posture design). `Some(_)`
     /// overrides that default for this component specifically.
     #[serde(default)]
     pub delivery: Option<DeliveryPosture>,
@@ -567,18 +567,18 @@ pub enum DeliveryPosture {
 }
 
 /// Per-listener receive queue and datagram-\>batch assembly
-/// (`docs/adr/0027-decoupled-listener-io.md`). Meaningful only on a datagram listener (today
+/// (`docs/adr/decoupled-listener-io.md`). Meaningful only on a datagram listener (today
 /// `statsd_in`/`syslog_in`); graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a
 /// non-default value on any other kind, including `internal` (a listener by role, but one with no
 /// socket, no queue, and no decoder). Flat, following [`BufferConfig`]'s own
 /// `retry_budget`/`retry_max_delay` precedent rather than nesting a `batch:` sub-block -- two
 /// levels of optional-with-defaults is harder to scan in YAML than a flat prefix. Every field
 /// defaults, so a `receive:` block is never required -- **but an omitted block is not byte-for-
-/// byte the pre-ADR-0027 behavior**, and isn't meant to be: `batch_max_events: 1_000` and
+/// byte the pre-ADR `decoupled-listener-io` behavior**, and isn't meant to be: `batch_max_events: 1_000` and
 /// `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into
 /// batches (up to 1000 events, or up to 100ms of added latency before a send) rather than sending
 /// one batch per datagram immediately, matching what every established UDP listener researched
-/// for ADR 0027 does out of the box. A deployment that genuinely needs the old one-send-per-
+/// for ADR `decoupled-listener-io` does out of the box. A deployment that genuinely needs the old one-send-per-
 /// datagram, no-added-latency behavior gets it back explicitly with `batch_max_events: 1`, not by
 /// omitting `receive:`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -599,7 +599,7 @@ pub struct ReceiveConfig {
     /// Telegraf, gostatsd) treats this the same way.
     pub overflow: OverflowPolicy,
     /// Events to accumulate across datagrams before one send downstream. `1` means one send per
-    /// datagram -- the behavior before ADR 0027 -- since the accumulator flushes on a bound
+    /// datagram -- the behavior before ADR `decoupled-listener-io` -- since the accumulator flushes on a bound
     /// *reached or exceeded* and never splits a single decode's output. `0` is rejected as an
     /// impossible bound (graph rule 18, the twin of rule 15's `buffer.max_batches: 0` check).
     pub batch_max_events: usize,
@@ -619,7 +619,7 @@ pub struct ReceiveConfig {
     #[schemars(with = "Option<String>")]
     pub receive_buffer_bytes: Option<u64>,
     /// How long a listener keeps draining a cooperative shutdown before being cancelled by drop
-    /// (`docs/adr/0027-decoupled-listener-io.md`, revising ADR 0013's unconditional cancel-by-drop
+    /// (`docs/adr/decoupled-listener-io.md`, revising ADR `service-lifecycle-and-output-retry`'s unconditional cancel-by-drop
     /// into a bounded one). Matches `buffer.shutdown_grace`'s default so both ends of the
     /// pipeline drain on the same number.
     #[serde(with = "humantime_serde_duration")]
@@ -628,7 +628,7 @@ pub struct ReceiveConfig {
 }
 
 /// Defaults, justified against established UDP listeners' own tuning figures -- see
-/// `docs/adr/0027-decoupled-listener-io.md` for the full numeric derivation (Telegraf, gostatsd,
+/// `docs/adr/decoupled-listener-io.md` for the full numeric derivation (Telegraf, gostatsd,
 /// DogStatsD, rsyslog, syslog-ng).
 impl Default for ReceiveConfig {
     fn default() -> Self {
@@ -667,7 +667,7 @@ mod human_bytes {
     /// claim in *both* directions at once: the generated schema said `"type": "string"` while a
     /// real config's serialized form was always a bare number, and a schema-strict validator
     /// would separately reject the bare-integer input form `logit` itself accepted -- two
-    /// distinct violations of ADR 0003's "the schema can't drift from what the binary accepts"
+    /// distinct violations of ADR `config-yaml-jsonschema`'s "the schema can't drift from what the binary accepts"
     /// contract, not one. Consistently string-only (a quoted `"134217728"` or `"64MiB"`, always
     /// serialized the same way) matches the published schema exactly, with no asymmetry to
     /// reason about.
@@ -783,7 +783,7 @@ mod human_bytes {
         fn serialize_emits_a_string_matching_the_published_schema() {
             // Matches `#[schemars(with = "String")]`'s claim exactly, both directions -- see
             // this module's own doc comment for why an earlier bare-integer form was a real
-            // ADR-0003 schema-drift bug, not just a style choice.
+            // ADR `config-yaml-jsonschema` schema-drift bug, not just a style choice.
             #[derive(serde::Serialize)]
             struct W {
                 #[serde(with = "super")]
@@ -796,7 +796,7 @@ mod human_bytes {
 
     /// The same codec, for `Option<u64>` fields (`#[serde(default, with =
     /// "human_bytes::option")]`) -- used by `ReceiveConfig::receive_buffer_bytes`
-    /// (`docs/adr/0027-decoupled-listener-io.md`), where `None` means "leave the kernel default
+    /// (`docs/adr/decoupled-listener-io.md`), where `None` means "leave the kernel default
     /// alone" rather than a byte count of zero. Mirrors `humantime_serde_duration::option`'s
     /// shape exactly: a nested module because `#[serde(with = "...")]` on an `Option<u64>` field
     /// calls *this* module's `serialize`/`deserialize` with `Option<u64>`, not the parent's `u64`
@@ -929,7 +929,7 @@ mod humantime_serde_duration {
 }
 
 /// Generate the published JSON Schema for [`Config`]. Backs the `logit schema` CLI command
-/// (ADR 0003) -- CI regenerates `schema/logit.schema.json` from this and fails if it's stale.
+/// (ADR `config-yaml-jsonschema`) -- CI regenerates `schema/logit.schema.json` from this and fails if it's stale.
 pub fn json_schema() -> schemars::schema::RootSchema {
     schemars::schema_for!(Config)
 }

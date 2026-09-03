@@ -95,11 +95,11 @@ heap allocation *and* the full 392 bytes. Inline capacity 8 is therefore not "fr
 **A statsd counter costs the same 776 bytes as a fully-populated nginx access log.** `Event` has no
 compact representation for the common case; the space for attributes, a sketch, and a span is
 reserved unconditionally. That is the price of "an event is whatever it carries"
-([ADR 0012](../adr/0012-multi-payload-events.md)) implemented with inline storage.
+([ADR `multi-payload-events`](../adr/multi-payload-events.md)) implemented with inline storage.
 
 **`MetricKind::Distribution` sets the size of every metric.** A `Counter(f64)` needs 8 bytes and
 pays 176, because `DDSketch` (two `Store`s and a `Config`) is inlined into the enum — deliberately,
-per [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md): boxing it would save 144 bytes
+per [ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md): boxing it would save 144 bytes
 here but cost an allocation on every distribution metric actually constructed or cloned, and
 distributions are a shipping, commonly-populated feature (`kv_metrics`, statsd's `ms`/`h`/`d`), not
 a rare one — see below.
@@ -121,7 +121,7 @@ alone would suggest taking them.
 
 **Both boxing changes trade `Event`'s size for allocation count, and this project now has a stated
 priority for that exact conflict: minimize allocations, not size**
-([ADR 0017](../adr/0017-minimize-allocations-over-event-size.md)). `logit`'s deployments are not
+([ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md)). `logit`'s deployments are not
 constrained by the in-flight footprint at stake here (hundreds of bytes per event); a heap
 allocation is the more expensive resource by a wide margin at this scale — copying a few hundred
 extra bytes is close to free, while an allocation does real, measurable work even on a fast path.
@@ -136,13 +136,13 @@ one bins `Vec` per distribution); boxing made that 5, and on the project's own r
 which carries 2 distributions per event — the headline ingest number this document tracks went
 from 5 to 7 allocations per line. That's not a rare-workload edge case; it's the flagship config.
 **`Box`ing `SpanRecord`** was reverted for the same reason applied consistently rather than
-selectively: no OTLP (or other span-producing) input exists yet, but per ADR 0017 that's a `v0.1`
+selectively: no OTLP (or other span-producing) input exists yet, but per ADR `minimize-allocations-over-event-size` that's a `v0.1`
 gap, not a property of the workload — a trace-focused deployment will populate `span` on most
 events the same way the nginx config already populates `metrics` with distributions, once that
 input exists. Treating spans as safe to box because nothing constructs one *yet* would just be
 deferring the same mistake to whenever that input lands. That prediction is now partly realized
 without any external input at all:
-[ADR 0025](../adr/0025-internal-span-emission-and-deterministic-sampling.md) makes `internal`
+[ADR `internal-span-emission-and-deterministic-sampling`](../adr/internal-span-emission-and-deterministic-sampling.md) makes `internal`
 itself a real, if low-volume by default, producer of `span`-carrying events — a drained span
 event costs exactly what this table already prices (776 bytes inline, `SpanRecord`'s 136 of it),
 no new type and no change to this row's reasoning, just the first real caller of the shape this
@@ -163,7 +163,7 @@ guess in either direction: see §8.
 question, never yet asked.** Any event with 2+ metrics spills — which includes the nginx reference
 config's event (4 metrics) unconditionally, and `kv_metrics` configurations generally, by design.
 Worth noting a real interaction with the `DdSketch` decision above: `MetricRecord` is 184 bytes
-with the sketch inlined (per ADR 0017), so widening `MetricList`'s capacity is considerably more
+with the sketch inlined (per ADR `minimize-allocations-over-event-size`), so widening `MetricList`'s capacity is considerably more
 expensive in bytes per additional slot than it would have been if the sketch had stayed boxed (40
 bytes/slot). The two decisions aren't independent of each other. Also recorded as an open knob,
 same reasoning as `AttrMap`'s: real per-event metric-count data is needed before picking a number,
@@ -193,9 +193,9 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `syslog_in` decode 1 line | **1** | just the `Vec<Event>`; every field slices the datagram |
 | `syslog_in` decode 100 lines | **1** | + 5 reallocs from `Vec` growth |
 | `syslog_in` decode 1 logs-only line | **1** | plain-text message, no JSON -- same zero-copy shape |
-| `syslog_in` `decode_into` into a warm buffer | **0** | ADR 0027 -- see below |
+| `syslog_in` `decode_into` into a warm buffer | **0** | ADR `decoupled-listener-io` -- see below |
 | `statsd_in` decode 1 line | **2** | fixed -- see below, tag values now slice the datagram too |
-| `statsd_in` `decode_into` into a warm buffer | **1** | ADR 0027 -- see below |
+| `statsd_in` `decode_into` into a warm buffer | **1** | ADR `decoupled-listener-io` -- see below |
 | `statsd_in` decode 1 distribution line (`ms`/`h`/`d`, unsampled) | **3** | 2 as above + 1 `bins` Vec on the sketch's first sample |
 | `statsd_in` decode 1 sampled distribution line (`@0.1`, 10 weighted samples) | **3** | same as unsampled -- `DdSketch::add_weighted` delegates to `add_with_count`, O(1) and zero extra allocations regardless of weight |
 | `json` parse + merge (nginx shape) | **1** | fixed -- see below, was 7 |
@@ -204,7 +204,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `keep` filter to 3 attrs | **0** | 3 attributes fit inline |
 | `aggregate` absorb (after `keep`) | **0** | `SeriesKey` clone stays inline |
 | `aggregate` absorb (no `keep`) | **4** | one per metric — the map no longer fits inline |
-| `aggregate` flush 4 series | **6** | +4 since flush-side trace linking landed (ADR 0020) — one `Vec<SpanLink>` per series, see below |
+| `aggregate` flush 4 series | **6** | +4 since flush-side trace linking landed (ADR `trace-context-propagation-on-delivered`) — one `Vec<SpanLink>` per series, see below |
 | `aggregate` flush 100 retained gauge series (spilled attrs) | **209** | `gauge_retention > 0` only — see below; the default (`0`) tumbling path above is unaffected |
 | **full ingest chain, 1 line** | **5** | decode → aggregate; was 11 before `json`'s fix |
 | `Event::clone` (nginx shape) | **4** | what each extra fan-out branch costs |
@@ -213,8 +213,8 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `Event::clone` (span shape) | **2** | 1 per `Vec` (`events`, `links`) -- every `AttrMap` here stays inline |
 | `stdio_out` encode 100 events | **101** | ~1/event -- fixed, see below, was 1801 |
 | `influxdb_out` encode 100 events | **30** | ~0.3/event — see below |
-| receive queue: push then pop, warm | **0** | `BoundedQueue<Datagram>`, ADR 0027 -- see below |
-| accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR 0027 -- see below |
+| receive queue: push then pop, warm | **0** | `BoundedQueue<Datagram>`, ADR `decoupled-listener-io` -- see below |
+| accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR `decoupled-listener-io` -- see below |
 | `syslog_out` encode_into 100 events | **100** | ~1/event -- reused struct-held scratch buffers, was 401, see below |
 
 And the corresponding times:
@@ -248,12 +248,12 @@ And the corresponding times:
 > allocation counts are what `crates/logit-bench/tests/allocations.rs`'s
 > `statsd_decode_one_distribution_line`/`statsd_decode_one_sampled_distribution_line` pin.
 
-### Listener I/O decoupling: the `decode_into` buffer-reuse win (ADR 0027)
+### Listener I/O decoupling: the `decode_into` buffer-reuse win (ADR `decoupled-listener-io`)
 
 Two numbers for the same decoder look contradictory at first glance and aren't: `statsd_in decode
 1 line` (2) and `statsd_in decode_into into a warm buffer` (1) measure two different call paths.
 `decode()` (the trait's provided default, used by every existing test and benchmark, and the only
-path that existed before [ADR 0027](../adr/0027-decoupled-listener-io.md)) always hands
+path that existed before [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)) always hands
 `decode_into` a fresh `Vec::new()` — that allocation is real and unavoidable *for that call shape*,
 so the original numbers stand unchanged. `decode_into` called directly against a buffer the caller
 *reuses* across datagrams — `logit-inputs::udp::decode_loop`'s actual hot path — is a strictly
@@ -280,7 +280,7 @@ ever the per-stage allocation cost, per this section's own scope.
 
 ### `aggregate` flush now costs one allocation per series, for real trace links
 
-[ADR 0020](../adr/0020-trace-context-propagation-on-delivered.md)'s flush-side linking widened
+[ADR `trace-context-propagation-on-delivered`](../adr/trace-context-propagation-on-delivered.md)'s flush-side linking widened
 `Transform::flush` to pair each emitted `Event` with the bounded, best-effort `Vec<SpanLink>` that
 attributes it (`crates/logit-transforms/src/aggregate.rs`'s `ContributingContexts`). Re-measured,
 not assumed, per this file's own rule: `aggregate_flush_100_series` moved from 2 to 6 allocations —
@@ -298,9 +298,9 @@ the links on the way out, since nothing turns them into a real `SpanRecord` yet
 `aggregate` flushes any series at all, whether or not a config ever routes anything to look at the
 result.
 
-### Gauge retention's own cost, isolated and measured (ADR 0008's amendment)
+### Gauge retention's own cost, isolated and measured (ADR `aggregation-window-semantics`'s amendment)
 
-`gauge_retention > 0` (`docs/adr/0008-aggregation-window-semantics.md`'s amendment) adds a real,
+`gauge_retention > 0` (`docs/adr/aggregation-window-semantics.md`'s amendment) adds a real,
 separate allocation cost on top of the flush numbers above, paid only by series that are actually
 retained -- the default (`gauge_retention: 0`) path above is untouched, confirmed by
 `aggregate_flush_100_series` re-measuring at exactly the same **6** it was before retention existed.
@@ -473,7 +473,7 @@ channel hop and the trait-object call, because both drive a **current-thread** r
 ### Costing internal spans: the `Delivered` trade, measured
 
 `docs/known-gaps.md`'s internal-spans entry gates carrying trace context on `Delivered` on measured
-evidence, per [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md). The coverage above
+evidence, per [ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md). The coverage above
 is what made that measurement possible; this is the measurement itself. **Not a decision** -- ADR
 0017 asks for evidence before the trade is decided, and this is that evidence, recorded so the
 decision (its own ADR, when someone takes it) doesn't have to re-derive it.
@@ -489,7 +489,7 @@ back to this table's pre-existing state except the one line below.
 
 **Size: `size_of::<Delivered>()` goes from 32 to 56 -- exactly `TraceContext`'s 24 bytes, no padding
 overhead.** This is a per-*batch* cost, on the channel payload, not a per-event one: contrast with
-`Event`'s 776 bytes, where ADR 0017 already settled that a much smaller per-event size cost is
+`Event`'s 776 bytes, where ADR `minimize-allocations-over-event-size` already settled that a much smaller per-event size cost is
 worth avoiding an allocation. `Delivered` isn't `Event` -- this is a different type, on a different
 part of the pipeline, at a different multiplier (one per batch, not one per event within it), so
 0017's conclusion doesn't transfer here by default; it's cited for contrast, not as the answer.
@@ -527,7 +527,7 @@ what it produces, rather than always minting a fresh root) touches `run_transfor
 themselves, not just `Fanout`/`Delivered` -- a materially bigger change than the type-and-copy cost
 measured here, and the actual shape a real internal-spans feature would need.
 
-**Decided and built, on this evidence:** [ADR 0020](../adr/0020-trace-context-propagation-on-delivered.md)
+**Decided and built, on this evidence:** [ADR `trace-context-propagation-on-delivered`](../adr/trace-context-propagation-on-delivered.md)
 took the measurements above as its basis and implemented real propagation for the two node kinds
 with an unambiguous parent (`Transform::process`/`ScriptWorker::process`'s non-flush path, and
 `run_output`, which needed no new wiring at all). Every allocation-count assertion from before that
@@ -537,7 +537,7 @@ per-node-kind account, and `docs/known-gaps.md`'s internal-spans entry for what'
 (flush's *n*-to-1 problem, `SpanRecord` emission, sampling).
 
 **Emission itself landed next, on the same "measure, don't assume" basis, and changed nothing in
-this section's numbers.** [ADR 0025](../adr/0025-internal-span-emission-and-deterministic-sampling.md)
+this section's numbers.** [ADR `internal-span-emission-and-deterministic-sampling`](../adr/internal-span-emission-and-deterministic-sampling.md)
 built the piece this section's "what's left unmeasured" line named -- a real `Telemetry::span`/
 `SpanGuard`, a bounded per-component span buffer, and `ComponentBuffer::drain`'s span-emitting pass
 -- and the deliberately deterministic-on-`trace_id` sampler (`trace_is_sampled`) is *why* it changed
@@ -556,7 +556,7 @@ actually exercises a `Telemetry::span` call site, and it matters which do:
   disabled path is free; it says nothing about a *live* registry sampling below `1.0`.
 - `process_batch_*`/`send_batch_*`'s "telemetry live" variants attach a real `Telemetry` from a live
   `Registry` -- but `process_batch`/`send_batch` are the per-batch bodies `run_transform`/
-  `write_loop` call *into*; the actual `Telemetry::span` calls (ADR 0025) live one level up, in
+  `write_loop` call *into*; the actual `Telemetry::span` calls (ADR `internal-span-emission-and-deterministic-sampling`) live one level up, in
   `run_transform`/`run_flush`/`run_lua`/`write_loop` themselves, none of which `logit-bench` drives
   directly under `CountingAlloc`. These constants holding unmodified is expected (nothing about them
   changed), but it does not exercise the sample-decision branch either.
@@ -661,7 +661,7 @@ mutating branch pays when it has to.
 
 The design this section originally recommended: put `Arc<EventBatch>` on the channels, and have
 each consumer do `Arc::try_unwrap(batch).unwrap_or_else(|shared| (*shared).clone())`. Landed in
-three rounds (`docs/adr/0016-arc-eventbatch-copy-on-write.md`, PR #33) — worth reading in full for
+three rounds (`docs/adr/arc-eventbatch-copy-on-write.md`, PR #33) — worth reading in full for
 how much the initial "strictly no worse anywhere" framing had to be corrected against real
 measurement. The honest result, by fan-out shape:
 
@@ -694,7 +694,7 @@ tests that manually pin each ordering
 
 **A further hop past `Fanout::send` exists for an `Output` branch, and it is not free.** The table
 above measures `Fanout::send` alone; a sink's batch then takes one more step,
-`drain_inbox` (`runtime.rs`, [ADR 0021](../adr/0021-buffered-sink-delivery.md)), which moves it off
+`drain_inbox` (`runtime.rs`, [ADR `buffered-sink-delivery`](../adr/buffered-sink-delivery.md)), which moves it off
 the component's inbox into its `SinkQueue`. For a single-consumer edge, `Fanout::send` itself costs
 0 (the table's first row) — but `drain_inbox` always needs an `Arc<EventBatch>` to hand to the
 queue, so a `Delivered::Owned` batch costs exactly one `Arc::new` there, previously paid nowhere on
@@ -703,7 +703,7 @@ this path at all. `drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc
 rather than through a full `run`. A `Delivered::Shared` batch (a real fan-out) already carries its
 `Arc`, so this hop costs `drain_inbox` nothing further beyond what the table above already counts.
 
-**This likelihood flipped with [ADR 0021](../adr/0021-buffered-sink-delivery.md).** Before it,
+**This likelihood flipped with [ADR `buffered-sink-delivery`](../adr/buffered-sink-delivery.md).** Before it,
 `run_output` held its `Arc` handle for the full duration of `output.send` — typically real I/O,
 measurably slower than a `Transform`'s local processing — so 6 was the likelier practical outcome
 despite 1 being reachable. After the drain/write split, `drain_inbox` drops its handle the instant
@@ -871,12 +871,12 @@ is an admission-control estimate, not an allocator-accounting figure — unlike 
 exact-equality discipline: a `MetricKind::Distribution`'s `DDSketch` is approximated with a fixed
 constant rather than walked bin-by-bin, and `Value`'s numeric/bool/null variants (stored inline, no
 heap component) contribute nothing. It is consumed by the buffered sink-delivery work
-(`docs/plans/0004-buffered-sink-delivery.md`, `docs/adr/0021-buffered-sink-delivery.md`): every
+(`docs/plans/buffered-sink-delivery.md`, `docs/adr/buffered-sink-delivery.md`): every
 sink's `SinkQueue` (`crates/logit-pipeline/src/queue.rs`) bounds itself on both batch count and this
 estimate, whichever trips first.
 
 **A second consumer of the same byte-aware bounding idea, on the listener side.**
-[ADR 0027](../adr/0027-decoupled-listener-io.md) generalizes `SinkQueue` into `BoundedQueue<T:
+[ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md) generalizes `SinkQueue` into `BoundedQueue<T:
 Queued>` and gives a UDP listener's receive queue (`logit-inputs::udp::ReceiveQueue`) its own
 weight: `Datagram::weight()` is `bytes.len()` plus the struct's own inline footprint, bounding
 *undecoded* bytes rather than `estimated_heap_bytes()`'s decoded-event estimate. `receive.
@@ -898,7 +898,7 @@ by construction), and it returns memory to the OS reluctantly, so RSS drifts upw
 while the working set stays flat.
 
 `logit` therefore uses **jemalloc** by default —
-[ADR 0015](../adr/0015-jemalloc-global-allocator.md) — behind a default-on `jemalloc` feature on
+[ADR `jemalloc-global-allocator`](../adr/jemalloc-global-allocator.md) — behind a default-on `jemalloc` feature on
 `logit-cli`, so `--no-default-features` still builds against the system allocator and the
 comparison stays available.
 
@@ -1041,7 +1041,7 @@ might regress a workload the fixtures don't cover.
    `process`'s existing `MissingProcess` — instead of being silently treated as "no `flush()`" and
    quietly losing every flush tick's events forever.
 7. ~~**`Arc<EventBatch>` copy-on-write on channels.**~~ **Done, with real caveats** (§3) — landed
-   over three rounds (`docs/adr/0016-arc-eventbatch-copy-on-write.md`), each correcting an
+   over three rounds (`docs/adr/arc-eventbatch-copy-on-write.md`), each correcting an
    overclaim the previous one made. Single-consumer edges and all-`Output` fan-outs are
    unconditionally better (0 and 1 allocations respectively, both strict wins). A fan-out mixing
    one `Output` branch with one mutating branch is genuinely racy — 1 or 6, decided by scheduling,
@@ -1053,12 +1053,12 @@ might regress a workload the fixtures don't cover.
    Whether to go the *other* direction (increase it) is a separate, still-open question — see the
    new "Deferred" bucket below.
 9. ~~**`Box` `SpanRecord`.**~~ **Decided: don't box** (§1,
-   [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md)). Measured first (construction
+   [ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md)). Measured first (construction
    11 → 12 allocations, clone 2 → 3, for the span fixture) before implementing and then reverting:
    the 128-byte saving trades against an allocation cost that a trace-focused deployment would pay
    on most events once a span-producing input exists — evaluated against that eventual workload,
    not against `v0.1`'s current lack of one, per the new policy.
-10. ~~**`Box` the `DdSketch`.**~~ **Decided: don't box** (§1, ADR 0017). Measured both the
+10. ~~**`Box` the `DdSketch`.**~~ **Decided: don't box** (§1, ADR `minimize-allocations-over-event-size`). Measured both the
     single-distribution and distribution-heavy fixtures before implementing and then reverting:
     boxing saved 144 bytes but cost the project's own reference config a real allocation increase
     (full ingest chain 5 → 7) — distributions are a shipping, commonly-populated feature, not the
@@ -1115,7 +1115,7 @@ traffic, which doesn't exist yet and can't be synthesized honestly.
   item 8) but not enough to decide whether to *increase* it, or to pick `MetricList`'s (§8 items
   12-13). That needs real production telemetry, not more synthetic fixtures — recorded as
   deliberately deferred rather than guessed, per the direction settled when `DdSketch`/`SpanRecord`
-  were measured and then not boxed for the same reason (§1, [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md)).
+  were measured and then not boxed for the same reason (§1, [ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md)).
 - **What do the unmeasured workload shapes actually cost?** Answered, for allocation and clone
   cost: logs-only, wide-JSON, distribution-heavy metrics, and spans are all fixtured and measured
   (§0, §2), and that evidence is what drove §8 items 8-10's decisions (one confirmed-unchanged, two
@@ -1127,7 +1127,7 @@ traffic, which doesn't exist yet and can't be synthesized honestly.
   11.2 MB ± 3%, finishing marginally *below* where it started, with aggregated windows landing in
   InfluxDB throughout. That rules out a leak and shows pages are being returned. It does **not**
   isolate jemalloc from glibc: the same soak has not been run with `--no-default-features`, and
-  the drift ADR 0015 is really about takes days, not minutes, to show up. The escape hatch exists
+  the drift ADR `jemalloc-global-allocator` is really about takes days, not minutes, to show up. The escape hatch exists
   so that comparison stays one build away.
 - **Is there a compact `Event` representation** worth having — one that doesn't reserve span and
   sketch space on a bare log line? Boxing the rare variants (§8 items 9-10) is the cheap answer, but

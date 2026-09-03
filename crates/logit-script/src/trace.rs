@@ -1,6 +1,6 @@
 //! Exposes the incoming batch's trace context to Lua as a plain global table, mirroring
 //! `crate::telemetry`'s install-once-mutate-later shape. See `docs/design/lua-api.md`'s "Reading
-//! trace context" section and `docs/adr/0020-trace-context-propagation-on-delivered.md`.
+//! trace context" section and `docs/adr/trace-context-propagation-on-delivered.md`.
 //!
 //! Unlike `telemetry`, this is installed unconditionally in [`crate::ScriptWorker::new`], not as
 //! an opt-in builder: propagation is a property of the pipeline every Lua node runs in, not

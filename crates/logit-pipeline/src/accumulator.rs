@@ -1,6 +1,6 @@
 //! [`BatchAccumulator`]: amortizes many small decoded batches into fewer, larger ones before a
 //! [`crate::Fanout::send`] -- the "datagram->batch assembly" half of
-//! `docs/adr/0027-decoupled-listener-io.md`. Transport-agnostic and socket-free by design: a UDP
+//! `docs/adr/decoupled-listener-io.md`. Transport-agnostic and socket-free by design: a UDP
 //! listener's decode loop (`logit-inputs`) is the only caller today, but nothing here mentions a
 //! socket, a datagram, or any concrete [`logit_proto::Decoder`].
 
@@ -77,7 +77,7 @@ impl BatchAccumulator {
     /// leaving `events` empty **with its allocated capacity intact** -- unlike `std::mem::take`,
     /// which would replace it with a fresh, capacity-0 `Vec` and silently undo the whole point of
     /// reusing a scratch buffer across calls (`docs/design/memory.md` §2; see also
-    /// `docs/adr/0027-decoupled-listener-io.md`'s allocation accounting).
+    /// `docs/adr/decoupled-listener-io.md`'s allocation accounting).
     ///
     /// Returns `Some` once a bound is *reached or exceeded* -- never splits a decoded batch, which
     /// is what makes `batch_max_events: 1` mean "one send per datagram": every non-empty decode
@@ -93,7 +93,7 @@ impl BatchAccumulator {
     /// (`StatsdDecoder`, `SyslogDecoder`) constructs one `Arc::new(Resource::default())` per
     /// decoder instance and stamps every decoded batch with it, so in practice this comparison
     /// never trips -- it exists to make that assumption load-bearing rather than latent, the same
-    /// *n*-to-1 hazard `docs/adr/0008-aggregation-window-semantics.md` already documents for a Lua
+    /// *n*-to-1 hazard `docs/adr/aggregation-window-semantics.md` already documents for a Lua
     /// component's `flush()`.
     ///
     /// **Why weight tracking here is exact, not approximate, despite being incremental.**

@@ -1,5 +1,5 @@
 //! `otlp_output_to_otlp_input_round_trips_a_batch_through_http`/`_through_grpc` --
-//! `docs/plans/0005-otlp-end-to-end.md`'s "strongest single test, needing no external service" for
+//! `docs/plans/otlp-end-to-end.md`'s "strongest single test, needing no external service" for
 //! PR3: stand an [`OtlpInput`] up on an ephemeral port in-process, point an [`OtlpOutput`] at it,
 //! and assert what comes out the far end's [`Fanout`] matches what went in. Lives here (an
 //! integration test in `logit-cli`, which already depends on both `logit-inputs` and

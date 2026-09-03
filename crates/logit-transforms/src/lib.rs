@@ -32,7 +32,7 @@ mod chained_pipeline_test {
     /// metrics and nothing else -- specifically, that the tags surviving into `aggregate`'s
     /// `SeriesKey` are exactly what `keep` named. This is what proves `keep`'s documented
     /// placement ahead of `aggregate` (`crate::keep`'s module doc comment,
-    /// `docs/adr/0014-kv-metrics-semantics.md`) actually bounds series cardinality end to end,
+    /// `docs/adr/kv-metrics-semantics.md`) actually bounds series cardinality end to end,
     /// not just in isolation.
     #[test]
     fn json_kv_metrics_keep_aggregate_chain_produces_correctly_tagged_metrics() {

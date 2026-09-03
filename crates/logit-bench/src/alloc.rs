@@ -110,7 +110,7 @@ fn bump_live(delta: i64) {
 /// Wraps another allocator, counting every request that passes through it.
 ///
 /// Generic over the inner allocator so a benchmark can measure against whatever allocator
-/// production actually uses (`docs/adr/0015-jemalloc-global-allocator.md`) rather than always
+/// production actually uses (`docs/adr/jemalloc-global-allocator.md`) rather than always
 /// against `System` -- allocation *counts* are allocator-independent, but the time those counts
 /// cost is not.
 pub struct CountingAlloc<A = System> {
