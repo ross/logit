@@ -8,11 +8,15 @@
 //! rather than relying on a convention nobody checks. The pipeline runs one [`ScriptWorker`] per
 //! worker thread.
 
-use logit_core::{Event, Telemetry};
+use logit_core::{Event, Resource, Telemetry};
 use mlua::{Lua, LuaOptions, RegistryKey, StdLib, Value as LuaValue};
+use std::cell::RefCell;
 use std::marker::PhantomData;
+use std::rc::Rc;
+use std::sync::Arc;
 
 mod proxy;
+mod resource;
 mod telemetry;
 mod trace;
 mod value;
@@ -81,6 +85,10 @@ pub struct ScriptWorker {
     /// mutate it in place -- see `crate::trace`'s module doc for why this is unconditional,
     /// unlike `telemetry`'s opt-in builder.
     trace_table: RegistryKey,
+    /// Shared with the installed `resource` global's userdata -- see `crate::resource`'s module
+    /// doc for why this is a plain `Rc`, not a `RegistryKey` like `trace_table`: `set_resource`/
+    /// `take_resource` need to hand a real `Arc<Resource>` back out without a `&Lua` in hand.
+    resource_state: Rc<RefCell<resource::ResourceState>>,
     _not_send_sync: PhantomData<*const ()>,
 }
 
@@ -124,6 +132,9 @@ impl ScriptWorker {
         // `trace` exists," permanently capturing `nil` -- caught in review with a script using
         // exactly that pattern (`local incoming_trace = trace`), which then failed on every event.
         let trace_table = trace::install(&lua)?;
+        // Same "before `.exec()`" reasoning as `trace_table` above, and the same unconditional
+        // (not opt-in) installation -- see `crate::resource`'s module doc.
+        let resource_state = resource::install(&lua)?;
         lua.load(source).exec()?;
         let process_fn = match lua.globals().get::<_, LuaValue>("process")? {
             LuaValue::Function(f) => f,
@@ -141,7 +152,7 @@ impl ScriptWorker {
         // does via `MissingProcess`.
         let flush_fn: Option<mlua::Function> = lua.globals().get("flush")?;
         let flush = flush_fn.map(|f| lua.create_registry_value(f)).transpose()?;
-        Ok(Self { lua, process, flush, trace_table, _not_send_sync: PhantomData })
+        Ok(Self { lua, process, flush, trace_table, resource_state, _not_send_sync: PhantomData })
     }
 
     /// Overwrites the `trace` global's `trace_id`/`span_id` (hex-encoded) so this worker's next
@@ -155,6 +166,22 @@ impl ScriptWorker {
         span_id: [u8; 8],
     ) -> Result<(), ScriptError> {
         trace::set_context(&self.lua, &self.trace_table, trace_id, span_id).map_err(Into::into)
+    }
+
+    /// Resets `resource` (`crate::resource`) so this worker's next `process()`/`flush()` call
+    /// reads the given batch's resource, and clears any write left over from a previous batch.
+    /// Called once per incoming batch, before its events reach `process`
+    /// (`crates/logit-pipeline/src/runtime.rs`'s `run_lua`) -- unlike `set_trace_context`, no
+    /// `&Lua` is needed, since `resource`'s state is a plain `Rc`, not a `RegistryKey`.
+    pub fn set_resource(&self, resource: &Arc<Resource>) {
+        resource::set(&self.resource_state, resource);
+    }
+
+    /// `Some` if a script wrote `resource` since the last [`ScriptWorker::set_resource`] call --
+    /// `None`, the common case, if it never touched the global. See `crate::resource`'s module
+    /// doc; `run_lua` uses this both after a batch's `process()` calls and after `flush()`.
+    pub fn take_resource(&self) -> Option<Arc<Resource>> {
+        resource::take(&self.resource_state)
     }
 
     /// Installs a `telemetry` global so `process()`/`flush()` can emit their own metrics -- a

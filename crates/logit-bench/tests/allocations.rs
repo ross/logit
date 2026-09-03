@@ -985,6 +985,57 @@ fn process_batch_through_keep() {
     expect_allocs("runtime: process_batch through keep, telemetry disabled", stats, 1);
 }
 
+/// `set`'s attribute-only path through `process_batch` -- `map_resource` returns `None`
+/// immediately (`resource_pairs` is empty), so this costs exactly what `keep`'s equivalent test
+/// above costs: `process_batch`'s own `Vec::with_capacity(batch.events.len())`, nothing from
+/// `Set` itself.
+#[test]
+fn process_batch_through_set_attributes_only() {
+    let mut set = fixtures::set_attributes();
+    let telemetry = Telemetry::default();
+    let warm = fixtures::nginx_batch(1);
+    drop(process_batch(&mut set, warm, &telemetry));
+
+    let batch = fixtures::nginx_batch(1);
+    let (out, stats) = measure(|| process_batch(&mut set, batch, &telemetry));
+    let out = out.expect("set forwards events, never absorbs");
+    assert_eq!(out.events.len(), 1);
+    expect_allocs("runtime: process_batch through set (attributes only)", stats, 1);
+}
+
+/// `Set::map_resource`'s one-entry cache (`crates/logit-transforms/src/set.rs`): a second call
+/// with the same input `Arc<Resource>` must hit the cache and cost nothing, in contrast to a
+/// cache miss (`set_resource_map_resource_cache_miss` below), which allocates a rebuilt
+/// `AttrMap`/`Resource`/`Arc`.
+#[test]
+fn set_resource_map_resource_cache_hit_costs_nothing() {
+    let mut set = fixtures::set_resource();
+    let resource = fixtures::resource();
+    drop(set.map_resource(&resource)); // warm the cache
+
+    let (mapped, stats) = measure(|| set.map_resource(&resource));
+    assert!(mapped.is_some());
+    expect_allocs("transform: set.map_resource, cached (same input Arc)", stats, 0);
+}
+
+/// The cache-miss cost `set_resource_map_resource_cache_hit_costs_nothing` contrasts with: a
+/// distinct input `Arc<Resource>` each call, exactly what a listener that mints a fresh `Arc` per
+/// request (`otlp_in`) would drive. **Just 1, not the naively-expected "clone the map, insert,
+/// wrap in an Arc" 2+** -- the fixture resource's `AttrMap` starts empty, and cloning/inserting
+/// into an empty `SmallVec` under its 8-slot inline capacity (`docs/design/data-model.md`'s
+/// small-map layout) never touches the heap; the one allocation is `Arc::new(Resource { .. })`
+/// itself.
+#[test]
+fn set_resource_map_resource_cache_miss() {
+    let mut set = fixtures::set_resource();
+    drop(set.map_resource(&fixtures::resource())); // warm, distinct Arc from the measured call
+
+    let resource = fixtures::resource();
+    let (mapped, stats) = measure(|| set.map_resource(&resource));
+    assert!(mapped.is_some());
+    expect_allocs("transform: set.map_resource, cache miss (distinct input Arc)", stats, 1);
+}
+
 /// The other outcome `process_batch` can produce: every event absorbed, nothing forwarded.
 /// `fixtures::statsd_event` is metrics-only (`clone_one_statsd_event` above), which is what lets
 /// `Aggregator::process` return `None` for it (`logit-transforms`'
@@ -1443,6 +1494,62 @@ fn lua_process_one_event() {
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
     assert!(matches!(outcome, ProcessOutcome::Emit(_)));
     expect_allocs("lua: process 1 event", stats, 9);
+}
+
+/// `run_lua`'s full per-batch resource contract (`crates/logit-script/src/resource.rs`): a
+/// `set_resource` call before `process`, then `take_resource` after -- for a script that never
+/// touches `resource` at all, this must cost exactly what `lua_process_one_event` above costs.
+/// `set_resource`/`take_resource` on their own don't allocate: `set_resource` only assigns two
+/// fields, and `take_resource` returns `None` (`ResourceState::modified` stays `None`) without
+/// touching the heap.
+#[test]
+fn lua_process_one_event_with_resource_hooks_but_no_write_costs_the_same_as_process_alone() {
+    let worker = ScriptWorker::new(fixtures::LUA_ENRICH_SCRIPT).expect("script should load");
+    let resource = fixtures::resource();
+    worker.set_resource(&resource);
+    drop(worker.process(fixtures::nginx_event()));
+    drop(worker.take_resource());
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| {
+        worker.set_resource(&resource);
+        let outcome = worker.process(event).expect("script should run");
+        assert!(worker.take_resource().is_none(), "the script never writes resource");
+        outcome
+    });
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: set_resource + process + take_resource, no write", stats, 9);
+}
+
+/// The cost a script that writes `resource` (`docs/adr/operator-declared-resource-attributes.md`)
+/// actually pays -- measured, not derived from the no-write path above, since
+/// `LUA_RESOURCE_WRITE_SCRIPT` never touches `event.attributes` at all and so skips the `+3` for
+/// creating and caching an `AttrsProxy` that `lua_process_one_event`'s script pays. **7**: the 4
+/// baseline per-call allocations every `process()` call costs regardless of what a script touches
+/// (`lua_process_one_event`'s own breakdown), `+1` for the `Box` on `ProcessOutcome::Emit`, `+1`
+/// for `lua_to_resource_value`'s `Bytes` allocation for the new `"nginx"` string, and `+1` for
+/// `take_resource`'s `Arc::new(Resource { .. })` commit -- the copy-on-write `AttrMap` clone
+/// itself is free here for the same reason `set_resource_map_resource_cache_miss` above is: the
+/// fixture resource starts with an empty, inline `AttrMap`.
+#[test]
+fn lua_process_one_event_writing_resource() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_RESOURCE_WRITE_SCRIPT).expect("script should load");
+    let resource = fixtures::resource();
+    worker.set_resource(&resource);
+    drop(worker.process(fixtures::nginx_event()));
+    drop(worker.take_resource());
+
+    let event = fixtures::nginx_event();
+    let (committed, stats) = measure(|| {
+        worker.set_resource(&resource);
+        let outcome = worker.process(event).expect("script should run");
+        assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+        worker.take_resource()
+    });
+    let committed = committed.expect("the script writes resource on every call");
+    assert_eq!(committed.attributes.get("service.name"), Some(&Value::str("nginx")));
+    expect_allocs("lua: set_resource + process + take_resource, writing resource", stats, 7);
 }
 
 // ---------------------------------------------------------------------------------------------

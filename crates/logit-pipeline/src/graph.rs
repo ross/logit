@@ -95,6 +95,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | KvMetrics { .. }
         | Keep { .. }
         | Remove { .. }
+        | Set { .. }
         | Logfmt
         | Kv
         | Regex { .. }
@@ -135,6 +136,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         KvMetrics { .. } => "kv_metrics",
         Keep { .. } => "keep",
         Remove { .. } => "remove",
+        Set { .. } => "set",
         Logfmt => "logfmt",
         Kv => "kv",
         Regex { .. } => "regex",
@@ -169,6 +171,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::KvMetrics { .. }
             | ComponentKind::Keep { .. }
             | ComponentKind::Remove { .. }
+            | ComponentKind::Set { .. }
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::OtlpOut { .. }
             | ComponentKind::StdioOut { .. }
@@ -334,6 +337,19 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     "component '{id}': a kv_metrics counter, gauge, or distribution entry \
                      requires a non-empty 'name' -- influxdb_out cannot encode a metric with no \
                      measurement name"
+                );
+            }
+        }
+    }
+
+    // Rule 12: `set`-specific validation -- neither map configured can only ever be a no-op,
+    // exactly the `kv_metrics` rule above, for the same reason.
+    for (id, component) in &components {
+        if let ComponentKind::Set { resource, attributes } = &component.kind {
+            if resource.is_empty() && attributes.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a set with neither 'resource' nor 'attributes' \
+                     configured can only ever be a no-op"
                 );
             }
         }
@@ -946,6 +962,44 @@ mod tests {
         .expect("should resolve");
         assert_eq!(graph.components["keep"].role(), Role::Transform);
         assert_eq!(graph.components["remove"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_set_with_neither_map_configured_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "identity",
+                vec!["in"],
+                ComponentKind::Set {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                },
+            ),
+            ("out", vec!["identity"], sink()),
+        ]));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_set_with_only_resource_configured_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "identity",
+                vec!["in"],
+                ComponentKind::Set {
+                    resource: std::collections::BTreeMap::from([(
+                        "service.name".to_string(),
+                        logit_config::SetValue::Str("nginx".to_string()),
+                    )]),
+                    attributes: std::collections::BTreeMap::new(),
+                },
+            ),
+            ("out", vec!["identity"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["identity"].role(), Role::Transform);
     }
 
     #[test]

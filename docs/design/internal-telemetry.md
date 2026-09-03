@@ -402,6 +402,12 @@ Worked examples, one per shipped component:
   suppressing before events reach it. No `Diagnostics` on either (pure attribute filtering has
   nothing to warn about), so `Telemetry` is attached directly rather than through the
   `Diagnostics` bridge.
+- `set` (`crates/logit-transforms/src/set.rs`): `logit.transform.set.resource.rebuilt` (count) —
+  fires only on a `map_resource` cache miss (a batch whose incoming resource `Arc` isn't the one
+  cached from the last call), so a config that defeats the one-entry cache (a listener minting a
+  fresh `Arc` per batch, `otlp_in` chief among them) is visible as a rate rather than invisible.
+  Absent entirely when `set` has no `resource:` configured (`map_resource` returns before touching
+  telemetry) — see [ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md).
 - `stdio_out` (`crates/logit-outputs/src/stdio.rs`): `logit.output.batch.bytes` — direct parity
   with `influxdb_out`'s own batch-bytes metric. Also has no `Diagnostics` (a write error
   propagates as a hard failure today, with no `warn_throttled` call site to bridge).

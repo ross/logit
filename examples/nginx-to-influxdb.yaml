@@ -13,6 +13,9 @@
 #   nginx --syslog/UDP--> nginx_in (syslog_in)
 #                              |
 #                              v
+#                       nginx_identity (set)          <- stamps a real service.name on the batch's
+#                              |                          resource (ADR
+#                              v                          operator-declared-resource-attributes)
 #                          nginx_json (json)          <- merges the JSON body into attributes
 #                              |
 #                              v
@@ -35,9 +38,20 @@ components:
     type: syslog_in
     bind: 0.0.0.0:5140
 
+  # `syslog_in` mustn't invent a resource identity for data it didn't produce
+  # (docs/design/internal-telemetry.md's "Resource identity" section) -- `set` is the operator
+  # declaring one instead (ADR operator-declared-resource-attributes), landing as a real resource
+  # tag on every metric `influx_out` writes below (influxdb_out merge-joins resource attributes
+  # into tags alongside event attributes).
+  nginx_identity:
+    type: set
+    sources: [nginx_in]
+    resource:
+      service.name: nginx
+
   nginx_json:
     type: json
-    sources: [nginx_in]
+    sources: [nginx_identity]
 
   nginx_metrics:
     type: kv_metrics
