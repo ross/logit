@@ -214,11 +214,15 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, or `receive.batch_max_events`
     of `0` is rejected — the twin of rule 15. `receive.batch_flush_interval: 0s` is **not**
     rejected — it means "no flush timer," a meaningful setting, unlike the count bounds.
-19. An empty `signals:` list on `has_signal`, `keep_signals`, or `drop_signals` is rejected, as is
-    a `keep_signals`/`drop_signals` naming all three signals — either can only ever drop every
-    event, the same silent-black-hole failure rule 7 exists to catch. `keep`'s empty `fields` list
-    stays legal by contrast — "drop every attribute" is a real operation, "drop every event" is
-    not. See `docs/adr/signal-filtering-components.md`.
+19. An empty `signals:` list on `has_signal`, `keep_signals`, or `drop_signals` is rejected.
+    `keep_signals`/`drop_signals` additionally reject naming all three signals. Which of the two
+    shapes is the silent black hole (rule 7's "no consumer" failure, recast here as "no event
+    ever gets through") and which is the no-op (every event forwarded untouched) is *opposite*
+    between the two kinds — an allowlist naming nothing keeps nothing (black hole), naming
+    everything keeps everything (no-op); a denylist is the mirror. Both shapes are rejected
+    either way, but the error message names the right one. `keep`'s empty `fields` list stays
+    legal by contrast — "drop every attribute" is a real operation, "drop every event" is not.
+    See `docs/adr/signal-filtering-components.md`.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that
