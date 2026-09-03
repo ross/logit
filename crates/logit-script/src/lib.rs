@@ -1001,6 +1001,34 @@ mod tests {
     }
 
     #[test]
+    fn reassigning_trace_id_drops_the_old_spans_id_and_flags() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.log.trace_id = "ab000000000000000000000000000000"
+                event.log.span_id = "cd00000000000000"
+                event.log.trace_flags = 1
+                event.log.trace_id = "ef000000000000000000000000000000"
+                event.attributes.trace_id = event.log.trace_id
+                event.attributes.span_id_is_nil = (event.log.span_id == nil)
+                event.attributes.flags = event.log.trace_flags
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(log_and_counter_event("hits", 1.0)).unwrap());
+        assert_eq!(
+            out.attributes.get("trace_id").and_then(|v| v.as_str()),
+            Some("ef000000000000000000000000000000")
+        );
+        assert!(matches!(
+            out.attributes.get("span_id_is_nil"),
+            Some(logit_core::Value::Bool(true))
+        ));
+        assert!(matches!(out.attributes.get("flags"), Some(logit_core::Value::I64(0))));
+    }
+
+    #[test]
     fn writing_span_id_without_a_trace_id_first_is_a_clear_error() {
         let w = worker(
             r#"

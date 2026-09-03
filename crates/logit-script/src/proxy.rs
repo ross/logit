@@ -350,12 +350,10 @@ impl UserData for LogProxy {
                                         .to_string(),
                                 )
                             })?;
-                            match &mut log.trace {
-                                Some(t) => t.trace_id = trace_id,
-                                None => {
-                                    log.trace = Some(TraceRef { trace_id, span_id: None, flags: 0 })
-                                }
-                            }
+                            // A changed trace_id replaces the whole TraceRef, not just the
+                            // id field -- an old span_id/flags belongs to the old trace and
+                            // must not be carried over onto the new one.
+                            log.trace = Some(TraceRef { trace_id, span_id: None, flags: 0 });
                             Ok(())
                         }
                         other => Err(mlua::Error::RuntimeError(format!(

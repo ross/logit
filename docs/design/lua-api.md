@@ -283,9 +283,11 @@ end
 
 **`trace_id`/`span_id` are lowercase hex strings, `nil` when absent** -- 32 characters (16 bytes)
 and 16 characters (8 bytes) respectively, the same shape the `trace` global above uses. Assigning
-a valid hex string to `trace_id` sets it (creating the trace context if the log had none);
-assigning `nil` clears the *whole* trace context, `span_id`/`trace_flags` included, since OTLP's
-own contract is that a span only means something alongside a trace. `span_id` and `trace_flags`
+a valid hex string to `trace_id` sets it, replacing the whole trace context: a log with no trace
+context gets a fresh one, and a log that already had one gets a fresh one too, `span_id`/
+`trace_flags` reset along with it -- an old span belongs to the old trace, not the new one.
+Assigning `nil` likewise clears the *whole* trace context, `span_id`/`trace_flags` included, since
+OTLP's own contract is that a span only means something alongside a trace. `span_id` and `trace_flags`
 can only be set once `trace_id` is -- assigning either first is a clear error, not a silent no-op,
 since there would be nothing for them to attach to. `trace_flags` is a plain integer, 0-255 (the
 low 8 bits OTLP's `LogRecord.flags` actually carries); bit 0 is the W3C `SAMPLED` flag. An invalid
