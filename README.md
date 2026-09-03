@@ -33,7 +33,7 @@ protocols — `otlp_out` is what carries `logit`'s own internal spans to Tempo i
 `logit` now emits those spans itself, one per pipeline node-visit, deterministically sampled on
 `trace_id` ([ADR `internal-span-emission-and-deterministic-sampling`](docs/adr/internal-span-emission-and-deterministic-sampling.md),
 [docs/plans/otlp-end-to-end.md](docs/plans/otlp-end-to-end.md)). `json`, `kv_metrics`,
-`keep`, `remove`, and `set` have joined `aggregate` as implemented native transforms — `logit
+`keep`, `remove`, `set`, and `trace_context` have joined `aggregate` as implemented native transforms — `logit
 run` rejects a config referencing any other unimplemented kind with a clear error. Config is a flat
 graph of named components, each declaring its own `sources` ([ADR `component-graph-configuration`](docs/adr/component-graph-configuration.md),
 [docs/design/pipeline-graph.md](docs/design/pipeline-graph.md)) — `logit graph <config>` prints the
@@ -104,7 +104,7 @@ crates/
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution, the node runtime
   logit-inputs      per-protocol listeners; statsd, syslog
   logit-outputs     per-protocol sinks; InfluxDB, stdio, syslog
-  logit-transforms  built-in native transform components; aggregate, json, kv_metrics, keep, remove, set
+  logit-transforms  built-in native transform components; aggregate, json, kv_metrics, keep, remove, set, trace_context
   logit-cli         the `logit` binary
   logit-bench       dev-only: allocation-count tests and throughput benchmarks
 docs/

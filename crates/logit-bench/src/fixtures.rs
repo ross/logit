@@ -165,6 +165,13 @@ pub fn set_resource() -> Set {
     Set::new(vec![("service.name".to_string(), Value::str("nginx"))], vec![])
 }
 
+/// A `trace_context` configured to lift `trace_id` only (no `span_id`/`flags`, `keep_source:
+/// false`) -- the common case, for `crates/logit-bench/tests/allocations.rs`'s
+/// `trace_context_lifts_a_valid_trace_id`.
+pub fn trace_context() -> logit_transforms::TraceContext {
+    logit_transforms::TraceContext::new("trace_id".to_string(), None, None, false)
+}
+
 pub fn aggregator() -> Aggregator {
     Aggregator::new(Duration::from_secs(10))
 }
@@ -264,6 +271,17 @@ end
 pub const LUA_RESOURCE_WRITE_SCRIPT: &str = r#"
 function process(event)
   resource["service.name"] = "nginx"
+  return event
+end
+"#;
+
+/// Reads `event.log.trace_id` on every call -- for measuring what a script touching the new
+/// `event.log` proxy costs (`crates/logit-script/src/proxy.rs`'s `LogProxy`,
+/// `docs/adr/log-record-trace-context.md`), over [`LUA_ENRICH_SCRIPT`]'s baseline
+/// (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event_reading_log_trace`).
+pub const LUA_LOG_TRACE_READ_SCRIPT: &str = r#"
+function process(event)
+  local _ = event.log.trace_id
   return event
 end
 "#;

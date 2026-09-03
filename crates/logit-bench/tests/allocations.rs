@@ -19,7 +19,7 @@
 
 use logit_bench::alloc::{measure, CountingAlloc, Stats};
 use logit_bench::fixtures;
-use logit_core::{EventBatch, Registry, Telemetry, Value};
+use logit_core::{EventBatch, Registry, Telemetry, TraceRef, Value};
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::stdio::{EventDump, Format};
 use logit_outputs::syslog::{Format as SyslogFormat, MessageBuf, SyslogEncoder};
@@ -490,7 +490,7 @@ fn aggregate_flush_retained_gauges() {
 
 /// What each extra fan-out consumer costs per event: `Fanout::send` deep-clones the batch for
 /// every consumer but the last. Four allocations (the spilled `AttrMap`, the spilled `MetricList`,
-/// and a `bins` Vec per sketch) plus a 792-byte memcpy, per event, per extra branch.
+/// and a `bins` Vec per sketch) plus an 800-byte memcpy, per event, per extra branch.
 ///
 /// The `Arc<EventBatch>` copy-on-write change in `docs/design/memory.md` is aimed at exactly this:
 /// a branch that only reads -- every sink -- would pay none of it.
@@ -505,7 +505,7 @@ fn clone_one_event() {
 }
 
 /// The cheap end of the range: a statsd counter with three tags and one metric fits entirely
-/// within `Event`'s inline capacity, so cloning it is a pure 792-byte memcpy. Same 792 bytes as
+/// within `Event`'s inline capacity, so cloning it is a pure 800-byte memcpy. Same 800 bytes as
 /// the nginx event above -- that size is paid unconditionally, whatever the event carries.
 #[test]
 fn clone_one_statsd_event() {
@@ -1001,6 +1001,31 @@ fn process_batch_through_set_attributes_only() {
     let out = out.expect("set forwards events, never absorbs");
     assert_eq!(out.events.len(), 1);
     expect_allocs("runtime: process_batch through set (attributes only)", stats, 1);
+}
+
+/// `trace_context` lifting a valid `trace_id` -- **1**, identical to `keep`/`set`'s own
+/// process_batch tests: `process_batch`'s own `Vec::with_capacity(batch.events.len())` is the
+/// whole cost. `parse_trace_id` (`logit_core::trace`) works on stack arrays, and `AttrMap::remove`
+/// (the default `keep_source: false` path) is an in-place `SmallVec` shift -- `TraceContext`
+/// itself contributes nothing.
+#[test]
+fn trace_context_lifts_a_valid_trace_id() {
+    let mut trace_context = fixtures::trace_context();
+    let resource = fixtures::resource();
+    let event_with_trace_id = {
+        let mut event = fixtures::nginx_event();
+        event.attributes.insert("trace_id", Value::str("ab".repeat(16)));
+        event
+    };
+    let telemetry = Telemetry::default();
+    let warm = EventBatch { resource: resource.clone(), events: vec![event_with_trace_id.clone()] };
+    drop(process_batch(&mut trace_context, warm, &telemetry));
+
+    let batch = EventBatch { resource, events: vec![event_with_trace_id] };
+    let (out, stats) = measure(|| process_batch(&mut trace_context, batch, &telemetry));
+    let out = out.expect("trace_context forwards events, never absorbs");
+    assert!(out.events[0].log.as_ref().unwrap().trace.is_some(), "the lift should have succeeded");
+    expect_allocs("transform: trace_context, lifting a valid trace_id", stats, 1);
 }
 
 /// `Set::map_resource`'s one-entry cache (`crates/logit-transforms/src/set.rs`): a second call
@@ -1550,6 +1575,30 @@ fn lua_process_one_event_writing_resource() {
     let committed = committed.expect("the script writes resource on every call");
     assert_eq!(committed.attributes.get("service.name"), Some(&Value::str("nginx")));
     expect_allocs("lua: set_resource + process + take_resource, writing resource", stats, 7);
+}
+
+/// What a script reading `event.log.trace_id` costs (`crates/logit-script/src/proxy.rs`'s
+/// `LogProxy`, `docs/adr/log-record-trace-context.md`). **9** -- the same total as
+/// `lua_process_one_event`'s `AttrsProxy`-touching script, despite `LUA_LOG_TRACE_READ_SCRIPT`
+/// never touching `event.attributes` at all: creating and caching a `LogProxy` userdata on first
+/// access costs the same as `AttrsProxy` did there, and `to_hex`'s returned `String` costs what
+/// the attribute write cost there. Measured, not derived from that breakdown -- the two scripts
+/// don't share enough of their allocation shape to assume the numbers would just add up.
+#[test]
+fn lua_process_one_event_reading_log_trace() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_LOG_TRACE_READ_SCRIPT).expect("script should load");
+    let mut warm = fixtures::nginx_event();
+    warm.log.as_mut().unwrap().trace =
+        Some(TraceRef { trace_id: [1; 16], span_id: None, flags: 0 });
+    drop(worker.process(warm));
+
+    let mut event = fixtures::nginx_event();
+    event.log.as_mut().unwrap().trace =
+        Some(TraceRef { trace_id: [1; 16], span_id: None, flags: 0 });
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: process 1 event, reading event.log.trace_id", stats, 9);
 }
 
 // ---------------------------------------------------------------------------------------------

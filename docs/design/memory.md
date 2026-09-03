@@ -38,15 +38,15 @@ explicitly meant to cover**:
 
 | Workload | Carries | Wasted per event today |
 |---|---|---:|
-| Logs only (syslog, file tail → forward) | attributes + `log` | 336 B (`MetricList` + `SpanRecord`) |
-| Metrics only (statsd, collectd, scrape → aggregate) | attributes + 1 metric | 184 B, plus ~176 of `MetricList` a `Counter` can't use |
-| Traces only (OTLP → forward) | attributes + `span` | 248 B (`LogRecord` + `MetricList`) |
+| Logs only (syslog, file tail → forward) | attributes + `log` | 328 B (`MetricList` + `SpanRecord`) |
+| Metrics only (statsd, collectd, scrape → aggregate) | attributes + 1 metric | 208 B, plus ~176 of `MetricList` a `Counter` can't use |
+| Traces only (OTLP → forward) | attributes + `span` | 264 B (`LogRecord` + `MetricList`) |
 | Mixed (the nginx shape — the first one measured) | all three | least of any shape |
 
 Two consequences that matter for how much weight to put on §8:
 
-- **Everything in §1 (sizing) applies to every workload**, because `Event`'s 792 bytes are paid on
-  every hop whatever the event carries. Every shape above wastes 180-340 bytes on payloads it never
+- **Everything in §1 (sizing) applies to every workload**, because `Event`'s 800 bytes are paid on
+  every hop whatever the event carries. Every shape above wastes 208-328 bytes on payloads it never
   holds. That argument doesn't depend on the fixture at all.
 - **Several specific *fixes* are workload-dependent, and one flips sign** depending on the mix. A
   change that is free for a logs-only pipeline can cost a metrics-only one an allocation per event.
@@ -63,10 +63,10 @@ items 7-9 in §8; it doesn't by itself settle the *sizing* decisions those items
 ## 1. The event model's footprint
 
 ```
-Event                                       776 bytes
+Event                                       800 bytes
 ├── timestamp: i64                            8
 ├── attributes: AttrMap                      392   ← SmallVec<[(Symbol, Value); 8]>
-├── log: Option<LogRecord>                    48
+├── log: Option<LogRecord>                    72
 ├── metrics: MetricList                      192   ← SmallVec<[MetricRecord; 1]>
 └── span: Option<SpanRecord>                 136
 ```
@@ -82,7 +82,8 @@ with the constituent parts:
 | `MetricKind` | 176 | almost entirely the inlined `DDSketch` |
 | `MetricRecord` | 184 | `MetricKind` + name + unit |
 | `MetricList` | 192 | 1 × 184 inline + 8 |
-| `LogRecord` | 48 | `Option<LogRecord>` is also 48 — `Severity`'s niche absorbs `None` |
+| `TraceRef` | 26 | `[u8;16]` trace id + `Option<[u8;8]>` span id + a flags byte; `Option<TraceRef>` is also 26 -- niche-filled through `Option<[u8;8]>`'s own tag |
+| `LogRecord` | 72 | `Value` (40) + `Option<TraceRef>` (26) + `Severity`/`BodyFormat` (2); `Option<LogRecord>` is also 72 — `Severity`'s niche absorbs `None` |
 | `SpanRecord` | 136 | `Option<SpanRecord>` is also 136 — `SpanKind`'s niche absorbs `None` |
 
 **Three things about this are worth internalizing.**
@@ -92,7 +93,7 @@ heap `(ptr, cap)` pair share one slot, sized by the larger. So an event with 13 
 heap allocation *and* the full 392 bytes. Inline capacity 8 is therefore not "free up to 8" — it is
 384 bytes on every event, forever, and the reference nginx pipeline spills past it anyway.
 
-**A statsd counter costs the same 776 bytes as a fully-populated nginx access log.** `Event` has no
+**A statsd counter costs the same 800 bytes as a fully-populated nginx access log.** `Event` has no
 compact representation for the common case; the space for attributes, a sketch, and a span is
 reserved unconditionally. That is the price of "an event is whatever it carries"
 ([ADR `multi-payload-events`](../adr/multi-payload-events.md)) implemented with inline storage.
@@ -144,7 +145,7 @@ deferring the same mistake to whenever that input lands. That prediction is now 
 without any external input at all:
 [ADR `internal-span-emission-and-deterministic-sampling`](../adr/internal-span-emission-and-deterministic-sampling.md) makes `internal`
 itself a real, if low-volume by default, producer of `span`-carrying events — a drained span
-event costs exactly what this table already prices (776 bytes inline, `SpanRecord`'s 136 of it),
+event costs exactly what this table already prices (800 bytes inline, `SpanRecord`'s 136 of it),
 no new type and no change to this row's reasoning, just the first real caller of the shape this
 section was already sized for.
 
@@ -409,8 +410,10 @@ draft actually established:
 | `process_batch` through `set` (attributes only) | **1** | identical to `keep` — `Transform::map_resource`'s default `None` return costs nothing beyond the call itself (`crates/logit-pipeline/src/transform.rs`) |
 | `set.map_resource`, cached (same input `Arc`) | **0** | the one-entry `Arc::ptr_eq` cache (`crates/logit-transforms/src/set.rs`) hits |
 | `set.map_resource`, cache miss (distinct input `Arc`) | **1** | `Arc::new(Resource { .. })` only — cloning/inserting into the fixture's empty, inline `AttrMap` never touches the heap |
+| `trace_context`, lifting a valid `trace_id` | **1** | identical to `keep`/`set`'s own rows — `process_batch`'s own `Vec` is the whole cost; `parse_trace_id` (`logit_core::trace`) works on stack arrays and `AttrMap::remove` (`keep_source: false`) is an in-place `SmallVec` shift |
 | `run_lua`: `set_resource` + `process` + `take_resource`, script never writes `resource` | **9** | identical to plain `process` (below) — `set_resource`/`take_resource` are field assignments, no allocation |
 | `run_lua`: `set_resource` + `process` + `take_resource`, script writes `resource` | **7** | see `crates/logit-script/src/resource.rs` — lower than the row above because this script (unlike `LUA_ENRICH_SCRIPT`) never touches `event.attributes`, skipping its `AttrsProxy` cost; the `+1` here is `take_resource`'s `Arc::new(Resource { .. })` commit |
+| `process` reading `event.log.trace_id` (`LogProxy`) | **9** | same total a script touching `event.attributes` instead pays (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event`) despite touching no attributes at all — creating and caching the `LogProxy` userdata costs what `AttrsProxy` does there, `to_hex`'s returned `String` costs what an attribute write does; a script that never touches `event.log` pays none of it, unchanged at 9 either way |
 | `process_batch`, fully absorbed (`aggregate`) | **1** | the same `Vec`, built before any event is processed, thrown away unused when nothing survives |
 | `process_batch` through `keep`, telemetry live, **steady state** | **1** | identical to disabled — `count`/`timer` update an existing `ComponentBuffer` entry in place, no allocation of their own |
 | `process_batch`, **first call after an `internal` drain** | **3** | the `out` `Vec` (1) + a `HashMap` table rebuild (1) + a fresh `DdSketch` (1) — see below |
@@ -497,7 +500,7 @@ back to this table's pre-existing state except the one line below.
 
 **Size: `size_of::<Delivered>()` goes from 32 to 56 -- exactly `TraceContext`'s 24 bytes, no padding
 overhead.** This is a per-*batch* cost, on the channel payload, not a per-event one: contrast with
-`Event`'s 776 bytes, where ADR `minimize-allocations-over-event-size` already settled that a much smaller per-event size cost is
+`Event`'s 800 bytes, where ADR `minimize-allocations-over-event-size` already settled that a much smaller per-event size cost is
 worth avoiding an allocation. `Delivered` isn't `Event` -- this is a different type, on a different
 part of the pipeline, at a different multiplier (one per batch, not one per event within it), so
 0017's conclusion doesn't transfer here by default; it's cited for contrast, not as the answer.
@@ -661,7 +664,7 @@ branch, with nothing extra to design or maintain for that guarantee. `runtime.rs
 it's the thing every change described below was built to never regress — including through three
 rounds of correcting an initial performance claim, per that section.
 
-For scale: the deep clone this section used to describe unconditionally (4 allocations, a 792-byte
+For scale: the deep clone this section used to describe unconditionally (4 allocations, an 800-byte
 memcpy per event per extra branch, 228 ns, ~11% of the ingest chain) is still exactly what a
 mutating branch pays when it has to.
 
@@ -754,7 +757,7 @@ Two things that didn't change through any of this:
   `Arc<Inner>` with copy-on-write for the same reason.
 
 A second, separable change: `Transform::process(&mut self, &Arc<Resource>, &mut Event) -> bool`
-plus `Vec::retain_mut` in `run_transform` would remove one full 792-byte `Event` memcpy per node
+plus `Vec::retain_mut` in `run_transform` would remove one full 800-byte `Event` memcpy per node
 hop and one `Vec` allocation per batch per node. Nothing is lost — the trait already can't emit
 more than one event per input. Deserves its own ADR; gets more expensive to make with every
 transform that lands (§8 item 14).
@@ -868,7 +871,7 @@ a real problem with a TCP or file-tail input, where nothing caps how many events
 The byte-aware bound is `EventBatch::estimated_heap_bytes()` (`crates/logit-core/src/event.rs`): a
 deliberately approximate, O(events) walk. The dominant term, added after an initial pass
 undercounted it, is the `Vec<Event>` backing storage itself --
-`events.capacity() * size_of::<Event>()` -- which every event pays (776 bytes each, §1) *before*
+`events.capacity() * size_of::<Event>()` -- which every event pays (800 bytes each, §1) *before*
 any nested heap payload; a batch of numeric-only metrics with no string attributes would otherwise
 estimate close to zero despite genuinely holding hundreds of bytes per event. On top of that: a
 batch's attribute keys/values, log bodies, span-owned data (name, and every `SpanEvent`/`SpanLink`'s
@@ -1100,7 +1103,7 @@ traffic, which doesn't exist yet and can't be synthesized honestly.
 
 ### Later — needs a reason first
 
-14. **`Transform::process(&mut Event) -> bool`.** Removes a 792-byte memcpy per node hop. Gets more
+14. **`Transform::process(&mut Event) -> bool`.** Removes an 800-byte memcpy per node hop. Gets more
     expensive to decide with every transform that lands, so decide it early even if applied late.
     Touches `runtime.rs`, the same file item 7's three rounds just settled — a fresh reason to
     check `unwrap_batch`'s current shape before starting, not a blocker any more.

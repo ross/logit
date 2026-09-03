@@ -352,6 +352,7 @@ mod tests {
                 message: Value::str(message),
                 severity: None,
                 body_format: BodyFormat::Raw,
+                trace: None,
             },
         )
     }

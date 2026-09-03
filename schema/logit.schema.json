@@ -424,6 +424,47 @@
           }
         },
         {
+          "description": "Lifts an application trace/span reference off an event's attributes onto its `LogRecord` (`docs/adr/log-record-trace-context.md`) -- the common \"my JSON log body already has a `trace_id` field\" case, without writing Lua (`event.log.trace_id`, `docs/design/lua-api.md`). Overwrites `log.trace` on a successful lift -- operator intent, the same posture `Set` has. An event with no log, or missing/unparseable named attribute(s), passes through untouched (never an error) -- see `crates/logit-transforms/src/trace_context.rs` for the exact skip conditions.",
+          "type": "object",
+          "required": [
+            "trace_id",
+            "type"
+          ],
+          "properties": {
+            "flags": {
+              "description": "The attribute holding the W3C trace flags (0-255, decimal -- never hex), if any.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "keep_source": {
+              "description": "Keep the source attribute(s) after a successful lift, instead of removing them (the default). Removing matters for OTLP-native backends: Loki turns log attributes into structured metadata under their own names, so a leftover `trace_id` attribute would collide with the native `trace_id` key `LogRecord.trace_id` already produces.",
+              "default": false,
+              "type": "boolean"
+            },
+            "span_id": {
+              "description": "The attribute holding a 16-character hex span id, if any. A `Some` field name whose attribute is absent means \"no span,\" not a skip -- only present-but-unparseable is an error.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "trace_id": {
+              "description": "The attribute holding a 32-character hex trace id. Required, and rejected as an empty string at graph-validation time -- an empty field name could never match a real attribute, so a component configured that way can only ever be a no-op.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "trace_context"
+              ]
+            }
+          }
+        },
+        {
           "type": "object",
           "required": [
             "type"

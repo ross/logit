@@ -86,7 +86,12 @@ mod tests {
         Event::log(
             0,
             AttrMap::new(),
-            LogRecord { message: Value::str("msg"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("msg"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         )
     }
 

@@ -1004,7 +1004,12 @@ mod tests {
         Event::log(
             ts,
             AttrMap::new(),
-            LogRecord { message: Value::str(message), severity, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str(message),
+                severity,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         )
     }
 
@@ -1080,7 +1085,12 @@ mod tests {
         let event = Event::log(
             0,
             attrs,
-            LogRecord { message: Value::str("hi"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("hi"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let mut encoder = SyslogEncoder::new(Format::Rfc3164, 16);
         let (msgs, _) = encode_with(&mut encoder, vec![event]);
@@ -1107,6 +1117,7 @@ mod tests {
                 message: Value::str("x"),
                 severity: Some(Severity::Fatal), // would otherwise map to 2
                 body_format: BodyFormat::Raw,
+                trace: None,
             },
         );
         let (msgs, _) = encode(vec![event]);
@@ -1151,6 +1162,7 @@ mod tests {
                 message: Value::str("x"),
                 severity: Some(Severity::Warn),
                 body_format: BodyFormat::Raw,
+                trace: None,
             },
         );
         let (msgs, _) = encode(vec![event]);
@@ -1164,7 +1176,12 @@ mod tests {
         let event = Event::log(
             0,
             attrs,
-            LogRecord { message: Value::str("x"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("x"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let mut encoder = SyslogEncoder::new(Format::Rfc5424, 16).with_hostname("from-config");
         let (msgs, _) = encode_with(&mut encoder, vec![event]);
@@ -1233,7 +1250,12 @@ mod tests {
         let event = Event::log(
             0,
             attrs,
-            LogRecord { message: Value::str("x"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("x"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let (msgs, _) = encode(vec![event]);
         assert!(msgs[0].contains("bad_host_"));
@@ -1246,7 +1268,12 @@ mod tests {
         let event = Event::log(
             0,
             attrs,
-            LogRecord { message: Value::str("x"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("x"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let mut encoder = SyslogEncoder::new(Format::Rfc3164, 16);
         let (msgs, _) = encode_with(&mut encoder, vec![event]);
@@ -1260,7 +1287,12 @@ mod tests {
         let event = Event::log(
             0,
             attrs,
-            LogRecord { message: Value::str("x"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("x"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let (msgs, _) = encode(vec![event]);
         let app_name = msgs[0].split(' ').nth(3).unwrap();
@@ -1277,7 +1309,12 @@ mod tests {
         let event = Event::log(
             0,
             attrs,
-            LogRecord { message: Value::str("x"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("x"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let (msgs, _) = encode(vec![event]);
         assert!(msgs[0].contains(" __ "));

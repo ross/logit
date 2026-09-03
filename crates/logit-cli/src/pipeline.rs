@@ -25,7 +25,7 @@ use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
 use logit_transforms::{
     Aggregator, JsonParser, Keep as KeepTransform, KvMetrics as KvMetricsTransform,
-    Remove as RemoveTransform, Set as SetTransform,
+    Remove as RemoveTransform, Set as SetTransform, TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -263,6 +263,15 @@ fn build_spec(
         Set { resource, attributes } => NodeSpec::Transform(Box::new(
             SetTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
                 .with_telemetry(telemetry.clone()),
+        )),
+        TraceContext { trace_id, span_id, flags, keep_source } => NodeSpec::Transform(Box::new(
+            TraceContextTransform::new(
+                trace_id.clone(),
+                span_id.clone(),
+                flags.clone(),
+                *keep_source,
+            )
+            .with_telemetry(telemetry.clone()),
         )),
 
         InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(
@@ -981,5 +990,53 @@ mod tests {
             build_spec("identity", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
+    }
+
+    /// Unlike `build_spec_builds_a_set_transform` above, this actually runs the built transform
+    /// against an event rather than only checking the `NodeSpec` variant -- specifically to catch
+    /// a swapped-argument-order regression (`trace_id`/`span_id`/`flags`/`keep_source` all being
+    /// the same shape of value at the call site makes that an easy mistake to introduce silently).
+    #[test]
+    fn build_spec_builds_a_working_trace_context_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::TraceContext {
+                trace_id: "tid".to_string(),
+                span_id: Some("sid".to_string()),
+                flags: None,
+                keep_source: true,
+            },
+        };
+        let NodeSpec::Transform(mut transform) =
+            build_spec("trace", &component, Path::new(""), None).unwrap().0
+        else {
+            panic!("expected a Transform node");
+        };
+
+        let mut attrs = logit_core::AttrMap::new();
+        attrs.insert("tid", logit_core::Value::str("ab".repeat(16)));
+        attrs.insert("sid", logit_core::Value::str("cd".repeat(8)));
+        let event = logit_core::Event::log(
+            0,
+            attrs,
+            logit_core::LogRecord {
+                message: logit_core::Value::str("msg"),
+                severity: None,
+                body_format: logit_core::BodyFormat::Raw,
+                trace: None,
+            },
+        );
+        let resource = Arc::new(logit_core::Resource::default());
+        let out = transform.process(&resource, event).expect("should forward the event");
+        let trace = out.log.expect("log should survive").trace.expect("trace should be lifted");
+        assert_eq!(trace.trace_id, [0xab; 16]);
+        assert_eq!(trace.span_id, Some([0xcd; 8]));
+        assert!(
+            out.attributes.get("tid").is_some(),
+            "keep_source: true should retain the attribute"
+        );
     }
 }

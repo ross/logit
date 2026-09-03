@@ -273,6 +273,33 @@ pub enum ComponentKind {
         #[serde(default)]
         attributes: std::collections::BTreeMap<String, SetValue>,
     },
+    /// Lifts an application trace/span reference off an event's attributes onto its `LogRecord`
+    /// (`docs/adr/log-record-trace-context.md`) -- the common "my JSON log body already has a
+    /// `trace_id` field" case, without writing Lua (`event.log.trace_id`,
+    /// `docs/design/lua-api.md`). Overwrites `log.trace` on a successful lift -- operator intent,
+    /// the same posture `Set` has. An event with no log, or missing/unparseable named
+    /// attribute(s), passes through untouched (never an error) -- see
+    /// `crates/logit-transforms/src/trace_context.rs` for the exact skip conditions.
+    TraceContext {
+        /// The attribute holding a 32-character hex trace id. Required, and rejected as an empty
+        /// string at graph-validation time -- an empty field name could never match a real
+        /// attribute, so a component configured that way can only ever be a no-op.
+        trace_id: String,
+        /// The attribute holding a 16-character hex span id, if any. A `Some` field name whose
+        /// attribute is absent means "no span," not a skip -- only present-but-unparseable is an
+        /// error.
+        #[serde(default)]
+        span_id: Option<String>,
+        /// The attribute holding the W3C trace flags (0-255, decimal -- never hex), if any.
+        #[serde(default)]
+        flags: Option<String>,
+        /// Keep the source attribute(s) after a successful lift, instead of removing them (the
+        /// default). Removing matters for OTLP-native backends: Loki turns log attributes into
+        /// structured metadata under their own names, so a leftover `trace_id` attribute would
+        /// collide with the native `trace_id` key `LogRecord.trace_id` already produces.
+        #[serde(default)]
+        keep_source: bool,
+    },
     // The rest of the built-in native transforms -- not implemented yet (`logit-transforms`),
     // carried over as unimplemented `ComponentKind` variants so config referencing one gets a
     // clear "not implemented yet" at validation time rather than a deserialization error.
@@ -1212,6 +1239,41 @@ mod tests {
             Some(&SetValue::Str("3".to_string())),
             "a quoted number must stay a string, not be coerced into I64"
         );
+    }
+
+    #[test]
+    fn trace_context_component_deserializes_with_defaults() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "trace_context", "sources": ["in"], "trace_id": "trace_id"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::TraceContext { trace_id, span_id, flags, keep_source } => {
+                assert_eq!(trace_id, "trace_id");
+                assert_eq!(span_id, None);
+                assert_eq!(flags, None);
+                assert!(!keep_source);
+            }
+            other => panic!("expected TraceContext, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trace_context_component_deserializes_every_field() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "trace_context", "sources": ["in"], "trace_id": "trace_id",
+                "span_id": "span_id", "flags": "trace_flags", "keep_source": true}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::TraceContext { trace_id, span_id, flags, keep_source } => {
+                assert_eq!(trace_id, "trace_id");
+                assert_eq!(span_id, Some("span_id".to_string()));
+                assert_eq!(flags, Some("trace_flags".to_string()));
+                assert!(keep_source);
+            }
+            other => panic!("expected TraceContext, got {other:?}"),
+        }
     }
 
     #[test]
