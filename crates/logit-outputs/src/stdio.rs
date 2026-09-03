@@ -35,6 +35,7 @@ use crate::Output;
 use anyhow::Context;
 use logit_core::interner::resolve;
 use logit_core::time::format_rfc3339_utc;
+use logit_core::trace::push_hex;
 use logit_core::{
     AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource, Severity, SpanEvent, SpanKind,
     SpanLink, SpanRecord, SpanStatus, Telemetry, Value,
@@ -118,6 +119,21 @@ fn render_event_block(out: &mut String, resource: &Resource, event: &Event) {
         out.push_str(severity);
         out.push_str("] ");
         render_value(out, &log.message);
+        // The log's own application trace context (`docs/adr/log-record-trace-context.md`),
+        // distinct from this node's internal `span`/`span_event`/`span_link` sections below --
+        // present only when something (a codec decode, `trace_context`, or a script) actually set
+        // it, so an untouched log line is unaffected.
+        if let Some(trace) = log.trace {
+            out.push_str(" trace_id=");
+            push_hex(out, &trace.trace_id);
+            if let Some(span_id) = trace.span_id {
+                out.push_str(" span_id=");
+                push_hex(out, &span_id);
+            }
+            if trace.flags != 0 {
+                let _ = write!(out, " flags={}", trace.flags);
+            }
+        }
     }
     out.push('\n');
 
@@ -333,12 +349,6 @@ fn render_span_link(out: &mut String, link: &SpanLink) {
     if !link.attributes.is_empty() {
         out.push_str(" attrs ");
         render_attrs(out, &link.attributes);
-    }
-}
-
-fn push_hex(out: &mut String, bytes: &[u8]) {
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
     }
 }
 
@@ -654,6 +664,39 @@ mod tests {
     fn log_with_no_severity_renders_a_dash() {
         let out = encode(vec![log_event(0, "hello", None)]);
         assert!(out.contains("log[-] \"hello\""), "got: {out}");
+    }
+
+    #[test]
+    fn a_log_with_no_trace_context_renders_no_trace_suffix_at_all() {
+        let out = encode(vec![log_event(0, "hello", None)]);
+        assert!(!out.contains("trace_id="), "got: {out}");
+    }
+
+    #[test]
+    fn a_logs_trace_context_renders_after_the_message() {
+        let mut event = log_event(0, "hello", Some(Severity::Info));
+        event.log.as_mut().unwrap().trace =
+            Some(logit_core::TraceRef { trace_id: [0xab; 16], span_id: Some([0xcd; 8]), flags: 1 });
+        let out = encode(vec![event]);
+        assert_eq!(
+            out,
+            format!(
+                "1970-01-01T00:00:00.000000000Z log[info] \"hello\" trace_id={} span_id={} flags=1\n",
+                "ab".repeat(16),
+                "cd".repeat(8)
+            )
+        );
+    }
+
+    #[test]
+    fn a_logs_trace_context_with_no_span_id_and_zero_flags_omits_both() {
+        let mut event = log_event(0, "hello", None);
+        event.log.as_mut().unwrap().trace =
+            Some(logit_core::TraceRef { trace_id: [0xab; 16], span_id: None, flags: 0 });
+        let out = encode(vec![event]);
+        assert!(out.contains(&format!("trace_id={}\n", "ab".repeat(16))), "got: {out}");
+        assert!(!out.contains("span_id="), "got: {out}");
+        assert!(!out.contains("flags="), "got: {out}");
     }
 
     #[test]
