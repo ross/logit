@@ -45,7 +45,12 @@ mod chained_pipeline_test {
         let event = Event::log(
             0,
             AttrMap::new(),
-            LogRecord { message: Value::str(raw), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str(raw),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
 
         // json: the raw body becomes attributes.

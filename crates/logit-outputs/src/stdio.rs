@@ -609,7 +609,12 @@ mod tests {
         Event::log(
             ts,
             AttrMap::new(),
-            LogRecord { message: Value::str(message), severity, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str(message),
+                severity,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         )
     }
 

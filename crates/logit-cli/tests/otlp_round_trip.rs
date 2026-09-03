@@ -30,7 +30,12 @@ fn mixed_signal_batch() -> EventBatch {
     let log = Event::log(
         1_000,
         AttrMap::new(),
-        LogRecord { message: Value::str("hello"), severity: None, body_format: BodyFormat::Raw },
+        LogRecord {
+            message: Value::str("hello"),
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+        },
     );
     let metric = Event::metric(
         2_000,

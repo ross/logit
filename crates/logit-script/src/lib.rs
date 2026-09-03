@@ -297,6 +297,7 @@ mod tests {
             message: logit_core::Value::str("GET /"),
             severity: None,
             body_format: logit_core::BodyFormat::Raw,
+            trace: None,
         });
         event
     }

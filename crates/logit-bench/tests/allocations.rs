@@ -490,7 +490,7 @@ fn aggregate_flush_retained_gauges() {
 
 /// What each extra fan-out consumer costs per event: `Fanout::send` deep-clones the batch for
 /// every consumer but the last. Four allocations (the spilled `AttrMap`, the spilled `MetricList`,
-/// and a `bins` Vec per sketch) plus a 792-byte memcpy, per event, per extra branch.
+/// and a `bins` Vec per sketch) plus an 800-byte memcpy, per event, per extra branch.
 ///
 /// The `Arc<EventBatch>` copy-on-write change in `docs/design/memory.md` is aimed at exactly this:
 /// a branch that only reads -- every sink -- would pay none of it.
@@ -505,7 +505,7 @@ fn clone_one_event() {
 }
 
 /// The cheap end of the range: a statsd counter with three tags and one metric fits entirely
-/// within `Event`'s inline capacity, so cloning it is a pure 792-byte memcpy. Same 792 bytes as
+/// within `Event`'s inline capacity, so cloning it is a pure 800-byte memcpy. Same 800 bytes as
 /// the nginx event above -- that size is paid unconditionally, whatever the event carries.
 #[test]
 fn clone_one_statsd_event() {

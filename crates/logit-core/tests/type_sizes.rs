@@ -19,7 +19,7 @@
 
 use logit_core::{
     AttrMap, Event, LogRecord, MetricKind, MetricList, MetricRecord, Resource, SpanRecord, Symbol,
-    Value,
+    TraceRef, Value,
 };
 use std::mem::{size_of, size_of_val};
 
@@ -92,9 +92,23 @@ fn metric_kind_is_sized_by_the_inlined_ddsketch() {
     );
 }
 
+/// `TraceRef` -- `LogRecord`'s optional application-trace reference (`docs/adr/
+/// log-record-trace-context.md`). `span_id: Option<[u8;8]>` has no niche of its own ([u8;8]'s
+/// value space is fully used), so it costs a discriminant byte: 16 (trace_id) + 9 (span_id) + 1
+/// (flags) = 26.
+#[test]
+fn trace_ref_is_sized_by_its_two_id_arrays_plus_a_span_discriminant() {
+    assert_eq!(size_of::<TraceRef>(), 26);
+    // `Option<TraceRef>` is free, somewhat surprisingly: `span_id`'s inner `Option<[u8;8]>`
+    // discriminant byte only uses 2 of its 256 possible values, and rustc's niche-filling finds
+    // and reuses one of the other 254 for the outer `Option`'s `None` -- confirmed here, not
+    // assumed, since it's a compiler optimization with no language guarantee behind it.
+    assert_eq!(size_of::<Option<TraceRef>>(), 26, "niche-filled through Option<[u8;8]>'s tag");
+}
+
 #[test]
 fn record_types() {
-    assert_eq!(size_of::<LogRecord>(), 48);
+    assert_eq!(size_of::<LogRecord>(), 72, "message: Value (40) + Option<TraceRef> (32)");
     assert_eq!(size_of::<SpanRecord>(), 136);
     assert_eq!(size_of::<Resource>(), size_of::<AttrMap>());
 
@@ -110,11 +124,16 @@ fn record_types() {
 /// and lists what could be reclaimed.
 ///
 /// Note what this means for the cheap cases: a bare log line with two attributes and a statsd
-/// counter with three tags both cost this same 792 bytes to move, because `AttrMap`'s inline
+/// counter with three tags both cost this same 800 bytes to move, because `AttrMap`'s inline
 /// capacity and `MetricKind`'s inlined sketch are paid unconditionally.
 #[test]
 fn event_size() {
-    assert_eq!(size_of::<Event>(), 776, "792 minus the 16 bytes smallvec's `union` feature saves");
+    assert_eq!(
+        size_of::<Event>(),
+        800,
+        "776 (post-`union`-feature baseline) + the 24 bytes LogRecord::trace added (48 -> 72, \
+         see record_types) -- see docs/adr/log-record-trace-context.md"
+    );
 
     // The breakdown, asserted so it can't drift out of sync with the total above.
     let sum = size_of::<i64>()

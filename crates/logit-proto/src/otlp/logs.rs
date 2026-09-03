@@ -138,7 +138,7 @@ pub(crate) fn decode_log_record(record: pb::LogRecord, mut attrs: AttrMap) -> Ev
     } else {
         record.observed_time_unix_nano as i64
     };
-    Event::log(timestamp, attrs, LogRecord { message, severity, body_format })
+    Event::log(timestamp, attrs, LogRecord { message, severity, body_format, trace: None })
 }
 
 #[cfg(test)]
@@ -189,7 +189,12 @@ mod tests {
             let event = Event::log(
                 0,
                 AttrMap::new(),
-                LogRecord { message: Value::str("hi"), severity: None, body_format: format },
+                LogRecord {
+                    message: Value::str("hi"),
+                    severity: None,
+                    body_format: format,
+                    trace: None,
+                },
             );
             let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
             let decoded = decode_log_record(encoded, AttrMap::new());
@@ -248,7 +253,12 @@ mod tests {
         let event = Event::log(
             0,
             AttrMap::new(),
-            LogRecord { message: Value::str("hi"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("hi"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
         assert_eq!(encoded.severity_number, pb::SeverityNumber::Unspecified as i32);
