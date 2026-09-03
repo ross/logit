@@ -409,7 +409,13 @@ impl Aggregator {
 
         for (gi, group) in self.groups.iter_mut().enumerate() {
             let series = std::mem::take(&mut group.series);
-            let mut events = Vec::new();
+            // `series.len()` upper-bounds `events.len()` -- every series either emits (tumbling,
+            // or a freshly-retained gauge) or doesn't (a still-idle retained gauge), never more
+            // than one event each -- so this preallocates for the always-taken default
+            // (`gauge_retention: 0`) path exactly as the pre-retention code did, avoiding the
+            // Vec's own amortized-growth reallocations that pushing into an unsized `Vec::new()`
+            // would otherwise pay on every flush.
+            let mut events = Vec::with_capacity(series.len());
             for (key, mut state) in series {
                 let is_gauge = matches!(state.accumulator, Accumulator::Gauge { .. });
                 if state.updated_this_window {
