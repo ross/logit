@@ -19,7 +19,7 @@
 
 use logit_bench::alloc::{measure, CountingAlloc, Stats};
 use logit_bench::fixtures;
-use logit_core::{EventBatch, Registry, Telemetry, Value};
+use logit_core::{EventBatch, Registry, Telemetry, TraceRef, Value};
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::stdio::{EventDump, Format};
 use logit_outputs::syslog::{Format as SyslogFormat, MessageBuf, SyslogEncoder};
@@ -1550,6 +1550,30 @@ fn lua_process_one_event_writing_resource() {
     let committed = committed.expect("the script writes resource on every call");
     assert_eq!(committed.attributes.get("service.name"), Some(&Value::str("nginx")));
     expect_allocs("lua: set_resource + process + take_resource, writing resource", stats, 7);
+}
+
+/// What a script reading `event.log.trace_id` costs (`crates/logit-script/src/proxy.rs`'s
+/// `LogProxy`, `docs/adr/log-record-trace-context.md`). **9** -- the same total as
+/// `lua_process_one_event`'s `AttrsProxy`-touching script, despite `LUA_LOG_TRACE_READ_SCRIPT`
+/// never touching `event.attributes` at all: creating and caching a `LogProxy` userdata on first
+/// access costs the same as `AttrsProxy` did there, and `to_hex`'s returned `String` costs what
+/// the attribute write cost there. Measured, not derived from that breakdown -- the two scripts
+/// don't share enough of their allocation shape to assume the numbers would just add up.
+#[test]
+fn lua_process_one_event_reading_log_trace() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_LOG_TRACE_READ_SCRIPT).expect("script should load");
+    let mut warm = fixtures::nginx_event();
+    warm.log.as_mut().unwrap().trace =
+        Some(TraceRef { trace_id: [1; 16], span_id: None, flags: 0 });
+    drop(worker.process(warm));
+
+    let mut event = fixtures::nginx_event();
+    event.log.as_mut().unwrap().trace =
+        Some(TraceRef { trace_id: [1; 16], span_id: None, flags: 0 });
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: process 1 event, reading event.log.trace_id", stats, 9);
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -268,6 +268,17 @@ function process(event)
 end
 "#;
 
+/// Reads `event.log.trace_id` on every call -- for measuring what a script touching the new
+/// `event.log` proxy costs (`crates/logit-script/src/proxy.rs`'s `LogProxy`,
+/// `docs/adr/log-record-trace-context.md`), over [`LUA_ENRICH_SCRIPT`]'s baseline
+/// (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event_reading_log_trace`).
+pub const LUA_LOG_TRACE_READ_SCRIPT: &str = r#"
+function process(event)
+  local _ = event.log.trace_id
+  return event
+end
+"#;
+
 // -------------------------------------------------------------------------------------------
 // Logs-only: a plain-text syslog line with no JSON body at all
 // -------------------------------------------------------------------------------------------

@@ -313,6 +313,17 @@ mod tests {
         }
     }
 
+    /// `ProcessOutcome` isn't `Debug` (see the comment further down this file), so
+    /// `Result::unwrap_err` doesn't work on `ScriptWorker::process`'s return value -- this is the
+    /// match-and-panic-on-`Ok` idiom the rest of this file already uses, wrapped up for the
+    /// several `event.log` tests that only care about the error text.
+    fn process_err(w: &ScriptWorker, event: Event) -> String {
+        match w.process(event) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("expected process() to reject this script"),
+        }
+    }
+
     #[test]
     fn process_can_read_and_write_attributes() {
         let w = worker(
@@ -869,6 +880,262 @@ mod tests {
             !message.contains("no field"),
             "should report read-only, not a nonexistent field: {message}"
         );
+    }
+
+    #[test]
+    fn event_dot_log_is_nil_when_the_event_has_no_log() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.log_is_nil = (event.log == nil)
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(counter_event("hits", 1.0)).unwrap());
+        assert!(matches!(out.attributes.get("log_is_nil"), Some(logit_core::Value::Bool(true))));
+    }
+
+    #[test]
+    fn event_dot_log_reads_message_severity_and_body_format() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.message = event.log.message
+                event.attributes.body_format = event.log.body_format
+                event.attributes.severity_is_nil = (event.log.severity == nil)
+                event.attributes.trace_id_is_nil = (event.log.trace_id == nil)
+                event.attributes.trace_flags_is_nil = (event.log.trace_flags == nil)
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(log_and_counter_event("hits", 1.0)).unwrap());
+        assert_eq!(out.attributes.get("message").and_then(|v| v.as_str()), Some("GET /"));
+        assert_eq!(out.attributes.get("body_format").and_then(|v| v.as_str()), Some("raw"));
+        assert!(matches!(
+            out.attributes.get("severity_is_nil"),
+            Some(logit_core::Value::Bool(true))
+        ));
+        assert!(matches!(
+            out.attributes.get("trace_id_is_nil"),
+            Some(logit_core::Value::Bool(true))
+        ));
+        assert!(matches!(
+            out.attributes.get("trace_flags_is_nil"),
+            Some(logit_core::Value::Bool(true))
+        ));
+    }
+
+    #[test]
+    fn writing_trace_id_then_reading_it_back_round_trips_as_lowercase_hex() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.log.trace_id = "ab000000000000000000000000000000"
+                event.attributes.trace_id = event.log.trace_id
+                event.attributes.span_id_is_nil = (event.log.span_id == nil)
+                event.attributes.flags = event.log.trace_flags
+                return event
+            end
+            "#,
+        );
+        // Provoke a real length mismatch to catch a copy-paste error in the fixture below rather
+        // than trusting hand-counted hex characters.
+        let trace_id_hex = "ab000000000000000000000000000000";
+        assert_eq!(trace_id_hex.len(), 32, "fixture bug: not a valid 16-byte trace id");
+        let out = emitted(w.process(log_and_counter_event("hits", 1.0)).unwrap());
+        assert_eq!(out.attributes.get("trace_id").and_then(|v| v.as_str()), Some(trace_id_hex));
+        assert!(matches!(
+            out.attributes.get("span_id_is_nil"),
+            Some(logit_core::Value::Bool(true))
+        ));
+        assert!(matches!(out.attributes.get("flags"), Some(logit_core::Value::I64(0))));
+    }
+
+    #[test]
+    fn writing_span_id_and_trace_flags_after_trace_id_works() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.log.trace_id = "ab000000000000000000000000000000"
+                event.log.span_id = "cd00000000000000"
+                event.log.trace_flags = 1
+                event.attributes.span_id = event.log.span_id
+                event.attributes.flags = event.log.trace_flags
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(log_and_counter_event("hits", 1.0)).unwrap());
+        assert_eq!(
+            out.attributes.get("span_id").and_then(|v| v.as_str()),
+            Some("cd00000000000000")
+        );
+        assert!(matches!(out.attributes.get("flags"), Some(logit_core::Value::I64(1))));
+    }
+
+    #[test]
+    fn writing_trace_id_to_nil_clears_span_id_and_flags_too() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.log.trace_id = "ab000000000000000000000000000000"
+                event.log.span_id = "cd00000000000000"
+                event.log.trace_id = nil
+                event.attributes.trace_id_is_nil = (event.log.trace_id == nil)
+                event.attributes.span_id_is_nil = (event.log.span_id == nil)
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(log_and_counter_event("hits", 1.0)).unwrap());
+        assert!(matches!(
+            out.attributes.get("trace_id_is_nil"),
+            Some(logit_core::Value::Bool(true))
+        ));
+        assert!(matches!(
+            out.attributes.get("span_id_is_nil"),
+            Some(logit_core::Value::Bool(true))
+        ));
+    }
+
+    #[test]
+    fn writing_span_id_without_a_trace_id_first_is_a_clear_error() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.log.span_id = "cd00000000000000"
+                return event
+            end
+            "#,
+        );
+        let err = process_err(&w, log_and_counter_event("hits", 1.0));
+        assert!(err.contains("trace_id"), "got: {err}");
+    }
+
+    #[test]
+    fn writing_trace_flags_without_a_trace_id_first_is_a_clear_error() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.log.trace_flags = 1
+                return event
+            end
+            "#,
+        );
+        let err = process_err(&w, log_and_counter_event("hits", 1.0));
+        assert!(err.contains("trace_id"), "got: {err}");
+    }
+
+    #[test]
+    fn writing_an_invalid_hex_trace_id_is_a_clear_error() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.log.trace_id = "not-hex"
+                return event
+            end
+            "#,
+        );
+        let err = process_err(&w, log_and_counter_event("hits", 1.0));
+        assert!(err.contains("trace_id"), "got: {err}");
+    }
+
+    #[test]
+    fn writing_an_out_of_range_trace_flags_is_a_clear_error() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.log.trace_id = "ab000000000000000000000000000000"
+                event.log.trace_flags = 256
+                return event
+            end
+            "#,
+        );
+        let err = process_err(&w, log_and_counter_event("hits", 1.0));
+        assert!(err.contains("trace_flags"), "got: {err}");
+    }
+
+    #[test]
+    fn assigning_to_message_severity_or_body_format_reports_read_only() {
+        for field in ["message", "severity", "body_format"] {
+            let w = worker(&format!(
+                r#"
+                function process(event)
+                    event.log.{field} = "x"
+                    return event
+                end
+                "#
+            ));
+            let err = process_err(&w, log_and_counter_event("hits", 1.0));
+            assert!(err.contains("read-only"), "field {field}, got: {err}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_field_on_event_dot_log_is_a_clear_error() {
+        let w = worker(
+            r#"
+            function process(event)
+                local _ = event.log.nonexistent
+                event.log.nonexistent = 1
+                return event
+            end
+            "#,
+        );
+        let err = process_err(&w, log_and_counter_event("hits", 1.0));
+        assert!(err.contains("no field"), "got: {err}");
+    }
+
+    #[test]
+    fn assigning_to_event_dot_log_itself_reports_it_as_read_only() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.log = nil
+                return event
+            end
+            "#,
+        );
+        let err = process_err(&w, log_and_counter_event("hits", 1.0));
+        assert!(err.contains("read-only"), "got: {err}");
+    }
+
+    #[test]
+    fn to_table_includes_a_log_sub_table_matching_the_proxy() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.log.trace_id = "ab000000000000000000000000000000"
+                local t = event:to_table()
+                event.attributes.message = t.log.message
+                event.attributes.trace_id = t.log.trace_id
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(log_and_counter_event("hits", 1.0)).unwrap());
+        assert_eq!(out.attributes.get("message").and_then(|v| v.as_str()), Some("GET /"));
+        assert_eq!(
+            out.attributes.get("trace_id").and_then(|v| v.as_str()),
+            Some("ab000000000000000000000000000000")
+        );
+    }
+
+    #[test]
+    fn to_table_dot_log_is_nil_when_the_event_has_no_log() {
+        let w = worker(
+            r#"
+            function process(event)
+                local t = event:to_table()
+                event.attributes.log_is_nil = (t.log == nil)
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(counter_event("hits", 1.0)).unwrap());
+        assert!(matches!(out.attributes.get("log_is_nil"), Some(logit_core::Value::Bool(true))));
     }
 
     /// `event.type` no longer exists (docs/adr/multi-payload-events.md) -- `__index`'s
