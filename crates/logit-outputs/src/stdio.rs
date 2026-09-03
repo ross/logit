@@ -236,10 +236,14 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
         MetricKind::GaugeDelta(v) => {
             // Rendered distinguishably from a resolved `Gauge` (`gauge_delta`, not `gauge`), and
             // with an explicit sign, so an operator can see at a glance that this is an
-            // *unresolved* relative adjustment (`docs/adr/0024-relative-gauge-adjustments.md`) --
+            // *unresolved* relative adjustment (`docs/adr/0026-relative-gauge-adjustments.md`) --
             // a debug sink must never silently print it as though it were an absolute value.
             out.push_str("gauge_delta=");
-            if *v >= 0.0 {
+            // `is_sign_positive`, not `*v >= 0.0` -- `-0.0 >= 0.0` is true in IEEE-754 comparison,
+            // but `f64`'s `Display` still renders `-0.0` as `"-0"`, so `>= 0.0` would double the
+            // sign into the malformed `+-0`. `is_sign_positive` reads the sign bit directly and
+            // excludes negative zero, matching what `Display` is about to print.
+            if v.is_sign_positive() {
                 out.push('+');
             }
             let _ = write!(out, "{v}");
@@ -806,7 +810,7 @@ mod tests {
     }
 
     /// `gauge_delta`, not `gauge` -- an unresolved relative adjustment must be visually
-    /// distinguishable from a resolved absolute value (`docs/adr/0024-relative-gauge-adjustments.md`),
+    /// distinguishable from a resolved absolute value (`docs/adr/0026-relative-gauge-adjustments.md`),
     /// with an explicit sign so a positive delta doesn't read as a bare number.
     #[test]
     fn gauge_delta_renders_distinguishably_with_an_explicit_sign() {
@@ -815,6 +819,15 @@ mod tests {
 
         let out = encode(vec![metric_event(0, "conns", MetricKind::GaugeDelta(-5.0))]);
         assert!(out.contains("conns gauge_delta=-5"), "got: {out}");
+    }
+
+    /// `-0.0 >= 0.0` is true (IEEE-754), but `Display` still renders negative zero as `"-0"` -- a
+    /// naive `>= 0.0` sign check would double the sign into `+-0`. Regression for that.
+    #[test]
+    fn gauge_delta_negative_zero_does_not_double_the_sign() {
+        let out = encode(vec![metric_event(0, "conns", MetricKind::GaugeDelta(-0.0))]);
+        assert!(out.contains("conns gauge_delta=-0"), "got: {out}");
+        assert!(!out.contains("+-0"), "got: {out}");
     }
 
     #[test]

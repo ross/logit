@@ -17,13 +17,17 @@
 //! never fed at all -- arity rules out a `sources` entry pointing at one -- so `Input` never
 //! receives a `Delivered` either way.)
 //!
-//! Every `Delivered` also carries a [`TraceContext`] -- the internal-spans propagation this PR's
-//! costing exercise (`docs/known-gaps.md`) measured and reverted before deciding to build for
-//! real. See [`TraceContext`]'s own doc comment for the propagation model, and
+//! Every `Delivered` also carries a [`TraceContext`] -- the substrate for internal spans, built
+//! per `docs/adr/0020-trace-context-propagation-on-delivered.md` on the measured evidence of a
+//! costing exercise that came before it (`docs/known-gaps.md`). Real span emission -- turning
+//! that context into an actual `SpanRecord`-carrying `Event` -- landed in
+//! `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`: `Fanout::send`/
+//! `send_blocking` (below) record this node's own listener span around the send. See
+//! [`TraceContext`]'s own doc comment for the propagation model, and
 //! `docs/design/pipeline-graph.md`'s "Trace context propagation" section for the account of which
 //! node kinds propagate a real parent today and which still mint a root.
 
-use logit_core::{EventBatch, Telemetry};
+use logit_core::{EventBatch, SpanKind, Telemetry};
 use std::cell::Cell;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -35,17 +39,19 @@ use tokio::sync::mpsc;
 /// **Propagation model:** `trace_id` is set once, at a trace's true origin, and never changes
 /// again as a batch moves through the graph -- every hop's emitted batch keeps its parent's
 /// `trace_id`. `span_id` changes at *every* hop: [`TraceContext::child`] keeps `trace_id` and mints
-/// a fresh `span_id`, so a hop's own `span_id` is what the *next* hop's span would record as its
-/// `parent_span_id`, once something actually builds a `SpanRecord` from this (not done yet -- see
-/// the module doc above).
+/// a fresh `span_id`, so a hop's own `span_id` is what the *next* hop's span records as its own
+/// `parent_span_id` -- the actual `SpanRecord` this builds into is real now
+/// (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`; see the module doc above).
 ///
-/// **Not every node can produce a `child` today.** A node with exactly one incoming batch per
-/// emission (a listener producing its first batch, `Transform::process`/`ScriptWorker::process`'s
-/// per-batch loop) has one unambiguous parent, and does. A node whose emission is built from
-/// however many upstream batches contributed since the last tick (`Transform::flush`, Lua's
-/// timer-driven `flush()`) has no single correct parent -- an *n*-to-1 relationship, not 1-to-1 --
-/// and still mints a fresh [`TraceContext::new_root`] rather than picking one arbitrarily.
-/// `docs/known-gaps.md`'s internal-spans entry tracks this as the open half.
+/// **Not every node can produce a `child`.** A node with exactly one incoming batch per emission (a
+/// listener producing its first batch, `Transform::process`/`ScriptWorker::process`'s per-batch
+/// loop) has one unambiguous parent, and does. A node whose emission is built from however many
+/// upstream batches contributed since the last tick (`Transform::flush`, Lua's timer-driven
+/// `flush()`) has no single correct parent -- an *n*-to-1 relationship, not 1-to-1 -- and mints a
+/// fresh [`TraceContext::new_root`] instead, deliberately, rather than picking one arbitrarily; ADR
+/// 0022 records this as the settled design, not something still to be built. `docs/known-gaps.md`'s
+/// internal-spans entry names the narrower residuals that *are* still open (the listener span's
+/// window, Lua `flush()`'s link-less root).
 /// `Default` is the all-zero context -- a placeholder for tests/benches that construct a
 /// `Delivered` directly and don't care what it carries, never used by `Fanout` itself (which
 /// always calls [`TraceContext::new_root`] or [`TraceContext::child`]).
@@ -184,18 +190,45 @@ impl Fanout {
         self.consumers.is_empty()
     }
 
-    /// Sends `batch` as a new trace root -- see [`Fanout::send_with_context`] for everything
-    /// about delivery mechanics; this is the right call for a node with no single incoming batch
-    /// to inherit a parent context from (every listener; a flush-driven emission, deliberately,
-    /// per [`TraceContext`]'s own doc comment).
+    /// Sends `batch` as a new trace root, recording this node's own listener span around the
+    /// send -- the right call for a node with no single incoming batch to inherit a parent
+    /// context from (every listener; `Input::run` never receives a `Delivered`, so has no parent
+    /// to inherit). See [`Fanout::send_with_own_context`] for everything about delivery mechanics.
+    ///
+    /// **This is the one place a listener's own `SpanKind::Producer` span is recorded** --
+    /// `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`'s per-node-kind table.
+    /// Its window is deliberately just this call, not "however long the listener spent building
+    /// `batch`": `Fanout::send` has no visibility into that (`Input::run` is a free-form loop), so
+    /// this doesn't fabricate a start time it can't actually know. Once `run_flush`/`run_lua`'s
+    /// flush path minted its own root and called [`Fanout::send_with_own_context`] directly
+    /// (this PR), a genuine listener is the *only* remaining caller of this method -- so "one
+    /// call to `send`" and "one listener emission" are now the same event.
     pub async fn send(&self, batch: EventBatch) {
-        self.send_with_context(batch, TraceContext::new_root()).await
+        let ctx = TraceContext::new_root();
+        let mut span =
+            self.telemetry.span("send", SpanKind::Producer, ctx.trace_id, ctx.span_id, None);
+        span.events(batch.events.len() as u64);
+        self.send_with_own_context(batch, ctx).await;
     }
 
     /// Sends `batch` to every consumer, as a [`TraceContext::child`] of `parent` -- the right call
-    /// for a node that has exactly one incoming batch to attribute this emission to
-    /// (`Transform::process`/`ScriptWorker::process`'s per-batch loop; not `Transform::flush`,
-    /// which has no single parent to propagate, per [`TraceContext`]'s own doc comment).
+    /// for a node that has exactly one incoming batch to attribute this emission to, but that
+    /// doesn't itself record a span for the send (`run_transform`/`run_lua`'s non-flush paths
+    /// record their own `SpanKind::Internal` span around `process` *and* the send, so the context
+    /// this mints has to be knowable *before* the send call -- see [`Fanout::send_with_own_context`],
+    /// which this is now defined in terms of).
+    pub async fn send_with_context(&self, batch: EventBatch, parent: TraceContext) {
+        self.send_with_own_context(batch, parent.child()).await
+    }
+
+    /// Sends `batch` to every consumer under `ctx`, exactly as minted by the caller -- the
+    /// primitive every other `send*` variant on this type is built from. The right call for a
+    /// node that already minted its own `TraceContext` for a span it's recording around this send
+    /// (or around a wider window that includes it): the span's `span_id` and the outgoing
+    /// `Delivered`'s `span_id` must be the *same* id, which only holds if nothing mints a second,
+    /// unrelated context here. `send_with_context(b, parent)` is exactly
+    /// `send_with_own_context(b, parent.child())` -- the two aren't independent behaviors, just
+    /// two ways of arriving at the context this one actually sends under.
     ///
     /// A closed consumer is silently skipped -- see `docs/design/pipeline-graph.md`'s backpressure
     /// section: propagating a closed downstream as a real shutdown signal is a named open
@@ -207,14 +240,14 @@ impl Fanout {
     /// cost entirely. More than one consumer: wraps `batch` in an `Arc` once, then clones the `Arc`
     /// (a refcount bump, not a deep clone) for every consumer but the last, which gets it moved --
     /// saving one atomic increment/decrement pair, not a structural privilege (see
-    /// [`Delivered::Shared`]'s doc comment). Every consumer gets the *same* child context -- one
-    /// batch forking into several downstream branches is still one emission, not several.
-    pub async fn send_with_context(&self, batch: EventBatch, parent: TraceContext) {
+    /// [`Delivered::Shared`]'s doc comment). Every consumer gets the *same* context -- one batch
+    /// forking into several downstream branches is still one emission, not several, so it records
+    /// (at most, at the caller's own discretion) exactly one span here, never one per branch.
+    pub async fn send_with_own_context(&self, batch: EventBatch, ctx: TraceContext) {
         let Some((last, rest)) = self.consumers.split_last() else { return };
         let n = batch.events.len();
         self.record_send(n);
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
-        let ctx = parent.child();
         if rest.is_empty() {
             if last.send(Delivered::Owned(batch, ctx)).await.is_err() {
                 self.record_dropped_on_close(n);
@@ -235,19 +268,29 @@ impl Fanout {
 
     /// The `blocking_send` equivalent of [`Fanout::send`], for a node running on a plain OS
     /// thread rather than as a tokio task (a Lua node -- see
-    /// `docs/design/pipeline-graph.md`'s "Thread model" section).
+    /// `docs/design/pipeline-graph.md`'s "Thread model" section). Same listener-span reasoning as
+    /// `send`'s own doc comment.
     pub fn send_blocking(&self, batch: EventBatch) {
-        self.send_blocking_with_context(batch, TraceContext::new_root())
+        let ctx = TraceContext::new_root();
+        let mut span =
+            self.telemetry.span("send", SpanKind::Producer, ctx.trace_id, ctx.span_id, None);
+        span.events(batch.events.len() as u64);
+        self.send_blocking_with_own_context(batch, ctx);
     }
 
     /// The `blocking_send` equivalent of [`Fanout::send_with_context`] -- see that method for the
     /// propagation contract.
     pub fn send_blocking_with_context(&self, batch: EventBatch, parent: TraceContext) {
+        self.send_blocking_with_own_context(batch, parent.child())
+    }
+
+    /// The `blocking_send` equivalent of [`Fanout::send_with_own_context`] -- see that method for
+    /// the propagation contract.
+    pub fn send_blocking_with_own_context(&self, batch: EventBatch, ctx: TraceContext) {
         let Some((last, rest)) = self.consumers.split_last() else { return };
         let n = batch.events.len();
         self.record_send(n);
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
-        let ctx = parent.child();
         if rest.is_empty() {
             if last.blocking_send(Delivered::Owned(batch, ctx)).is_err() {
                 self.record_dropped_on_close(n);
@@ -470,5 +513,29 @@ mod tests {
         let b = rx_b.recv().await.expect("b should receive").context();
         assert_eq!(a, b, "both branches of one fan-out should carry the identical child context");
         assert_eq!(a.trace_id, parent.trace_id);
+    }
+
+    /// `send` mints a root and records exactly one `SpanKind::Producer` span for it -- the
+    /// drained span's own `span_id` must be the same id the delivered batch actually went out
+    /// under, not some unrelated id minted separately (`docs/adr/0025-internal-span-emission-and-
+    /// deterministic-sampling.md`'s "the span's `span_id` and the outgoing `Delivered`'s `span_id`
+    /// must be the same id").
+    #[tokio::test]
+    async fn send_records_a_root_span_whose_span_id_is_the_context_it_sent_under() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("in", "statsd_in", "listener");
+        let (tx, mut rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]).with_telemetry(telemetry);
+
+        fanout.send(batch(2)).await;
+        let sent_ctx = rx.recv().await.expect("should receive").context();
+
+        let events = registry.drain(0);
+        let span_event = events.iter().find(|e| e.span.is_some()).expect("a span event");
+        let record = span_event.span.as_ref().expect("span record");
+        assert_eq!(record.span_id, sent_ctx.span_id);
+        assert_eq!(record.trace_id, sent_ctx.trace_id);
+        assert_eq!(record.parent_span_id, None, "a listener span has no parent");
+        assert_eq!(record.kind, logit_core::SpanKind::Producer);
     }
 }

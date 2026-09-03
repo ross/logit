@@ -70,6 +70,33 @@ pub struct MetricSpec {
     pub unit: Option<String>,
 }
 
+/// Which OTLP transport a component speaks -- both `otlp_in` and `otlp_out` carry identical
+/// protobuf payloads (`crates/logit-proto/src/otlp`), differing only in framing and endpoint
+/// shape (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OtlpProtocol {
+    /// OTLP/HTTP, protobuf body, one POST per signal. Default: it's what an
+    /// `http://host:4318`-shaped endpoint already implies, and a bare `endpoint: http://tempo:4318`
+    /// would be silently wrong under any other default.
+    #[default]
+    Http,
+    /// Unary gRPC over plaintext HTTP/2 -- `crates/logit-outputs/src/otlp.rs`'s hand-rolled gRPC
+    /// transport has no TLS support at all (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`), so an
+    /// `otlp_out` component's `endpoint` under this protocol is rejected at construction time if
+    /// it's written with an `https://` scheme, rather than silently exporting in plaintext.
+    Grpc,
+}
+
+/// `ComponentKind::Internal`'s `span_sample_rate` default when a config omits it -- re-exported
+/// from `logit-core` (not restated as a bare literal here) so the two crates can never drift
+/// apart on what "the default" actually is. This is also the one place `logit-config` depends on
+/// `logit-core` at all: a small, deliberately narrow edge (one `pub const`), not a general
+/// dependency on the event model this crate otherwise has no business needing.
+fn default_span_sample_rate() -> f64 {
+    logit_core::DEFAULT_SPAN_SAMPLE_RATE
+}
+
 /// A component's kind, tagged by `type` in config. Every protocol kind is suffixed `_in`/`_out`
 /// uniformly (`docs/design/pipeline-graph.md`'s naming rationale) so a listener and a sink for the
 /// same protocol never collide on one tag value; transform kinds take no suffix, since there's
@@ -93,6 +120,8 @@ pub enum ComponentKind {
     /// OpenTelemetry Protocol (logs, metrics, and/or traces).
     OtlpIn {
         bind: String,
+        #[serde(default)]
+        protocol: OtlpProtocol,
     },
     /// Tail one or more files as a log source, rotation- and checkpoint-aware.
     FileTail {
@@ -117,6 +146,17 @@ pub enum ComponentKind {
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         interval: Duration,
+        /// Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id`
+        /// the same way at every node -- a kept trace is kept at every hop, never partially. Below
+        /// `1.0` by default: span volume is a different shape than metric volume (one span per
+        /// node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans
+        /// off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full
+        /// traces rather than a representative sample would set this explicitly. Named
+        /// `span_sample_rate`, not `sample_rate` -- there is already a `ComponentKind::Sample`
+        /// transform, and `internal` may grow other sampling knobs later. See
+        /// `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`.
+        #[serde(default = "default_span_sample_rate")]
+        span_sample_rate: f64,
     },
 
     /// Inline Lua source (a YAML block scalar in practice). See `docs/design/lua-api.md`.
@@ -143,7 +183,7 @@ pub enum ComponentKind {
         #[schemars(with = "String")]
         interval: Duration,
         /// How many consecutive windows a gauge series with no new data is retained past its
-        /// last update, so a relative gauge adjustment (`docs/adr/0024-relative-gauge-adjustments.md`)
+        /// last update, so a relative gauge adjustment (`docs/adr/0026-relative-gauge-adjustments.md`)
         /// arriving in a later window can still resolve against the value it last held. `0`
         /// disables retention entirely -- every gauge series is drained every window exactly like
         /// a counter, matching this field's absence before it existed. See the
@@ -238,6 +278,8 @@ pub enum ComponentKind {
     },
     OtlpOut {
         endpoint: String,
+        #[serde(default)]
+        protocol: OtlpProtocol,
     },
     /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
     LogitOut {
@@ -821,7 +863,26 @@ mod tests {
             serde_json::from_str(r#"{"type": "internal", "interval": "10s"}"#).unwrap();
         assert!(component.sources.is_empty());
         match component.kind {
-            ComponentKind::Internal { interval } => assert_eq!(interval, Duration::from_secs(10)),
+            ComponentKind::Internal { interval, .. } => {
+                assert_eq!(interval, Duration::from_secs(10));
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    /// `span_sample_rate` is optional, defaulting to `logit_core::DEFAULT_SPAN_SAMPLE_RATE`
+    /// (0.1) -- an `internal` component that predates this field (every shipped config before
+    /// this PR) still deserializes, with spans sampled at a tenth rather than silently disabled
+    /// or silently kept at full volume.
+    #[test]
+    fn internal_without_span_sample_rate_defaults_to_one_tenth() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "internal", "interval": "10s"}"#).unwrap();
+        match component.kind {
+            ComponentKind::Internal { span_sample_rate, .. } => {
+                assert_eq!(span_sample_rate, 0.1);
+                assert_eq!(span_sample_rate, logit_core::DEFAULT_SPAN_SAMPLE_RATE);
+            }
             other => panic!("expected Internal, got {other:?}"),
         }
     }
@@ -930,6 +991,36 @@ mod tests {
         .unwrap();
         assert_eq!(component.sources, vec!["enrich".to_string()]);
         assert!(matches!(component.kind, ComponentKind::InfluxDbOut { .. }));
+    }
+
+    #[test]
+    fn otlp_out_without_protocol_defaults_to_http() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_out", "sources": ["in"], "endpoint": "http://tempo:4318"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpOut { endpoint, protocol } => {
+                assert_eq!(endpoint, "http://tempo:4318");
+                assert_eq!(protocol, OtlpProtocol::Http);
+            }
+            other => panic!("expected OtlpOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otlp_in_with_protocol_grpc_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_in", "bind": "0.0.0.0:4317", "protocol": "grpc"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpIn { bind, protocol } => {
+                assert_eq!(bind, "0.0.0.0:4317");
+                assert_eq!(protocol, OtlpProtocol::Grpc);
+            }
+            other => panic!("expected OtlpIn, got {other:?}"),
+        }
     }
 
     #[test]

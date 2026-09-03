@@ -237,7 +237,7 @@ fn build_event(
             // unambiguous as '+', not a case needing its own guess. No config escape hatch: this
             // decoder used to reject any signed value outright, so there is no prior working
             // "absolute negative gauge" behavior a `negative_gauge: delta|absolute` toggle could
-            // ever have been preserving (see docs/adr/0024-relative-gauge-adjustments.md's
+            // ever have been preserving (see docs/adr/0026-relative-gauge-adjustments.md's
             // Alternatives). `f64::from_str` accepts a leading '+' the same as '-' (pinned by
             // `plus_prefixed_gauge_values_parse_via_from_str`), so `parse_finite_value` handles
             // both signs identically; only the *choice* between `Gauge`/`GaugeDelta` is decided

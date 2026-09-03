@@ -3,6 +3,7 @@
 
 pub mod buffer;
 pub mod frame;
+pub mod otlp;
 
 use logit_core::EventBatch;
 
@@ -12,6 +13,12 @@ pub enum CodecError {
     Malformed(String),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+    /// Something this codec cannot represent at all, as opposed to [`CodecError::Malformed`]'s
+    /// "this input violates the format." OTLP's own service RPCs (PR3) are the first caller: an
+    /// `application/json` content type, or an unknown gRPC method name, is well-formed on the
+    /// wire, just not something this codec speaks.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }
 
 /// Turns wire bytes into an [`EventBatch`]. Every input (statsd, syslog, OTLP, the native
@@ -25,4 +32,69 @@ pub trait Decoder {
 /// this.
 pub trait Encoder {
     fn encode(&mut self, batch: &EventBatch) -> Result<bytes::Bytes, CodecError>;
+}
+
+/// Which OTLP service a payload belongs to. `logit`'s `Event` doesn't split by signal -- one event
+/// may carry a log, metrics, and a span at once (ADR 0012) -- but OTLP's wire protocol does: logs,
+/// metrics, and traces are three separate RPCs/URLs with three separate message types. A `Signal`
+/// names which one a given payload of bytes belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    Logs,
+    Metrics,
+    Traces,
+}
+
+impl Signal {
+    /// The OTLP/HTTP path this signal is POSTed to, e.g. `/v1/traces`. Doubles as the `signal` tag
+    /// value on any telemetry a caller attaches to a per-signal operation.
+    pub fn path(self) -> &'static str {
+        match self {
+            Signal::Logs => "/v1/logs",
+            Signal::Metrics => "/v1/metrics",
+            Signal::Traces => "/v1/traces",
+        }
+    }
+
+    /// The fully qualified gRPC method name for this signal's `Export` RPC.
+    pub fn grpc_method(self) -> &'static str {
+        match self {
+            Signal::Logs => "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+            Signal::Metrics => "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+            Signal::Traces => "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Signal::Logs => "logs",
+            Signal::Metrics => "metrics",
+            Signal::Traces => "traces",
+        }
+    }
+}
+
+/// An encoder whose wire format splits one [`EventBatch`] across several payloads, one per
+/// [`Signal`] -- [`Encoder`] doesn't fit here since OTLP has no single message type an
+/// [`EventBatch`] maps onto. Additive: [`Decoder`]/[`Encoder`] are unchanged, and every codec that
+/// already implements them (the native format, statsd, syslog) is untouched.
+pub trait SignalEncoder {
+    /// Encodes `batch` into zero or more `(Signal, bytes)` payloads. Only non-empty signals
+    /// appear -- an event batch with no metrics produces no `Signal::Metrics` payload -- and an
+    /// entirely empty batch yields none at all, never an empty OTLP request.
+    fn encode_signals(
+        &mut self,
+        batch: &EventBatch,
+    ) -> Result<Vec<(Signal, bytes::Bytes)>, CodecError>;
+}
+
+/// The mirror of [`SignalEncoder`]. Returns several batches, not one: a single OTLP request can
+/// carry data from N distinct `Resource*` entries, and an [`EventBatch`] holds exactly one
+/// `Arc<Resource>` -- collapsing every entry under the first would silently mislabel the rest.
+pub trait SignalDecoder {
+    fn decode_signal(
+        &mut self,
+        signal: Signal,
+        bytes: bytes::Bytes,
+    ) -> Result<Vec<EventBatch>, CodecError>;
 }

@@ -139,7 +139,7 @@ the config. The two most directly actionable for buffering:
 
 `aggregate` normally drains every series on every flush (tumbling). A statsd gauge is an
 exception: the sender transmits only on change and expects the last value to persist, and a
-relative adjustment (`+`/`-`, `docs/adr/0024-relative-gauge-adjustments.md`) sent in a later window
+relative adjustment (`+`/`-`, `docs/adr/0026-relative-gauge-adjustments.md`) sent in a later window
 needs the gauge's last-known value to apply against. `gauge_retention` (on by default, `5`
 windows) and `max_retained_gauge_series` (on by default, `10,000` series) on an `aggregate`
 component control this — see the field doc comments in the schema (`logit schema`) for the exact
@@ -164,6 +164,28 @@ would predict is a sign of a leak (each series' name/tags never repeating) worth
 `logit.transform.series.evicted{reason="cardinality"}` — any sustained nonzero rate here means
 `max_retained_gauge_series` is undersized for this pipeline's actual gauge cardinality, and deltas
 are silently resolving against 0 as a result.
+
+## `otlp_in`: put `keep` in front of it
+
+`otlp_in`'s attribute *keys* are arbitrary peer-supplied strings, not something `logit`'s own
+config or a fixed protocol grammar bounds — unlike every other listener here (statsd's
+`#tag:value`, syslog's structured-data field names), where the set of possible attribute keys is
+fixed by `logit`'s own decoder, not by whatever a remote OTLP exporter happens to send.
+`crates/logit-proto/src/otlp/common.rs`'s `key_values_into_attrs` interns every OTLP
+`KeyValue.key` it decodes into the process-wide interner (`crates/logit-core/src/interner.rs`),
+which never evicts (`docs/known-gaps.md`'s interner entry) — so a client that sends a *different*
+attribute key on every request (an id embedded in a key name, a misbehaving or malicious exporter)
+grows that table for the life of the process, with nothing here to stop it.
+
+The existing mitigation for that gap applies directly: put a `keep` component immediately
+downstream of `otlp_in`, naming only the attribute keys you actually intend to keep. That turns an
+unbounded, peer-controlled key set into the fixed, `logit`-controlled one every other listener
+already gets for free — the same reasoning [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml)
+already applies ahead of `aggregate`, extended here to cover interning too, not just series
+cardinality. This matters most for a deployment where `otlp_in` faces something other than
+`logit`'s own trusted fleet (a third-party exporter, a multi-tenant ingest path) — see
+`docs/known-gaps.md`'s interner entry for when the underlying "listeners are private by deployment
+shape" premise is worth re-checking at all.
 
 ## The nginx-side recipe
 
