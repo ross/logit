@@ -716,6 +716,30 @@ already built that have a known, accepted rough edge.
   sustained-failure guard for signals that are succeeding. `demo/logit.yaml`'s `trace_windowed`/
   `trace_out` components carry this same explanation inline.
 
+- **`otlp_out` has no custom headers, no compression, no gRPC TLS, and no per-signal filter** —
+  found evaluating whether it could replace the demo's `syslog_out` → Alloy → Loki log leg
+  ([docs/plans/otlp-logs-and-resource-identity.md](plans/otlp-logs-and-resource-identity.md)'s
+  workstream E). No `X-Scope-OrgID`-equivalent header support rules out any multi-tenant Loki/Mimir/
+  Grafana Cloud target; `crates/logit-outputs/src/otlp.rs`'s frame encoder never sets the compressed
+  flag; `reject_insecure_grpc_endpoint` hard-rejects `https://` under `protocol: grpc` rather than
+  supporting it; and there's no way to say "logs only" at the sink — it sends whatever signals a
+  batch's events happen to carry. None of these block the demo (single-tenant, plaintext gRPC to
+  Tempo); all of them block a real deployment. The compression half of this mirrors the `otlp_in`
+  gap above but was never itself filed until now.
+
+- **No mechanism exists anywhere in `logit` to attach a static attribute to a batch's resource** —
+  found in the same investigation
+  ([docs/plans/otlp-logs-and-resource-identity.md](plans/otlp-logs-and-resource-identity.md),
+  workstream A). Not config (no `attributes`/`labels`/`tags`/`resource` field on any input), not any
+  transform (`keep`/`json`/`kv_metrics`/`aggregate` only filter or derive), and Lua can mutate only
+  *event* attributes (`crates/logit-script/src/proxy.rs`'s `AttrsProxy`), never a resource. This is
+  what blocks giving `syslog_in`/`statsd_in` traffic a real `service.name` for OTLP-native backends
+  (Loki's index labels among them) without the just-landed rule that `logit`'s own code must not
+  invent one. The plan's workstream A sketches the fix — an operator-declared `resource:` config
+  field, landing on a new ADR distinguishing "code invents an identity" (still forbidden) from "an
+  operator configuring the pipeline declares one" (fine, same category as `syslog_out`'s existing
+  `hostname`/`app_name` fields) — plus the demo-stack workstreams (B, C, D) it would unblock.
+
 - **`otlp_out`'s gRPC transport opens a fresh connection per request, never pooled.** Every gRPC
   `send` (`crates/logit-outputs/src/otlp.rs`'s `grpc_roundtrip`) connects, performs a fresh HTTP/2
   handshake, sends exactly one framed request, reads the response, then drops the connection —
