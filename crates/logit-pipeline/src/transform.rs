@@ -39,6 +39,21 @@ pub trait Transform: Send {
         let _ = ctx;
     }
 
+    /// Called once per incoming batch, after `observe_batch_context` and before any of that
+    /// batch's events reach `process` -- gives a transform a chance to substitute the batch's
+    /// resource (`crates/logit-transforms::Set` is the first implementer:
+    /// `docs/adr/operator-declared-resource-attributes.md`). `None` (the default) means "forward
+    /// this batch under the resource it arrived with," costing nothing beyond the call itself --
+    /// `process_batch` (`crates/logit-pipeline/src/runtime.rs`) moves the incoming `Arc` straight
+    /// through rather than cloning it. `Some` replaces it: both `process`'s `resource` argument
+    /// and the outgoing batch use the substituted value. Not a `process` parameter for the same
+    /// reason `observe_batch_context` isn't: the substitution is per-*batch*, and widening the
+    /// per-event hot path would cost every implementer for the one that actually needs it.
+    fn map_resource(&mut self, resource: &Arc<Resource>) -> Option<Arc<Resource>> {
+        let _ = resource;
+        None
+    }
+
     /// `Some(interval)` if this transform has a flush contract -- a timer-driven emission
     /// independent of inbound traffic, like `aggregate`'s tumbling windows
     /// (`docs/adr/aggregation-window-semantics.md`). `None` (the default) means this

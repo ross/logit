@@ -981,11 +981,16 @@ pub fn process_batch(
     telemetry.count("logit.component.batches.received", 1.0, &[]);
     telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
 
+    // `map_resource` before any event reaches `process`, per `Transform::map_resource`'s doc
+    // comment -- `None` (the common case) moves the incoming `Arc` straight through with no
+    // clone; `Some` substitutes it for both `process`'s argument and the outgoing batch.
+    let resource = transform.map_resource(&batch.resource).unwrap_or(batch.resource);
+
     let process_timer = telemetry.timer("logit.component.process.duration");
     let mut out = Vec::with_capacity(batch.events.len());
     let mut absorbed: u64 = 0;
     for event in batch.events {
-        match transform.process(&batch.resource, event) {
+        match transform.process(&resource, event) {
             Some(event) => out.push(event),
             None => absorbed += 1,
         }
@@ -1001,7 +1006,7 @@ pub fn process_batch(
     if out.is_empty() {
         None
     } else {
-        Some(EventBatch { resource: batch.resource, events: out })
+        Some(EventBatch { resource, events: out })
     }
 }
 
@@ -1058,9 +1063,11 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 /// becomes `fanout.send_blocking` for the same reason: no `.await` available outside `block_on`.
 ///
 /// Unlike `Transform::flush`, a Lua `flush()` has no resource of its own to stamp its emitted
-/// events with (`docs/adr/aggregation-window-semantics.md`) -- `last_resource` tracks
-/// whichever resource this component most recently saw on a real batch, defaulting to a fresh one
-/// if none has arrived yet.
+/// events with (`docs/adr/aggregation-window-semantics.md`) -- `last_resource` defaults to
+/// whichever resource this component most recently saw on a real batch (a fresh one if none has
+/// arrived yet), but a script that writes `resource` inside `process()` or `flush()`
+/// (`crates/logit-script/src/resource.rs`, `docs/adr/operator-declared-resource-attributes.md`)
+/// overrides that default explicitly -- see `flush_now`'s `take_resource` call below.
 #[allow(clippy::too_many_arguments)]
 fn run_lua(
     id: String,
@@ -1095,13 +1102,20 @@ fn run_lua(
     // internal-spans entry, and the existing resource-stamping gap this same imprecision already
     // has: `last_resource` above is the identical shape of approximation, just for `Resource`
     // instead of `TraceContext`).
-    let flush_now = |worker: &ScriptWorker, resource: &Arc<Resource>, fanout: &Fanout| {
+    let flush_now = |worker: &ScriptWorker, resource: &mut Arc<Resource>, fanout: &Fanout| {
         let ctx = TraceContext::new_root();
         let mut span = telemetry.span("flush", SpanKind::Internal, ctx.trace_id, ctx.span_id, None);
 
         let timer = telemetry.timer("logit.component.flush.duration");
         let result = worker.flush();
         drop(timer);
+        // A `flush()` that wrote `resource` (`crates/logit-script/src/resource.rs`) commits that
+        // write here -- the one way a flush-driven emission can carry a real identity instead of
+        // `last_resource`'s "whichever batch was last seen" approximation (`docs/known-gaps.md`'s
+        // Lua-flush-staleness entry).
+        if let Some(new_resource) = worker.take_resource() {
+            *resource = new_resource;
+        }
         // Sampled here too, not only after a batch (below) -- `ScriptWorker::used_memory`'s own
         // doc comment names accumulation *across `flush()` calls* as exactly the leak shape this
         // metric exists to catch. A script whose only growth happens in `flush()` (nothing new
@@ -1132,7 +1146,7 @@ fn run_lua(
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
-                flush_now(&worker, &last_resource, &fanout);
+                flush_now(&worker, &mut last_resource, &fanout);
                 let interval = configured_interval
                     .expect("next_flush is only ever Some for a component with an interval");
                 next_flush = Some(advance_flush_deadline(deadline, now_instant, interval));
@@ -1156,7 +1170,7 @@ fn run_lua(
         };
         let Some(batch) = batch else {
             if next_flush.is_some() {
-                flush_now(&worker, &last_resource, &fanout);
+                flush_now(&worker, &mut last_resource, &fanout);
             }
             return;
         };
@@ -1185,7 +1199,11 @@ fn run_lua(
             eprintln!("component '{id}': setting trace context failed: {err}");
         }
         let batch = unwrap_batch(batch);
-        last_resource = batch.resource.clone();
+        // Lets the script's own `process()`/`flush()` read (and write) `resource`
+        // (`crates/logit-script/src/resource.rs`) -- called on every batch, including one whose
+        // every event errors, so a later `flush()` never reads a stale identity because this
+        // batch happened to produce nothing.
+        worker.set_resource(&batch.resource);
         telemetry.count("logit.component.batches.received", 1.0, &[]);
         telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
 
@@ -1237,12 +1255,15 @@ fn run_lua(
             // failed one.
             span.error();
         }
+        // Picks up a write to `resource` made anywhere during this batch's `process()` calls
+        // (`crates/logit-script/src/resource.rs`'s copy-on-write commit); `None` means the script
+        // never wrote it, so the incoming `Arc` moves straight through with no clone -- same
+        // `map_resource`-shaped contract `process_batch` (above) gives native transforms.
+        let resource = worker.take_resource().unwrap_or(batch.resource);
+        last_resource = resource.clone();
         if !out.is_empty() {
             span.events(out.len() as u64);
-            fanout.send_blocking_with_own_context(
-                EventBatch { resource: batch.resource, events: out },
-                ctx,
-            );
+            fanout.send_blocking_with_own_context(EventBatch { resource, events: out }, ctx);
         }
     }
 }
@@ -1339,7 +1360,7 @@ mod tests {
     use crate::graph;
     use crate::queue::OverflowPolicy;
     use logit_config::{Component, ComponentKind, Config};
-    use logit_core::{Event, MetricKind, Registry, SpanLink, SpanStatus};
+    use logit_core::{AttrMap, Event, MetricKind, Registry, SpanLink, SpanStatus};
     use std::collections::HashMap as Map;
 
     #[test]
@@ -1589,6 +1610,64 @@ mod tests {
             });
             Some(event)
         }
+    }
+
+    /// A native `Transform` that substitutes the resource on every batch it sees -- standing in
+    /// for `logit-transforms::Set`'s `map_resource` implementation.
+    struct ResourceMappingTransform {
+        replacement: Arc<Resource>,
+    }
+
+    impl Transform for ResourceMappingTransform {
+        fn process(&mut self, resource: &Arc<Resource>, event: Event) -> Option<Event> {
+            // Proves `process_batch` passes the *mapped* resource to `process`, not the batch's
+            // original one.
+            assert!(Arc::ptr_eq(resource, &self.replacement));
+            Some(event)
+        }
+
+        fn map_resource(&mut self, _resource: &Arc<Resource>) -> Option<Arc<Resource>> {
+            Some(self.replacement.clone())
+        }
+    }
+
+    /// `Transform::map_resource`'s contract (`crates/logit-pipeline/src/transform.rs`): a `Some`
+    /// return substitutes the resource for both `process`'s argument (asserted inside
+    /// `ResourceMappingTransform::process` above) and the outgoing batch.
+    #[test]
+    fn process_batch_uses_map_resources_substituted_resource_for_the_outgoing_batch() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("service.name", "mapped");
+        let replacement = Arc::new(Resource { attributes: attrs });
+        let mut transform = ResourceMappingTransform { replacement: replacement.clone() };
+
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![Event::empty(0, AttrMap::new())],
+        };
+        let telemetry = Registry::new().telemetry_for("x", "x", "x");
+
+        let out = process_batch(&mut transform, batch, &telemetry).expect("one event should pass");
+        assert!(
+            Arc::ptr_eq(&out.resource, &replacement),
+            "the outgoing batch must carry map_resource's substituted Arc"
+        );
+    }
+
+    /// The `None` default (every existing native transform) must leave `process_batch`'s outgoing
+    /// batch carrying the *exact same* `Arc` the incoming batch had -- no clone, no substitution.
+    #[test]
+    fn process_batch_with_no_map_resource_override_passes_the_incoming_arc_through_unchanged() {
+        let mut transform = MutatingTransform;
+        let resource = Arc::new(Resource::default());
+        let batch = EventBatch {
+            resource: resource.clone(),
+            events: vec![Event::empty(0, AttrMap::new())],
+        };
+        let telemetry = Registry::new().telemetry_for("x", "x", "x");
+
+        let out = process_batch(&mut transform, batch, &telemetry).expect("one event should pass");
+        assert!(Arc::ptr_eq(&out.resource, &resource), "the default map_resource must be a no-op");
     }
 
     /// Operationalizes branch isolation (docs/adr/multi-payload-events.md). Since
@@ -2353,6 +2432,95 @@ mod tests {
             })
         });
         assert!(vm_memory.is_some_and(|v| v > 0.0), "a loaded Lua VM should report nonzero memory");
+    }
+
+    /// A `process()` that writes `resource` (`crates/logit-script/src/resource.rs`,
+    /// `docs/adr/operator-declared-resource-attributes.md`) must produce an outgoing batch
+    /// carrying that resource, not the one the batch arrived with.
+    #[tokio::test]
+    async fn run_lua_process_writing_resource_re_stamps_the_outgoing_batch() {
+        let mut components = Map::new();
+        components.insert(
+            "in".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            },
+        );
+        let script = r#"
+            function process(event)
+                resource["service.name"] = "web"
+                return event
+            end
+        "#
+        .to_string();
+        components.insert(
+            "enrich".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
+                sources: vec!["in".to_string()],
+                kind: ComponentKind::Lua { script: script.clone(), interval: None },
+            },
+        );
+        components.insert(
+            "out".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
+                sources: vec!["enrich".to_string()],
+                kind: influxdb_out(),
+            },
+        );
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert("enrich".to_string(), NodeSpec::Lua { script, interval: None });
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx: result_tx }),
+                SinkQueueConfig::default(),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = ["in", "enrich", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+        )
+        .await
+        .expect("should not hang")
+        .expect("should complete without error");
+
+        let received =
+            result_rx.recv_timeout(Duration::from_secs(1)).expect("output should receive a batch");
+        assert_eq!(
+            received.resource.attributes.get("service.name"),
+            Some(&logit_core::Value::str("web")),
+            "a resource write inside process() must reach the outgoing batch"
+        );
     }
 
     /// Finds the drained `process` span `run_lua` recorded for `component_id`, panicking with the

@@ -195,11 +195,15 @@ already built that have a known, accepted rough edge.
   improvement under the current design. See [memory.md](design/memory.md) §3 for the complete,
   shape-by-shape account — there is no single number for "what fan-out costs now."
 - **A Lua component's `flush()` has no resource of its own at a timer tick** — unlike an `aggregate`
-  component, which tracks its own per-resource windows, a Lua component's flushed events are
-  stamped with whichever resource it most recently saw on a real batch
+  component, which tracks its own per-resource windows, a Lua component's flushed events default to
+  whichever resource it most recently saw on a real batch
   (`crates/logit-pipeline/src/runtime.rs`, see [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)).
-  Fine for every config today (one listener, one resource); would need a real answer once a
-  component has more than one upstream resource.
+  A script can now override that default explicitly by writing `resource` inside `flush()` itself
+  (`crates/logit-script/src/resource.rs`, [ADR `operator-declared-resource-attributes`](adr/operator-declared-resource-attributes.md)) —
+  a workaround available to the script author, not a fix to the underlying gap: `logit` still has
+  no way to attribute a flush-driven emission to a *specific* one of several upstream resources on
+  its own. Fine for every config today (one listener, one resource); would need a real answer once
+  a component has more than one upstream resource and no script-side override.
 - **A Lua component's `flush()` sees a stale trace context, for the same reason.** `trace.trace_id`/
   `trace.span_id` (`docs/design/lua-api.md`'s "Reading trace context") reflect whichever batch
   `process()` most recently saw, not any single batch a flush-driven emission could correctly
@@ -209,6 +213,13 @@ already built that have a known, accepted rough edge.
   script that wants better than "stale" can read `trace.trace_id`/`trace.span_id` inside its own
   `process()` and do its own bookkeeping — the values are genuinely there to use, just not
   aggregated by `logit` on the script's behalf.
+- **No native way to stamp `logit`'s own pipeline trace context onto a log's `LogRecord.trace`** —
+  a script can already do this by hand (`event.log.trace_id = trace.trace_id`,
+  [ADR `log-record-trace-context`](adr/log-record-trace-context.md)), but the `trace_context`
+  native transform has no equivalent opt-in mode, only attribute-lifting. Deliberately deferred,
+  not designed around yet: it stamps *logit's* identity onto *application* data, which must stay
+  strictly opt-in (never a default, same posture as everything else on this page), and no concrete
+  consumer has needed it yet. Revisit once one does.
 - ~~**A benchmark of the event proxy against plain table conversion is still outstanding**~~ —
   **closed.** Measured in `crates/logit-bench/benches/pipeline.rs` (`lua::proxy` vs
   `lua::to_table`): the proxy is faster, widening in its favour for scripts that read few
@@ -342,7 +353,9 @@ already built that have a known, accepted rough edge.
   stage merged into `event.attributes` is lost on the way out unless the message body already
   carried it, so `syslog_in -> json -> syslog_out` is *less* than a byte-for-byte relay. Mapping
   attributes to SD-ELEMENTs would need an SD-ID convention (a private enterprise number, RFC 5424
-  §7.2.2) that shouldn't be picked in passing while implementing the sink itself.
+  §7.2.2) that shouldn't be picked in passing while implementing the sink itself. Same reason a
+  log's native trace context (`log.trace`, [ADR `log-record-trace-context`](adr/log-record-trace-context.md))
+  has nowhere to go over this wire today — no SD-ELEMENT convention exists to carry it.
 - **`syslog_out` re-stamps a relayed message's timestamp rather than preserving the origin's** —
   every emitted message's TIMESTAMP is `event.timestamp` (receipt time), never the `syslog.
   timestamp` attribute `syslog_in` may have left on the event, for the same reason `syslog_in`
@@ -641,14 +654,13 @@ already built that have a known, accepted rough edge.
   | decode | OTLP `ExponentialHistogramDataPoint` wider than 512 derived buckets → skipped | `logit.input.metrics.skipped{metric_kind="exponential_histogram", reason="bucket_cap"}` | The *mapping itself* is exact (an exponential histogram is a fixed-bucket histogram with geometric bounds, not lossy) — this is a volume bound against a peer-chosen `scale`/`offset` producing an unbounded `Vec`, the same "bound and count" shape every buffer in this codebase uses for its own overflow. |
   | decode | any OTLP data point with `flags & DATA_POINT_FLAGS_NO_RECORDED_VALUE_MASK` → skipped | `logit.input.metrics.skipped{metric_kind, reason="no_recorded_value"}` | Never fails the whole request — OTLP has its own channel for reporting rejected points back (`partial_success`), wired in PR3, not invented here as a second one. |
 
-  Two residual, narrower gaps in the same codec, not yet worth their own table row:
-  `BodyFormat`/a span's `Status.message` have no OTLP field of their own and round-trip through a
-  reserved attribute (`logit.body_format`, `otel.status_message`) instead — lossless, just an
+  One residual, narrower gap in the same codec, not yet worth its own table row: `BodyFormat`/a
+  span's `Status.message` have no OTLP field of their own and round-trip through a reserved
+  attribute (`logit.body_format`, `otel.status_message`) instead — lossless, just an
   attribute-shaped workaround, documented in `otlp/logs.rs`'s and `otlp/traces.rs`'s own module
-  docs. And a bare `LogRecord`'s OTLP `trace_id`/`span_id` fields (correlating a log to a trace
-  without carrying the span itself) are dropped on both directions — `logit_core::LogRecord` has no
-  field for them, since this codebase's own correlation mechanism is a log and its span sharing one
-  `Event`, not a pair of IDs living on the log alone.
+  docs. (A bare `LogRecord`'s OTLP `trace_id`/`span_id`/`flags` fields used to be filed here too —
+  closed, `logit_core::LogRecord::trace` now carries them,
+  [ADR `log-record-trace-context`](adr/log-record-trace-context.md).)
 
   Both `Distribution`→`Summary` and `Set`→skip are a real, if narrow, qualification of
   [ADR `native-wire-format-with-otlp-bridge`](adr/native-wire-format-with-otlp-bridge.md)'s claim that the internal model "must
@@ -734,28 +746,16 @@ already built that have a known, accepted rough edge.
   `trace_out` components carry this same explanation inline.
 
 - **`otlp_out` has no custom headers, no compression, no gRPC TLS, and no per-signal filter** —
-  found evaluating whether it could replace the demo's `syslog_out` → Alloy → Loki log leg
+  found evaluating whether it could replace the demo's `syslog_out` → Alloy → Loki log leg, and
+  later used to do exactly that
   ([docs/plans/otlp-logs-and-resource-identity.md](plans/otlp-logs-and-resource-identity.md)'s
   workstream E). No `X-Scope-OrgID`-equivalent header support rules out any multi-tenant Loki/Mimir/
   Grafana Cloud target; `crates/logit-outputs/src/otlp.rs`'s frame encoder never sets the compressed
   flag; `reject_insecure_grpc_endpoint` hard-rejects `https://` under `protocol: grpc` rather than
   supporting it; and there's no way to say "logs only" at the sink — it sends whatever signals a
   batch's events happen to carry. None of these block the demo (single-tenant, plaintext gRPC to
-  Tempo); all of them block a real deployment. The compression half of this mirrors the `otlp_in`
-  gap above but was never itself filed until now.
-
-- **No mechanism exists anywhere in `logit` to attach a static attribute to a batch's resource** —
-  found in the same investigation
-  ([docs/plans/otlp-logs-and-resource-identity.md](plans/otlp-logs-and-resource-identity.md),
-  workstream A). Not config (no `attributes`/`labels`/`tags`/`resource` field on any input), not any
-  transform (`keep`/`json`/`kv_metrics`/`aggregate` only filter or derive), and Lua can mutate only
-  *event* attributes (`crates/logit-script/src/proxy.rs`'s `AttrsProxy`), never a resource. This is
-  what blocks giving `syslog_in`/`statsd_in` traffic a real `service.name` for OTLP-native backends
-  (Loki's index labels among them) without the just-landed rule that `logit`'s own code must not
-  invent one. The plan's workstream A sketches the fix — an operator-declared `resource:` config
-  field, landing on a new ADR distinguishing "code invents an identity" (still forbidden) from "an
-  operator configuring the pipeline declares one" (fine, same category as `syslog_out`'s existing
-  `hostname`/`app_name` fields) — plus the demo-stack workstreams (B, C, D) it would unblock.
+  Tempo and plaintext HTTP to Loki); all of them block a real deployment. The compression half of
+  this mirrors the `otlp_in` gap above but was never itself filed until now.
 
 - **`otlp_out`'s gRPC transport opens a fresh connection per request, never pooled.** Every gRPC
   `send` (`crates/logit-outputs/src/otlp.rs`'s `grpc_roundtrip`) connects, performs a fresh HTTP/2

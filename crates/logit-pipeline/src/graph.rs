@@ -95,6 +95,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | KvMetrics { .. }
         | Keep { .. }
         | Remove { .. }
+        | Set { .. }
+        | TraceContext { .. }
         | Logfmt
         | Kv
         | Regex { .. }
@@ -135,6 +137,8 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         KvMetrics { .. } => "kv_metrics",
         Keep { .. } => "keep",
         Remove { .. } => "remove",
+        Set { .. } => "set",
+        TraceContext { .. } => "trace_context",
         Logfmt => "logfmt",
         Kv => "kv",
         Regex { .. } => "regex",
@@ -169,6 +173,8 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::KvMetrics { .. }
             | ComponentKind::Keep { .. }
             | ComponentKind::Remove { .. }
+            | ComponentKind::Set { .. }
+            | ComponentKind::TraceContext { .. }
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::OtlpOut { .. }
             | ComponentKind::StdioOut { .. }
@@ -339,6 +345,19 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 12: `set`-specific validation -- neither map configured can only ever be a no-op,
+    // exactly the `kv_metrics` rule above, for the same reason.
+    for (id, component) in &components {
+        if let ComponentKind::Set { resource, attributes } = &component.kind {
+            if resource.is_empty() && attributes.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a set with neither 'resource' nor 'attributes' \
+                     configured can only ever be a no-op"
+                );
+            }
+        }
+    }
+
     // Rule 13: at most one `internal` component.
     let internal_ids: Vec<&String> = components
         .iter()
@@ -449,6 +468,20 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': 'receive.batch_max_bytes' must be at least 1 -- 0 means no \
                      datagram could ever be accumulated"
+                );
+            }
+        }
+    }
+
+    // Rule 19: `trace_context`-specific validation -- an empty `trace_id` field name could never
+    // name a real attribute, so a component configured that way can only ever be a no-op, the
+    // same reasoning rules 10-12 already apply to `kv_metrics`/`set`.
+    for (id, component) in &components {
+        if let ComponentKind::TraceContext { trace_id, .. } = &component.kind {
+            if trace_id.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a trace_context with an empty 'trace_id' field name can \
+                     only ever be a no-op"
                 );
             }
         }
@@ -946,6 +979,83 @@ mod tests {
         .expect("should resolve");
         assert_eq!(graph.components["keep"].role(), Role::Transform);
         assert_eq!(graph.components["remove"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_set_with_neither_map_configured_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "identity",
+                vec!["in"],
+                ComponentKind::Set {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                },
+            ),
+            ("out", vec!["identity"], sink()),
+        ]));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_set_with_only_resource_configured_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "identity",
+                vec!["in"],
+                ComponentKind::Set {
+                    resource: std::collections::BTreeMap::from([(
+                        "service.name".to_string(),
+                        logit_config::SetValue::Str("nginx".to_string()),
+                    )]),
+                    attributes: std::collections::BTreeMap::new(),
+                },
+            ),
+            ("out", vec!["identity"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["identity"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_trace_context_with_an_empty_trace_id_field_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "trace",
+                vec!["in"],
+                ComponentKind::TraceContext {
+                    trace_id: String::new(),
+                    span_id: None,
+                    flags: None,
+                    keep_source: false,
+                },
+            ),
+            ("out", vec!["trace"], sink()),
+        ]));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_trace_context_with_a_trace_id_field_name_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "trace",
+                vec!["in"],
+                ComponentKind::TraceContext {
+                    trace_id: "trace_id".to_string(),
+                    span_id: None,
+                    flags: None,
+                    keep_source: false,
+                },
+            ),
+            ("out", vec!["trace"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["trace"].role(), Role::Transform);
     }
 
     #[test]

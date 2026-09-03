@@ -24,7 +24,7 @@ impl EventBatch {
     /// don't add this to either of those.
     ///
     /// What gets counted: the dominant term first -- `events.capacity() * size_of::<Event>()`,
-    /// the batch's own backing storage, which every event pays (776 bytes each, `memory.md` §1)
+    /// the batch's own backing storage, which every event pays (800 bytes each, `memory.md` §1)
     /// *before* any nested heap payload -- a batch of numeric-only metrics with no string
     /// attributes would otherwise estimate close to zero despite genuinely holding hundreds of
     /// bytes per event. Then, per event: every attribute key's and value's byte length
@@ -242,7 +242,7 @@ mod tests {
     fn a_purely_numeric_metric_event_is_not_undercounted_to_near_zero() {
         // The exact scenario a review finding named: a numeric-only event (no strings anywhere)
         // used to estimate at only a few bytes (the metric name symbol's length) despite Event
-        // itself costing 776 bytes before any nested allocation -- the dominant term for a
+        // itself costing 800 bytes before any nested allocation -- the dominant term for a
         // metrics-heavy batch. Must now be at least one Event's worth of backing storage.
         let record = MetricRecord {
             name: crate::interner::intern("numeric_only_test_counter"),
@@ -286,6 +286,7 @@ mod tests {
             message: Value::str("a reasonably long log line for the estimator to see"),
             severity: None,
             body_format: BodyFormat::Raw,
+            trace: None,
         };
         let bytes = default_batch(vec![Event::log(0, AttrMap::new(), log)]).estimated_heap_bytes();
         assert!(bytes > 0);
@@ -338,6 +339,7 @@ mod tests {
                 message: Value::str("padding so each added event is not entirely free"),
                 severity: None,
                 body_format: BodyFormat::Raw,
+                trace: None,
             };
             b.events.push(Event::log(i, attrs, log));
 

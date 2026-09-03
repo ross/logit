@@ -23,7 +23,7 @@ get-started instructions and shows this stack's own pipeline, rendered live.
 | Hello-world app | http://localhost:8080 | Start here. Landing page, Grafana link, and the demo's traffic source. |
 | Grafana | http://localhost:3000 | Anonymous admin access. Open the "logit" folder for the pre-built dashboard. |
 | InfluxDB | http://localhost:8086 | `logit`/`logit-demo-password`. Bucket `metrics`, org `logit`. |
-| Loki | http://localhost:3100 | Provisioned as a Grafana datasource; receives `logit`'s own logs via `syslog_out` → `alloy`. |
+| Loki | http://localhost:3100 | Provisioned as a Grafana datasource; receives `logit`'s own logs directly via `otlp_out`. |
 | Tempo | http://localhost:3200 (query), :4317/:4318 (OTLP) | Provisioned as a Grafana datasource; receives `logit`'s own internal spans over OTLP/gRPC. |
 
 `docker compose logs -f logit` shows every decoded event as a `stdio_out` block — the fastest way
@@ -42,19 +42,21 @@ The hello-world app at `:8080` ([`hello/app.py`](hello/app.py), stdlib Python, n
 both the front door and the traffic source: it logs every real visit, plus a background stream of
 synthetic requests every half-second so the dashboard has something to show immediately — the same
 RFC 3164 + JSON-body shape `../crates/logit-bench/src/fixtures.rs` measures — to `logit`'s
-`syslog_in` listener. [`logit.yaml`](logit.yaml) runs it through `json`, then fans out three ways:
-to `stdio_out` (the `docker compose logs` tap), to a logs leg (`log_out`, `syslog_out` over UDP RFC
-5424 to `alloy:5141` → Loki), and to a metrics leg (`kv_metrics` → `keep` → `aggregate` →
-`influxdb_out`) — plus `logit` observing its own pipeline via `internal`
+`syslog_in` listener. [`logit.yaml`](logit.yaml) stamps a real `service.name`/`service.namespace`
+onto the batch's resource (`access_identity`, a `set` component,
+`../docs/adr/operator-declared-resource-attributes.md`), runs it through `json`, then fans out
+three ways: to `stdio_out` (the `docker compose logs` tap), to a logs leg (`log_out`, `otlp_out`
+over HTTP straight to Loki — no relay service in between,
+`../docs/plans/otlp-logs-and-resource-identity.md`), and to a metrics leg (`kv_metrics` → `keep` →
+`aggregate` → `influxdb_out`) — plus `logit` observing its own pipeline via `internal`
 (`../docs/design/internal-telemetry.md`) into that same InfluxDB bucket *and*, as real spans, over
 OTLP/gRPC into Tempo, one span per node-visit at `span_sample_rate: 1.0` so nothing is thinned out
 (`../docs/adr/internal-span-emission-and-deterministic-sampling.md`,
 `../docs/adr/hand-rolled-grpc-over-hyper.md`). **All three signals work end to end today** —
 that's what the shipped Grafana dashboard shows, side by side: the `logit.*` InfluxDB panels, a Loki
-logs panel, and a Tempo traces panel, all over the same pipeline. `log_out` round-trips `access_in`'s
-own `syslog.hostname`/`syslog.tag` attributes onto every relayed message
-(`../docs/adr/syslog-output.md`), so Loki gets real `host`/`app` stream labels with no extra
-config.
+logs panel, and a Tempo traces panel, all over the same pipeline. `access_identity` is what gives
+Loki real `service_name`/`service_namespace` stream labels with no extra `loki.yaml` config — both
+are already in Loki's default index-label set.
 
 The pipeline diagram on the landing page (and at `:8080/graph.svg` directly) is rendered at
 startup, not hand-drawn: `graph-dot` runs `logit graph logit.yaml` against the actual config this
@@ -78,12 +80,12 @@ application spans in Tempo alongside `logit`'s own internal ones
 datasource also carries a `derivedFields` link to Tempo (`tracesToLogsV2` on the Tempo datasource,
 `grafana/provisioning/datasources/datasources.yaml`), so a `trace_id=<hex>` in a log line clicks
 straight through to the matching Tempo trace — `logit`'s own emitted logs don't currently carry one
-(`syslog_out` round-trips `syslog.*` attributes, not trace context), so this link is proven wiring
-waiting on a future log line that names a trace, not a gap in what's shipped.
+(`LogRecord` has no trace-context field yet, `../docs/known-gaps.md`), so this link is proven
+wiring waiting on a future log line that names a trace, not a gap in what's shipped.
 
 ## Stopping
 
 ```sh
 docker compose down        # stop, keep data
-docker compose down -v     # stop, wipe all volumes (InfluxDB/Grafana/Loki/Tempo/Alloy/graph state)
+docker compose down -v     # stop, wipe all volumes (InfluxDB/Grafana/Loki/Tempo/graph state)
 ```

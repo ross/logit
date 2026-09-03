@@ -96,8 +96,8 @@ into one tagged enum creates real collisions — `Otlp { bind }` (a listener) an
 keeps the rule predictable as more protocols gain a second side — `syslog_out` (RFC 3164/5424 over
 UDP or TCP, `docs/adr/syslog-output.md`) is exactly that case, landing well after `SyslogIn`.
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`,
-`remove`, and any future native transform — take no suffix; there's only ever one direction for a
-transform to be.
+`remove`, `set`, `trace_context`, and any future native transform — take no suffix; there's only
+ever one direction for a transform to be.
 
 **`interval` stays a per-kind optional field, unchanged from today.** `lua`/`lua_file` already carry
 an optional flush interval (`docs/adr/aggregation-window-semantics.md`); `aggregate` requires
@@ -142,7 +142,7 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `syslog_in`, `otlp_in`, `file_tail`, `logit_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`, `remove`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `otlp_out`, `logit_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
@@ -186,7 +186,11 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     meaningless (`docs/adr/kv-metrics-semantics.md`).
 12. A `kv_metrics` counter, gauge, or distribution entry with an empty `name` is rejected — the
     implemented `influxdb_out` sink can't encode a metric with no measurement name
-    (`docs/adr/kv-metrics-semantics.md`).
+    (`docs/adr/kv-metrics-semantics.md`). (Numbering note: `crates/logit-pipeline/src/graph.rs`'s
+    own rule comments have drifted from this list since `set` landed -- its code folds this
+    `kv_metrics` check under one "Rules 10 + 11" comment alongside the two above it, and reuses
+    the number 12 for `set`'s own no-op check instead. The rules themselves are unchanged; only
+    the comment numbering no longer lines up one-to-one with this list.)
 13. At most one `internal` component — two would each drain (and so split) the same process-wide
     telemetry `Registry`, silently halving whichever one a downstream consumer happened not to be
     reading from rather than failing clearly.
@@ -206,6 +210,12 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, or `receive.batch_max_events`
     of `0` is rejected — the twin of rule 15. `receive.batch_flush_interval: 0s` is **not**
     rejected — it means "no flush timer," a meaningful setting, unlike the count bounds.
+19. (Also since drifted into the code's numbering, see the note on 12 above.) A `set` with both
+    `resource` and `attributes` empty is rejected, and a `trace_context` with an empty `trace_id`
+    field name is rejected — both are the same "can only ever be a no-op" reasoning rules 10-12
+    apply to `kv_metrics`, extended to the two components that landed after this list was written
+    (`docs/adr/operator-declared-resource-attributes.md`,
+    `docs/adr/log-record-trace-context.md`).
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that
@@ -284,6 +294,11 @@ transforms implement, letting the node runtime hold `Box<dyn Transform + Send>` 
 `Box<dyn Input + Send>`/`Box<dyn Output + Send>` rather than growing a parallel hand-written enum
 per node kind. Lua nodes stay the one hand-special-cased kind, for the `!Send` reason above — a
 trait object doesn't fix that, and shouldn't try to.
+
+`Transform` later grew a second per-batch hook alongside `process`: `map_resource`, called once per
+incoming batch before any event reaches `process`, letting a transform substitute the batch's
+resource (`logit-transforms::Set` is the first implementer) — see
+[ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md).
 
 ### Trace context propagation
 

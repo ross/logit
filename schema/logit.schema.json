@@ -393,6 +393,78 @@
           }
         },
         {
+          "description": "Stamps constant values onto every event's attributes and/or the batch's resource -- the operator-declared counterpart to a wire-carried identity (`docs/adr/operator-declared-resource-attributes.md`). Overwrites on key collision in both maps: a configured value wins over whatever the wire carried. At least one of `resource`/`attributes` must be non-empty -- rejected at graph-validation time otherwise, the same \"can only ever be a no-op\" rule `KvMetrics` already has.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "attributes": {
+              "description": "Applied per event, to `event.attributes`.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/SetValue"
+              }
+            },
+            "resource": {
+              "description": "Applied once per batch, to the batch's `Resource` -- every event in the batch shares it (`docs/design/data-model.md`'s \"`Resource` is `Arc`-shared\" note).",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/SetValue"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "set"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Lifts an application trace/span reference off an event's attributes onto its `LogRecord` (`docs/adr/log-record-trace-context.md`) -- the common \"my JSON log body already has a `trace_id` field\" case, without writing Lua (`event.log.trace_id`, `docs/design/lua-api.md`). Overwrites `log.trace` on a successful lift -- operator intent, the same posture `Set` has. An event with no log, or missing/unparseable named attribute(s), passes through untouched (never an error) -- see `crates/logit-transforms/src/trace_context.rs` for the exact skip conditions.",
+          "type": "object",
+          "required": [
+            "trace_id",
+            "type"
+          ],
+          "properties": {
+            "flags": {
+              "description": "The attribute holding the W3C trace flags (0-255, decimal -- never hex), if any.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "keep_source": {
+              "description": "Keep the source attribute(s) after a successful lift, instead of removing them (the default). Removing matters for OTLP-native backends: Loki turns log attributes into structured metadata under their own names, so a leftover `trace_id` attribute would collide with the native `trace_id` key `LogRecord.trace_id` already produces.",
+              "default": false,
+              "type": "boolean"
+            },
+            "span_id": {
+              "description": "The attribute holding a 16-character hex span id, if any. A `Some` field name whose attribute is absent means \"no span,\" not a skip -- only present-but-unparseable is an error.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "trace_id": {
+              "description": "The attribute holding a 32-character hex trace id. Required, and rejected as an empty string at graph-validation time -- an empty field name could never match a real attribute, so a component configured that way can only ever be a no-op.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "trace_context"
+              ]
+            }
+          }
+        },
+        {
           "type": "object",
           "required": [
             "type"
@@ -704,7 +776,7 @@
               ]
             },
             "max_message_bytes": {
-              "description": "Bounds one encoded message (PRI + header + MSG). Defaults to 8192, matching Grafana Alloy's `loki.source.syslog` `max_message_length` default -- the receiver the demo stack points this at -- rather than RFC 3164 §4.1's traditional 1024, which would truncate a JSON-bodied message on every modern relay chain. A string via [`human_bytes`], exactly like `BufferConfig::max_bytes`.",
+              "description": "Bounds one encoded message (PRI + header + MSG). Defaults to 8192, matching Grafana Alloy's `loki.source.syslog` `max_message_length` default -- a real receiver's own choice, verified against Alloy v1.19.2 -- rather than RFC 3164 §4.1's traditional 1024, which would truncate a JSON-bodied message on every modern relay chain. A string via [`human_bytes`], exactly like `BufferConfig::max_bytes`.",
               "default": "8192",
               "type": "string"
             },
@@ -890,6 +962,25 @@
         }
       },
       "additionalProperties": false
+    },
+    "SetValue": {
+      "description": "One value a `set` component (`ComponentKind::Set`) can stamp onto an attribute or a resource attribute. `#[serde(untagged)]`: YAML's own scalar types decide the variant, so `resource: {service.name: nginx, retries: 3, ratio: 0.5, sampled: true}` reads exactly as written, no `!i64`/`!f64` tag needed.\n\n**`I64` must stay ordered before `F64`.** `serde`'s untagged enum deserializer tries variants in declaration order and keeps the first that parses; `3` parses as both an `i64` and an `f64`, so `F64` before `I64` would silently turn every whole-number YAML scalar into a float. `Bool`/`Str` are unambiguous against the others (a YAML boolean/string never also parses as a number) so their position doesn't matter.",
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "type": "number",
+          "format": "double"
+        },
+        {
+          "type": "string"
+        }
+      ]
     },
     "StdioTarget": {
       "type": "string"

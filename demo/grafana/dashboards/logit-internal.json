@@ -118,8 +118,8 @@
     {
       "id": 8,
       "type": "logs",
-      "title": "Loki: raw demo traffic ({job=\"demo\"})",
-      "description": "`log_out` (`syslog_out`, docs/adr/syslog-output.md) relays access_json's events as RFC 5424 syslog to Alloy (demo/alloy/config.alloy), which pushes them into Loki -- `host`/`app` stream labels come from the event's own `syslog.hostname`/`syslog.tag` attributes, round-tripped from `access_in`'s syslog_in decode, not from any syslog_out config field.",
+      "title": "Loki: raw demo traffic ({service_name=\"demo-hello\"})",
+      "description": "`log_out` (`otlp_out`, docs/plans/otlp-logs-and-resource-identity.md workstream B) exports access_json's events straight to Loki over OTLP/HTTP -- no relay service in between. `service_name`/`service_namespace` stream labels come from `access_identity` (`set`, ADR operator-declared-resource-attributes) stamping the batch's resource, not from any per-event config field.",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
       "datasource": { "type": "loki", "uid": "loki" },
       "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true },
@@ -127,7 +127,7 @@
         {
           "refId": "A",
           "datasource": { "type": "loki", "uid": "loki" },
-          "expr": "{job=\"demo\"}",
+          "expr": "{service_name=\"demo-hello\"}",
           "queryType": "range"
         }
       ]
@@ -135,14 +135,14 @@
     {
       "id": 9,
       "type": "timeseries",
-      "title": "Loki: lines/sec, by host (LogQL count_over_time)",
+      "title": "Loki: lines/sec, by service (LogQL count_over_time)",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
       "datasource": { "type": "loki", "uid": "loki" },
       "targets": [
         {
           "refId": "A",
           "datasource": { "type": "loki", "uid": "loki" },
-          "expr": "sum by (host) (count_over_time({job=\"demo\"}[$__interval]))",
+          "expr": "sum by (service_name) (count_over_time({service_name=\"demo-hello\"}[$__interval]))",
           "queryType": "range"
         }
       ]
@@ -158,7 +158,7 @@
         {
           "refId": "A",
           "datasource": { "type": "loki", "uid": "loki" },
-          "expr": "sum(count_over_time({job=\"demo\"} | json | status >= 500 [$__interval]))",
+          "expr": "sum(count_over_time({service_name=\"demo-hello\"} | json | status >= 500 [$__interval]))",
           "queryType": "range"
         }
       ]

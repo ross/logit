@@ -227,7 +227,12 @@ mod tests {
         Event::log(
             0,
             map,
-            LogRecord { message: Value::str("msg"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("msg"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         )
     }
 
