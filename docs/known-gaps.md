@@ -53,7 +53,14 @@ already built that have a known, accepted rough edge.
   design (likely the same drain/writer split, applied to `Input::run` instead of `Output::send`) and
   its own plan once there's a reason to prioritize it over other gaps here.
 - ~~**Relative gauge adjustment (`+`/`-`) and sample-rate extrapolation for distributions**~~ —
-  **closed, both halves**, independently (`docs/adr/0026-relative-gauge-adjustments.md`).
+  **closed, both halves, on two separate, independently-mergeable branches**
+  (`docs/adr/0026-relative-gauge-adjustments.md`). Relative gauge adjustment is this branch's own
+  work, below. Sample-rate extrapolation is a sibling PR's — `feat/statsd-sample-rate-extrapolation`,
+  reviewed and green independently of this stack, deliberately never merged into it (the two gaps
+  share one entry but have no code dependency on each other). **If this note reads before that PR
+  has actually merged to `main`, its description below is accurate for that PR's own branch, not
+  yet for this repository** — `git log --oneline main -- crates/logit-core/src/metric.rs` naming
+  `add_weighted` is the check.
 
   **Relative gauge adjustments.** `statsd_in` decodes any leading `+`/`-` on a `g` value into
   `MetricKind::GaugeDelta` — explicitly *unresolved*; it must never reach a sink. `aggregate`
@@ -71,6 +78,15 @@ already built that have a known, accepted rough edge.
   peak).
 
   What's left open, by design, not oversight:
+  - **Retention is on by default (`gauge_retention: 5`, `max_retained_gauge_series: 10,000`), so
+    upgrading with no config change turns it on for every existing `aggregate` component.**
+    Deliberate — a feature whose entire point is resolving deltas correctly shouldn't ship
+    opt-in, and both fields are additive to the schema so no config fails to validate — but it is
+    a real behavior change: a config with high-cardinality, slowly-churning gauge tags can see its
+    steady-state memory grow purely from the upgrade (up to `max_retained_gauge_series` idle series
+    held for up to `gauge_retention` extra windows per `aggregate` component), with no line in the
+    config saying so. `logit.transform.series.retained` makes the actual number visible;
+    `gauge_retention: 0` opts back out to the exact pre-upgrade behavior.
   - **A delta after eviction (the cardinality cap) or after a process restart resolves against
     0.0.** The eviction case is counted and reported (`logit.transform.gauge.delta.unseeded`,
     `logit.transform.series.evicted{reason="cardinality"}`) — never silent. The restart case is
@@ -88,7 +104,8 @@ already built that have a known, accepted rough edge.
     collector this instance forwards to is legitimate) and `logit validate` has no warning channel
     today, only pass/fail. Deferred, not silently skipped.
 
-  **Sample-rate extrapolation for distributions.** `DdSketch::add_weighted(value, count)`
+  **Sample-rate extrapolation for distributions** (`feat/statsd-sample-rate-extrapolation`, not
+  part of this branch — see the note above). `DdSketch::add_weighted(value, count)`
   (`crates/logit-core/src/metric.rs`) delegates to `sketches_ddsketch::DDSketch::add_with_count`
   (an O(1) native weighted add, not a repeated-`add` loop or a binary-doubling `merge` — both were
   considered and rejected: the crate does have a native weighted add, and even a repeated-`add`
