@@ -24,8 +24,9 @@ use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
 use logit_transforms::{
-    Aggregator, JsonParser, Keep as KeepTransform, KvMetrics as KvMetricsTransform,
-    Remove as RemoveTransform,
+    Aggregator, DropSignals as DropSignalsTransform, HasSignal as HasSignalTransform, JsonParser,
+    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, KvMetrics as KvMetricsTransform,
+    MatchMode as TransformMatchMode, Remove as RemoveTransform, SignalSet,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -260,6 +261,16 @@ fn build_spec(
         Remove { fields } => NodeSpec::Transform(Box::new(
             RemoveTransform::new(fields.clone()).with_telemetry(telemetry.clone()),
         )),
+        HasSignal { signals, mode } => NodeSpec::Transform(Box::new(
+            HasSignalTransform::new(to_signal_set(signals), to_match_mode(*mode))
+                .with_telemetry(telemetry.clone()),
+        )),
+        KeepSignals { signals } => NodeSpec::Transform(Box::new(
+            KeepSignalsTransform::new(to_signal_set(signals)).with_telemetry(telemetry.clone()),
+        )),
+        DropSignals { signals } => NodeSpec::Transform(Box::new(
+            DropSignalsTransform::new(to_signal_set(signals)).with_telemetry(telemetry.clone()),
+        )),
 
         InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(
             Box::new(
@@ -445,6 +456,28 @@ fn syslog_format(cfg: logit_config::SyslogFormat) -> logit_outputs::syslog::Form
     match cfg {
         logit_config::SyslogFormat::Rfc3164 => logit_outputs::syslog::Format::Rfc3164,
         logit_config::SyslogFormat::Rfc5424 => logit_outputs::syslog::Format::Rfc5424,
+    }
+}
+
+/// Converts config's `Vec<Signal>` (`logit-config`, which `logit-transforms` deliberately doesn't
+/// depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the transform crate's
+/// boolean-flags `SignalSet`.
+fn to_signal_set(signals: &[logit_config::Signal]) -> SignalSet {
+    let mut set = SignalSet::default();
+    for signal in signals {
+        match signal {
+            logit_config::Signal::Logs => set.logs = true,
+            logit_config::Signal::Metrics => set.metrics = true,
+            logit_config::Signal::Traces => set.traces = true,
+        }
+    }
+    set
+}
+
+fn to_match_mode(mode: logit_config::MatchMode) -> TransformMatchMode {
+    match mode {
+        logit_config::MatchMode::AnyOf => TransformMatchMode::AnyOf,
+        logit_config::MatchMode::Only => TransformMatchMode::Only,
     }
 }
 
@@ -931,6 +964,54 @@ mod tests {
         };
         assert!(matches!(
             build_spec("remove", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_has_signal_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::HasSignal {
+                signals: vec![logit_config::Signal::Traces],
+                mode: logit_config::MatchMode::AnyOf,
+            },
+        };
+        assert!(matches!(
+            build_spec("has_signal", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_keep_signals_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::KeepSignals { signals: vec![logit_config::Signal::Logs] },
+        };
+        assert!(matches!(
+            build_spec("keep_signals", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_drop_signals_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::DropSignals { signals: vec![logit_config::Signal::Metrics] },
+        };
+        assert!(matches!(
+            build_spec("drop_signals", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
     }

@@ -44,6 +44,11 @@
 //!     impossible bound, the twin of rule 15.
 //!     `receive.batch_flush_interval: 0s` is **not** rejected: it means "no flush timer," a
 //!     meaningful setting, unlike the count bounds.
+//! 19. An empty `signals:` list on `has_signal`, `keep_signals`, or `drop_signals` is rejected, as
+//!     is a `keep_signals`/`drop_signals` naming all three signals -- each can only ever drop
+//!     every event, the same silent-black-hole failure rule 7 exists to catch. `keep`'s empty
+//!     `fields` list stays legal by contrast -- "drop every attribute" is a real operation,
+//!     "drop every event" is not. See `docs/adr/signal-filtering-components.md`.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -95,6 +100,9 @@ pub fn role(kind: &ComponentKind) -> Role {
         | KvMetrics { .. }
         | Keep { .. }
         | Remove { .. }
+        | HasSignal { .. }
+        | KeepSignals { .. }
+        | DropSignals { .. }
         | Logfmt
         | Kv
         | Regex { .. }
@@ -135,6 +143,9 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         KvMetrics { .. } => "kv_metrics",
         Keep { .. } => "keep",
         Remove { .. } => "remove",
+        HasSignal { .. } => "has_signal",
+        KeepSignals { .. } => "keep_signals",
+        DropSignals { .. } => "drop_signals",
         Logfmt => "logfmt",
         Kv => "kv",
         Regex { .. } => "regex",
@@ -169,6 +180,9 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::KvMetrics { .. }
             | ComponentKind::Keep { .. }
             | ComponentKind::Remove { .. }
+            | ComponentKind::HasSignal { .. }
+            | ComponentKind::KeepSignals { .. }
+            | ComponentKind::DropSignals { .. }
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::OtlpOut { .. }
             | ComponentKind::StdioOut { .. }
@@ -451,6 +465,42 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      datagram could ever be accumulated"
                 );
             }
+        }
+    }
+
+    // Rule 19: `has_signal`/`keep_signals`/`drop_signals` need a non-empty `signals:`, and
+    // `keep_signals`/`drop_signals` additionally reject naming all three signals -- either shape
+    // can only ever drop every event, the same silent-black-hole failure rule 7 exists to catch.
+    // `has_signal` naming all three signals is left alone: under `mode: only` that's a real,
+    // if permissive, "forward anything with a payload" filter, not a no-op.
+    for (id, component) in &components {
+        match &component.kind {
+            ComponentKind::HasSignal { signals, .. } => {
+                if signals.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': 'signals' must name at least one signal -- an empty \
+                         list can only ever drop every event"
+                    );
+                }
+            }
+            ComponentKind::KeepSignals { signals } | ComponentKind::DropSignals { signals } => {
+                if signals.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': 'signals' must name at least one signal -- an empty \
+                         list can only ever drop every event"
+                    );
+                }
+                let names_all_three = signals.contains(&logit_config::Signal::Logs)
+                    && signals.contains(&logit_config::Signal::Metrics)
+                    && signals.contains(&logit_config::Signal::Traces);
+                if names_all_three {
+                    anyhow::bail!(
+                        "component '{id}': 'signals' names all three signals -- that can only \
+                         ever drop every event"
+                    );
+                }
+            }
+            _ => {}
         }
     }
 
@@ -913,6 +963,73 @@ mod tests {
     }
 
     #[test]
+    fn a_has_signal_with_an_empty_signals_list_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasSignal { signals: vec![], mode: logit_config::MatchMode::AnyOf },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("must name at least one signal"), "got: {err}");
+    }
+
+    #[test]
+    fn a_keep_signals_with_an_empty_signals_list_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("filter", vec!["in"], ComponentKind::KeepSignals { signals: vec![] }),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("must name at least one signal"), "got: {err}");
+    }
+
+    #[test]
+    fn a_drop_signals_naming_all_three_signals_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::DropSignals {
+                    signals: vec![
+                        logit_config::Signal::Logs,
+                        logit_config::Signal::Metrics,
+                        logit_config::Signal::Traces,
+                    ],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("names all three signals"), "got: {err}");
+    }
+
+    #[test]
+    fn a_has_signal_naming_all_three_signals_resolves_fine() {
+        // Unlike `keep_signals`/`drop_signals`, `has_signal` naming all three signals is a real,
+        // permissive filter under `mode: only` ("forward anything with a payload"), not a no-op.
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasSignal {
+                    signals: vec![
+                        logit_config::Signal::Logs,
+                        logit_config::Signal::Metrics,
+                        logit_config::Signal::Traces,
+                    ],
+                    mode: logit_config::MatchMode::Only,
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]))
+        .expect("should resolve");
+    }
+
+    #[test]
     fn a_kv_metrics_with_only_a_counter_resolves_as_a_transform() {
         let graph = resolve(cfg(vec![
             ("in", vec![], listener()),
@@ -946,6 +1063,39 @@ mod tests {
         .expect("should resolve");
         assert_eq!(graph.components["keep"].role(), Role::Transform);
         assert_eq!(graph.components["remove"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn the_signal_components_resolve_as_transforms_with_the_right_kind_names() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "has_signal",
+                vec!["in"],
+                ComponentKind::HasSignal {
+                    signals: vec![logit_config::Signal::Traces],
+                    mode: logit_config::MatchMode::AnyOf,
+                },
+            ),
+            (
+                "keep_signals",
+                vec!["has_signal"],
+                ComponentKind::KeepSignals { signals: vec![logit_config::Signal::Logs] },
+            ),
+            (
+                "drop_signals",
+                vec!["keep_signals"],
+                ComponentKind::DropSignals { signals: vec![logit_config::Signal::Metrics] },
+            ),
+            ("out", vec!["drop_signals"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["has_signal"].role(), Role::Transform);
+        assert_eq!(graph.components["keep_signals"].role(), Role::Transform);
+        assert_eq!(graph.components["drop_signals"].role(), Role::Transform);
+        assert_eq!(kind_name(&graph.components["has_signal"].kind), "has_signal");
+        assert_eq!(kind_name(&graph.components["keep_signals"].kind), "keep_signals");
+        assert_eq!(kind_name(&graph.components["drop_signals"].kind), "drop_signals");
     }
 
     #[test]

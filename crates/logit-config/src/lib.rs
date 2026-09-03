@@ -94,6 +94,29 @@ pub enum OtlpProtocol {
     Grpc,
 }
 
+/// A signal an event's payload may carry -- OTLP's vocabulary (`logit_proto::Signal`), not
+/// `Event`'s field names, since that's the vocabulary `has_signal`/`keep_signals`/`drop_signals`
+/// are meant to be read against. `Traces` corresponds to `event.span`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Signal {
+    Logs,
+    Metrics,
+    Traces,
+}
+
+/// `has_signal`'s matching rule. `AnyOf` forwards an event carrying at least one signal named in
+/// `signals`, untouched, even if it also carries a signal that isn't named. `Only` additionally
+/// requires the event carry nothing outside `signals` -- a mixed event that also has a signal not
+/// listed is dropped, not trimmed (`keep_signals` trims; `has_signal` never mutates an event).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchMode {
+    #[default]
+    AnyOf,
+    Only,
+}
+
 /// `ComponentKind::Internal`'s `span_sample_rate` default when a config omits it -- re-exported
 /// from `logit-core` (not restated as a bare literal here) so the two crates can never drift
 /// apart on what "the default" actually is. This is also the one place `logit-config` depends on
@@ -238,6 +261,34 @@ pub enum ComponentKind {
     /// Drops the named attributes, keeping the rest.
     Remove {
         fields: Vec<String>,
+    },
+    /// Drops an event that doesn't carry a wanted signal -- e.g. `signals: [traces]` ahead of a
+    /// traces-only sink like Tempo, fed from a source (`internal`) whose drains also carry
+    /// metrics. Never mutates a forwarded event: under the default `mode: any_of`, an event
+    /// carrying a listed signal is forwarded exactly as it arrived, including any signal *not*
+    /// listed. `mode: only` additionally requires the event carry nothing outside `signals`.
+    /// Place `keep_signals`/`drop_signals` ahead of this instead if disallowed payloads must
+    /// actually be stripped, not just tolerated. `signals` may not be empty --
+    /// see `docs/adr/signal-filtering-components.md`.
+    HasSignal {
+        signals: Vec<Signal>,
+        #[serde(default)]
+        mode: MatchMode,
+    },
+    /// Retains only the listed signals' payloads on every event, clearing the rest -- an
+    /// allowlist, the same relationship to `drop_signals` that `keep` has to `remove`. Unlike
+    /// `has_signal`, this mutates: an event carrying a log and derived metrics with
+    /// `signals: [logs]` loses the metrics but keeps the log. Drops an event left with no
+    /// payload at all. `signals` may not be empty, and may not name all three signals -- either
+    /// can only ever drop every event. See `docs/adr/signal-filtering-components.md`.
+    KeepSignals {
+        signals: Vec<Signal>,
+    },
+    /// Clears the listed signals' payloads on every event, keeping the rest -- a denylist, the
+    /// mirror of `keep_signals`. Drops an event left with no payload at all. `signals` may not be
+    /// empty, and may not name all three signals. See `docs/adr/signal-filtering-components.md`.
+    DropSignals {
+        signals: Vec<Signal>,
     },
     // The rest of the built-in native transforms -- not implemented yet (`logit-transforms`),
     // carried over as unimplemented `ComponentKind` variants so config referencing one gets a
@@ -1134,6 +1185,57 @@ mod tests {
                 assert_eq!(fields, vec!["client_ip".to_string(), "user_agent".to_string()]);
             }
             other => panic!("expected Remove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn has_signal_component_deserializes_with_mode_defaulting_to_any_of() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "has_signal", "sources": ["in"], "signals": ["traces"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::HasSignal { signals, mode } => {
+                assert_eq!(signals, vec![Signal::Traces]);
+                assert_eq!(mode, MatchMode::AnyOf);
+            }
+            other => panic!("expected HasSignal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn has_signal_component_can_override_mode_to_only() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "has_signal", "sources": ["in"], "signals": ["traces"], "mode": "only"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::HasSignal { mode, .. } => assert_eq!(mode, MatchMode::Only),
+            other => panic!("expected HasSignal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keep_signals_component_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "keep_signals", "sources": ["in"], "signals": ["logs"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::KeepSignals { signals } => assert_eq!(signals, vec![Signal::Logs]),
+            other => panic!("expected KeepSignals, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_signals_component_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "drop_signals", "sources": ["in"], "signals": ["metrics"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DropSignals { signals } => assert_eq!(signals, vec![Signal::Metrics]),
+            other => panic!("expected DropSignals, got {other:?}"),
         }
     }
 

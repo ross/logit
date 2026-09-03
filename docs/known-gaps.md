@@ -712,35 +712,32 @@ already built that have a known, accepted rough edge.
   specifically to end a process stuck on a genuine misconfiguration (a bad token, a bad bucket); a
   demo whose "misconfiguration" is actually two signals correctly reaching a backend that only
   wants one is exactly the false-positive case it wasn't built to distinguish. `demo/logit.yaml`
-  works around this at the config layer: a dedicated `aggregate` node (`trace_windowed`) sits
-  between `self` and `trace_out`, absorbing every mergeable metric into window state and
-  forwarding a metric-less event -- a pure span -- untouched and immediately
-  (`crates/logit-transforms/src/aggregate.rs`'s `process` doc comment). That makes the overwhelming
-  majority of `trace_out`'s batches traces-only, so `send` succeeds and the guard's streak keeps
-  resetting; `trace_windowed`'s own periodic `flush` still occasionally emits a real metrics-only
-  batch that fails the same way, but the many successful pure-span deliveries surrounding it (every
-  ~10s, against one `flush` per 60s) reset the guard long before it reaches 60s.
+  fixes this at the config layer: `trace_only` (`type: has_signal`, `signals: [traces]`) sits
+  between `self` and `trace_out`, dropping every metric-only drain and forwarding every span-only
+  one untouched ([ADR `signal-filtering-components`](adr/signal-filtering-components.md)) -- unlike
+  the `aggregate`-based workaround this replaced, `has_signal` never mutates a forwarded event and
+  never lets a metrics-only batch reach `trace_out` at all, so the guard's streak never resets from
+  a near-miss; there's simply nothing left for it to trip on.
 
   This is specific to pointing `otlp_out` at a mixed-signal source feeding a signal-partial
   backend -- a production `otlp_out` scoped to a source that only ever carries the signals its
-  destination accepts would never hit either half of this. Not fixed at the source here
-  (`docs/plans/otlp-end-to-end.md` is config/docs only, no new Rust) -- the real fix is a
-  config-layer way to filter an event stream by which payload it carries (no existing transform
-  does this directly; `keep`/`remove` filter attributes, not `event.metrics`/`event.log`/
-  `event.span` themselves -- `aggregate` only does it as a side effect of absorbing metrics for a
-  different purpose) or a per-signal partial-failure mode on `OtlpOutput::send` that doesn't abort
-  sibling signals already in flight and doesn't let one incompatible signal alone trip the
-  sustained-failure guard for signals that are succeeding. `demo/logit.yaml`'s `trace_windowed`/
-  `trace_out` components carry this same explanation inline.
+  destination accepts would never hit either half of this. `has_signal` (and its
+  payload-stripping siblings `keep_signals`/`drop_signals`) is the general config-layer fix; a
+  per-signal partial-failure mode on `OtlpOutput::send` that doesn't abort sibling signals already
+  in flight and doesn't let one incompatible signal alone trip the sustained-failure guard for
+  signals that are succeeding remains a separate, unfiled possible improvement to `otlp_out`
+  itself. `demo/logit.yaml`'s `trace_only`/`trace_out` components carry this same explanation
+  inline.
 
-- **`otlp_out` has no custom headers, no compression, no gRPC TLS, and no per-signal filter** —
+- **`otlp_out` has no custom headers, no compression, and no gRPC TLS** —
   found evaluating whether it could replace the demo's `syslog_out` → Alloy → Loki log leg
   ([docs/plans/otlp-logs-and-resource-identity.md](plans/otlp-logs-and-resource-identity.md)'s
-  workstream E). No `X-Scope-OrgID`-equivalent header support rules out any multi-tenant Loki/Mimir/
-  Grafana Cloud target; `crates/logit-outputs/src/otlp.rs`'s frame encoder never sets the compressed
-  flag; `reject_insecure_grpc_endpoint` hard-rejects `https://` under `protocol: grpc` rather than
-  supporting it; and there's no way to say "logs only" at the sink — it sends whatever signals a
-  batch's events happen to carry. None of these block the demo (single-tenant, plaintext gRPC to
+  workstream E; its per-signal-filter half is fixed, see
+  [ADR `signal-filtering-components`](adr/signal-filtering-components.md)). No `X-Scope-OrgID`-equivalent
+  header support rules out any multi-tenant Loki/Mimir/Grafana Cloud target;
+  `crates/logit-outputs/src/otlp.rs`'s frame encoder never sets the compressed flag;
+  `reject_insecure_grpc_endpoint` hard-rejects `https://` under `protocol: grpc` rather than
+  supporting it. None of these block the demo (single-tenant, plaintext gRPC to
   Tempo); all of them block a real deployment. The compression half of this mirrors the `otlp_in`
   gap above but was never itself filed until now.
 

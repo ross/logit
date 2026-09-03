@@ -402,6 +402,14 @@ Worked examples, one per shipped component:
   suppressing before events reach it. No `Diagnostics` on either (pure attribute filtering has
   nothing to warn about), so `Telemetry` is attached directly rather than through the
   `Diagnostics` bridge.
+- `has_signal`/`keep_signals`/`drop_signals` (`crates/logit-transforms/src/signals.rs`):
+  `logit.transform.events.filtered` (count — an event dropped, by any of the three) and
+  `logit.transform.payloads.stripped{signal}` (count — `keep_signals`/`drop_signals` only, one
+  per payload slot actually cleared). `process_batch`'s own `logit.component.events.dropped
+  {reason="absorbed"}` still fires alongside these on every drop (`crates/logit-pipeline/src/
+  runtime.rs`) — its `reason` tag is imprecise for a filter, same as for `keep`/`remove`, but
+  fixing that tag is out of scope here. No `Diagnostics` on any of the three — nothing about
+  matching or clearing a fixed signal set can fail.
 - `stdio_out` (`crates/logit-outputs/src/stdio.rs`): `logit.output.batch.bytes` — direct parity
   with `influxdb_out`'s own batch-bytes metric. Also has no `Diagnostics` (a write error
   propagates as a hard failure today, with no `warn_throttled` call site to bridge).

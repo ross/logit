@@ -393,6 +393,80 @@
           }
         },
         {
+          "description": "Drops an event that doesn't carry a wanted signal -- e.g. `signals: [traces]` ahead of a traces-only sink like Tempo, fed from a source (`internal`) whose drains also carry metrics. Never mutates a forwarded event: under the default `mode: any_of`, an event carrying a listed signal is forwarded exactly as it arrived, including any signal *not* listed. `mode: only` additionally requires the event carry nothing outside `signals`. Place `keep_signals`/`drop_signals` ahead of this instead if disallowed payloads must actually be stripped, not just tolerated. `signals` may not be empty -- see `docs/adr/signal-filtering-components.md`.",
+          "type": "object",
+          "required": [
+            "signals",
+            "type"
+          ],
+          "properties": {
+            "mode": {
+              "default": "any_of",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/MatchMode"
+                }
+              ]
+            },
+            "signals": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/Signal"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "has_signal"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Retains only the listed signals' payloads on every event, clearing the rest -- an allowlist, the same relationship to `drop_signals` that `keep` has to `remove`. Unlike `has_signal`, this mutates: an event carrying a log and derived metrics with `signals: [logs]` loses the metrics but keeps the log. Drops an event left with no payload at all. `signals` may not be empty, and may not name all three signals -- either can only ever drop every event. See `docs/adr/signal-filtering-components.md`.",
+          "type": "object",
+          "required": [
+            "signals",
+            "type"
+          ],
+          "properties": {
+            "signals": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/Signal"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "keep_signals"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Clears the listed signals' payloads on every event, keeping the rest -- a denylist, the mirror of `keep_signals`. Drops an event left with no payload at all. `signals` may not be empty, and may not name all three signals. See `docs/adr/signal-filtering-components.md`.",
+          "type": "object",
+          "required": [
+            "signals",
+            "type"
+          ],
+          "properties": {
+            "signals": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/Signal"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "drop_signals"
+              ]
+            }
+          }
+        },
+        {
           "type": "object",
           "required": [
             "type"
@@ -778,6 +852,14 @@
         "at_most_once"
       ]
     },
+    "MatchMode": {
+      "description": "`has_signal`'s matching rule. `AnyOf` forwards an event carrying at least one signal named in `signals`, untouched, even if it also carries a signal that isn't named. `Only` additionally requires the event carry nothing outside `signals` -- a mixed event that also has a signal not listed is dropped, not trimmed (`keep_signals` trims; `has_signal` never mutates an event).",
+      "type": "string",
+      "enum": [
+        "any_of",
+        "only"
+      ]
+    },
     "MetricSpec": {
       "description": "One `kv_metrics` entry: a metric `name`, an optional source `field`, and an optional `unit`. See `ComponentKind::KvMetrics` and `docs/adr/kv-metrics-semantics.md`.",
       "type": "object",
@@ -890,6 +972,15 @@
         }
       },
       "additionalProperties": false
+    },
+    "Signal": {
+      "description": "A signal an event's payload may carry -- OTLP's vocabulary (`logit_proto::Signal`), not `Event`'s field names, since that's the vocabulary `has_signal`/`keep_signals`/`drop_signals` are meant to be read against. `Traces` corresponds to `event.span`.",
+      "type": "string",
+      "enum": [
+        "logs",
+        "metrics",
+        "traces"
+      ]
     },
     "StdioTarget": {
       "type": "string"

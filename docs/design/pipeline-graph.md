@@ -79,6 +79,14 @@ pub enum ComponentKind {
     Keep { fields: Vec<String> },
     // A denylist: drops the named attributes, keeping the rest.
     Remove { fields: Vec<String> },
+    // Drops an event that doesn't carry a wanted signal -- never mutates a forwarded event
+    // (docs/adr/signal-filtering-components.md).
+    HasSignal { signals: Vec<Signal>, mode: MatchMode },
+    // Retains only the listed signals' payloads, clearing the rest -- an allowlist, `has_signal`'s
+    // mutating counterpart.
+    KeepSignals { signals: Vec<Signal> },
+    // A denylist: clears the listed signals' payloads, keeping the rest.
+    DropSignals { signals: Vec<Signal> },
     // logfmt, kv, regex, csv, rename, filter, sample, throttle, dedup —
     // as each lands in logit-transforms, same shape: a `ComponentKind` variant, no `sources`
     // opinion of its own (that lives on `Component`, uniformly).
@@ -96,8 +104,8 @@ into one tagged enum creates real collisions — `Otlp { bind }` (a listener) an
 keeps the rule predictable as more protocols gain a second side — `syslog_out` (RFC 3164/5424 over
 UDP or TCP, `docs/adr/syslog-output.md`) is exactly that case, landing well after `SyslogIn`.
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`,
-`remove`, and any future native transform — take no suffix; there's only ever one direction for a
-transform to be.
+`remove`, `has_signal`, `keep_signals`, `drop_signals`, and any future native transform — take no
+suffix; there's only ever one direction for a transform to be.
 
 **`interval` stays a per-kind optional field, unchanged from today.** `lua`/`lua_file` already carry
 an optional flush interval (`docs/adr/aggregation-window-semantics.md`); `aggregate` requires
@@ -142,7 +150,7 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `syslog_in`, `otlp_in`, `file_tail`, `logit_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`, `remove`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`, `remove`, `has_signal`, `keep_signals`, `drop_signals`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `otlp_out`, `logit_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
@@ -206,6 +214,11 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, or `receive.batch_max_events`
     of `0` is rejected — the twin of rule 15. `receive.batch_flush_interval: 0s` is **not**
     rejected — it means "no flush timer," a meaningful setting, unlike the count bounds.
+19. An empty `signals:` list on `has_signal`, `keep_signals`, or `drop_signals` is rejected, as is
+    a `keep_signals`/`drop_signals` naming all three signals — either can only ever drop every
+    event, the same silent-black-hole failure rule 7 exists to catch. `keep`'s empty `fields` list
+    stays legal by contrast — "drop every attribute" is a real operation, "drop every event" is
+    not. See `docs/adr/signal-filtering-components.md`.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

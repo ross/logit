@@ -167,7 +167,9 @@ Surfaced while checking Loki compatibility; none block the demo, all block a rea
   (`crates/logit-outputs/src/otlp.rs:359-370`) hard-rejects an `https://` endpoint under
   `protocol: grpc` at construction time, rather than supporting it.
 - No signal filter — a sink sends whatever signal types the events in its batch happen to carry;
-  there's no way to say "logs only" at the sink.
+  there's no way to say "logs only" at the sink. (Landed: `has_signal`/`keep_signals`/
+  `drop_signals`, three insertable transform components rather than a sink field — see ADR
+  `signal-filtering-components` and `docs/plans/signal-filtering-and-otlp-out-config-gaps.md`.)
 - Hardcoded per-signal paths (fine for the standard OTLP layout, blocks any backend using a
   different mount point).
 - `observed_time_unix_nano` always `0` on encode (`logs.rs:114`).
