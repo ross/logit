@@ -729,16 +729,17 @@ already built that have a known, accepted rough edge.
   itself. `demo/logit.yaml`'s `trace_only`/`trace_out` components carry this same explanation
   inline.
 
-- **`otlp_out` has no custom headers, no compression, and no gRPC TLS** —
+- **`otlp_out` has no compression and no gRPC TLS** —
   found evaluating whether it could replace the demo's `syslog_out` → Alloy → Loki log leg
   ([docs/plans/otlp-logs-and-resource-identity.md](plans/otlp-logs-and-resource-identity.md)'s
   workstream E; its per-signal-filter half is fixed, see
-  [ADR `signal-filtering-components`](adr/signal-filtering-components.md)). No `X-Scope-OrgID`-equivalent
-  header support rules out any multi-tenant Loki/Mimir/Grafana Cloud target;
+  [ADR `signal-filtering-components`](adr/signal-filtering-components.md), and custom headers are
+  fixed too — `headers:` on `otlp_out`, validated case-insensitively against a reserved,
+  protocol-owned set by `logit-pipeline::graph::resolve`'s rule 20).
   `crates/logit-outputs/src/otlp.rs`'s frame encoder never sets the compressed flag;
   `reject_insecure_grpc_endpoint` hard-rejects `https://` under `protocol: grpc` rather than
-  supporting it. None of these block the demo (single-tenant, plaintext gRPC to
-  Tempo); all of them block a real deployment. The compression half of this mirrors the `otlp_in`
+  supporting it. Neither blocks the demo (single-tenant, plaintext gRPC to
+  Tempo); both block a real deployment. The compression half of this mirrors the `otlp_in`
   gap above but was never itself filed until now.
 
 - **No mechanism exists anywhere in `logit` to attach a static attribute to a batch's resource** —

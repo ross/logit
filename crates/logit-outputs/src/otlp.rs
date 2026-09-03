@@ -35,7 +35,7 @@
 use crate::Output;
 use anyhow::Context;
 use bytes::Bytes;
-use http::{HeaderMap, Method};
+use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -43,6 +43,7 @@ use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::Fault;
 use logit_proto::otlp::OtlpEncoder;
 use logit_proto::{Signal, SignalEncoder};
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
@@ -68,6 +69,13 @@ pub struct OtlpOutput {
     encoder: OtlpEncoder,
     telemetry: Telemetry,
     diag: Diagnostics,
+    /// Extra headers sent on every export request, on both transports -- applied per request
+    /// (`send_http`/`grpc_roundtrip`), never baked into `client` via `reqwest`'s
+    /// `default_headers`. `with_timeout` rebuilds `client` unconditionally, so headers set via
+    /// `default_headers` would silently vanish if `with_timeout` were called afterward -- an
+    /// order-dependent bug no type would catch. A plain field sidesteps that entirely: `client`
+    /// stays a pure function of the timeout, exactly the invariant `build_client` already assumes.
+    headers: HeaderMap,
 }
 
 impl OtlpOutput {
@@ -84,6 +92,7 @@ impl OtlpOutput {
             encoder: OtlpEncoder::new(),
             telemetry: Telemetry::default(),
             diag: Diagnostics::default(),
+            headers: HeaderMap::new(),
         })
     }
 
@@ -94,6 +103,24 @@ impl OtlpOutput {
         self.client = build_client(timeout);
         self.request_timeout = timeout;
         self
+    }
+
+    /// Sets the extra headers sent on every export request (`headers:` in config) -- e.g.
+    /// `X-Scope-OrgID` for a multi-tenant Loki/Mimir/Grafana Cloud target. Fails if any name or
+    /// value isn't a legal HTTP header (`logit-pipeline::graph::resolve`'s rule 20 rejects a
+    /// protocol-owned name like `content-type` before construction ever sees it; this catches the
+    /// lexical shape `graph` can't -- illegal bytes, embedded newlines).
+    pub fn with_headers(mut self, headers: &HashMap<String, String>) -> anyhow::Result<Self> {
+        let mut map = HeaderMap::with_capacity(headers.len());
+        for (name, value) in headers {
+            let header_name = HeaderName::from_bytes(name.as_bytes())
+                .with_context(|| format!("otlp_out: {name:?} is not a legal header name"))?;
+            let header_value = HeaderValue::from_str(value)
+                .with_context(|| format!("otlp_out: header {name:?} has an invalid value"))?;
+            map.insert(header_name, header_value);
+        }
+        self.headers = map;
+        Ok(self)
     }
 
     /// Attaches a component id to this output's own diagnostics and, via
@@ -132,10 +159,19 @@ impl OtlpOutput {
 
     async fn send_http(&mut self, signal: Signal, payload: Bytes) -> anyhow::Result<()> {
         let url = format!("{}{}", self.endpoint.trim_end_matches('/'), signal.path());
+        // Built as one `HeaderMap`, custom headers cloned in first and `Content-Type` inserted
+        // after -- `HeaderMap::insert` unconditionally replaces any prior value for that key
+        // (unlike `RequestBuilder::header`, which appends), so the protocol-owned header always
+        // wins even if `graph::resolve`'s reserved-name rule (rule 20) were ever bypassed. One
+        // `.headers(..)` call rather than mixing it with further `.header(..)` calls, whose
+        // append-not-replace semantics would otherwise undo this guarantee.
+        let mut headers = self.headers.clone();
+        headers
+            .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/x-protobuf"));
         let result = self
             .client
             .post(&url)
-            .header("Content-Type", "application/x-protobuf")
+            .headers(headers)
             .timeout(self.request_timeout)
             .body(payload)
             .send()
@@ -186,9 +222,11 @@ impl OtlpOutput {
 
     async fn send_grpc(&mut self, signal: Signal, payload: Bytes) -> anyhow::Result<()> {
         let authority = grpc_authority(&self.endpoint).to_string();
-        let outcome =
-            tokio::time::timeout(self.request_timeout, grpc_roundtrip(&authority, signal, payload))
-                .await;
+        let outcome = tokio::time::timeout(
+            self.request_timeout,
+            grpc_roundtrip(&authority, signal, payload, &self.headers),
+        )
+        .await;
 
         let (code, message, body) = match outcome {
             Ok(Ok(v)) => v,
@@ -416,6 +454,7 @@ async fn grpc_roundtrip(
     authority: &str,
     signal: Signal,
     payload: Bytes,
+    headers: &HeaderMap,
 ) -> Result<(u32, String, Bytes), (Fault, anyhow::Error)> {
     let stream = connect(authority).await.map_err(|fault| {
         (
@@ -435,15 +474,27 @@ async fn grpc_roundtrip(
         let _ = conn.await;
     });
 
+    // Built as one `HeaderMap`, custom headers cloned in first and the protocol-owned ones
+    // inserted after -- `HeaderMap::insert` unconditionally replaces any prior value for that
+    // key, so these three always win even if `graph::resolve`'s reserved-name rule (rule 20)
+    // were ever bypassed. Assigned onto the request wholesale rather than via the builder's own
+    // `.header(..)` (which appends, not replaces), for the same reason as `send_http`.
+    let mut req_headers = headers.clone();
+    req_headers
+        .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/grpc+proto"));
+    req_headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
+    req_headers.insert(
+        HeaderName::from_static("grpc-accept-encoding"),
+        HeaderValue::from_static("identity"),
+    );
+
     let body = Full::new(Bytes::from(grpc_frame(&payload)));
-    let req = http::Request::builder()
+    let mut req = http::Request::builder()
         .method(Method::POST)
         .uri(signal.grpc_method())
-        .header("content-type", "application/grpc+proto")
-        .header("te", "trailers")
-        .header("grpc-accept-encoding", "identity")
         .body(body)
         .expect("a well-formed request always builds");
+    *req.headers_mut() = req_headers;
 
     let res = sender.send_request(req).await.map_err(|e| {
         (Fault::Ambiguous, anyhow::Error::new(e).context("OTLP/gRPC request failed"))
@@ -821,6 +872,89 @@ mod tests {
         assert_eq!(rejected, 2.0, "the rejected count should be counted, not silently dropped");
     }
 
+    /// A one-shot raw TCP peer that captures the first request's bytes verbatim rather than
+    /// parsing them -- enough to assert a header actually landed on the wire without pulling in
+    /// an HTTP request parser just for a test.
+    async fn canned_http_server_capturing_request(
+    ) -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_task = captured.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let mut buf = [0u8; 8192];
+                if let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await
+                {
+                    captured_task.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+                let _ = stream.write_all(RESP_200_EMPTY.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (addr, captured)
+    }
+
+    #[tokio::test]
+    async fn a_custom_header_is_sent_on_the_http_request() {
+        let (addr, captured) = canned_http_server_capturing_request().await;
+        let mut output = http_output(addr)
+            .with_headers(&HashMap::from([("X-Scope-OrgID".to_string(), "tenant-a".to_string())]))
+            .unwrap();
+        output.send(&metric_batch()).await.expect("should succeed");
+
+        let request = String::from_utf8_lossy(&captured.lock().unwrap()).to_lowercase();
+        assert!(request.contains("x-scope-orgid: tenant-a"), "got request: {request}");
+    }
+
+    #[tokio::test]
+    async fn a_custom_header_does_not_override_content_type() {
+        // `graph::resolve`'s rule 20 rejects `content-type` at config-validation time -- this
+        // proves the defense-in-depth guarantee directly, bypassing that rule via `with_headers`.
+        let (addr, captured) = canned_http_server_capturing_request().await;
+        let mut output = http_output(addr)
+            .with_headers(&HashMap::from([("content-type".to_string(), "text/plain".to_string())]))
+            .unwrap();
+        output.send(&metric_batch()).await.expect("should succeed");
+
+        let request = String::from_utf8_lossy(&captured.lock().unwrap()).to_lowercase();
+        assert!(request.contains("content-type: application/x-protobuf"), "got request: {request}");
+        assert!(!request.contains("text/plain"), "got request: {request}");
+    }
+
+    #[test]
+    fn with_timeout_after_with_headers_keeps_the_headers() {
+        // Regression test for the ordering hazard `with_headers`'s own doc comment describes:
+        // headers live in their own field, applied per request, never baked into `client` --
+        // so calling `with_timeout` after `with_headers` must not lose them.
+        let output = OtlpOutput::new("http://localhost:4318".to_string(), OtlpTransport::Http)
+            .unwrap()
+            .with_headers(&HashMap::from([("X-Scope-OrgID".to_string(), "tenant-a".to_string())]))
+            .unwrap()
+            .with_timeout(Duration::from_secs(5));
+        assert_eq!(
+            output.headers.get("x-scope-orgid").map(|v| v.to_str().unwrap()),
+            Some("tenant-a")
+        );
+    }
+
+    #[test]
+    fn an_invalid_header_value_fails_construction() {
+        // `OtlpOutput` isn't `Debug` (it embeds a `reqwest::Client`), so `Result::unwrap_err`
+        // -- which needs `Debug` on the `Ok` side to format its panic message -- doesn't work
+        // here. Same reason `logit-pipeline::graph`'s tests have their own `expect_err` helper.
+        let err = match OtlpOutput::new("http://localhost:4318".to_string(), OtlpTransport::Http)
+            .unwrap()
+            .with_headers(&HashMap::from([("X-Scope-OrgID".to_string(), "bad\nvalue".to_string())]))
+        {
+            Ok(_) => panic!("expected an invalid header value to fail construction"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:?}").contains("X-Scope-OrgID"), "got: {err:?}");
+    }
+
     #[test]
     fn otlp_output_reports_itself_not_duplicate_safe() {
         let output =
@@ -917,6 +1051,77 @@ mod tests {
         let addr = canned_grpc_server(0, "", Vec::new()).await;
         let mut output = grpc_output(addr);
         output.send(&metric_batch()).await.expect("grpc-status 0 should succeed");
+    }
+
+    /// The twin of `canned_grpc_server`, capturing the request's headers into `captured` instead
+    /// of replying with a configurable status -- always `grpc-status: 0`, since these tests only
+    /// need to inspect what was sent, not how a failure is classified.
+    async fn canned_grpc_server_capturing_headers(
+    ) -> (std::net::SocketAddr, Arc<std::sync::Mutex<Option<HeaderMap>>>) {
+        use hyper::service::service_fn;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let captured_task = captured.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let io = TokioIo::new(stream);
+                let captured = captured_task.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                        *captured.lock().unwrap() = Some(req.headers().clone());
+                        async move {
+                            let mut trailers = HeaderMap::new();
+                            trailers.insert("grpc-status", "0".parse().unwrap());
+                            let body = TestGrpcBody {
+                                data: Some(Bytes::from(grpc_frame(&[]))),
+                                trailers: Some(trailers),
+                            };
+                            Ok::<_, std::convert::Infallible>(
+                                http::Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/grpc+proto")
+                                    .body(body)
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        (addr, captured)
+    }
+
+    #[tokio::test]
+    async fn a_custom_header_is_sent_on_the_grpc_request() {
+        let (addr, captured) = canned_grpc_server_capturing_headers().await;
+        let mut output = grpc_output(addr)
+            .with_headers(&HashMap::from([("X-Scope-OrgID".to_string(), "tenant-a".to_string())]))
+            .unwrap();
+        output.send(&metric_batch()).await.expect("should succeed");
+
+        let headers = captured.lock().unwrap().clone().expect("request should have been captured");
+        assert_eq!(headers.get("x-scope-orgid").map(|v| v.to_str().unwrap()), Some("tenant-a"));
+    }
+
+    #[tokio::test]
+    async fn a_custom_header_does_not_override_the_fixed_grpc_content_type() {
+        let (addr, captured) = canned_grpc_server_capturing_headers().await;
+        let mut output = grpc_output(addr)
+            .with_headers(&HashMap::from([("content-type".to_string(), "text/plain".to_string())]))
+            .unwrap();
+        output.send(&metric_batch()).await.expect("should succeed");
+
+        let headers = captured.lock().unwrap().clone().expect("request should have been captured");
+        assert_eq!(
+            headers.get("content-type").map(|v| v.to_str().unwrap()),
+            Some("application/grpc+proto")
+        );
     }
 
     #[tokio::test]

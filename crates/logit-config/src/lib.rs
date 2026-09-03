@@ -337,6 +337,16 @@ pub enum ComponentKind {
         endpoint: String,
         #[serde(default)]
         protocol: OtlpProtocol,
+        /// Extra headers sent on every export request, on both `protocol: http` and
+        /// `protocol: grpc` -- e.g. `X-Scope-OrgID` for a multi-tenant Loki/Mimir/Grafana Cloud
+        /// target. A value is a plain string like any other field, so `!env` works on it
+        /// (`docs/adr/env-yaml-tag.md`) -- the way to carry an `Authorization: Bearer …` token
+        /// without inlining it. A name owned by the protocol itself (`content-type`,
+        /// `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`,
+        /// `connection`, any `grpc-*` header, or an HTTP/2 pseudo-header starting with `:`) is
+        /// rejected at config-validation time rather than silently overridden.
+        #[serde(default)]
+        headers: HashMap<String, String>,
     },
     /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
     LogitOut {
@@ -1265,9 +1275,25 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::OtlpOut { endpoint, protocol } => {
+            ComponentKind::OtlpOut { endpoint, protocol, headers } => {
                 assert_eq!(endpoint, "http://tempo:4318");
                 assert_eq!(protocol, OtlpProtocol::Http);
+                assert!(headers.is_empty());
+            }
+            other => panic!("expected OtlpOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otlp_out_headers_default_to_empty_and_can_be_set() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_out", "sources": ["in"], "endpoint": "http://tempo:4318",
+                "headers": {"X-Scope-OrgID": "tenant-a"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpOut { headers, .. } => {
+                assert_eq!(headers.get("X-Scope-OrgID"), Some(&"tenant-a".to_string()));
             }
             other => panic!("expected OtlpOut, got {other:?}"),
         }

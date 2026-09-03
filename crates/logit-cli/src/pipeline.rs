@@ -281,8 +281,9 @@ fn build_spec(
             queue_config(&component.buffer),
             write_config(&component.buffer),
         ),
-        OtlpOut { endpoint, protocol } => {
+        OtlpOut { endpoint, protocol, headers } => {
             let output = OtlpOutput::new(endpoint.clone(), otlp_out_transport(*protocol))?
+                .with_headers(headers)?
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
             NodeSpec::Output(
@@ -730,6 +731,7 @@ mod tests {
                 kind: ComponentKind::OtlpOut {
                     endpoint: "http://localhost:4318".to_string(),
                     protocol,
+                    headers: HashMap::new(),
                 },
             };
             assert!(
@@ -756,6 +758,7 @@ mod tests {
             kind: ComponentKind::OtlpOut {
                 endpoint: "https://tempo:4317".to_string(),
                 protocol: logit_config::OtlpProtocol::Grpc,
+                headers: HashMap::new(),
             },
         };
         let err = match build_spec("out", &component, Path::new(""), None) {

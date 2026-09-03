@@ -49,6 +49,10 @@
 //!     every event, the same silent-black-hole failure rule 7 exists to catch. `keep`'s empty
 //!     `fields` list stays legal by contrast -- "drop every attribute" is a real operation,
 //!     "drop every event" is not. See `docs/adr/signal-filtering-components.md`.
+//! 20. An `otlp_out` `headers:` entry naming an empty string, an HTTP/2 pseudo-header (starting
+//!     with `:`), or a header the wire transport itself sets (`content-type`, `grpc-encoding`,
+//!     etc. -- see `RESERVED_OTLP_HEADERS`) is rejected, case-insensitively -- almost certainly a
+//!     config mistake, not a meaningful override.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -236,6 +240,28 @@ pub struct Graph {
     /// actually has to protect there.
     pub topological_order: Vec<String>,
 }
+
+/// Header names `otlp_out`'s two wire transports set themselves -- `content-type` and the
+/// hand-rolled gRPC framing's own `grpc-*`/`te`/`connection`/etc. headers
+/// (`crates/logit-outputs/src/otlp.rs`'s `send_http`/`grpc_roundtrip`). A config `headers:` entry
+/// naming one of these is almost certainly a config mistake, not a meaningful override -- checked
+/// case-insensitively, matching HTTP's own header-name semantics. `OtlpOutput::with_headers`
+/// guards the same thing in code, as defense in depth; this is what gives an operator a clear,
+/// component-scoped error at config-load time instead.
+const RESERVED_OTLP_HEADERS: &[&str] = &[
+    "content-type",
+    "content-length",
+    "content-encoding",
+    "host",
+    "te",
+    "transfer-encoding",
+    "connection",
+    "grpc-encoding",
+    "grpc-accept-encoding",
+    "grpc-timeout",
+    "grpc-status",
+    "grpc-message",
+];
 
 pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     let Config { components } = config;
@@ -501,6 +527,30 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 }
             }
             _ => {}
+        }
+    }
+
+    // Rule 20: an `otlp_out` `headers:` entry may not name a header the protocol itself sets --
+    // see `RESERVED_OTLP_HEADERS`'s own doc comment.
+    for (id, component) in &components {
+        if let ComponentKind::OtlpOut { headers, .. } = &component.kind {
+            for name in headers.keys() {
+                if name.is_empty() {
+                    anyhow::bail!("component '{id}': 'headers' has an empty header name");
+                }
+                if name.starts_with(':') {
+                    anyhow::bail!(
+                        "component '{id}': 'headers' names {name:?} -- an HTTP/2 pseudo-header \
+                         (starting with ':') can't be set as a custom header"
+                    );
+                }
+                if RESERVED_OTLP_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+                    anyhow::bail!(
+                        "component '{id}': 'headers' names {name:?}, which this protocol sets \
+                         itself -- it can't be overridden"
+                    );
+                }
+            }
         }
     }
 
@@ -1025,6 +1075,59 @@ mod tests {
                 },
             ),
             ("out", vec!["filter"], sink()),
+        ]))
+        .expect("should resolve");
+    }
+
+    fn otlp_out_with_headers(headers: Vec<(&str, &str)>) -> ComponentKind {
+        ComponentKind::OtlpOut {
+            endpoint: "http://localhost:4318".to_string(),
+            protocol: logit_config::OtlpProtocol::Http,
+            headers: headers.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+
+    #[test]
+    fn an_otlp_out_with_a_reserved_header_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], otlp_out_with_headers(vec![("Content-Type", "text/plain")])),
+        ]));
+        assert!(err.contains("sets itself"), "got: {err}");
+    }
+
+    #[test]
+    fn an_otlp_out_with_a_reserved_header_name_is_rejected_case_insensitively() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], otlp_out_with_headers(vec![("GRPC-ENCODING", "gzip")])),
+        ]));
+        assert!(err.contains("sets itself"), "got: {err}");
+    }
+
+    #[test]
+    fn an_otlp_out_with_an_empty_header_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], otlp_out_with_headers(vec![("", "tenant-a")])),
+        ]));
+        assert!(err.contains("empty header name"), "got: {err}");
+    }
+
+    #[test]
+    fn an_otlp_out_with_a_pseudo_header_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], otlp_out_with_headers(vec![(":method", "POST")])),
+        ]));
+        assert!(err.contains("pseudo-header"), "got: {err}");
+    }
+
+    #[test]
+    fn an_otlp_out_with_a_custom_header_resolves_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], otlp_out_with_headers(vec![("X-Scope-OrgID", "tenant-a")])),
         ]))
         .expect("should resolve");
     }

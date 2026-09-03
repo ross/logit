@@ -160,7 +160,9 @@ and worth doing at the same time as whatever adds trace-context fields to `LogRe
 Surfaced while checking Loki compatibility; none block the demo, all block a real deployment:
 
 - No custom headers — no way to send `X-Scope-OrgID`, which rules out any multi-tenant Loki, Mimir,
-  or Grafana Cloud target.
+  or Grafana Cloud target. (Landed: `headers:` on `otlp_out`, applied on both transports, validated
+  against a reserved protocol-owned set — see
+  `docs/plans/signal-filtering-and-otlp-out-config-gaps.md`'s workstream 2.)
 - No compression support (`crates/logit-outputs/src/otlp.rs:479-482` — the frame's compressed flag
   is always `0`).
 - No TLS configuration for gRPC — `reject_insecure_grpc_endpoint`
