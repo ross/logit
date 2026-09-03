@@ -348,7 +348,10 @@ pub enum ComponentKind {
         /// without inlining it. A name owned by the protocol itself (`content-type`,
         /// `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`,
         /// `connection`, any `grpc-*` header, or an HTTP/2 pseudo-header starting with `:`) is
-        /// rejected at config-validation time rather than silently overridden.
+        /// rejected at config-validation time rather than silently overridden. Two keys naming
+        /// the same header once case is ignored (e.g. `X-Scope-OrgID` and `x-scope-orgid`) are
+        /// rejected too -- HTTP header names are case-insensitive, so which value would actually
+        /// be sent is otherwise undefined.
         #[serde(default)]
         headers: HashMap<String, String>,
     },

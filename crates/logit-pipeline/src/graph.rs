@@ -54,9 +54,11 @@
 //!     `fields` list stays legal by contrast -- "drop every attribute" is a real operation,
 //!     "drop every event" is not. See `docs/adr/signal-filtering-components.md`.
 //! 20. An `otlp_out` `headers:` entry naming an empty string, an HTTP/2 pseudo-header (starting
-//!     with `:`), or a header the wire transport itself sets (`content-type`, `grpc-encoding`,
-//!     etc. -- see `RESERVED_OTLP_HEADERS`) is rejected, case-insensitively -- almost certainly a
-//!     config mistake, not a meaningful override.
+//!     with `:`), any `grpc-*` header, or another header the wire transport itself sets
+//!     (`content-type`, etc. -- see `RESERVED_OTLP_HEADERS`) is rejected, case-insensitively --
+//!     almost certainly a config mistake, not a meaningful override. Two entries naming the same
+//!     header once case is ignored (HTTP header names are case-insensitive) are also rejected --
+//!     which value would actually be sent is otherwise undefined.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -253,13 +255,14 @@ pub struct Graph {
     pub topological_order: Vec<String>,
 }
 
-/// Header names `otlp_out`'s two wire transports set themselves -- `content-type` and the
-/// hand-rolled gRPC framing's own `grpc-*`/`te`/`connection`/etc. headers
-/// (`crates/logit-outputs/src/otlp.rs`'s `send_http`/`grpc_roundtrip`). A config `headers:` entry
-/// naming one of these is almost certainly a config mistake, not a meaningful override -- checked
-/// case-insensitively, matching HTTP's own header-name semantics. `OtlpOutput::with_headers`
-/// guards the same thing in code, as defense in depth; this is what gives an operator a clear,
-/// component-scoped error at config-load time instead.
+/// Non-gRPC header names `otlp_out`'s HTTP transport sets itself, or that HTTP/1.1's own
+/// connection-management semantics reserve regardless of transport
+/// (`crates/logit-outputs/src/otlp.rs`'s `send_http`). Checked case-insensitively, matching
+/// HTTP's own header-name semantics. Every `grpc-*` name is reserved too -- checked separately,
+/// by prefix, in `resolve` -- since the gRPC wire protocol defines a whole namespace of them
+/// (`grpc-encoding`, `grpc-status`, `grpc-trace-bin`, ...), not just the handful
+/// `crates/logit-outputs/src/otlp.rs`'s `grpc_roundtrip` happens to set today; a fixed list here
+/// would silently stop covering a `grpc-*` header this project starts setting later.
 const RESERVED_OTLP_HEADERS: &[&str] = &[
     "content-type",
     "content-length",
@@ -268,11 +271,6 @@ const RESERVED_OTLP_HEADERS: &[&str] = &[
     "te",
     "transfer-encoding",
     "connection",
-    "grpc-encoding",
-    "grpc-accept-encoding",
-    "grpc-timeout",
-    "grpc-status",
-    "grpc-message",
 ];
 
 pub fn resolve(config: Config) -> anyhow::Result<Graph> {
@@ -559,10 +557,15 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 20: an `otlp_out` `headers:` entry may not name a header the protocol itself sets --
-    // see `RESERVED_OTLP_HEADERS`'s own doc comment.
+    // Rule 20: an `otlp_out` `headers:` entry may not name a header the protocol itself sets
+    // (see `RESERVED_OTLP_HEADERS`'s own doc comment for why `grpc-*` is a prefix check here,
+    // not a fixed list), and no two entries may name the same header once case is ignored --
+    // HTTP header names are case-insensitive, so e.g. `X-Scope-OrgID` and `x-scope-orgid` in the
+    // same `headers:` block would silently collide into one `HeaderMap` entry
+    // (`OtlpOutput::with_headers`) with no way to predict which value wins.
     for (id, component) in &components {
         if let ComponentKind::OtlpOut { headers, .. } = &component.kind {
+            let mut seen_lowercase = BTreeSet::new();
             for name in headers.keys() {
                 if name.is_empty() {
                     anyhow::bail!("component '{id}': 'headers' has an empty header name");
@@ -573,10 +576,20 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                          (starting with ':') can't be set as a custom header"
                     );
                 }
-                if RESERVED_OTLP_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+                let lowercase = name.to_ascii_lowercase();
+                if lowercase.starts_with("grpc-")
+                    || RESERVED_OTLP_HEADERS.contains(&lowercase.as_str())
+                {
                     anyhow::bail!(
                         "component '{id}': 'headers' names {name:?}, which this protocol sets \
                          itself -- it can't be overridden"
+                    );
+                }
+                if !seen_lowercase.insert(lowercase) {
+                    anyhow::bail!(
+                        "component '{id}': 'headers' names {name:?}, which differs only in \
+                         case from another entry -- HTTP header names are case-insensitive, so \
+                         which value would actually be sent is undefined"
                     );
                 }
             }
@@ -1186,6 +1199,35 @@ mod tests {
             ("out", vec!["in"], otlp_out_with_headers(vec![("GRPC-ENCODING", "gzip")])),
         ]));
         assert!(err.contains("sets itself"), "got: {err}");
+    }
+
+    #[test]
+    fn an_otlp_out_with_a_grpc_header_not_on_the_fixed_reserved_list_is_still_rejected() {
+        // Regression guard: RESERVED_OTLP_HEADERS deliberately no longer lists every gRPC header
+        // name individually -- any `grpc-*` header is reserved by prefix, not by exact match, so
+        // a header this project doesn't itself set (e.g. `grpc-trace-bin`, part of the gRPC wire
+        // protocol but never used by `crates/logit-outputs/src/otlp.rs`) is still rejected.
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], otlp_out_with_headers(vec![("grpc-trace-bin", "x")])),
+        ]));
+        assert!(err.contains("sets itself"), "got: {err}");
+    }
+
+    #[test]
+    fn an_otlp_out_with_two_headers_differing_only_in_case_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                otlp_out_with_headers(vec![
+                    ("X-Scope-OrgID", "tenant-a"),
+                    ("x-scope-orgid", "tenant-b"),
+                ]),
+            ),
+        ]));
+        assert!(err.contains("differs only in case"), "got: {err}");
     }
 
     #[test]

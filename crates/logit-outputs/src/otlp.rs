@@ -109,7 +109,12 @@ impl OtlpOutput {
     /// `X-Scope-OrgID` for a multi-tenant Loki/Mimir/Grafana Cloud target. Fails if any name or
     /// value isn't a legal HTTP header (`logit-pipeline::graph::resolve`'s rule 20 rejects a
     /// protocol-owned name like `content-type` before construction ever sees it; this catches the
-    /// lexical shape `graph` can't -- illegal bytes, embedded newlines).
+    /// lexical shape `graph` can't -- illegal bytes, embedded newlines). Also fails if two names
+    /// collide once `HeaderName` normalizes their case (`X-Scope-OrgID`/`x-scope-orgid` are the
+    /// same header on the wire) -- `HeaderMap::insert` would otherwise silently keep whichever of
+    /// the two happened to be iterated last out of `headers`' arbitrary `HashMap` order, and
+    /// `graph::resolve`'s own rule 20 check for this is the same defense-in-depth relationship as
+    /// the reserved-name check above.
     pub fn with_headers(mut self, headers: &HashMap<String, String>) -> anyhow::Result<Self> {
         let mut map = HeaderMap::with_capacity(headers.len());
         for (name, value) in headers {
@@ -117,7 +122,13 @@ impl OtlpOutput {
                 .with_context(|| format!("otlp_out: {name:?} is not a legal header name"))?;
             let header_value = HeaderValue::from_str(value)
                 .with_context(|| format!("otlp_out: header {name:?} has an invalid value"))?;
-            map.insert(header_name, header_value);
+            if map.insert(header_name, header_value).is_some() {
+                anyhow::bail!(
+                    "otlp_out: header {name:?} collides with another entry in 'headers' once \
+                     case is ignored -- HTTP header names are case-insensitive, so which value \
+                     would actually be sent is undefined"
+                );
+            }
         }
         self.headers = map;
         Ok(self)
@@ -953,6 +964,25 @@ mod tests {
             Err(err) => err,
         };
         assert!(format!("{err:?}").contains("X-Scope-OrgID"), "got: {err:?}");
+    }
+
+    #[test]
+    fn two_headers_differing_only_in_case_fail_construction_instead_of_silently_colliding() {
+        // Regression guard: HTTP header names are case-insensitive, so `HeaderName` normalizes
+        // "X-Scope-OrgID" and "x-scope-orgid" to the same key -- without this check,
+        // `HeaderMap::insert` would silently keep whichever of the two `with_headers` happened to
+        // iterate last (`headers`' `HashMap` iteration order is unspecified), sending a different
+        // value on different runs with no error either way.
+        let err = match OtlpOutput::new("http://localhost:4318".to_string(), OtlpTransport::Http)
+            .unwrap()
+            .with_headers(&HashMap::from([
+                ("X-Scope-OrgID".to_string(), "tenant-a".to_string()),
+                ("x-scope-orgid".to_string(), "tenant-b".to_string()),
+            ])) {
+            Ok(_) => panic!("expected case-colliding headers to fail construction"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:?}").contains("case is ignored"), "got: {err:?}");
     }
 
     #[test]

@@ -670,7 +670,7 @@
               "type": "string"
             },
             "headers": {
-              "description": "Extra headers sent on every export request, on both `protocol: http` and `protocol: grpc` -- e.g. `X-Scope-OrgID` for a multi-tenant Loki/Mimir/Grafana Cloud target. A value is a plain string like any other field, so `!env` works on it (`docs/adr/env-yaml-tag.md`) -- the way to carry an `Authorization: Bearer …` token without inlining it. A name owned by the protocol itself (`content-type`, `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, any `grpc-*` header, or an HTTP/2 pseudo-header starting with `:`) is rejected at config-validation time rather than silently overridden.",
+              "description": "Extra headers sent on every export request, on both `protocol: http` and `protocol: grpc` -- e.g. `X-Scope-OrgID` for a multi-tenant Loki/Mimir/Grafana Cloud target. A value is a plain string like any other field, so `!env` works on it (`docs/adr/env-yaml-tag.md`) -- the way to carry an `Authorization: Bearer …` token without inlining it. A name owned by the protocol itself (`content-type`, `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, any `grpc-*` header, or an HTTP/2 pseudo-header starting with `:`) is rejected at config-validation time rather than silently overridden. Two keys naming the same header once case is ignored (e.g. `X-Scope-OrgID` and `x-scope-orgid`) are rejected too -- HTTP header names are case-insensitive, so which value would actually be sent is otherwise undefined.",
               "default": {},
               "type": "object",
               "additionalProperties": {
