@@ -47,6 +47,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "x".to_string() },
             },
@@ -55,6 +56,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::InfluxDbOut {
                     url: "u".to_string(),
@@ -81,6 +83,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["missing".to_string()],
                 kind: ComponentKind::InfluxDbOut {
                     url: "u".to_string(),

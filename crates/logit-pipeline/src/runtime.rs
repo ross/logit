@@ -10,8 +10,8 @@
 use crate::fanout::{Delivered, TraceContext};
 use crate::graph::Graph;
 use crate::output::{classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fault};
-use crate::sink_queue::{SinkQueue, SinkQueueConfig};
-use crate::{Fanout, Input, Output, Transform};
+use crate::queue::{SinkQueue, SinkQueueConfig};
+use crate::{Fanout, Input, InputRuntimeConfig, Output, Transform};
 use anyhow::Context;
 use logit_core::{Diagnostics, EventBatch, Resource, SpanKind, Telemetry};
 use logit_script::{ProcessOutcome, ScriptWorker};
@@ -40,8 +40,14 @@ const CHANNEL_CAPACITY: usize = 64;
 /// `ComponentKind` becomes is the registry's job (`logit-cli`), not this crate's -- this crate
 /// only knows how to *run* each variant once built.
 pub enum NodeSpec {
-    Input(Box<dyn Input + Send>),
-    /// The sink's own `SinkQueue` bounds/overflow policy (see `sink_queue.rs`) plus its retry
+    /// `InputRuntimeConfig` mirrors `Output`'s own runtime knobs below: production call sites
+    /// (`logit-cli::pipeline::build_spec`) derive `shutdown_grace` from the listener's `receive:`
+    /// block (`docs/adr/0027-decoupled-listener-io.md`), defaulting to
+    /// `InputRuntimeConfig::default()` (`Duration::ZERO` -- cancel-by-drop immediately, ADR
+    /// 0013's original behaviour) for a listener with no `receive:` block; a test can pass a
+    /// short grace to keep a shutdown test fast.
+    Input(Box<dyn Input + Send>, InputRuntimeConfig),
+    /// The sink's own `SinkQueue` bounds/overflow policy (see `queue.rs`) plus its retry
     /// budget and shutdown grace (see `RetryConfig`/`WriteLoopConfig`). Production call sites
     /// (`logit-cli::pipeline::build_spec`) build these from the component's own
     /// `logit_config::BufferConfig` (`queue_config`/`write_config` there), defaulting to
@@ -139,14 +145,20 @@ pub async fn run_with_telemetry(
             .with_context(|| format!("no implementation registered for component '{id}'"))?;
 
         match spec {
-            NodeSpec::Input(input) => {
+            NodeSpec::Input(input, input_config) => {
                 // A listener's own inbox is never written to (arity rule: a listener has no
                 // sources, so nothing ever names it as a source and sends into it) -- nothing
                 // reads it either. A listener's own send-side telemetry (batches/events sent,
                 // send-blocked duration) comes from `fanout` above, already attached -- nothing
                 // further to instrument here.
                 drop(inbox);
-                tasks.spawn(run_input(id, input, fanout, shutdown_rx.clone()));
+                tasks.spawn(run_input(
+                    id,
+                    input,
+                    fanout,
+                    shutdown_rx.clone(),
+                    input_config.shutdown_grace,
+                ));
             }
             NodeSpec::Output(output, queue_config, write_config) => {
                 tasks.spawn(run_output(
@@ -232,19 +244,38 @@ pub async fn run_with_telemetry(
     result
 }
 
+/// Drives one listener via [`Input::run_until_shutdown`], racing it against a *grace-delayed*
+/// backstop rather than `shutdown` itself (`docs/adr/0027-decoupled-listener-io.md`, revising
+/// ADR 0013's "no `Input` trait change" rationale, not its cancel-by-drop mechanism -- see the
+/// trait's own doc comment).
+///
+/// **Why grace-delayed, and why that doesn't add latency to a non-overriding input.**
+/// `run_until_shutdown`'s default body already races `run` against `shutdown` and resolves the
+/// instant it fires -- exactly ADR 0013's original behaviour, unchanged. If this function's outer
+/// race were *also* against `shutdown` itself, both arms would resolve simultaneously with no way
+/// to prefer letting an overriding implementation finish draining first. Racing against
+/// [`shutdown_grace_expired`] instead means: the default impl (or any override that finishes
+/// before the grace) always wins that race, so nothing pays added latency; an override still
+/// working when the grace expires is the only case where this backstop actually fires, cancelling
+/// it by drop -- the same loss ADR 0013 always accepted, now bounded by `shutdown_grace` rather
+/// than unconditional.
+///
+/// No `Box::pin`/`Option` dance like `run_output` needed (`shutdown.clone()` below gives the two
+/// `select!` arms disjoint receivers, and neither arm holds a value the other one needs back
+/// afterward) -- `run_output`'s dance existed only because its two arms shared a mutable borrow of
+/// `output` that the caller needed reclaimed regardless of which arm won.
 async fn run_input(
     id: String,
     mut input: Box<dyn Input + Send>,
     fanout: Fanout,
     mut shutdown: watch::Receiver<bool>,
+    shutdown_grace: Duration,
 ) -> anyhow::Result<()> {
+    let mut deadline: Option<tokio::time::Instant> = None;
     tokio::select! {
-        result = input.run(fanout) => result.with_context(|| format!("component '{id}'")),
-        // `wait_for` checks the current value before waiting on a change, so this resolves
-        // immediately if `shutdown` was already flipped before this task started racing it --
-        // unlike `changed()`, which only fires on a transition and could otherwise miss a
-        // shutdown that landed between this receiver's creation and this select.
-        _ = shutdown.wait_for(|&due| due) => Ok(()),
+        result = input.run_until_shutdown(fanout, shutdown.clone())
+            => result.with_context(|| format!("component '{id}'")),
+        () = shutdown_grace_expired(&mut shutdown, &mut deadline, shutdown_grace) => Ok(()),
     }
 }
 
@@ -399,13 +430,13 @@ pub async fn drain_inbox(
 ) {
     while let Some(delivered) = inbox.recv().await {
         // Read before `unwrap_batch_arc` consumes `delivered` -- `SinkQueue` now carries this
-        // context alongside the batch (`sink_queue.rs`'s own doc comment) specifically so
+        // context alongside the batch (`queue.rs`'s own doc comment) specifically so
         // `write_loop`'s sink span can be parented on it once `peek` reads it back.
         let ctx = delivered.context();
         let batch = unwrap_batch_arc(delivered);
         telemetry.count("logit.component.batches.received", 1.0, &[]);
         telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
-        queue.push(batch, ctx).await;
+        queue.push((batch, ctx)).await;
     }
     queue.close();
 }
@@ -638,7 +669,7 @@ async fn finish_and_flush(
 ) {
     let mut dropped_batches: u64 = 0;
     let mut dropped_events: u64 = 0;
-    while let Some(batch) = queue.commit() {
+    while let Some((batch, _ctx)) = queue.commit() {
         dropped_batches += 1;
         dropped_events += batch.events.len() as u64;
     }
@@ -1279,7 +1310,11 @@ fn now_unix_nanos() -> i64 {
 /// remainder makes this constant-time even when a very small interval has missed billions of
 /// ticks. If the platform cannot represent the cadence's next instant, fall back to the smallest
 /// representable useful delay rather than overflowing or leaving the deadline due forever.
-fn advance_flush_deadline(
+///
+/// `pub(crate)` rather than private: [`crate::accumulator::BatchAccumulator`] reuses this exact
+/// cadence math for its own interval-driven flush rather than a second copy
+/// (`docs/adr/0027-decoupled-listener-io.md`).
+pub(crate) fn advance_flush_deadline(
     deadline: tokio::time::Instant,
     now: tokio::time::Instant,
     interval: Duration,
@@ -1301,7 +1336,7 @@ mod tests {
     use super::*;
     use crate::fanout::TraceContext;
     use crate::graph;
-    use crate::sink_queue::OverflowPolicy;
+    use crate::queue::OverflowPolicy;
     use logit_config::{Component, ComponentKind, Config};
     use logit_core::{Event, MetricKind, Registry, SpanLink, SpanStatus};
     use std::collections::HashMap as Map;
@@ -1374,6 +1409,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -1382,6 +1418,7 @@ mod tests {
             "enrich".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Lua {
                     script: r#"function process(event) event.attributes.tagged = "yes" return event end"#
@@ -1394,6 +1431,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["enrich".to_string()],
                 kind: ComponentKind::InfluxDbOut {
                     url: "http://localhost:8086".to_string(),
@@ -1414,7 +1452,10 @@ mod tests {
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
             "in".to_string(),
-            NodeSpec::Input(Box::new(OneShotInput { batch: Some(batch) })),
+            NodeSpec::Input(
+                Box::new(OneShotInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
         );
         specs.insert(
             "enrich".to_string(),
@@ -1477,6 +1518,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -1485,6 +1527,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::InfluxDbOut {
                     url: "http://localhost:8086".to_string(),
@@ -1505,7 +1548,10 @@ mod tests {
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
             "in".to_string(),
-            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
         );
         specs.insert(
             "out".to_string(),
@@ -1563,6 +1609,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -1574,6 +1621,7 @@ mod tests {
             "branch_a".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Json { skip_to_brace: false },
             },
@@ -1582,6 +1630,7 @@ mod tests {
             "sink_a".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["branch_a".to_string()],
                 kind: influxdb_out(),
             },
@@ -1590,6 +1639,7 @@ mod tests {
             "sink_b".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: influxdb_out(),
             },
@@ -1606,7 +1656,10 @@ mod tests {
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
             "in".to_string(),
-            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
         );
         specs.insert("branch_a".to_string(), NodeSpec::Transform(Box::new(MutatingTransform)));
         specs.insert(
@@ -1724,6 +1777,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -1732,6 +1786,7 @@ mod tests {
             "windowed".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Aggregate {
                     interval: Duration::from_secs(3600),
@@ -1744,6 +1799,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["windowed".to_string()],
                 kind: ComponentKind::InfluxDbOut {
                     url: "http://localhost:8086".to_string(),
@@ -1765,7 +1821,10 @@ mod tests {
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
             "in".to_string(),
-            NodeSpec::Input(Box::new(SignalingInput { batch: Some(batch), sent: Some(sent_tx) })),
+            NodeSpec::Input(
+                Box::new(SignalingInput { batch: Some(batch), sent: Some(sent_tx) }),
+                InputRuntimeConfig::default(),
+            ),
         );
         specs.insert(
             "windowed".to_string(),
@@ -1801,6 +1860,204 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("the flushed window should have reached the output before exit");
         assert_eq!(received.events.len(), 1);
+    }
+
+    // -- `Input::run_until_shutdown` and `run_input`'s grace backstop
+    //    (`docs/adr/0027-decoupled-listener-io.md`). --
+
+    /// Never returns on its own -- the shape that makes the default `run_until_shutdown`'s
+    /// `select!` the *only* way this input can ever stop.
+    struct ForeverInput;
+
+    #[async_trait::async_trait]
+    impl Input for ForeverInput {
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+    }
+
+    /// Overrides `run_until_shutdown` to wait for the signal, then keep draining for
+    /// `drain_for` before sending `batch` (if any) and returning -- the shape a real cooperative
+    /// listener takes.
+    struct DrainingInput {
+        drain_for: Duration,
+        batch: Option<EventBatch>,
+    }
+
+    #[async_trait::async_trait]
+    impl Input for DrainingInput {
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+
+        async fn run_until_shutdown(
+            &mut self,
+            sink: Fanout,
+            mut shutdown: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            let _ = shutdown.wait_for(|&due| due).await;
+            tokio::time::sleep(self.drain_for).await;
+            if let Some(batch) = self.batch.take() {
+                sink.send(batch).await;
+            }
+            Ok(())
+        }
+    }
+
+    /// Errors immediately, before any shutdown -- for the "error still propagates with context"
+    /// case, which relies on nothing but `Input::run`'s existing contract.
+    struct ErrInput;
+
+    #[async_trait::async_trait]
+    impl Input for ErrInput {
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            anyhow::bail!("boom")
+        }
+    }
+
+    /// The regression this workstream exists to prevent: grace-delaying `run_input`'s backstop
+    /// arm must not add latency to an input that doesn't override `run_until_shutdown`. Uses a
+    /// deliberately huge grace (1 hour) -- if the backstop ever won this race instead of the
+    /// default impl, this test would need to wait out that whole hour of virtual time, which the
+    /// 1-second real-time `timeout` below would catch as a failure regardless.
+    #[tokio::test(start_paused = true)]
+    async fn a_non_overriding_input_returns_at_the_instant_shutdown_fires_not_after_the_grace() {
+        let (tx, _rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let huge_grace = Duration::from_secs(3600);
+
+        let handle = tokio::spawn(run_input(
+            "in".to_string(),
+            Box::new(ForeverInput),
+            fanout,
+            shutdown_rx,
+            huge_grace,
+        ));
+
+        // Let the spawned task start and park inside the default `run_until_shutdown`'s `select!`.
+        tokio::task::yield_now().await;
+        let before = tokio::time::Instant::now();
+        shutdown_tx.send(true).expect("receiver should still be alive");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("must resolve promptly -- waiting out the 1-hour grace would time out here")
+            .expect("task should not panic");
+        assert!(result.is_ok());
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(before),
+            Duration::ZERO,
+            "the default impl must resolve at the instant shutdown fires, adding no latency"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_overriding_input_draining_within_its_grace_completes_and_delivers() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 1.0)],
+        };
+
+        let handle = tokio::spawn(run_input(
+            "in".to_string(),
+            Box::new(DrainingInput { drain_for: Duration::from_secs(2), batch: Some(batch) }),
+            fanout,
+            shutdown_rx,
+            Duration::from_secs(10), // grace comfortably longer than the 2s drain
+        ));
+
+        tokio::task::yield_now().await;
+        shutdown_tx.send(true).expect("receiver should still be alive");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("should resolve once the 2s drain completes, well before the 10s grace")
+            .expect("task should not panic");
+        assert!(result.is_ok());
+
+        let delivered = rx.recv().await.expect("the drained batch should have reached the fanout");
+        assert_eq!(unwrap_batch(delivered).events.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_overriding_input_that_never_finishes_is_cancelled_at_exactly_the_grace_deadline() {
+        let (tx, _rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let grace = Duration::from_secs(5);
+
+        let handle = tokio::spawn(run_input(
+            "in".to_string(),
+            // Drains far longer than the grace -- must be cancelled by drop at the deadline,
+            // never allowed to actually finish its sleep.
+            Box::new(DrainingInput { drain_for: Duration::from_secs(3600), batch: None }),
+            fanout,
+            shutdown_rx,
+            grace,
+        ));
+
+        tokio::task::yield_now().await;
+        let before = tokio::time::Instant::now();
+        shutdown_tx.send(true).expect("receiver should still be alive");
+
+        let result = tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("must be cancelled at the 5s grace, not wait out the 1-hour drain")
+            .expect("task should not panic");
+        assert!(result.is_ok(), "grace expiry resolves Ok, matching write_loop's own convention");
+        assert_eq!(tokio::time::Instant::now().duration_since(before), grace);
+    }
+
+    /// The default impl's shutdown path is still exactly ADR 0013's cancel-by-drop: dropping
+    /// `run`'s future drops the `Fanout` inside it, which drops the last `Sender` into every
+    /// downstream inbox, closing them -- unchanged by this workstream's `run_input` restructuring.
+    #[tokio::test(start_paused = true)]
+    async fn the_default_impls_dropped_run_future_still_closes_every_downstream_inbox() {
+        let (tx, mut rx) = mpsc::channel::<Delivered>(1);
+        let fanout = Fanout::new(vec![tx]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(run_input(
+            "in".to_string(),
+            Box::new(ForeverInput),
+            fanout,
+            shutdown_rx,
+            Duration::from_secs(60),
+        ));
+        tokio::task::yield_now().await;
+        shutdown_tx.send(true).expect("receiver should still be alive");
+        handle.await.expect("task should not panic").expect("should complete without error");
+
+        assert!(
+            rx.recv().await.is_none(),
+            "the downstream inbox should observe every sender dropped and close"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_input_erroring_before_any_shutdown_still_propagates_with_its_component_context() {
+        let (tx, _rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let err = run_input(
+            "bad".to_string(),
+            Box::new(ErrInput),
+            fanout,
+            shutdown_rx,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect_err("should propagate the input's own error");
+        let message = format!("{err:#}");
+        assert!(message.contains("component 'bad'"), "got: {message}");
+        assert!(message.contains("boom"), "got: {message}");
     }
 
     /// The property `unwrap_batch` (and the whole `Arc<EventBatch>` design,
@@ -1880,6 +2137,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -1888,6 +2146,7 @@ mod tests {
             "xform".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Json { skip_to_brace: false },
             },
@@ -1896,6 +2155,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["xform".to_string()],
                 kind: influxdb_out(),
             },
@@ -1911,7 +2171,10 @@ mod tests {
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
             "in".to_string(),
-            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
         );
         specs.insert("xform".to_string(), NodeSpec::Transform(Box::new(MutatingTransform)));
         specs.insert(
@@ -1977,6 +2240,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -1985,6 +2249,7 @@ mod tests {
             "enrich".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Lua {
                     script: "function process(event) return {event, event:clone()} end".to_string(),
@@ -1996,6 +2261,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["enrich".to_string()],
                 kind: influxdb_out(),
             },
@@ -2011,7 +2277,10 @@ mod tests {
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
             "in".to_string(),
-            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
         );
         specs.insert(
             "enrich".to_string(),
@@ -2112,6 +2381,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -2120,6 +2390,7 @@ mod tests {
             "enrich".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Lua {
                     script: "function process(event) error('boom') end".to_string(),
@@ -2131,6 +2402,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["enrich".to_string()],
                 kind: influxdb_out(),
             },
@@ -2146,7 +2418,10 @@ mod tests {
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
             "in".to_string(),
-            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
         );
         specs.insert(
             "enrich".to_string(),
@@ -2202,6 +2477,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -2217,6 +2493,7 @@ mod tests {
             "enrich".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Lua { script: script.clone(), interval: None },
             },
@@ -2225,6 +2502,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["enrich".to_string()],
                 kind: influxdb_out(),
             },
@@ -2240,7 +2518,10 @@ mod tests {
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
             "in".to_string(),
-            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
         );
         specs.insert("enrich".to_string(), NodeSpec::Lua { script, interval: None });
         specs.insert(
@@ -2296,6 +2577,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -2304,6 +2586,7 @@ mod tests {
             "windowed".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Lua {
                     script: "function process(event) return event end".to_string(),
@@ -2315,6 +2598,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["windowed".to_string()],
                 kind: influxdb_out(),
             },
@@ -2322,7 +2606,10 @@ mod tests {
         let g = graph::resolve(Config { components }).expect("should resolve");
 
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
-        specs.insert("in".to_string(), NodeSpec::Input(Box::new(FiniteInput { batch: None })));
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(FiniteInput { batch: None }), InputRuntimeConfig::default()),
+        );
         specs.insert(
             "windowed".to_string(),
             NodeSpec::Lua {
@@ -2380,7 +2667,7 @@ mod tests {
 
     /// A minimal one-shot gate for tests: `wait()` blocks until `open()` is called, from anywhere,
     /// any time relative to `wait()` -- race-free via the same "register `notified()` before
-    /// checking state" idiom `SinkQueue` itself relies on (`sink_queue.rs`).
+    /// checking state" idiom `SinkQueue` itself relies on (`queue.rs`).
     #[derive(Clone)]
     struct Gate(Arc<GateState>);
 
@@ -2510,6 +2797,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -2518,6 +2806,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: influxdb_out(),
             },
@@ -2534,7 +2823,10 @@ mod tests {
         let gate = Gate::new();
         let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
-        specs.insert("in".to_string(), NodeSpec::Input(Box::new(BurstInput { batches })));
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(BurstInput { batches }), InputRuntimeConfig::default()),
+        );
         specs.insert(
             "out".to_string(),
             NodeSpec::Output(
@@ -2607,6 +2899,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -2615,6 +2908,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: influxdb_out(),
             },
@@ -2628,7 +2922,10 @@ mod tests {
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
             "in".to_string(),
-            NodeSpec::Input(Box::new(FiniteInput { batch: Some(batch) })),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
         );
         specs.insert(
             "out".to_string(),
@@ -2662,6 +2959,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -2670,6 +2968,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: influxdb_out(),
             },
@@ -2683,7 +2982,10 @@ mod tests {
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
             "in".to_string(),
-            NodeSpec::Input(Box::new(BurstInput { batches: vec![batch] })),
+            NodeSpec::Input(
+                Box::new(BurstInput { batches: vec![batch] }),
+                InputRuntimeConfig::default(),
+            ),
         );
         specs.insert(
             "out".to_string(),
@@ -2718,6 +3020,7 @@ mod tests {
             "in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -2726,6 +3029,7 @@ mod tests {
             "out".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 kind: influxdb_out(),
             },
@@ -2741,7 +3045,10 @@ mod tests {
 
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
-        specs.insert("in".to_string(), NodeSpec::Input(Box::new(FiniteBurstInput { batches })));
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(FiniteBurstInput { batches }), InputRuntimeConfig::default()),
+        );
         specs.insert(
             "out".to_string(),
             NodeSpec::Output(
@@ -2865,7 +3172,7 @@ mod tests {
         let telemetry = Telemetry::default();
         let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
         for batch in batches {
-            queue.push(batch, TraceContext::default()).await;
+            queue.push((batch, TraceContext::default())).await;
         }
         queue.close();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -3017,7 +3324,7 @@ mod tests {
         let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        queue.push(one_event_batch(1.0), TraceContext::default()).await;
+        queue.push((one_event_batch(1.0), TraceContext::default())).await;
 
         let queue_for_task = Arc::clone(&queue);
         // `write_loop` borrows `output` (it no longer owns it -- `run_output` does, normally);
@@ -3044,7 +3351,7 @@ mod tests {
         // above documents.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW).await;
 
-        queue.push(one_event_batch(2.0), TraceContext::default()).await;
+        queue.push((one_event_batch(2.0), TraceContext::default())).await;
         queue.close();
 
         let result = tokio::time::timeout(Duration::from_secs(5), handle)
@@ -3101,7 +3408,7 @@ mod tests {
         };
 
         // attempt 1: Permanent -- sets streak_since
-        queue.push(one_event_batch(1.0), TraceContext::default()).await;
+        queue.push((one_event_batch(1.0), TraceContext::default())).await;
 
         let queue_for_task = Arc::clone(&queue);
         let handle = tokio::spawn(async move {
@@ -3122,11 +3429,11 @@ mod tests {
         // reset the streak before the window is ever checked again.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
         // attempt 2: success -- resets the streak
-        queue.push(one_event_batch(2.0), TraceContext::default()).await;
+        queue.push((one_event_batch(2.0), TraceContext::default())).await;
         attempted_rx.recv().await.expect("attempt 2 (succeeding) should have happened");
 
         // attempt 3: Permanent again -- a fresh streak
-        queue.push(one_event_batch(3.0), TraceContext::default()).await;
+        queue.push((one_event_batch(3.0), TraceContext::default())).await;
         attempted_rx.recv().await.expect("attempt 3 (failing again) should have happened");
         queue.close();
 
@@ -3170,7 +3477,7 @@ mod tests {
         let (attempted_tx, mut attempted_rx) = mpsc::unbounded_channel();
         let output = AlwaysUnclassifiedFailure { attempted: attempted_tx };
 
-        queue.push(one_event_batch(1.0), TraceContext::default()).await;
+        queue.push((one_event_batch(1.0), TraceContext::default())).await;
         let queue_for_task = Arc::clone(&queue);
         let handle = tokio::spawn(async move {
             let mut output = output;
@@ -3188,7 +3495,7 @@ mod tests {
 
         // Well past the window, with nothing but this unclassified failure the whole time.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
-        queue.push(one_event_batch(2.0), TraceContext::default()).await;
+        queue.push((one_event_batch(2.0), TraceContext::default())).await;
         attempted_rx.recv().await.expect("a later attempt should have happened");
         queue.close();
 
@@ -3255,7 +3562,7 @@ mod tests {
         };
 
         // Permanent -- sets streak_since
-        queue.push(one_event_batch(1.0), TraceContext::default()).await;
+        queue.push((one_event_batch(1.0), TraceContext::default())).await;
         let queue_for_task = Arc::clone(&queue);
         let handle = tokio::spawn(async move {
             let mut output = output;
@@ -3278,12 +3585,12 @@ mod tests {
         // retry loop has already given up and committed batch 2 before batch 3 is pushed --
         // simpler and less brittle than trying to count exactly how many retries it took.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
-        queue.push(one_event_batch(2.0), TraceContext::default()).await;
+        queue.push((one_event_batch(2.0), TraceContext::default())).await;
         attempted_rx.recv().await.expect("batch 2's first attempt should have happened");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Permanent again -- must be a fresh streak
-        queue.push(one_event_batch(3.0), TraceContext::default()).await;
+        queue.push((one_event_batch(3.0), TraceContext::default())).await;
         attempted_rx.recv().await.expect("attempt 3 (Permanent) should have happened");
         queue.close();
 
@@ -3308,7 +3615,7 @@ mod tests {
 
         let telemetry = Telemetry::default();
         let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
-        queue.push(one_event_batch(1.0), TraceContext::default()).await;
+        queue.push((one_event_batch(1.0), TraceContext::default())).await;
         // Deliberately left open (not closed) -- shutdown grace must cut delivery off even while
         // the queue could still receive more, not just once it's known to be exhausted.
 
@@ -3616,6 +3923,7 @@ mod tests {
             "bad_in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -3624,6 +3932,7 @@ mod tests {
             "bad".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["bad_in".to_string()],
                 kind: influxdb_out(),
             },
@@ -3632,6 +3941,7 @@ mod tests {
             "good_in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -3640,6 +3950,7 @@ mod tests {
             "good".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["good_in".to_string()],
                 kind: influxdb_out(),
             },
@@ -3653,7 +3964,10 @@ mod tests {
         let (delivered_tx, mut delivered_rx) = mpsc::unbounded_channel();
 
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
-        specs.insert("bad_in".to_string(), NodeSpec::Input(Box::new(ChannelInput { rx: bad_rx })));
+        specs.insert(
+            "bad_in".to_string(),
+            NodeSpec::Input(Box::new(ChannelInput { rx: bad_rx }), InputRuntimeConfig::default()),
+        );
         specs.insert(
             "bad".to_string(),
             NodeSpec::Output(
@@ -3662,8 +3976,10 @@ mod tests {
                 WriteLoopConfig::default(),
             ),
         );
-        specs
-            .insert("good_in".to_string(), NodeSpec::Input(Box::new(ChannelInput { rx: good_rx })));
+        specs.insert(
+            "good_in".to_string(),
+            NodeSpec::Input(Box::new(ChannelInput { rx: good_rx }), InputRuntimeConfig::default()),
+        );
         specs.insert(
             "good".to_string(),
             NodeSpec::Output(
@@ -3819,6 +4135,7 @@ mod tests {
             "bad1_in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -3827,6 +4144,7 @@ mod tests {
             "bad1".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["bad1_in".to_string()],
                 kind: influxdb_out(),
             },
@@ -3835,6 +4153,7 @@ mod tests {
             "bad2_in".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
             },
@@ -3843,6 +4162,7 @@ mod tests {
             "bad2".to_string(),
             Component {
                 buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["bad2_in".to_string()],
                 kind: influxdb_out(),
             },
@@ -3862,8 +4182,10 @@ mod tests {
         };
 
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
-        specs
-            .insert("bad1_in".to_string(), NodeSpec::Input(Box::new(ChannelInput { rx: bad1_rx })));
+        specs.insert(
+            "bad1_in".to_string(),
+            NodeSpec::Input(Box::new(ChannelInput { rx: bad1_rx }), InputRuntimeConfig::default()),
+        );
         specs.insert(
             "bad1".to_string(),
             NodeSpec::Output(
@@ -3875,8 +4197,10 @@ mod tests {
                 generous_grace,
             ),
         );
-        specs
-            .insert("bad2_in".to_string(), NodeSpec::Input(Box::new(ChannelInput { rx: bad2_rx })));
+        specs.insert(
+            "bad2_in".to_string(),
+            NodeSpec::Input(Box::new(ChannelInput { rx: bad2_rx }), InputRuntimeConfig::default()),
+        );
         specs.insert(
             "bad2".to_string(),
             NodeSpec::Output(
@@ -4194,7 +4518,7 @@ mod tests {
         let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
         let (mut output, _handles) = faulty_output(Fault::Permanent, u32::MAX, false);
         let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
-        queue.push(one_event_batch(1.0), TraceContext::new_root()).await;
+        queue.push((one_event_batch(1.0), TraceContext::new_root())).await;
         queue.close();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -4227,7 +4551,7 @@ mod tests {
         let (mut output, _handles) = faulty_output(Fault::Clean, 0, false);
         let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
         let parent = TraceContext::new_root();
-        queue.push(one_event_batch(1.0), parent).await;
+        queue.push((one_event_batch(1.0), parent)).await;
         queue.close();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 

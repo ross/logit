@@ -57,6 +57,17 @@ impl Diagnostics {
         eprintln!("component '{}': {msg}", self.component_id);
     }
 
+    /// Mainly for tests: lets a caller confirm which id a `Diagnostics` value actually carries,
+    /// e.g. after a builder chain is supposed to have propagated one into a nested component (a
+    /// decoder wrapped by a listener, say) that has no other way to expose it. Not `#[cfg(test)]`
+    /// -- a cross-crate test (`logit-inputs`' own test module, checking a value built in
+    /// `logit-core`) needs this compiled into `logit-core`'s normal build, since `#[cfg(test)]`
+    /// items are never visible outside the crate that defines them, even to a dependent crate's
+    /// own tests.
+    pub fn component_id(&self) -> &str {
+        &self.component_id
+    }
+
     /// Reports the 1st, 2nd, 4th, 8th, ... occurrence of `key` (each naming the running total) and
     /// suppresses the rest -- bounded stderr volume under a flood of the same complaint (e.g. one
     /// malformed line per request) without needing a clock. A time-window limiter was the more

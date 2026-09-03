@@ -135,6 +135,75 @@ the config. The two most directly actionable for buffering:
   here is data loss worth alerting on; which `reason` tells you whether the cause is an overflowing
   queue, a failing destination, or a slow drain racing shutdown.
 
+## Listener intake
+
+Every UDP listener (`statsd_in`, `syslog_in`) sits in front of a per-component, in-memory receive
+queue that decouples reading the socket from decoding and batching what it received
+([ADR 0027](adr/0027-decoupled-listener-io.md)) — the listener-side sibling of the sink delivery
+buffering above. This is what lets a slow or backed-up destination downstream be ridden out without
+the socket itself going unread. It's tunable per listener via a `receive:` block on that component
+(`receive:` is rejected at validation time on anything but a datagram listener) — see the commented
+example in [`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml). Every field
+defaults, so an omitted `receive:` is the values below.
+
+### Failure semantics: `drop_oldest`, not `block` — the opposite default from `buffer:`
+
+`buffer:`'s default is `block`, and that's the right call there: the producer being backpressured
+is an in-process drain that can afford to wait. `receive:`'s default is `drop_oldest`, and that's
+deliberately the opposite call, for a reason worth understanding rather than just remembering: the
+producer behind a UDP listener is the kernel's socket receive buffer, which *cannot* wait. Setting
+`receive.overflow: block` doesn't prevent loss under sustained overload, it just relocates it from a
+place `logit` can count and report (`logit.component.datagrams.dropped`) to a place it can't see at
+all (the kernel silently discarding into a counter this process never reads). Every mature UDP
+listener in the field — syslog-ng, rsyslog, Telegraf, gostatsd — treats this the same way. Leave
+`overflow` at its default unless you have a specific reason to want backpressure to propagate all
+the way back to the sender instead.
+
+- `overflow: drop_oldest` (the default) or `drop_newest` both keep the socket being read
+  unconditionally, evicting from the queue instead. `drop_oldest` favors fresh data over stale under
+  sustained overload; `drop_newest` favors whatever's already queued, at the cost of losing an
+  entire burst's tail once the queue fills, since a full queue then stays full.
+- `overflow: block` genuinely stops `recv_from` once the queue is full — the one configuration
+  under which this listener can itself apply backpressure, and the one place `receive.push.blocked.
+  duration` (below) actually records anything.
+- On SIGTERM/SIGINT, the listener gets up to `receive.shutdown_grace` (5s by default) to decode and
+  deliver whatever's still queued before the process exits; whatever's still queued past that
+  deadline is dropped, uncounted (nothing is left running to count it once the grace expires).
+
+### Sizing, and `SO_RCVBUF`
+
+`receive.max_bytes` (32MiB default) and `receive.max_datagrams` (10,000 default) bound the receive
+queue itself — undecoded bytes, not decoded events — whichever trips first. `receive.
+batch_max_events`/`batch_max_bytes` (1,000 / 1MiB default) are a second, independent bound one
+layer downstream: how much a listener accumulates across datagrams before sending one batch on,
+capped by `batch_flush_interval` (100ms default) regardless of size so a quiet listener never stalls
+data waiting to fill a batch.
+
+`receive.receive_buffer_bytes` requests a specific `SO_RCVBUF` at bind time (omitted, the default,
+leaves the kernel's own default alone). Linux doubles whatever you request for its own bookkeeping,
+so a successful request routinely reports back roughly 2× what was asked — `logit` accounts for
+that when deciding whether to warn. If you do set this and see a startup warning naming
+`net.core.rmem_max`, that sysctl is clamping the request below what you asked for; raise it to get
+the full requested size. The granted value is always gauged
+(`logit.input.receive_buffer.bytes`), even when you never set an override, so you can see the
+kernel default before deciding whether to raise it.
+
+### What to watch
+
+- `logit.component.receive.utilization` (gauge) — the fill ratio of whichever of `max_datagrams`/
+  `max_bytes` is closer to tripping. Sustained values near 1.0 mean decode is falling behind the
+  socket; under `block`, that's also back-pressuring the sender (or, for a local process, the OS).
+- `logit.component.datagrams.dropped` / `.bytes.dropped` (count, tagged `reason`:
+  `overflow_oldest`/`overflow_newest`) — every datagram this listener itself decided to drop. This
+  is *better* news than it sounds: it's the visible, attributable counterpart to a kernel drop you'd
+  otherwise never see at all. A sustained nonzero rate here means the listener is genuinely
+  overloaded relative to how fast downstream is decoding/consuming, and is worth sizing `receive:`
+  or the downstream chain against.
+- `logit.component.receive.latency` (timing) — arrival-to-dequeue per datagram. Since decode now
+  runs on its own loop, this is the number that says whether event timestamps (always receipt time,
+  stamped at arrival, never decode time) are still trustworthy under load — a healthy listener keeps
+  this small; a climbing value under sustained load means decode is genuinely falling behind.
+
 ## Gauge retention
 
 `aggregate` normally drains every series on every flush (tumbling). A statsd gauge is an

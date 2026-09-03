@@ -16,9 +16,11 @@
 //! on a false positive), but observable the day RFC 5424 defines a version past `1` and a real
 //! sender's lines start hitting it.
 //!
-//! **Timestamp semantics.** Every emitted [`Event`]'s `timestamp` is *receipt* time
-//! (`now_nanos()`, once per datagram, exactly like [`crate::statsd::StatsdDecoder`]) -- never the
-//! sender's own timestamp. RFC 3164's timestamp carries no year and no timezone, so resolving it
+//! **Timestamp semantics.** Every emitted [`Event`]'s `timestamp` is *receipt* time -- the
+//! `received_at` passed into [`SyslogDecoder::decode_into`], captured by the read half at the
+//! moment the datagram came off the socket (`docs/adr/0027-decoupled-listener-io.md`), not
+//! whenever decode happens to run -- never the sender's own timestamp. RFC 3164's timestamp
+//! carries no year and no timezone, so resolving it
 //! to an instant means guessing both; doing that only for RFC 5424 (whose timestamp *is*
 //! unambiguous) would silently give two senders on one listener different timestamp semantics.
 //! The sender's own timestamp is not discarded -- it lands in the `syslog.timestamp` attribute
@@ -72,42 +74,62 @@
 //! technically end in `:` -- silently eating part of the body as a fake tag. Restricting the
 //! character class rules that out: `{"status"` contains `{`/`"`, which no real tag ever does.
 
+use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use bytes::Bytes;
 use logit_core::{
-    AttrMap, BodyFormat, Diagnostics, Event, EventBatch, LogRecord, Resource, Severity, Telemetry,
-    Value,
+    AttrMap, BodyFormat, Diagnostics, Event, LogRecord, Resource, Severity, Telemetry, Value,
 };
 use logit_pipeline::Fanout;
 use logit_proto::{CodecError, Decoder};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::net::UdpSocket;
+use tokio::sync::watch;
 
+/// Thin wrapper over [`UdpListener<SyslogDecoder>`] -- the read/decode split and datagram-\>batch
+/// assembly all live there (`docs/adr/0027-decoupled-listener-io.md`); this type is just the
+/// decoder choice plus the public constructor/builder surface `logit-cli::pipeline` and this
+/// module's own tests already depend on.
 pub struct SyslogInput {
-    pub bind: String,
-    diag: Diagnostics,
-    /// Component-specific detail beyond the runtime's uniform layer-2 metrics (`docs/design/
-    /// internal-telemetry.md`'s "layer 3") -- how many datagrams and bytes actually arrived on
-    /// the wire, mirroring `StatsdInput`'s own worked example.
-    telemetry: Telemetry,
+    inner: UdpListener<SyslogDecoder>,
 }
 
 impl SyslogInput {
     pub fn new(bind: impl Into<String>) -> Self {
-        Self { bind: bind.into(), diag: Diagnostics::default(), telemetry: Telemetry::default() }
+        Self {
+            inner: UdpListener::new(
+                bind,
+                SyslogDecoder::new(Arc::new(Resource::default())),
+                UdpListenerConfig::default(),
+            ),
+        }
     }
 
     /// Attaches a component id to this listener's diagnostics -- and to the [`SyslogDecoder`] it
-    /// constructs in `run`, so both report under the same id.
+    /// wraps, so both report under the same id. Both halves matter: `UdpListener`'s own
+    /// `diag` is what a whole-datagram decode failure reports through
+    /// (`decode_loop`'s `bad_datagram`); the decoder's own `diag` field is what a malformed
+    /// *line* inside an otherwise-valid datagram reports through (`bad_line`) -- two distinct
+    /// `Diagnostics` values that must both carry the same id and telemetry handle, or one class
+    /// of decode failure silently reports under no component id and with telemetry disabled.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.diag = diag;
+        self.inner =
+            self.inner.with_diagnostics(diag.clone()).map_decoder(|d| d.with_diagnostics(diag));
         self
     }
 
-    /// Attaches a telemetry handle -- see the `telemetry` field's doc comment.
+    /// Attaches a telemetry handle -- component-specific detail beyond the runtime's uniform
+    /// layer-2 metrics (`docs/design/internal-telemetry.md`'s "layer 3"): how many datagrams and
+    /// bytes actually arrived on the wire, mirroring `StatsdInput`'s own worked example.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.telemetry = telemetry;
+        self.inner = self.inner.with_telemetry(telemetry);
+        self
+    }
+
+    /// Overrides the receive-queue/batching/shutdown-grace knobs a `receive:` config block sets
+    /// (`docs/adr/0027-decoupled-listener-io.md`). Defaults to [`UdpListenerConfig::default`] --
+    /// today's behaviour -- when never called.
+    pub fn with_receive(mut self, config: UdpListenerConfig) -> Self {
+        self.inner = self.inner.with_config(config);
         self
     }
 }
@@ -115,31 +137,15 @@ impl SyslogInput {
 #[async_trait::async_trait]
 impl Input for SyslogInput {
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
-        let socket = UdpSocket::bind(&self.bind).await?;
-        let mut decoder =
-            SyslogDecoder::new(Arc::new(Resource::default())).with_diagnostics(self.diag.clone());
-        // The largest possible UDP payload (65535 minus the 8-byte UDP header) -- same bound
-        // `StatsdInput` uses.
-        let mut buf = vec![0u8; 65_507];
-        loop {
-            let (n, _peer) = socket.recv_from(&mut buf).await?;
-            self.telemetry.count("logit.input.datagrams", 1.0, &[]);
-            self.telemetry.count("logit.input.datagram.bytes", n as f64, &[]);
-            let bytes = Bytes::copy_from_slice(&buf[..n]);
-            match decoder.decode(bytes) {
-                Ok(batch) if !batch.events.is_empty() => {
-                    // `Fanout::send` has no per-consumer failure signal to react to -- a closed
-                    // consumer is silently skipped (`docs/design/pipeline-graph.md`'s backpressure
-                    // section notes this as a named open question, not solved here).
-                    sink.send(batch).await;
-                }
-                Ok(_) => {} // empty datagram
-                Err(err) => {
-                    // A malformed line from one client shouldn't take the whole listener down.
-                    self.diag.warn_throttled("bad_datagram", err);
-                }
-            }
-        }
+        self.inner.run(sink).await
+    }
+
+    async fn run_until_shutdown(
+        &mut self,
+        sink: Fanout,
+        shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        self.inner.run_until_shutdown(sink, shutdown).await
     }
 }
 
@@ -159,13 +165,23 @@ impl SyslogDecoder {
         self.diag = diag;
         self
     }
+
+    /// Test-only: confirms `SyslogInput::with_diagnostics` actually reached this decoder's own
+    /// `diag`, not just `UdpListener`'s.
+    #[cfg(test)]
+    pub(crate) fn diag(&self) -> &Diagnostics {
+        &self.diag
+    }
 }
 
 impl Decoder for SyslogDecoder {
-    fn decode(&mut self, bytes: Bytes) -> Result<EventBatch, CodecError> {
-        let timestamp = now_nanos();
-        let mut events = Vec::new();
-        // Per line, not per datagram -- exactly `StatsdDecoder::decode`'s precedent. nginx's
+    fn decode_into(
+        &mut self,
+        bytes: Bytes,
+        received_at: i64,
+        out: &mut Vec<Event>,
+    ) -> Result<Arc<Resource>, CodecError> {
+        // Per line, not per datagram -- exactly `StatsdDecoder::decode_into`'s precedent. nginx's
         // `escape=json` guarantees no raw newline inside an access-log body, so this split is
         // safe for the target workload. Splitting happens on the raw bytes, before any UTF-8
         // validation, so one line with an invalid UTF-8 byte can't reject its siblings -- see the
@@ -182,8 +198,8 @@ impl Decoder for SyslogDecoder {
             // *not* whitespace-only content, which is real MSG data, not framing.
             if !line.is_empty() {
                 match std::str::from_utf8(&line) {
-                    Ok(text) => match parse_line(&line, text, timestamp, &mut self.diag) {
-                        Ok(event) => events.push(event),
+                    Ok(text) => match parse_line(&line, text, received_at, &mut self.diag) {
+                        Ok(event) => out.push(event),
                         Err(err) => {
                             self.diag.warn_throttled("bad_line", err);
                         }
@@ -201,12 +217,8 @@ impl Decoder for SyslogDecoder {
                 None => break,
             }
         }
-        Ok(EventBatch { resource: self.resource.clone(), events })
+        Ok(self.resource.clone())
     }
-}
-
-fn now_nanos() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64
 }
 
 /// Reconstructs a `Bytes` sharing the line's underlying allocation for `sub`, a substring derived
@@ -804,6 +816,50 @@ mod tests {
     fn decode(datagram: &str) -> Vec<Event> {
         let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
         decoder.decode(Bytes::from(datagram.to_string())).expect("decode should succeed").events
+    }
+
+    /// Regression: `SyslogInput::with_diagnostics` used to only set `UdpListener`'s own `diag`,
+    /// never reaching the wrapped `SyslogDecoder`'s -- so a malformed *line* (as opposed to a
+    /// whole malformed datagram) reported through a permanently unnamed, telemetry-disabled
+    /// `Diagnostics::default()`, regardless of what the component was actually configured with.
+    #[test]
+    fn with_diagnostics_reaches_the_wrapped_decoder_too() {
+        let input = SyslogInput::new("127.0.0.1:0").with_diagnostics(Diagnostics::new("my-id"));
+        assert_eq!(input.inner.decoder().diag().component_id(), "my-id");
+    }
+
+    /// `decode_into` must stamp every event with the caller's `received_at`, not a fresh
+    /// call-time clock read -- the property `docs/adr/0027-decoupled-listener-io.md` exists for:
+    /// once decode runs on its own loop, "now" at decode time can be arbitrarily later than
+    /// arrival under backlog, and this module's own doc comment promises `timestamp` is receipt
+    /// time, not decode time.
+    #[test]
+    fn decode_into_stamps_events_with_the_callers_received_at_not_the_current_time() {
+        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
+        let deliberately_not_now: i64 = 123;
+        let mut out = Vec::new();
+        decoder
+            .decode_into(
+                Bytes::from_static(b"<134>1 - - - - - - test"),
+                deliberately_not_now,
+                &mut out,
+            )
+            .expect("decode should succeed");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].timestamp, deliberately_not_now);
+    }
+
+    /// `decode_into` appends to `out` rather than replacing it -- the property that lets a caller
+    /// accumulate several datagrams' events into one reused buffer
+    /// (`logit_pipeline::BatchAccumulator`) instead of allocating fresh per datagram.
+    #[test]
+    fn decode_into_appends_to_an_already_populated_out_buffer_rather_than_replacing_it() {
+        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
+        let mut out = vec![Event::empty(0, AttrMap::new())];
+        decoder
+            .decode_into(Bytes::from_static(b"<134>1 - - - - - - test"), 1, &mut out)
+            .expect("decode should succeed");
+        assert_eq!(out.len(), 2, "the pre-existing event must survive, plus the newly decoded one");
     }
 
     fn only_event(events: Vec<Event>) -> Event {

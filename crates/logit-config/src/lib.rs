@@ -48,6 +48,12 @@ pub struct Component {
     /// `ComponentKind` variant, so a future fifth sink kind costs nothing extra here.
     #[serde(default)]
     pub buffer: BufferConfig,
+    /// Per-listener receive queue and batching (`docs/adr/0027-decoupled-listener-io.md`).
+    /// Meaningful only on a datagram listener -- graph validation rejects a non-default value on
+    /// any other kind, `internal` included. A sibling field of `kind`, mirroring `buffer`'s own
+    /// placement.
+    #[serde(default)]
+    pub receive: ReceiveConfig,
     #[serde(flatten)]
     pub kind: ComponentKind,
 }
@@ -560,6 +566,85 @@ pub enum DeliveryPosture {
     AtMostOnce,
 }
 
+/// Per-listener receive queue and datagram-\>batch assembly
+/// (`docs/adr/0027-decoupled-listener-io.md`). Meaningful only on a datagram listener (today
+/// `statsd_in`/`syslog_in`); graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a
+/// non-default value on any other kind, including `internal` (a listener by role, but one with no
+/// socket, no queue, and no decoder). Flat, following [`BufferConfig`]'s own
+/// `retry_budget`/`retry_max_delay` precedent rather than nesting a `batch:` sub-block -- two
+/// levels of optional-with-defaults is harder to scan in YAML than a flat prefix. Every field
+/// defaults, so a `receive:` block is never required -- **but an omitted block is not byte-for-
+/// byte the pre-ADR-0027 behavior**, and isn't meant to be: `batch_max_events: 1_000` and
+/// `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into
+/// batches (up to 1000 events, or up to 100ms of added latency before a send) rather than sending
+/// one batch per datagram immediately, matching what every established UDP listener researched
+/// for ADR 0027 does out of the box. A deployment that genuinely needs the old one-send-per-
+/// datagram, no-added-latency behavior gets it back explicitly with `batch_max_events: 1`, not by
+/// omitting `receive:`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct ReceiveConfig {
+    /// Datagrams the read half may hold ahead of the decode half.
+    pub max_datagrams: usize,
+    /// Byte bound on the queue (undecoded datagram bytes, not `estimated_heap_bytes`), checked
+    /// alongside `max_datagrams` -- whichever trips first.
+    #[serde(with = "human_bytes")]
+    #[schemars(with = "String")]
+    pub max_bytes: u64,
+    /// What happens once both bounds are full. Defaults to `drop_oldest`, **deliberately unlike
+    /// `buffer:`'s `block`**: blocking a sink's producer backpressures an in-process drain that
+    /// can wait, while blocking a UDP reader backpressures the kernel, which cannot -- the kernel
+    /// just discards the datagram into a counter this process never reads. `block` relocates loss
+    /// out of view rather than preventing it; every mature UDP listener (syslog-ng, rsyslog,
+    /// Telegraf, gostatsd) treats this the same way.
+    pub overflow: OverflowPolicy,
+    /// Events to accumulate across datagrams before one send downstream. `1` means one send per
+    /// datagram -- the behavior before ADR 0027 -- since the accumulator flushes on a bound
+    /// *reached or exceeded* and never splits a single decode's output. `0` is rejected as an
+    /// impossible bound (graph rule 18, the twin of rule 15's `buffer.max_batches: 0` check).
+    pub batch_max_events: usize,
+    #[serde(with = "human_bytes")]
+    #[schemars(with = "String")]
+    pub batch_max_bytes: u64,
+    /// Longest an accumulated batch waits before being sent regardless of size. `0s` disables the
+    /// timer entirely (the two bounds above are then the only trigger) -- unlike the count
+    /// bounds, zero here is a meaningful setting, not an impossible one, and is not rejected.
+    #[serde(with = "humantime_serde_duration")]
+    #[schemars(with = "String")]
+    pub batch_flush_interval: Duration,
+    /// `SO_RCVBUF`, requested at bind. `None` -- the default -- leaves the kernel default alone:
+    /// a nonzero default here would exceed most stock kernels' `net.core.rmem_max` (212992 B) and
+    /// warn on every first run, training operators to ignore the one warning that matters.
+    #[serde(with = "human_bytes::option")]
+    #[schemars(with = "Option<String>")]
+    pub receive_buffer_bytes: Option<u64>,
+    /// How long a listener keeps draining a cooperative shutdown before being cancelled by drop
+    /// (`docs/adr/0027-decoupled-listener-io.md`, revising ADR 0013's unconditional cancel-by-drop
+    /// into a bounded one). Matches `buffer.shutdown_grace`'s default so both ends of the
+    /// pipeline drain on the same number.
+    #[serde(with = "humantime_serde_duration")]
+    #[schemars(with = "String")]
+    pub shutdown_grace: Duration,
+}
+
+/// Defaults, justified against established UDP listeners' own tuning figures -- see
+/// `docs/adr/0027-decoupled-listener-io.md` for the full numeric derivation (Telegraf, gostatsd,
+/// DogStatsD, rsyslog, syslog-ng).
+impl Default for ReceiveConfig {
+    fn default() -> Self {
+        Self {
+            max_datagrams: 10_000,
+            max_bytes: 32 * 1024 * 1024,
+            overflow: OverflowPolicy::DropOldest,
+            batch_max_events: 1_000,
+            batch_max_bytes: 1024 * 1024,
+            batch_flush_interval: Duration::from_millis(100),
+            receive_buffer_bytes: None,
+            shutdown_grace: Duration::from_secs(5),
+        }
+    }
+}
+
 /// A human-readable byte-size codec (`134217728`, `64MiB`, `128KiB`, `1GiB`) for `BufferConfig::
 /// max_bytes`, mirroring `humantime_serde_duration`'s shape below -- hand-rolled rather than a new
 /// crate dependency, consistent with that module's own reasoning. Binary (1024-based) units only,
@@ -706,6 +791,84 @@ mod human_bytes {
             }
             let json = serde_json::to_string(&W { bytes: 64 * 1024 * 1024 }).unwrap();
             assert_eq!(json, r#"{"bytes":"67108864"}"#);
+        }
+    }
+
+    /// The same codec, for `Option<u64>` fields (`#[serde(default, with =
+    /// "human_bytes::option")]`) -- used by `ReceiveConfig::receive_buffer_bytes`
+    /// (`docs/adr/0027-decoupled-listener-io.md`), where `None` means "leave the kernel default
+    /// alone" rather than a byte count of zero. Mirrors `humantime_serde_duration::option`'s
+    /// shape exactly: a nested module because `#[serde(with = "...")]` on an `Option<u64>` field
+    /// calls *this* module's `serialize`/`deserialize` with `Option<u64>`, not the parent's `u64`
+    /// ones. Still string-only in both directions -- `None` serializes as JSON/YAML null, `Some`
+    /// as the same quoted string the parent codec produces.
+    pub mod option {
+        use serde::{Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(bytes: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+            match bytes {
+                Some(bytes) => super::serialize(bytes, s),
+                None => s.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = Option<u64>;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a byte count string (e.g. \"64MiB\") or null")
+                }
+
+                fn visit_none<E: serde::de::Error>(self) -> Result<Option<u64>, E> {
+                    Ok(None)
+                }
+
+                fn visit_unit<E: serde::de::Error>(self) -> Result<Option<u64>, E> {
+                    Ok(None)
+                }
+
+                fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Option<u64>, D::Error> {
+                    super::deserialize(d).map(Some)
+                }
+            }
+            d.deserialize_option(Visitor)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+            struct Wrapper {
+                #[serde(default, with = "super")]
+                bytes: Option<u64>,
+            }
+
+            #[test]
+            fn round_trips_none_as_null() {
+                let w: Wrapper = serde_json::from_str(r#"{"bytes": null}"#).unwrap();
+                assert_eq!(w.bytes, None);
+                assert_eq!(serde_json::to_string(&w).unwrap(), r#"{"bytes":null}"#);
+            }
+
+            #[test]
+            fn an_omitted_field_defaults_to_none() {
+                let w: Wrapper = serde_json::from_str("{}").unwrap();
+                assert_eq!(w.bytes, None);
+            }
+
+            #[test]
+            fn round_trips_a_quoted_size_as_some() {
+                let w: Wrapper = serde_json::from_str(r#"{"bytes": "8MiB"}"#).unwrap();
+                assert_eq!(w.bytes, Some(8 * 1024 * 1024));
+                assert_eq!(serde_json::to_string(&w).unwrap(), r#"{"bytes":"8388608"}"#);
+            }
+
+            #[test]
+            fn an_unquoted_number_is_still_rejected_when_present() {
+                let err = serde_json::from_str::<Wrapper>(r#"{"bytes": 8388608}"#).unwrap_err();
+                assert!(err.to_string().contains("byte count string"), "got: {err}");
+            }
         }
     }
 }
@@ -1047,6 +1210,7 @@ mod tests {
         let original = Component {
             sources: vec!["in".to_string()],
             buffer: BufferConfig::default(),
+            receive: ReceiveConfig::default(),
             kind: ComponentKind::Lua {
                 script: "x".to_string(),
                 interval: Some(Duration::from_secs(30)),
@@ -1166,6 +1330,87 @@ mod tests {
                 "buffer": {"bogus_field": 1}}"#,
         );
         assert!(result.is_err(), "an unknown buffer field should be rejected");
+    }
+
+    #[test]
+    fn component_with_no_receive_block_defaults_to_receiveconfig_default() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "statsd_in", "bind": "0.0.0.0:8125"}"#).unwrap();
+        assert_eq!(component.receive, ReceiveConfig::default());
+    }
+
+    #[test]
+    fn an_empty_receive_block_deserializes_to_every_default() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "receive": {}}"#)
+                .unwrap();
+        assert_eq!(component.receive, ReceiveConfig::default());
+    }
+
+    #[test]
+    fn a_fully_specified_receive_block_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "statsd_in", "bind": "0.0.0.0:8125",
+                "receive": {"max_datagrams": 4096, "max_bytes": "16MiB", "overflow": "block",
+                            "batch_max_events": 500, "batch_max_bytes": "512KiB",
+                            "batch_flush_interval": "250ms", "receive_buffer_bytes": "8MiB",
+                            "shutdown_grace": "10s"}}"#,
+        )
+        .unwrap();
+        assert_eq!(component.receive.max_datagrams, 4096);
+        assert_eq!(component.receive.max_bytes, 16 * 1024 * 1024);
+        assert_eq!(component.receive.overflow, OverflowPolicy::Block);
+        assert_eq!(component.receive.batch_max_events, 500);
+        assert_eq!(component.receive.batch_max_bytes, 512 * 1024);
+        assert_eq!(component.receive.batch_flush_interval, Duration::from_millis(250));
+        assert_eq!(component.receive.receive_buffer_bytes, Some(8 * 1024 * 1024));
+        assert_eq!(component.receive.shutdown_grace, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn each_receive_overflow_variant_deserializes() {
+        // Same enum as `buffer.overflow` (`OverflowPolicy`) -- `each_overflow_variant_deserializes`
+        // above already covers the type itself; this just confirms `receive.overflow` actually
+        // wires to it.
+        for (raw, expected) in [
+            ("block", OverflowPolicy::Block),
+            ("drop_oldest", OverflowPolicy::DropOldest),
+            ("drop_newest", OverflowPolicy::DropNewest),
+        ] {
+            let component: Component = serde_json::from_str(&format!(
+                r#"{{"type": "statsd_in", "bind": "0.0.0.0:8125",
+                    "receive": {{"overflow": "{raw}"}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(component.receive.overflow, expected);
+        }
+    }
+
+    #[test]
+    fn receive_buffer_bytes_omitted_stays_none() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "receive": {}}"#)
+                .unwrap();
+        assert_eq!(component.receive.receive_buffer_bytes, None);
+    }
+
+    #[test]
+    fn receive_buffer_bytes_explicit_null_stays_none() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "statsd_in", "bind": "0.0.0.0:8125",
+                "receive": {"receive_buffer_bytes": null}}"#,
+        )
+        .unwrap();
+        assert_eq!(component.receive.receive_buffer_bytes, None);
+    }
+
+    #[test]
+    fn an_unknown_field_under_receive_is_rejected() {
+        let result: Result<Component, _> = serde_json::from_str(
+            r#"{"type": "statsd_in", "bind": "0.0.0.0:8125",
+                "receive": {"bogus_field": 1}}"#,
+        );
+        assert!(result.is_err(), "an unknown receive field should be rejected");
     }
 
     #[test]

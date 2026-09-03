@@ -73,7 +73,12 @@ those spans, and the `internal` metrics alongside them, out over the wire (both 
 OTLP/gRPC, a hand-rolled unary gRPC client/server over `hyper` rather than `tonic`,
 [ADR 0024](docs/adr/0024-hand-rolled-grpc-over-hyper.md)); `otlp_in` is the mirror, implemented and
 tested but not yet exercised by the demo. `demo/`'s `trace_out` proves the whole chain against a
-real Tempo, exactly the way `log_out` proves `syslog_out` against a real Loki.
+real Tempo, exactly the way `log_out` proves `syslog_out` against a real Loki. `statsd_in`/`syslog_in`
+(`crates/logit-inputs/src/statsd.rs`/`syslog.rs`) are now thin wrappers over a shared
+`logit-inputs::udp::UdpListener` driver: a UDP listener's socket read and its decode/batch-assembly
+loop run decoupled through a `ReceiveQueue`, the listener-side mirror of `SinkQueue`'s sink-side
+decoupling, so a stalled downstream no longer stops the socket being read; see
+[ADR 0027](docs/adr/0027-decoupled-listener-io.md) and the `receive:` config block it introduces.
 
 ## Environment
 

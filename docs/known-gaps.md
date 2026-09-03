@@ -20,38 +20,69 @@ already built that have a known, accepted rough edge.
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`), and
   every sink now sits behind a bounded, byte-aware `SinkQueue`
-  (`crates/logit-pipeline/src/sink_queue.rs`) that keeps accepting while a delivery attempt is in
+  (`crates/logit-pipeline/src/queue.rs`) that keeps accepting while a delivery attempt is in
   flight or backing off, with retry (`RetryConfig`, up to 60s by default) and fault-classification-
   driven duplicate-safety (`Fault`/`DeliveryPosture`, `crates/logit-pipeline/src/output.rs`) moved
   behind that boundary ([ADR 0021](adr/0021-buffered-sink-delivery.md)). A persistent failure no
   longer ends `logit run` by default — it degrades to dropping the offending batch and continuing,
   exiting only after a sustained ~60s window of nothing but configuration-error (`Fault::Permanent`)
   failures. What's left, genuinely open:
-  - **No durable (disk-backed) buffering** — the queue is in-memory only; a process restart loses
-    whatever it was holding. Plausibly config-optional even once it lands, since not every
-    deployment needs cross-restart durability; blocked on the `rkyv`-vs-hand-rolled wire encoding
-    decision ([wire-protocol.md](design/wire-protocol.md)), which this deliberately does not settle
-    in passing.
+  - **No durable (disk-backed) buffering** — both the sink's `SinkQueue` and (since
+    [ADR 0027](adr/0027-decoupled-listener-io.md)) a UDP listener's `ReceiveQueue` are in-memory
+    only; a process restart, SIGKILL, or a shutdown grace that expires mid-drain loses whatever
+    either was holding. Plausibly config-optional even once it lands, since not every deployment
+    needs cross-restart durability; blocked on the `rkyv`-vs-hand-rolled wire encoding decision
+    ([wire-protocol.md](design/wire-protocol.md)), which this deliberately does not settle in
+    passing.
   - **No end-to-end acknowledgement** — delivery is confirmed only as far as the immediate
-    destination accepting the write; nothing tracks whether the data survives past that point.
+    destination accepting the write; nothing tracks whether the data survives past that point. The
+    receive-side loss this used to also name (a UDP listener losing datagrams before anything
+    reaches a buffer) narrowed with ADR 0027: a listener now counts every datagram it drops itself
+    (`logit.component.datagrams.dropped`); what remains uncounted is the kernel's own drop, before
+    `logit` ever sees the datagram — see the new kernel-drop-visibility entry below.
   - **No out-of-order/credit-based acknowledgement** — `SinkQueue` is deliberately in-order and
     single-in-flight (one queue, one writer, `peek`-then-`commit`-the-head only). Several in-flight
     batches acknowledged out of order is real future scope for the native wire protocol's
     credit-based flow control, not built or designed yet.
-- **Delivery I/O is not decoupled from event processing within a node: listener half only, sink half
-  closed.** Each component is its own tokio task, but *within* one node, I/O and processing used to
-  share a single sequential path on both the sink and the listener side. The sink half is fixed
-  ([ADR 0021](adr/0021-buffered-sink-delivery.md), directly above): `run_output`
-  (`crates/logit-pipeline/src/runtime.rs`) now splits into a drain half (`drain_inbox`) and a writer
-  half (`write_loop`) sharing the `SinkQueue`, so a slow or retrying sink no longer stops draining
-  its own inbox. **The listener half remains fully open**: `StatsdInput::run`
-  (`crates/logit-inputs/src/statsd.rs`, and `syslog_in`'s equivalent loop) still interleaves
-  `recv_from`, decode, and `Fanout::send` in one path, so downstream backpressure still stops a
-  listener from reading its socket, and the kernel still drops datagrams silently and uncounted.
-  Decoupling the sink side makes that backpressure rarer — a slow InfluxDB no longer stalls the
-  whole chain behind it — but does not remove the listener-side hazard itself, which needs its own
-  design (likely the same drain/writer split, applied to `Input::run` instead of `Output::send`) and
-  its own plan once there's a reason to prioritize it over other gaps here.
+- **No visibility into the kernel's own UDP receive-buffer drops.** A listener's `ReceiveQueue`
+  ([ADR 0027](adr/0027-decoupled-listener-io.md), directly above) counts every datagram *it* drops,
+  but a datagram the kernel discards before `recv_from` ever returns it is invisible to `logit`
+  entirely. Linux exposes this per-socket in `/proc/net/udp[6]`'s `drops` column; sampling it (on a
+  timer, keyed by the listener's own bound address) as `logit.input.kernel.drops` would close the
+  last uncounted loss path, and is Linux-only with no new dependency. Worth noting almost nothing in
+  the field does this in-process — syslog-ng, rsyslog, Telegraf, and gostatsd all tell operators to
+  run `netstat -su`/`ss -u` themselves — so building it would put `logit` ahead of the field, not
+  merely at parity.
+- **A UDP listener reads one datagram per syscall.** `read_loop` (`logit-inputs::udp`,
+  [ADR 0027](adr/0027-decoupled-listener-io.md)) calls `recv_from` once per datagram. `recvmmsg(2)`
+  amortizes that across a batch — rsyslog's own high-throughput reference config sets `batchSize`
+  to 128, gostatsd's `--receive-batch-size` defaults to 50 — and syscall overhead is the read half's
+  dominant remaining cost now that a stalled downstream no longer stops it running. Not built:
+  `tokio::net::UdpSocket` doesn't expose `recvmmsg`, so this needs raw-fd work via `try_io` plus a
+  `libc` binding.
+- **One reader per UDP listener.** A single `recv_from` loop is one core's worth of read capacity.
+  `SO_REUSEPORT` lets multiple sockets share one port with the kernel load-balancing datagrams
+  across them — gostatsd's `--max-readers` (default `min(8, NumCPU)`), rsyslog's per-listener
+  thread count (capped at 32). Not built, partly because it interacts with the previous entry (a
+  batched read raises the single-reader ceiling before more readers are worth adding) and partly
+  because N readers each holding their own `Fanout` clone would need its own answer to the
+  cancel-by-drop shutdown cascade ([ADR 0013](adr/0013-service-lifecycle-and-output-retry.md)) that
+  today assumes exactly one `Fanout` per listener.
+- **A `ReceiveQueue`'s depth/bytes/utilization gauges update on every datagram, not every batch.**
+  `BoundedQueue::push`/`pop` (`crates/logit-pipeline/src/queue.rs`) call `update_gauges` — three
+  `Telemetry::gauge` calls, each locking `ComponentBuffer`'s `Mutex<HashMap>`
+  (`crates/logit-core/src/telemetry.rs`) — unconditionally on every accepted item. On a `SinkQueue`
+  that's once per *batch*, an already-accepted cost; on a `ReceiveQueue` it's once per *datagram*,
+  and the same listener's `read_loop` (pushing) and `decode_loop` (popping) run concurrently against
+  the identical lock, so this is genuine cross-task contention on the receive side's two hottest
+  loops, not just added per-call overhead. Deliberately not changed here: `BoundedQueue` is one
+  implementation serving both queues by design ([ADR 0027](adr/0027-decoupled-listener-io.md),
+  workstream A), and coalescing or sampling the receive side's gauge updates without also touching
+  the sink side would split that implementation's behavior back apart along exactly the seam it was
+  built to erase. If this ever shows up as a measured bottleneck (`script/bench`, the same evidence
+  bar `docs/design/memory.md`'s "Costing internal spans" section sets for a similar hot-path
+  tradeoff), the fix belongs in `BoundedQueue` itself — e.g. gauging on a sampled/coalesced cadence
+  for every caller — not as a receive-only special case.
 - ~~**Relative gauge adjustment (`+`/`-`) and sample-rate extrapolation for distributions**~~ —
   **closed, both halves** (`docs/adr/0026-relative-gauge-adjustments.md`). Landed as two
   independently-reviewed branches — relative gauge adjustment and sample-rate extrapolation had no
@@ -268,10 +299,15 @@ already built that have a known, accepted rough edge.
   [memory.md](design/memory.md)'s recommendations.
 - **Channel depth is bounded in batches, not bytes or events**
   (`CHANNEL_CAPACITY`, `crates/logit-pipeline/src/runtime.rs`) — 64 batches per edge, with
-  unbounded batch size. A 65 KB syslog datagram can decode to hundreds of events, so one edge can
-  hold tens of megabytes with nothing in the config saying so, and total in-flight memory scales
-  with edge count. Bounded in practice today only because datagram size caps batch size; becomes
-  real with a TCP or file-tail input, where nothing caps how many events one read produces.
+  unbounded batch size. Narrowed by [ADR 0027](adr/0027-decoupled-listener-io.md) for a UDP
+  listener's own outbound edge specifically: `BatchAccumulator` now merges many datagrams into one
+  batch under an explicit, config-visible byte bound (`receive.batch_max_bytes`, default 1MiB), so
+  what a `statsd_in`/`syslog_in` edge can hold is bounded by config, not just by datagram size. What
+  remains open is every *other* edge — a transform's outbound batch size is still unbounded, so a
+  65 KB syslog datagram parsed into hundreds of events and then re-batched by a downstream transform
+  can still produce an oversized batch with nothing in the config saying so, and total in-flight
+  memory still scales with edge count. Becomes real with a TCP or file-tail input feeding a
+  transform directly, where nothing caps how many events one read produces.
 - **`!env` is invisible to `schema/logit.schema.json`** ([ADR 0011](adr/0011-env-yaml-tag.md)) —
   resolution happens on the parsed YAML tree before serde ever sees it
   (`crates/logit-cli/src/config.rs`), so the schema describes the substituted shape, never the tag
@@ -339,8 +375,12 @@ already built that have a known, accepted rough edge.
   UTF-8 validation to the MSG slice alone — a real change, not a one-line fix, and nginx's
   `escape=json` access-log writer never emits invalid UTF-8 in practice, so there's no production
   producer forcing the issue yet.
-- **A syslog event's `timestamp` is receipt time, not the sender's** — `syslog_in` stamps every
-  event with `now_nanos()` at decode and preserves the sender's own timestamp separately, as the
+- **A syslog event's `timestamp` is receipt time, not the sender's** — every event is stamped with
+  the instant its datagram came off the socket (`received_at`, captured by the read half and
+  threaded through to `Decoder::decode_into` explicitly since
+  [ADR 0027](adr/0027-decoupled-listener-io.md) decoupled decode from the read loop — not a fresh
+  clock read at decode time, which could otherwise run arbitrarily behind arrival under backlog)
+  and preserves the sender's own timestamp separately, as the
   `syslog.timestamp` attribute (a `Value::Timestamp` for RFC 5424's RFC 3339 form, a raw
   `Value::Str` for RFC 3164's). The two can diverge: by network and queueing delay always, and by an
   arbitrary amount when the sender's clock is skewed or when messages are replayed or forwarded

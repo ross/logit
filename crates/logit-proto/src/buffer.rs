@@ -78,9 +78,14 @@ pub struct InMemoryBuffer<T> {
 }
 
 impl<T> InMemoryBuffer<T> {
+    /// Preallocates the underlying `VecDeque`'s capacity to `max_len.min(4096)` -- capped so a
+    /// pathologically large `max_len` can't preallocate gigabytes at startup. Negligible for a
+    /// shallow queue (a sink's default 1024 items); worth it for one many times deeper (a UDP
+    /// listener's receive queue, `crates/logit-pipeline/src/queue.rs`'s `BoundedQueue`), where the
+    /// ~14 warm-up reallocations an empty-start deque would otherwise pay land in the hot path.
     pub fn new(max_len: usize, max_weight: u64, overflow: OverflowPolicy) -> Self {
         Self {
-            items: VecDeque::new(),
+            items: VecDeque::with_capacity(max_len.min(4096)),
             max_len,
             max_weight,
             weight: 0,

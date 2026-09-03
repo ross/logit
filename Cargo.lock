@@ -818,6 +818,7 @@ dependencies = [
  "logit-pipeline",
  "logit-proto",
  "logit-transforms",
+ "socket2",
  "tokio",
 ]
 

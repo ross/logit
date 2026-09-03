@@ -8,7 +8,7 @@ use logit_core::EventBatch;
 /// A sink component: takes batches and delivers them somewhere. Buffering between the pipeline
 /// and delivery is the **runtime's** responsibility, not this trait's -- `run_output`
 /// (`runtime.rs`) splits into a drain half and a writer half joined around a `SinkQueue`
-/// (`sink_queue.rs`), so a sink's own inbox keeps draining while a slow or backing-off delivery
+/// (`queue.rs`), so a sink's own inbox keeps draining while a slow or backing-off delivery
 /// attempt is in flight. See `docs/adr/0021-buffered-sink-delivery.md`. `Output::send` itself
 /// only ever sees one batch at a time, exactly as before this existed. A sink has at least one
 /// source and is never itself a source of anything else (`docs/design/pipeline-graph.md`'s arity

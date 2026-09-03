@@ -743,6 +743,24 @@
             }
           ]
         },
+        "receive": {
+          "description": "Per-listener receive queue and batching (`docs/adr/0027-decoupled-listener-io.md`). Meaningful only on a datagram listener -- graph validation rejects a non-default value on any other kind, `internal` included. A sibling field of `kind`, mirroring `buffer`'s own placement.",
+          "default": {
+            "batch_flush_interval": "0.1s",
+            "batch_max_bytes": "1048576",
+            "batch_max_events": 1000,
+            "max_bytes": "33554432",
+            "max_datagrams": 10000,
+            "overflow": "drop_oldest",
+            "receive_buffer_bytes": null,
+            "shutdown_grace": "5s"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReceiveConfig"
+            }
+          ]
+        },
         "sources": {
           "default": [],
           "type": "array",
@@ -815,6 +833,63 @@
         "drop_oldest",
         "drop_newest"
       ]
+    },
+    "ReceiveConfig": {
+      "description": "Per-listener receive queue and datagram-\\>batch assembly (`docs/adr/0027-decoupled-listener-io.md`). Meaningful only on a datagram listener (today `statsd_in`/`syslog_in`); graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind, including `internal` (a listener by role, but one with no socket, no queue, and no decoder). Flat, following [`BufferConfig`]'s own `retry_budget`/`retry_max_delay` precedent rather than nesting a `batch:` sub-block -- two levels of optional-with-defaults is harder to scan in YAML than a flat prefix. Every field defaults, so a `receive:` block is never required -- **but an omitted block is not byte-for- byte the pre-ADR-0027 behavior**, and isn't meant to be: `batch_max_events: 1_000` and `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into batches (up to 1000 events, or up to 100ms of added latency before a send) rather than sending one batch per datagram immediately, matching what every established UDP listener researched for ADR 0027 does out of the box. A deployment that genuinely needs the old one-send-per- datagram, no-added-latency behavior gets it back explicitly with `batch_max_events: 1`, not by omitting `receive:`.",
+      "type": "object",
+      "properties": {
+        "batch_flush_interval": {
+          "description": "Longest an accumulated batch waits before being sent regardless of size. `0s` disables the timer entirely (the two bounds above are then the only trigger) -- unlike the count bounds, zero here is a meaningful setting, not an impossible one, and is not rejected.",
+          "default": "0.1s",
+          "type": "string"
+        },
+        "batch_max_bytes": {
+          "default": "1048576",
+          "type": "string"
+        },
+        "batch_max_events": {
+          "description": "Events to accumulate across datagrams before one send downstream. `1` means one send per datagram -- the behavior before ADR 0027 -- since the accumulator flushes on a bound *reached or exceeded* and never splits a single decode's output. `0` is rejected as an impossible bound (graph rule 18, the twin of rule 15's `buffer.max_batches: 0` check).",
+          "default": 1000,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_bytes": {
+          "description": "Byte bound on the queue (undecoded datagram bytes, not `estimated_heap_bytes`), checked alongside `max_datagrams` -- whichever trips first.",
+          "default": "33554432",
+          "type": "string"
+        },
+        "max_datagrams": {
+          "description": "Datagrams the read half may hold ahead of the decode half.",
+          "default": 10000,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "overflow": {
+          "description": "What happens once both bounds are full. Defaults to `drop_oldest`, **deliberately unlike `buffer:`'s `block`**: blocking a sink's producer backpressures an in-process drain that can wait, while blocking a UDP reader backpressures the kernel, which cannot -- the kernel just discards the datagram into a counter this process never reads. `block` relocates loss out of view rather than preventing it; every mature UDP listener (syslog-ng, rsyslog, Telegraf, gostatsd) treats this the same way.",
+          "default": "drop_oldest",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OverflowPolicy"
+            }
+          ]
+        },
+        "receive_buffer_bytes": {
+          "description": "`SO_RCVBUF`, requested at bind. `None` -- the default -- leaves the kernel default alone: a nonzero default here would exceed most stock kernels' `net.core.rmem_max` (212992 B) and warn on every first run, training operators to ignore the one warning that matters.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shutdown_grace": {
+          "description": "How long a listener keeps draining a cooperative shutdown before being cancelled by drop (`docs/adr/0027-decoupled-listener-io.md`, revising ADR 0013's unconditional cancel-by-drop into a bounded one). Matches `buffer.shutdown_grace`'s default so both ends of the pipeline drain on the same number.",
+          "default": "5s",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "StdioTarget": {
       "type": "string"

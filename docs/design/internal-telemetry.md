@@ -281,7 +281,7 @@ receive/processing side from their own loops, which already see every batch and 
 | `logit.script.vm.memory` | gauge | `run_lua`, once per batch — the strongest signal a stateful script is leaking Lua-side state |
 | `logit.script.events.emitted{outcome="emit"\|"emit_many"}` | count | `run_lua`, per `ProcessOutcome` — distinguishes a 1:1 script from a fan-out one |
 
-**Every sink also gets a `SinkQueue`** (`crates/logit-pipeline/src/sink_queue.rs`,
+**Every sink also gets a `SinkQueue`** (`crates/logit-pipeline/src/queue.rs`,
 `docs/adr/0021-buffered-sink-delivery.md`) sitting between its inbox drain and delivery — its own
 uniform layer, same reasoning as `Fanout`'s: instrumenting the one choke point every sink's batches
 pass through gives every sink these for free, no per-sink code:
@@ -306,6 +306,33 @@ last two rows are Lua-specific (recorded in `run_lua`, not shared with `run_tran
 because only a Lua node has a VM to sample or a script return value to classify — everything else
 in this table applies uniformly across every component kind.
 
+**Every UDP listener also gets a `ReceiveQueue`** (`logit-inputs::udp`, an instance of the same
+generic `BoundedQueue<T: Queued>` `SinkQueue` is, `docs/adr/0027-decoupled-listener-io.md`) sitting
+between the socket read and decode — the listener-side mirror of the sink block above, one choke
+point every datagram passes through:
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.component.receive.datagrams` | gauge | datagrams currently queued, sampled on every push/pop |
+| `logit.component.receive.bytes` | gauge | undecoded datagram bytes summed over what's queued |
+| `logit.component.receive.utilization` | gauge | `max(datagram ratio, byte ratio)` against the two configured bounds |
+| `logit.component.receive.push.blocked.duration` | timing | only under `overflow: block`, only when a push actually waited |
+| `logit.component.receive.latency` | timing | arrival (`Datagram::received_at`) → dequeue, per datagram — the number that says whether event timestamps are trustworthy under load |
+| `logit.component.datagrams.dropped{reason=...}` / `.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction) |
+| `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown` — a `BatchAccumulator` emission |
+| `logit.input.receive_buffer.bytes` / `.requested.bytes` | gauge | granted `SO_RCVBUF` after any kernel clamp, and what was actually requested (absent when unset) — sampled once at bind |
+
+Three naming choices worth calling out, since the obvious names collide with existing ones: drops
+are `logit.component.*`, not `logit.input.*` — they're emitted by the same generic `BoundedQueue`
+code as the sink side's `batches.dropped`, and an operator alerting on data loss shouldn't have to
+union two namespaces (the pre-existing `logit.input.datagrams`/`.datagram.bytes` *arrival* counters
+stay under `logit.input.*`, since nothing in the runtime can see a datagram boundary — those remain
+genuinely impl-known); accumulator emissions are `receive.flushed`, not an unqualified
+`batches.flushed`, because `logit.component.flush.events`/`.flush.duration` already mean "a
+stateful transform's window flush," and a bare `batches.flushed` next to those would read as the
+same concept. `overflow: block` (never the receive-queue default — see the ADR) is the one
+configuration under which `push.blocked.duration` records anything at all.
+
 **Layer 3: a component adds only what only it knows**, via the same `with_telemetry` builder
 idiom `with_diagnostics`/`with_timeout`/`with_retry` already established
 (`crates/logit-cli/src/pipeline.rs::build_spec`). Both layers write into the *same*
@@ -317,12 +344,14 @@ Worked examples, one per shipped component:
 
 - `statsd_in` (`crates/logit-inputs/src/statsd.rs`): `logit.input.datagrams`,
   `logit.input.datagram.bytes` — per-datagram detail `Fanout`'s per-batch view can't see, plus
-  decode failures free via the `Diagnostics` bridge. A sampled `ms`/`h`/`d` line whose `@<rate>`
-  implied a weight above `MAX_SAMPLE_WEIGHT` (the decode-time sample-rate extrapolation's bound on
-  how far one value can inflate a `Distribution`'s `count()`) clamps rather than extrapolating
-  unboundedly, reported via that same `Diagnostics` bridge as
-  `logit.component.diagnostics{key="sample_rate_clamped"}` — no separate counter needed, since the
-  bridge already mirrors every occurrence.
+  decode failures free via the `Diagnostics` bridge. Both listeners are now thin wrappers over
+  `logit-inputs::udp::UdpListener` (`docs/adr/0027-decoupled-listener-io.md`), which is where the
+  `ReceiveQueue`/`receive_buffer.*` table above actually gets recorded — free for both, no
+  per-listener code. A sampled `ms`/`h`/`d` line whose `@<rate>` implied a weight above
+  `MAX_SAMPLE_WEIGHT` (the decode-time sample-rate extrapolation's bound on how far one value can
+  inflate a `Distribution`'s `count()`) clamps rather than extrapolating unboundedly, reported via
+  that same `Diagnostics` bridge as `logit.component.diagnostics{key="sample_rate_clamped"}` — no
+  separate counter needed, since the bridge already mirrors every occurrence.
 - `syslog_in` (`crates/logit-inputs/src/syslog.rs`): the same pair, `logit.input.datagrams`/
   `.datagram.bytes` — direct parity with `statsd_in`, the other UDP listener.
 - `aggregate` (`crates/logit-transforms/src/aggregate.rs`): `logit.transform.series.active` and
