@@ -279,14 +279,18 @@ pub enum ComponentKind {
     /// allowlist, the same relationship to `drop_signals` that `keep` has to `remove`. Unlike
     /// `has_signal`, this mutates: an event carrying a log and derived metrics with
     /// `signals: [logs]` loses the metrics but keeps the log. Drops an event left with no
-    /// payload at all. `signals` may not be empty, and may not name all three signals -- either
-    /// can only ever drop every event. See `docs/adr/signal-filtering-components.md`.
+    /// payload at all. `signals` may not be empty (that keeps nothing, dropping every event) and
+    /// may not name all three signals (that keeps everything, a no-op that forwards every event
+    /// untouched) -- both are rejected as config mistakes. See
+    /// `docs/adr/signal-filtering-components.md`.
     KeepSignals {
         signals: Vec<Signal>,
     },
     /// Clears the listed signals' payloads on every event, keeping the rest -- a denylist, the
     /// mirror of `keep_signals`. Drops an event left with no payload at all. `signals` may not be
-    /// empty, and may not name all three signals. See `docs/adr/signal-filtering-components.md`.
+    /// empty (that drops nothing, a no-op that forwards every event untouched) and may not name
+    /// all three signals (that drops everything, dropping every event) -- both are rejected as
+    /// config mistakes. See `docs/adr/signal-filtering-components.md`.
     DropSignals {
         signals: Vec<Signal>,
     },

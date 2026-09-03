@@ -44,9 +44,13 @@
 //!     impossible bound, the twin of rule 15.
 //!     `receive.batch_flush_interval: 0s` is **not** rejected: it means "no flush timer," a
 //!     meaningful setting, unlike the count bounds.
-//! 19. An empty `signals:` list on `has_signal`, `keep_signals`, or `drop_signals` is rejected, as
-//!     is a `keep_signals`/`drop_signals` naming all three signals -- each can only ever drop
-//!     every event, the same silent-black-hole failure rule 7 exists to catch. `keep`'s empty
+//! 19. An empty `signals:` list on `has_signal`, `keep_signals`, or `drop_signals` is rejected.
+//!     `keep_signals`/`drop_signals` additionally reject naming all three signals. Which of the
+//!     two shapes is the silent black hole (rule 7's "no consumer" failure, recast here as "no
+//!     event ever gets through") and which is the no-op (every event forwarded untouched) is
+//!     *opposite* between the two kinds -- an allowlist naming nothing keeps nothing (black
+//!     hole), naming everything keeps everything (no-op); a denylist is the mirror. Both shapes
+//!     are rejected either way, but the error message names the right one. `keep`'s empty
 //!     `fields` list stays legal by contrast -- "drop every attribute" is a real operation,
 //!     "drop every event" is not. See `docs/adr/signal-filtering-components.md`.
 //!
@@ -202,6 +206,14 @@ fn interval(kind: &ComponentKind) -> Option<Duration> {
         }
         _ => None,
     }
+}
+
+/// `true` if `signals` names all three of `Logs`/`Metrics`/`Traces` -- rule 19's shared test for
+/// `keep_signals`/`drop_signals`'s two opposite black-hole shapes.
+fn names_all_three(signals: &[logit_config::Signal]) -> bool {
+    signals.contains(&logit_config::Signal::Logs)
+        && signals.contains(&logit_config::Signal::Metrics)
+        && signals.contains(&logit_config::Signal::Traces)
 }
 
 pub struct ResolvedComponent {
@@ -468,9 +480,15 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 19: `has_signal`/`keep_signals`/`drop_signals` need a non-empty `signals:`, and
-    // `keep_signals`/`drop_signals` additionally reject naming all three signals -- either shape
-    // can only ever drop every event, the same silent-black-hole failure rule 7 exists to catch.
+    // Rule 19: `has_signal`/`keep_signals`/`drop_signals` need a non-empty `signals:`. For
+    // `keep_signals`/`drop_signals`, an empty or all-three list is *always* rejected, but which
+    // of the two is the silent-black-hole shape (rule 7's "no consumer" failure, here recast as
+    // "no event ever gets through") and which is the no-op (every event forwarded completely
+    // untouched, so the component is pointless) is *opposite* between the two kinds -- an
+    // allowlist that names nothing keeps nothing (black hole), one that names everything keeps
+    // everything (no-op); a denylist is the mirror. Both shapes are rejected either way (a no-op
+    // component is exactly as much a config mistake as a black hole one), but the message must
+    // say which is which, or it tells the operator the wrong thing happened.
     // `has_signal` naming all three signals is left alone: under `mode: only` that's a real,
     // if permissive, "forward anything with a payload" filter, not a no-op.
     for (id, component) in &components {
@@ -483,20 +501,31 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     );
                 }
             }
-            ComponentKind::KeepSignals { signals } | ComponentKind::DropSignals { signals } => {
+            ComponentKind::KeepSignals { signals } => {
                 if signals.is_empty() {
                     anyhow::bail!(
                         "component '{id}': 'signals' must name at least one signal -- an empty \
-                         list can only ever drop every event"
+                         list keeps nothing, dropping every event"
                     );
                 }
-                let names_all_three = signals.contains(&logit_config::Signal::Logs)
-                    && signals.contains(&logit_config::Signal::Metrics)
-                    && signals.contains(&logit_config::Signal::Traces);
-                if names_all_three {
+                if names_all_three(signals) {
                     anyhow::bail!(
-                        "component '{id}': 'signals' names all three signals -- that can only \
-                         ever drop every event"
+                        "component '{id}': 'signals' names all three signals -- that keeps \
+                         everything, a no-op that forwards every event untouched"
+                    );
+                }
+            }
+            ComponentKind::DropSignals { signals } => {
+                if signals.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': 'signals' must name at least one signal -- an empty \
+                         list drops nothing, a no-op that forwards every event untouched"
+                    );
+                }
+                if names_all_three(signals) {
+                    anyhow::bail!(
+                        "component '{id}': 'signals' names all three signals -- that drops \
+                         everything, dropping every event"
                     );
                 }
             }
@@ -984,6 +1013,11 @@ mod tests {
             ("out", vec!["filter"], sink()),
         ]));
         assert!(err.contains("must name at least one signal"), "got: {err}");
+        assert!(
+            err.contains("keeps nothing"),
+            "a keep_signals with an empty list is the black-hole shape (drops every event), \
+             not the no-op shape -- got: {err}"
+        );
     }
 
     #[test]
@@ -1004,6 +1038,55 @@ mod tests {
             ("out", vec!["filter"], sink()),
         ]));
         assert!(err.contains("names all three signals"), "got: {err}");
+        assert!(
+            err.contains("drops everything"),
+            "a drop_signals naming all three signals is the black-hole shape (drops every \
+             event), not the no-op shape -- got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_keep_signals_naming_all_three_signals_is_rejected_as_a_no_op_not_a_black_hole() {
+        // The inverse of the drop_signals case above: for keep_signals (an allowlist), naming
+        // all three signals keeps everything -- a no-op, not the "drop every event" black hole.
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::KeepSignals {
+                    signals: vec![
+                        logit_config::Signal::Logs,
+                        logit_config::Signal::Metrics,
+                        logit_config::Signal::Traces,
+                    ],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("names all three signals"), "got: {err}");
+        assert!(
+            err.contains("keeps everything") && err.contains("no-op"),
+            "a keep_signals naming all three signals is the no-op shape (keeps every event \
+             untouched), not the black-hole shape -- got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_drop_signals_with_an_empty_signals_list_is_rejected_as_a_no_op_not_a_black_hole() {
+        // The inverse of the keep_signals-empty case: for drop_signals (a denylist), an empty
+        // list drops nothing -- a no-op, not the "drop every event" black hole.
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("filter", vec!["in"], ComponentKind::DropSignals { signals: vec![] }),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("must name at least one signal"), "got: {err}");
+        assert!(
+            err.contains("drops nothing") && err.contains("no-op"),
+            "a drop_signals with an empty list is the no-op shape (forwards every event \
+             untouched), not the black-hole shape -- got: {err}"
+        );
     }
 
     #[test]
