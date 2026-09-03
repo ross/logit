@@ -53,14 +53,9 @@ already built that have a known, accepted rough edge.
   design (likely the same drain/writer split, applied to `Input::run` instead of `Output::send`) and
   its own plan once there's a reason to prioritize it over other gaps here.
 - ~~**Relative gauge adjustment (`+`/`-`) and sample-rate extrapolation for distributions**~~ —
-  **closed, both halves, on two separate, independently-mergeable branches**
-  (`docs/adr/0026-relative-gauge-adjustments.md`). Relative gauge adjustment is this branch's own
-  work, below. Sample-rate extrapolation is a sibling PR's — `feat/statsd-sample-rate-extrapolation`,
-  reviewed and green independently of this stack, deliberately never merged into it (the two gaps
-  share one entry but have no code dependency on each other). **If this note reads before that PR
-  has actually merged to `main`, its description below is accurate for that PR's own branch, not
-  yet for this repository** — `git log --oneline main -- crates/logit-core/src/metric.rs` naming
-  `add_weighted` is the check.
+  **closed, both halves** (`docs/adr/0026-relative-gauge-adjustments.md`). Landed as two
+  independently-reviewed branches — relative gauge adjustment and sample-rate extrapolation had no
+  code dependency on each other — merged together here now that both are on `main`.
 
   **Relative gauge adjustments.** `statsd_in` decodes any leading `+`/`-` on a `g` value into
   `MetricKind::GaugeDelta` — explicitly *unresolved*; it must never reach a sink. `aggregate`
@@ -104,8 +99,7 @@ already built that have a known, accepted rough edge.
     collector this instance forwards to is legitimate) and `logit validate` has no warning channel
     today, only pass/fail. Deferred, not silently skipped.
 
-  **Sample-rate extrapolation for distributions** (`feat/statsd-sample-rate-extrapolation`, not
-  part of this branch — see the note above). `DdSketch::add_weighted(value, count)`
+  **Sample-rate extrapolation for distributions.** `DdSketch::add_weighted(value, count)`
   (`crates/logit-core/src/metric.rs`) delegates to `sketches_ddsketch::DDSketch::add_with_count`
   (an O(1) native weighted add, not a repeated-`add` loop or a binary-doubling `merge` — both were
   considered and rejected: the crate does have a native weighted add, and even a repeated-`add`

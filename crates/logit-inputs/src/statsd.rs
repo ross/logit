@@ -8,7 +8,8 @@
 //! ```
 //!
 //! `<type>` is one of `c` (counter), `g` (gauge), `ms`/`h`/`d` (timing/histogram/distribution --
-//! all decoded as a single-sample [`logit_core::DdSketch`]), or `s` (set, not yet implemented --
+//! decoded into a [`logit_core::DdSketch`], extrapolated to `(1.0 / sample_rate).round()` weighted
+//! samples when `@<sample-rate>` is present), or `s` (set, not yet implemented --
 //! see the note on [`HyperLogLog`](logit_core::HyperLogLog)). Multiple `:`-separated values share
 //! one type/sample-rate/tags and become one [`Event`] each. A datagram may contain multiple
 //! newline-separated lines.
@@ -123,7 +124,7 @@ impl Decoder for StatsdDecoder {
             // datagram -- StatsD clients routinely pack several independent metrics into one
             // packet, so treating the datagram as atomic would let a single bad line take down
             // everything alongside it. Isolate per line: keep what parsed, report what didn't.
-            match parse_line(&bytes, text, line, timestamp) {
+            match parse_line(&bytes, text, line, timestamp, &mut self.diag) {
                 Ok(mut line_events) => events.append(&mut line_events),
                 Err(err) => {
                     self.diag.warn_throttled("bad_line", err);
@@ -163,6 +164,7 @@ fn parse_line(
     text: &str,
     line: &str,
     timestamp: i64,
+    diag: &mut Diagnostics,
 ) -> Result<Vec<Event>, CodecError> {
     let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
 
@@ -209,11 +211,24 @@ fn parse_line(
     values_part
         .split(':')
         .map(|raw_value| {
-            build_event(name, raw_value, type_part, sample_rate, &attributes, timestamp, line)
+            build_event(name, raw_value, type_part, sample_rate, &attributes, timestamp, line, diag)
         })
         .collect()
 }
 
+/// Caps the number of weighted samples one sampled statsd value can insert into a `DdSketch`.
+/// `DdSketch::add_weighted` delegates to `sketches_ddsketch::DDSketch::add_with_count`, which is
+/// O(1) regardless of `count`, so this is not a CPU-loop DoS guard -- it bounds how far a single
+/// crafted `@`-rate can inflate a `Distribution`'s `count()` (a population estimate,
+/// `docs/design/data-model.md`) away from reality: without it, a single `@0.0000001` sample rate
+/// would claim ten million observations from one UDP value. A fixed constant, not configurable,
+/// matching `crates/logit-transforms/src/aggregate.rs`'s stated stance on
+/// `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`. Applied per value, not per line or per datagram -- a
+/// multi-value line (`name:v1:v2:...:vN|ms|@rate`) clamps each value independently, which is fine
+/// now that `add_weighted` is O(1) per call regardless of the weight involved.
+const MAX_SAMPLE_WEIGHT: u64 = 1000;
+
+#[allow(clippy::too_many_arguments)]
 fn build_event(
     name: &str,
     raw_value: &str,
@@ -222,6 +237,7 @@ fn build_event(
     attributes: &AttrMap,
     timestamp: i64,
     line: &str,
+    diag: &mut Diagnostics,
 ) -> Result<Event, CodecError> {
     let malformed = |what: &str| CodecError::Malformed(format!("{what}: {line:?}"));
 
@@ -246,6 +262,12 @@ fn build_event(
             // the value unresolved and hands it off; a `GaugeDelta` that reaches a sink with no
             // `aggregate` on its path is that component's problem to report, not this one's to
             // guess around.
+            //
+            // `sample_rate` is deliberately ignored here (and below, for `s`): a gauge/set value
+            // is absolute (or, for a delta, an adjustment), not a count of occurrences, so there
+            // is nothing to extrapolate -- unlike `c`/`ms`/`h`/`d`, "1 in N samples reported this
+            // value" doesn't imply anything about the other N-1, and pretending otherwise would
+            // be meaningless, not just a missed opportunity.
             let value = parse_finite_value(raw_value, "gauge", line)?;
             if raw_value.starts_with('+') || raw_value.starts_with('-') {
                 MetricKind::GaugeDelta(value)
@@ -255,16 +277,36 @@ fn build_event(
         }
         "ms" | "h" | "d" => {
             let value = parse_finite_value(raw_value, "timing/histogram", line)?;
-            // TODO: DDSketch has no native weighted-add, so a sample rate < 1 here is decoded as
-            // a single unweighted sample rather than extrapolated -- a smaller gap in practice
-            // than for counters, since timings/histograms are rarely sampled in DogStatsD
-            // clients, but a gap nonetheless.
+            // Decode-time extrapolation, matching what `c` already does above
+            // (`Counter(value / sample_rate)`): a sampled distribution can't scale a single
+            // stored number the way a counter can, since `DdSketch` has no notion of "this one
+            // sample represents N" -- so the extrapolation has to happen as N actual samples
+            // instead. `parse_line` already guarantees `sample_rate` is finite and in `(0, 1]`
+            // before this is ever reached, so `1.0 / sample_rate` can't be NaN/inf/negative here.
+            let weight = (1.0 / sample_rate).round().max(1.0) as u64;
+            if weight > MAX_SAMPLE_WEIGHT {
+                // See `MAX_SAMPLE_WEIGHT`'s doc comment: this bounds the extrapolated population
+                // estimate, not a tuning knob. `warn_throttled` mirrors every occurrence (not
+                // just the throttled-to-stderr subset) into `logit.component.diagnostics
+                // {key="sample_rate_clamped"}` via `diag`'s own telemetry handle, so there's
+                // nowhere else this needs to report to.
+                diag.warn_throttled(
+                    "sample_rate_clamped",
+                    format_args!(
+                        "sample rate @{sample_rate} on {line:?} implies a weight of {weight}, \
+                         clamped to {MAX_SAMPLE_WEIGHT}"
+                    ),
+                );
+            }
+            let weight = weight.min(MAX_SAMPLE_WEIGHT);
             let mut sketch = DdSketch::new();
-            sketch.add(value);
+            sketch.add_weighted(value, weight);
             MetricKind::Distribution(sketch)
         }
         "s" => {
-            // See the note on `HyperLogLog` in logit-core::metric: not implemented yet.
+            // See the note on `HyperLogLog` in logit-core::metric: not implemented yet. When it
+            // is, `sample_rate` should stay ignored here too, for the same reason it's ignored on
+            // `g` above: a set membership is not a count to extrapolate.
             return Err(malformed("set metrics ('s') are not implemented yet"));
         }
         other => return Err(malformed(&format!("unknown metric type '{other}'"))),
@@ -299,6 +341,7 @@ fn parse_finite_value(raw_value: &str, what: &str, line: &str) -> Result<f64, Co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logit_core::Registry;
 
     fn decode(line: &str) -> Vec<Event> {
         let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
@@ -323,7 +366,8 @@ mod tests {
     fn parse_err(line: &str) -> CodecError {
         let bytes = Bytes::from(line.to_string());
         let text = std::str::from_utf8(&bytes).unwrap();
-        parse_line(&bytes, text, text, 0).expect_err("expected this line to be rejected")
+        let mut diag = Diagnostics::default();
+        parse_line(&bytes, text, text, 0, &mut diag).expect_err("expected this line to be rejected")
     }
 
     #[test]
@@ -479,6 +523,99 @@ mod tests {
                 assert!((q - 120.0).abs() < 1.0, "quantile {q} should be close to 120");
             }
             other => panic!("expected Distribution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sampled_distribution_at_half_rate_inserts_two_weighted_samples() {
+        let metric = only_metric(decode("x:100|ms|@0.5"));
+        match metric.kind {
+            MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 2),
+            other => panic!("expected Distribution, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sampled_distribution_at_tenth_rate_inserts_ten_weighted_samples() {
+        let metric = only_metric(decode("x:100|ms|@0.1"));
+        match metric.kind {
+            MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 10),
+            other => panic!("expected Distribution, got {other:?}"),
+        }
+    }
+
+    /// The most important test in this set: an explicit `@1` (the default, unsampled rate) must
+    /// decode a distribution exactly as it always has -- one sample, not extrapolated -- so this
+    /// change is additive only for genuinely sampled lines. `statsd_decode_one_line` in
+    /// `crates/logit-bench/tests/allocations.rs` pins the same claim at the allocation level.
+    #[test]
+    fn unsampled_distribution_still_inserts_exactly_one_sample() {
+        let metric = only_metric(decode("x:100|ms|@1"));
+        match metric.kind {
+            MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 1),
+            other => panic!("expected Distribution, got {other:?}"),
+        }
+    }
+
+    /// A weighted extrapolation is still a real DDSketch, subject to `Config::defaults()`'s 1%
+    /// relative-accuracy bound (`crates/logit-core/src/metric.rs`) -- pins that decode-time
+    /// extrapolation doesn't degrade quantile accuracy versus an unsampled line.
+    #[test]
+    fn sampled_distribution_quantile_stays_within_the_configured_relative_error_bound() {
+        let metric = only_metric(decode("x:100|ms|@0.1"));
+        match metric.kind {
+            MetricKind::Distribution(sketch) => {
+                let q = sketch.quantile(0.5).expect("quantile should be present");
+                let relative_error = (q - 100.0).abs() / 100.0;
+                assert!(
+                    relative_error <= 0.01,
+                    "quantile {q} is more than 1% away from the true value 100.0"
+                );
+            }
+            other => panic!("expected Distribution, got {other:?}"),
+        }
+    }
+
+    /// A sample rate implying a weight above `MAX_SAMPLE_WEIGHT` (bounds the extrapolated
+    /// population estimate, not a tuning knob -- see its doc comment) clamps rather than
+    /// inflating `count()` unboundedly, and reports the clamp via `Diagnostics::warn_throttled`'s
+    /// own telemetry mirror (`logit.component.diagnostics{key="sample_rate_clamped"}`) -- the
+    /// same mechanism `logit_core::diag`'s
+    /// `every_warn_throttled_occurrence_increments_the_metric_...` test pins, asserted here via
+    /// its telemetry mirror rather than capturing stderr.
+    #[test]
+    fn extreme_sample_rate_clamps_the_weight_and_reports_it() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let diag = Diagnostics::new("statsd_in").with_telemetry(telemetry);
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default())).with_diagnostics(diag);
+
+        let events = decoder
+            .decode(Bytes::from("x:100|ms|@0.0000001".to_string()))
+            .expect("decode should succeed")
+            .events;
+        let metric = only_metric(events);
+        match metric.kind {
+            MetricKind::Distribution(sketch) => {
+                assert_eq!(
+                    sketch.count(),
+                    MAX_SAMPLE_WEIGHT as usize,
+                    "weight should clamp to MAX_SAMPLE_WEIGHT"
+                );
+            }
+            other => panic!("expected Distribution, got {other:?}"),
+        }
+
+        let diagnostics_event = registry
+            .drain(0)
+            .into_iter()
+            .find(|e| {
+                e.attributes.get("key").and_then(|v| v.as_str()) == Some("sample_rate_clamped")
+            })
+            .expect("sample_rate_clamped diagnostic should have fired");
+        match &diagnostics_event.metrics[0].kind {
+            MetricKind::Counter(v) => assert_eq!(*v, 1.0, "clamping should report exactly once"),
+            other => panic!("expected Counter, got {other:?}"),
         }
     }
 

@@ -194,6 +194,8 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `syslog_in` decode 100 lines | **1** | + 5 reallocs from `Vec` growth |
 | `syslog_in` decode 1 logs-only line | **1** | plain-text message, no JSON -- same zero-copy shape |
 | `statsd_in` decode 1 line | **2** | fixed -- see below, tag values now slice the datagram too |
+| `statsd_in` decode 1 distribution line (`ms`/`h`/`d`, unsampled) | **3** | 2 as above + 1 `bins` Vec on the sketch's first sample |
+| `statsd_in` decode 1 sampled distribution line (`@0.1`, 10 weighted samples) | **3** | same as unsampled -- `DdSketch::add_weighted` delegates to `add_with_count`, O(1) and zero extra allocations regardless of weight |
 | `json` parse + merge (nginx shape) | **1** | fixed -- see below, was 7 |
 | `json` parse + merge (wide-JSON, 28 keys) | **1** | same fix, confirmed to generalize past a small field count |
 | `kv_metrics` derive 4 metrics | **3** | `MetricList` spill + one `bins` Vec per sketch |
@@ -233,10 +235,14 @@ And the corresponding times:
 > invent differences that aren't there. Compare rows within the table freely; treat absolute values
 > as this machine on this day. This table was refreshed once, in one sitting, after landing the
 > `json`/`statsd_in`/`stdio_out`/Lua-boundary fixes below -- every row reflects the current code.
-> The `syslog_out` row is the one exception, added in a later, separate `script/bench` run rather
+> The `syslog_out` row is one exception, added in a later, separate `script/bench` run rather
 > than refreshing the whole table again for one new row -- its allocation count is exact and
 > comparable regardless (deterministic, not machine-dependent), but don't read its wall-clock
-> figure as directly comparable to the others' down to the nanosecond, per this same caveat.
+> figure as directly comparable to the others' down to the nanosecond, per this same caveat. The
+> two `statsd_in` distribution-decode rows are a second such exception, added for decode-time
+> sample-rate extrapolation (`DdSketch::add_weighted`) without a wall-clock figure at all -- their
+> allocation counts are what `crates/logit-bench/tests/allocations.rs`'s
+> `statsd_decode_one_distribution_line`/`statsd_decode_one_sampled_distribution_line` pin.
 
 ### `aggregate` flush now costs one allocation per series, for real trace links
 
