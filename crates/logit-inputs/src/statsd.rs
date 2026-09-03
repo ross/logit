@@ -231,21 +231,27 @@ fn build_event(
             MetricKind::Counter(value / sample_rate)
         }
         "g" => {
-            // A leading '+'/'-' marks a *relative* adjustment to the gauge's previous value, per
-            // the DogStatsD spec -- and per that same spec, a plain negative number is
-            // indistinguishable from a relative decrement, so any leading sign is ambiguous, not
-            // just '+'. Applying a relative update needs state this decoder doesn't have (it
-            // belongs to the future `aggregate` processor, docs/design/lua-api.md's `flush()`
-            // contract); silently reinterpreting a delta as an absolute value would produce a
-            // wrong number that looks correct, so this rejects it the same way `s` (set) is
-            // rejected below: a clear not-implemented error instead of quietly wrong data.
-            if raw_value.starts_with('+') || raw_value.starts_with('-') {
-                return Err(malformed(
-                    "relative gauge adjustments ('+'/'-') are not implemented yet",
-                ));
-            }
+            // Any leading '+'/'-' means a *relative* adjustment to the gauge's previous value,
+            // per the statsd/DogStatsD spec -- and per that same spec there is no wire syntax for
+            // setting a gauge to a negative absolute value at all, so a leading '-' is just as
+            // unambiguous as '+', not a case needing its own guess. No config escape hatch: this
+            // decoder used to reject any signed value outright, so there is no prior working
+            // "absolute negative gauge" behavior a `negative_gauge: delta|absolute` toggle could
+            // ever have been preserving (see docs/adr/0026-relative-gauge-adjustments.md's
+            // Alternatives). `f64::from_str` accepts a leading '+' the same as '-' (pinned by
+            // `plus_prefixed_gauge_values_parse_via_from_str`), so `parse_finite_value` handles
+            // both signs identically; only the *choice* between `Gauge`/`GaugeDelta` is decided
+            // here. Resolution belongs to `aggregate` (docs/design/data-model.md is explicit that
+            // aggregation state lives there, not in the wire decoder) -- this decoder only marks
+            // the value unresolved and hands it off; a `GaugeDelta` that reaches a sink with no
+            // `aggregate` on its path is that component's problem to report, not this one's to
+            // guess around.
             let value = parse_finite_value(raw_value, "gauge", line)?;
-            MetricKind::Gauge(value)
+            if raw_value.starts_with('+') || raw_value.starts_with('-') {
+                MetricKind::GaugeDelta(value)
+            } else {
+                MetricKind::Gauge(value)
+            }
         }
         "ms" | "h" | "d" => {
             let value = parse_finite_value(raw_value, "timing/histogram", line)?;
@@ -390,14 +396,77 @@ mod tests {
         assert!(matches!(metric.kind, MetricKind::Gauge(v) if v == 0.75));
     }
 
+    /// `f64::from_str`'s grammar accepts a leading `+` the same as `-` -- pinned directly, since
+    /// `build_event`'s `"g"` arm relies on this to make `parse_finite_value` handle both signs
+    /// identically and let only the `starts_with` check decide `Gauge` vs. `GaugeDelta`.
     #[test]
-    fn gauge_relative_adjustments_are_rejected_not_silently_reinterpreted() {
-        // Per the DogStatsD spec, a leading '+' or '-' means "adjust the previous value by this
-        // much", which this decoder can't apply (no state). Silently treating '+5' or '-5' as an
-        // absolute value would produce a wrong number that looks like a correct one, so both are
-        // rejected rather than guessed at.
-        assert!(matches!(parse_err("cpu.load:+5|g"), CodecError::Malformed(_)));
-        assert!(matches!(parse_err("cpu.load:-5|g"), CodecError::Malformed(_)));
+    fn plus_prefixed_gauge_values_parse_via_from_str() {
+        assert_eq!("+5".parse::<f64>(), Ok(5.0));
+        assert_eq!("+0".parse::<f64>(), Ok(0.0));
+    }
+
+    #[test]
+    fn a_leading_plus_decodes_as_a_gauge_delta() {
+        let metric = only_metric(decode("conns:+5|g"));
+        assert!(matches!(metric.kind, MetricKind::GaugeDelta(v) if v == 5.0));
+    }
+
+    #[test]
+    fn a_leading_minus_decodes_as_a_gauge_delta() {
+        let metric = only_metric(decode("conns:-5|g"));
+        assert!(matches!(metric.kind, MetricKind::GaugeDelta(v) if v == -5.0));
+    }
+
+    /// The unsigned case is unchanged by this workstream -- pinned directly, not just implied by
+    /// the pre-existing `gauge` test, since it's the regression that matters most here.
+    #[test]
+    fn an_unsigned_gauge_value_still_decodes_as_an_absolute_gauge() {
+        let metric = only_metric(decode("cpu.load:5|g"));
+        assert!(matches!(metric.kind, MetricKind::Gauge(v) if v == 5.0));
+    }
+
+    /// `+0` is a legal no-op delta, not an error -- distinct from an *unsigned* `0`, which is
+    /// (and stays) an ordinary absolute `Gauge(0.0)`.
+    #[test]
+    fn a_leading_plus_zero_is_a_legal_no_op_delta_not_an_error() {
+        let metric = only_metric(decode("conns:+0|g"));
+        assert!(matches!(metric.kind, MetricKind::GaugeDelta(v) if v == 0.0));
+    }
+
+    /// A signed non-finite value is still rejected by `parse_finite_value`, same as an unsigned
+    /// one -- the sign only decides `Gauge` vs. `GaugeDelta`, never bypasses the finiteness check.
+    #[test]
+    fn signed_non_finite_gauge_values_are_still_rejected() {
+        for value in ["+NaN", "+inf", "-inf"] {
+            let line = format!("load:{value}|g");
+            assert!(
+                matches!(parse_err(&line), CodecError::Malformed(_)),
+                "expected {value} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_signed_gauge_with_tags_and_a_sample_rate_decodes() {
+        let events = decode("conns:-5|g|@0.5|#host:web1");
+        let event = &events[0];
+        assert!(matches!(event.metrics[0].kind, MetricKind::GaugeDelta(v) if v == -5.0));
+        assert_eq!(event.attributes.get("host").and_then(|v| v.as_str()), Some("web1"));
+    }
+
+    /// Multi-value grammar (`name:v1:v2|type`) applied to signed gauge values: each value is
+    /// decoded independently, so a mix of signs on one line yields two independent deltas, not
+    /// one merged value or a decode error.
+    #[test]
+    fn multi_value_signed_gauges_yield_two_independent_deltas() {
+        let events = decode("conns:+1:-2|g");
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(only_metric(vec![events[0].clone()]).kind, MetricKind::GaugeDelta(v) if v == 1.0)
+        );
+        assert!(
+            matches!(only_metric(vec![events[1].clone()]).kind, MetricKind::GaugeDelta(v) if v == -2.0)
+        );
     }
 
     #[test]

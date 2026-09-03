@@ -15,6 +15,13 @@ pub struct MetricRecord {
 pub enum MetricKind {
     Counter(f64),
     Gauge(f64),
+    /// A *relative* adjustment to a gauge's previous value (statsd/DogStatsD's leading `+`/`-`
+    /// syntax, `crates/logit-inputs/src/statsd.rs`) -- **unresolved**. This variant must never
+    /// reach a sink; it is resolved into an ordinary [`MetricKind::Gauge`] by the `aggregate`
+    /// transform (`crates/logit-transforms/src/aggregate.rs`), which is the only component that
+    /// carries the running gauge value a delta needs to apply against. See
+    /// `docs/adr/0026-relative-gauge-adjustments.md`.
+    GaugeDelta(f64),
     Set(HyperLogLog),
     Distribution(DdSketch),
     /// Fixed-bucket histogram, e.g. a Prometheus-style scrape input. Each `(bound, count)` pair is

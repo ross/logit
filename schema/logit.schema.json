@@ -267,8 +267,22 @@
             "type"
           ],
           "properties": {
+            "gauge_retention": {
+              "description": "How many consecutive windows a gauge series with no new data is retained past its last update, so a relative gauge adjustment (`docs/adr/0026-relative-gauge-adjustments.md`) arriving in a later window can still resolve against the value it last held. `0` disables retention entirely -- every gauge series is drained every window exactly like a counter, matching this field's absence before it existed. See the `docs/adr/0008-aggregation-window-semantics.md` amendment for the full design.",
+              "default": 5,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
             "interval": {
               "type": "string"
+            },
+            "max_retained_gauge_series": {
+              "description": "A hard cap on how many gauge series may be retained across this component's whole window at once -- a DoS/cardinality guard, not a tuning knob. `gauge_retention` alone bounds only how long one series survives; without this, a sustained stream of never-repeating series names would hold unboundedly many retained series regardless of how short the retention window is. Least-recently-updated series are evicted first once exceeded.",
+              "default": 10000,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
             },
             "type": {
               "type": "string",
