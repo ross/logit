@@ -30,13 +30,13 @@ motivated extensions recorded as new `docs/known-gaps.md` entries, not built her
 
 Each workstream below landed as its own commit on this branch (A–E together, F, then G); read the
 design docs a workstream references before touching that area again — this plan sequences work, it
-doesn't re-derive design that belongs in [ADR 0022](../adr/0022-decoupled-listener-io.md) or a
+doesn't re-derive design that belongs in [ADR 0026](../adr/0026-decoupled-listener-io.md) or a
 design doc.
 
 ## What established implementations do
 
 Researched before designing, because the intended outcome was to match the field rather than
-invent — see [ADR 0022](../adr/0022-decoupled-listener-io.md)'s Context section for the full
+invent — see [ADR 0026](../adr/0026-decoupled-listener-io.md)'s Context section for the full
 table and citations (Telegraf, gostatsd, DogStatsD, rsyslog, syslog-ng, and Vector as the
 instructive counter-example). The short version: every mature UDP listener researched decouples
 read from parse via a bounded queue, and every one of them drops on overflow by default rather than
@@ -73,7 +73,7 @@ shape — never `tokio::spawn`.
 Today SIGTERM loses one in-flight datagram, and ADR 0013 accepts that explicitly on the premise
 that "dropping a UDP-listener future mid-datagram is already an accepted loss." A receive queue
 holding thousands of datagrams plus an accumulator invalidates that premise. The fix
-([ADR 0022](../adr/0022-decoupled-listener-io.md) has the full design) is an additive, defaulted
+([ADR 0026](../adr/0026-decoupled-listener-io.md) has the full design) is an additive, defaulted
 trait method whose default body **is** ADR 0013's own `select!`, relocated onto the trait, so a
 non-overriding listener still resolves at the exact instant shutdown fires — zero added latency —
 while `run_input` races the (possibly overridden) result against a grace-delayed backstop. This
@@ -113,7 +113,7 @@ D ──┘
 A (queue generalization), B (batch accumulator), C (`Decoder` timestamp widening), and D
 (`Input::run_until_shutdown` + `run_input`'s grace backstop) were mutually independent. E (the UDP
 driver, wiring A–D together) needed all four. F (config, schema, validation) needed E. G (telemetry
-catalog, docs, `known-gaps.md`, ADR 0022 to Accepted) needed F. Landed as three commits: A–E
+catalog, docs, `known-gaps.md`, ADR 0026 to Accepted) needed F. Landed as three commits: A–E
 together, then F, then G.
 
 ---
@@ -167,7 +167,7 @@ events across resources.
 > only on a resource change), the capacity term read live off `self.events.capacity()` (`O(1)`),
 > and `events_weight` (a running sum, updated by adding just the incoming slice's per-event
 > contribution). The three reproduce `estimated_heap_bytes` exactly, by construction — see ADR
-> 0022. Caught by a whitebox test (`incremental_weight_matches_a_full_recompute_after_many_absorbs`)
+> 0026. Caught by a whitebox test (`incremental_weight_matches_a_full_recompute_after_many_absorbs`)
 > that absorbs many slices under one shared resource and compares the incremental total against a
 > from-scratch recompute of the merged batch.
 
@@ -210,7 +210,7 @@ tests per decoder (`decode_into_stamps_events_with_the_callers_received_at_not_t
 nothing to drain.
 
 **As shipped.** `crates/logit-pipeline/src/input.rs` gains the defaulted `run_until_shutdown`
-exactly as designed in [ADR 0022](../adr/0022-decoupled-listener-io.md). `NodeSpec::Input` becomes
+exactly as designed in [ADR 0026](../adr/0026-decoupled-listener-io.md). `NodeSpec::Input` becomes
 `Input(Box<dyn Input + Send>, InputRuntimeConfig)`; `run_input` gains a `shutdown_grace: Duration`
 parameter and races `input.run_until_shutdown(...)` against `shutdown_grace_expired` (the existing
 helper `write_loop` already used, reused unchanged). `shutdown.clone()` in the first arm means the
@@ -296,20 +296,21 @@ new `human_bytes::option` submodule (mirroring the pre-existing `humantime_serde
 for `receive_buffer_bytes: Option<u64>`. Defaults: `max_datagrams` 10,000, `max_bytes` 32MiB,
 `overflow` `drop_oldest`, `batch_max_events` 1,000, `batch_max_bytes` 1MiB, `batch_flush_interval`
 100ms, `receive_buffer_bytes` `None`, `shutdown_grace` 5s — see
-[ADR 0022](../adr/0022-decoupled-listener-io.md) for the numeric derivation against the field's own
+[ADR 0026](../adr/0026-decoupled-listener-io.md) for the numeric derivation against the field's own
 tuning figures.
 
-**Graph validation** (`crates/logit-pipeline/src/graph.rs`), rules 16 and 17: rule 16 rejects a
-non-default `receive:` on any kind that isn't a datagram listener — a dedicated
+**Graph validation** (`crates/logit-pipeline/src/graph.rs`), rules 17 and 18 (rule 16, added
+separately by `internal`'s `span_sample_rate` validation, sits between this plan's two): rule 17
+rejects a non-default `receive:` on any kind that isn't a datagram listener — a dedicated
 `is_datagram_listener` predicate (`StatsdIn | SyslogIn` today), deliberately not `role() !=
-Role::Listener`, since `internal` is a listener by role but has no socket/queue/decoder. Rule 17
+Role::Listener`, since `internal` is a listener by role but has no socket/queue/decoder. Rule 18
 rejects a zero `max_datagrams`/`max_bytes`/`batch_max_events` (the twin of rule 15) but accepts
 `batch_flush_interval: 0s`, which means "no timer."
 
 `crates/logit-cli/src/pipeline.rs::build_spec` derives both `UdpListenerConfig` (via new
 `receive_config`) and `InputRuntimeConfig` (via new `input_runtime_config`) from
 `component.receive` — `input_runtime_config` applies uniformly to every `NodeSpec::Input` arm
-including `internal`, safe because rule 16 already guarantees a non-datagram-listener's `receive`
+including `internal`, safe because rule 17 already guarantees a non-datagram-listener's `receive`
 is `ReceiveConfig::default()` by the time a resolved graph reaches `build_spec`.
 
 `UdpListener`/`StatsdInput` gained a `config()`/`receive_config()` getter purely for test
@@ -396,7 +397,7 @@ updated to `queue.rs`.
 > commit.
 
 **Done:** `examples/internal-telemetry.yaml` is the config the new metrics are exercisable through;
-[ADR 0022](../adr/0022-decoupled-listener-io.md) is Accepted.
+[ADR 0026](../adr/0026-decoupled-listener-io.md) is Accepted.
 
 ---
 
@@ -425,4 +426,4 @@ a temporarily-lowered `net.core.rmem_max`. Both are real, valuable end-to-end co
 plan's central claim, exercising the running `compose.yaml` stack and host-level sysctls rather than
 the crate test suite — worth doing before or shortly after this lands somewhere it matters
 operationally, using the exact steps `docs/deploying.md`'s new "Listener intake" section and
-[ADR 0022](../adr/0022-decoupled-listener-io.md) already describe.
+[ADR 0026](../adr/0026-decoupled-listener-io.md) already describe.

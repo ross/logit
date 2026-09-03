@@ -93,8 +93,9 @@ pub enum ComponentKind {
 into one tagged enum creates real collisions — `Otlp { bind }` (a listener) and `Otlp { endpoint }`
 (a sink) can't both be `type: otlp` in an internally-tagged enum, and the same is true of the two
 `Logit` variants. Suffixing *every* protocol kind uniformly, not just the two that collide today,
-keeps the rule predictable as more protocols gain a second side (`syslog_out`, once syslog egress
-exists, say). Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`,
+keeps the rule predictable as more protocols gain a second side — `syslog_out` (RFC 3164/5424 over
+UDP or TCP, `docs/adr/0022-syslog-output.md`) is exactly that case, landing well after `SyslogIn`.
+Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`,
 `remove`, and any future native transform — take no suffix; there's only ever one direction for a
 transform to be.
 
@@ -195,12 +196,14 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     than a meaningful setting silently ignored.
 15. A sink's `buffer.max_batches` or `buffer.max_bytes` of `0` is rejected — an impossible bound
     (no batch could ever be queued) rather than a small one.
-16. A non-default `receive:` block is rejected on any kind that is not a **datagram listener**
-    (`docs/adr/0022-decoupled-listener-io.md`), today `statsd_in`/`syslog_in`. Deliberately not
+16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` — a config error, not
+    something to clamp silently.
+17. A non-default `receive:` block is rejected on any kind that is not a **datagram listener**
+    (`docs/adr/0026-decoupled-listener-io.md`), today `statsd_in`/`syslog_in`. Deliberately not
     "any non-listener": `internal` is a listener by role but has no socket, no queue, and no
     decoder, so `receive:` on it would be exactly the silently-ignored-setting failure rule 14
     guards against on the sink side.
-17. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, or `receive.batch_max_events`
+18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, or `receive.batch_max_events`
     of `0` is rejected — the twin of rule 15. `receive.batch_flush_interval: 0s` is **not**
     rejected — it means "no flush timer," a meaningful setting, unlike the count bounds.
 
@@ -287,31 +290,38 @@ trait object doesn't fix that, and shouldn't try to.
 Every `Delivered` (the channel payload one `Fanout` edge carries, `crates/logit-pipeline/src/fanout.rs`)
 carries a `TraceContext { trace_id: [u8; 16], span_id: [u8; 8] }` — the substrate for internal
 spans, decided and built per [ADR 0020](../adr/0020-trace-context-propagation-on-delivered.md) on
-the measured evidence [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md) required. No
-`SpanRecord` is emitted anywhere yet (that's a separate, still-open piece — see `docs/known-gaps.md`'s
-internal-spans entry) — this is only the plumbing that gets the *right* context to the *right*
-place once something does.
+the measured evidence [ADR 0017](../adr/0017-minimize-allocations-over-event-size.md) required.
+[ADR 0025](../adr/0025-internal-span-emission-and-deterministic-sampling.md) is what actually turns
+this plumbing into a `SpanRecord`-carrying `Event` — see `docs/design/internal-telemetry.md`'s
+"Spans" section for the emit API, the sampler, and the bound.
 
 **Which node kinds propagate a real parent, and which mint a fresh root, is not uniform — it's
 exactly the 1-to-1-vs-*n*-to-1 distinction the rest of this doc already draws between a node's
 per-batch processing and its flush:**
 
-| Node kind | Context of what it emits |
-|---|---|
-| A listener's own batches | Always a fresh root — `Input::run` never receives a `Delivered` (arity rules out a `sources` entry pointing at one), so there is no parent to inherit. |
-| `Transform::process`/`ScriptWorker::process` (the non-flush path) | A [`TraceContext::child`] of the one incoming batch that produced it — 1-to-1, unambiguous. |
-| `Transform::flush`/Lua's timer-driven `flush()` | A fresh root, deliberately — an *n*-to-1 relationship (however many batches were absorbed since the last tick), with no single correct parent to propagate. Tracked as an open gap, not silently approximated; see ADR 0020's "What this doesn't do." |
-| `run_output` | Emits nothing further downstream — nothing to propagate *to*. It already borrows the incoming `Delivered` without unwrapping (`Output::send(&EventBatch)`, [ADR 0016](../adr/0016-arc-eventbatch-copy-on-write.md)), so the context is there to read (`Delivered::context()`) once something needs it. |
+| Node kind | Context of what it emits | Span recorded |
+|---|---|---|
+| A listener's own batches | Always a fresh root — `Input::run` never receives a `Delivered` (arity rules out a `sources` entry pointing at one), so there is no parent to inherit. | `SpanKind::Producer`, in `Fanout::send`/`send_blocking` |
+| `Transform::process`/`ScriptWorker::process` (the non-flush path) | A [`TraceContext::child`] of the one incoming batch that produced it — 1-to-1, unambiguous. | `SpanKind::Internal`, in `run_transform`/`run_lua` |
+| `Transform::flush`/Lua's timer-driven `flush()` | A fresh root, deliberately — an *n*-to-1 relationship (however many batches were absorbed since the last tick), with no single correct parent to propagate. Tracked as an open gap, not silently approximated; see ADR 0020's "What this doesn't do." One root now covers *every* resource group a flush emits, not one root per group (ADR 0025). | `SpanKind::Internal`, in `run_flush`/`run_lua`'s `flush_now` |
+| `run_output` | Already borrows the incoming `Delivered` without unwrapping (`Output::send(&EventBatch)`, [ADR 0016](../adr/0016-arc-eventbatch-copy-on-write.md)), so the context is there to read. Nothing further downstream to propagate *to* — the sink span mints `ctx.child()` as its own identity and then discards it (ADR 0025). | `SpanKind::Client`, in `write_loop` |
 
-Mechanically: `Fanout::send`/`send_blocking` (mint a root) are unchanged in signature and behavior;
-`Fanout::send_with_context`/`send_blocking_with_context` (mint a child of a given parent) are new,
-additive methods used only by the two propagating call sites above. `Delivered::context()` is a
-cheap `&self` accessor — read it *before* `unwrap_batch` consumes the batch, since `unwrap_batch`
-itself still discards the context (changing its return type to include one would force every
-existing caller, most of which don't propagate anything, to thread a value through unused).
+Mechanically: `Fanout::send`/`send_blocking` mint a root, open the listener's own span, and
+delegate to `Fanout::send_with_own_context` (new, ADR 0025) — the *only* remaining caller of
+`send`/`send_blocking`, now that a flush-driven emission (which used to call `send` directly) also
+mints its own root and calls `send_with_own_context` instead, so it can record its own span around
+the same context. `Fanout::send_with_context`/`send_blocking_with_context` (mint a child of a given
+parent, no span of their own) are defined in terms of `send_with_own_context` too — additive
+methods, no existing signature changed. `Delivered::context()` is a cheap `&self` accessor — read
+it *before* `unwrap_batch` consumes the batch, since `unwrap_batch` itself still discards the
+context (changing its return type to include one would force every existing caller, most of which
+don't propagate anything, to thread a value through unused). `SinkQueue`'s entries carry the
+context too now (`push`/`peek`, ADR 0025) — the last place it was still being discarded, on the
+one path (`drain_inbox` → `write_loop`) that needs it to parent the sink's own span.
 
 A fan-out (one batch, several downstream branches) gives every branch the *identical* child
-context — one emission forking into several consumers is still one hop, not several.
+context — one emission forking into several consumers is still one hop, not several, and (per ADR
+0022) records exactly one span for it, not one per branch.
 
 ## Backpressure: diamonds are the normal shape now
 
@@ -361,7 +371,7 @@ still applies it once the queue itself fills — it just surfaces later and deep
 `logit.component.buffer.utilization` rather than only as a stalled inbox.
 
 **Listener-side receive decoupling does the same thing one hop earlier**
-(`docs/adr/0022-decoupled-listener-io.md`). A UDP listener's `recv_from`, decode, and
+(`docs/adr/0026-decoupled-listener-io.md`). A UDP listener's `recv_from`, decode, and
 `Fanout::send` used to share one loop, so downstream backpressure stopped the socket being read and
 the kernel dropped datagrams silently and uncounted. `logit-inputs::udp::UdpListener` splits into a
 read half that moves datagrams off the socket into a `ReceiveQueue` (`BoundedQueue<Datagram>`, the
@@ -385,7 +395,7 @@ config is a graph rather than a list of linear pipelines.
   undefined component can't be drawn at all" and required rule 2 to pass first — that premise was
   simply wrong once actually tried; corrected here rather than left as a stated constraint the
   implementation quietly didn't follow.)
-- Runs the full validation (all fifteen rules) after rendering and reports any failures to stderr with a
+- Runs the full validation (all eighteen rules) after rendering and reports any failures to stderr with a
   non-zero exit — without suppressing the DOT output. This is deliberate: `graph` is most useful on
   exactly the configs that fail validation, since a cycle — or a typo'd source, now visibly
   dangling — is far easier to see rendered than to parse out of an error message naming two
@@ -430,14 +440,14 @@ logit-core   logit-config   logit-script
   kind-to-trait-object registry (today's `build_input`/`build_output`, generalized).
 - Keeps the channel type out of `logit-core`, whose doc comment states "no I/O, no pipeline" —
   weakening that would blur a boundary the crate exists to hold.
-- Owns `BoundedQueue<T: Queued>` and `BatchAccumulator` (`docs/adr/0022-decoupled-listener-io.md`)
+- Owns `BoundedQueue<T: Queued>` and `BatchAccumulator` (`docs/adr/0026-decoupled-listener-io.md`)
   alongside `Fanout` and the node runtime — both are transport-agnostic (nothing in either type
   mentions a socket or a decoder). The UDP socket bind, `SO_RCVBUF` setsockopt, and `recv_from` loop
   that *uses* them (`logit-inputs::udp::UdpListener`) stay in `logit-inputs`, following the same
   "traits and generic machinery here, concrete protocol impls there" split the crate already
   applies everywhere else.
 
-`graph.rs` (resolution + the seventeen validation rules + topo-sort) is a **pure function over
+`graph.rs` (resolution + the eighteen validation rules + topo-sort) is a **pure function over
 `Config`** — no channels, no threads, no tokio — mirroring how `apply_transforms` in today's
 `pipeline.rs` was deliberately kept pure specifically so it's unit-testable without spinning up
 real I/O. `logit run`, `logit validate`, and `logit graph` are three different things layered on

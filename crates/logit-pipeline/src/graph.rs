@@ -30,14 +30,16 @@
 //!     rather than a meaningful setting silently ignored.
 //! 15. A sink's `buffer.max_batches` or `buffer.max_bytes` of `0` is rejected -- an impossible
 //!     bound (no batch could ever be queued) rather than a small one.
-//! 16. A non-default `receive:` block is rejected on any kind that is not a datagram listener
-//!     (today `statsd_in`/`syslog_in`) -- `receive:` (`docs/adr/0022-decoupled-listener-io.md`)
+//! 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` -- a config error, not
+//!     something to clamp silently.
+//! 17. A non-default `receive:` block is rejected on any kind that is not a datagram listener
+//!     (today `statsd_in`/`syslog_in`) -- `receive:` (`docs/adr/0026-decoupled-listener-io.md`)
 //!     configures a listener's socket-side receive queue, which only a datagram listener has.
 //!     Deliberately **not** `role(&kind) != Role::Listener`: `internal` is a listener by role but
 //!     has no socket, no queue, and no decoder, so `receive:` on it would be a silently-ignored
 //!     setting -- exactly what this rule exists to catch on the sink side (rule 14). A future
 //!     listener kind rejects `receive:` until it is actually wired to the UDP driver.
-//! 17. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`,
+//! 18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`,
 //!     `receive.batch_max_events`, or `receive.batch_max_bytes` of `0` is rejected -- an
 //!     impossible bound, the twin of rule 15.
 //!     `receive.batch_flush_interval: 0s` is **not** rejected: it means "no flush timer," a
@@ -102,7 +104,11 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Sample { .. }
         | Throttle { .. }
         | Dedup { .. } => Role::Transform,
-        InfluxDbOut { .. } | OtlpOut { .. } | LogitOut { .. } | StdioOut { .. } => Role::Sink,
+        InfluxDbOut { .. }
+        | OtlpOut { .. }
+        | LogitOut { .. }
+        | StdioOut { .. }
+        | SyslogOut { .. } => Role::Sink,
     }
 }
 
@@ -142,6 +148,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         OtlpOut { .. } => "otlp_out",
         LogitOut { .. } => "logit_out",
         StdioOut { .. } => "stdio_out",
+        SyslogOut { .. } => "syslog_out",
     }
 }
 
@@ -153,6 +160,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
         kind,
         ComponentKind::StatsdIn { .. }
             | ComponentKind::SyslogIn { .. }
+            | ComponentKind::OtlpIn { .. }
             | ComponentKind::Internal { .. }
             | ComponentKind::Lua { .. }
             | ComponentKind::LuaFile { .. }
@@ -162,7 +170,9 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Keep { .. }
             | ComponentKind::Remove { .. }
             | ComponentKind::InfluxDbOut { .. }
+            | ComponentKind::OtlpOut { .. }
             | ComponentKind::StdioOut { .. }
+            | ComponentKind::SyslogOut { .. }
     )
 }
 
@@ -173,7 +183,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
 fn interval(kind: &ComponentKind) -> Option<Duration> {
     match kind {
         ComponentKind::Lua { interval, .. } | ComponentKind::LuaFile { interval, .. } => *interval,
-        ComponentKind::Aggregate { interval } | ComponentKind::Internal { interval } => {
+        ComponentKind::Aggregate { interval } | ComponentKind::Internal { interval, .. } => {
             Some(*interval)
         }
         _ => None,
@@ -188,8 +198,8 @@ pub struct ResolvedComponent {
     /// sink-only by [`resolve`] (rule 14); meaningless on any other role, so a non-sink component's
     /// value here is always [`BufferConfig::default`] once resolution has succeeded.
     pub buffer: BufferConfig,
-    /// Per-listener receive queue/batching config (`docs/adr/0022-decoupled-listener-io.md`).
-    /// Validated as datagram-listener-only by [`resolve`] (rule 16); meaningless on any other
+    /// Per-listener receive queue/batching config (`docs/adr/0026-decoupled-listener-io.md`).
+    /// Validated as datagram-listener-only by [`resolve`] (rule 17); meaningless on any other
     /// kind, so its value here is always [`ReceiveConfig::default`] once resolution has succeeded.
     pub receive: ReceiveConfig,
 }
@@ -378,7 +388,28 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 16: `receive:` is a datagram-listener-only concept -- see this module's own doc
+    // Rule 16: `internal`'s `span_sample_rate` must be finite and within `[0, 1]` -- a config
+    // error, not something to clamp silently. `trace_is_sampled` (`crates/logit-core/src/
+    // telemetry.rs`) treats NaN as "keep everything," which would be a surprising thing to get
+    // from a typo (`span_sample_rate: tru` parsing as a string coerced to NaN, say) rather than a
+    // deliberate "sample everything" choice; a value above 1 or below 0 is unambiguously a
+    // mistake, since neither has a sensible "keep more/less than everything" reading.
+    for (id, component) in &components {
+        if let ComponentKind::Internal { span_sample_rate, .. } = &component.kind {
+            if !span_sample_rate.is_finite() {
+                anyhow::bail!(
+                    "component '{id}': 'span_sample_rate' must be a finite number, got {span_sample_rate}"
+                );
+            }
+            if !(0.0..=1.0).contains(span_sample_rate) {
+                anyhow::bail!(
+                    "component '{id}': 'span_sample_rate' must be between 0.0 and 1.0, got {span_sample_rate}"
+                );
+            }
+        }
+    }
+
+    // Rule 17: `receive:` is a datagram-listener-only concept -- see this module's own doc
     // comment on why this checks a dedicated predicate rather than `role() == Role::Listener`
     // (which would wrongly also permit `internal`).
     for (id, component) in &components {
@@ -391,7 +422,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 17: the twin of rule 15, for a listener's receive queue -- `0` on any of the four
+    // Rule 18: the twin of rule 15, for a listener's receive queue -- `0` on any of the four
     // count/byte bounds is an impossible bound, never a small one. `batch_flush_interval: 0s` is
     // deliberately not checked here: zero there means "no timer," a meaningful setting.
     for (id, component) in &components {
@@ -436,9 +467,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     Ok(Graph { components: resolved, topological_order })
 }
 
-/// The predicate rule 16 needs: which `ComponentKind`s the UDP listener driver
-/// (`docs/adr/0022-decoupled-listener-io.md`, `logit-inputs::udp::UdpListener`) actually backs.
-/// Kept explicit rather than derived from [`Role`] -- see rule 16's own doc comment -- so a new
+/// The predicate rule 17 needs: which `ComponentKind`s the UDP listener driver
+/// (`docs/adr/0026-decoupled-listener-io.md`, `logit-inputs::udp::UdpListener`) actually backs.
+/// Kept explicit rather than derived from [`Role`] -- see rule 17's own doc comment -- so a new
 /// listener kind rejects `receive:` until it is actually wired to that driver.
 fn is_datagram_listener(kind: &ComponentKind) -> bool {
     matches!(kind, ComponentKind::StatsdIn { .. } | ComponentKind::SyslogIn { .. })
@@ -725,7 +756,7 @@ mod tests {
     #[test]
     fn unimplemented_kind_is_rejected() {
         let err = expect_err(cfg(vec![
-            ("in", vec![], ComponentKind::OtlpIn { bind: "127.0.0.1:0".to_string() }),
+            ("in", vec![], ComponentKind::LogitIn { bind: "127.0.0.1:0".to_string() }),
             ("out", vec!["in"], sink()),
         ]));
         assert!(err.contains("not implemented yet"), "got: {err}");
@@ -926,7 +957,11 @@ mod tests {
     }
 
     fn internal() -> ComponentKind {
-        ComponentKind::Internal { interval: Duration::from_secs(10) }
+        internal_with_rate(logit_core::DEFAULT_SPAN_SAMPLE_RATE)
+    }
+
+    fn internal_with_rate(span_sample_rate: f64) -> ComponentKind {
+        ComponentKind::Internal { interval: Duration::from_secs(10), span_sample_rate }
     }
 
     #[test]
@@ -956,10 +991,50 @@ mod tests {
     #[test]
     fn internal_with_zero_interval_is_rejected() {
         let err = expect_err(cfg(vec![
-            ("self", vec![], ComponentKind::Internal { interval: Duration::ZERO }),
+            (
+                "self",
+                vec![],
+                ComponentKind::Internal {
+                    interval: Duration::ZERO,
+                    span_sample_rate: logit_core::DEFAULT_SPAN_SAMPLE_RATE,
+                },
+            ),
             ("out", vec!["self"], sink()),
         ]));
         assert!(err.contains("flush interval of 0s"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_rejects_a_span_sample_rate_above_one() {
+        let err = expect_err(cfg(vec![
+            ("self", vec![], internal_with_rate(1.5)),
+            ("out", vec!["self"], sink()),
+        ]));
+        assert!(
+            err.contains("span_sample_rate") && err.contains("between 0.0 and 1.0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_a_span_sample_rate_below_zero() {
+        let err = expect_err(cfg(vec![
+            ("self", vec![], internal_with_rate(-0.1)),
+            ("out", vec!["self"], sink()),
+        ]));
+        assert!(
+            err.contains("span_sample_rate") && err.contains("between 0.0 and 1.0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_a_span_sample_rate_that_is_not_finite() {
+        let err = expect_err(cfg(vec![
+            ("self", vec![], internal_with_rate(f64::NAN)),
+            ("out", vec!["self"], sink()),
+        ]));
+        assert!(err.contains("span_sample_rate") && err.contains("finite"), "got: {err}");
     }
 
     fn non_default_buffer() -> BufferConfig {
@@ -1076,7 +1151,7 @@ mod tests {
         assert!(err.contains("'receive' is only meaningful on a datagram listener"), "got: {err}");
     }
 
-    /// The reason rule 16 checks a dedicated predicate rather than `role() == Role::Listener`:
+    /// The reason rule 17 checks a dedicated predicate rather than `role() == Role::Listener`:
     /// `internal` is a listener by role but has no socket, no queue, and no decoder, so a
     /// `receive:` block on it must be rejected just as clearly as on a sink or a transform.
     #[test]
@@ -1103,7 +1178,7 @@ mod tests {
     #[test]
     fn a_default_receive_on_a_non_listener_validates_fine() {
         // An explicitly-written but all-default `receive: {}` is indistinguishable from an
-        // omitted block -- rule 16 only rejects a genuinely *non-default* value.
+        // omitted block -- rule 17 only rejects a genuinely *non-default* value.
         let graph = resolve(cfg_with_receive(vec![
             ("in", vec![], listener(), ReceiveConfig::default()),
             ("enrich", vec!["in"], lua(), ReceiveConfig::default()),
@@ -1169,7 +1244,7 @@ mod tests {
     }
 
     /// Unlike the four count/byte bounds above, `batch_flush_interval: 0s` is a meaningful
-    /// setting ("no flush timer") -- rule 17 must not reject it.
+    /// setting ("no flush timer") -- rule 18 must not reject it.
     #[test]
     fn a_listeners_receive_with_a_zero_batch_flush_interval_validates_fine() {
         let graph = resolve(cfg_with_receive(vec![

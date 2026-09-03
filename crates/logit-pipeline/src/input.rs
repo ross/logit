@@ -15,7 +15,7 @@ pub trait Input {
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()>;
 
     /// Runs until `shutdown` flips, with the opportunity to drain buffered work first
-    /// (`docs/adr/0022-decoupled-listener-io.md`). The default *is* [`Input::run`] raced against
+    /// (`docs/adr/0026-decoupled-listener-io.md`). The default *is* [`Input::run`] raced against
     /// the signal -- ADR 0013's original cancel-by-drop shutdown, relocated here: `shutdown`
     /// winning drops `run`'s future and the `Fanout` inside it, cascading the close-time flush
     /// through every downstream node exactly as before. An implementation with nothing buffered

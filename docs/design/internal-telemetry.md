@@ -99,6 +99,111 @@ above becomes visible instead of silently growing the interner. Under the tag co
 never fires in practice: cardinality is bounded by how many distinct metric names and
 compile-time-constant tag values a component's code contains, not by traffic.
 
+## Spans
+
+Closes the emission half of what was, until [ADR 0025](../adr/0025-internal-span-emission-and-deterministic-sampling.md),
+an open item: [ADR 0020](../adr/0020-trace-context-propagation-on-delivered.md) put a real
+`TraceContext` on every `Delivered` and gave the two unambiguous node kinds a real parent to
+propagate; a follow-up gave `Transform::flush` a bounded `Vec<SpanLink>` per emitted event. Neither
+emitted a `SpanRecord`. This section is that emission, plus the sampling knob span volume needs
+that metric volume never did.
+
+### One span is one node's minted `TraceContext`
+
+Not "one node's processing of one batch" — the two differ for `Transform::flush` (an *n*-to-1
+emission, no single incoming batch) and for a flush spanning several resource groups (which used
+to mint several unrelated roots for what is really one unit of work). The runtime mints a context
+exactly once per unit of work and uses that *same* context both as the span's identity and as what
+the emission is sent under:
+
+| Node | `trace_id` | `span_id` | `parent_span_id` | `SpanKind` | Recorded in | Window measured |
+|---|---|---|---|---|---|---|
+| Listener | fresh root | that root's | none | `Producer` | `Fanout::send`/`send_blocking` | the `send` call only |
+| `Transform::process` | inherited | `parent.child()`, minted in `run_transform` | incoming | `Internal` | `run_transform` | `process_batch` + send |
+| Lua `process` | inherited | same, minted in `run_lua` | incoming | `Internal` | `run_lua` | `process()` + blocking send |
+| `Transform::flush` | fresh root | that root's | none | `Internal` | `run_flush` | `flush()` + every group's send |
+| Lua `flush()` | fresh root | that root's | none | `Internal` | `run_lua`'s `flush_now` | `flush()` + send |
+| `run_output` | inherited | `ctx.child()`, minted then discarded | incoming | `Client` | `write_loop` | the whole `deliver_with_retry` |
+
+A fan-out (one batch, several downstream consumers) still records exactly one span: it's one
+`send_with_own_context` call by one node, and the *N* consumers each mint their own child later, on
+their own visit — the span belongs to the emission, not the edge.
+
+### The emit API
+
+Mirrors `Telemetry::timer`'s shape:
+
+```rust
+let mut span = telemetry.span(op, kind, trace_id, span_id, parent_span_id);
+span.events(n);            // how many events this emission carries
+span.link(link);            // or .links(iter) -- bounded, see below
+span.tag("fault", "ambiguous");
+span.error();                // or .ok() -- defaults to Ok
+```                           // dropped, or .finish(), to record it
+
+`op` is one of `"process"|"flush"|"send"|"deliver"` — half of the drained span's `name`, joined
+with this component's own `kind` at drain time (`"aggregate process"`, `"influxdb_out deliver"`).
+The sample decision (below) is made *inside* `span`, before any span-shaped state exists — an
+unsampled trace gets the same disabled `SpanGuard` a disabled handle's `timer()` returns: every
+method an immediate no-op, no allocation, no clock read beyond the one sampling comparison.
+
+### The sampler: deterministic on `trace_id`
+
+```rust
+pub fn trace_is_sampled(trace_id: &[u8; 16], rate: f64) -> bool
+```
+
+Every node — and every `logit` process in a split-collection topology (`docs/OVERVIEW.md`) —
+computes the same keep/drop verdict independently, from `trace_id` alone: a kept trace is kept at
+*every* hop, a dropped one dropped at every hop, with no propagated bit and no extra bytes on
+`TraceContext`/`Delivered`. Same shape as OTel's `TraceIdRatioBased` sampler (the top 53 bits of
+the low 8 `trace_id` bytes — `f64`'s exact-integer range — compared against `rate`).
+
+The rate lives on `Registry` (`Registry::with_span_sampling(rate)`, process-wide — graph rule 13
+already guarantees at most one `internal` component) and is copied into each `ComponentBuffer` at
+construction, so a live span never needs a second lock. Config:
+
+```yaml
+self:
+  type: internal
+  interval: 10s
+  span_sample_rate: 0.1   # the default; 1.0 keeps everything, 0.0 turns spans off
+```
+
+Below `1.0` by default (`DEFAULT_SPAN_SAMPLE_RATE = 0.1`): span volume is a different shape than
+metric volume — one span per node-visit per batch, where a metric point coalesces between drains.
+Named `span_sample_rate`, not `sample_rate` — there is already a `ComponentKind::Sample` transform,
+and `internal` may grow other sampling knobs later. Graph validation rule 16 rejects a non-finite
+or out-of-`[0, 1]` value as a config error, since `trace_is_sampled` treats NaN as "keep
+everything" — a surprising result to get from a typo rather than a deliberate choice.
+
+### The bound: a plain `Vec`, not a keyed map
+
+A point's `PointKey` map coalesces repeats at the same `(name, tags)` key; two spans never share an
+identity to coalesce on, so `ComponentBuffer` holds spans in a separate, unkeyed `Vec`, capped at
+`MAX_SPANS_PER_COMPONENT` (512) — a volume bound, not a cardinality one, since nothing else bounds
+how many can accumulate except drain interval × sample rate. `SpanGuard::link`/`links` additionally
+cap each individual span's own link list at `MAX_LINKS_PER_SPAN` (32). Both drop-and-count, never
+silently grow: `logit.internal.spans.dropped{reason="buffer_full"}` on the buffer (drained
+alongside `points.dropped`), `logit.internal.span.links.dropped{reason="cardinality"}` recorded
+immediately on the guard.
+
+### Span versus point, side by side
+
+| | Point | Span |
+|---|---|---|
+| Storage | `HashMap<PointKey, Pending>`, keyed | `Vec<PendingSpan>`, unkeyed |
+| Coalesces? | Yes, by `(name, tags)` | No — every visit is distinct |
+| Cap | `MAX_KEYS_PER_COMPONENT` (1024 distinct keys) | `MAX_SPANS_PER_COMPONENT` (512 total) |
+| Drop counter | `logit.internal.points.dropped{reason="cardinality"}` | `logit.internal.spans.dropped{reason="buffer_full"}` |
+| Drained `Event::timestamp` | the drain time, `now` | the span's own `start` — **never** `now` |
+| Emitted-count counter | `logit.internal.points.emitted` | `logit.internal.spans.emitted` |
+
+The timestamp row is the one place `ComponentBuffer::drain(now)` must ignore its own `now`
+argument for spans: `Event::timestamp` *is* the span's start (`SpanRecord`'s own doc comment), so
+stamping it with the drain time would make every span drift later than reality by however long it
+sat in the buffer.
+
 ## `internal`: the drain
 
 ```rust
@@ -202,7 +307,7 @@ because only a Lua node has a VM to sample or a script return value to classify 
 in this table applies uniformly across every component kind.
 
 **Every UDP listener also gets a `ReceiveQueue`** (`logit-inputs::udp`, an instance of the same
-generic `BoundedQueue<T: Queued>` `SinkQueue` is, `docs/adr/0022-decoupled-listener-io.md`) sitting
+generic `BoundedQueue<T: Queued>` `SinkQueue` is, `docs/adr/0026-decoupled-listener-io.md`) sitting
 between the socket read and decode — the listener-side mirror of the sink block above, one choke
 point every datagram passes through:
 
@@ -240,7 +345,7 @@ Worked examples, one per shipped component:
 - `statsd_in` (`crates/logit-inputs/src/statsd.rs`): `logit.input.datagrams`,
   `logit.input.datagram.bytes` — per-datagram detail `Fanout`'s per-batch view can't see, plus
   decode failures free via the `Diagnostics` bridge. Both listeners are now thin wrappers over
-  `logit-inputs::udp::UdpListener` (`docs/adr/0022-decoupled-listener-io.md`), which is where the
+  `logit-inputs::udp::UdpListener` (`docs/adr/0026-decoupled-listener-io.md`), which is where the
   `ReceiveQueue`/`receive_buffer.*` table above actually gets recorded — free for both, no
   per-listener code.
 - `syslog_in` (`crates/logit-inputs/src/syslog.rs`): the same pair, `logit.input.datagrams`/
@@ -275,6 +380,14 @@ Worked examples, one per shipped component:
   (`docs/adr/0021-buffered-sink-delivery.md`) into the generic `deliver_with_retry` every sink now
   shares, so retry counting is a Layer 2 metric (`logit.component.retries`, above), not something
   each sink tracks for itself.
+- `syslog_out` (`crates/logit-outputs/src/syslog.rs`): `logit.output.batch.bytes`,
+  `logit.output.request.duration`, `logit.output.requests{class="ok"|"error"}` — the same shape as
+  `influxdb_out`'s, minus the HTTP-specific status classes, since there's no response to classify.
+  Plus detail neither of the other two sinks needs: `logit.output.events.skipped` (events with no
+  `log` record — nothing to render as a syslog message, ADR 0012), `logit.output.messages.
+  truncated` and `logit.output.messages.dropped{reason="oversize_header"|"oversize_datagram"}`
+  (per-message size handling, `docs/adr/0022-syslog-output.md`'s "Sizing" section). Retry stays a
+  Layer 2 metric here too, for the same reason as `influxdb_out`.
 
 ## Metrics from Lua scripts
 

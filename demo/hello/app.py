@@ -156,8 +156,9 @@ counts, aggregates, and writes the result to InfluxDB.</p>
   <li>Dashboards &rarr; the <strong>logit</strong> folder &rarr; <strong>logit internals</strong>.</li>
   <li>Give it ten seconds: <code>aggregate</code> flushes on a 10s window.</li>
 </ol>
-<p>Loki and Tempo are up and provisioned too, but empty by design -- <code>logit</code> has no
-<code>syslog_out</code> or <code>otlp_out</code> yet. See <code>demo/README.md</code>.</p>
+<p>Loki and Tempo are up and provisioned too -- Loki is receiving this app's own logs via
+<code>syslog_out</code> and Grafana Alloy, but Tempo stays empty by design: <code>logit</code> has
+no <code>otlp_out</code> yet. See <code>demo/README.md</code>.</p>
 
 <h2>The pipeline</h2>
 <img src="/graph.svg" alt="logit pipeline graph">

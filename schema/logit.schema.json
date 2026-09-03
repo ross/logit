@@ -87,7 +87,7 @@
           }
         },
         {
-          "description": "RFC 3164 / RFC 5424 syslog over UDP or TCP.",
+          "description": "RFC 3164 / RFC 5424 syslog over UDP. **Not** TCP, despite this doc comment's old claim -- `crates/logit-inputs/src/syslog.rs`'s own module doc has always said UDP-only (nginx's `syslog:` writer is UDP-only, so a TCP accept loop would buy this listener nothing; `docs/known-gaps.md`'s \"syslog TCP and structured data\" entry tracks it as future, additive work). `syslog_out` (the egress side, `docs/adr/0022-syslog-output.md`) supports both UDP and TCP -- that asymmetry is deliberate, not a sign this needs fixing to match.",
           "type": "object",
           "required": [
             "bind",
@@ -115,6 +115,14 @@
           "properties": {
             "bind": {
               "type": "string"
+            },
+            "protocol": {
+              "default": "http",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OtlpProtocol"
+                }
+              ]
             },
             "type": {
               "type": "string",
@@ -183,6 +191,12 @@
             "interval": {
               "description": "Both the drain cadence for every component's buffered points and the sampling tick for this component's own process-level gauges (interner size, uptime). Should divide evenly into any downstream `aggregate` interval, or the two windows beat against each other.",
               "type": "string"
+            },
+            "span_sample_rate": {
+              "description": "Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id` the same way at every node -- a kept trace is kept at every hop, never partially. Below `1.0` by default: span volume is a different shape than metric volume (one span per node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full traces rather than a representative sample would set this explicitly. Named `span_sample_rate`, not `sample_rate` -- there is already a `ComponentKind::Sample` transform, and `internal` may grow other sampling knobs later. See `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`.",
+              "default": 0.1,
+              "type": "number",
+              "format": "double"
             },
             "type": {
               "type": "string",
@@ -567,6 +581,14 @@
             "endpoint": {
               "type": "string"
             },
+            "protocol": {
+              "default": "http",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OtlpProtocol"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -616,6 +638,77 @@
               ]
             }
           }
+        },
+        {
+          "description": "RFC 3164 / RFC 5424 syslog egress over UDP or TCP -- the mirror of `SyslogIn`, and a real relay: header fields round-trip from an event's `syslog.*` attributes when present, falling back to the defaults below only when an event carries none (e.g. one that never passed through `syslog_in`). See `docs/adr/0022-syslog-output.md`.",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "type"
+          ],
+          "properties": {
+            "app_name": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "connect_timeout": {
+              "description": "TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a dropped connection) is allowed to take before `send` reports it as a failure.",
+              "default": "5s",
+              "type": "string"
+            },
+            "endpoint": {
+              "description": "`host:port`. Resolved at connect/bind time, never at config-load time -- a `syslog_out` pointed at a destination that isn't up yet is not a config error (`!env` still applies like any other string field, ADR 0011).",
+              "type": "string"
+            },
+            "facility": {
+              "description": "PRI facility used only when the event carries no `syslog.facility` attribute.",
+              "default": "local0",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SyslogFacility"
+                }
+              ]
+            },
+            "format": {
+              "description": "RFC 3164 carries no year and no timezone in its TIMESTAMP, so a receiver has to guess both -- `rfc5424`'s unambiguous RFC 3339 timestamp is the better default; `syslog_in` already parses both dialects, so emitting both is parity, not new scope.",
+              "default": "rfc5424",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SyslogFormat"
+                }
+              ]
+            },
+            "hostname": {
+              "description": "HOSTNAME/APP-NAME fallbacks, used only when the event carries no `syslog.hostname`/ `syslog.tag` attribute -- e.g. an event that never passed through `syslog_in`. Omitted entirely (rather than a literal `logit` default) so a relayed line's origin is never silently overwritten with something that looks like a config mistake.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max_message_bytes": {
+              "description": "Bounds one encoded message (PRI + header + MSG). Defaults to 8192, matching Grafana Alloy's `loki.source.syslog` `max_message_length` default -- the receiver the demo stack points this at -- rather than RFC 3164 §4.1's traditional 1024, which would truncate a JSON-bodied message on every modern relay chain. A string via [`human_bytes`], exactly like `BufferConfig::max_bytes`.",
+              "default": "8192",
+              "type": "string"
+            },
+            "transport": {
+              "default": "udp",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SyslogTransport"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "syslog_out"
+              ]
+            }
+          }
         }
       ],
       "properties": {
@@ -637,7 +730,7 @@
           ]
         },
         "receive": {
-          "description": "Per-listener receive queue and batching (`docs/adr/0022-decoupled-listener-io.md`). Meaningful only on a datagram listener -- graph validation rejects a non-default value on any other kind, `internal` included. A sibling field of `kind`, mirroring `buffer`'s own placement.",
+          "description": "Per-listener receive queue and batching (`docs/adr/0026-decoupled-listener-io.md`). Meaningful only on a datagram listener -- graph validation rejects a non-default value on any other kind, `internal` included. A sibling field of `kind`, mirroring `buffer`'s own placement.",
           "default": {
             "batch_flush_interval": "0.1s",
             "batch_max_bytes": "1048576",
@@ -699,6 +792,25 @@
         }
       }
     },
+    "OtlpProtocol": {
+      "description": "Which OTLP transport a component speaks -- both `otlp_in` and `otlp_out` carry identical protobuf payloads (`crates/logit-proto/src/otlp`), differing only in framing and endpoint shape (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`).",
+      "oneOf": [
+        {
+          "description": "OTLP/HTTP, protobuf body, one POST per signal. Default: it's what an `http://host:4318`-shaped endpoint already implies, and a bare `endpoint: http://tempo:4318` would be silently wrong under any other default.",
+          "type": "string",
+          "enum": [
+            "http"
+          ]
+        },
+        {
+          "description": "Unary gRPC over plaintext HTTP/2 -- `crates/logit-outputs/src/otlp.rs`'s hand-rolled gRPC transport has no TLS support at all (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`), so an `otlp_out` component's `endpoint` under this protocol is rejected at construction time if it's written with an `https://` scheme, rather than silently exporting in plaintext.",
+          "type": "string",
+          "enum": [
+            "grpc"
+          ]
+        }
+      ]
+    },
     "OverflowPolicy": {
       "description": "What a sink's `SinkQueue` does once both its bounds (`max_batches`/`max_bytes`) are full. `logit-config`'s own copy -- `logit-config` must not depend on `logit-pipeline` (`docs/design/pipeline-graph.md`'s crate layout), so `crates/logit-cli/src/pipeline.rs` converts this to `logit_pipeline::OverflowPolicy` when building a `NodeSpec::Output`.",
       "type": "string",
@@ -709,7 +821,7 @@
       ]
     },
     "ReceiveConfig": {
-      "description": "Per-listener receive queue and datagram-\\>batch assembly (`docs/adr/0022-decoupled-listener-io.md`). Meaningful only on a datagram listener (today `statsd_in`/`syslog_in`); graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind, including `internal` (a listener by role, but one with no socket, no queue, and no decoder). Flat, following [`BufferConfig`]'s own `retry_budget`/`retry_max_delay` precedent rather than nesting a `batch:` sub-block -- two levels of optional-with-defaults is harder to scan in YAML than a flat prefix. Every field defaults, so a `receive:` block is never required -- **but an omitted block is not byte-for- byte the pre-ADR-0022 behavior**, and isn't meant to be: `batch_max_events: 1_000` and `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into batches (up to 1000 events, or up to 100ms of added latency before a send) rather than sending one batch per datagram immediately, matching what every established UDP listener researched for ADR 0022 does out of the box. A deployment that genuinely needs the old one-send-per- datagram, no-added-latency behavior gets it back explicitly with `batch_max_events: 1`, not by omitting `receive:`.",
+      "description": "Per-listener receive queue and datagram-\\>batch assembly (`docs/adr/0026-decoupled-listener-io.md`). Meaningful only on a datagram listener (today `statsd_in`/`syslog_in`); graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind, including `internal` (a listener by role, but one with no socket, no queue, and no decoder). Flat, following [`BufferConfig`]'s own `retry_budget`/`retry_max_delay` precedent rather than nesting a `batch:` sub-block -- two levels of optional-with-defaults is harder to scan in YAML than a flat prefix. Every field defaults, so a `receive:` block is never required -- **but an omitted block is not byte-for- byte the pre-ADR-0026 behavior**, and isn't meant to be: `batch_max_events: 1_000` and `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into batches (up to 1000 events, or up to 100ms of added latency before a send) rather than sending one batch per datagram immediately, matching what every established UDP listener researched for ADR 0026 does out of the box. A deployment that genuinely needs the old one-send-per- datagram, no-added-latency behavior gets it back explicitly with `batch_max_events: 1`, not by omitting `receive:`.",
       "type": "object",
       "properties": {
         "batch_flush_interval": {
@@ -722,7 +834,7 @@
           "type": "string"
         },
         "batch_max_events": {
-          "description": "Events to accumulate across datagrams before one send downstream. `1` means one send per datagram -- the behavior before ADR 0022 -- since the accumulator flushes on a bound *reached or exceeded* and never splits a single decode's output. `0` is rejected as an impossible bound (graph rule 17, the twin of rule 15's `buffer.max_batches: 0` check).",
+          "description": "Events to accumulate across datagrams before one send downstream. `1` means one send per datagram -- the behavior before ADR 0026 -- since the accumulator flushes on a bound *reached or exceeded* and never splits a single decode's output. `0` is rejected as an impossible bound (graph rule 18, the twin of rule 15's `buffer.max_batches: 0` check).",
           "default": 1000,
           "type": "integer",
           "format": "uint",
@@ -758,7 +870,7 @@
           ]
         },
         "shutdown_grace": {
-          "description": "How long a listener keeps draining a cooperative shutdown before being cancelled by drop (`docs/adr/0022-decoupled-listener-io.md`, revising ADR 0013's unconditional cancel-by-drop into a bounded one). Matches `buffer.shutdown_grace`'s default so both ends of the pipeline drain on the same number.",
+          "description": "How long a listener keeps draining a cooperative shutdown before being cancelled by drop (`docs/adr/0026-decoupled-listener-io.md`, revising ADR 0013's unconditional cancel-by-drop into a bounded one). Matches `buffer.shutdown_grace`'s default so both ends of the pipeline drain on the same number.",
           "default": "5s",
           "type": "string"
         }
@@ -767,6 +879,52 @@
     },
     "StdioTarget": {
       "type": "string"
+    },
+    "SyslogFacility": {
+      "description": "The syslog PRI facility, named rather than a bare `0..=23` integer so schemars publishes a real enumeration and a typo is a config error rather than a silently-wrong PRI. Ordered to match the standard facility codes (`kern` is 0); `as_u8` reads the discriminant back out. `local0` defaults, matching `demo/hello/app.py`'s own `PRI = 134` (facility 16), so the demo round-trips its own PRI unchanged even before `syslog.facility` attribute precedence applies.",
+      "type": "string",
+      "enum": [
+        "kern",
+        "user",
+        "mail",
+        "daemon",
+        "auth",
+        "syslog",
+        "lpr",
+        "news",
+        "uucp",
+        "cron",
+        "authpriv",
+        "ftp",
+        "ntp",
+        "security",
+        "console",
+        "solaris_cron",
+        "local0",
+        "local1",
+        "local2",
+        "local3",
+        "local4",
+        "local5",
+        "local6",
+        "local7"
+      ]
+    },
+    "SyslogFormat": {
+      "description": "Which syslog dialect `syslog_out` emits. See `SyslogOut::format`'s doc comment for why `rfc5424` is the default.",
+      "type": "string",
+      "enum": [
+        "rfc3164",
+        "rfc5424"
+      ]
+    },
+    "SyslogTransport": {
+      "description": "`syslog_out`'s transport. UDP (the default) mirrors `syslog_in` and needs no ordering guarantee against the receiver's startup -- a fire-and-forget `send_to` before the receiver is up just loses that line, the same honest limit `syslog_in`'s own UDP intake accepts on the way in. TCP is what makes `Fault` classification (`docs/adr/0021-buffered-sink-delivery.md`) meaningful for this sink: a connect failure is unambiguously `Fault::Clean`.",
+      "type": "string",
+      "enum": [
+        "udp",
+        "tcp"
+      ]
     }
   }
 }

@@ -33,7 +33,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 /// Thin wrapper over [`UdpListener<StatsdDecoder>`] -- the read/decode split and datagram-\>batch
-/// assembly all live there (`docs/adr/0022-decoupled-listener-io.md`); this type is just the
+/// assembly all live there (`docs/adr/0026-decoupled-listener-io.md`); this type is just the
 /// decoder choice plus the public constructor/builder surface `logit-cli::pipeline` and this
 /// module's own tests already depend on.
 pub struct StatsdInput {
@@ -74,7 +74,7 @@ impl StatsdInput {
     }
 
     /// Overrides the receive-queue/batching/shutdown-grace knobs a `receive:` config block sets
-    /// (`docs/adr/0022-decoupled-listener-io.md`). Defaults to [`UdpListenerConfig::default`] --
+    /// (`docs/adr/0026-decoupled-listener-io.md`). Defaults to [`UdpListenerConfig::default`] --
     /// today's behaviour -- when never called.
     pub fn with_receive(mut self, config: UdpListenerConfig) -> Self {
         self.inner = self.inner.with_config(config);
@@ -329,7 +329,7 @@ mod tests {
     }
 
     /// `decode_into` must stamp every event with the caller's `received_at`, not a fresh
-    /// call-time clock read -- the property `docs/adr/0022-decoupled-listener-io.md` exists for:
+    /// call-time clock read -- the property `docs/adr/0026-decoupled-listener-io.md` exists for:
     /// once decode runs on its own loop, "now" at decode time can be arbitrarily later than
     /// arrival under backlog.
     #[test]

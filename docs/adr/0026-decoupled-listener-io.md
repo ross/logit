@@ -1,4 +1,4 @@
-# 0022 — Decoupled listener I/O
+# 0026 — Decoupled listener I/O
 
 ## Status
 Accepted
@@ -142,7 +142,7 @@ Two design points worth recording:
 - **`batch_max_events: 1` is the exact, magic-value-free spelling of "no accumulation."**
   `absorb` flushes once a bound is *reached or exceeded* and never splits a decoded batch, so every
   non-empty decode immediately reaches a `max_events: 1` bound — one send per datagram, byte for
-  byte the pre-ADR-0022 behavior. `0` stays rejected as an impossible bound (graph rule 17, the
+  byte the pre-ADR-0026 behavior. `0` stays rejected as an impossible bound (graph rule 18, the
   twin of rule 15's `buffer.max_batches: 0` check).
 - **Never merges across a resource change.** An accumulated batch carries one `Arc<Resource>`; if
   the incoming resource isn't `Arc::ptr_eq` to what's held, whatever was held is flushed first

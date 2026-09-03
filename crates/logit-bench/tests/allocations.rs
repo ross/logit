@@ -22,6 +22,7 @@ use logit_bench::fixtures;
 use logit_core::{EventBatch, Registry, Telemetry, Value};
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::stdio::{EventDump, Format};
+use logit_outputs::syslog::{Format as SyslogFormat, MessageBuf, SyslogEncoder};
 use logit_pipeline::runtime::drain_inbox;
 use logit_pipeline::{
     process_batch, send_batch, unwrap_batch, Delivered, Fanout, SinkQueue, SinkQueueConfig,
@@ -135,7 +136,7 @@ fn syslog_decode_one_logs_only_line() {
 }
 
 /// The measurement `syslog_decode_one_line` above deliberately doesn't cover
-/// (`docs/adr/0022-decoupled-listener-io.md`): `decode_into` called against a buffer the caller
+/// (`docs/adr/0026-decoupled-listener-io.md`): `decode_into` called against a buffer the caller
 /// *reuses* across datagrams -- `logit-inputs::udp::decode_loop`'s actual hot path -- rather than
 /// `decode()`'s convenience default, which always hands `decode_into` a fresh `Vec::new()` and so
 /// can never show this. Zero, not one: the `Vec<Event>` is cleared (keeping capacity), not
@@ -176,7 +177,7 @@ fn statsd_decode_into_a_warm_reused_buffer_costs_one_not_two() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Listener receive queue and batch accumulator (docs/adr/0022-decoupled-listener-io.md)
+// Listener receive queue and batch accumulator (docs/adr/0026-decoupled-listener-io.md)
 // ---------------------------------------------------------------------------------------------
 
 /// A push immediately followed by a pop, once the underlying `VecDeque` is warm (past its initial
@@ -472,6 +473,48 @@ fn fanout_send_one_consumer_costs_nothing() {
     expect_allocs("fanout: send + receive, 1 consumer", stats, 0);
 }
 
+/// The test above proves the *disabled*-telemetry path is free, but `Fanout::send` now opens a
+/// span too (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`), and a
+/// disabled `Telemetry` handle (`Telemetry::default()`, `Option::None` inside) never reaches
+/// `Telemetry::span`'s sample-decision branch at all -- it can't stand in for the *live-but-
+/// unsampled* path a production pipeline with an `internal` component and the default (0.1, never
+/// 0.0 by default, but a rate below `1.0` is the common case) sample rate actually runs.
+/// This is that path, proven directly: a real `Registry` (`with_span_sampling(0.0)`, so every
+/// trace is dropped deterministically -- see `trace_is_sampled`), attached the same way
+/// `crates/logit-cli/src/pipeline.rs::prepare` attaches one in production. `SpanGuard::disabled()`
+/// is what `Telemetry::span` returns once `trace_is_sampled` says no, exactly like the
+/// `Option::None` case -- same expected count, 0, now actually exercising the branch that decides
+/// it rather than skipping it.
+#[test]
+fn fanout_send_one_consumer_with_a_live_unsampled_registry_costs_nothing() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let registry = logit_core::Registry::with_span_sampling(0.0);
+    let telemetry = registry.telemetry_for("in", "statsd_in", "listener");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let fanout = Fanout::new(vec![tx]).with_telemetry(telemetry);
+
+    // Warms both the usual first-call cost (`CountingAlloc`'s own module doc) and this
+    // `ComponentBuffer`'s point map -- `logit.component.batches.sent`/`.events.sent`/
+    // `.send.blocked.duration` all need their first-insert growth to happen here, not inside the
+    // measured region below, same reasoning as `docs/design/memory.md`'s "first call after a
+    // drain" cost: an update to an already-resident map key is free, a fresh insert isn't.
+    let warm = fixtures::nginx_batch(1);
+    rt.block_on(async {
+        fanout.send(warm).await;
+        drop(unwrap_delivered(rx.recv().await.expect("should receive")));
+    });
+
+    let batch = fixtures::nginx_batch(1);
+    let (received, stats) = measure(|| {
+        rt.block_on(async {
+            fanout.send(batch).await;
+            unwrap_delivered(rx.recv().await.expect("should receive"))
+        })
+    });
+    assert_eq!(received.events.len(), 1);
+    expect_allocs("fanout: send + receive, 1 consumer, live unsampled registry", stats, 0);
+}
+
 /// The other half of the same story, measured honestly rather than assumed: a real fan-out (two
 /// consumers here) still costs *one* branch a full `EventBatch` deep clone -- one `Vec<Event>`
 /// allocation plus the 4 allocations [`clone_one_event`] measures for the one nginx-shaped event
@@ -626,7 +669,7 @@ fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
             Delivered::Owned(batch, _ctx) => Arc::new(batch),
             Delivered::Shared(shared, _ctx) => shared,
         };
-        queue.push(warmed).await;
+        queue.push((warmed, TraceContext::default())).await;
         queue.commit();
     });
 
@@ -1258,6 +1301,30 @@ fn stdio_encode_100_events() {
     let (text, stats) = measure(|| dump.encode(&batch));
     assert!(!text.is_empty());
     expect_allocs("stdio_out: encode 100 events", stats, 101);
+}
+
+/// First measured at 401 (~4/event): `encode_event`'s header/message text, the pre-sanitize
+/// render, the sanitized-message copy, and each sanitized header field (hostname/app-name) were
+/// all fresh per-event `String` allocations -- three of those four were function-locals recreated
+/// on *every* call, so even warming `encode_into` once (per this file's own discipline) didn't
+/// help, since the very next call's locals started from empty capacity again. `SyslogEncoder`
+/// now holds `line`/`raw_msg`/`scratch` as reused struct fields instead (mirroring
+/// `InfluxLineEncoder`'s own scratch buffers), which is what brought this down to 100 (exactly
+/// 1/event). What's left is `format_rfc3339_utc`'s own per-call allocation
+/// (`push_rfc5424_timestamp`, `logit_core::time`) -- the same shared, already-accepted cost
+/// `stdio_out`'s own encoder documents for its own timestamp line, out of this encoder's scope to
+/// avoid without changing that function's signature. See `docs/design/memory.md`.
+#[test]
+fn syslog_encode_into_100_events() {
+    let mut encoder = SyslogEncoder::new(SyslogFormat::Rfc5424, 16);
+    let batch = fixtures::nginx_batch(100);
+    let mut out = MessageBuf::default();
+    let _ = encoder.encode_into(&batch, &mut out); // warm-up call; EncodeStats is Copy
+
+    let (stats_out, stats) = measure(|| encoder.encode_into(&batch, &mut out));
+    assert_eq!(out.len(), 100);
+    assert_eq!(stats_out.skipped_no_log, 0);
+    expect_allocs("syslog_out: encode_into 100 events", stats, 100);
 }
 
 // ---------------------------------------------------------------------------------------------

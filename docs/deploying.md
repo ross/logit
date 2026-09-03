@@ -139,7 +139,7 @@ the config. The two most directly actionable for buffering:
 
 Every UDP listener (`statsd_in`, `syslog_in`) sits in front of a per-component, in-memory receive
 queue that decouples reading the socket from decoding and batching what it received
-([ADR 0022](adr/0022-decoupled-listener-io.md)) — the listener-side sibling of the sink delivery
+([ADR 0026](adr/0026-decoupled-listener-io.md)) — the listener-side sibling of the sink delivery
 buffering above. This is what lets a slow or backed-up destination downstream be ridden out without
 the socket itself going unread. It's tunable per listener via a `receive:` block on that component
 (`receive:` is rejected at validation time on anything but a datagram listener) — see the commented
@@ -203,6 +203,28 @@ kernel default before deciding whether to raise it.
   runs on its own loop, this is the number that says whether event timestamps (always receipt time,
   stamped at arrival, never decode time) are still trustworthy under load — a healthy listener keeps
   this small; a climbing value under sustained load means decode is genuinely falling behind.
+
+## `otlp_in`: put `keep` in front of it
+
+`otlp_in`'s attribute *keys* are arbitrary peer-supplied strings, not something `logit`'s own
+config or a fixed protocol grammar bounds — unlike every other listener here (statsd's
+`#tag:value`, syslog's structured-data field names), where the set of possible attribute keys is
+fixed by `logit`'s own decoder, not by whatever a remote OTLP exporter happens to send.
+`crates/logit-proto/src/otlp/common.rs`'s `key_values_into_attrs` interns every OTLP
+`KeyValue.key` it decodes into the process-wide interner (`crates/logit-core/src/interner.rs`),
+which never evicts (`docs/known-gaps.md`'s interner entry) — so a client that sends a *different*
+attribute key on every request (an id embedded in a key name, a misbehaving or malicious exporter)
+grows that table for the life of the process, with nothing here to stop it.
+
+The existing mitigation for that gap applies directly: put a `keep` component immediately
+downstream of `otlp_in`, naming only the attribute keys you actually intend to keep. That turns an
+unbounded, peer-controlled key set into the fixed, `logit`-controlled one every other listener
+already gets for free — the same reasoning [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml)
+already applies ahead of `aggregate`, extended here to cover interning too, not just series
+cardinality. This matters most for a deployment where `otlp_in` faces something other than
+`logit`'s own trusted fleet (a third-party exporter, a multi-tenant ingest path) — see
+`docs/known-gaps.md`'s interner entry for when the underlying "listeners are private by deployment
+shape" premise is worth re-checking at all.
 
 ## The nginx-side recipe
 

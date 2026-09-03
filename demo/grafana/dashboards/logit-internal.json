@@ -118,8 +118,8 @@
     {
       "id": 8,
       "type": "logs",
-      "title": "Loki: raw demo traffic ({job=\"demo\"}) -- empty by design",
-      "description": "Nothing feeds Loki today -- `logit` has no `syslog_out` yet, and the demo doesn't work around that. This panel is a sample LogQL query, ready for the day something writes here (demo/alloy/config.alloy is unfed scaffolding for exactly that). See demo/README.md's \"What isn't wired yet\".",
+      "title": "Loki: raw demo traffic ({job=\"demo\"})",
+      "description": "`log_out` (`syslog_out`, docs/adr/0022-syslog-output.md) relays access_json's events as RFC 5424 syslog to Alloy (demo/alloy/config.alloy), which pushes them into Loki -- `host`/`app` stream labels come from the event's own `syslog.hostname`/`syslog.tag` attributes, round-tripped from `access_in`'s syslog_in decode, not from any syslog_out config field.",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
       "datasource": { "type": "loki", "uid": "loki" },
       "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true },
@@ -160,6 +160,39 @@
           "datasource": { "type": "loki", "uid": "loki" },
           "expr": "sum(count_over_time({job=\"demo\"} | json | status >= 500 [$__interval]))",
           "queryType": "range"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "traces",
+      "title": "Tempo: logit's own internal spans",
+      "description": "logit observing itself as *traces*, not just metrics (docs/adr/0025-internal-span-emission-and-deterministic-sampling.md, docs/plans/0005-otlp-end-to-end.md) -- one span per node-visit (listener send, transform process/flush, sink deliver), exported over OTLP/gRPC by demo/logit.yaml's `trace_out`. Open a trace to see the pipeline's real shape: a syslog_in root with json/kv_metrics/keep/aggregate children, or an internal-only root for `self`'s own drain. `{}` matches everything -- `logit` is the only thing sending to this Tempo.",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 36 },
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{}",
+          "tableType": "traces",
+          "limit": 20
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "logit.internal.spans.dropped (buffer_full)",
+      "description": "The per-component span buffer's overflow counter (MAX_SPANS_PER_COMPONENT, docs/design/internal-telemetry.md) -- should stay at zero at demo volume; a nonzero value means the demo's traffic is outrunning the bounded buffer between `internal`'s drain ticks, not that traces are being lost silently.",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 46 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb" },
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"logit.internal.spans.dropped\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> group(columns: [\"component\", \"reason\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
         }
       ]
     }

@@ -1,6 +1,6 @@
 //! [`BatchAccumulator`]: amortizes many small decoded batches into fewer, larger ones before a
 //! [`crate::Fanout::send`] -- the "datagram->batch assembly" half of
-//! `docs/adr/0022-decoupled-listener-io.md`. Transport-agnostic and socket-free by design: a UDP
+//! `docs/adr/0026-decoupled-listener-io.md`. Transport-agnostic and socket-free by design: a UDP
 //! listener's decode loop (`logit-inputs`) is the only caller today, but nothing here mentions a
 //! socket, a datagram, or any concrete [`logit_proto::Decoder`].
 
@@ -77,7 +77,7 @@ impl BatchAccumulator {
     /// leaving `events` empty **with its allocated capacity intact** -- unlike `std::mem::take`,
     /// which would replace it with a fresh, capacity-0 `Vec` and silently undo the whole point of
     /// reusing a scratch buffer across calls (`docs/design/memory.md` §2; see also
-    /// `docs/adr/0022-decoupled-listener-io.md`'s allocation accounting).
+    /// `docs/adr/0026-decoupled-listener-io.md`'s allocation accounting).
     ///
     /// Returns `Some` once a bound is *reached or exceeded* -- never splits a decoded batch, which
     /// is what makes `batch_max_events: 1` mean "one send per datagram": every non-empty decode
@@ -97,8 +97,8 @@ impl BatchAccumulator {
     /// component's `flush()`.
     ///
     /// **Why weight tracking here is exact, not approximate, despite being incremental.**
-    /// `EventBatch::estimated_heap_bytes` is `resource.estimated_heap_bytes() + events.capacity()
-    /// * size_of::<Event>() + events.iter().map(Event::estimated_heap_bytes).sum()` -- three terms,
+    /// `EventBatch::estimated_heap_bytes` is `resource.estimated_heap_bytes() + events.capacity() *
+    /// size_of::<Event>() + events.iter().map(Event::estimated_heap_bytes).sum()` -- three terms,
     /// each cheap to reproduce without re-walking events already accounted for: the resource term
     /// only changes when the resource does (`resource_weight`, updated on the rare
     /// `ResourceChange` path below); the per-event term is a plain running sum, so adding just the

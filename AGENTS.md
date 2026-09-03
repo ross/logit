@@ -15,17 +15,28 @@ something that looks broken — it's likely a documented, deliberate gap, not an
 **Current state:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a
 Lua enrichment stage, InfluxDB 2.x out, via `logit run <config>` (see
 [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml), `script/server`). Since then,
-`syslog_in` and `stdio_out` (`crates/logit-inputs`/`crates/logit-outputs`) and `json`, `kv_metrics`,
-`keep`, and `remove` (`crates/logit-transforms`) have all landed as real, implemented
-`ComponentKind`s — [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises all
-of them together against a real nginx (`examples/nginx/`), and
+`syslog_in`, `stdio_out`, `otlp_in`, and `otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`,
+`crates/logit-proto`'s `otlp` codec) and `json`, `kv_metrics`, `keep`, and `remove`
+(`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —
+[examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises the syslog/InfluxDB
+side together against a real nginx (`examples/nginx/`), and
 [docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside
 the dev stack. `examples/` is contributor-facing fixtures the dev stack (`script/server`) runs
 against, kept real because other things in the repo depend on them (`compose.yaml`'s `nginx`
 service, `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE`) — `demo/` is the answer to
 "let me see this work" for anyone else, a self-contained `docker compose up` against the release
-image, and the forcing function for `syslog_out`/`otlp_out` next
-([docs/plans/0003-demo-stack.md](docs/plans/0003-demo-stack.md)). Config is a flat graph of named components (ADR 0009,
+image. All three signals now flow through it end to end — logs, metrics, and traces alike, into
+Loki, InfluxDB, and Tempo respectively
+([docs/plans/0003-demo-stack.md](docs/plans/0003-demo-stack.md),
+[docs/plans/0005-otlp-end-to-end.md](docs/plans/0005-otlp-end-to-end.md)). `syslog_out` (RFC
+3164/5424 over UDP or TCP, header fields round-tripped from an event's `syslog.*` attributes,
+[ADR 0022](docs/adr/0022-syslog-output.md)) is live in `demo/logit.yaml`'s `log_out`, writing to
+`alloy` → Loki. `otlp_in`/`otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`, OTLP for logs,
+metrics, and traces, both OTLP/HTTP and a hand-rolled OTLP/gRPC transport,
+[ADR 0023](docs/adr/0023-committed-pregenerated-otlp-protobuf.md)/
+[ADR 0024](docs/adr/0024-hand-rolled-grpc-over-hyper.md)) are real, implemented `ComponentKind`s —
+`otlp_out` is live in `demo/logit.yaml`'s `trace_out`, writing to Tempo over gRPC; `otlp_in` ships
+tested but unexercised by the demo. Config is a flat graph of named components (ADR 0009,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively
@@ -46,18 +57,28 @@ per-component buffers into ordinary events on its own `interval`; see
 [ADR 0018](docs/adr/0018-internal-telemetry-as-pipeline-events.md) and
 [internal-telemetry.md](docs/design/internal-telemetry.md) for the framework, and
 [examples/internal-telemetry.yaml](examples/internal-telemetry.yaml) for a runnable config. Every
-`Delivered` (one `Fanout` edge's channel payload) now carries a real `TraceContext`, propagated as
-a child of its parent for the two node kinds with an unambiguous one to propagate
-(`Transform::process`/`ScriptWorker::process`'s non-flush path, and `run_output`) — the substrate
-for internal spans, not spans themselves yet; see
+`Delivered` (one `Fanout` edge's channel payload) carries a real `TraceContext`, propagated as a
+child of its parent for the two node kinds with an unambiguous one to propagate
+(`Transform::process`/`ScriptWorker::process`'s non-flush path, and `run_output`); see
 [ADR 0020](docs/adr/0020-trace-context-propagation-on-delivered.md) and
-[pipeline-graph.md](docs/design/pipeline-graph.md)'s "Trace context propagation" section.
-`statsd_in`/`syslog_in` (`crates/logit-inputs/src/statsd.rs`/`syslog.rs`) are now thin wrappers over
-a shared `logit-inputs::udp::UdpListener` driver: a UDP listener's socket read and its decode/
-batch-assembly loop run decoupled through a `ReceiveQueue`, the listener-side mirror of
-`SinkQueue`'s sink-side decoupling, so a stalled downstream no longer stops the socket being read;
-see [ADR 0022](docs/adr/0022-decoupled-listener-io.md) and the `receive:` config block it
-introduces.
+[pipeline-graph.md](docs/design/pipeline-graph.md)'s "Trace context propagation" section. That
+context is now a real `SpanRecord` too, not just substrate -- every node visit (a listener's send,
+a transform's process/flush, a sink's deliver) mints exactly one span, deterministically sampled on
+`trace_id` (`span_sample_rate`, default `0.1`, `1.0` in the demo) so every `logit` process in a
+split-collection topology reaches the same keep/drop verdict independently with no propagated bit;
+see [ADR 0025](docs/adr/0025-internal-span-emission-and-deterministic-sampling.md) and
+`internal-telemetry.md`'s "Spans" section. `docs/known-gaps.md`'s internal-spans entry tracks what's
+still open (the listener span's window, Lua `flush()`'s link-less root). `otlp_out` is what carries
+those spans, and the `internal` metrics alongside them, out over the wire (both OTLP/HTTP and
+OTLP/gRPC, a hand-rolled unary gRPC client/server over `hyper` rather than `tonic`,
+[ADR 0024](docs/adr/0024-hand-rolled-grpc-over-hyper.md)); `otlp_in` is the mirror, implemented and
+tested but not yet exercised by the demo. `demo/`'s `trace_out` proves the whole chain against a
+real Tempo, exactly the way `log_out` proves `syslog_out` against a real Loki. `statsd_in`/`syslog_in`
+(`crates/logit-inputs/src/statsd.rs`/`syslog.rs`) are now thin wrappers over a shared
+`logit-inputs::udp::UdpListener` driver: a UDP listener's socket read and its decode/batch-assembly
+loop run decoupled through a `ReceiveQueue`, the listener-side mirror of `SinkQueue`'s sink-side
+decoupling, so a stalled downstream no longer stops the socket being read; see
+[ADR 0026](docs/adr/0026-decoupled-listener-io.md) and the `receive:` config block it introduces.
 
 ## Environment
 
@@ -166,7 +187,7 @@ crates/
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, internal (self-telemetry)
-  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio
+  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, syslog
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)

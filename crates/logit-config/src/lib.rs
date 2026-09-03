@@ -48,7 +48,7 @@ pub struct Component {
     /// `ComponentKind` variant, so a future fifth sink kind costs nothing extra here.
     #[serde(default)]
     pub buffer: BufferConfig,
-    /// Per-listener receive queue and batching (`docs/adr/0022-decoupled-listener-io.md`).
+    /// Per-listener receive queue and batching (`docs/adr/0026-decoupled-listener-io.md`).
     /// Meaningful only on a datagram listener -- graph validation rejects a non-default value on
     /// any other kind, `internal` included. A sibling field of `kind`, mirroring `buffer`'s own
     /// placement.
@@ -76,6 +76,33 @@ pub struct MetricSpec {
     pub unit: Option<String>,
 }
 
+/// Which OTLP transport a component speaks -- both `otlp_in` and `otlp_out` carry identical
+/// protobuf payloads (`crates/logit-proto/src/otlp`), differing only in framing and endpoint
+/// shape (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OtlpProtocol {
+    /// OTLP/HTTP, protobuf body, one POST per signal. Default: it's what an
+    /// `http://host:4318`-shaped endpoint already implies, and a bare `endpoint: http://tempo:4318`
+    /// would be silently wrong under any other default.
+    #[default]
+    Http,
+    /// Unary gRPC over plaintext HTTP/2 -- `crates/logit-outputs/src/otlp.rs`'s hand-rolled gRPC
+    /// transport has no TLS support at all (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`), so an
+    /// `otlp_out` component's `endpoint` under this protocol is rejected at construction time if
+    /// it's written with an `https://` scheme, rather than silently exporting in plaintext.
+    Grpc,
+}
+
+/// `ComponentKind::Internal`'s `span_sample_rate` default when a config omits it -- re-exported
+/// from `logit-core` (not restated as a bare literal here) so the two crates can never drift
+/// apart on what "the default" actually is. This is also the one place `logit-config` depends on
+/// `logit-core` at all: a small, deliberately narrow edge (one `pub const`), not a general
+/// dependency on the event model this crate otherwise has no business needing.
+fn default_span_sample_rate() -> f64 {
+    logit_core::DEFAULT_SPAN_SAMPLE_RATE
+}
+
 /// A component's kind, tagged by `type` in config. Every protocol kind is suffixed `_in`/`_out`
 /// uniformly (`docs/design/pipeline-graph.md`'s naming rationale) so a listener and a sink for the
 /// same protocol never collide on one tag value; transform kinds take no suffix, since there's
@@ -87,13 +114,20 @@ pub enum ComponentKind {
     StatsdIn {
         bind: String,
     },
-    /// RFC 3164 / RFC 5424 syslog over UDP or TCP.
+    /// RFC 3164 / RFC 5424 syslog over UDP. **Not** TCP, despite this doc comment's old claim --
+    /// `crates/logit-inputs/src/syslog.rs`'s own module doc has always said UDP-only (nginx's
+    /// `syslog:` writer is UDP-only, so a TCP accept loop would buy this listener nothing;
+    /// `docs/known-gaps.md`'s "syslog TCP and structured data" entry tracks it as future,
+    /// additive work). `syslog_out` (the egress side, `docs/adr/0022-syslog-output.md`) supports
+    /// both UDP and TCP -- that asymmetry is deliberate, not a sign this needs fixing to match.
     SyslogIn {
         bind: String,
     },
     /// OpenTelemetry Protocol (logs, metrics, and/or traces).
     OtlpIn {
         bind: String,
+        #[serde(default)]
+        protocol: OtlpProtocol,
     },
     /// Tail one or more files as a log source, rotation- and checkpoint-aware.
     FileTail {
@@ -118,6 +152,17 @@ pub enum ComponentKind {
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         interval: Duration,
+        /// Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id`
+        /// the same way at every node -- a kept trace is kept at every hop, never partially. Below
+        /// `1.0` by default: span volume is a different shape than metric volume (one span per
+        /// node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans
+        /// off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full
+        /// traces rather than a representative sample would set this explicitly. Named
+        /// `span_sample_rate`, not `sample_rate` -- there is already a `ComponentKind::Sample`
+        /// transform, and `internal` may grow other sampling knobs later. See
+        /// `docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`.
+        #[serde(default = "default_span_sample_rate")]
+        span_sample_rate: f64,
     },
 
     /// Inline Lua source (a YAML block scalar in practice). See `docs/design/lua-api.md`.
@@ -223,6 +268,8 @@ pub enum ComponentKind {
     },
     OtlpOut {
         endpoint: String,
+        #[serde(default)]
+        protocol: OtlpProtocol,
     },
     /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
     LogitOut {
@@ -235,6 +282,122 @@ pub enum ComponentKind {
         #[serde(default)]
         target: StdioTarget,
     },
+    /// RFC 3164 / RFC 5424 syslog egress over UDP or TCP -- the mirror of `SyslogIn`, and a real
+    /// relay: header fields round-trip from an event's `syslog.*` attributes when present,
+    /// falling back to the defaults below only when an event carries none (e.g. one that never
+    /// passed through `syslog_in`). See `docs/adr/0022-syslog-output.md`.
+    SyslogOut {
+        /// `host:port`. Resolved at connect/bind time, never at config-load time -- a `syslog_out`
+        /// pointed at a destination that isn't up yet is not a config error (`!env` still applies
+        /// like any other string field, ADR 0011).
+        endpoint: String,
+        #[serde(default)]
+        transport: SyslogTransport,
+        /// RFC 3164 carries no year and no timezone in its TIMESTAMP, so a receiver has to guess
+        /// both -- `rfc5424`'s unambiguous RFC 3339 timestamp is the better default; `syslog_in`
+        /// already parses both dialects, so emitting both is parity, not new scope.
+        #[serde(default)]
+        format: SyslogFormat,
+        /// PRI facility used only when the event carries no `syslog.facility` attribute.
+        #[serde(default)]
+        facility: SyslogFacility,
+        /// HOSTNAME/APP-NAME fallbacks, used only when the event carries no `syslog.hostname`/
+        /// `syslog.tag` attribute -- e.g. an event that never passed through `syslog_in`. Omitted
+        /// entirely (rather than a literal `logit` default) so a relayed line's origin is never
+        /// silently overwritten with something that looks like a config mistake.
+        #[serde(default)]
+        hostname: Option<String>,
+        #[serde(default)]
+        app_name: Option<String>,
+        /// Bounds one encoded message (PRI + header + MSG). Defaults to 8192, matching Grafana
+        /// Alloy's `loki.source.syslog` `max_message_length` default -- the receiver the demo
+        /// stack points this at -- rather than RFC 3164 §4.1's traditional 1024, which would
+        /// truncate a JSON-bodied message on every modern relay chain. A string via
+        /// [`human_bytes`], exactly like `BufferConfig::max_bytes`.
+        #[serde(default = "default_max_message_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_message_bytes: u64,
+        /// TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a
+        /// dropped connection) is allowed to take before `send` reports it as a failure.
+        #[serde(default = "default_syslog_connect_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        connect_timeout: Duration,
+    },
+}
+
+fn default_max_message_bytes() -> u64 {
+    8192
+}
+
+/// Mirrors `logit_outputs::syslog::DEFAULT_CONNECT_TIMEOUT` -- can't reference it directly
+/// (`logit-outputs` depends on `logit-config`, never the reverse), so keep the two in sync by
+/// hand if this ever changes.
+fn default_syslog_connect_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+/// `syslog_out`'s transport. UDP (the default) mirrors `syslog_in` and needs no ordering
+/// guarantee against the receiver's startup -- a fire-and-forget `send_to` before the receiver is
+/// up just loses that line, the same honest limit `syslog_in`'s own UDP intake accepts on the way
+/// in. TCP is what makes `Fault` classification (`docs/adr/0021-buffered-sink-delivery.md`)
+/// meaningful for this sink: a connect failure is unambiguously `Fault::Clean`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SyslogTransport {
+    #[default]
+    Udp,
+    Tcp,
+}
+
+/// Which syslog dialect `syslog_out` emits. See `SyslogOut::format`'s doc comment for why
+/// `rfc5424` is the default.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SyslogFormat {
+    Rfc3164,
+    #[default]
+    Rfc5424,
+}
+
+/// The syslog PRI facility, named rather than a bare `0..=23` integer so schemars publishes a
+/// real enumeration and a typo is a config error rather than a silently-wrong PRI. Ordered to
+/// match the standard facility codes (`kern` is 0); `as_u8` reads the discriminant back out.
+/// `local0` defaults, matching `demo/hello/app.py`'s own `PRI = 134` (facility 16), so the demo
+/// round-trips its own PRI unchanged even before `syslog.facility` attribute precedence applies.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SyslogFacility {
+    Kern,
+    User,
+    Mail,
+    Daemon,
+    Auth,
+    Syslog,
+    Lpr,
+    News,
+    Uucp,
+    Cron,
+    Authpriv,
+    Ftp,
+    Ntp,
+    Security,
+    Console,
+    SolarisCron,
+    #[default]
+    Local0,
+    Local1,
+    Local2,
+    Local3,
+    Local4,
+    Local5,
+    Local6,
+    Local7,
+}
+
+impl SyslogFacility {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
 }
 
 /// Where `stdio_out` writes: config keeps this a plain scalar (`target: stdout`), not a tagged
@@ -374,18 +537,18 @@ pub enum DeliveryPosture {
 }
 
 /// Per-listener receive queue and datagram-\>batch assembly
-/// (`docs/adr/0022-decoupled-listener-io.md`). Meaningful only on a datagram listener (today
+/// (`docs/adr/0026-decoupled-listener-io.md`). Meaningful only on a datagram listener (today
 /// `statsd_in`/`syslog_in`); graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a
 /// non-default value on any other kind, including `internal` (a listener by role, but one with no
 /// socket, no queue, and no decoder). Flat, following [`BufferConfig`]'s own
 /// `retry_budget`/`retry_max_delay` precedent rather than nesting a `batch:` sub-block -- two
 /// levels of optional-with-defaults is harder to scan in YAML than a flat prefix. Every field
 /// defaults, so a `receive:` block is never required -- **but an omitted block is not byte-for-
-/// byte the pre-ADR-0022 behavior**, and isn't meant to be: `batch_max_events: 1_000` and
+/// byte the pre-ADR-0026 behavior**, and isn't meant to be: `batch_max_events: 1_000` and
 /// `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into
 /// batches (up to 1000 events, or up to 100ms of added latency before a send) rather than sending
 /// one batch per datagram immediately, matching what every established UDP listener researched
-/// for ADR 0022 does out of the box. A deployment that genuinely needs the old one-send-per-
+/// for ADR 0026 does out of the box. A deployment that genuinely needs the old one-send-per-
 /// datagram, no-added-latency behavior gets it back explicitly with `batch_max_events: 1`, not by
 /// omitting `receive:`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -406,9 +569,9 @@ pub struct ReceiveConfig {
     /// Telegraf, gostatsd) treats this the same way.
     pub overflow: OverflowPolicy,
     /// Events to accumulate across datagrams before one send downstream. `1` means one send per
-    /// datagram -- the behavior before ADR 0022 -- since the accumulator flushes on a bound
+    /// datagram -- the behavior before ADR 0026 -- since the accumulator flushes on a bound
     /// *reached or exceeded* and never splits a single decode's output. `0` is rejected as an
-    /// impossible bound (graph rule 17, the twin of rule 15's `buffer.max_batches: 0` check).
+    /// impossible bound (graph rule 18, the twin of rule 15's `buffer.max_batches: 0` check).
     pub batch_max_events: usize,
     #[serde(with = "human_bytes")]
     #[schemars(with = "String")]
@@ -426,7 +589,7 @@ pub struct ReceiveConfig {
     #[schemars(with = "Option<String>")]
     pub receive_buffer_bytes: Option<u64>,
     /// How long a listener keeps draining a cooperative shutdown before being cancelled by drop
-    /// (`docs/adr/0022-decoupled-listener-io.md`, revising ADR 0013's unconditional cancel-by-drop
+    /// (`docs/adr/0026-decoupled-listener-io.md`, revising ADR 0013's unconditional cancel-by-drop
     /// into a bounded one). Matches `buffer.shutdown_grace`'s default so both ends of the
     /// pipeline drain on the same number.
     #[serde(with = "humantime_serde_duration")]
@@ -435,7 +598,7 @@ pub struct ReceiveConfig {
 }
 
 /// Defaults, justified against established UDP listeners' own tuning figures -- see
-/// `docs/adr/0022-decoupled-listener-io.md` for the full numeric derivation (Telegraf, gostatsd,
+/// `docs/adr/0026-decoupled-listener-io.md` for the full numeric derivation (Telegraf, gostatsd,
 /// DogStatsD, rsyslog, syslog-ng).
 impl Default for ReceiveConfig {
     fn default() -> Self {
@@ -603,7 +766,7 @@ mod human_bytes {
 
     /// The same codec, for `Option<u64>` fields (`#[serde(default, with =
     /// "human_bytes::option")]`) -- used by `ReceiveConfig::receive_buffer_bytes`
-    /// (`docs/adr/0022-decoupled-listener-io.md`), where `None` means "leave the kernel default
+    /// (`docs/adr/0026-decoupled-listener-io.md`), where `None` means "leave the kernel default
     /// alone" rather than a byte count of zero. Mirrors `humantime_serde_duration::option`'s
     /// shape exactly: a nested module because `#[serde(with = "...")]` on an `Option<u64>` field
     /// calls *this* module's `serialize`/`deserialize` with `Option<u64>`, not the parent's `u64`
@@ -811,7 +974,26 @@ mod tests {
             serde_json::from_str(r#"{"type": "internal", "interval": "10s"}"#).unwrap();
         assert!(component.sources.is_empty());
         match component.kind {
-            ComponentKind::Internal { interval } => assert_eq!(interval, Duration::from_secs(10)),
+            ComponentKind::Internal { interval, .. } => {
+                assert_eq!(interval, Duration::from_secs(10));
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    /// `span_sample_rate` is optional, defaulting to `logit_core::DEFAULT_SPAN_SAMPLE_RATE`
+    /// (0.1) -- an `internal` component that predates this field (every shipped config before
+    /// this PR) still deserializes, with spans sampled at a tenth rather than silently disabled
+    /// or silently kept at full volume.
+    #[test]
+    fn internal_without_span_sample_rate_defaults_to_one_tenth() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "internal", "interval": "10s"}"#).unwrap();
+        match component.kind {
+            ComponentKind::Internal { span_sample_rate, .. } => {
+                assert_eq!(span_sample_rate, 0.1);
+                assert_eq!(span_sample_rate, logit_core::DEFAULT_SPAN_SAMPLE_RATE);
+            }
             other => panic!("expected Internal, got {other:?}"),
         }
     }
@@ -920,6 +1102,36 @@ mod tests {
         .unwrap();
         assert_eq!(component.sources, vec!["enrich".to_string()]);
         assert!(matches!(component.kind, ComponentKind::InfluxDbOut { .. }));
+    }
+
+    #[test]
+    fn otlp_out_without_protocol_defaults_to_http() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_out", "sources": ["in"], "endpoint": "http://tempo:4318"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpOut { endpoint, protocol } => {
+                assert_eq!(endpoint, "http://tempo:4318");
+                assert_eq!(protocol, OtlpProtocol::Http);
+            }
+            other => panic!("expected OtlpOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otlp_in_with_protocol_grpc_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_in", "bind": "0.0.0.0:4317", "protocol": "grpc"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpIn { bind, protocol } => {
+                assert_eq!(bind, "0.0.0.0:4317");
+                assert_eq!(protocol, OtlpProtocol::Grpc);
+            }
+            other => panic!("expected OtlpIn, got {other:?}"),
+        }
     }
 
     #[test]
