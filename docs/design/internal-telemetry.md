@@ -408,6 +408,12 @@ Worked examples, one per shipped component:
   fresh `Arc` per batch, `otlp_in` chief among them) is visible as a rate rather than invisible.
   Absent entirely when `set` has no `resource:` configured (`map_resource` returns before touching
   telemetry) — see [ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md).
+- `trace_context` (`crates/logit-transforms/src/trace_context.rs`): `logit.transform.trace_context.lifted`
+  (count) on a successful lift; `.skipped{reason="missing"|"invalid"}` otherwise — `missing` when
+  the configured `trace_id` attribute isn't present at all, `invalid` when it (or a configured
+  `span_id`/`flags`) is present but doesn't parse. The `kv_metrics` `.derived`/`.derived.skipped`
+  pattern, applied to lifting a trace context instead of deriving a metric — see
+  [ADR `log-record-trace-context`](../adr/log-record-trace-context.md).
 - `stdio_out` (`crates/logit-outputs/src/stdio.rs`): `logit.output.batch.bytes` — direct parity
   with `influxdb_out`'s own batch-bytes metric. Also has no `Diagnostics` (a write error
   propagates as a hard failure today, with no `warn_throttled` call site to bridge).

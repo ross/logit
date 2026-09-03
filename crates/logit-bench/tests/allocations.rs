@@ -1003,6 +1003,31 @@ fn process_batch_through_set_attributes_only() {
     expect_allocs("runtime: process_batch through set (attributes only)", stats, 1);
 }
 
+/// `trace_context` lifting a valid `trace_id` -- **1**, identical to `keep`/`set`'s own
+/// process_batch tests: `process_batch`'s own `Vec::with_capacity(batch.events.len())` is the
+/// whole cost. `parse_trace_id` (`logit_core::trace`) works on stack arrays, and `AttrMap::remove`
+/// (the default `keep_source: false` path) is an in-place `SmallVec` shift -- `TraceContext`
+/// itself contributes nothing.
+#[test]
+fn trace_context_lifts_a_valid_trace_id() {
+    let mut trace_context = fixtures::trace_context();
+    let resource = fixtures::resource();
+    let event_with_trace_id = {
+        let mut event = fixtures::nginx_event();
+        event.attributes.insert("trace_id", Value::str("ab".repeat(16)));
+        event
+    };
+    let telemetry = Telemetry::default();
+    let warm = EventBatch { resource: resource.clone(), events: vec![event_with_trace_id.clone()] };
+    drop(process_batch(&mut trace_context, warm, &telemetry));
+
+    let batch = EventBatch { resource, events: vec![event_with_trace_id] };
+    let (out, stats) = measure(|| process_batch(&mut trace_context, batch, &telemetry));
+    let out = out.expect("trace_context forwards events, never absorbs");
+    assert!(out.events[0].log.as_ref().unwrap().trace.is_some(), "the lift should have succeeded");
+    expect_allocs("transform: trace_context, lifting a valid trace_id", stats, 1);
+}
+
 /// `Set::map_resource`'s one-entry cache (`crates/logit-transforms/src/set.rs`): a second call
 /// with the same input `Arc<Resource>` must hit the cache and cost nothing, in contrast to a
 /// cache miss (`set_resource_map_resource_cache_miss` below), which allocates a rebuilt
