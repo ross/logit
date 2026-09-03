@@ -27,16 +27,16 @@ service, `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE`) — `demo/`
 "let me see this work" for anyone else, a self-contained `docker compose up` against the release
 image. All three signals now flow through it end to end — logs, metrics, and traces alike, into
 Loki, InfluxDB, and Tempo respectively
-([docs/plans/0003-demo-stack.md](docs/plans/0003-demo-stack.md),
-[docs/plans/0005-otlp-end-to-end.md](docs/plans/0005-otlp-end-to-end.md)). `syslog_out` (RFC
+([docs/plans/demo-stack.md](docs/plans/demo-stack.md),
+[docs/plans/otlp-end-to-end.md](docs/plans/otlp-end-to-end.md)). `syslog_out` (RFC
 3164/5424 over UDP or TCP, header fields round-tripped from an event's `syslog.*` attributes,
-[ADR 0022](docs/adr/0022-syslog-output.md)) is live in `demo/logit.yaml`'s `log_out`, writing to
+[ADR `syslog-output`](docs/adr/syslog-output.md)) is live in `demo/logit.yaml`'s `log_out`, writing to
 `alloy` → Loki. `otlp_in`/`otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`, OTLP for logs,
 metrics, and traces, both OTLP/HTTP and a hand-rolled OTLP/gRPC transport,
-[ADR 0023](docs/adr/0023-committed-pregenerated-otlp-protobuf.md)/
-[ADR 0024](docs/adr/0024-hand-rolled-grpc-over-hyper.md)) are real, implemented `ComponentKind`s —
+[ADR `committed-pregenerated-otlp-protobuf`](docs/adr/committed-pregenerated-otlp-protobuf.md)/
+[ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md)) are real, implemented `ComponentKind`s —
 `otlp_out` is live in `demo/logit.yaml`'s `trace_out`, writing to Tempo over gRPC; `otlp_in` ships
-tested but unexercised by the demo. Config is a flat graph of named components (ADR 0009,
+tested but unexercised by the demo. Config is a flat graph of named components (ADR `component-graph-configuration`,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively
@@ -45,40 +45,40 @@ VAR_NAME` -- any field on any component can pull its value from the environment 
 0011), which is why `influxdb_out`'s `token` is a plain string, not an env-specific field. `logit
 graph <config>` prints the resolved graph as graphviz DOT (`crates/logit-cli/src/dot.rs`).
 `logit run` rejects a config referencing any other unimplemented kind with a clear error; see
-[ADR 0008](docs/adr/0008-aggregation-window-semantics.md) for `aggregate`'s windowing semantics,
-[ADR 0010](docs/adr/0010-json-parsing-into-attributes.md) for `json`'s parsing semantics,
-[ADR 0014](docs/adr/0014-kv-metrics-semantics.md) for `kv_metrics`'/`keep`'s semantics,
-[ADR 0013](docs/adr/0013-service-lifecycle-and-output-retry.md) for signal-driven shutdown and
+[ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md) for `aggregate`'s windowing semantics,
+[ADR `json-parsing-into-attributes`](docs/adr/json-parsing-into-attributes.md) for `json`'s parsing semantics,
+[ADR `kv-metrics-semantics`](docs/adr/kv-metrics-semantics.md) for `kv_metrics`'/`keep`'s semantics,
+[ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md) for signal-driven shutdown and
 `influxdb_out`'s bounded output retry, `crates/logit-inputs/src/statsd.rs` and
 `crates/logit-outputs/src/influxdb.rs` for the listener/sink side, `crates/logit-pipeline/src/runtime.rs`
 for orchestration and the per-node flush-tick timer. `internal` (`crates/logit-inputs/src/internal.rs`)
 is `logit` observing itself — a listener like any other, draining `logit_core::telemetry`'s
 per-component buffers into ordinary events on its own `interval`; see
-[ADR 0018](docs/adr/0018-internal-telemetry-as-pipeline-events.md) and
+[ADR `internal-telemetry-as-pipeline-events`](docs/adr/internal-telemetry-as-pipeline-events.md) and
 [internal-telemetry.md](docs/design/internal-telemetry.md) for the framework, and
 [examples/internal-telemetry.yaml](examples/internal-telemetry.yaml) for a runnable config. Every
 `Delivered` (one `Fanout` edge's channel payload) carries a real `TraceContext`, propagated as a
 child of its parent for the two node kinds with an unambiguous one to propagate
 (`Transform::process`/`ScriptWorker::process`'s non-flush path, and `run_output`); see
-[ADR 0020](docs/adr/0020-trace-context-propagation-on-delivered.md) and
+[ADR `trace-context-propagation-on-delivered`](docs/adr/trace-context-propagation-on-delivered.md) and
 [pipeline-graph.md](docs/design/pipeline-graph.md)'s "Trace context propagation" section. That
 context is now a real `SpanRecord` too, not just substrate -- every node visit (a listener's send,
 a transform's process/flush, a sink's deliver) mints exactly one span, deterministically sampled on
 `trace_id` (`span_sample_rate`, default `0.1`, `1.0` in the demo) so every `logit` process in a
 split-collection topology reaches the same keep/drop verdict independently with no propagated bit;
-see [ADR 0025](docs/adr/0025-internal-span-emission-and-deterministic-sampling.md) and
+see [ADR `internal-span-emission-and-deterministic-sampling`](docs/adr/internal-span-emission-and-deterministic-sampling.md) and
 `internal-telemetry.md`'s "Spans" section. `docs/known-gaps.md`'s internal-spans entry tracks what's
 still open (the listener span's window, Lua `flush()`'s link-less root). `otlp_out` is what carries
 those spans, and the `internal` metrics alongside them, out over the wire (both OTLP/HTTP and
 OTLP/gRPC, a hand-rolled unary gRPC client/server over `hyper` rather than `tonic`,
-[ADR 0024](docs/adr/0024-hand-rolled-grpc-over-hyper.md)); `otlp_in` is the mirror, implemented and
+[ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md)); `otlp_in` is the mirror, implemented and
 tested but not yet exercised by the demo. `demo/`'s `trace_out` proves the whole chain against a
 real Tempo, exactly the way `log_out` proves `syslog_out` against a real Loki. `statsd_in`/`syslog_in`
 (`crates/logit-inputs/src/statsd.rs`/`syslog.rs`) are now thin wrappers over a shared
 `logit-inputs::udp::UdpListener` driver: a UDP listener's socket read and its decode/batch-assembly
 loop run decoupled through a `ReceiveQueue`, the listener-side mirror of `SinkQueue`'s sink-side
 decoupling, so a stalled downstream no longer stops the socket being read; see
-[ADR 0027](docs/adr/0027-decoupled-listener-io.md) and the `receive:` config block it introduces.
+[ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) and the `receive:` config block it introduces.
 
 ## Environment
 
@@ -101,8 +101,8 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/demo [compose args]` | Run the self-contained demo stack (`demo/`) — the release image, no dev container |
 
 All default to `sudo docker`; `DOCKER=docker` or `DOCKER=podman` overrides. See
-[ADR 0005](docs/adr/0005-containerized-development.md) and
-[ADR 0006](docs/adr/0006-scripts-to-rule-them-all.md).
+[ADR `containerized-development`](docs/adr/containerized-development.md) and
+[ADR `scripts-to-rule-them-all`](docs/adr/scripts-to-rule-them-all.md).
 
 ## Workflow
 
@@ -117,13 +117,16 @@ for no real benefit here. A merge commit costs nothing extra and pushes normally
 
 ## Conventions to hold to
 
-- **A new design decision worth remembering gets an ADR** (`docs/adr/`, numbered, following the
-  existing files' Status/Context/Decision/Alternatives/Consequences shape) — not just a comment or
-  a PR description. Check the existing ADRs before re-deciding something they already settled.
+- **A new design decision worth remembering gets an ADR** (`docs/adr/<slug>.md`, copied from
+  [`docs/adr/TEMPLATE.md`](docs/adr/TEMPLATE.md)) — not just a comment or a PR description. Name
+  the file after the decision, not a number: parallel branches racing for "the next number" was a
+  recurring source of merge churn (see [`docs/adr/README.md`](docs/adr/README.md) for the full
+  index and the `created`/`updated` frontmatter that orders it). Check the existing ADRs before
+  re-deciding something they already settled. `docs/plans/` follows the same convention.
 - **`rustfmt.toml`/`clippy.toml` are enforced**, not advisory — `script/cibuild` fails the build on
   either. Run `script/format` before committing rather than hand-formatting.
 - **Every config type derives `Serialize + Deserialize + JsonSchema` together**
-  ([ADR 0003](docs/adr/0003-config-yaml-jsonschema.md)) — the published schema is generated from
+  ([ADR `config-yaml-jsonschema`](docs/adr/config-yaml-jsonschema.md)) — the published schema is generated from
   the Rust types specifically so it can't drift. If `schemars` needs a hint `serde` doesn't give it
   (as with the hand-rolled `Duration` codec in `logit-config`), add `#[schemars(with = "...")]`
   alongside `#[serde(with = "...")]` rather than dropping the derive.
@@ -133,7 +136,7 @@ for no real benefit here. A merge commit costs nothing extra and pushes normally
   default.
 - **A config file is always read through `logit_cli::config::load`**, never a bare
   `std::fs::read_to_string` + `serde_norway::from_str` — that's what resolves `!env` and rejects an
-  unknown YAML tag (ADR 0011); a call site that bypasses it silently loses both.
+  unknown YAML tag (ADR `env-yaml-tag`); a call site that bypasses it silently loses both.
 
 ## Design constraints that aren't optional
 

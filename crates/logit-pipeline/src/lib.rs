@@ -1,6 +1,6 @@
 //! The pipeline component graph: trait definitions, the graph resolution/validation module, and
 //! the node runtime. See `docs/design/pipeline-graph.md` and
-//! `docs/adr/0009-component-graph-configuration.md` for the design this crate implements.
+//! `docs/adr/component-graph-configuration.md` for the design this crate implements.
 //!
 //! Crate layout note (`docs/design/pipeline-graph.md`'s "Crate layout" section): this crate
 //! defines `Input`/`Output`/`Transform` -- `logit-inputs`/`logit-outputs`/`logit-transforms` hold

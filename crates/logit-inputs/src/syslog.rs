@@ -18,7 +18,7 @@
 //!
 //! **Timestamp semantics.** Every emitted [`Event`]'s `timestamp` is *receipt* time -- the
 //! `received_at` passed into [`SyslogDecoder::decode_into`], captured by the read half at the
-//! moment the datagram came off the socket (`docs/adr/0027-decoupled-listener-io.md`), not
+//! moment the datagram came off the socket (`docs/adr/decoupled-listener-io.md`), not
 //! whenever decode happens to run -- never the sender's own timestamp. RFC 3164's timestamp
 //! carries no year and no timezone, so resolving it
 //! to an instant means guessing both; doing that only for RFC 5424 (whose timestamp *is*
@@ -86,7 +86,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 /// Thin wrapper over [`UdpListener<SyslogDecoder>`] -- the read/decode split and datagram-\>batch
-/// assembly all live there (`docs/adr/0027-decoupled-listener-io.md`); this type is just the
+/// assembly all live there (`docs/adr/decoupled-listener-io.md`); this type is just the
 /// decoder choice plus the public constructor/builder surface `logit-cli::pipeline` and this
 /// module's own tests already depend on.
 pub struct SyslogInput {
@@ -126,7 +126,7 @@ impl SyslogInput {
     }
 
     /// Overrides the receive-queue/batching/shutdown-grace knobs a `receive:` config block sets
-    /// (`docs/adr/0027-decoupled-listener-io.md`). Defaults to [`UdpListenerConfig::default`] --
+    /// (`docs/adr/decoupled-listener-io.md`). Defaults to [`UdpListenerConfig::default`] --
     /// today's behaviour -- when never called.
     pub fn with_receive(mut self, config: UdpListenerConfig) -> Self {
         self.inner = self.inner.with_config(config);
@@ -829,7 +829,7 @@ mod tests {
     }
 
     /// `decode_into` must stamp every event with the caller's `received_at`, not a fresh
-    /// call-time clock read -- the property `docs/adr/0027-decoupled-listener-io.md` exists for:
+    /// call-time clock read -- the property `docs/adr/decoupled-listener-io.md` exists for:
     /// once decode runs on its own loop, "now" at decode time can be arbitrarily later than
     /// arrival under backlog, and this module's own doc comment promises `timestamp` is receipt
     /// time, not decode time.

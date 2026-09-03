@@ -1,7 +1,7 @@
 # Native wire protocol
 
 The `logit`-to-`logit` protocol for splitting collection from processing across nodes
-([overview](../OVERVIEW.md), [ADR 0004](../adr/0004-native-wire-format-with-otlp-bridge.md)). OTLP
+([overview](../OVERVIEW.md), [ADR `native-wire-format-with-otlp-bridge`](../adr/native-wire-format-with-otlp-bridge.md)). OTLP
 remains available as an interop codec at ingest/egress; this document is specifically the efficient
 native path between two `logit` nodes.
 
@@ -69,7 +69,7 @@ throughput.
 - **Transport:** TCP first; QUIC is a plausible later upgrade (head-of-line-blocking avoidance
   matters less here than getting the format and node-to-node story right first).
 - **TLS:** via `rustls`, not OpenSSL — keeps the "no host toolchain needed" property
-  ([ADR 0005](../adr/0005-containerized-development.md)) intact, since `rustls` has no system OpenSSL
+  ([ADR `containerized-development`](../adr/containerized-development.md)) intact, since `rustls` has no system OpenSSL
   dependency to link against.
 - **Handshake:** negotiates protocol version, supported codecs, and supported compression before any
   batch is sent, so a version mismatch fails fast and legibly instead of corrupting a stream.
@@ -81,7 +81,7 @@ throughput.
 
 `Buffer<T>` (`logit_proto::buffer`) is a bounded, in-process queue between a producer and a
 slower/intermittent consumer, with an ack shape rather than a plain pop — see
-`docs/adr/0021-buffered-sink-delivery.md` for the reasoning:
+`docs/adr/buffered-sink-delivery.md` for the reasoning:
 
 ```rust
 pub trait Buffer<T> {

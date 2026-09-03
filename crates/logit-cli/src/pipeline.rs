@@ -1,5 +1,5 @@
 //! `logit run`: resolves a config's component graph (`docs/design/pipeline-graph.md`,
-//! `docs/adr/0009-component-graph-configuration.md`) into a runnable [`NodeSpec`] per component
+//! `docs/adr/component-graph-configuration.md`) into a runnable [`NodeSpec`] per component
 //! and hands it to `logit_pipeline::run`. See `docs/OVERVIEW.md` for the shape (`logit` as
 //! sidecar, host agent, or central aggregator is all just this, differing only by config).
 //!
@@ -158,10 +158,10 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<()> {
 /// `graph::resolve` already rejected every kind `is_implemented` doesn't recognize (rule 8), so
 /// the fallback arm below is unreachable in practice, not a silent gap.
 ///
-/// `id` attaches a [`Diagnostics`] to every component that emits one (`docs/adr/0013-service-
-/// lifecycle-and-output-retry.md`) via each kind's own `with_diagnostics` builder -- not a
-/// constructor parameter, so none of the ~60 existing tests across these four kinds needed to
-/// change.
+/// `id` attaches a [`Diagnostics`] to every component that emits one
+/// (`docs/adr/service-lifecycle-and-output-retry.md`) via each kind's own `with_diagnostics`
+/// builder -- not a constructor parameter, so none of the ~60 existing tests across these four
+/// kinds needed to change.
 ///
 /// `registry` is `Some` only when the config being built contains an `internal` component
 /// (`prepare` below) -- every component gets a [`Telemetry`] handle from it either way
@@ -345,8 +345,8 @@ fn build_spec(
     Ok((spec, telemetry))
 }
 
-/// Builds a sink's `SinkQueueConfig` from its `BufferConfig` (`docs/adr/0021-buffered-sink-
-/// delivery.md`, workstream F) -- the sole place `logit_config::OverflowPolicy` is converted to
+/// Builds a sink's `SinkQueueConfig` from its `BufferConfig` (`docs/adr/buffered-sink-delivery.md`,
+/// workstream F) -- the sole place `logit_config::OverflowPolicy` is converted to
 /// `logit_pipeline::OverflowPolicy`, since neither config nor pipeline crate can see both types
 /// without violating the dependency direction (`logit-pipeline` depends on `logit-config`, never
 /// the reverse; `docs/design/pipeline-graph.md`'s crate layout).
@@ -400,7 +400,7 @@ fn overflow_policy(cfg: logit_config::OverflowPolicy) -> logit_pipeline::Overflo
 }
 
 /// Builds a UDP listener's `UdpListenerConfig` from its `ReceiveConfig`
-/// (`docs/adr/0027-decoupled-listener-io.md`) -- the receive-side mirror of `queue_config`/
+/// (`docs/adr/decoupled-listener-io.md`) -- the receive-side mirror of `queue_config`/
 /// `write_config` above.
 fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::UdpListenerConfig {
     logit_inputs::udp::UdpListenerConfig {

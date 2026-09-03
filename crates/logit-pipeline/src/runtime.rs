@@ -29,7 +29,7 @@ use tokio::task::JoinSet;
 /// restart-policy supervisor to notice; one malformed batch cannot kill an otherwise-healthy
 /// pipeline. Fixed, not config-exposed -- workstream F's `logit_config::BufferConfig` deliberately
 /// does not surface this window; revisit if a real deployment ever needs to tune it.
-/// See `docs/adr/0021-buffered-sink-delivery.md`'s "Failure handling" section.
+/// See `docs/adr/buffered-sink-delivery.md`'s "Failure handling" section.
 const PERMANENT_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Bounded channel capacity between two graph nodes. Small and arbitrary -- just enough to smooth
@@ -42,7 +42,7 @@ const CHANNEL_CAPACITY: usize = 64;
 pub enum NodeSpec {
     /// `InputRuntimeConfig` mirrors `Output`'s own runtime knobs below: production call sites
     /// (`logit-cli::pipeline::build_spec`) derive `shutdown_grace` from the listener's `receive:`
-    /// block (`docs/adr/0027-decoupled-listener-io.md`), defaulting to
+    /// block (`docs/adr/decoupled-listener-io.md`), defaulting to
     /// `InputRuntimeConfig::default()` (`Duration::ZERO` -- cancel-by-drop immediately, ADR
     /// 0013's original behaviour) for a listener with no `receive:` block; a test can pass a
     /// short grace to keep a shutdown test fast.
@@ -215,7 +215,7 @@ pub async fn run_with_telemetry(
     // On the first error (from either arm below), record it and trigger the same shutdown signal
     // SIGTERM already drives -- every remaining task then gets the graceful-shutdown treatment it
     // already knows how to handle (a listener's inbox closes normally, cascading through to
-    // `write_loop`'s shutdown-grace drain, `docs/adr/0021-buffered-sink-delivery.md`) instead of
+    // `write_loop`'s shutdown-grace drain, `docs/adr/buffered-sink-delivery.md`) instead of
     // being aborted mid-flight by dropping `tasks` early, which would silently discard a healthy
     // sibling's buffered, not-yet-delivered work. Keep `join_next`ing until every task has actually
     // exited (the loop condition, unchanged) rather than breaking -- only the *first* error is kept
@@ -245,19 +245,19 @@ pub async fn run_with_telemetry(
 }
 
 /// Drives one listener via [`Input::run_until_shutdown`], racing it against a *grace-delayed*
-/// backstop rather than `shutdown` itself (`docs/adr/0027-decoupled-listener-io.md`, revising
-/// ADR 0013's "no `Input` trait change" rationale, not its cancel-by-drop mechanism -- see the
+/// backstop rather than `shutdown` itself (`docs/adr/decoupled-listener-io.md`, revising
+/// ADR `service-lifecycle-and-output-retry`'s "no `Input` trait change" rationale, not its cancel-by-drop mechanism -- see the
 /// trait's own doc comment).
 ///
 /// **Why grace-delayed, and why that doesn't add latency to a non-overriding input.**
 /// `run_until_shutdown`'s default body already races `run` against `shutdown` and resolves the
-/// instant it fires -- exactly ADR 0013's original behaviour, unchanged. If this function's outer
+/// instant it fires -- exactly ADR `service-lifecycle-and-output-retry`'s original behaviour, unchanged. If this function's outer
 /// race were *also* against `shutdown` itself, both arms would resolve simultaneously with no way
 /// to prefer letting an overriding implementation finish draining first. Racing against
 /// [`shutdown_grace_expired`] instead means: the default impl (or any override that finishes
 /// before the grace) always wins that race, so nothing pays added latency; an override still
 /// working when the grace expires is the only case where this backstop actually fires, cancelling
-/// it by drop -- the same loss ADR 0013 always accepted, now bounded by `shutdown_grace` rather
+/// it by drop -- the same loss ADR `service-lifecycle-and-output-retry` always accepted, now bounded by `shutdown_grace` rather
 /// than unconditional.
 ///
 /// No `Box::pin`/`Option` dance like `run_output` needed (`shutdown.clone()` below gives the two
@@ -280,7 +280,7 @@ async fn run_input(
 }
 
 /// A sink node's drain-and-deliver pair, decoupled through a [`SinkQueue`]
-/// (`docs/adr/0021-buffered-sink-delivery.md`): [`drain_inbox`] moves every `Delivered` off this
+/// (`docs/adr/buffered-sink-delivery.md`): [`drain_inbox`] moves every `Delivered` off this
 /// component's inbox into the queue as fast as the queue's own bounds allow, while [`write_loop`]
 /// delivers from the queue independently -- so a slow or backing-off `Output::send` no longer
 /// stops this sink's own inbox from moving batches into its (deeper, byte-bounded) queue, the way
@@ -457,7 +457,7 @@ fn unwrap_batch_arc(delivered: Delivered) -> Arc<EventBatch> {
 
 /// Retry budget for [`write_loop`]'s generic `deliver_with_retry`, driving every sink -- moved
 /// here from `logit-outputs::influxdb::RetryPolicy`, which owned its own retry loop before
-/// `docs/adr/0021-buffered-sink-delivery.md`; now every sink gets retry for free instead of
+/// `docs/adr/buffered-sink-delivery.md`; now every sink gets retry for free instead of
 /// reimplementing it.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryConfig {
@@ -475,8 +475,8 @@ pub struct RetryConfig {
 
 impl Default for RetryConfig {
     fn default() -> Self {
-        // Widened from ADR 0013's ~5s default: a stall here no longer reaches the drain loop or
-        // the listener behind it (docs/adr/0021-buffered-sink-delivery.md), since the queue
+        // Widened from ADR `service-lifecycle-and-output-retry`'s ~5s default: a stall here no longer reaches the drain loop or
+        // the listener behind it (docs/adr/buffered-sink-delivery.md), since the queue
         // absorbs it instead -- so a much larger budget, enough to ride out a real destination
         // restart, is now affordable.
         Self {
@@ -495,10 +495,10 @@ pub struct WriteLoopConfig {
     /// Once the shutdown signal fires, `write_loop`'s remaining allowed drain time is capped at
     /// this, measured from the moment shutdown first fired (not reset per batch) -- so a
     /// permanently-down sink can't hang process exit indefinitely under SIGTERM. See
-    /// `docs/adr/0021-buffered-sink-delivery.md`'s "shutdown grace" section.
+    /// `docs/adr/buffered-sink-delivery.md`'s "shutdown grace" section.
     pub shutdown_grace: Duration,
     /// Overrides the delivery posture `write_loop` would otherwise derive from
-    /// `output.duplicate_safe()` (`docs/adr/0021-buffered-sink-delivery.md`'s three-layer posture
+    /// `output.duplicate_safe()` (`docs/adr/buffered-sink-delivery.md`'s three-layer posture
     /// design: sink fact -> runtime default -> this config override). `None` -- the default --
     /// means "use the derived default"; workstream F's `logit-config::BufferConfig::delivery`
     /// is what sets this per component.
@@ -534,7 +534,7 @@ enum Delivery {
 /// Attempts to deliver `batch` via `output.send`, retrying per `posture`/[`is_retryable`] until
 /// either it succeeds, a failure isn't retryable, or `retry.total_budget` (a fresh budget for this
 /// call) is exhausted. Moved here from `logit-outputs::influxdb::InfluxDbOutput::send`'s own retry
-/// loop (`docs/adr/0021-buffered-sink-delivery.md`) -- every sink gets this for free now, driven by
+/// loop (`docs/adr/buffered-sink-delivery.md`) -- every sink gets this for free now, driven by
 /// its own `Fault` classification and `duplicate_safe` fact rather than reimplementing the loop.
 ///
 /// **Every attempt, including the first, is raced against the remaining budget** via
@@ -590,7 +590,7 @@ async fn deliver_with_retry(
 /// The backoff before retry attempt `attempt + 1`: `base_delay` doubled `attempt - 1` times via
 /// repeated `saturating_mul`, stopping early once it's already at or past `max_delay` -- correct
 /// for *any* `base_delay`/`max_delay` pair, not just `RetryConfig::default`'s. Moved here from
-/// `logit-outputs::influxdb` verbatim (`docs/adr/0021-buffered-sink-delivery.md`) -- it was never
+/// `logit-outputs::influxdb` verbatim (`docs/adr/buffered-sink-delivery.md`) -- it was never
 /// InfluxDB-specific, just historically homed on the one sink that had a retry loop at all. See
 /// that module's history for why the loop is bounded at 128 iterations and why a single
 /// `base_delay * 2u32.pow(shift)` with a fixed shift cap doesn't work for every `base_delay`/
@@ -704,7 +704,7 @@ async fn finish_and_flush(
 /// and empty -- see [`SinkQueue::peek`]) or shutdown grace expires. Per batch: attempt delivery via
 /// [`deliver_with_retry`], per the posture resolved from `write_config.delivery_override` (config,
 /// workstream F) falling back to `output.duplicate_safe()`'s derived default
-/// (`docs/adr/0021-buffered-sink-delivery.md`). On success, commit and reset the permanent-failure
+/// (`docs/adr/buffered-sink-delivery.md`). On success, commit and reset the permanent-failure
 /// streak. On failure (not retryable, or retryable but the budget ran out), commit anyway (the
 /// process no longer exits on an ordinary sink failure), count and warn -- *except*: a run of
 /// nothing but *explicitly classified* `Fault::Permanent` outcomes (see
@@ -769,11 +769,11 @@ async fn write_loop(
         };
 
         // The sink span: the only span that can carry `SpanStatus::Error` and a fault tag,
-        // which is the whole point of instrumenting a sink (`docs/adr/0025-internal-span-
-        // emission-and-deterministic-sampling.md`). `ctx.child()` is minted, used as this span's
-        // identity, and then discarded -- `run_output` emits nothing further downstream for
-        // anything to inherit it (`Output::send` takes `&EventBatch`, not `&Delivered`), so there
-        // is no propagation left to do with it beyond this one span.
+        // which is the whole point of instrumenting a sink
+        // (`docs/adr/internal-span-emission-and-deterministic-sampling.md`). `ctx.child()` is
+        // minted, used as this span's identity, and then discarded -- `run_output` emits nothing
+        // further downstream for anything to inherit it (`Output::send` takes `&EventBatch`, not
+        // `&Delivered`), so there is no propagation left to do with it beyond this one span.
         let span_ctx = ctx.child();
         let mut span = telemetry.span(
             "deliver",
@@ -865,7 +865,7 @@ async fn write_loop(
 /// the same way `fanout.rs`'s own tests already are.
 ///
 /// No caller in this crate any more -- `run_output`'s real delivery path now goes through
-/// `deliver_with_retry`/`write_loop` (`docs/adr/0021-buffered-sink-delivery.md`), which calls
+/// `deliver_with_retry`/`write_loop` (`docs/adr/buffered-sink-delivery.md`), which calls
 /// `output.send` directly so it can classify the resulting `Fault` and drive retry/posture
 /// decisions from it; `send_batch`'s all-or-nothing `anyhow::Result` return doesn't fit that. Kept
 /// as its own `pub` function purely so the bench/allocations harness can still measure this exact
@@ -946,8 +946,9 @@ async fn run_transform(
         // A no-op for every other transform.
         transform.observe_batch_context(parent);
         // Minted here, not inside `Fanout::send_with_context`, because this node records its own
-        // span around `process_batch` *and* the send (`docs/adr/0025-internal-span-emission-and-
-        // deterministic-sampling.md`'s per-node-kind table): the span's `span_id` and the outgoing
+        // span around `process_batch` *and* the send
+        // (`docs/adr/internal-span-emission-and-deterministic-sampling.md`'s per-node-kind
+        // table): the span's `span_id` and the outgoing
         // `Delivered`'s `span_id` have to be the same id, which only holds if this is the one and
         // only place a context is minted for this emission.
         let ctx = parent.child();
@@ -1006,7 +1007,7 @@ pub fn process_batch(
 
 /// Shared by `run_transform`'s two flush call sites (the deadline tick and the close-time flush).
 /// Timed as one call even when it yields several `(resource, events)` groups -- `flush`'s own
-/// per-resource windowing (`docs/adr/0008-aggregation-window-semantics.md`) is internal to the
+/// per-resource windowing (`docs/adr/aggregation-window-semantics.md`) is internal to the
 /// transform, not something this timing needs to break out further.
 ///
 /// **Mints one root before `transform.flush(now)`, then sends every resource group under that
@@ -1016,12 +1017,12 @@ pub fn process_batch(
 /// there is still no single correct parent to inherit (`TraceContext`'s own doc comment,
 /// `crates/logit-pipeline/src/fanout.rs`; `docs/known-gaps.md`'s internal-spans entry tracks this
 /// *n*-to-1 gap as deliberate, not something this function is wrong to leave open). What changed
-/// (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`): earlier, every resource
+/// (`docs/adr/internal-span-emission-and-deterministic-sampling.md`): earlier, every resource
 /// group minted its *own* fresh root via plain `fanout.send`, so an `aggregate` flush spanning
 /// several resources looked like several unrelated hops; now one root is minted before `flush()`
 /// runs, and every group's batch goes out as a *sibling* under it -- one flush is one unit of
 /// work, and N resource groups are an internal detail of `aggregate`'s per-resource windowing
-/// (`docs/adr/0008-aggregation-window-semantics.md`), not N hops. The contributing-context links
+/// (`docs/adr/aggregation-window-semantics.md`), not N hops. The contributing-context links
 /// `Transform::flush` returns per event (`Aggregator`'s bounded `ContributingContexts`) are unioned
 /// onto this one flush span, bounded by `MAX_LINKS_PER_SPAN` same as any other span's links.
 async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, telemetry: &Telemetry) {
@@ -1057,7 +1058,7 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 /// becomes `fanout.send_blocking` for the same reason: no `.await` available outside `block_on`.
 ///
 /// Unlike `Transform::flush`, a Lua `flush()` has no resource of its own to stamp its emitted
-/// events with (`docs/adr/0008-aggregation-window-semantics.md`) -- `last_resource` tracks
+/// events with (`docs/adr/aggregation-window-semantics.md`) -- `last_resource` tracks
 /// whichever resource this component most recently saw on a real batch, defaulting to a fresh one
 /// if none has arrived yet.
 #[allow(clippy::too_many_arguments)]
@@ -1227,7 +1228,7 @@ fn run_lua(
         }
         if errors > 0 {
             telemetry.count("logit.component.errors", errors as f64, &[("reason", "process")]);
-            // Consistent with `write_loop`'s own rule (ADR 0025): the call site whose error path
+            // Consistent with `write_loop`'s own rule (ADR `internal-span-emission-and-deterministic-sampling`): the call site whose error path
             // fired is the one that marks the span, not a downstream reader inferring it from
             // `logit.component.errors`. A batch with *any* script error, even a partial one mixed
             // with successful emits, is not a clean node visit -- `span`'s default status is `Ok`,
@@ -1250,7 +1251,7 @@ fn run_lua(
 /// `Transform`/`ScriptWorker::process` -- called from `run_transform`/`run_lua` only. `run_output`
 /// (above) never calls this: `Output::send` takes `&EventBatch`, so it borrows straight out of the
 /// `Delivered` instead, which is what actually realizes the fan-out saving for an `Output` branch
-/// (`docs/adr/0016-arc-eventbatch-copy-on-write.md`'s "Round two"). `Transform`/`ScriptWorker`
+/// (`docs/adr/arc-eventbatch-copy-on-write.md`'s "Round two"). `Transform`/`ScriptWorker`
 /// still need to mutate or consume an *owned* `Event`, so this unwrap can't be skipped for them.
 ///
 /// `Delivered::Owned` (a single-consumer edge) is already the owned batch: no `Arc` was ever
@@ -1264,7 +1265,7 @@ fn run_lua(
 ///
 /// **An `Output` sibling on the same fan-out doesn't change this into a guarantee either way --
 /// it's still genuinely racy, just against a different clock than it used to be.** Before
-/// `docs/adr/0021-buffered-sink-delivery.md` split `run_output` into `drain_inbox`/`write_loop`,
+/// `docs/adr/buffered-sink-delivery.md` split `run_output` into `drain_inbox`/`write_loop`,
 /// the `Output` branch held its `Delivered` handle for the full duration of `output.send`, which
 /// typically does real I/O -- slower than a `Transform`'s local processing, making a clone (cost
 /// 6) the likelier practical outcome even though a free unwrap (cost 1) was reachable. That's no
@@ -1313,7 +1314,7 @@ fn now_unix_nanos() -> i64 {
 ///
 /// `pub(crate)` rather than private: [`crate::accumulator::BatchAccumulator`] reuses this exact
 /// cadence math for its own interval-driven flush rather than a second copy
-/// (`docs/adr/0027-decoupled-listener-io.md`).
+/// (`docs/adr/decoupled-listener-io.md`).
 pub(crate) fn advance_flush_deadline(
     deadline: tokio::time::Instant,
     now: tokio::time::Instant,
@@ -1368,7 +1369,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Output for RecordingOutput {
         async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-            // `Output::send` only ever borrows (`docs/adr/0016-arc-eventbatch-copy-on-write.md`);
+            // `Output::send` only ever borrows (`docs/adr/arc-eventbatch-copy-on-write.md`);
             // this test double clones onto its own plain `std::sync::mpsc` channel purely so the
             // assertion side of each test can inspect what arrived after this async fn returns.
             let _ = self.tx.send(batch.clone());
@@ -1590,8 +1591,8 @@ mod tests {
         }
     }
 
-    /// Operationalizes branch isolation (docs/adr/0012-multi-payload-events.md). Since
-    /// docs/adr/0016-arc-eventbatch-copy-on-write.md, `Fanout` no longer deep-clones eagerly at
+    /// Operationalizes branch isolation (docs/adr/multi-payload-events.md). Since
+    /// docs/adr/arc-eventbatch-copy-on-write.md, `Fanout` no longer deep-clones eagerly at
     /// send time -- a real fan-out hands every branch its own `Delivered::Shared` handle onto one
     /// `Arc`, and the clone (if any) happens lazily, at `unwrap_batch`, right before a branch's own
     /// node can touch the batch at all. Whichever branch doesn't win `Arc::try_unwrap` gets a real,
@@ -1600,7 +1601,7 @@ mod tests {
     /// sibling branch's copy of the same upstream event, even now that `Event` can carry several
     /// payloads at once. Proven against a real two-branch fan-out (one listener feeding a
     /// mutating transform on one branch and a sink directly on the other -- exactly the "one
-    /// listener, two independently-processed downstream chains" shape ADR 0009 exists to make an
+    /// listener, two independently-processed downstream chains" shape ADR `component-graph-configuration` exists to make an
     /// ordinary config, not an edge case), not just asserted in a design doc.
     #[tokio::test]
     async fn a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch() {
@@ -1863,7 +1864,7 @@ mod tests {
     }
 
     // -- `Input::run_until_shutdown` and `run_input`'s grace backstop
-    //    (`docs/adr/0027-decoupled-listener-io.md`). --
+    //    (`docs/adr/decoupled-listener-io.md`). --
 
     /// Never returns on its own -- the shape that makes the default `run_until_shutdown`'s
     /// `select!` the *only* way this input can ever stop.
@@ -2014,7 +2015,7 @@ mod tests {
         assert_eq!(tokio::time::Instant::now().duration_since(before), grace);
     }
 
-    /// The default impl's shutdown path is still exactly ADR 0013's cancel-by-drop: dropping
+    /// The default impl's shutdown path is still exactly ADR `service-lifecycle-and-output-retry`'s cancel-by-drop: dropping
     /// `run`'s future drops the `Fanout` inside it, which drops the last `Sender` into every
     /// downstream inbox, closing them -- unchanged by this workstream's `run_input` restructuring.
     #[tokio::test(start_paused = true)]
@@ -2061,7 +2062,7 @@ mod tests {
     }
 
     /// The property `unwrap_batch` (and the whole `Arc<EventBatch>` design,
-    /// docs/adr/0016-arc-eventbatch-copy-on-write.md) rests on for a single-consumer edge: `Fanout`
+    /// docs/adr/arc-eventbatch-copy-on-write.md) rests on for a single-consumer edge: `Fanout`
     /// with exactly one consumer never touches an `Arc` at all, so what arrives at the other end is
     /// `Delivered::Owned` -- proving the fast path (item 1 of the PR #33 review) actually takes,
     /// not just that the code happens to also be correct if it didn't.
@@ -2369,7 +2370,7 @@ mod tests {
 
     /// The error half of `run_lua_records_vm_memory_and_emit_outcome`'s success case: a script
     /// error must mark the process span `SpanStatus::Error`, not leave it at its default `Ok` --
-    /// ADR 0025's rule that the call site whose own error path fired is the one that marks the
+    /// ADR `internal-span-emission-and-deterministic-sampling`'s rule that the call site whose own error path fired is the one that marks the
     /// span, applied to Lua's `process` the same way `write_loop` already applies it to a failed
     /// delivery. Every event in the batch errors here, so `out` also stays empty and nothing is
     /// ever sent downstream -- exactly the case that would otherwise drain as a *successful*
@@ -2662,7 +2663,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // `run_output`'s drain/write split (`docs/adr/0021-buffered-sink-delivery.md`)
+    // `run_output`'s drain/write split (`docs/adr/buffered-sink-delivery.md`)
     // -----------------------------------------------------------------------------------------
 
     /// A minimal one-shot gate for tests: `wait()` blocks until `open()` is called, from anywhere,
@@ -2782,7 +2783,7 @@ mod tests {
     }
 
     /// The property this whole workstream exists to deliver
-    /// (`docs/adr/0021-buffered-sink-delivery.md`, `docs/plans/0004-buffered-sink-delivery.md`
+    /// (`docs/adr/buffered-sink-delivery.md`, `docs/plans/buffered-sink-delivery.md`
     /// section C): a slow/backing-off `Output::send` no longer stops its own component's inbox
     /// from draining. Proven directly: while the sink's very first delivery attempt is parked on a
     /// gate, several more batches sent right behind it still make it off the inbox and into the
@@ -2883,7 +2884,7 @@ mod tests {
     }
 
     /// **Behavior change from before this workstream, deliberate**
-    /// (`docs/adr/0021-buffered-sink-delivery.md`'s "Failure handling" section): an isolated,
+    /// (`docs/adr/buffered-sink-delivery.md`'s "Failure handling" section): an isolated,
     /// unclassified send failure (defaults to `Fault::Permanent`, see `output::classify`) used to
     /// end `run` outright the moment it happened. It no longer does -- `write_loop` drops the
     /// batch, counts it, and moves on; only a *sustained* run of nothing but `Permanent` failures
@@ -3073,7 +3074,7 @@ mod tests {
 
     // -----------------------------------------------------------------------------------------
     // `write_loop`'s retry/posture/failure-handling/shutdown-grace logic
-    // (`docs/adr/0021-buffered-sink-delivery.md`, workstream D)
+    // (`docs/adr/buffered-sink-delivery.md`, workstream D)
     // -----------------------------------------------------------------------------------------
 
     /// A sink whose `send` fails with a `fault`-tagged error for its first `fail_times` calls,
@@ -3877,8 +3878,8 @@ mod tests {
 
     // -----------------------------------------------------------------------------------------
     // `run_with_telemetry`'s join loop: drain every task on the first error instead of aborting
-    // (`docs/plans/0004-buffered-sink-delivery.md` workstream E,
-    // `docs/adr/0021-buffered-sink-delivery.md`)
+    // (`docs/plans/buffered-sink-delivery.md` workstream E,
+    // `docs/adr/buffered-sink-delivery.md`)
     // -----------------------------------------------------------------------------------------
 
     /// An `Input` fully driven by the test: every batch handed to the paired `UnboundedSender`
@@ -4448,7 +4449,7 @@ mod tests {
 
     /// A local fake `Transform` whose `flush()` always emits two resource groups in one call --
     /// standing in for `Aggregator`'s per-resource windowing
-    /// (`docs/adr/0008-aggregation-window-semantics.md`) -- used to prove `run_flush` sends every
+    /// (`docs/adr/aggregation-window-semantics.md`) -- used to prove `run_flush` sends every
     /// group under one shared root context and unions every group's links onto one flush span.
     struct MultiGroupFlushTransform {
         links_for_first_group: Vec<SpanLink>,

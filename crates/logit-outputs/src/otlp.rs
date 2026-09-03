@@ -1,10 +1,10 @@
 //! OTLP output -- exports logs, metrics, and traces to any OTLP-speaking backend, over either
 //! OTLP/HTTP (protobuf-over-POST) or OTLP/gRPC, selected by `protocol` in config
-//! (`logit_config::OtlpProtocol`). See `docs/adr/0024-hand-rolled-grpc-over-hyper.md` for why the
+//! (`logit_config::OtlpProtocol`). See `docs/adr/hand-rolled-grpc-over-hyper.md` for why the
 //! gRPC transport is a ~150-line hand-rolled client over `hyper` rather than `tonic`.
 //!
 //! **One `send` call, several HTTP/gRPC requests.** `logit`'s [`EventBatch`] mixes logs, metrics,
-//! and spans on one `Event` (ADR 0012), but OTLP is three separate services -- so `send` calls
+//! and spans on one `Event` (ADR `multi-payload-events`), but OTLP is three separate services -- so `send` calls
 //! [`logit_proto::SignalEncoder::encode_signals`] once and issues one request per non-empty
 //! signal it returns, sequentially, in whatever order `encode_signals` produced them. A batch with
 //! only metrics issues exactly one request; a mixed batch issues up to three. This is also why
@@ -237,7 +237,7 @@ impl OtlpOutput {
 #[async_trait::async_trait]
 impl Output for OtlpOutput {
     /// Exactly one attempt per request, same "no retry in a sink" contract every other output
-    /// follows (`docs/adr/0021-buffered-sink-delivery.md`) -- but here that's per-*request*, not
+    /// follows (`docs/adr/buffered-sink-delivery.md`) -- but here that's per-*request*, not
     /// per-`send` call: a batch producing three signals issues three requests, and the first
     /// failure aborts the rest without attempting them. `write_loop` sees this as one failed
     /// `send` and retries the whole batch, which is exactly what makes duplicate-safety a real
@@ -345,7 +345,7 @@ fn grpc_fault(code: u32) -> Fault {
 
 /// Rejects a `protocol: grpc` endpoint written with an `https://` scheme, as a hard
 /// construction-time error rather than a silent downgrade. This output's gRPC transport has no
-/// TLS support at all (`docs/adr/0024-hand-rolled-grpc-over-hyper.md` -- unary gRPC over plain
+/// TLS support at all (`docs/adr/hand-rolled-grpc-over-hyper.md` -- unary gRPC over plain
 /// `hyper`, nothing more) -- so unlike `grpc_authority`'s deliberate `http://`/`grpc://`
 /// equivalence (an operator copying one component's endpoint to the other, where both spellings
 /// genuinely mean the same plaintext connection), treating `https://` as one more friendly
@@ -360,7 +360,7 @@ fn reject_insecure_grpc_endpoint(endpoint: &str, transport: OtlpTransport) -> an
     if transport == OtlpTransport::Grpc && endpoint.to_ascii_lowercase().starts_with("https://") {
         anyhow::bail!(
             "otlp_out: endpoint {endpoint:?} has protocol: grpc, but this output's gRPC \
-             transport has no TLS support (docs/adr/0024-hand-rolled-grpc-over-hyper.md) -- an \
+             transport has no TLS support (docs/adr/hand-rolled-grpc-over-hyper.md) -- an \
              https:// endpoint would silently be exported in plaintext. Use protocol: http for a \
              TLS-terminated OTLP endpoint, or a plaintext http://... / grpc://... endpoint for \
              gRPC"
@@ -478,7 +478,7 @@ fn grpc_status_from(headers: &HeaderMap) -> Option<(u32, String)> {
 
 /// Frames `payload` as one unary gRPC message: `[compressed:u8=0][len:u32 BE][payload]` -- the
 /// wire shape every gRPC-over-HTTP/2 message body uses, request or response
-/// (`docs/adr/0024-hand-rolled-grpc-over-hyper.md`). The compressed flag is always `0`: this
+/// (`docs/adr/hand-rolled-grpc-over-hyper.md`). The compressed flag is always `0`: this
 /// output never sets `grpc-encoding` on a request, so there is never anything to mark compressed.
 fn grpc_frame(payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(5 + payload.len());

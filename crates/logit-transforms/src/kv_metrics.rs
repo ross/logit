@@ -1,7 +1,7 @@
 //! The built-in `kv_metrics` transform: turns attributes already on an event (typically merged
 //! there by `json`) into metrics on that *same* event -- nginx's access-log body becomes
 //! `nginx.requests`/`nginx.bytes_sent`/`nginx.request_time` without a second round trip through a
-//! Lua script. See `docs/adr/0014-kv-metrics-semantics.md` for the skip rules, the numeric
+//! Lua script. See `docs/adr/kv-metrics-semantics.md` for the skip rules, the numeric
 //! coercion rules, and the deliberate absence of a `tags:` field on this config surface -- tag
 //! selection is `keep`'s job (`crate::keep`), not something restated on every metrics producer.
 //!
@@ -27,7 +27,7 @@ pub struct MetricSpec {
     /// graph-validation time (`crates/logit-pipeline/src/graph.rs`), not here -- a distribution of
     /// nothing is meaningless. Names an attribute literally, not a path: `field: http.status`
     /// means the attribute named `http.status`, never a `status` key nested under `http` in a
-    /// `Value::Map` (`docs/adr/0014-kv-metrics-semantics.md`).
+    /// `Value::Map` (`docs/adr/kv-metrics-semantics.md`).
     pub field: Option<String>,
     pub unit: Option<String>,
 }
@@ -175,7 +175,7 @@ impl Transform for KvMetrics {
 /// A counter/gauge entry's value for this event: `1.0` with no `field` (per-event
 /// increment/set-to-1), or the named attribute's coerced numeric value -- `None` when the field
 /// is missing, non-numeric, or non-finite, meaning "skip this metric for this event," never an
-/// error and never a dropped event (`docs/adr/0014-kv-metrics-semantics.md`). This is the common
+/// error and never a dropped event (`docs/adr/kv-metrics-semantics.md`). This is the common
 /// path, not an edge case: nginx's `$upstream_response_time` is `-` on a non-proxied request and a
 /// comma-separated list on a retried one.
 fn metric_value(m: &CompiledMetric, attrs: &AttrMap) -> Option<f64> {
@@ -189,7 +189,7 @@ fn metric_value(m: &CompiledMetric, attrs: &AttrMap) -> Option<f64> {
 /// cleanly to a finite `f64` (so it works whether the source JSON quoted the value or not).
 /// `Bool`, `Null`, `Bytes`, `Timestamp`, `Array`, and `Map` never coerce. Deliberately *not* a
 /// general `Value::as_f64` on `logit-core`: a general method that silently parses strings would be
-/// a surprising API for every other caller of `Value` (`docs/adr/0014-kv-metrics-semantics.md`),
+/// a surprising API for every other caller of `Value` (`docs/adr/kv-metrics-semantics.md`),
 /// so this stays private to this module.
 fn numeric(value: &Value) -> Option<f64> {
     let v = match value {

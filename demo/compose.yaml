@@ -72,7 +72,7 @@ services:
   # and Tempo receive real data now (demo/grafana/provisioning/datasources/datasources.yaml).
   tempo:
     # Pinned to 2.10.x, not the current 3.0.x: Tempo 3.0 removed the legacy ingester write path
-    # and reworked config wholesale (docs/plans/0003-demo-stack.md). 2.10's monolithic mode is
+    # and reworked config wholesale (docs/plans/demo-stack.md). 2.10's monolithic mode is
     # the well-trodden config below.
     image: docker.io/grafana/tempo:2.10.8
     command: ["-config.file=/etc/tempo/tempo.yaml"]
@@ -112,14 +112,14 @@ services:
     image: logit-demo:latest
     command: ["run", "/config.yaml"]
     depends_on:
-      # influxdb_out retries transient failures (ADR 0013), but there's no reason to spend the
+      # influxdb_out retries transient failures (ADR `service-lifecycle-and-output-retry`), but there's no reason to spend the
       # demo's first several seconds visibly doing that.
       influxdb:
         condition: service_healthy
       # `service_started`, not `service_healthy` -- `tempo` (above) declares no healthcheck at
       # all, so `service_started` is the honest limit anyway (same reasoning as `hello`'s
       # dependency on `logit` below). Unlike `influxdb_out`, `trace_out` doesn't need Tempo up
-      # first for a clean start: it retries through `write_loop` like any other sink (ADR 0013's
+      # first for a clean start: it retries through `write_loop` like any other sink (ADR `service-lifecycle-and-output-retry`'s
       # bounded output retry), so a `logit` that starts before Tempo finishes booting just retries
       # its first few span exports rather than failing.
       tempo:

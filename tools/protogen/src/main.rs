@@ -1,5 +1,5 @@
 //! One-shot generator for `crates/logit-proto/src/otlp/generated/`. Not a workspace member and
-//! not a build-time dependency (see `docs/adr/0023-committed-pregenerated-otlp-protobuf.md`) --
+//! not a build-time dependency (see `docs/adr/committed-pregenerated-otlp-protobuf.md`) --
 //! run via `script/protogen`, inside a throwaway image with `protoc` installed, then review the
 //! diff and commit the result by hand. Messages only, no service stubs: PR3 hand-rolls the RPCs.
 

@@ -8,7 +8,7 @@
 //! `logit graph` print *something* useful for a cyclic or otherwise-broken config, rather than
 //! only ever working on configs `logit run` would already accept. It still needs a fully-typed
 //! `Config`, though -- every `!env` reference (including one on a field this command never reads,
-//! like a token) must resolve first, same as `run`/`validate` (`docs/adr/0011-env-yaml-tag.md`).
+//! like a token) must resolve first, same as `run`/`validate` (`docs/adr/env-yaml-tag.md`).
 
 use logit_config::Config;
 use logit_pipeline::graph::{role, Role};

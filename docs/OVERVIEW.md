@@ -41,7 +41,7 @@ edges.
   listener has no sources, a sink has sources and is nobody's source, and anything in between can
   feed as many downstream components as need it. See
   [docs/design/pipeline-graph.md](design/pipeline-graph.md) and
-  [ADR 0009](adr/0009-component-graph-configuration.md).
+  [ADR `component-graph-configuration`](adr/component-graph-configuration.md).
 
 ## What this is not (for now)
 

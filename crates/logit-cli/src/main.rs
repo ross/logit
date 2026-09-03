@@ -6,7 +6,7 @@ mod dot;
 mod pipeline;
 
 /// jemalloc rather than the platform default (glibc malloc on this project's `debian:bookworm-slim`
-/// runtime image) -- see `docs/adr/0015-jemalloc-global-allocator.md` and
+/// runtime image) -- see `docs/adr/jemalloc-global-allocator.md` and
 /// `docs/design/memory.md`. `logit` is exactly the workload glibc's arena model handles worst: a
 /// long-lived, multi-threaded process churning small short-lived allocations forever, where RSS
 /// drifts upward for days without the working set growing.
@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Print the JSON Schema for the config file format (ADR 0003) to stdout.
+    /// Print the JSON Schema for the config file format (ADR `config-yaml-jsonschema`) to stdout.
     Schema,
     /// Validate a config file against the schema and print a summary.
     Validate { path: std::path::PathBuf },
@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
         Command::Graph { path } => {
             // Every `!env` reference must resolve here too, same as `run`/`validate` -- no
             // lenient mode that renders a config's shape with its secrets left unset
-            // (docs/adr/0011-env-yaml-tag.md's Alternatives).
+            // (docs/adr/env-yaml-tag.md's Alternatives).
             let config = config::load(&path)?;
             // Print the DOT first, always -- then report validation problems on stderr without
             // suppressing it. A cyclic or otherwise-broken config is exactly what this command is

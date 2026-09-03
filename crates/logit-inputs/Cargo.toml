@@ -16,7 +16,7 @@ tokio.workspace = true
 bytes.workspace = true
 socket2.workspace = true
 # otlp_in's HTTP/1.1+h2c and hand-rolled gRPC-over-HTTP/2 servers
-# (docs/adr/0024-hand-rolled-grpc-over-hyper.md).
+# (docs/adr/hand-rolled-grpc-over-hyper.md).
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true

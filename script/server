@@ -3,7 +3,7 @@
 # Starts the local InfluxDB + Grafana + nginx stack and runs logit against a config file (default:
 # examples/statsd-to-influxdb.yaml) -- the v0.1 vertical slice (statsd -> Lua -> InfluxDB, see
 # docs/OVERVIEW.md), working end to end via `logit run`. Also try
-# examples/nginx-to-influxdb.yaml (docs/plans/0002-nginx-integration.md, workstream F) against the
+# examples/nginx-to-influxdb.yaml (docs/plans/nginx-integration.md, workstream F) against the
 # nginx service started below.
 
 set -e

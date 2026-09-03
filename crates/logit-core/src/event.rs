@@ -18,7 +18,7 @@ impl EventBatch {
     /// Approximate heap bytes held by this batch: the `Vec<Event>` backing allocation itself,
     /// attribute keys/values, log bodies, span-owned data, metric records, and the batch's
     /// resource. Deliberately approximate -- an O(events) walk for admission control (bounding an
-    /// in-memory delivery buffer, see `docs/adr/0021-buffered-sink-delivery.md`), NOT an
+    /// in-memory delivery buffer, see `docs/adr/buffered-sink-delivery.md`), NOT an
     /// allocator-accounting figure. Exempt from this crate's exact-size/exact-allocation-count
     /// discipline (`tests/type_sizes.rs`, `crates/logit-bench/tests/allocations.rs`) on purpose --
     /// don't add this to either of those.
@@ -130,7 +130,7 @@ pub type MetricList = SmallVec<[MetricRecord; 1]>;
 /// The same access log line is both a log and, once a transform like `kv_metrics` has run, a
 /// source of several derived metrics; a sink emits whatever it finds. Two logs on one event is
 /// unrepresentable by construction, since `log` is a single `Option`, not a list. See
-/// `docs/adr/0012-multi-payload-events.md` and `docs/design/data-model.md`.
+/// `docs/adr/multi-payload-events.md` and `docs/design/data-model.md`.
 #[derive(Debug, Clone)]
 pub struct Event {
     /// Unix nanoseconds.

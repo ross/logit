@@ -1,4 +1,4 @@
-# Reference nginx image for docs/plans/0002-nginx-integration.md's workstream F -- a
+# Reference nginx image for docs/plans/nginx-integration.md's workstream F -- a
 # self-contained proof of syslog_in -> json -> kv_metrics -> keep -> aggregate -> influxdb_out
 # against a real nginx, inside this repo's own dev stack. Not a deployment guide: see
 # docs/deploying.md for the real-world recipe (a read-only bind mount over a config directory,

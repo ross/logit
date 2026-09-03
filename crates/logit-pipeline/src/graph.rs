@@ -16,7 +16,7 @@
 //! 10. A `kv_metrics` with counters, gauges, and distributions all empty is rejected -- it can
 //!     only ever be a no-op, the same silent-black-hole failure rule 7 exists to catch.
 //! 11. A `kv_metrics` distribution entry with no `field` is rejected -- a distribution of nothing
-//!     is meaningless (`docs/adr/0014-kv-metrics-semantics.md`).
+//!     is meaningless (`docs/adr/kv-metrics-semantics.md`).
 //! 12. A `kv_metrics` counter, gauge, or distribution entry with an empty `name` is rejected -- the
 //!     implemented `influxdb_out` sink can't encode a metric with no measurement name (Influx line
 //!     protocol requires one), so this must be caught here rather than surfacing as a runtime sink
@@ -25,7 +25,7 @@
 //!     process-wide telemetry `Registry`, silently halving whichever one a downstream consumer
 //!     happened not to be reading from rather than failing clearly.
 //! 14. A non-default `buffer:` block on a non-sink component is rejected -- `buffer:`
-//!     (`docs/adr/0021-buffered-sink-delivery.md`) configures a sink's delivery queue, which only a
+//!     (`docs/adr/buffered-sink-delivery.md`) configures a sink's delivery queue, which only a
 //!     sink has, so a listener or transform carrying one is almost certainly a misplaced block
 //!     rather than a meaningful setting silently ignored.
 //! 15. A sink's `buffer.max_batches` or `buffer.max_bytes` of `0` is rejected -- an impossible
@@ -33,7 +33,7 @@
 //! 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` -- a config error, not
 //!     something to clamp silently.
 //! 17. A non-default `receive:` block is rejected on any kind that is not a datagram listener
-//!     (today `statsd_in`/`syslog_in`) -- `receive:` (`docs/adr/0027-decoupled-listener-io.md`)
+//!     (today `statsd_in`/`syslog_in`) -- `receive:` (`docs/adr/decoupled-listener-io.md`)
 //!     configures a listener's socket-side receive queue, which only a datagram listener has.
 //!     Deliberately **not** `role(&kind) != Role::Listener`: `internal` is a listener by role but
 //!     has no socket, no queue, and no decoder, so `receive:` on it would be a silently-ignored
@@ -194,11 +194,11 @@ pub struct ResolvedComponent {
     pub sources: Vec<String>,
     pub consumers: Vec<String>,
     pub kind: ComponentKind,
-    /// Per-sink delivery buffer config (`docs/adr/0021-buffered-sink-delivery.md`). Validated as
+    /// Per-sink delivery buffer config (`docs/adr/buffered-sink-delivery.md`). Validated as
     /// sink-only by [`resolve`] (rule 14); meaningless on any other role, so a non-sink component's
     /// value here is always [`BufferConfig::default`] once resolution has succeeded.
     pub buffer: BufferConfig,
-    /// Per-listener receive queue/batching config (`docs/adr/0027-decoupled-listener-io.md`).
+    /// Per-listener receive queue/batching config (`docs/adr/decoupled-listener-io.md`).
     /// Validated as datagram-listener-only by [`resolve`] (rule 17); meaningless on any other
     /// kind, so its value here is always [`ReceiveConfig::default`] once resolution has succeeded.
     pub receive: ReceiveConfig,
@@ -468,7 +468,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 }
 
 /// The predicate rule 17 needs: which `ComponentKind`s the UDP listener driver
-/// (`docs/adr/0027-decoupled-listener-io.md`, `logit-inputs::udp::UdpListener`) actually backs.
+/// (`docs/adr/decoupled-listener-io.md`, `logit-inputs::udp::UdpListener`) actually backs.
 /// Kept explicit rather than derived from [`Role`] -- see rule 17's own doc comment -- so a new
 /// listener kind rejects `receive:` until it is actually wired to that driver.
 fn is_datagram_listener(kind: &ComponentKind) -> bool {

@@ -2,7 +2,7 @@
 //! points ([`logit_core::telemetry`]) on `interval` and emits them into the graph as ordinary
 //! events, exactly like any other listener -- so every existing downstream tool (`aggregate`,
 //! `keep`, `lua`, any sink) already works on them, with nothing new to build. See
-//! `docs/design/internal-telemetry.md` and `docs/adr/0018-internal-telemetry-as-pipeline-events.md`.
+//! `docs/design/internal-telemetry.md` and `docs/adr/internal-telemetry-as-pipeline-events.md`.
 //!
 //! `interval` serves double duty: the drain cadence for every component's buffered points, and
 //! the sampling tick for this component's own process-level gauges (interner size, uptime) --

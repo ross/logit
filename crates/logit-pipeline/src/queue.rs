@@ -1,7 +1,7 @@
 //! [`BoundedQueue`]: the async wrapper around `logit_proto::buffer::Buffer` that decouples a
 //! node's own I/O from whatever's downstream of it -- see
-//! `docs/adr/0021-buffered-sink-delivery.md` (the sink side, `SinkQueue`) and
-//! `docs/adr/0027-decoupled-listener-io.md` (the listener side, `ReceiveQueue`). `Buffer` itself
+//! `docs/adr/buffered-sink-delivery.md` (the sink side, `SinkQueue`) and
+//! `docs/adr/decoupled-listener-io.md` (the listener side, `ReceiveQueue`). `Buffer` itself
 //! is sync (no `.await` in a critical section), so this type owns the one thing a sync trait
 //! can't express: `Block`, which awaits room rather than dropping.
 //!
@@ -43,8 +43,9 @@ impl Queued for Arc<EventBatch> {
 /// [`SinkQueue`]'s actual item type: a batch alongside the [`TraceContext`] it arrived with.
 /// `TraceContext` is `Copy`, 24 bytes, so this rides inline in the existing `(item, weight)` slot
 /// `InMemoryBuffer` already stores -- no new allocation, and weight/units are unaffected, since
-/// both are computed from the batch alone. See `docs/adr/0025-internal-span-emission-and-
-/// deterministic-sampling.md` for why this exists: `write_loop`'s sink span (the only span that
+/// both are computed from the batch alone. See
+/// `docs/adr/internal-span-emission-and-deterministic-sampling.md` for why this exists:
+/// `write_loop`'s sink span (the only span that
 /// can carry `SpanStatus::Error` and a retry count) needs the context that arrived with this
 /// batch, and `drain_inbox`/`peek` were the last place it was still being discarded.
 impl Queued for (Arc<EventBatch>, TraceContext) {
@@ -60,7 +61,7 @@ impl Queued for (Arc<EventBatch>, TraceContext) {
 /// formatted -- `docs/design/internal-telemetry.md`'s cardinality convention requires every name
 /// to be a compile-time constant, and a name built at runtime (`format!("logit.{kind}...")`)
 /// would be exactly the mistake that convention exists to prevent. [`SINK_QUEUE_METRICS`] is the
-/// one instance today; `logit-inputs`' receive queue (`docs/adr/0027-decoupled-listener-io.md`)
+/// one instance today; `logit-inputs`' receive queue (`docs/adr/decoupled-listener-io.md`)
 /// adds a second.
 pub struct QueueMetrics {
     /// Gauge: items currently queued.
@@ -91,7 +92,7 @@ pub static SINK_QUEUE_METRICS: QueueMetrics = QueueMetrics {
 /// -- it's this type's own addition, layered on top of the two dropping policies that trait can
 /// express synchronously (see `logit_proto::buffer::OverflowPolicy`'s doc comment for why). Shared
 /// between the sink and receive sides: both need the same three-way choice, only the *default*
-/// differs (`docs/adr/0027-decoupled-listener-io.md`'s core argument for why a UDP listener's
+/// differs (`docs/adr/decoupled-listener-io.md`'s core argument for why a UDP listener's
 /// default must not be `Block`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverflowPolicy {
@@ -102,7 +103,7 @@ pub enum OverflowPolicy {
 
 /// Bounds and overflow behavior for one [`BoundedQueue`], in the queue's own generic terms
 /// (items/weight rather than a domain-specific unit). [`SinkQueueConfig`]/`ReceiveQueueConfig`
-/// (`logit-inputs`, `docs/adr/0027-decoupled-listener-io.md`) each convert into this rather than
+/// (`logit-inputs`, `docs/adr/decoupled-listener-io.md`) each convert into this rather than
 /// being this directly -- a sink operator reasons in batches, a listener operator in datagrams,
 /// and each config type's own field names and doc comments should say so.
 #[derive(Debug, Clone, Copy)]
@@ -144,8 +145,8 @@ impl From<SinkQueueConfig> for QueueConfig {
 
 /// The async wrapper around `logit_proto::buffer::InMemoryBuffer<T>` that sits between a node's
 /// own I/O and whatever it's decoupled from, letting the two proceed independently -- a sink's
-/// inbox drain and its writer (`docs/adr/0021-buffered-sink-delivery.md`, `SinkQueue`), or a UDP
-/// listener's socket read and its decode loop (`docs/adr/0027-decoupled-listener-io.md`,
+/// inbox drain and its writer (`docs/adr/buffered-sink-delivery.md`, `SinkQueue`), or a UDP
+/// listener's socket read and its decode loop (`docs/adr/decoupled-listener-io.md`,
 /// `logit-inputs`' `ReceiveQueue`). Not `Clone` -- exactly one value exists per node, wrapped in
 /// `Arc` by its two callers, each holding their own `Arc::clone`.
 ///
@@ -434,7 +435,7 @@ impl<T: Queued + Clone> BoundedQueue<T> {
 /// A sink's delivery queue: `Arc<EventBatch>` paired with the [`TraceContext`] it arrived with,
 /// not bare `Arc<EventBatch>` -- `write_loop`'s sink span needs the context that produced each
 /// batch, and `peek`/`commit` are the only place it can still be read back
-/// (`docs/adr/0025-internal-span-emission-and-deterministic-sampling.md`).
+/// (`docs/adr/internal-span-emission-and-deterministic-sampling.md`).
 pub type SinkQueue = BoundedQueue<(Arc<EventBatch>, TraceContext)>;
 
 impl SinkQueue {

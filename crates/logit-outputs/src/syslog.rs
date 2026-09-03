@@ -1,7 +1,7 @@
 //! RFC 3164 / RFC 5424 syslog egress over UDP or TCP -- the mirror of `logit_inputs::syslog`, and
 //! a real relay: header fields round-trip from an event's `syslog.*` attributes when present
 //! (exactly what `SyslogDecoder` writes), falling back to configured defaults only for an event
-//! that never passed through `syslog_in`. See `docs/adr/0022-syslog-output.md`.
+//! that never passed through `syslog_in`. See `docs/adr/syslog-output.md`.
 //!
 //! Split the way `influxdb.rs`/`stdio.rs` are: a pure [`SyslogEncoder`] (no socket anywhere, every
 //! format/precedence/sanitization test runs against it directly) plus the thin [`SyslogOutput`]
@@ -162,7 +162,7 @@ impl MessageBuf {
 /// into `logit.output.*` telemetry (`docs/design/internal-telemetry.md`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeStats {
-    /// Events with no `log` record (legal under `docs/adr/0012-multi-payload-events.md`) -- a
+    /// Events with no `log` record (legal under `docs/adr/multi-payload-events.md`) -- a
     /// metric-only or span-only event has nothing to render as a syslog message. The exact
     /// inverse of `influxdb_out`, which skips log-only/span-only events: neither sink invents a
     /// rendering for a payload shape it can't represent.
@@ -311,8 +311,7 @@ impl SyslogEncoder {
         // `| json` LogQL stage uses Go's `encoding/json`, which does not skip a leading BOM,
         // so every relayed line silently failed to parse as JSON and every `| json`-filtered
         // dashboard panel came back empty despite lines actually landing in Loki. Confirmed
-        // by re-running the same query with the BOM removed. See `docs/adr/0022-syslog-
-        // output.md`.
+        // by re-running the same query with the BOM removed. See `docs/adr/syslog-output.md`.
         if !self.scratch.is_empty() {
             // The separator itself counts against `max_message_bytes` -- pushing it
             // unconditionally, then only clearing the message on overflow, left the separator on
@@ -802,7 +801,7 @@ impl Output for SyslogOutput {
     /// `false` for both transports: syslog has no destination-side idempotency to lean on (unlike
     /// `influxdb_out`'s idempotent-overwrite semantics) -- a redelivered message is a duplicated
     /// log line at the receiver. This still lets a `Fault::Clean` retry succeed under the derived
-    /// `AtMostOnce` posture (`docs/adr/0021-buffered-sink-delivery.md`'s table), which covers the
+    /// `AtMostOnce` posture (`docs/adr/buffered-sink-delivery.md`'s table), which covers the
     /// common outage shape (the receiver restarting) with zero duplicate risk.
     fn duplicate_safe(&self) -> bool {
         false
@@ -815,14 +814,14 @@ impl SyslogOutput {
     /// stop relying on. `EMSGSIZE`/`InvalidInput` (the datagram is too large for the local path
     /// MTU or send buffer) is a per-message data condition, not a sink failure: dropped and
     /// counted, never classified as a `Fault` -- doing so would risk tripping
-    /// `docs/adr/0021-buffered-sink-delivery.md`'s sustained-permanent-failure exit window on an
+    /// `docs/adr/buffered-sink-delivery.md`'s sustained-permanent-failure exit window on an
     /// otherwise healthy sink. A failure on the *first* message this call attempts is
     /// `Fault::Clean` -- nothing in this batch has left the host yet. Any later message's
     /// failure, after at least one earlier datagram in the same batch already went out
     /// (`sent > 0`), is `Fault::Ambiguous` instead: `Clean` is a whole-batch promise that the
     /// destination saw none of it, and claiming that after a partial send would make the generic
     /// writer resend the whole batch under `at_most_once`, duplicating whatever already landed
-    /// (`docs/adr/0021-buffered-sink-delivery.md`'s duplicate-safety argument depends on `Clean`
+    /// (`docs/adr/buffered-sink-delivery.md`'s duplicate-safety argument depends on `Clean`
     /// never over-claiming this way, exactly as `influxdb_out`'s own `classify_transport_error`
     /// doc comment stresses for its own `Clean`/`Ambiguous` split).
     ///
@@ -876,7 +875,7 @@ impl SyslogOutput {
     /// both raised in review of an earlier version that got them wrong:
     ///
     /// - **Cancellation safety.** `deliver_with_retry` races every attempt against
-    ///   `tokio::time::timeout` (`docs/adr/0021-buffered-sink-delivery.md`), and
+    ///   `tokio::time::timeout` (`docs/adr/buffered-sink-delivery.md`), and
     ///   [`AsyncWriteExt::write_all`] is explicitly documented as not cancel-safe: if the timeout
     ///   fires mid-write, the future is dropped with an unknown number of bytes already on the
     ///   wire. This function always `stream.take()`s the connection into a local before writing
@@ -1045,9 +1044,10 @@ mod tests {
         assert_eq!(msgs[0], "<134>1 1970-01-01T00:00:00.000000Z - - - - - hello world");
     }
 
-    /// No RFC 5424 §6.4 BOM before MSG -- verified against the real demo stack (`docs/adr/0022-
-    /// syslog-output.md`) that Loki's `| json` LogQL stage silently fails to parse a BOM-prefixed
-    /// JSON body, so every relayed line's fields would be unqueryable despite landing in Loki.
+    /// No RFC 5424 §6.4 BOM before MSG -- verified against the real demo stack
+    /// (`docs/adr/syslog-output.md`) that Loki's `| json` LogQL stage silently fails to parse a
+    /// BOM-prefixed JSON body, so every relayed line's fields would be unqueryable despite
+    /// landing in Loki.
     #[test]
     fn no_bom_precedes_the_message_even_though_rfc_5424_section_6_4_allows_one() {
         let (msgs, _) = encode(vec![log_event(0, "hello", None)]);

@@ -1,4 +1,4 @@
-# Production runtime image for logit (docs/plans/0002-nginx-integration.md, workstream B).
+# Production runtime image for logit (docs/plans/nginx-integration.md, workstream B).
 #
 # Unlike Dockerfile.dev (the container contributors build and test in), this is what a consumer
 # builds or pulls to actually run `logit`. Built with `script/image`.

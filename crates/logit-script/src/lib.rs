@@ -658,7 +658,7 @@ mod tests {
         // a value copied to a different key came from somewhere that remembers its variant, since
         // by that point it's just a plain Lua string like any other. Asserted deliberately, as a
         // documented contract rather than an accident -- see
-        // docs/adr/0007-lua-value-identity-preservation.md's Consequences section.
+        // docs/adr/lua-value-identity-preservation.md's Consequences section.
         let w = worker(
             r#"
             function process(event)
@@ -804,7 +804,7 @@ mod tests {
         assert!(matches!(out.attributes.get("has_span"), Some(logit_core::Value::Bool(false))));
     }
 
-    /// The headline test for the multi-payload model (docs/adr/0012-multi-payload-events.md): an
+    /// The headline test for the multi-payload model (docs/adr/multi-payload-events.md): an
     /// event carrying both a log and a metric reports both as present simultaneously, with no
     /// lossy single "type" to check instead.
     #[test]
@@ -843,7 +843,7 @@ mod tests {
         );
     }
 
-    /// `event.type` no longer exists (docs/adr/0012-multi-payload-events.md) -- `__index`'s
+    /// `event.type` no longer exists (docs/adr/multi-payload-events.md) -- `__index`'s
     /// existing catch-all still returns `nil` for any unrecognized key, so a script written
     /// against the old field silently reads `nil` (falsy) rather than erroring. Worth pinning
     /// down explicitly: this is a silent behavior change for any pre-existing script, not a hard

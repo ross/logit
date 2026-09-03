@@ -1,13 +1,13 @@
 //! The built-in `aggregate` transform: a stateful, tumbling-window metric aggregator.
 //!
-//! Windowing/merge semantics are recorded in `docs/adr/0008-aggregation-window-semantics.md` and
+//! Windowing/merge semantics are recorded in `docs/adr/aggregation-window-semantics.md` and
 //! come from `docs/design/data-model.md`'s mergeable-metric-kinds design: `Counter` sums, `Gauge`
 //! keeps the value with the latest source timestamp, `Distribution` merges via `DdSketch::merge`
 //! (this is that method's first real caller anywhere in the codebase). `Set`/`Histogram`/`Summary`
 //! have no defined merge rule here yet (`Set` specifically is blocked on `HyperLogLog` still being a
 //! method-less stub) and pass through untouched rather than being dropped -- this project's
 //! consistent stance on data it doesn't know how to handle correctly. Since an event can now carry
-//! a log and/or a span alongside its metrics (docs/adr/0012-multi-payload-events.md), pass-through
+//! a log and/or a span alongside its metrics (docs/adr/multi-payload-events.md), pass-through
 //! is per *metric*, not per *event*: this stage absorbs every mergeable metric off an event and
 //! forwards whatever's left -- the unmergeable metrics, plus any log/span -- rather than treating
 //! "can't merge one metric" as a reason to forward the whole event untouched.
@@ -27,19 +27,19 @@ use std::time::Duration;
 /// the last flush -- reasonable/best-effort, not exhaustive. `SpanLink` (`crates/logit-core/src/span.rs`)
 /// already exists in the data model for exactly this shape (OTel's answer to "this span was
 /// influenced by several others, not descended from one"), per
-/// `docs/adr/0020-trace-context-propagation-on-delivered.md`. Same "cap gates insertion only,
+/// `docs/adr/trace-context-propagation-on-delivered.md`. Same "cap gates insertion only,
 /// already-seen is always free to re-observe, drop-and-count past it" shape
 /// `ComponentBuffer::upsert` already uses (`crates/logit-core/src/telemetry.rs`) -- the one
 /// precedent in this codebase for a bounded, drop-and-counted set.
 ///
 /// Per-series, not shared across a whole resource group or the whole `Aggregator`: a link belongs
 /// to the specific series whose flush would become a span, and attributing it to unrelated series
-/// in the same window would be exactly the "silently wrong" shape ADR 0020 rejected when it
+/// in the same window would be exactly the "silently wrong" shape ADR `trace-context-propagation-on-delivered` rejected when it
 /// considered (and rejected) picking an arbitrary parent for a flush.
 #[derive(Default)]
 struct ContributingContexts {
     /// Inline capacity 1: most series see exactly one contributing source, so this stays free
-    /// (`docs/adr/0017-minimize-allocations-over-event-size.md`'s policy) until a genuinely
+    /// (`docs/adr/minimize-allocations-over-event-size.md`'s policy) until a genuinely
     /// fanned-in series needs more.
     seen: SmallVec<[TraceContext; 1]>,
     dropped: u64,
@@ -85,7 +85,7 @@ impl ContributingContexts {
 /// and passes everything else straight through; `flush` drains every non-gauge accumulator and
 /// every gauge series past its retention window, resetting each to empty -- state does not carry
 /// across flushes for those. **A gauge series is the one exception**, per `gauge_retention`: see
-/// `docs/adr/0008-aggregation-window-semantics.md`'s "gauge series carry across the window
+/// `docs/adr/aggregation-window-semantics.md`'s "gauge series carry across the window
 /// boundary" amendment for the full design and why gauges specifically (not counters) get this.
 pub struct Aggregator {
     interval: Duration,
@@ -100,7 +100,7 @@ pub struct Aggregator {
     /// last update, so a delta in window N+1 can still resolve against window N's final absolute
     /// value. `0` (the default, matching `Aggregator::new`) reproduces today's strictly-tumbling
     /// behavior exactly -- no gauge series ever survives a flush. Set via
-    /// [`Aggregator::with_gauge_retention`]. See the ADR 0008 amendment.
+    /// [`Aggregator::with_gauge_retention`]. See the ADR `aggregation-window-semantics` amendment.
     gauge_retention: u32,
     /// Hard cap on how many gauge series may be retained across all resource groups at once -- a
     /// DoS/cardinality guard, not a tuning knob. `gauge_retention` alone bounds only the *tail*
@@ -160,7 +160,7 @@ impl Aggregator {
     }
 
     /// Enables cross-flush gauge retention -- see the `gauge_retention`/`max_retained_gauge_series`
-    /// field doc comments and the ADR 0008 amendment. Matches the existing
+    /// field doc comments and the ADR `aggregation-window-semantics` amendment. Matches the existing
     /// `with_diagnostics`/`with_telemetry` builder shape, so `Aggregator::new(interval)`'s
     /// signature stays unchanged and every existing caller (including `crates/logit-bench`'s
     /// fixture) compiles unchanged, defaulting to `0` -- strictly tumbling, exactly today's
@@ -196,7 +196,7 @@ impl Aggregator {
     /// Absorbs every mergeable metric (`Counter`/`Gauge`/`Distribution`) off `event` into this
     /// aggregator's window state, and forwards whatever's left -- unmergeable metric kinds, a
     /// kind conflict with an already-accumulating series, and/or a log or span, if the event
-    /// carries any (docs/adr/0012-multi-payload-events.md). `None` only when nothing at all
+    /// carries any (docs/adr/multi-payload-events.md). `None` only when nothing at all
     /// remains on the event; a pure log/span event (no metrics at all) never touches window
     /// state, matching the zero-cost pass-through this had before an event could carry more than
     /// one payload.
@@ -224,7 +224,7 @@ impl Aggregator {
         for record in metrics {
             // No merge rule defined for these (docs/design/data-model.md) -- leave them on the
             // event rather than absorbing or dropping them. `GaugeDelta` is *not* here -- it has
-            // a real resolution below, unlike these three (docs/adr/0026-relative-gauge-adjustments.md).
+            // a real resolution below, unlike these three (docs/adr/relative-gauge-adjustments.md).
             if matches!(
                 record.kind,
                 MetricKind::Set(_) | MetricKind::Histogram { .. } | MetricKind::Summary { .. }
@@ -271,7 +271,7 @@ impl Aggregator {
                     true
                 }
                 (Accumulator::Gauge { value, .. }, MetricKind::GaugeDelta(d)) => {
-                    // Asymmetric on purpose (docs/adr/0026-relative-gauge-adjustments.md,
+                    // Asymmetric on purpose (docs/adr/relative-gauge-adjustments.md,
                     // verbatim there): a delta applies to the running value in *arrival* order
                     // and never advances `at` -- note the `..`. Mixing "deltas in arrival order"
                     // with "absolutes by last-write-wins" is undefined the moment they interleave
@@ -315,7 +315,7 @@ impl Aggregator {
                     // startup. That is expected, current-workstream behavior, not a leak or a
                     // bug: once C lands, a gauge series survives an idle window and this only
                     // fires for a genuinely new series or one that's aged out of retention. See
-                    // `docs/adr/0026-relative-gauge-adjustments.md`'s Consequences.
+                    // `docs/adr/relative-gauge-adjustments.md`'s Consequences.
                     self.telemetry.count("logit.transform.gauge.delta.unseeded", 1.0, &[]);
                     self.diag.warn_throttled(
                         "gauge_delta_unseeded",
@@ -362,7 +362,7 @@ impl Aggregator {
     /// gained retention. A gauge series with `gauge_retention > 0` instead survives into the next
     /// window, subject to `max_retained_gauge_series`: see the `gauge_retention`/
     /// `max_retained_gauge_series` field doc comments and
-    /// `docs/adr/0008-aggregation-window-semantics.md`'s amendment for the full design.
+    /// `docs/adr/aggregation-window-semantics.md`'s amendment for the full design.
     /// `current_batch_context` is *not* reset here -- it isn't part of any one window (see its own
     /// field doc comment).
     pub fn flush(&mut self, now: i64) -> FlushOutput {
@@ -585,7 +585,7 @@ impl Accumulator {
             MetricKind::Counter(_) => Accumulator::Counter(0.0),
             // `Gauge` and `GaugeDelta` share one accumulator -- they're not a kind conflict, just
             // two different ways to update the same running value (`docs/adr/
-            // 0026-relative-gauge-adjustments.md`). This makes `new_for` non-injective on
+            // relative-gauge-adjustments.md`). This makes `new_for` non-injective on
             // purpose: two different `MetricKind`s map to the same `Accumulator` variant, which
             // would otherwise be easy to miss given the `unreachable!()` arm below makes the rest
             // of this mapping look total-and-one-to-one.
@@ -890,7 +890,7 @@ mod tests {
     }
 
     /// Guards `process`'s pass-through `matches!` directly, not just by implication
-    /// (`docs/adr/0026-relative-gauge-adjustments.md`): a `GaugeDelta` must be absorbed, not
+    /// (`docs/adr/relative-gauge-adjustments.md`): a `GaugeDelta` must be absorbed, not
     /// forwarded, now that workstream B gives it a real resolution -- the opposite of what
     /// workstream A's version of this test pinned. A comment alone on the `matches!` wouldn't
     /// catch a future change that silently defeated the whole feature by adding `GaugeDelta`
@@ -1146,7 +1146,7 @@ mod tests {
         assert_eq!(counter_value(kind_of(&events[0])), 1.0);
     }
 
-    /// The headline test for the multi-payload model (docs/adr/0012-multi-payload-events.md): an
+    /// The headline test for the multi-payload model (docs/adr/multi-payload-events.md): an
     /// event carrying both a log and a counter has the counter absorbed into window state while
     /// the log is still forwarded -- pass-through is per metric now, not per event.
     #[test]
@@ -1338,7 +1338,7 @@ mod tests {
         assert_eq!(dropped, Some(1.0), "the 9th distinct context should be dropped and counted");
     }
 
-    /// Tumbling, not sliding (ADR 0008): a series' contributing-context set resets with the rest
+    /// Tumbling, not sliding (ADR `aggregation-window-semantics`): a series' contributing-context set resets with the rest
     /// of its accumulator state at flush, exactly like `a_second_flush_after_the_first_emits_nothing`
     /// already pins for the accumulated value itself.
     #[test]
@@ -1430,7 +1430,7 @@ mod tests {
 
     // -----------------------------------------------------------------------------------------
     // Workstream C: gauge series retention across the window boundary
-    // (docs/adr/0008-aggregation-window-semantics.md's amendment)
+    // (docs/adr/aggregation-window-semantics.md's amendment)
     // -----------------------------------------------------------------------------------------
 
     #[test]
@@ -1625,7 +1625,7 @@ mod tests {
     }
 
     /// `ContributingContexts`' doc comment scopes it to "since the last flush" -- a carried-over
-    /// context on a retained gauge would produce the silently-wrong `SpanLink` parent ADR 0020
+    /// context on a retained gauge would produce the silently-wrong `SpanLink` parent ADR `trace-context-propagation-on-delivered`
     /// rejected. `mem::take`n every flush unconditionally, retained or not.
     #[test]
     fn contexts_are_never_carried_across_a_flush_even_for_a_retained_gauge() {

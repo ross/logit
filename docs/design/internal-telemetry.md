@@ -2,7 +2,7 @@
 
 How `logit` observes its own behavior: the emit API, the buffer it feeds, the `internal` source
 that drains it into the graph, and the naming/tagging conventions every component follows.
-Decision record: [ADR 0018](../adr/0018-internal-telemetry-as-pipeline-events.md). This document
+Decision record: [ADR `internal-telemetry-as-pipeline-events`](../adr/internal-telemetry-as-pipeline-events.md). This document
 is load-bearing per `AGENTS.md` — read it before adding a new internal metric or touching
 `logit_core::telemetry`.
 
@@ -86,7 +86,7 @@ These are exactly `logit-transforms::Aggregator`'s own merge rules
 identity is load-bearing, not incidental: it's what makes attaching a real `aggregate` component
 downstream of `internal` extend this to any actual time window *correctly* — the merges compose,
 because they're the same merges. The buffer itself has no notion of a time window; it holds
-whatever has accumulated since the last drain and nothing more. See ADR 0018 for why this can't
+whatever has accumulated since the last drain and nothing more. See ADR `internal-telemetry-as-pipeline-events` for why this can't
 take DogStatsD's "pack raw samples, let the server aggregate" option for timings —
 `logit_core::MetricKind` has no raw-sample representation, only mergeable ones.
 
@@ -101,8 +101,8 @@ compile-time-constant tag values a component's code contains, not by traffic.
 
 ## Spans
 
-Closes the emission half of what was, until [ADR 0025](../adr/0025-internal-span-emission-and-deterministic-sampling.md),
-an open item: [ADR 0020](../adr/0020-trace-context-propagation-on-delivered.md) put a real
+Closes the emission half of what was, until [ADR `internal-span-emission-and-deterministic-sampling`](../adr/internal-span-emission-and-deterministic-sampling.md),
+an open item: [ADR `trace-context-propagation-on-delivered`](../adr/trace-context-propagation-on-delivered.md) put a real
 `TraceContext` on every `Delivered` and gave the two unambiguous node kinds a real parent to
 propagate; a follow-up gave `Transform::flush` a bounded `Vec<SpanLink>` per emitted event. Neither
 emitted a `SpanRecord`. This section is that emission, plus the sampling knob span volume needs
@@ -282,7 +282,7 @@ receive/processing side from their own loops, which already see every batch and 
 | `logit.script.events.emitted{outcome="emit"\|"emit_many"}` | count | `run_lua`, per `ProcessOutcome` — distinguishes a 1:1 script from a fan-out one |
 
 **Every sink also gets a `SinkQueue`** (`crates/logit-pipeline/src/queue.rs`,
-`docs/adr/0021-buffered-sink-delivery.md`) sitting between its inbox drain and delivery — its own
+`docs/adr/buffered-sink-delivery.md`) sitting between its inbox drain and delivery — its own
 uniform layer, same reasoning as `Fanout`'s: instrumenting the one choke point every sink's batches
 pass through gives every sink these for free, no per-sink code:
 
@@ -307,7 +307,7 @@ because only a Lua node has a VM to sample or a script return value to classify 
 in this table applies uniformly across every component kind.
 
 **Every UDP listener also gets a `ReceiveQueue`** (`logit-inputs::udp`, an instance of the same
-generic `BoundedQueue<T: Queued>` `SinkQueue` is, `docs/adr/0027-decoupled-listener-io.md`) sitting
+generic `BoundedQueue<T: Queued>` `SinkQueue` is, `docs/adr/decoupled-listener-io.md`) sitting
 between the socket read and decode — the listener-side mirror of the sink block above, one choke
 point every datagram passes through:
 
@@ -345,7 +345,7 @@ Worked examples, one per shipped component:
 - `statsd_in` (`crates/logit-inputs/src/statsd.rs`): `logit.input.datagrams`,
   `logit.input.datagram.bytes` — per-datagram detail `Fanout`'s per-batch view can't see, plus
   decode failures free via the `Diagnostics` bridge. Both listeners are now thin wrappers over
-  `logit-inputs::udp::UdpListener` (`docs/adr/0027-decoupled-listener-io.md`), which is where the
+  `logit-inputs::udp::UdpListener` (`docs/adr/decoupled-listener-io.md`), which is where the
   `ReceiveQueue`/`receive_buffer.*` table above actually gets recorded — free for both, no
   per-listener code. A sampled `ms`/`h`/`d` line whose `@<rate>` implied a weight above
   `MAX_SAMPLE_WEIGHT` (the decode-time sample-rate extrapolation's bound on how far one value can
@@ -358,7 +358,7 @@ Worked examples, one per shipped component:
   `logit.transform.resource.groups`, sampled at the top of `flush` before it touches its own state
   — the peak-of-window series count, which is the visible signal for the cardinality blow-up
   `crate::keep`'s own module doc already warns `aggregate` is exposed to. Gauge retention across
-  the window boundary (`docs/adr/0008-aggregation-window-semantics.md`'s amendment) adds three
+  the window boundary (`docs/adr/aggregation-window-semantics.md`'s amendment) adds three
   more: `logit.transform.series.retained` (gauge — the idle-but-carried population; `.active`
   itself keeps its original "series updated this window" meaning, not silently widened to include
   these), `logit.transform.series.evicted{reason="idle"|"cardinality"}` (count — a TTL expiry vs.
@@ -390,21 +390,21 @@ Worked examples, one per shipped component:
 - `influxdb_out` (`crates/logit-outputs/src/influxdb.rs`): `logit.output.requests{class="2xx|
   4xx|5xx|network_error"}`, `logit.output.request.duration` (per attempt), `logit.output.batch.bytes`
   — the encode/HTTP-response detail a generic `send.duration` timer can't distinguish. A
-  `MetricKind::GaugeDelta` reaching this encoder unresolved (`docs/adr/0026-relative-gauge-adjustments.md`
+  `MetricKind::GaugeDelta` reaching this encoder unresolved (`docs/adr/relative-gauge-adjustments.md`
   — means the pipeline is missing an `aggregate` component) reports under its own
   `logit.component.diagnostics{key="gauge_delta_unresolved"}`, not the generic `encode_error` every
   other unrepresentable kind uses, specifically so it's greppable on its own. **Not**
   `logit.output.retries` — retry moved out of this sink entirely
-  (`docs/adr/0021-buffered-sink-delivery.md`) into the generic `deliver_with_retry` every sink now
+  (`docs/adr/buffered-sink-delivery.md`) into the generic `deliver_with_retry` every sink now
   shares, so retry counting is a Layer 2 metric (`logit.component.retries`, above), not something
   each sink tracks for itself.
 - `syslog_out` (`crates/logit-outputs/src/syslog.rs`): `logit.output.batch.bytes`,
   `logit.output.request.duration`, `logit.output.requests{class="ok"|"error"}` — the same shape as
   `influxdb_out`'s, minus the HTTP-specific status classes, since there's no response to classify.
   Plus detail neither of the other two sinks needs: `logit.output.events.skipped` (events with no
-  `log` record — nothing to render as a syslog message, ADR 0012), `logit.output.messages.
+  `log` record — nothing to render as a syslog message, ADR `multi-payload-events`), `logit.output.messages.
   truncated` and `logit.output.messages.dropped{reason="oversize_header"|"oversize_datagram"}`
-  (per-message size handling, `docs/adr/0022-syslog-output.md`'s "Sizing" section). Retry stays a
+  (per-message size handling, `docs/adr/syslog-output.md`'s "Sizing" section). Retry stays a
   Layer 2 metric here too, for the same reason as `influxdb_out`.
 
 ## Metrics from Lua scripts
@@ -423,7 +423,7 @@ the process's own interner (`interner::resolve(interner::intern(s))`, which genu
 `&'static str`) — reusing existing, already-accepted infrastructure rather than a new leak
 mechanism, at the cost that a script author (not the compiler) is now the one responsible for not
 building a metric name or tag value out of per-event data. Full reasoning, including the
-alternatives considered: [ADR 0019](../adr/0019-lua-authored-telemetry-cardinality.md). See
+alternatives considered: [ADR `lua-authored-telemetry-cardinality`](../adr/lua-authored-telemetry-cardinality.md). See
 `docs/design/lua-api.md`'s "Emitting telemetry from a script" for the script-author-facing version
 of this same warning.
 
@@ -465,14 +465,14 @@ clear error surfaces the mistake instead of a silent no-op.
 3. Call `count`/`gauge`/`timing`/`timer` at the point that already knows the fact. No new type, no
    registration step, no schema change.
 4. If it's genuinely new ground (a new signal type, a new source of process-level facts), read
-   ADR 0018's "Alternatives considered" first — several shapes that look like natural extensions
+   ADR `internal-telemetry-as-pipeline-events`'s "Alternatives considered" first — several shapes that look like natural extensions
    were deliberately not built yet, for stated reasons.
 
 ## What this is not
 
 - **Not a time-series aggregation engine.** The buffer coalesces to bound volume between drains;
   any real windowed aggregation is `aggregate`, attached downstream like any other consumer.
-- **Not a scrape endpoint.** There is no pull path and no plan for one — see ADR 0018's
+- **Not a scrape endpoint.** There is no pull path and no plan for one — see ADR `internal-telemetry-as-pipeline-events`'s
   alternatives for why.
 - **Not the `tracing` migration.** `Diagnostics`'s stderr output and this telemetry layer are both
   still separate from the deferred `tracing` migration `docs/known-gaps.md` names; that migration,

@@ -1,6 +1,6 @@
 # Shared helpers sourced by every other script/* file. Not meant to be run directly.
 #
-# The project's environment is a container (Dockerfile.dev / compose.yaml, ADR 0005) -- nothing
+# The project's environment is a container (Dockerfile.dev / compose.yaml, ADR `containerized-development`) -- nothing
 # here assumes Rust, LuaJIT, or any other toolchain is installed on the host.
 
 set -e
@@ -9,7 +9,7 @@ ROOT="$(cd "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)"
 cd "${ROOT}"
 
 # Override with `DOCKER=docker script/...` (in the `docker` group) or `DOCKER=podman script/...`
-# (rootless) -- see ADR 0005. Defaults to sudo because that's what works out of the box here.
+# (rootless) -- see ADR `containerized-development`. Defaults to sudo because that's what works out of the box here.
 DOCKER="${DOCKER:-sudo docker}"
 COMPOSE="${DOCKER} compose"
 

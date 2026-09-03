@@ -1,7 +1,7 @@
 //! The built-in `json` transform: parses a log record's message as JSON and merges the resulting
 //! key/values into the event's attributes, where every downstream component -- native transform,
 //! Lua script (via `EventProxy`), or sink -- can already see them. See
-//! `docs/adr/0010-json-parsing-into-attributes.md` for the design decisions this implements.
+//! `docs/adr/json-parsing-into-attributes.md` for the design decisions this implements.
 //!
 //! Stateless -- unlike `Aggregator`, this never flushes, so `impl Transform` only overrides
 //! `process`, taking the trait's default `flush_interval`/`flush`.
@@ -19,9 +19,10 @@ use std::sync::Arc;
 /// Any metrics/span already on the event ride through unaffected either way -- only `log.message`
 /// is read and only `attributes` is written. A message that fails to parse (or, with
 /// `skip_to_brace` off, isn't a JSON object at all) also passes through untouched, with a
-/// count-throttled diagnostic (`Diagnostics::warn_throttled`, `docs/adr/0013-service-lifecycle-
-/// and-output-retry.md`) -- dropping telemetry over one malformed line is worse than a no-op, and
-/// a high-volume malformed source must not flood stderr one line per event either.
+/// count-throttled diagnostic (`Diagnostics::warn_throttled`,
+/// `docs/adr/service-lifecycle-and-output-retry.md`) -- dropping telemetry over one malformed
+/// line is worse than a no-op, and a high-volume malformed source must not flood stderr one line
+/// per event either.
 pub struct JsonParser {
     /// Skip everything before the first `{` and parse from there, tolerating trailing content
     /// after the object closes. Off by default: the whole line is assumed to be the JSON data,

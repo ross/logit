@@ -20,7 +20,7 @@ pub enum MetricKind {
     /// reach a sink; it is resolved into an ordinary [`MetricKind::Gauge`] by the `aggregate`
     /// transform (`crates/logit-transforms/src/aggregate.rs`), which is the only component that
     /// carries the running gauge value a delta needs to apply against. See
-    /// `docs/adr/0026-relative-gauge-adjustments.md`.
+    /// `docs/adr/relative-gauge-adjustments.md`.
     GaugeDelta(f64),
     Set(HyperLogLog),
     Distribution(DdSketch),

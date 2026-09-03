@@ -3,7 +3,7 @@
 # Runs `logit validate` over every shipped config -- demo/logit.yaml and every examples/*.yaml --
 # so a component field rename or a new validation rule doesn't silently leave a config broken.
 # Part of script/cibuild. Needs INFLUXDB_TOKEN resolvable (every shipped config's `influxdb_out`
-# uses `!env INFLUXDB_TOKEN`, ADR 0011).
+# uses `!env INFLUXDB_TOKEN`, ADR `env-yaml-tag`).
 #
 # Defaulted here, not left to compose.yaml's `dev` service `environment:` -- common.sh's `run()`
 # execs directly in CI (no `docker compose run`, so that default never applies there), only going

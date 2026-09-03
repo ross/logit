@@ -31,7 +31,7 @@ code from the collector protos at all.
 
 `script/protogen` runs `prost-build` (with `protoc`, inside a throwaway image --
 `tools/protogen/Dockerfile` -- never the dev image, per
-[ADR 0023](../../../docs/adr/0023-committed-pregenerated-otlp-protobuf.md)) against these files and
+[ADR `committed-pregenerated-otlp-protobuf`](../../../docs/adr/committed-pregenerated-otlp-protobuf.md)) against these files and
 overwrites `crates/logit-proto/src/otlp/generated/*.v1.rs`. Review the diff and commit it by hand;
 this is a deliberate, reviewed act, not a CI check (`script/cibuild` never touches `protoc`).
 

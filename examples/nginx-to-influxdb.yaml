@@ -1,11 +1,11 @@
-# The nginx reference example (docs/plans/0002-nginx-integration.md, workstream F): proves
+# The nginx reference example (docs/plans/nginx-integration.md, workstream F): proves
 # syslog_in -> json -> kv_metrics -> keep -> aggregate -> influxdb_out (plus stdio_out for
 # visibility) against a real nginx (examples/nginx/), end to end in this repo's own dev stack.
 #
 # This is a contributor-facing fixture, not the recommended starting point for trying `logit` --
 # it exists because root compose.yaml's `nginx` service and crates/logit-bench/src/fixtures.rs's
 # NGINX_SYSLOG_LINE both depend on examples/nginx/ staying real and runnable
-# (docs/plans/0003-demo-stack.md). To just see `logit` work, run `demo/` instead
+# (docs/plans/demo-stack.md). To just see `logit` work, run `demo/` instead
 # (`cd demo && docker compose up`).
 #
 # Topology:

@@ -25,7 +25,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 429 (InfluxDB's own rate-limit response) and any 5xx are treated as transient (`Fault::Ambiguous`
 /// -- see [`Fault`]) -- 429 is a deliberate, narrow deviation from "a 4xx stays a hard failure" (see
-/// ADR 0013). Every other 4xx (`Fault::Permanent`) is a config error (a bad org/bucket/token), never
+/// ADR `service-lifecycle-and-output-retry`). Every other 4xx (`Fault::Permanent`) is a config error (a bad org/bucket/token), never
 /// worth retrying.
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status.is_server_error() || status.as_u16() == 429
@@ -39,7 +39,7 @@ pub struct InfluxDbOutput {
     client: reqwest::Client,
     encoder: InfluxLineEncoder,
     /// This attempt's request timeout. `send` makes exactly one attempt per call now
-    /// (`docs/adr/0021-buffered-sink-delivery.md` -- retry timing moved to the generic writer in
+    /// (`docs/adr/buffered-sink-delivery.md` -- retry timing moved to the generic writer in
     /// `logit-pipeline`), so there's no "remaining retry budget" left to clamp this against any
     /// more; it's simply what `with_timeout` set (or [`DEFAULT_TIMEOUT`]), applied to `client` at
     /// build time and passed again per-request for clarity.
@@ -74,7 +74,7 @@ impl InfluxDbOutput {
 
     /// Attaches a component id to this output's encoder diagnostics (per-metric encode failures).
     /// `InfluxDbOutput` itself no longer has any diagnostics of its own to attribute -- it stopped
-    /// retrying (`docs/adr/0021-buffered-sink-delivery.md`), and the generic writer that now owns
+    /// retrying (`docs/adr/buffered-sink-delivery.md`), and the generic writer that now owns
     /// retry timing gets its own `Diagnostics` handle from `logit-pipeline::runtime::write_loop`.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.encoder = self.encoder.with_diagnostics(diag);
@@ -111,7 +111,7 @@ fn build_client(timeout: Duration) -> reqwest::Client {
 #[async_trait::async_trait]
 impl Output for InfluxDbOutput {
     /// Exactly one attempt per call -- no loop, no sleep. Retry timing/budget now belongs to the
-    /// generic writer in `logit-pipeline` (`docs/adr/0021-buffered-sink-delivery.md`); this only
+    /// generic writer in `logit-pipeline` (`docs/adr/buffered-sink-delivery.md`); this only
     /// classifies what happened and reports it via [`Fault`] (`.context(fault)`).
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let body = self.encoder.encode(batch)?;
@@ -177,7 +177,7 @@ impl Output for InfluxDbOutput {
     /// of every `encode` call -- so re-encoding and re-sending a buffered batch on retry produces
     /// byte-for-byte the same body as the first attempt, and InfluxDB treats an identical
     /// `(measurement, tag set, timestamp)` write as an idempotent overwrite, not a second point.
-    /// See `docs/adr/0021-buffered-sink-delivery.md`.
+    /// See `docs/adr/buffered-sink-delivery.md`.
     fn duplicate_safe(&self) -> bool {
         true
     }
@@ -205,7 +205,7 @@ fn classify_transport_error(err: &reqwest::Error) -> Fault {
 /// Only an event's `metrics` have a line-protocol mapping; its log body and span (if any) are
 /// skipped (`docs/OVERVIEW.md`'s v0.1 slice is metrics-only -- there's no established convention
 /// yet for what a log line or span becomes in InfluxDB, and guessing one isn't this output's job).
-/// An event can carry several metrics at once now (`docs/adr/0012-multi-payload-events.md`), so
+/// An event can carry several metrics at once now (`docs/adr/multi-payload-events.md`), so
 /// each one becomes its own line, sharing that event's tags.
 /// Public only so `logit-bench` can measure encoding in isolation, the same reason this is split
 /// out from [`InfluxDbOutput`] at all -- `docs/design/memory.md` quotes a per-point allocation
@@ -291,7 +291,7 @@ impl Encoder for InfluxLineEncoder {
                     // A `GaugeDelta` reaching a sink is a distinct, greppable failure mode from an
                     // ordinary encode error -- it means the pipeline is missing an `aggregate`
                     // component, not that this particular metric is malformed. See
-                    // `docs/adr/0026-relative-gauge-adjustments.md`.
+                    // `docs/adr/relative-gauge-adjustments.md`.
                     let key = if matches!(metric.kind, MetricKind::GaugeDelta(_)) {
                         "gauge_delta_unresolved"
                     } else {
@@ -440,7 +440,7 @@ fn encode_metric_line(
     // lookups each once the chain has been compressed once.
     //
     // Needs no algorithmic change for an event carrying several metrics
-    // (docs/adr/0012-multi-payload-events.md): distinct metric names on one event produce
+    // (docs/adr/multi-payload-events.md): distinct metric names on one event produce
     // distinct series keys (they differ by measurement) and never collide, so they keep the
     // event's own timestamp untouched; a *repeated* metric name on one event (e.g. `kv_metrics`
     // configured to add the same counter twice, or two aggregated series that happen to share a
@@ -854,7 +854,7 @@ mod tests {
     }
 
     /// A `GaugeDelta` reaching this encoder means the pipeline is missing an `aggregate`
-    /// component (`docs/adr/0026-relative-gauge-adjustments.md`) -- it must be dropped, not
+    /// component (`docs/adr/relative-gauge-adjustments.md`) -- it must be dropped, not
     /// written as though it were an absolute value, and its sibling metric in the same batch must
     /// still come through untouched, matching `set_metrics_are_skipped_not_fatal` above.
     #[test]
@@ -1186,7 +1186,7 @@ mod tests {
     }
 
     /// `send` now makes exactly one attempt per call -- retry timing moved to `logit-pipeline`'s
-    /// generic writer (`docs/adr/0021-buffered-sink-delivery.md`). A success is still a plain
+    /// generic writer (`docs/adr/buffered-sink-delivery.md`). A success is still a plain
     /// `Ok(())`, single attempt.
     #[tokio::test]
     async fn a_successful_response_returns_ok_on_the_first_attempt() {
@@ -1225,7 +1225,7 @@ mod tests {
     #[tokio::test]
     async fn a_429_rate_limit_response_is_classified_ambiguous() {
         // 429 is InfluxDB's own rate-limit response and genuinely transient -- the one deliberate
-        // deviation from "a 4xx is a hard failure" (ADR 0013).
+        // deviation from "a 4xx is a hard failure" (ADR `service-lifecycle-and-output-retry`).
         let (addr, count) = canned_server(vec![RESP_429]).await;
         let mut output = output_against(addr).await;
 

@@ -1,7 +1,7 @@
-# The demo pipeline (demo/README.md, docs/plans/0003-demo-stack.md, docs/plans/
-# 0005-otlp-end-to-end.md). Exercises exactly what `logit` implements today -- syslog in, json +
+# The demo pipeline (demo/README.md, docs/plans/demo-stack.md, docs/plans/
+# otlp-end-to-end.md). Exercises exactly what `logit` implements today -- syslog in, json +
 # kv_metrics + keep + aggregate, InfluxDB out, syslog out, OTLP/gRPC out, plus `internal` observing
-# the pipeline itself (ADR 0018, ADR 0025) -- against the traffic `demo/compose.yaml`'s `hello`
+# the pipeline itself (ADR `internal-telemetry-as-pipeline-events`, ADR `internal-span-emission-and-deterministic-sampling`) -- against the traffic `demo/compose.yaml`'s `hello`
 # service emits (real visits plus a background synthetic loop). All three signals -- logs, metrics,
 # traces -- now leave `logit` for a real backend: Loki, InfluxDB, and Tempo respectively.
 #
@@ -44,7 +44,7 @@ components:
   # Logs to Loki, via the `alloy` service's syslog listener (demo/alloy/config.alloy). Sources
   # `access_json`, so the message is the raw JSON body -- exactly what the dashboard's `| json`
   # LogQL panels parse. RFC 5424, not 3164: 3164 carries no year and no timezone, so a receiver
-  # has to guess both (docs/adr/0022-syslog-output.md). `facility`/`hostname`/`app_name` are all
+  # has to guess both (docs/adr/syslog-output.md). `facility`/`hostname`/`app_name` are all
   # left at their defaults on purpose -- the demo's traffic already carries `syslog.facility`,
   # `syslog.hostname` (`demo-hello`), and `syslog.tag` (`demoapp`) from `access_in`'s own
   # `syslog_in` decode, and `syslog_out` round-trips those attributes onto every relayed message,
@@ -80,9 +80,9 @@ components:
     sources: [trimmed]
     interval: 10s
 
-  # `logit` observing itself (docs/design/internal-telemetry.md, ADR 0018) -- the dashboard's
+  # `logit` observing itself (docs/design/internal-telemetry.md, ADR `internal-telemetry-as-pipeline-events`) -- the dashboard's
   # `logit.*` panels come from here. `span_sample_rate` set explicitly to `1.0` rather than left at
-  # its `0.1` default (docs/adr/0025-internal-span-emission-and-deterministic-sampling.md) -- this
+  # its `0.1` default (docs/adr/internal-span-emission-and-deterministic-sampling.md) -- this
   # is a demo meant to show every span it can, not a production deployment weighing span volume
   # against storage cost.
   self:
@@ -120,8 +120,8 @@ components:
   # spans already landed). What isn't recoverable: confirmed directly against a first version of
   # this config that skipped `trace_windowed` -- `self`'s 10s drain interval meant *every* batch
   # failed this way, `send` never once returned `Ok` for `trace_out`, and `write_loop`'s ~60s
-  # sustained-permanent-failure guard (`docs/adr/0013-service-lifecycle-and-output-retry.md`,
-  # revised by `docs/adr/0021-buffered-sink-delivery.md`) killed the whole `logit` process a
+  # sustained-permanent-failure guard (`docs/adr/service-lifecycle-and-output-retry.md`,
+  # revised by `docs/adr/buffered-sink-delivery.md`) killed the whole `logit` process a
   # minute after startup -- taking the InfluxDB metrics path down with it. `trace_windowed`'s own
   # `flush` (every 60s here) still occasionally emits a real metrics-only batch that fails the same
   # way, but the many successful pure-span deliveries in between (every ~10s) reset that guard's
@@ -133,7 +133,7 @@ components:
     sources: [self]
     interval: 60s
 
-  # Deliberately gRPC, not HTTP (docs/adr/0024-hand-rolled-grpc-over-hyper.md) -- Tempo's `:4317`
+  # Deliberately gRPC, not HTTP (docs/adr/hand-rolled-grpc-over-hyper.md) -- Tempo's `:4317`
   # receiver, to exercise the transport the rest of this config doesn't otherwise touch;
   # `endpoint` is a bare `host:port` authority for gRPC, not a URL (see
   # `crates/logit-outputs/src/otlp.rs`'s `grpc_authority`).

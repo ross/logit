@@ -34,7 +34,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 /// Thin wrapper over [`UdpListener<StatsdDecoder>`] -- the read/decode split and datagram-\>batch
-/// assembly all live there (`docs/adr/0027-decoupled-listener-io.md`); this type is just the
+/// assembly all live there (`docs/adr/decoupled-listener-io.md`); this type is just the
 /// decoder choice plus the public constructor/builder surface `logit-cli::pipeline` and this
 /// module's own tests already depend on.
 pub struct StatsdInput {
@@ -75,7 +75,7 @@ impl StatsdInput {
     }
 
     /// Overrides the receive-queue/batching/shutdown-grace knobs a `receive:` config block sets
-    /// (`docs/adr/0027-decoupled-listener-io.md`). Defaults to [`UdpListenerConfig::default`] --
+    /// (`docs/adr/decoupled-listener-io.md`). Defaults to [`UdpListenerConfig::default`] --
     /// today's behaviour -- when never called.
     pub fn with_receive(mut self, config: UdpListenerConfig) -> Self {
         self.inner = self.inner.with_config(config);
@@ -272,7 +272,7 @@ fn build_event(
             // unambiguous as '+', not a case needing its own guess. No config escape hatch: this
             // decoder used to reject any signed value outright, so there is no prior working
             // "absolute negative gauge" behavior a `negative_gauge: delta|absolute` toggle could
-            // ever have been preserving (see docs/adr/0026-relative-gauge-adjustments.md's
+            // ever have been preserving (see docs/adr/relative-gauge-adjustments.md's
             // Alternatives). `f64::from_str` accepts a leading '+' the same as '-' (pinned by
             // `plus_prefixed_gauge_values_parse_via_from_str`), so `parse_finite_value` handles
             // both signs identically; only the *choice* between `Gauge`/`GaugeDelta` is decided
@@ -378,7 +378,7 @@ mod tests {
     }
 
     /// `decode_into` must stamp every event with the caller's `received_at`, not a fresh
-    /// call-time clock read -- the property `docs/adr/0027-decoupled-listener-io.md` exists for:
+    /// call-time clock read -- the property `docs/adr/decoupled-listener-io.md` exists for:
     /// once decode runs on its own loop, "now" at decode time can be arbitrarily later than
     /// arrival under backlog.
     #[test]

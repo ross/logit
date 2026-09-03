@@ -1,7 +1,7 @@
 //! A deliberately small diagnostics helper -- not a `tracing` migration (that stays separate,
 //! out-of-scope work; see `docs/known-gaps.md`). Gives every stderr diagnostic a consistent
 //! `component 'id': msg` prefix, and a way to bound how many times a high-volume, low-value
-//! message repeats. See `docs/adr/0013-service-lifecycle-and-output-retry.md`.
+//! message repeats. See `docs/adr/service-lifecycle-and-output-retry.md`.
 
 use crate::telemetry::Telemetry;
 use std::collections::HashMap;
@@ -73,7 +73,7 @@ impl Diagnostics {
     /// malformed line per request) without needing a clock. A time-window limiter was the more
     /// obvious shape, but no component here has a clock injected, and threading one through purely
     /// for diagnostics would make an otherwise-deterministic interface non-deterministic to test
-    /// (see ADR 0013's Alternatives). Returns whether this call actually reported, so a test can
+    /// (see ADR `service-lifecycle-and-output-retry`'s Alternatives). Returns whether this call actually reported, so a test can
     /// assert the throttling directly rather than capturing stderr.
     ///
     /// Every occurrence -- not just the ones that actually print -- increments

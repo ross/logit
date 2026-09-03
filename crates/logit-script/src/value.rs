@@ -41,7 +41,7 @@ pub fn value_to_lua<'lua>(lua: &'lua Lua, value: &Value) -> mlua::Result<LuaValu
         // value is treated as a no-op, so the stored `Value` -- and its variant -- survives an
         // unmodified round-trip even though nothing here can tell the difference between "this
         // string came from a Bytes attribute" and "this is a brand-new string a script just
-        // built". See `lua_value_matches` below and `docs/adr/0007-lua-value-identity-preservation.md`
+        // built". See `lua_value_matches` below and `docs/adr/lua-value-identity-preservation.md`
         // for the full reasoning, including why a tagged userdata wrapper was considered and
         // rejected.
         //
@@ -151,7 +151,7 @@ fn lua_string_repr(value: &Value) -> Option<Cow<'_, [u8]>> {
 /// it can't run while the event's `RefCell` is still borrowed the way this check is (see
 /// `AttrsProxy::__newindex`'s comment), and no concrete reported consequence has justified the
 /// restructuring that would take yet, the same complexity-vs-value tradeoff that ruled out a
-/// tagged userdata wrapper for the top-level case (ADR 0007).
+/// tagged userdata wrapper for the top-level case (ADR `lua-value-identity-preservation`).
 pub(crate) fn lua_value_matches(existing: &Value, new: &LuaValue) -> bool {
     match new {
         LuaValue::Nil => matches!(existing, Value::Null),

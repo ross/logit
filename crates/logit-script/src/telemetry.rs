@@ -1,7 +1,7 @@
 //! Exposes `logit_core::telemetry::Telemetry` to Lua scripts, so `process()`/`flush()` can emit
 //! their own metrics -- domain-specific facts (an order value, a custom business counter) that no
 //! amount of Rust-side instrumentation could infer. See `docs/design/lua-api.md`'s "Emitting
-//! telemetry from a script" and `docs/adr/0019-lua-authored-telemetry-cardinality.md`.
+//! telemetry from a script" and `docs/adr/lua-authored-telemetry-cardinality.md`.
 //!
 //! **Cardinality is convention-enforced here, not type-system-enforced.** Every Rust-side
 //! `Telemetry` call takes `&'static str` names/tags specifically so cardinality is bounded by

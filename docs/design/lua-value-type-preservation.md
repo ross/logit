@@ -101,7 +101,7 @@ The `__eq` breakage is unfixable in Lua 5.1 and hits comparison — the single m
 script does with a string-shaped attribute. A wrapper would trade this document's narrow,
 already-scoped gaps for a much more commonly hit one, and fixing the `string.*`/`tonumber` cases
 would mean reimplementing significant chunks of Lua's `string` library against the wrapper. See
-[ADR 0007](../adr/0007-lua-value-identity-preservation.md) for the decision record.
+[ADR `lua-value-identity-preservation`](../adr/lua-value-identity-preservation.md) for the decision record.
 
 "Reject non-round-trippable assignments" was also considered and is unworkable as a general
 answer: `lua_to_value` has no way to distinguish "this string is an unmodified round-trip of a
@@ -158,5 +158,5 @@ behavior or updates it on purpose.
   gaps above.
 - `crates/logit-outputs/src/influxdb.rs` — `bytes_attribute_stays_excluded_from_tags_after_a_lua_enrichment_stage`,
   the end-to-end regression closing the loop on the concrete InfluxDB-tag consequence.
-- [`docs/adr/0007-lua-value-identity-preservation.md`](../adr/0007-lua-value-identity-preservation.md) —
+- [`docs/adr/lua-value-identity-preservation.md`](../adr/lua-value-identity-preservation.md) —
   the decision record: same material, framed as Status/Context/Decision/Alternatives/Consequences.

@@ -19,7 +19,7 @@ services:
       CARGO_HOME: /home/dev/.cargo
       CARGO_TARGET_DIR: /work/target
       # Read by examples/statsd-to-influxdb.yaml's `token: !env INFLUXDB_TOKEN`
-      # (docs/adr/0011-env-yaml-tag.md); matches the token influxdb seeds itself with below, and
+      # (docs/adr/env-yaml-tag.md); matches the token influxdb seeds itself with below, and
       # is overridable from the host shell (`INFLUXDB_TOKEN=... script/server`).
       INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-logit-dev-token}
     networks:
@@ -59,7 +59,7 @@ services:
     depends_on: [influxdb]
     networks: [logit]
 
-  # The reference nginx example (docs/plans/0002-nginx-integration.md, workstream F;
+  # The reference nginx example (docs/plans/nginx-integration.md, workstream F;
   # examples/nginx/). Reaches `dev`'s syslog listener over the compose-internal `logit` network
   # by its `logit` alias above -- no `ports:` entry needed for UDP 5140, since nginx never talks
   # to it from the host.
