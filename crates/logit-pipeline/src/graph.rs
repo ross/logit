@@ -53,6 +53,9 @@
 //!     with `:`), or a header the wire transport itself sets (`content-type`, `grpc-encoding`,
 //!     etc. -- see `RESERVED_OTLP_HEADERS`) is rejected, case-insensitively -- almost certainly a
 //!     config mistake, not a meaningful override.
+//! 21. A non-empty `otlp_out` `paths:` under `protocol: grpc` is rejected -- gRPC method names
+//!     are fixed by the OTLP service definitions, not a mount point `paths` can move, so silently
+//!     ignoring it would be a worse failure mode than a clear error.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -550,6 +553,22 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                          itself -- it can't be overridden"
                     );
                 }
+            }
+        }
+    }
+
+    // Rule 21: `otlp_out`'s `paths:` is HTTP-only -- gRPC method names are fixed by the `.proto`
+    // service definitions, not a mount point an operator can move, so a non-empty `paths:` under
+    // `protocol: grpc` is rejected rather than silently ignored (the same instinct as rule 14's
+    // `buffer:` on a non-sink, and rule 17's `receive:` on a non-datagram listener).
+    for (id, component) in &components {
+        if let ComponentKind::OtlpOut { protocol, paths, .. } = &component.kind {
+            if *protocol == logit_config::OtlpProtocol::Grpc && !paths.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': 'paths' has no effect under 'protocol: grpc' -- gRPC \
+                     method names are fixed by the OTLP service definitions, not a mount point \
+                     'paths' can move"
+                );
             }
         }
     }
@@ -1084,6 +1103,19 @@ mod tests {
             endpoint: "http://localhost:4318".to_string(),
             protocol: logit_config::OtlpProtocol::Http,
             headers: headers.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            paths: logit_config::OtlpPaths::default(),
+        }
+    }
+
+    fn otlp_out_with_paths(
+        protocol: logit_config::OtlpProtocol,
+        paths: logit_config::OtlpPaths,
+    ) -> ComponentKind {
+        ComponentKind::OtlpOut {
+            endpoint: "http://localhost:4318".to_string(),
+            protocol,
+            headers: Map::new(),
+            paths,
         }
     }
 
@@ -1128,6 +1160,48 @@ mod tests {
         resolve(cfg(vec![
             ("in", vec![], listener()),
             ("out", vec!["in"], otlp_out_with_headers(vec![("X-Scope-OrgID", "tenant-a")])),
+        ]))
+        .expect("should resolve");
+    }
+
+    #[test]
+    fn an_otlp_out_with_paths_under_grpc_is_rejected() {
+        let paths = logit_config::OtlpPaths {
+            logs: Some("/otlp/v1/logs".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], otlp_out_with_paths(logit_config::OtlpProtocol::Grpc, paths)),
+        ]));
+        assert!(err.contains("no effect under 'protocol: grpc'"), "got: {err}");
+    }
+
+    #[test]
+    fn an_otlp_out_with_paths_under_http_resolves_fine() {
+        let paths = logit_config::OtlpPaths {
+            logs: Some("/otlp/v1/logs".to_string()),
+            ..Default::default()
+        };
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], otlp_out_with_paths(logit_config::OtlpProtocol::Http, paths)),
+        ]))
+        .expect("should resolve");
+    }
+
+    #[test]
+    fn an_otlp_out_with_no_paths_under_grpc_resolves_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                otlp_out_with_paths(
+                    logit_config::OtlpProtocol::Grpc,
+                    logit_config::OtlpPaths::default(),
+                ),
+            ),
         ]))
         .expect("should resolve");
     }

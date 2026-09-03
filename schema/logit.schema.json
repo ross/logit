@@ -677,6 +677,19 @@
                 "type": "string"
               }
             },
+            "paths": {
+              "description": "Per-signal HTTP path overrides -- see [`OtlpPaths`]. `protocol: http` only; a non-empty value under `protocol: grpc` is a config error (rule 21), not silently ignored, since gRPC method names aren't a mount point an operator can move.",
+              "default": {
+                "logs": null,
+                "metrics": null,
+                "traces": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OtlpPaths"
+                }
+              ]
+            },
             "protocol": {
               "default": "http",
               "allOf": [
@@ -888,6 +901,33 @@
           "type": "string"
         },
         "unit": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "OtlpPaths": {
+      "description": "Per-signal HTTP path overrides for `otlp_out` (`paths:` in config). Not a `HashMap<String, String>` -- a typo'd key there would silently do nothing, where a struct field gets schema validation for free. Not a path *prefix* either: `endpoint`'s own trailing text already serves that role (`endpoint: http://host/otlp` already yields `/otlp/v1/logs` against `Signal::path`'s default, `crates/logit-outputs/src/otlp.rs`'s `send_http`), so a prefix field would be a second way to say the same thing. `None` on any field means \"use the OTLP-standard default\" (`/v1/logs`, `/v1/metrics`, `/v1/traces`). gRPC method names are fixed by the `.proto` service definitions, not a mount point an operator can move -- a non-empty `paths:` under `protocol: grpc` is rejected at config-validation time (rule 21) rather than silently ignored.",
+      "type": "object",
+      "properties": {
+        "logs": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metrics": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "traces": {
           "default": null,
           "type": [
             "string",

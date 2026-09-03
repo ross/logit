@@ -61,6 +61,18 @@ pub enum OtlpTransport {
     Grpc,
 }
 
+/// Per-signal HTTP path overrides (`paths:` in config) -- `None` means "use
+/// [`Signal::path`]'s default." gRPC method names are fixed by the `.proto` service definitions
+/// (`Signal::grpc_method`, shared with `otlp_in`'s router), so this is HTTP-only;
+/// `logit-pipeline::graph::resolve`'s rule 21 rejects a non-empty `paths:` under `protocol: grpc`
+/// rather than silently ignoring it.
+#[derive(Debug, Clone, Default)]
+pub struct SignalPaths {
+    pub logs: Option<String>,
+    pub metrics: Option<String>,
+    pub traces: Option<String>,
+}
+
 pub struct OtlpOutput {
     endpoint: String,
     transport: OtlpTransport,
@@ -76,6 +88,7 @@ pub struct OtlpOutput {
     /// order-dependent bug no type would catch. A plain field sidesteps that entirely: `client`
     /// stays a pure function of the timeout, exactly the invariant `build_client` already assumes.
     headers: HeaderMap,
+    paths: SignalPaths,
 }
 
 impl OtlpOutput {
@@ -93,6 +106,7 @@ impl OtlpOutput {
             telemetry: Telemetry::default(),
             diag: Diagnostics::default(),
             headers: HeaderMap::new(),
+            paths: SignalPaths::default(),
         })
     }
 
@@ -121,6 +135,26 @@ impl OtlpOutput {
         }
         self.headers = map;
         Ok(self)
+    }
+
+    /// Sets per-signal HTTP path overrides (`paths:` in config) -- for a backend using a
+    /// non-standard OTLP mount point. gRPC method names are protocol-fixed, so this has no effect
+    /// under `protocol: grpc`; `graph::resolve`'s rule 21 rejects a non-empty `paths:` there at
+    /// config-validation time rather than silently ignoring it.
+    pub fn with_paths(mut self, paths: SignalPaths) -> Self {
+        self.paths = paths;
+        self
+    }
+
+    /// The HTTP path a request for `signal` is POSTed to -- the config override if one was set,
+    /// else [`Signal::path`]'s OTLP-standard default.
+    fn path_for(&self, signal: Signal) -> &str {
+        let override_path = match signal {
+            Signal::Logs => &self.paths.logs,
+            Signal::Metrics => &self.paths.metrics,
+            Signal::Traces => &self.paths.traces,
+        };
+        override_path.as_deref().unwrap_or_else(|| signal.path())
     }
 
     /// Attaches a component id to this output's own diagnostics and, via
@@ -158,7 +192,7 @@ impl OtlpOutput {
     }
 
     async fn send_http(&mut self, signal: Signal, payload: Bytes) -> anyhow::Result<()> {
-        let url = format!("{}{}", self.endpoint.trim_end_matches('/'), signal.path());
+        let url = format!("{}{}", self.endpoint.trim_end_matches('/'), self.path_for(signal));
         // Built as one `HeaderMap`, custom headers cloned in first and `Content-Type` inserted
         // after -- `HeaderMap::insert` unconditionally replaces any prior value for that key
         // (unlike `RequestBuilder::header`, which appends), so the protocol-owned header always
@@ -766,6 +800,32 @@ mod tests {
         let mut output = http_output(addr);
         output.send(&metric_batch()).await.expect("should succeed");
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_path_override_is_used_instead_of_the_otlp_standard_default() {
+        let (addr, captured) = canned_http_server_capturing_request().await;
+        let mut output = http_output(addr).with_paths(SignalPaths {
+            metrics: Some("/otlp/v1/metrics".to_string()),
+            ..Default::default()
+        });
+        output.send(&metric_batch()).await.expect("should succeed");
+
+        let request = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(request.starts_with("POST /otlp/v1/metrics "), "got request: {request}");
+    }
+
+    #[tokio::test]
+    async fn a_signal_with_no_path_override_still_uses_the_otlp_standard_default() {
+        let (addr, captured) = canned_http_server_capturing_request().await;
+        let mut output = http_output(addr).with_paths(SignalPaths {
+            logs: Some("/otlp/v1/logs".to_string()),
+            ..Default::default()
+        });
+        output.send(&metric_batch()).await.expect("should succeed");
+
+        let request = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(request.starts_with("POST /v1/metrics "), "got request: {request}");
     }
 
     #[tokio::test]

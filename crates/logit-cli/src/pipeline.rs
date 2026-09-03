@@ -18,7 +18,7 @@ use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_outputs::influxdb::InfluxDbOutput;
-use logit_outputs::otlp::{OtlpOutput, OtlpTransport as OtlpOutTransport};
+use logit_outputs::otlp::{OtlpOutput, OtlpTransport as OtlpOutTransport, SignalPaths};
 use logit_outputs::stdio::StdioOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
@@ -281,9 +281,10 @@ fn build_spec(
             queue_config(&component.buffer),
             write_config(&component.buffer),
         ),
-        OtlpOut { endpoint, protocol, headers } => {
+        OtlpOut { endpoint, protocol, headers, paths } => {
             let output = OtlpOutput::new(endpoint.clone(), otlp_out_transport(*protocol))?
                 .with_headers(headers)?
+                .with_paths(to_signal_paths(paths))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
             NodeSpec::Output(
@@ -479,6 +480,17 @@ fn to_match_mode(mode: logit_config::MatchMode) -> TransformMatchMode {
     match mode {
         logit_config::MatchMode::AnyOf => TransformMatchMode::AnyOf,
         logit_config::MatchMode::Only => TransformMatchMode::Only,
+    }
+}
+
+/// Converts config's `OtlpPaths` (`logit-config`, which `logit-outputs` deliberately doesn't
+/// depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the output crate's own
+/// identically-shaped `SignalPaths`.
+fn to_signal_paths(paths: &logit_config::OtlpPaths) -> SignalPaths {
+    SignalPaths {
+        logs: paths.logs.clone(),
+        metrics: paths.metrics.clone(),
+        traces: paths.traces.clone(),
     }
 }
 
@@ -732,6 +744,7 @@ mod tests {
                     endpoint: "http://localhost:4318".to_string(),
                     protocol,
                     headers: HashMap::new(),
+                    paths: logit_config::OtlpPaths::default(),
                 },
             };
             assert!(
@@ -759,6 +772,7 @@ mod tests {
                 endpoint: "https://tempo:4317".to_string(),
                 protocol: logit_config::OtlpProtocol::Grpc,
                 headers: HashMap::new(),
+                paths: logit_config::OtlpPaths::default(),
             },
         };
         let err = match build_spec("out", &component, Path::new(""), None) {

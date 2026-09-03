@@ -173,8 +173,10 @@ Surfaced while checking Loki compatibility; none block the demo, all block a rea
   `drop_signals`, three insertable transform components rather than a sink field — see ADR
   `signal-filtering-components` and `docs/plans/signal-filtering-and-otlp-out-config-gaps.md`.)
 - Hardcoded per-signal paths (fine for the standard OTLP layout, blocks any backend using a
-  different mount point).
-- `observed_time_unix_nano` always `0` on encode (`logs.rs:114`).
+  different mount point). (Landed: `paths:` on `otlp_out`, HTTP-only — see
+  `docs/plans/signal-filtering-and-otlp-out-config-gaps.md`'s workstream 3.)
+- `observed_time_unix_nano` always `0` on encode (`logs.rs:114`). (Landed: stamped with
+  `logit_proto::now_nanos()` at encode — same workstream.)
 
 `docs/known-gaps.md:662-673` already files the compression gap for `otlp_in`; `otlp_out`'s half of
 the same gap is currently unfiled.

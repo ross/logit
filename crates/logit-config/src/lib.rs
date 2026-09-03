@@ -117,6 +117,33 @@ pub enum MatchMode {
     Only,
 }
 
+/// Per-signal HTTP path overrides for `otlp_out` (`paths:` in config). Not a `HashMap<String,
+/// String>` -- a typo'd key there would silently do nothing, where a struct field gets schema
+/// validation for free. Not a path *prefix* either: `endpoint`'s own trailing text already serves
+/// that role (`endpoint: http://host/otlp` already yields `/otlp/v1/logs` against `Signal::path`'s
+/// default, `crates/logit-outputs/src/otlp.rs`'s `send_http`), so a prefix field would be a second
+/// way to say the same thing. `None` on any field means "use the OTLP-standard default"
+/// (`/v1/logs`, `/v1/metrics`, `/v1/traces`). gRPC method names are fixed by the `.proto` service
+/// definitions, not a mount point an operator can move -- a non-empty `paths:` under
+/// `protocol: grpc` is rejected at config-validation time (rule 21) rather than silently ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OtlpPaths {
+    #[serde(default)]
+    pub logs: Option<String>,
+    #[serde(default)]
+    pub metrics: Option<String>,
+    #[serde(default)]
+    pub traces: Option<String>,
+}
+
+impl OtlpPaths {
+    /// `true` if every field is `None` -- rule 21's "did the operator actually set a path
+    /// override" check.
+    pub fn is_empty(&self) -> bool {
+        self.logs.is_none() && self.metrics.is_none() && self.traces.is_none()
+    }
+}
+
 /// `ComponentKind::Internal`'s `span_sample_rate` default when a config omits it -- re-exported
 /// from `logit-core` (not restated as a bare literal here) so the two crates can never drift
 /// apart on what "the default" actually is. This is also the one place `logit-config` depends on
@@ -347,6 +374,11 @@ pub enum ComponentKind {
         /// rejected at config-validation time rather than silently overridden.
         #[serde(default)]
         headers: HashMap<String, String>,
+        /// Per-signal HTTP path overrides -- see [`OtlpPaths`]. `protocol: http` only; a
+        /// non-empty value under `protocol: grpc` is a config error (rule 21), not silently
+        /// ignored, since gRPC method names aren't a mount point an operator can move.
+        #[serde(default)]
+        paths: OtlpPaths,
     },
     /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
     LogitOut {
@@ -1275,10 +1307,11 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::OtlpOut { endpoint, protocol, headers } => {
+            ComponentKind::OtlpOut { endpoint, protocol, headers, paths } => {
                 assert_eq!(endpoint, "http://tempo:4318");
                 assert_eq!(protocol, OtlpProtocol::Http);
                 assert!(headers.is_empty());
+                assert!(paths.is_empty());
             }
             other => panic!("expected OtlpOut, got {other:?}"),
         }
@@ -1294,6 +1327,23 @@ mod tests {
         match component.kind {
             ComponentKind::OtlpOut { headers, .. } => {
                 assert_eq!(headers.get("X-Scope-OrgID"), Some(&"tenant-a".to_string()));
+            }
+            other => panic!("expected OtlpOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otlp_out_paths_default_to_empty_and_can_be_set() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_out", "sources": ["in"], "endpoint": "http://loki:3100",
+                "paths": {"logs": "/otlp/v1/logs"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpOut { paths, .. } => {
+                assert_eq!(paths.logs, Some("/otlp/v1/logs".to_string()));
+                assert_eq!(paths.metrics, None);
+                assert_eq!(paths.traces, None);
             }
             other => panic!("expected OtlpOut, got {other:?}"),
         }
