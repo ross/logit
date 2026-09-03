@@ -17,7 +17,9 @@ Lua enrichment stage, InfluxDB 2.x out, via `logit run <config>` (see
 [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml), `script/server`). Since then,
 `syslog_in`, `stdio_out`, `otlp_in`, and `otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`,
 `crates/logit-proto`'s `otlp` codec) and `json`, `kv_metrics`, `keep`, `remove`, `set`, and
-`trace_context` (`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —
+`trace_context` (`crates/logit-transforms`, the last giving a `LogRecord` a native application
+trace/span reference, [ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md))
+have all landed as real, implemented `ComponentKind`s —
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises the syslog/InfluxDB
 side together against a real nginx (`examples/nginx/`), and
 [docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside

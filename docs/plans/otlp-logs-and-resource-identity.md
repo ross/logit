@@ -131,22 +131,33 @@ the *evidence* those choices interoperate with a real receiver, not the *reason*
 passages still cite Alloy v1.19.2 as the receiver they were verified against; only the ADR's
 now-stale claim that `demo/compose.yaml` has a live `alloy` service was corrected.
 
-### D. Log↔trace correlation has no native OTLP path yet
+### D. Log↔trace correlation has no native OTLP path yet — model/codec/Lua/transform half done
 
-`crates/logit-proto/src/otlp/logs.rs:121-122` always emits empty `trace_id`/`span_id` on every
-exported `LogRecord` — deliberate, per the doc comment at `:22-26`: `logit_core::LogRecord` has no
-field to carry them. So no OTLP log sink, Loki included, can ever get native trace correlation from
-`logit` today. The demo's existing correlation is a Grafana `derivedFields` regex over the log
-*body* (`demo/grafana/provisioning/datasources/datasources.yaml:30-39`), which is
-transport-independent and works identically whether the log leg goes through Alloy or straight OTLP
-— unaffected by workstream B either way.
+**Status: `LogRecord` now carries a native application trace/span reference.** `logit_core::
+LogRecord::trace: Option<TraceRef>` — [ADR `log-record-trace-context`](../adr/log-record-trace-context.md)
+has the full design. `otlp_out` encodes it (falling back to the same `Event`'s `span` when the log
+has none of its own); `otlp_in` decodes it, leniently, per OTLP's own contract for an invalid log
+trace id; a new `trace_context` native transform lifts one off an already-JSON-decoded attribute
+without writing Lua; `event.log.trace_id`/`span_id`/`trace_flags` are read+write from Lua. So an
+OTLP log sink — Loki included — can now get native trace correlation from `logit`, wherever the
+trace context comes from (the wire, an attribute, or a script).
 
-This connects to a previously-noted future direction: converting logs into span/trace events (e.g.
-nginx as a trace root arriving only via logs). Whichever component does that conversion is also the
-natural place to assign `service.name` for that data — same principle as workstream A, one level
-up the stack. Once `LogRecord` carries real trace context, the Grafana-side upgrade is a second
-derived field keyed on `trace_id` structured metadata instead of a body regex — strictly better,
-and worth doing at the same time as whatever adds trace-context fields to `LogRecord`.
+**What's still open, deliberately:** no mode stamps `logit`'s *own* pipeline trace context onto a
+log automatically — a script can do it by hand
+(`event.log.trace_id = trace.trace_id`), but that's an application-identity decision an operator
+must opt into, never a default (`docs/known-gaps.md`). And the demo-stack half of this workstream
+— wiring the demo's log leg to actually carry a trace context, and the Grafana-side upgrade this
+paragraph originally described (a second `derivedFields` entry keyed on Loki's `trace_id`
+structured metadata instead of the existing body regex) — is explicitly deferred to the demo app's
+own tracing rework, a separate, already-planned piece of work. The demo's existing correlation (a
+Grafana `derivedFields` regex over the log body,
+`demo/grafana/provisioning/datasources/datasources.yaml`) is untouched and still works identically
+either way.
+
+This also still connects to a previously-noted future direction: converting logs into span/trace
+events (e.g. nginx as a trace root arriving only via logs). Whichever component does that
+conversion is also the natural place to assign `service.name` for that data — same principle as
+workstream A, one level up the stack.
 
 ### E. `otlp_out` config gaps found along the way
 
