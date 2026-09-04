@@ -66,8 +66,10 @@ see the follow-up note in that plan.
 `trace.flags`, `span.id`, `span.parent_id`, `span.name`, `span.kind`, `span.status`, and
 `span.start`/`span.end`/`span.duration` — full table there. `trace_context`'s three original
 config fields (`trace_id`, `span_id`, `flags`) become optional, defaulting to `trace.id`/
-`span.id`/`trace.flags`; a config that names them explicitly (the pre-existing shape) still works
-unchanged.
+`span.id`/`trace.flags`; a config that names all three explicitly (the pre-existing shape) still
+works unchanged. A config naming only some of them picks up the convention default for the
+rest — a pre-existing config naming just `trace_id` now also reads `span.id`/`trace.flags` and a
+`traceparent` header where it previously read nothing for those.
 
 **Timing is integer nanoseconds, with unit-suffixed forms for coarser producers, never a float in
 an integer-denominated field.** OTLP's `start_time_unix_nano`/`end_time_unix_nano` are the model;
