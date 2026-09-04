@@ -69,12 +69,12 @@ one `logit` gap that blocks the clean version.
                                   nginx :80   ── map splits $http_traceparent, relays it upstream
                                      |
                                      v
-                                 hello :8080
+                                  app :8080  (Django, workstream B)
 
   syslog/UDP, one listener per tier:
      haproxy --> :5140  haproxy_in -> haproxy_identity -> haproxy_json -> haproxy_trace --+
      nginx   --> :5141  nginx_in   -> nginx_identity   -> nginx_json   -> nginx_trace  --+|
-     hello   --> :5142  app_in     -> app_identity     -> app_json     -> app_trace ----+||
+     app     --> :5142  app_in     -> app_identity     -> app_json     -> app_trace ----+||
                                                                                        vvv
                                             stdout (stdio_out) <---------------------------+++
                                             loki_out (otlp_out/HTTP) --> Loki
@@ -82,7 +82,7 @@ one `logit` gap that blocks the clean version.
      nginx_trace -> access_metrics -> trimmed (keep) -> windowed -> influx_out
                                                                         ^
      self (internal) -> self_windowed -------------------------------- -+
-     self -> trace_windowed ------------------------------> tempo_out --> Tempo
+     self -> trace_only (has_signal) ------------------------> tempo_out --> Tempo
                                                                               ^
      app --OTLP/HTTP protobuf:4318--------------------------------------------+
      (workstream B -- straight to Tempo's own OTLP/HTTP receiver, bypassing `logit` entirely)
@@ -203,7 +203,7 @@ to HAProxy's trace regardless.
   `crates/logit-inputs/src/syslog.rs`'s headerless-message path otherwise decodes fine (RFC 3164
   header omitted entirely — no need to hand-roll one).
 - `demo/logit.yaml` (edit) — no `otlp_in` component at all; `tempo_out` keeps its original single
-  source (`trace_windowed`, `logit`'s own internal spans only). Renamed the app tier's
+  source (`trace_only`, `logit`'s own internal spans only). Renamed the app tier's
   `service.name` to `demo-app` and updated the four dashboard panels that hardcoded `demo-hello`.
 - `demo/compose.yaml` (edit) — replaced `hello` with `app`, built from `demo/app/`; `app` depends
   on `tempo` (`service_started` — the OTLP/HTTP leg gets its own SDK-level export retry, same

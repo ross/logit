@@ -124,6 +124,18 @@
                 }
               ]
             },
+            "tls": {
+              "description": "Terminates TLS on this listener (both `protocol: http` and `protocol: grpc`) when present; plaintext when omitted. See [`TlsServerConfig`].",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsServerConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -465,6 +477,80 @@
           }
         },
         {
+          "description": "Drops an event that doesn't carry a wanted signal -- e.g. `signals: [traces]` ahead of a traces-only sink like Tempo, fed from a source (`internal`) whose drains also carry metrics. Never mutates a forwarded event: under the default `mode: any_of`, an event carrying a listed signal is forwarded exactly as it arrived, including any signal *not* listed. `mode: only` additionally requires the event carry nothing outside `signals`. Place `keep_signals`/`drop_signals` ahead of this instead if disallowed payloads must actually be stripped, not just tolerated. `signals` may not be empty -- see `docs/adr/signal-filtering-components.md`.",
+          "type": "object",
+          "required": [
+            "signals",
+            "type"
+          ],
+          "properties": {
+            "mode": {
+              "default": "any_of",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/MatchMode"
+                }
+              ]
+            },
+            "signals": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/Signal"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "has_signal"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Retains only the listed signals' payloads on every event, clearing the rest -- an allowlist, the same relationship to `drop_signals` that `keep` has to `remove`. Unlike `has_signal`, this mutates: an event carrying a log and derived metrics with `signals: [logs]` loses the metrics but keeps the log. Drops an event left with no payload at all. `signals` may not be empty (that keeps nothing, dropping every event) and may not name all three signals (that keeps everything, a no-op that forwards every event untouched) -- both are rejected as config mistakes. See `docs/adr/signal-filtering-components.md`.",
+          "type": "object",
+          "required": [
+            "signals",
+            "type"
+          ],
+          "properties": {
+            "signals": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/Signal"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "keep_signals"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Clears the listed signals' payloads on every event, keeping the rest -- a denylist, the mirror of `keep_signals`. Drops an event left with no payload at all. `signals` may not be empty (that drops nothing, a no-op that forwards every event untouched) and may not name all three signals (that drops everything, dropping every event) -- both are rejected as config mistakes. See `docs/adr/signal-filtering-components.md`.",
+          "type": "object",
+          "required": [
+            "signals",
+            "type"
+          ],
+          "properties": {
+            "signals": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/Signal"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "drop_signals"
+              ]
+            }
+          }
+        },
+        {
           "type": "object",
           "required": [
             "type"
@@ -664,14 +750,58 @@
             "type"
           ],
           "properties": {
+            "compression": {
+              "description": "Gzips request bodies on both transports -- see [`OtlpCompression`]. Defaults to `none`: a receiver has to opt into decoding it, and most (the OTel Collector's own receiver included) accept both, so there's rarely a reason to change this except against a bandwidth-constrained link.",
+              "default": "none",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OtlpCompression"
+                }
+              ]
+            },
             "endpoint": {
               "type": "string"
+            },
+            "headers": {
+              "description": "Extra headers sent on every export request, on both `protocol: http` and `protocol: grpc` -- e.g. `X-Scope-OrgID` for a multi-tenant Loki/Mimir/Grafana Cloud target. A value is a plain string like any other field, so `!env` works on it (`docs/adr/env-yaml-tag.md`) -- the way to carry an `Authorization: Bearer …` token without inlining it. A name owned by the protocol itself (`content-type`, `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, any `grpc-*` header, or an HTTP/2 pseudo-header starting with `:`) is rejected at config-validation time rather than silently overridden. Two keys naming the same header once case is ignored (e.g. `X-Scope-OrgID` and `x-scope-orgid`) are rejected too -- HTTP header names are case-insensitive, so which value would actually be sent is otherwise undefined.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "paths": {
+              "description": "Per-signal HTTP path overrides -- see [`OtlpPaths`]. `protocol: http` only; a non-empty value under `protocol: grpc` is a config error (rule 21), not silently ignored, since gRPC method names aren't a mount point an operator can move.",
+              "default": {
+                "logs": null,
+                "metrics": null,
+                "traces": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OtlpPaths"
+                }
+              ]
             },
             "protocol": {
               "default": "http",
               "allOf": [
                 {
                   "$ref": "#/definitions/OtlpProtocol"
+                }
+              ]
+            },
+            "tls": {
+              "description": "Tunes TLS on an `https://` endpoint -- see [`TlsClientConfig`]. A non-default value under a plain `http://`/`grpc://` endpoint is a config error (rule 22), not silently ignored.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
                 }
               ]
             },
@@ -850,6 +980,14 @@
         "at_most_once"
       ]
     },
+    "MatchMode": {
+      "description": "`has_signal`'s matching rule. `AnyOf` forwards an event carrying at least one signal named in `signals`, untouched, even if it also carries a signal that isn't named. `Only` additionally requires the event carry nothing outside `signals` -- a mixed event that also has a signal not listed is dropped, not trimmed (`keep_signals` trims; `has_signal` never mutates an event).",
+      "type": "string",
+      "enum": [
+        "any_of",
+        "only"
+      ]
+    },
     "MetricSpec": {
       "description": "One `kv_metrics` entry: a metric `name`, an optional source `field`, and an optional `unit`. See `ComponentKind::KvMetrics` and `docs/adr/kv-metrics-semantics.md`.",
       "type": "object",
@@ -878,6 +1016,41 @@
         }
       }
     },
+    "OtlpCompression": {
+      "description": "Whether `otlp_out` gzips its request bodies -- both transports (HTTP `Content-Encoding: gzip`, gRPC's per-message compressed-frame flag plus `grpc-encoding: gzip`). Default `none`, deliberately: flipping it would change an existing pipeline's wire behavior in a patch, and would break `otlp_out -> otlp_in` across two `logit` versions where only one side has learned gzip. `otlp_out` never advertises accepting a compressed *response* regardless of this setting (`docs/adr/otlp-compression-and-decompression-bounds.md`) -- this only ever compresses what it sends.",
+      "type": "string",
+      "enum": [
+        "none",
+        "gzip"
+      ]
+    },
+    "OtlpPaths": {
+      "description": "Per-signal HTTP path overrides for `otlp_out` (`paths:` in config). Not a `HashMap<String, String>` -- a typo'd key there would silently do nothing, where a struct field gets schema validation for free. Not a path *prefix* either: `endpoint`'s own trailing text already serves that role (`endpoint: http://host/otlp` already yields `/otlp/v1/logs` against `Signal::path`'s default, `crates/logit-outputs/src/otlp.rs`'s `send_http`), so a prefix field would be a second way to say the same thing. `None` on any field means \"use the OTLP-standard default\" (`/v1/logs`, `/v1/metrics`, `/v1/traces`). gRPC method names are fixed by the `.proto` service definitions, not a mount point an operator can move -- a non-empty `paths:` under `protocol: grpc` is rejected at config-validation time (rule 21) rather than silently ignored.",
+      "type": "object",
+      "properties": {
+        "logs": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metrics": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "traces": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "OtlpProtocol": {
       "description": "Which OTLP transport a component speaks -- both `otlp_in` and `otlp_out` carry identical protobuf payloads (`crates/logit-proto/src/otlp`), differing only in framing and endpoint shape (`docs/adr/hand-rolled-grpc-over-hyper.md`).",
       "oneOf": [
@@ -889,7 +1062,7 @@
           ]
         },
         {
-          "description": "Unary gRPC over plaintext HTTP/2 -- `crates/logit-outputs/src/otlp.rs`'s hand-rolled gRPC transport has no TLS support at all (`docs/adr/hand-rolled-grpc-over-hyper.md`), so an `otlp_out` component's `endpoint` under this protocol is rejected at construction time if it's written with an `https://` scheme, rather than silently exporting in plaintext.",
+          "description": "Unary gRPC over HTTP/2 -- plaintext (`http://`/`grpc://`) or TLS (`https://`), selected by `endpoint`'s scheme (`docs/adr/otlp-tls-and-pooled-grpc-client.md`). `otlp_out`'s `tls:` block tunes the TLS case.",
           "type": "string",
           "enum": [
             "grpc"
@@ -982,6 +1155,15 @@
         }
       ]
     },
+    "Signal": {
+      "description": "A signal an event's payload may carry -- OTLP's vocabulary (`logit_proto::Signal`), not `Event`'s field names, since that's the vocabulary `has_signal`/`keep_signals`/`drop_signals` are meant to be read against. `Traces` corresponds to `event.span`.",
+      "type": "string",
+      "enum": [
+        "logs",
+        "metrics",
+        "traces"
+      ]
+    },
     "StdioTarget": {
       "type": "string"
     },
@@ -1030,6 +1212,67 @@
         "udp",
         "tcp"
       ]
+    },
+    "TlsClientConfig": {
+      "description": "Client-side TLS tuning for `otlp_out` (`tls:` in config). On the HTTP transport, TLS itself is already selected by the endpoint's `https://` scheme, matching every OTel SDK's `OTEL_EXPORTER_OTLP_ENDPOINT` convention; on the gRPC transport, an `https://` endpoint now also means TLS (`docs/adr/otlp-tls-and-pooled-grpc-client.md` -- this used to be rejected outright, since the hand-rolled gRPC client had no TLS support at all). This block only tunes an already-TLS connection -- a non-default value under a plain `http://`/`grpc://` endpoint is rejected at config-validation time (rule 22) rather than silently ignored.",
+      "type": "object",
+      "properties": {
+        "ca_file": {
+          "description": "PEM bundle of CA certificates to trust *instead of* the bundled Mozilla root set. Path is resolved relative to the config file's own directory, same as `lua_file`/`stdio_out`'s `path`. A plain string, so `!env` works on it (ADR `env-yaml-tag`) if the certificate itself needs to come from the environment rather than a mounted file.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cert_file": {
+          "description": "Client certificate chain (PEM) presented for mutual TLS. Requires `key_file`; rejected at config-validation time if set without it (rule 22).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "insecure_skip_verify": {
+          "description": "Disables server-certificate verification entirely -- the connection is still encrypted, but accepts any certificate the peer presents, self-signed or otherwise. A startup warning is logged whenever this is `true`. Never the default; meant for a throwaway or pre-production endpoint, not a real deployment. Contradictory (and rejected) together with `ca_file` -- a trusted CA and \"trust nothing\" can't both be meant at once.",
+          "default": false,
+          "type": "boolean"
+        },
+        "key_file": {
+          "description": "Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`. Requires `cert_file`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TlsServerConfig": {
+      "description": "Server-side TLS for `otlp_in` (`tls:` in config). Its mere presence on a listener turns TLS on for that component -- there is no separate on/off flag. See [`TlsClientConfig`] for the file path resolution rule and `!env` compatibility, both identical here.",
+      "type": "object",
+      "required": [
+        "cert_file",
+        "key_file"
+      ],
+      "properties": {
+        "cert_file": {
+          "description": "Certificate chain (PEM) this listener presents to every client.",
+          "type": "string"
+        },
+        "client_ca_file": {
+          "description": "PEM bundle of CAs. When set, every connecting client must present a certificate chaining to one of them (mutual TLS) -- absent, any client is accepted once the TLS handshake itself completes.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_file": {
+          "description": "Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`.",
+          "type": "string"
+        }
+      }
     }
   }
 }

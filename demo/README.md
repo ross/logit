@@ -33,13 +33,14 @@ the demo's front door now; requests flow `haproxy` → `nginx` → `app` (a real
 not published on the host.
 
 `docker compose logs -f logit` shows every decoded event as a `stdio_out` block — the fastest way
-to see the pipeline doing something. You may occasionally see a `component 'tempo_out': batch
-dropped after a permanent send failure` warning (at most once a minute) — real and harmless, not a
-sign anything is broken: `trace_windowed` (`logit.yaml`) periodically flushes a metrics-only batch
-that Tempo (a traces-only backend) rejects, the same way it would reject any OTLP metrics request;
-the far more frequent traces-only batches in between all succeed. See
+to see the pipeline doing something. `self` (`internal`, observing `logit`'s own telemetry) mixes
+metric-only and span-only events in one stream, but `trace_only` (`type: has_signal`) drops the
+metric-only ones before they ever reach `tempo_out` — Tempo is a traces-only backend and would
+reject them. Unlike an earlier `aggregate`-based version of this filter, `has_signal` never
+forwards a metrics-only batch at all, so you shouldn't see any `component 'tempo_out'` send
+failures in steady state. See
 [docs/known-gaps.md](../docs/known-gaps.md)'s "`otlp_out` aborts an entire batch's `send`..." entry
-for the full account, including why `trace_windowed` exists at all — without it, this interaction
+for the full account, including why `trace_only` exists at all — without it, this interaction
 doesn't just log a warning, it stops `logit` a minute after startup.
 
 ## What's actually flowing
