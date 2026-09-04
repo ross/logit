@@ -1,7 +1,7 @@
 # The demo pipeline (demo/README.md, docs/plans/demo-tracing-stack.md, docs/plans/demo-stack.md,
 # docs/plans/otlp-end-to-end.md, docs/plans/otlp-logs-and-resource-identity.md). Exercises
-# syslog in, otlp in, set + json + trace_context + kv_metrics + keep + aggregate, InfluxDB out,
-# OTLP/HTTP out, OTLP/gRPC out, plus `internal` observing the pipeline itself (ADR
+# syslog in, otlp in, set + json + trace_context + scale + kv_metrics + keep + aggregate, InfluxDB
+# out, OTLP/HTTP out, OTLP/gRPC out, plus `internal` observing the pipeline itself (ADR
 # `internal-telemetry-as-pipeline-events`, ADR `internal-span-emission-and-deterministic-sampling`)
 # -- against traffic that crosses three real tiers: haproxy -> nginx -> app
 # (demo/compose.yaml's `traffic` service drives it; docs/plans/demo-tracing-stack.md's
@@ -29,17 +29,21 @@
 #                                       v                         v
 #                              tap (stdio_out)      log_out (otlp_out, HTTP) --> Loki
 #
-#                        nginx_trace (only -- the metrics source of record)
-#                                       |
-#                                       v
-#                       access_metrics (kv_metrics) <- adds metrics to the event
-#                                       |
-#                                       v
-#                                 trimmed (keep)   <- drops high-cardinality attrs (request_id,
-#                                       |             trace_id, span_id)
-#                                       v
-#                                 windowed (aggregate)
-#                                       |
+#          haproxy_trace                       nginx_trace
+#                |                                   |
+#                |                                   v
+#                |                          nginx_scale (scale)  <- request_time: s -> ms, to
+#                |                                   |              share a measurement with
+#                v                                   v              haproxy's own milliseconds
+#       haproxy_metrics (kv_metrics)         nginx_metrics (kv_metrics)
+#                |                                   |
+#                +-------------------+---------------+
+#                                    v
+#                              trimmed (keep)   <- drops high-cardinality attrs (request_id,
+#                                    |             trace_id, span_id)
+#                                    v
+#                              windowed (aggregate)
+#                                    |
 #   self (internal) --+-> self_windowed (aggregate) --> influx_out --> InfluxDB
 #                      |
 #                      +-> trace_windowed (aggregate) ---+
@@ -161,13 +165,27 @@ components:
     protocol: http
     endpoint: http://loki:3100/otlp
 
-  # The nginx tier only: it's the metrics source of record, and its JSON field names
-  # (host/request_method/status/body_bytes_sent/request_time) are unchanged from before
-  # workstream A, so this chain and demo/grafana/dashboards/logit-internal.json's InfluxDB panels
-  # need no edits.
-  access_metrics:
-    type: kv_metrics
+  # nginx's JSON field names (host/request_method/status/body_bytes_sent/request_time) are
+  # unchanged from before workstream A. `request_time` still arrives in SECONDS here -- `scale`
+  # converts it to milliseconds below, right before `nginx_metrics` reads it, so the attribute
+  # itself (and everything else that might read it, `tap`/`log_out` included) keeps meaning
+  # "seconds"; only the metrics branch sees the converted value.
+  nginx_scale:
+    type: scale
     sources: [nginx_trace]
+    fields:
+      request_time: 1000 # seconds -> milliseconds, to match haproxy's %Tr below
+
+  # Both tiers share the `web.*` measurement names below and are told apart by the `service.name`
+  # tag `*_identity` already stamped (Grafana panels filter on it) -- see
+  # docs/adr/scale-transform.md for why `request_time` needed `scale` first to make that safe.
+  # `web.bytes_sent` is the one name shared despite meaning slightly different things per tier:
+  # HAProxy's `%B` (demo/haproxy/haproxy.cfg) is total bytes written to the client, headers
+  # included; nginx's `$body_bytes_sent` is body only. Neither tier's panel ever compares the two
+  # directly, so sharing the name is fine -- just not exact.
+  nginx_metrics:
+    type: kv_metrics
+    sources: [nginx_scale]
     counters:
       - name: web.requests # +1 per event
       - name: web.bytes_sent
@@ -175,15 +193,35 @@ components:
     distributions:
       - name: web.request_time
         field: request_time
-        unit: s
+        unit: ms # nginx_scale already converted it
+
+  haproxy_metrics:
+    type: kv_metrics
+    sources: [haproxy_trace]
+    counters:
+      - name: web.requests
+      - name: web.bytes_sent
+        field: bytes_sent
+    # A process-wide gauge (HAProxy's own concurrent-connection count), not a per-request value --
+    # it rides on this event's request/response tags the same way every other field here does, so
+    # it lands as one series per tag combination holding the last value seen each window. A panel
+    # over it should `|> group() |> last()` rather than plot the raw series.
+    gauges:
+      - name: web.connections_active
+        field: conns_active
+    distributions:
+      - name: web.request_time
+        field: request_time_ms
+        unit: ms
 
   # Before `aggregate`, not after -- otherwise its SeriesKey would key a series per request on
   # `request_id` (or now, `trace_id`/`span_id`) alone. `host`/`request_method`/`status` are the
-  # only tags meant to survive.
+  # tags meant to survive from both tiers; `termination_state` is HAProxy-only (absent on nginx
+  # events, so it's simply not a tag there).
   trimmed:
     type: keep
-    sources: [access_metrics]
-    fields: [host, request_method, status]
+    sources: [nginx_metrics, haproxy_metrics]
+    fields: [host, request_method, status, termination_state]
 
   windowed:
     type: aggregate

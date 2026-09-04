@@ -13,30 +13,77 @@
     {
       "id": 1,
       "type": "timeseries",
-      "title": "web.requests (demo traffic)",
-      "description": "Requests from the hello-world app -- real visits plus a background synthetic loop -- by status code, proving syslog_in -> json -> kv_metrics -> keep -> aggregate end to end.",
+      "title": "web.requests (nginx)",
+      "description": "Requests reaching the nginx tier -- real visits plus a background synthetic loop -- by status code, proving syslog_in -> json -> scale -> kv_metrics -> keep -> aggregate end to end. Filtered on service.name so this and the haproxy panel beside it don't double-count the shared web.requests measurement.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "targets": [
         {
           "refId": "A",
           "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.requests\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> group(columns: [\"status\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.requests\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> filter(fn: (r) => r[\"service.name\"] == \"nginx\")\n  |> group(columns: [\"status\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "web.requests (haproxy)",
+      "description": "The same web.requests measurement as the nginx panel beside it, filtered to HAProxy's own service.name tag instead -- haproxy_metrics (demo/logit.yaml) is the front door's own request count, upstream of nginx's.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb" },
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.requests\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> filter(fn: (r) => r[\"service.name\"] == \"haproxy\")\n  |> group(columns: [\"status\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
         }
       ]
     },
     {
       "id": 2,
       "type": "timeseries",
-      "title": "web.request_time (p50 / p99)",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "title": "web.request_time (nginx, p50 / p99)",
+      "description": "Milliseconds, not seconds -- nginx_scale (demo/logit.yaml) converts nginx's own $request_time before nginx_metrics ever reads it, so this shares a unit and a measurement with haproxy's panel beside it.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
-      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
           "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.request_time\")\n  |> filter(fn: (r) => r._field == \"p50\" or r._field == \"p99\")"
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.request_time\")\n  |> filter(fn: (r) => r._field == \"p50\" or r._field == \"p99\")\n  |> filter(fn: (r) => r[\"service.name\"] == \"nginx\")"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "web.request_time (haproxy, p50 / p99)",
+      "description": "HAProxy's %Tr is native milliseconds, so haproxy_metrics needs no scale step -- unlike nginx's panel beside it, this reads request_time_ms directly.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb" },
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.request_time\")\n  |> filter(fn: (r) => r._field == \"p50\" or r._field == \"p99\")\n  |> filter(fn: (r) => r[\"service.name\"] == \"haproxy\")"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "web.connections_active (haproxy)",
+      "description": "HAProxy's own process-wide concurrent-connection gauge (%ac, demo/haproxy/haproxy.cfg), riding on each request event -- one series per request/response tag combination rather than one true process-wide series, so this groups everything together and takes the last value seen per window instead of plotting the raw per-tag series (docs/adr/scale-transform.md's sibling reasoning doesn't cover this; see haproxy_metrics's own comment in demo/logit.yaml).",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb" },
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.connections_active\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> group()\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)"
         }
       ]
     },
@@ -45,7 +92,7 @@
       "type": "timeseries",
       "title": "logit.component.events.{sent,received,dropped}",
       "description": "The uniform per-component runtime instrumentation every component gets for free (Fanout::send / run_transform / run_output).",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "targets": [
         {
@@ -59,7 +106,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "logit.component.process.duration (p99, by component)",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "targets": [
@@ -75,7 +122,7 @@
       "type": "timeseries",
       "title": "logit.output.requests (influxdb_out, by class)",
       "description": "influxdb_out's own retry-loop detail -- 2xx/4xx/5xx/network_error -- that run_output's single send.duration timer can't distinguish.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "targets": [
         {
@@ -89,7 +136,7 @@
       "id": 6,
       "type": "stat",
       "title": "logit.process.uptime",
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 16 },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 32 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "targets": [
@@ -105,7 +152,7 @@
       "type": "stat",
       "title": "logit.process.interner.strings",
       "description": "docs/known-gaps.md's interner-size observability hook -- the interner never evicts, so this only ever grows.",
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 16 },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 32 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "targets": [
         {
@@ -120,7 +167,7 @@
       "type": "logs",
       "title": "Loki: raw demo traffic ({service_name=\"demo-app\"})",
       "description": "`log_out` (`otlp_out`, docs/plans/otlp-logs-and-resource-identity.md workstream B) exports app_json's events straight to Loki over OTLP/HTTP -- no relay service in between. `service_name`/`service_namespace` stream labels come from `app_identity` (`set`, ADR operator-declared-resource-attributes) stamping the batch's resource, not from any per-event config field.",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 36 },
       "datasource": { "type": "loki", "uid": "loki" },
       "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true },
       "targets": [
@@ -136,7 +183,7 @@
       "id": 9,
       "type": "timeseries",
       "title": "Loki: lines/sec, by service (LogQL count_over_time)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
       "datasource": { "type": "loki", "uid": "loki" },
       "targets": [
         {
@@ -152,7 +199,7 @@
       "type": "timeseries",
       "title": "Loki: 5xx lines/sec (LogQL | json filter)",
       "description": "LogQL parsing the JSON message body itself, not just matching stream labels -- `| json` extracts `status` from each line, then filters on it.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
       "datasource": { "type": "loki", "uid": "loki" },
       "targets": [
         {
@@ -167,8 +214,8 @@
       "id": 11,
       "type": "table",
       "title": "Tempo: logit's own internal spans",
-      "description": "logit observing itself as *traces*, not just metrics (docs/adr/internal-span-emission-and-deterministic-sampling.md, docs/plans/otlp-end-to-end.md) -- one span per node-visit (listener send, transform process/flush, sink deliver), exported over OTLP/gRPC by demo/logit.yaml's `trace_out`. Click a trace ID to open its waterfall and see the pipeline's real shape: a syslog_in root with json/kv_metrics/keep/aggregate children, or an internal-only root for `self`'s own drain. `{}` matches everything -- `logit` is the only thing sending to this Tempo.\n\nThis is a `table` panel, not a `traces` panel: Grafana's `traces` panel type renders one trace's waterfall, not a searchable list of many -- the Tempo datasource's own response tells Grafana as much (`preferredVisualisationType: \"table\"`), and each row's Trace ID is already a link into the full trace view.",
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 36 },
+      "description": "logit observing itself as *traces*, not just metrics (docs/adr/internal-span-emission-and-deterministic-sampling.md, docs/plans/otlp-end-to-end.md) -- one span per node-visit (listener send, transform process/flush, sink deliver), exported over OTLP/gRPC by demo/logit.yaml's `trace_out`. Click a trace ID to open its waterfall and see the pipeline's real shape: a syslog_in root with json/scale/kv_metrics/keep/aggregate children, or an internal-only root for `self`'s own drain. `{}` matches everything -- `logit` is the only thing sending to this Tempo.\n\nThis is a `table` panel, not a `traces` panel: Grafana's `traces` panel type renders one trace's waterfall, not a searchable list of many -- the Tempo datasource's own response tells Grafana as much (`preferredVisualisationType: \"table\"`), and each row's Trace ID is already a link into the full trace view.",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 52 },
       "datasource": { "type": "tempo", "uid": "tempo" },
       "targets": [
         {
@@ -186,7 +233,7 @@
       "type": "timeseries",
       "title": "logit.internal.spans.dropped (buffer_full)",
       "description": "The per-component span buffer's overflow counter (MAX_SPANS_PER_COMPONENT, docs/design/internal-telemetry.md) -- should stay at zero at demo volume; a nonzero value means the demo's traffic is outrunning the bounded buffer between `internal`'s drain ticks, not that traces are being lost silently.",
-      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 46 },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 62 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "targets": [
         {

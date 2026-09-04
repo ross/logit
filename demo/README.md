@@ -65,8 +65,12 @@ tier's chain is `set` (`../docs/adr/operator-declared-resource-attributes.md`) �
 `trace_context` (`../docs/adr/log-record-trace-context.md`), which lifts the split trace fields
 onto `LogRecord.trace` — then all three fan into a shared `tap` (`stdio_out`) and a shared
 `log_out` (`otlp_out` over HTTP straight to Loki — no relay service in between,
-`../docs/plans/otlp-logs-and-resource-identity.md`). The nginx tier alone continues on to the
-metrics leg (`kv_metrics` → `keep` → `aggregate` → `influxdb_out`) — plus `logit` observing its own
+`../docs/plans/otlp-logs-and-resource-identity.md`). The haproxy and nginx tiers both continue on
+to the metrics leg — nginx's own chain adds a `scale` step first, converting `request_time` from
+seconds to milliseconds so it shares a measurement and a unit with haproxy's already-millisecond
+`%Tr` (`../docs/adr/scale-transform.md`) — before each tier's own `kv_metrics` (`nginx_metrics`/
+`haproxy_metrics`) fans into a shared `keep` → `aggregate` → `influxdb_out` tail, told apart in
+InfluxDB by the `service.name` tag each tier's `set` already stamped. `logit` also observes its own
 pipeline via `internal` (`../docs/design/internal-telemetry.md`) into that same InfluxDB bucket
 *and*, as real spans, over OTLP/gRPC into Tempo, one span per node-visit at `span_sample_rate: 1.0`
 so nothing is thinned out (`../docs/adr/internal-span-emission-and-deterministic-sampling.md`,
