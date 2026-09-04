@@ -37,123 +37,127 @@ where it's the one thing not verified by direct observation).
 
 ## Gaps this plan exists to schedule
 
-### A. Operator-declared resource attributes — the actual blocker
+### A. Operator-declared resource attributes — done
 
-**Finding:** there is no mechanism anywhere in `logit` to attach static attributes to a batch's
-resource. Not config (`crates/logit-config/src/lib.rs`, `schema/logit.schema.json` — grepped for
-`attributes`/`labels`/`tags`/`resource` on every input variant, no hits); not any transform
-(`keep`/`json`/`kv_metrics`/`aggregate` in `crates/logit-transforms/src/` only filter or derive,
-never insert a constant); and Lua can mutate only *event* attributes
-(`crates/logit-script/src/proxy.rs:194-238` `AttrsProxy`), never a resource.
+**Status: landed.** What was originally a finding-plus-sketch is now a shipped `set` transform,
+`Transform::map_resource`, and a read/write Lua `resource` global — see
+[ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md) for
+the design and rationale, [lua-api.md](../design/lua-api.md)'s "Reading and writing `resource`"
+section for the script-facing contract, and [data-model.md](../design/data-model.md) for the
+one-line model update (a batch's `Resource` was already dynamic — `Arc`-swappable, not
+immutable — the gap was a *mutation surface*, not the data model). Kept here, in past tense, as the
+record of what workstream A originally found and how it was resolved; the finding itself is no
+longer filed in `docs/known-gaps.md`.
 
-This matters beyond the demo: every OTLP-native backend keys behavior off resource attributes.
-Every future OTLP sink hits this same wall.
+An operator now writes, for example:
 
-**Design sketch, for whoever picks this up:**
-- Cheaper than it looks. `SyslogDecoder` already *holds* an `Arc<Resource>` field
-  (`crates/logit-inputs/src/syslog.rs:155`, returned unchanged on every decode at `:220`); only
-  `SyslogInput::new` (`:99-104`) hardcodes `Resource::default()`. The plumbing exists; the config
-  surface doesn't.
-- Touch points: a config field (e.g. `resource: BTreeMap<String, String>` on `syslog_in`),
-  regenerated `schema/logit.schema.json` (`script/schema`; `script/cibuild` fails the build on
-  drift), a builder on the input, threading through `crates/logit-cli/src/pipeline.rs`, tests, docs.
-- **Needs an ADR.** Written down badly, this reads as a contradiction of the rule PR #60 just
-  landed. Written down correctly: *`logit`'s code may not invent a resource identity for data it
-  didn't produce; an operator configuring the pipeline may declare one.* An operator writing
-  `resource: {service.name: demo-hello}` on a listener is declaring what that specific socket
-  receives — the same category of knowledge as `syslog_out`'s existing `hostname`/`app_name` config
-  fields, not a violation of "code doesn't guess." Suggested slug:
-  `operator-declared-resource-attributes`.
-- **Open questions to research before implementing:**
-  - Which inputs get the field first. `syslog_in` is the immediate motivator; `otlp_in` arguably
-    should never get one, since it already receives a real resource on the wire.
-  - Value types: strings only (simplest, matches what backends actually key on), or the full
-    `logit_core::Value` set (more expressive, more schema surface).
-  - Per-input only, or also a config-root default inherited by every input that doesn't override it.
-  - Interaction with `BatchAccumulator`'s flush-on-resource-change behavior
-    (`crates/logit-pipeline/src/accumulator.rs:88-95`) — a per-input constant resource should be a
-    non-issue (one static value, no mid-stream changes), but worth confirming before relying on it.
+```yaml
+web_identity:
+  type: set
+  sources: [web_logs]
+  resource:
+    service.name: nginx
+    service.namespace: demo
+```
 
-### B. A Loki-direct log leg, dropping `alloy`
+**Why a `set` graph component, not the per-input `resource:` field this plan originally
+sketched:** one mechanism composes anywhere in the graph (several inputs feeding one `set`, or one
+input feeding several differently-configured `set`s), covers event attributes the same way it
+covers the resource (a second thing this plan's original sketch would have needed its own
+mechanism for regardless), and needs no per-input schema surface — `otlp_in` in particular needs
+no special-casing, since an operator simply never puts a `set` after it. See the ADR's
+"Alternatives considered" for the full comparison.
 
-Feasible, and blocked on A for label quality — not blocked technically.
+**The `BatchAccumulator` interaction this plan's original sketch worried about doesn't arise.**
+`BatchAccumulator` (`crates/logit-pipeline/src/accumulator.rs`) is listener-side batching, upstream
+of every transform — `set`'s `map_resource` runs downstream of it, on an already-accumulated
+batch, so its `Arc::ptr_eq` resource-change flush logic never sees or interacts with `set` at all.
 
-**The correction that kills the obvious shortcut:** Loki's `otlp_config` allows the `index_label`
+Value types settled as scalars (string/int/float/bool via `SetValue`, an untagged enum) rather than
+strings-only — a per-event setter that couldn't write a number would have been a wart from day
+one. No config-root default was added; per-component configuration (insert a `set` wherever it's
+needed) covers the same ground without a second inheritance mechanism to reason about.
+
+### B. A Loki-direct log leg, dropping `alloy` — done
+
+**Status: landed.** `demo/logit.yaml`'s `log_out` is now `otlp_out` (protocol `http`, endpoint
+`http://loki:3100/otlp`), fed by a new `access_identity` (`set`) component that stamps
+`service.name: demo-hello`/`service.namespace: demo` onto the batch's resource right after
+`access_in`. `demo/alloy/` and the `alloy` service/volume in `demo/compose.yaml` are gone
+entirely; `logit`'s `depends_on` gained `loki: {condition: service_healthy}` so `log_out` doesn't
+spend its first several seconds retrying into a cold Loki. The three Loki dashboard panels
+(`demo/grafana/dashboards/logit-internal.json`) were rewritten from `{job="demo"}`/`by (host)` to
+`{service_name="demo-hello"}`/`by (service_name)` — Loki's OTLP resource-attribute label naming
+(dots become underscores).
+
+**No `demo/loki/loki.yaml` change was needed**, confirming the analysis below: `service.name`/
+`service.namespace` are already in Loki's default index-label set.
+
+The analysis that motivated this, kept for the record:
+
+**The correction that killed the obvious shortcut:** Loki's `otlp_config` allows the `index_label`
 action *only* for resource attributes, never for log-record attributes (confirmed against Grafana's
 own docs: "It additionally allows index_label action for Resource Attributes" — log/scope
-attributes are limited to `structured_metadata` or `drop`). `syslog.hostname`/`syslog.tag` are
+attributes are limited to `structured_metadata` or `drop`). `syslog.hostname`/`syslog.tag` were
 encoded as **log**-record attributes by `logit` (`crates/logit-proto/src/otlp/logs.rs:99-104` pushes
 `event.attributes` onto `LogRecord.attributes`), not resource attributes. So no Loki-side
-`otlp_config` change can promote them to index labels — full stop. This makes workstream A a hard
-prerequisite for a demo that doesn't look broken, not an optional enhancement.
+`otlp_config` change could have promoted them to index labels — full stop. This is what made
+workstream A a hard prerequisite for a demo that doesn't look broken, not an optional enhancement.
 
 **Loki's live default index-label set**, captured verbatim from the running demo stack's `/config`
-endpoint: `service.name`, `service.namespace`, `service.instance.id`, `deployment.environment`,
-`deployment.environment.name`, `cloud.region`, `cloud.availability_zone`, and a run of `k8s.*` /
-`container.name` keys. Everything else on the resource → structured metadata, never a label, unless
-explicitly configured otherwise.
+endpoint at the time: `service.name`, `service.namespace`, `service.instance.id`,
+`deployment.environment`, `deployment.environment.name`, `cloud.region`,
+`cloud.availability_zone`, and a run of `k8s.*` / `container.name` keys. Everything else on the
+resource → structured metadata, never a label, unless explicitly configured otherwise.
 
-**Consequence:** without A, every OTLP log line lands in Loki as `{service_name="unknown_service"}`
-with no `host`/`app`/`job`-equivalent label at all — a demo that looks broken. With A, setting
-`service.name`/`service.namespace` in `syslog_in`'s new `resource:` config is enough on its own —
-both are already in Loki's default index-label set, so **no `demo/loki/loki.yaml` change would be
-needed**.
+**Where the old labels came from — entirely Alloy, nothing else** (now removed):
+`demo/alloy/config.alloy` set static `job="demo"`, `protocol="udp"`, and relabeled
+`__syslog_message_hostname`→`host`, `__syslog_message_app_name`→`app`.
 
-**Where today's labels actually come from — entirely Alloy, nothing else:**
-`demo/alloy/config.alloy:13-16` sets static `job="demo"`, `protocol="udp"`; `:33-41` relabels
-`__syslog_message_hostname`→`host` and `__syslog_message_app_name`→`app`. All three Loki dashboard
-panels select on `{job="demo"}`
-(`demo/grafana/dashboards/logit-internal.json:130,145,161`) and would need new LogQL once Alloy's
-labels no longer exist.
+### C. What replacing Alloy cost: `syslog_out`'s only demo exercise — accepted
 
-**Removal surface**, if this is executed: `demo/compose.yaml:87-103` (the `alloy` service) plus the
-`alloy_data` volume at `:229`; `demo/alloy/config.alloy` (whole file, plus the now-empty
-`demo/alloy/` directory); `demo/logit.yaml:44-57` (`log_out`) and the topology comment at `:16`; and
-doc references treating Alloy as live in `docs/plans/demo-stack.md`, `demo/README.md`,
-`docs/adr/syslog-output.md`, `docs/adr/demo-stack-separate-from-dev-stack.md`,
-`docs/plans/otlp-end-to-end.md:36,329-330`.
+**Decision: accept the loss, document it, no loop-back.** `syslog_out` is no longer exercised
+end-to-end by anything in the demo — it stays fully covered by its own unit/integration tests and
+by `docs/adr/syslog-output.md`'s decisions, but the demo no longer demonstrates third-party syslog
+receiver interop. This was an explicit choice, not an oversight: the demo was never going to stay
+exhaustive over every `ComponentKind` as more land, and keeping Alloy solely to exercise one
+component, or looping `syslog_out` back into a second `syslog_in` to prove `logit` talks to itself
+(not real third-party interop, Alloy's actual evidentiary value), were both rejected as not worth
+what they'd cost or not actually preserving what mattered.
 
-One operational detail worth remembering: add `loki: {condition: service_healthy}` to `logit`'s
-`depends_on` in `demo/compose.yaml` when this lands. Loki already has a healthcheck (Alloy currently
-depends on it); without it, `log_out` spends its first several seconds retrying into a cold Loki.
+Confirmed: removing Alloy does **not** invalidate `docs/adr/syslog-output.md`'s decisions (RFC 6587
+octet-counting auto-detect, `idle_timeout` handling, `syslog.*` attribute round-tripping). Alloy was
+the *evidence* those choices interoperate with a real receiver, not the *reason* for them — those
+passages still cite Alloy v1.19.2 as the receiver they were verified against; only the ADR's
+now-stale claim that `demo/compose.yaml` has a live `alloy` service was corrected.
 
-### C. What replacing Alloy costs: `syslog_out`'s only demo exercise
+### D. Log↔trace correlation has no native OTLP path yet — model/codec/Lua/transform half done
 
-`syslog_out` is exercised end-to-end **only** by the Alloy leg — nothing else in the stack speaks
-syslog, which is the entire reason Alloy is there (Loki has no syslog receiver; promtail is EOL).
-Dropping Alloy drops that coverage. This is a decision to make, not one already made. Options:
+**Status: `LogRecord` now carries a native application trace/span reference.** `logit_core::
+LogRecord::trace: Option<TraceRef>` — [ADR `log-record-trace-context`](../adr/log-record-trace-context.md)
+has the full design. `otlp_out` encodes it (falling back to the same `Event`'s `span` when the log
+has none of its own); `otlp_in` decodes it, leniently, per OTLP's own contract for an invalid log
+trace id; a new `trace_context` native transform lifts one off an already-JSON-decoded attribute
+without writing Lua; `event.log.trace_id`/`span_id`/`trace_flags` are read+write from Lua. So an
+OTLP log sink — Loki included — can now get native trace correlation from `logit`, wherever the
+trace context comes from (the wire, an attribute, or a script).
 
-- **Accept the loss, document it.** Unit/integration tests still cover `syslog_out`; only
-  third-party-receiver interop goes undemoed.
-- **Keep Alloy solely for `syslog_out`.** Defeats the point of this workstream.
-- **Loop `syslog_out` back into a second `syslog_in`** on another port, feeding a `stdio_out`.
-  Exercises the encode path against `logit`'s own decoder, but proves `logit` talks to itself — not
-  that it interoperates with a real third-party syslog receiver, which was Alloy's actual
-  evidentiary value.
+**What's still open, deliberately:** no mode stamps `logit`'s *own* pipeline trace context onto a
+log automatically — a script can do it by hand
+(`event.log.trace_id = trace.trace_id`), but that's an application-identity decision an operator
+must opt into, never a default (`docs/known-gaps.md`). And the demo-stack half of this workstream
+— wiring the demo's log leg to actually carry a trace context, and the Grafana-side upgrade this
+paragraph originally described (a second `derivedFields` entry keyed on Loki's `trace_id`
+structured metadata instead of the existing body regex) — is explicitly deferred to the demo app's
+own tracing rework, a separate, already-planned piece of work. The demo's existing correlation (a
+Grafana `derivedFields` regex over the log body,
+`demo/grafana/provisioning/datasources/datasources.yaml`) is untouched and still works identically
+either way.
 
-Separately, confirm for whoever picks this up: removing Alloy does **not** invalidate
-`docs/adr/syslog-output.md`'s decisions (RFC 6587 octet-counting auto-detect at `:65-68`,
-`idle_timeout` handling at `:80-82`, `syslog.*` attribute round-tripping at `:105-107`). Alloy was
-the *evidence* those choices interoperate with a real receiver, not the *reason* for them. Those
-passages need rewording to cite Alloy as "one receiver, verified against v1.19.2" rather than "the
-demo's receiver" — not rescinding.
-
-### D. Log↔trace correlation has no native OTLP path yet
-
-`crates/logit-proto/src/otlp/logs.rs:121-122` always emits empty `trace_id`/`span_id` on every
-exported `LogRecord` — deliberate, per the doc comment at `:22-26`: `logit_core::LogRecord` has no
-field to carry them. So no OTLP log sink, Loki included, can ever get native trace correlation from
-`logit` today. The demo's existing correlation is a Grafana `derivedFields` regex over the log
-*body* (`demo/grafana/provisioning/datasources/datasources.yaml:30-39`), which is
-transport-independent and works identically whether the log leg goes through Alloy or straight OTLP
-— unaffected by workstream B either way.
-
-This connects to a previously-noted future direction: converting logs into span/trace events (e.g.
-nginx as a trace root arriving only via logs). Whichever component does that conversion is also the
-natural place to assign `service.name` for that data — same principle as workstream A, one level
-up the stack. Once `LogRecord` carries real trace context, the Grafana-side upgrade is a second
-derived field keyed on `trace_id` structured metadata instead of a body regex — strictly better,
-and worth doing at the same time as whatever adds trace-context fields to `LogRecord`.
+This also still connects to a previously-noted future direction: converting logs into span/trace
+events (e.g. nginx as a trace root arriving only via logs). Whichever component does that
+conversion is also the natural place to assign `service.name` for that data — same principle as
+workstream A, one level up the stack.
 
 ### E. `otlp_out` config gaps found along the way
 

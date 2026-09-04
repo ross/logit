@@ -497,7 +497,7 @@ fn parse_3164(
     Event::log(
         recv_ts,
         attrs,
-        LogRecord { message, severity: Some(severity), body_format: BodyFormat::Raw },
+        LogRecord { message, severity: Some(severity), body_format: BodyFormat::Raw, trace: None },
     )
 }
 
@@ -638,7 +638,7 @@ fn parse_5424(
     Ok(Event::log(
         recv_ts,
         attrs,
-        LogRecord { message, severity: Some(severity), body_format: BodyFormat::Raw },
+        LogRecord { message, severity: Some(severity), body_format: BodyFormat::Raw, trace: None },
     ))
 }
 

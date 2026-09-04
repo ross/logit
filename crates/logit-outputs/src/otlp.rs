@@ -705,6 +705,7 @@ mod tests {
                 message: logit_core::Value::str("hi"),
                 severity: None,
                 body_format: logit_core::BodyFormat::Raw,
+                trace: None,
             },
         );
         let metric = Event::metric(

@@ -35,17 +35,21 @@ precedence rule for the multi-payload case, and rejected it: a summary string is
 versus checking the specific thing a script actually cares about, and a script branching on
 `event.type == "metric"` would silently skip the metrics on a log-carrying event, exactly the shape
 a transform like `kv_metrics` produces. `event:clone()` (an independent deep copy, needed for
-fan-out — see the script contract below) rounds out the proxy's surface for now. Deliberately not
-exposed yet: typed access to record fields (a metric's value, a log's message, ...) and any
-`Event.new(...)`-style constructor — real API surface that deserves its own design pass once a
-concrete consumer (a metrics-from-attributes transform is the obvious one) needs it, rather than
-being guessed at ahead of that.
+fan-out — see the script contract below) rounds out the proxy's surface for now.
+
+**`event.log` is the first typed record access**, read/write on its trace context
+(`trace_id`/`span_id`/`trace_flags`) and read-only on `message`/`severity`/`body_format` — see
+"Reading and writing `event.log`" below. A metric's value and a span's fields remain unexposed:
+real API surface that deserves its own design pass once a concrete consumer needs it (a
+metrics-from-attributes transform is the obvious one for a metric value), rather than being
+guessed at ahead of that. Same for any `Event.new(...)`-style constructor.
 
 No `__pairs`: it isn't available under LuaJIT. `mlua::MetaMethod::Pairs` requires Lua 5.2+, and
 LuaJIT is Lua 5.1 semantics — this was in the original version of this section and is wrong.
 `event:to_table()` is the answer instead: a real, disconnected Lua table with `timestamp`,
-`attributes`, `has_log`, `has_metrics`, and `has_span`, for anything the proxy doesn't expose
-directly — including full attribute iteration
+`attributes`, `log` (itself a table -- see "Reading and writing `event.log`" below -- or `nil`),
+`has_log`, `has_metrics`, and `has_span`, for anything the proxy doesn't expose directly —
+including full attribute iteration
 (`for k, v in pairs(event:to_table().attributes) do ... end`, native `pairs()` on a real table) and
 building new structures or logging for debugging. The cost is opt-in and visible at the call site
 rather than paid unconditionally.
@@ -201,15 +205,107 @@ end
 of its events reach `process()`, so every event in one call to `process()` sees the same value.
 Both start at the all-zero placeholder (`"00...0"`) before any batch has arrived.
 
+**This is `logit`'s own pipeline identity, not an application's.** `trace` names which node-visit
+processed a batch -- it has nothing to do with `event.log.trace_id`
+(below), the *application's* trace context a log line was emitted under. A script copying one onto
+the other (`event.log.trace_id = trace.trace_id`, stamping a log with "which `logit` run handled
+this line") is a deliberate choice a script can make; `logit` never does it on its own -- see
+[ADR `log-record-trace-context`](../adr/log-record-trace-context.md).
+
 **Stale during `flush()`.** `trace` is *not* updated around a `flush()` call -- it keeps whatever
-the most recently processed batch set, the same staleness `event.attributes`'s resource has at a
-flush tick (see this crate's own known-gaps entry for both). A `flush()`-driven emission has no
-single incoming batch to attribute itself to -- however many batches contributed to whatever a
-stateful script is about to flush, `logit` has no way to know, and doesn't try to guess. A script
-that wants better than "whichever batch was last seen" needs to track contributing contexts itself,
-inside its own `process()` -- the values are genuinely there to read, `logit` just doesn't
-aggregate them on the script's behalf the way `docs/adr/trace-context-propagation-on-delivered.md`'s
-flush-side linking does for the native `aggregate` transform.
+the most recently processed batch set (see this crate's own known-gaps entry). A `flush()`-driven
+emission has no single incoming batch to attribute itself to -- however many batches contributed to
+whatever a stateful script is about to flush, `logit` has no way to know, and doesn't try to guess.
+A script that wants better than "whichever batch was last seen" needs to track contributing
+contexts itself, inside its own `process()` -- the values are genuinely there to read, `logit` just
+doesn't aggregate them on the script's behalf the way
+`docs/adr/trace-context-propagation-on-delivered.md`'s flush-side linking does for the native
+`aggregate` transform. `resource`, below, has the same default staleness at a flush tick, but --
+unlike `trace` -- a script can override it explicitly.
+
+## Reading and writing `resource`
+
+A `resource` global gives `process()` (and `flush()`) read *and write* access to the incoming
+batch's resource -- the same `Arc<Resource>` `EventBatch::resource` carries
+([data-model.md](data-model.md)), proxied the same way `event.attributes` is:
+
+```lua
+function process(event)
+  resource["service.name"] = "nginx"
+  resource["service.namespace"] = "demo"
+  return event
+end
+```
+
+Reads and writes go through `resource["key"]` exactly like `event.attributes["key"]`; enumerate
+every key with `resource:to_table()` (no `__pairs` under LuaJIT, same reason `event.attributes`
+needs `event:to_table()`). Assigning `nil` stores a null value, not a removal -- there is no way to
+delete a resource attribute from Lua, the same rule `event.attributes` follows.
+
+**Per batch, not per event.** A write inside `process()` applies to the whole outgoing batch,
+including any events already processed earlier in the same batch -- `resource` is batch-scoped
+state, not per-event. A script that wants a per-event identity uses `event.attributes` instead.
+Writes made at a script's top level, before any batch has arrived, are silently discarded once the
+first batch's `set_resource` call resets `resource` -- write inside `process()`/`flush()`, not at
+load time. `resource` starts empty, the same all-clear starting point `trace` has.
+
+**Copy-on-write, so a script that never touches `resource` costs nothing.** Reading or writing
+`event.attributes` on an event a script doesn't otherwise touch is already the common case this
+proxy design exists to keep cheap; `resource` follows the identical shape
+(`crates/logit-script/src/resource.rs`) -- see [memory.md](memory.md) for the measured cost of both
+the no-write and write paths.
+
+**A write inside `flush()` gives a stateful script's flush-driven emission a real identity**,
+where `trace` (above) has none to offer -- the one asymmetry between the two globals. It doesn't
+resolve the underlying *n*-to-1 problem (`logit` still can't attribute a flush automatically to one
+of several upstream resources), it just gives the script a way to state the answer itself when it
+knows one. See `docs/known-gaps.md`'s entry and
+[ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md).
+
+The `set` native transform (`logit_config::ComponentKind::Set`) offers the same capability without
+writing Lua at all, for the common case of stamping a handful of constant values -- see that ADR
+for why an operator reaches for a graph component here rather than a per-input config field.
+
+## Reading and writing `event.log`
+
+`event.log` is `nil` on an event with no log (`event.has_log == false`); otherwise it's a proxy
+onto the log record, `trace_id`/`span_id`/`trace_flags` read+write, `message`/`severity`/
+`body_format` read-only for now:
+
+```lua
+function process(event)
+  if event.log and event.log.trace_id == nil then
+    event.log.trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+  end
+  return event
+end
+```
+
+**`trace_id`/`span_id` are lowercase hex strings, `nil` when absent** -- 32 characters (16 bytes)
+and 16 characters (8 bytes) respectively, the same shape the `trace` global above uses. Assigning
+a valid hex string to `trace_id` sets it, replacing the whole trace context: a log with no trace
+context gets a fresh one, and a log that already had one gets a fresh one too, `span_id`/
+`trace_flags` reset along with it -- an old span belongs to the old trace, not the new one.
+Assigning `nil` likewise clears the *whole* trace context, `span_id`/`trace_flags` included, since
+OTLP's own contract is that a span only means something alongside a trace. `span_id` and `trace_flags`
+can only be set once `trace_id` is -- assigning either first is a clear error, not a silent no-op,
+since there would be nothing for them to attach to. `trace_flags` is a plain integer, 0-255 (the
+low 8 bits OTLP's `LogRecord.flags` actually carries); bit 0 is the W3C `SAMPLED` flag. An invalid
+hex string, or a `trace_flags` outside `0..=255`, is a runtime error naming the field, the same
+strictness `event.timestamp`'s parse has.
+
+**`message`/`severity`/`body_format` are read-only for now** -- a later design pass, once a
+concrete need for writing them shows up, not an oversight (same reasoning as the record-field gap
+noted above). `message` reads as whatever `Value` the log body holds (a string, most commonly);
+`severity` reads as a lowercase name (`"trace"`/`"debug"`/`"info"`/`"warn"`/`"error"`/`"fatal"`,
+matching `stdio_out`'s own rendering) or `nil` if the record carries none; `body_format` reads as
+`"raw"`/`"json"`/`"structured"`. Assigning to any of the three is a clear "read-only for now"
+error.
+
+The `trace_context` native transform (`logit_config::ComponentKind::TraceContext`) offers the
+common case -- lifting a trace id already sitting in an attribute (a JSON log body's own
+`trace_id` field, say) onto the log record -- without writing Lua, the same relationship `set` has
+to `resource`/`event.attributes`. See `docs/adr/log-record-trace-context.md`.
 
 ## Config shape
 
