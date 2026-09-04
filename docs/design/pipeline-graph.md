@@ -104,8 +104,8 @@ into one tagged enum creates real collisions — `Otlp { bind }` (a listener) an
 keeps the rule predictable as more protocols gain a second side — `syslog_out` (RFC 3164/5424 over
 UDP or TCP, `docs/adr/syslog-output.md`) is exactly that case, landing well after `SyslogIn`.
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`,
-`remove`, `set`, `trace_context`, `has_signal`, `keep_signals`, `drop_signals`, and any future
-native transform — take no suffix; there's only ever one direction for a transform to be.
+`remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, and any
+future native transform — take no suffix; there's only ever one direction for a transform to be.
 
 **`interval` stays a per-kind optional field, unchanged from today.** `lua`/`lua_file` already carry
 an optional flush interval (`docs/adr/aggregation-window-semantics.md`); `aggregate` requires
@@ -150,7 +150,7 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `syslog_in`, `otlp_in`, `file_tail`, `logit_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `has_signal`, `keep_signals`, `drop_signals`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `otlp_out`, `logit_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
@@ -224,7 +224,10 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     apply to `kv_metrics`, extended to the two components that landed after this list was written
     (`docs/adr/operator-declared-resource-attributes.md`,
     `docs/adr/log-record-trace-context.md`).
-20. An empty `signals:` list on `has_signal`, `keep_signals`, or `drop_signals` is rejected.
+20. A `scale` with an empty `fields` map is rejected (the same no-op reasoning again), as is an
+    empty field name within it (the same reasoning rule 19 applies to `trace_context`'s `trace_id`)
+    or a non-finite factor (`docs/adr/scale-transform.md`).
+21. An empty `signals:` list on `has_signal`, `keep_signals`, or `drop_signals` is rejected.
     `keep_signals`/`drop_signals` additionally reject naming all three signals. Which of the two
     shapes is the silent black hole (rule 7's "no consumer" failure, recast here as "no event
     ever gets through") and which is the no-op (every event forwarded untouched) is *opposite*
@@ -233,22 +236,20 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     either way, but the error message names the right one. `keep`'s empty `fields` list stays
     legal by contrast — "drop every attribute" is a real operation, "drop every event" is not.
     See `docs/adr/signal-filtering-components.md`.
-21. An `otlp_out` `headers:` entry may not name a header the protocol itself sets (`content-type`,
+22. An `otlp_out` `headers:` entry may not name a header the protocol itself sets (`content-type`,
     `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, any
     `grpc-*` header, an empty name, or an HTTP/2 pseudo-header starting with `:`) — checked
     case-insensitively.
-22. `otlp_out`'s `paths:` is HTTP-only — gRPC method names are fixed by the `.proto` service
+23. `otlp_out`'s `paths:` is HTTP-only — gRPC method names are fixed by the `.proto` service
     definitions, not a mount point an operator can move, so a non-empty `paths:` under
     `protocol: grpc` is rejected rather than silently ignored (the same instinct as rule 14's
     `buffer:` on a non-sink).
-23. An `otlp_out` `tls:` block: `cert_file`/`key_file` must be set together (mutual TLS needs
+24. An `otlp_out` `tls:` block: `cert_file`/`key_file` must be set together (mutual TLS needs
     both, not one alone); `insecure_skip_verify` together with `ca_file` is contradictory and
     rejected; and a non-empty `tls:` under a plain `http://`/`grpc://` endpoint is rejected —
     TLS is selected by `endpoint`'s scheme
     (`docs/adr/otlp-tls-and-pooled-grpc-client.md`), so a `tls:` block with nothing to tune would
-    otherwise be silently ignored rather than caught as a likely mistake. (Also drifted from the
-    code's own numbering, per the note on rule 12 — `graph::resolve`'s comment still calls this
-    "Rule 22," carried over unrenumbered from before rules 19/20 above were split out of one.)
+    otherwise be silently ignored rather than caught as a likely mistake.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

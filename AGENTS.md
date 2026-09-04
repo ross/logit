@@ -17,10 +17,11 @@ Lua enrichment stage, InfluxDB 2.x out, via `logit run <config>` (see
 [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml), `script/server`). Since then,
 `syslog_in`, `stdio_out`, `otlp_in`, and `otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`,
 `crates/logit-proto`'s `otlp` codec) and `json`, `kv_metrics`, `keep`, `remove`, `set`,
-`trace_context` (the last giving a `LogRecord` a native application trace/span reference,
-[ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md)), `has_signal`,
-`keep_signals`, and `drop_signals` (`crates/logit-transforms`) have all landed as real, implemented
-`ComponentKind`s —
+`trace_context` (giving a `LogRecord` a native application trace/span reference,
+[ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md)), `scale` (multiplying
+named numeric attributes by a constant factor,
+[ADR `scale-transform`](docs/adr/scale-transform.md)), `has_signal`, `keep_signals`, and
+`drop_signals` (`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises the syslog/InfluxDB
 side together against a real nginx (`examples/nginx/`), and
 [docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside
@@ -54,6 +55,7 @@ graph <config>` prints the resolved graph as graphviz DOT (`crates/logit-cli/src
 [ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md) for `aggregate`'s windowing semantics,
 [ADR `json-parsing-into-attributes`](docs/adr/json-parsing-into-attributes.md) for `json`'s parsing semantics,
 [ADR `kv-metrics-semantics`](docs/adr/kv-metrics-semantics.md) for `kv_metrics`'/`keep`'s semantics,
+[ADR `scale-transform`](docs/adr/scale-transform.md) for `scale`'s unit-conversion semantics,
 [ADR `service-lifecycle-and-output-retry`](docs/adr/service-lifecycle-and-output-retry.md) for signal-driven shutdown and
 `influxdb_out`'s bounded output retry, `crates/logit-inputs/src/statsd.rs` and
 `crates/logit-outputs/src/influxdb.rs` for the listener/sink side, `crates/logit-pipeline/src/runtime.rs`
@@ -201,7 +203,7 @@ crates/
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, internal (self-telemetry)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, syslog
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove, set, trace_context, has_signal, keep_signals, drop_signals
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
 ```

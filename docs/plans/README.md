@@ -6,6 +6,8 @@ each file's frontmatter is what orders this index, not the filename.
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Enabling plan: a traced demo stack — HAProxy → nginx → app](demo-tracing-stack.md) | 2026-09-03 | 2026-09-03 |
+| [Enabling plan: browser tracing for the demo](browser-tracing.md) | 2026-09-03 | 2026-09-03 |
 | [Closing plan: TLS for `otlp_out`/`otlp_in`](otlp-tls.md) | 2026-09-03 | 2026-09-03 |
 | [Closing plan: signal-aware filter components, and `otlp_out`'s remaining config gaps](signal-filtering-and-otlp-out-config-gaps.md) | 2026-09-03 | 2026-09-03 |
 | [Enabling plan: operator-declared resource identity, and a Loki-direct log leg](otlp-logs-and-resource-identity.md) | 2026-09-02 | 2026-09-03 |

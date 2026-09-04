@@ -513,7 +513,7 @@ already built that have a known, accepted rough edge.
     PR) is what actually closes this item, not ADR `internal-span-emission-and-deterministic-sampling` alone.** Everything above built a real
     `SpanRecord` inside `logit`'s own process; nothing tested whether the result was a span *any
     other system would recognize*. `otlp_out` (ADR `committed-pregenerated-otlp-protobuf`'s codec, ADR `hand-rolled-grpc-over-hyper`'s hand-rolled gRPC
-    transport) is that proof: `demo/logit.yaml`'s `trace_out` exports `internal`'s spans to a real
+    transport) is that proof: `demo/logit.yaml`'s `tempo_out` exports `internal`'s spans to a real
     Tempo over OTLP/gRPC, and Grafana's Tempo panel shows the actual parent/child tree a config's
     topology produces -- a listener root with transform/sink children, matching
     `pipeline-graph.md`'s table exactly. That is the end-to-end proof this entry was missing: not
@@ -693,9 +693,23 @@ already built that have a known, accepted rough edge.
   bounded the same way `otlp_out` bounds it on encode; see
   [ADR `otlp-compression-and-decompression-bounds`](adr/otlp-compression-and-decompression-bounds.md).)
 
+- **`otlp_in` only accepts OTLP/protobuf, not OTLP/JSON.** `crates/logit-inputs/src/otlp.rs`
+  rejects any `Content-Type` other than `application/x-protobuf`/`application/protobuf` with a
+  `415` and an explicit message (line ~194) — a deliberate scope cut for the PR that added
+  `otlp_in`, not an oversight. It's now a real blocker for one concrete consumer:
+  [docs/plans/browser-tracing.md](plans/browser-tracing.md) (workstream C of
+  [demo-tracing-stack.md](plans/demo-tracing-stack.md)) wants a real OpenTelemetry-JS browser SDK
+  exporting spans into the demo, and every browser trace exporter speaks OTLP/JSON —
+  `@opentelemetry/exporter-trace-otlp-proto` is Node-only (protobuf-in-the-browser has been an
+  open upstream request since 2022, `open-telemetry/opentelemetry-js#3118`). Closing this is a
+  bounded, well-specified feature — OTLP/JSON is a documented 1:1 mapping of the same protobuf
+  messages onto JSON, not a new wire format — but it's `logit-proto`/`otlp_in` work, not demo
+  work, which is why `browser-tracing.md` stopped short of it rather than reaching into `logit`
+  to build it in passing.
+
 - **`otlp_out` aborts an entire batch's `send` on the first signal request that fails -- pointed at
   a signal-partial backend fed by a mixed-signal source, that's not just noise, it can end the
-  process.** Discovered running `demo/`'s `trace_out` against Tempo
+  process.** Discovered running `demo/`'s `tempo_out` against Tempo
   ([docs/plans/otlp-end-to-end.md](plans/otlp-end-to-end.md)), not anticipated by that
   plan. `internal` (`self`, observing `logit`'s own pipeline) doesn't distinguish signals -- every
   drain carries both spans and this process's own `logit.*` metrics (all `Counter`/`Gauge`/
@@ -710,7 +724,7 @@ already built that have a known, accepted rough edge.
   against Tempo's `/api/search`/`/api/traces` endpoints.
 
   **That alone is recoverable noise. Pointed straight at `self` with nothing in between, it is not
-  recoverable at all.** `self`'s 10s drain interval meant *every* `trace_out` batch mixed both
+  recoverable at all.** `self`'s 10s drain interval meant *every* `tempo_out` batch mixed both
   signals, so `send` never once returned `Ok`, `last_success` never advanced, and `write_loop`'s
   ~60s sustained-permanent-failure guard
   ([ADR `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md), revised by
@@ -720,10 +734,10 @@ already built that have a known, accepted rough edge.
   demo whose "misconfiguration" is actually two signals correctly reaching a backend that only
   wants one is exactly the false-positive case it wasn't built to distinguish. `demo/logit.yaml`
   fixes this at the config layer: `trace_only` (`type: has_signal`, `signals: [traces]`) sits
-  between `self` and `trace_out`, dropping every metric-only drain and forwarding every span-only
+  between `self` and `tempo_out`, dropping every metric-only drain and forwarding every span-only
   one untouched ([ADR `signal-filtering-components`](adr/signal-filtering-components.md)) -- unlike
   the `aggregate`-based workaround this replaced, `has_signal` never mutates a forwarded event and
-  never lets a metrics-only batch reach `trace_out` at all, so the guard's streak never resets from
+  never lets a metrics-only batch reach `tempo_out` at all, so the guard's streak never resets from
   a near-miss; there's simply nothing left for it to trip on.
 
   This is specific to pointing `otlp_out` at a mixed-signal source feeding a signal-partial
@@ -733,7 +747,7 @@ already built that have a known, accepted rough edge.
   per-signal partial-failure mode on `OtlpOutput::send` that doesn't abort sibling signals already
   in flight and doesn't let one incompatible signal alone trip the sustained-failure guard for
   signals that are succeeding remains a separate, unfiled possible improvement to `otlp_out`
-  itself. `demo/logit.yaml`'s `trace_only`/`trace_out` components carry this same explanation
+  itself. `demo/logit.yaml`'s `trace_only`/`tempo_out` components carry this same explanation
   inline.
 
 - **No mechanism exists anywhere in `logit` to attach a static attribute to a batch's resource** —

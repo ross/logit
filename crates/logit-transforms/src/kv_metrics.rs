@@ -8,10 +8,10 @@
 //! Stateless -- like `json`, only `process` is overridden; `flush_interval`/`flush` keep the
 //! `Transform` trait's defaults.
 
+use crate::numeric;
 use logit_core::interner::{intern, resolve};
 use logit_core::{
     AttrMap, DdSketch, Diagnostics, Event, MetricKind, MetricRecord, Resource, Symbol, Telemetry,
-    Value,
 };
 use logit_pipeline::Transform;
 use std::sync::Arc;
@@ -185,27 +185,10 @@ fn metric_value(m: &CompiledMetric, attrs: &AttrMap) -> Option<f64> {
     }
 }
 
-/// Coerces a `Value` to a finite `f64`: `I64`/`U64`/`F64` directly, or a `Str` that parses
-/// cleanly to a finite `f64` (so it works whether the source JSON quoted the value or not).
-/// `Bool`, `Null`, `Bytes`, `Timestamp`, `Array`, and `Map` never coerce. Deliberately *not* a
-/// general `Value::as_f64` on `logit-core`: a general method that silently parses strings would be
-/// a surprising API for every other caller of `Value` (`docs/adr/kv-metrics-semantics.md`),
-/// so this stays private to this module.
-fn numeric(value: &Value) -> Option<f64> {
-    let v = match value {
-        Value::I64(n) => *n as f64,
-        Value::U64(n) => *n as f64,
-        Value::F64(n) => *n,
-        Value::Str(_) => value.as_str().and_then(|s| s.parse::<f64>().ok())?,
-        _ => return None,
-    };
-    v.is_finite().then_some(v)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::{BodyFormat, LogRecord, SpanEvent, SpanKind, SpanRecord, SpanStatus};
+    use logit_core::{BodyFormat, LogRecord, SpanEvent, SpanKind, SpanRecord, SpanStatus, Value};
 
     fn spec(name: &str, field: Option<&str>) -> MetricSpec {
         MetricSpec { name: name.to_string(), field: field.map(String::from), unit: None }

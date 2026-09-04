@@ -477,6 +477,30 @@
           }
         },
         {
+          "description": "Multiplies named numeric attributes by a constant factor, in place -- unit conversion (nginx's `request_time` in seconds -> milliseconds, say, to share a measurement name with a source that already reports milliseconds) without a Lua script. See `docs/adr/scale-transform.md`. A missing or non-numeric attribute is a silent skip for that field, never a dropped event -- the same posture `KvMetrics` takes toward its own fields.",
+          "type": "object",
+          "required": [
+            "fields",
+            "type"
+          ],
+          "properties": {
+            "fields": {
+              "description": "Attribute name -> multiplication factor. At least one entry is required -- rejected at graph-validation time otherwise, the same \"can only ever be a no-op\" rule `KvMetrics` and `Set` already have.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "number",
+                "format": "double"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "scale"
+              ]
+            }
+          }
+        },
+        {
           "description": "Drops an event that doesn't carry a wanted signal -- e.g. `signals: [traces]` ahead of a traces-only sink like Tempo, fed from a source (`internal`) whose drains also carry metrics. Never mutates a forwarded event: under the default `mode: any_of`, an event carrying a listed signal is forwarded exactly as it arrived, including any signal *not* listed. `mode: only` additionally requires the event carry nothing outside `signals`. Place `keep_signals`/`drop_signals` ahead of this instead if disallowed payloads must actually be stripped, not just tolerated. `signals` may not be empty -- see `docs/adr/signal-filtering-components.md`.",
           "type": "object",
           "required": [

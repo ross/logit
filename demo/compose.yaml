@@ -45,7 +45,7 @@ services:
       - grafana_data:/var/lib/grafana
     networks: [demo]
 
-  # Log backend -- receives `logit`'s own log lines directly over OTLP/HTTP from `log_out`
+  # Log backend -- receives `logit`'s own log lines directly over OTLP/HTTP from `loki_out`
   # (demo/logit.yaml, docs/plans/otlp-logs-and-resource-identity.md's workstream B; no relay
   # service in between). Unlike the old demo writer, `hello` below doesn't also write to Loki
   # directly -- `logit`'s own `otlp_out` is the only path in.
@@ -68,7 +68,7 @@ services:
       - loki_data:/loki
     networks: [demo]
 
-  # Trace backend -- receives `logit`'s own internal spans over OTLP/gRPC from `trace_out`
+  # Trace backend -- receives `logit`'s own internal spans over OTLP/gRPC from `tempo_out`
   # (demo/logit.yaml), provisioned in Grafana with `tracesToLogsV2` pointed at Loki -- both Loki
   # and Tempo receive real data now (demo/grafana/provisioning/datasources/datasources.yaml).
   tempo:
@@ -104,7 +104,7 @@ services:
         condition: service_healthy
       # `service_started`, not `service_healthy` -- `tempo` (above) declares no healthcheck at
       # all, so `service_started` is the honest limit anyway (same reasoning as `hello`'s
-      # dependency on `logit` below). Unlike `influxdb_out`/`otlp_out`'s Loki leg, `trace_out`
+      # dependency on `logit` below). Unlike `influxdb_out`/`otlp_out`'s Loki leg, `tempo_out`
       # doesn't need Tempo up first for a clean start: it retries through `write_loop` like any
       # other sink (ADR `service-lifecycle-and-output-retry`'s bounded output retry), so a `logit`
       # that starts before Tempo finishes booting just retries its first few span exports rather
@@ -119,20 +119,21 @@ services:
       demo:
         aliases: [logit]
 
-  # -- The demo's front door, and the graph render that feeds it ------------------------------
+  # -- The demo's front door, and the two graph renders that feed it --------------------------
   #
   # `logit graph` prints DOT; turning that into an SVG needs graphviz, which the release image
-  # doesn't (and shouldn't) carry. So: two one-shot containers, chained by
-  # `service_completed_successfully`, writing through a shared `graph_data` volume. This is
-  # runtime sequencing, not build-time -- `up --build` finishes every build before starting any
-  # container, but doesn't order builds relative to each other, so a cross-image
-  # `COPY --from=<another service's image>` at build time would be a race; depends_on isn't.
+  # doesn't (and shouldn't) carry. So: one-shot containers, chained by
+  # `service_completed_successfully` where there's a real dependency (graph-dot -> graph-svg),
+  # writing through a shared `graph_data` volume. This is runtime sequencing, not build-time --
+  # `up --build` finishes every build before starting any container, but doesn't order builds
+  # relative to each other, so a cross-image `COPY --from=<another service's image>` at build time
+  # would be a race; depends_on isn't.
   #
   # Note for podman-compose (script/common.sh's DOCKER=podman): `service_completed_successfully`
-  # is reportedly unimplemented there and may be ignored rather than honored, in which case
-  # `hello` can start before `graph-svg` finishes. Harmless either way -- see `hello`'s
-  # _load_graph_svg, which reads the file fresh per request rather than caching it, so a page
-  # load a few seconds later just works.
+  # is reportedly unimplemented there and may be ignored rather than honored, in which case `app`
+  # can start before `graph-svg`/`arch-svg` finish. Harmless either way -- see `app`'s
+  # `pages.views._serve_svg`, which reads each file fresh per request rather than caching it, so a
+  # page load a few seconds later just works.
 
   # Step 1: render the pipeline config to DOT, from the very image the demo is running.
   graph-dot:
@@ -167,41 +168,136 @@ services:
         condition: service_completed_successfully
     # `test -s` first: a config that fails to *load* leaves graph-dot's redirect writing nothing
     # at all (as opposed to the semantic-validation-failure case, which still writes real DOT).
-    # Either way this must exit 0, or `hello` (below) never starts.
+    # Either way this must exit 0, or `app` (below) never starts.
     command: ["test -s /graph/logit.dot && dot -Tsvg /graph/logit.dot -o /graph/logit.svg || true"]
     volumes:
       - graph_data:/graph
     networks: [demo]
 
-  # Step 3: the page a visitor actually lands on, and the demo's traffic source -- it logs its
-  # own real requests plus a background stream of synthetic ones, the same RFC 3164 + JSON-body
-  # shape crates/logit-bench/src/fixtures.rs measures (NGINX_SYSLOG_LINE), so this exercises a
-  # workload someone actually runs, not a made-up one. Replaces the old writer service's bash
-  # loop; unlike it, this doesn't also write to Loki directly -- `logit`'s own `log_out` is the
-  # only path in, the same way `influx_out`/`trace_out` are the only paths into InfluxDB and
-  # Tempo.
-  #
-  # A stock image plus a bind-mounted script, not a Dockerfile: it's stdlib-only Python, so
-  # there's nothing to install and nothing to rebuild after an edit.
-  hello:
-    image: docker.io/library/python:3.14-slim
-    command: ["python3", "/app/app.py"]
+  # A second, independent diagram: the demo's service architecture (who talks to whom, and what
+  # *kind* of traffic -- web/logging/tracing/metrics/query), shown just above the pipeline diagram
+  # on the landing page. Unlike graph-dot -> graph-svg above, there's no generation step first --
+  # demo/architecture.dot is hand-authored (see its own header comment for why: no single
+  # machine-readable source encodes "traffic type" the way demo/logit.yaml encodes the pipeline),
+  # so this just renders it, reusing the same Graphviz image graph-svg already builds. No
+  # `depends_on: graph-svg` -- independent output file, no shared input, and `up --build` finishes
+  # every image build before starting any container either way (graph-dot's own comment above).
+  arch-svg:
+    image: logit-demo-graph-renderer:latest
+    command: ["dot -Tsvg /architecture.dot -o /graph/architecture.svg"]
+    volumes:
+      - ./architecture.dot:/architecture.dot:ro
+      - graph_data:/graph
+    networks: [demo]
+
+  # Step 3: the innermost tier a request reaches -- no longer the demo's front door or its own
+  # traffic source (docs/plans/demo-tracing-stack.md's workstream A). Sits behind `nginx` below;
+  # `traffic` drives requests through the whole haproxy -> nginx -> app chain. A real Django app
+  # now (workstream B) -- replaces `hello`'s stdlib stub, so unlike every other bind-mounted script
+  # in this stack, this one is a real image build: `demo/app/Dockerfile`, not "nothing to install."
+  # Writes into `logit` for its access log only (syslog, `app_in`, :5142, same reasoning as every
+  # other tier's own listener). Its own OTel request spans bypass `logit` entirely and go straight
+  # to `tempo`'s own OTLP/HTTP receiver (below) -- deliberate, not every telemetry leg needs
+  # `logit` in front of it, and `demo/logit.yaml`'s header comment explains why this is the one
+  # that doesn't. `otlp_in` (`crates/logit-inputs/src/otlp.rs`) is consequently still unexercised
+  # by this demo.
+  app:
+    build:
+      context: ./app
+    image: logit-demo-app:latest
     depends_on:
       graph-svg:
+        condition: service_completed_successfully
+      arch-svg:
         condition: service_completed_successfully
       # UDP is fire-and-forget, so `logit` not being bound yet just loses lines silently rather
       # than failing -- `service_started` is the honest limit, there's no way to know a UDP
       # listener is actually bound short of a manual probe (docs/deploying.md's "ordering rule").
       logit:
         condition: service_started
+      # The OTLP/HTTP leg below is TCP and does get retried by the exporter's own SDK-level retry
+      # (a `BatchSpanProcessor` export failure just gets dropped and retried on the next batch, no
+      # crash), so `service_started` is no less honest a limit for `tempo` either -- same reasoning
+      # `logit`'s own dependency on `tempo` above already uses for `tempo_out`.
+      tempo:
+        condition: service_started
     environment:
       # The URL a *browser on the host* uses, not a container-network name.
       GRAFANA_URL: http://localhost:3000
+      LOGIT_PORT: "5142" # app_in, not haproxy_in/nginx_in -- see demo/logit.yaml
+      OTEL_SERVICE_NAME: demo-app
+      # Straight to Tempo's OTLP/HTTP receiver (demo/tempo/tempo.yaml's `otlp.protocols.http`,
+      # :4318) -- not `logit`. See the comment above and demo/logit.yaml's header comment for why.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf # documentation -- see gunicorn.conf.py's comment
+    # No longer published -- haproxy is the front door now.
+    volumes:
+      - graph_data:/graph:ro
+    restart: unless-stopped
+    networks: [demo]
+
+  # Step 4: nginx, relaying and logging the W3C traceparent haproxy mints. See
+  # demo/nginx/nginx.conf's header comment.
+  nginx:
+    image: docker.io/library/nginx:1.27-alpine
+    depends_on:
+      app:
+        condition: service_started
+      logit:
+        condition: service_started
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:z,ro
+    networks: [demo]
+
+  # Step 5: the demo's front door. Mints (or reuses) a W3C traceparent, forwards it to nginx, and
+  # is what `traffic` and any browser actually talk to. See demo/haproxy/haproxy.cfg's header
+  # comment.
+  haproxy:
+    image: docker.io/library/haproxy:3.0-alpine
+    depends_on:
+      nginx:
+        condition: service_started
+      logit:
+        condition: service_started
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:z,ro
     ports:
       - "8080:8080"
-    volumes:
-      - ./hello/app.py:/app/app.py:z,ro
-      - graph_data:/graph:ro
+    networks: [demo]
+
+  # The demo's traffic source, replacing `hello`'s old in-process synthetic loop (which fabricated
+  # syslog lines directly and so never crossed haproxy/nginx, carrying no trace context). Low
+  # volume by design -- this is a demo showing correlation working, not a load test. A stock image
+  # and an inline loop, not a Dockerfile, for the same "nothing to build" reason `hello` is one.
+  traffic:
+    image: docker.io/curlimages/curl:8.11.1
+    depends_on:
+      haproxy:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
+    # `$$p`, not `$p`: compose interpolates `$VAR`/`${VAR}` in this file itself before the string
+    # ever reaches the container's shell (confirmed empirically: unescaped, compose warned about
+    # an unset variable "p" and substituted an empty string, so every request hit "haproxy:8080"
+    # instead of cycling through the four paths below).
+    #
+    # A YAML *sequence* of one string, like graph-dot's/graph-svg's `command: ["..."]` above --
+    # NOT a bare scalar. Compose word-splits a bare-scalar `command:` itself (the same short-form
+    # normalization that turns `command: python3 app.py` into `["python3", "app.py"]`), stopping
+    # at the first `;` -- confirmed empirically: a bare multi-line scalar here resolved
+    # (`docker compose config`) to just `["while", "true"]`, silently discarding everything after,
+    # which `/bin/sh -c` then read as a bodyless `while true` and errored `unexpected end of file
+    # (expecting "do")`. Wrapping the whole script as one list element makes it a single opaque
+    # argv entry -- exactly what `-c` needs -- with no compose-side splitting at all. `|` (literal
+    # block) inside that one element keeps every line break a real newline, which the shell inside
+    # the container treats as a statement separator exactly like `;`.
+    command:
+      - |
+        while true; do
+          for p in / /health /graph.svg /missing; do
+            curl -s -o /dev/null "http://haproxy:8080$$p" || true
+            sleep 2
+          done
+        done
     restart: unless-stopped
     networks: [demo]
 

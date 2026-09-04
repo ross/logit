@@ -25,10 +25,21 @@ datasources:
     access: proxy
     url: http://loki:3100
     jsonData:
-      # A `trace_id=<hex>` in a log line becomes a click-through to Tempo. Costs nothing today --
-      # nothing emits a matching log line yet -- and lights up the moment something does.
+      # Two derived fields, both click through to the same Tempo trace. The label matcher is the
+      # one that actually fires against real data (docs/plans/demo-tracing-stack.md's workstream
+      # A): demo/logit.yaml's `trace_context` transforms lift each tier's trace_id/span_id onto
+      # LogRecord.trace with `keep_source` at its default `false`, so the id leaves the log body
+      # and becomes Loki's *native* trace_id structured metadata via OTLP ingestion, not text in
+      # the message. The body-regex field is kept as a fallback for any log line that names an id
+      # inline instead.
       derivedFields:
-        - name: TraceID
+        - name: TraceID (structured metadata)
+          datasourceUid: tempo
+          matcherType: label
+          matcherRegex: trace_id
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View trace"
+        - name: TraceID (body)
           datasourceUid: tempo
           matcherRegex: '(?:trace_id|traceID|traceid)[=":\s]+([a-fA-F0-9]{16,32})'
           # `$$` (not `$`): Grafana's *provisioning* loader interpolates `${VAR}` as an

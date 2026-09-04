@@ -118,6 +118,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Remove { .. }
         | Set { .. }
         | TraceContext { .. }
+        | Scale { .. }
         | HasSignal { .. }
         | KeepSignals { .. }
         | DropSignals { .. }
@@ -163,6 +164,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         Remove { .. } => "remove",
         Set { .. } => "set",
         TraceContext { .. } => "trace_context",
+        Scale { .. } => "scale",
         HasSignal { .. } => "has_signal",
         KeepSignals { .. } => "keep_signals",
         DropSignals { .. } => "drop_signals",
@@ -202,6 +204,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Remove { .. }
             | ComponentKind::Set { .. }
             | ComponentKind::TraceContext { .. }
+            | ComponentKind::Scale { .. }
             | ComponentKind::HasSignal { .. }
             | ComponentKind::KeepSignals { .. }
             | ComponentKind::DropSignals { .. }
@@ -543,7 +546,33 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 20: `has_signal`/`keep_signals`/`drop_signals` need a non-empty `signals:`. For
+    // Rule 20: `scale`-specific validation -- an empty `fields` map can only ever be a no-op, the
+    // same reasoning rules 10-12/19 already apply to `kv_metrics`/`set`/`trace_context`; an empty
+    // field name could never match a real attribute for the same reason rule 19 rejects one on
+    // `trace_context`; a non-finite factor would only ever produce values `numeric` then rejects
+    // downstream (`crates/logit-transforms/src/lib.rs::numeric`), which is a confusing way to
+    // learn about what's almost certainly a config typo.
+    for (id, component) in &components {
+        if let ComponentKind::Scale { fields } = &component.kind {
+            if fields.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a scale with no 'fields' configured can only ever be a \
+                     no-op"
+                );
+            }
+            if fields.keys().any(|field| field.is_empty()) {
+                anyhow::bail!(
+                    "component '{id}': a scale field name must not be empty -- it could never \
+                     match a real attribute"
+                );
+            }
+            if fields.values().any(|factor| !factor.is_finite()) {
+                anyhow::bail!("component '{id}': every scale factor must be a finite number");
+            }
+        }
+    }
+
+    // Rule 21: `has_signal`/`keep_signals`/`drop_signals` need a non-empty `signals:`. For
     // `keep_signals`/`drop_signals`, an empty or all-three list is *always* rejected, but which
     // of the two is the silent-black-hole shape (rule 7's "no consumer" failure, here recast as
     // "no event ever gets through") and which is the no-op (every event forwarded completely
@@ -596,7 +625,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 20: an `otlp_out` `headers:` entry may not name a header the protocol itself sets
+    // Rule 22: an `otlp_out` `headers:` entry may not name a header the protocol itself sets
     // (see `RESERVED_OTLP_HEADERS`'s own doc comment for why `grpc-*` is a prefix check here,
     // not a fixed list), and no two entries may name the same header once case is ignored --
     // HTTP header names are case-insensitive, so e.g. `X-Scope-OrgID` and `x-scope-orgid` in the
@@ -635,7 +664,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 21: `otlp_out`'s `paths:` is HTTP-only -- gRPC method names are fixed by the `.proto`
+    // Rule 23: `otlp_out`'s `paths:` is HTTP-only -- gRPC method names are fixed by the `.proto`
     // service definitions, not a mount point an operator can move, so a non-empty `paths:` under
     // `protocol: grpc` is rejected rather than silently ignored (the same instinct as rule 14's
     // `buffer:` on a non-sink, and rule 17's `receive:` on a non-datagram listener).
@@ -651,12 +680,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 22: `otlp_out`'s `tls:` block. `cert_file`/`key_file` must be set together -- a lone
+    // Rule 24: `otlp_out`'s `tls:` block. `cert_file`/`key_file` must be set together -- a lone
     // one is almost certainly a typo, not a deliberate half-configured mTLS. `insecure_skip_verify`
     // together with `ca_file` is contradictory -- "trust this CA" and "trust nothing, verify
     // nothing" can't both be meant. And a non-empty `tls:` under a plain `http://`/`grpc://`
     // endpoint is rejected outright, the same instinct as rule 14's `buffer:` on a non-sink and
-    // rule 21's `paths:` under `protocol: grpc` -- TLS is selected by the endpoint's scheme
+    // rule 23's `paths:` under `protocol: grpc` -- TLS is selected by the endpoint's scheme
     // (`docs/adr/otlp-tls-and-pooled-grpc-client.md`), so a `tls:` block with nothing to tune
     // would otherwise be silently ignored rather than caught as a likely mistake.
     for (id, component) in &components {
@@ -1607,6 +1636,75 @@ mod tests {
         ]))
         .expect("should resolve");
         assert_eq!(graph.components["trace"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_scale_with_no_fields_configured_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "scale",
+                vec!["in"],
+                ComponentKind::Scale { fields: std::collections::BTreeMap::new() },
+            ),
+            ("out", vec!["scale"], sink()),
+        ]));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_scale_with_an_empty_field_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "scale",
+                vec!["in"],
+                ComponentKind::Scale {
+                    fields: std::collections::BTreeMap::from([(String::new(), 1000.0)]),
+                },
+            ),
+            ("out", vec!["scale"], sink()),
+        ]));
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn a_scale_with_a_non_finite_factor_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "scale",
+                vec!["in"],
+                ComponentKind::Scale {
+                    fields: std::collections::BTreeMap::from([(
+                        "request_time".to_string(),
+                        f64::NAN,
+                    )]),
+                },
+            ),
+            ("out", vec!["scale"], sink()),
+        ]));
+        assert!(err.contains("finite"), "got: {err}");
+    }
+
+    #[test]
+    fn a_scale_with_a_field_configured_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "scale",
+                vec!["in"],
+                ComponentKind::Scale {
+                    fields: std::collections::BTreeMap::from([(
+                        "request_time".to_string(),
+                        1000.0,
+                    )]),
+                },
+            ),
+            ("out", vec!["scale"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["scale"].role(), Role::Transform);
     }
 
     #[test]
