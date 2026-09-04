@@ -2,15 +2,17 @@
 //! "built-in native processors ... meant to sit in front of user Lua" split. Each implements
 //! `logit_pipeline::Transform`, letting the node runtime run it as an ordinary tokio task (no
 //! dedicated OS thread, unlike a Lua component -- `docs/design/pipeline-graph.md`'s "Node kinds"
-//! section). `aggregate`, `json`, `kv_metrics`, `keep`, `remove`, `set`, and `trace_context` are
-//! implemented so far; more (`logfmt`, `kv`, `regex`, `csv`, `rename`, `filter`, `sample`,
-//! `throttle`, `dedup`) are expected to land here too.
+//! section). `aggregate`, `json`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`,
+//! `has_signal`, `keep_signals`, and `drop_signals` are implemented so far; more (`logfmt`, `kv`,
+//! `regex`, `csv`, `rename`, `filter`, `sample`, `throttle`, `dedup`) are expected to land here
+//! too.
 
 mod aggregate;
 mod json;
 mod keep;
 mod kv_metrics;
 mod set;
+mod signals;
 mod trace_context;
 
 pub use aggregate::Aggregator;
@@ -18,6 +20,7 @@ pub use json::JsonParser;
 pub use keep::{Keep, Remove};
 pub use kv_metrics::{KvMetrics, MetricSpec};
 pub use set::Set;
+pub use signals::{DropSignals, HasSignal, KeepSignals, MatchMode, SignalSet};
 pub use trace_context::TraceContext;
 
 /// Integration coverage across module boundaries -- each transform above is unit-tested in its
@@ -126,5 +129,54 @@ mod chained_pipeline_test {
                 other => panic!("unexpected series name: {other}"),
             }
         }
+    }
+
+    /// The workstream B (Loki-direct) shape from `docs/plans/otlp-logs-and-resource-identity.md`:
+    /// a `json -> kv_metrics -> keep_signals[logs]` chain proves the derived metrics are stripped
+    /// off before a logs-only sink would see the event, while the log body itself survives
+    /// untouched -- `keep_signals` mutates the payload, unlike `has_signal`.
+    #[test]
+    fn json_kv_metrics_keep_signals_chain_strips_derived_metrics_and_keeps_the_log() {
+        let resource = Arc::new(Resource::default());
+
+        let raw = r#"{"status":200,"body_bytes_sent":512}"#;
+        let event = Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str(raw),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
+        );
+
+        let mut json = JsonParser::new(false);
+        let event = json.process(&resource, event).expect("json always forwards");
+
+        let mut kv = KvMetrics::new(
+            vec![MetricSpec {
+                name: "nginx.bytes_sent".to_string(),
+                field: Some("body_bytes_sent".to_string()),
+                unit: None,
+            }],
+            vec![],
+            vec![],
+        );
+        let event = kv.process(&resource, event).expect("kv_metrics always forwards");
+        assert_eq!(event.metrics.len(), 1, "one derived counter");
+
+        let mut keep_logs =
+            KeepSignals::new(SignalSet { logs: true, metrics: false, traces: false });
+        let event = keep_logs.process(&resource, event).expect("the log half survives");
+        assert!(
+            event.metrics.is_empty(),
+            "derived metrics must be stripped before a logs-only sink"
+        );
+        assert_eq!(
+            event.log.as_ref().unwrap().message,
+            Value::str(raw),
+            "the log body is untouched"
+        );
     }
 }

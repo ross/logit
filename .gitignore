@@ -6,3 +6,4 @@ __pycache__/
 # tools/* are each their own standalone [workspace] (never a member of the root one -- see
 # tools/protogen/Cargo.toml), so their build output lands in their own target/, not the root one.
 /tools/*/target
+.code-graph/

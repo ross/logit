@@ -59,9 +59,38 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # HTTP client (otlp_out's HTTP transport); these are for otlp_in's server (both transports) and
 # otlp_out's gRPC client.
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+# `client-legacy` (+ `http2`) is otlp_out's gRPC connection manager (docs/adr/otlp-tls-and-pooled-grpc-client.md)
+# -- a `hyper_util::client::legacy::Client` replaces the hand-rolled per-request TcpStream connect,
+# which is what gives the gRPC transport both TLS and connection pooling in one move.
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-legacy", "http2"] }
 http = "1"
 http-body-util = "0.1"
+# otlp_out's optional gzip request compression and otlp_in's matching decode
+# (docs/adr/otlp-compression-and-decompression-bounds.md) -- default features only, which pulls in
+# the pure-Rust `miniz_oxide` backend rather than a C zlib, keeping "no host toolchain needed"
+# intact (ADR `containerized-development`).
+flate2 = "1"
+# TLS for otlp_out (both transports) and otlp_in (docs/adr/otlp-tls-and-pooled-grpc-client.md).
+# All four already resolve in Cargo.lock at these exact versions, transitively via `reqwest`'s
+# `rustls-tls` feature -- promoting them to direct dependencies adds no new crate version to the
+# graph (script/audit confirms, not assumes). `ring` is the crypto provider throughout; `aws-lc-rs`
+# is never enabled -- it needs a C toolchain, which would break `containerized-development`'s "no
+# host toolchain needed" property.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# PEM parsing (`CertificateDer::pem_slice_iter`, `PrivateKeyDer::from_pem_slice`, ...) lives behind
+# this crate's `std` feature -- there is no separate `pem` feature, confirmed against the vendored
+# crate source, not assumed. `rustls-pemfile` is deprecated in this crate's favor, so this is the
+# one PEM parser in the dependency graph, not a second one.
+rustls-pki-types = { version = "1", features = ["std"] }
+# otlp_in's TLS acceptor, and a dev-only canned-TLS-server helper for otlp_out's tests.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+# otlp_out's gRPC transport: TLS + connection pooling via `HttpsConnector` under `hyper-util`'s
+# client. `native-tokio` is deliberately NOT enabled -- that feature pulls in `rustls-native-certs`,
+# a new crate this decision doesn't need (see the ADR's "default trust store" note).
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "logging"] }
+# The bundled Mozilla root set otlp_out's HTTP transport already trusts by default via `reqwest`;
+# promoted to a direct dependency so otlp_out's gRPC transport can use the identical default.
+webpki-roots = "1"
 
 [profile.release]
 lto = true

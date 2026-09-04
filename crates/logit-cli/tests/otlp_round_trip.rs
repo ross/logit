@@ -11,8 +11,10 @@ use logit_core::{
     AttrMap, BodyFormat, Event, EventBatch, LogRecord, MetricKind, MetricRecord, Resource,
     SpanKind, SpanRecord, SpanStatus, TraceRef, Value,
 };
-use logit_inputs::otlp::{OtlpInput, OtlpTransport as InTransport};
-use logit_outputs::otlp::{OtlpOutput, OtlpTransport as OutTransport};
+use logit_inputs::otlp::{OtlpInput, OtlpTransport as InTransport, TlsServerSettings};
+use logit_outputs::otlp::{
+    OtlpCompression, OtlpOutput, OtlpTransport as OutTransport, TlsClientSettings,
+};
 use logit_pipeline::{Fanout, Input, Output};
 use std::sync::Arc;
 use std::time::Duration;
@@ -138,4 +140,128 @@ async fn otlp_output_to_otlp_input_round_trips_a_batch_through_grpc() {
 
     let received = round_trip(input, output, &mixed_signal_batch()).await;
     assert_round_tripped(&received);
+}
+
+/// The pair `docs/adr/otlp-compression-and-decompression-bounds.md` exists for: proves
+/// `otlp_out`'s gzip compression and `otlp_in`'s matching decode landed together, not just that
+/// each side's own unit tests pass in isolation.
+#[tokio::test]
+async fn otlp_output_to_otlp_input_round_trips_a_gzip_compressed_batch_through_http() {
+    let addr = ephemeral_addr().await;
+    let input = OtlpInput::new(addr.clone(), InTransport::Http);
+    let output = OtlpOutput::new(format!("http://{addr}"), OutTransport::Http)
+        .unwrap()
+        .with_compression(OtlpCompression::Gzip);
+
+    let received = round_trip(input, output, &mixed_signal_batch()).await;
+    assert_round_tripped(&received);
+}
+
+#[tokio::test]
+async fn otlp_output_to_otlp_input_round_trips_a_gzip_compressed_batch_through_grpc() {
+    let addr = ephemeral_addr().await;
+    let input = OtlpInput::new(addr.clone(), InTransport::Grpc);
+    let output = OtlpOutput::new(addr.clone(), OutTransport::Grpc)
+        .unwrap()
+        .with_compression(OtlpCompression::Gzip);
+
+    let received = round_trip(input, output, &mixed_signal_batch()).await;
+    assert_round_tripped(&received);
+}
+
+/// The TLS counterpart to the four round trips above -- `docs/adr/otlp-tls-and-pooled-grpc-client.md`'s
+/// own strongest single test, the same role the gzip pair plays for compression: proves
+/// `otlp_out`'s client TLS and `otlp_in`'s server TLS actually interoperate, not just that each
+/// side's own unit tests pass against a hand-built canned peer in isolation.
+mod tls {
+    use super::*;
+
+    fn testdata_dir() -> std::path::PathBuf {
+        // `logit-cli` lives at `crates/logit-cli`; the fixtures live at the repo root's
+        // `testdata/tls` (`testdata/tls/README.md`) -- two levels up from `CARGO_MANIFEST_DIR`.
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
+    }
+
+    #[tokio::test]
+    async fn otlp_output_to_otlp_input_round_trips_a_batch_through_https() {
+        let addr = ephemeral_addr().await;
+        let input = OtlpInput::new(addr.clone(), InTransport::Http)
+            .with_tls(
+                &TlsServerSettings {
+                    cert_file: "server.pem".to_string(),
+                    key_file: "server.key".to_string(),
+                    client_ca_file: None,
+                },
+                &testdata_dir(),
+            )
+            .unwrap();
+        let output = OtlpOutput::new(format!("https://{addr}"), OutTransport::Http)
+            .unwrap()
+            .with_tls(
+                &TlsClientSettings { ca_file: Some("ca.pem".to_string()), ..Default::default() },
+                &testdata_dir(),
+            )
+            .unwrap();
+
+        let received = round_trip(input, output, &mixed_signal_batch()).await;
+        assert_round_tripped(&received);
+    }
+
+    #[tokio::test]
+    async fn otlp_output_to_otlp_input_round_trips_a_batch_through_grpc_over_tls() {
+        let addr = ephemeral_addr().await;
+        let input = OtlpInput::new(addr.clone(), InTransport::Grpc)
+            .with_tls(
+                &TlsServerSettings {
+                    cert_file: "server.pem".to_string(),
+                    key_file: "server.key".to_string(),
+                    client_ca_file: None,
+                },
+                &testdata_dir(),
+            )
+            .unwrap();
+        let output = OtlpOutput::new(format!("https://{addr}"), OutTransport::Grpc)
+            .unwrap()
+            .with_tls(
+                &TlsClientSettings { ca_file: Some("ca.pem".to_string()), ..Default::default() },
+                &testdata_dir(),
+            )
+            .unwrap();
+
+        let received = round_trip(input, output, &mixed_signal_batch()).await;
+        assert_round_tripped(&received);
+    }
+
+    /// Mutual TLS: `otlp_in` requires a client certificate chaining to `ca.pem`, `otlp_out`
+    /// presents `client.pem`/`client.key` -- both signed by the same test CA
+    /// (`testdata/tls/regen.sh`).
+    #[tokio::test]
+    async fn otlp_output_to_otlp_input_round_trips_a_batch_through_mutual_tls() {
+        let addr = ephemeral_addr().await;
+        let input = OtlpInput::new(addr.clone(), InTransport::Http)
+            .with_tls(
+                &TlsServerSettings {
+                    cert_file: "server.pem".to_string(),
+                    key_file: "server.key".to_string(),
+                    client_ca_file: Some("ca.pem".to_string()),
+                },
+                &testdata_dir(),
+            )
+            .unwrap();
+        let output = OtlpOutput::new(format!("https://{addr}"), OutTransport::Http)
+            .unwrap()
+            .with_tls(
+                &TlsClientSettings {
+                    ca_file: Some("ca.pem".to_string()),
+                    cert_file: Some("client.pem".to_string()),
+                    key_file: Some("client.key".to_string()),
+                    insecure_skip_verify: false,
+                },
+                &testdata_dir(),
+            )
+            .unwrap();
+
+        let received = round_trip(input, output, &mixed_signal_batch()).await;
+        assert_round_tripped(&received);
+    }
 }

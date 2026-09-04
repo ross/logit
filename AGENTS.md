@@ -16,10 +16,11 @@ something that looks broken — it's likely a documented, deliberate gap, not an
 Lua enrichment stage, InfluxDB 2.x out, via `logit run <config>` (see
 [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml), `script/server`). Since then,
 `syslog_in`, `stdio_out`, `otlp_in`, and `otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`,
-`crates/logit-proto`'s `otlp` codec) and `json`, `kv_metrics`, `keep`, `remove`, `set`, and
-`trace_context` (`crates/logit-transforms`, the last giving a `LogRecord` a native application
-trace/span reference, [ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md))
-have all landed as real, implemented `ComponentKind`s —
+`crates/logit-proto`'s `otlp` codec) and `json`, `kv_metrics`, `keep`, `remove`, `set`,
+`trace_context` (the last giving a `LogRecord` a native application trace/span reference,
+[ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md)), `has_signal`,
+`keep_signals`, and `drop_signals` (`crates/logit-transforms`) have all landed as real, implemented
+`ComponentKind`s —
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises the syslog/InfluxDB
 side together against a real nginx (`examples/nginx/`), and
 [docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside
@@ -75,9 +76,13 @@ see [ADR `internal-span-emission-and-deterministic-sampling`](docs/adr/internal-
 `internal-telemetry.md`'s "Spans" section. `docs/known-gaps.md`'s internal-spans entry tracks what's
 still open (the listener span's window, Lua `flush()`'s link-less root). `otlp_out` is what carries
 those spans, and the `internal` metrics alongside them, out over the wire (both OTLP/HTTP and
-OTLP/gRPC, a hand-rolled unary gRPC client/server over `hyper` rather than `tonic`,
-[ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md)); `otlp_in` is the mirror, implemented and
-tested but not yet exercised by the demo. `demo/`'s `trace_out` proves the whole chain against a
+OTLP/gRPC -- gRPC framing is a hand-rolled service over `hyper` rather than `tonic`
+([ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md)), but its client-side
+connection management is a pooled, TLS-capable `hyper-util`/`hyper-rustls` client, not a
+per-request hand-rolled connect; both `otlp_out` and `otlp_in` support TLS (`tls:` in config,
+private CAs and mutual TLS included) on both transports, selected by the endpoint's scheme
+([ADR `otlp-tls-and-pooled-grpc-client`](docs/adr/otlp-tls-and-pooled-grpc-client.md))); `otlp_in`
+is the mirror, implemented and tested but not yet exercised by the demo. `demo/`'s `trace_out` proves the whole chain against a
 real Tempo, exactly the way `log_out` proves `syslog_out` against a real Loki. `statsd_in`/`syslog_in`
 (`crates/logit-inputs/src/statsd.rs`/`syslog.rs`) are now thin wrappers over a shared
 `logit-inputs::udp::UdpListener` driver: a UDP listener's socket read and its decode/batch-assembly
@@ -196,7 +201,7 @@ crates/
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, internal (self-telemetry)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, syslog
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove, set, trace_context
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove, set, trace_context, has_signal, keep_signals, drop_signals
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
 ```

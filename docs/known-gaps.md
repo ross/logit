@@ -371,7 +371,11 @@ already built that have a known, accepted rough edge.
   that contained a real newline. Accepted in `docs/adr/syslog-output.md`.
 - **`syslog_out` has no TLS** — plaintext UDP/TCP only; RFC 5425 (syslog over TLS) and RFC 6012
   (DTLS) are both out of scope. A `logit -> remote collector` hop over an untrusted network has no
-  transport security today.
+  transport security today. `otlp_out`/`otlp_in` gained `tls:` config
+  ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)) via a
+  `TlsClientConfig`/`TlsServerConfig` pair in `logit-config` designed to be reusable by any other
+  protocol — `syslog_out`'s own TLS support, if it lands, is a config-plumbing exercise against
+  those same types, not a design decision to redo.
 - **`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
   per-message framing** — `syslog_out` needs one UDP datagram or one octet-counted TCP frame per
   *message*, which one opaque `Bytes` per *batch* can't express, so it bypasses the trait entirely
@@ -671,32 +675,23 @@ already built that have a known, accepted rough edge.
   qualification stated plainly, and `crates/logit-proto/src/otlp/metrics.rs`'s module doc for the
   full encode/decode tables this summarizes.
 
-- **`otlp_in` doesn't support compressed requests, and its `partial_success` response is always
-  empty.** Two separate, deliberate gaps in `crates/logit-inputs/src/otlp.rs`
-  ([ADR `hand-rolled-grpc-over-hyper`](adr/hand-rolled-grpc-over-hyper.md)):
-  - **Compression.** `Content-Encoding: gzip` (OTLP/HTTP) and `grpc-encoding: gzip` (OTLP/gRPC) are
-    both rejected outright (`415`/`grpc-status: 12`) rather than silently mishandled — `flate2`
-    isn't a dependency, and decompressing untrusted input unboundedly is real, security-relevant
-    surface (a compression-bomb-shaped request) this PR deliberately didn't take on. The practical
-    consequence: the OTel Collector's own default OTLP exporter sends gzip, so pointing a real
-    Collector at `otlp_in` fails on day one even though `otlp_out → otlp_in` (this PR's own
-    round-trip tests, which never set either header) works fine, and `otlp_out → Tempo` (PR4's demo
-    path) is unaffected since Tempo's own OTLP receiver doesn't require compression. Revisit with
-    `flate2` if a real deployment needs it.
-  - **`partial_success` accounting.** OTLP's `Export*ServiceResponse.partial_success` field exists
-    so a receiver can accept most of a request while reporting which records it rejected —
-    `otlp_out` (`crates/logit-outputs/src/otlp.rs`) fully implements the *reading* half of this (see
-    its `a_partial_success_response_is_counted_not_failed` tests). But
-    `logit_proto::SignalDecoder::decode_signal` doesn't return a per-call skip/reject count today —
-    only a self-telemetry counter (`logit.input.metrics.skipped{metric_kind, reason}`) — so there's
-    nothing for `otlp_in` to echo back into the wire response yet: every successful decode replies
-    with an empty (all-default, meaning "fully accepted") `partial_success`, even when the request
-    silently skipped a metric point internally (an over-cap exponential histogram, a
-    `NO_RECORDED_VALUE`-flagged point). A fully malformed request (bad protobuf, an invalid span id)
-    still correctly fails the *whole* request (`400`/`grpc-status: 3`), which is the one shape
-    `otlp_in`'s response *does* reflect today. Threading a real per-call count through would be a
-    `SignalDecoder` API change (`crates/logit-proto`), out of scope for the PR that added `otlp_in`
-    itself — a natural next step whenever OTLP input volume makes the gap worth closing.
+- **`otlp_in`'s `partial_success` response is always empty.** OTLP's
+  `Export*ServiceResponse.partial_success` field exists so a receiver can accept most of a request
+  while reporting which records it rejected — `otlp_out` (`crates/logit-outputs/src/otlp.rs`) fully
+  implements the *reading* half of this (see its `a_partial_success_response_is_counted_not_failed`
+  tests). But `logit_proto::SignalDecoder::decode_signal` doesn't return a per-call skip/reject
+  count today — only a self-telemetry counter (`logit.input.metrics.skipped{metric_kind, reason}`)
+  — so there's nothing for `otlp_in` to echo back into the wire response yet: every successful
+  decode replies with an empty (all-default, meaning "fully accepted") `partial_success`, even when
+  the request silently skipped a metric point internally (an over-cap exponential histogram, a
+  `NO_RECORDED_VALUE`-flagged point). A fully malformed request (bad protobuf, an invalid span id)
+  still correctly fails the *whole* request (`400`/`grpc-status: 3`), which is the one shape
+  `otlp_in`'s response *does* reflect today. Threading a real per-call count through would be a
+  `SignalDecoder` API change (`crates/logit-proto`), out of scope for the PR that added `otlp_in`
+  itself — a natural next step whenever OTLP input volume makes the gap worth closing.
+  (Compression was the other half of this entry — `otlp_in` now decodes gzip on both transports,
+  bounded the same way `otlp_out` bounds it on encode; see
+  [ADR `otlp-compression-and-decompression-bounds`](adr/otlp-compression-and-decompression-bounds.md).)
 
 - **`otlp_out` aborts an entire batch's `send` on the first signal request that fails -- pointed at
   a signal-partial backend fed by a mixed-signal source, that's not just noise, it can end the
@@ -724,50 +719,48 @@ already built that have a known, accepted rough edge.
   specifically to end a process stuck on a genuine misconfiguration (a bad token, a bad bucket); a
   demo whose "misconfiguration" is actually two signals correctly reaching a backend that only
   wants one is exactly the false-positive case it wasn't built to distinguish. `demo/logit.yaml`
-  works around this at the config layer: a dedicated `aggregate` node (`trace_windowed`) sits
-  between `self` and `trace_out`, absorbing every mergeable metric into window state and
-  forwarding a metric-less event -- a pure span -- untouched and immediately
-  (`crates/logit-transforms/src/aggregate.rs`'s `process` doc comment). That makes the overwhelming
-  majority of `trace_out`'s batches traces-only, so `send` succeeds and the guard's streak keeps
-  resetting; `trace_windowed`'s own periodic `flush` still occasionally emits a real metrics-only
-  batch that fails the same way, but the many successful pure-span deliveries surrounding it (every
-  ~10s, against one `flush` per 60s) reset the guard long before it reaches 60s.
+  fixes this at the config layer: `trace_only` (`type: has_signal`, `signals: [traces]`) sits
+  between `self` and `trace_out`, dropping every metric-only drain and forwarding every span-only
+  one untouched ([ADR `signal-filtering-components`](adr/signal-filtering-components.md)) -- unlike
+  the `aggregate`-based workaround this replaced, `has_signal` never mutates a forwarded event and
+  never lets a metrics-only batch reach `trace_out` at all, so the guard's streak never resets from
+  a near-miss; there's simply nothing left for it to trip on.
 
   This is specific to pointing `otlp_out` at a mixed-signal source feeding a signal-partial
   backend -- a production `otlp_out` scoped to a source that only ever carries the signals its
-  destination accepts would never hit either half of this. Not fixed at the source here
-  (`docs/plans/otlp-end-to-end.md` is config/docs only, no new Rust) -- the real fix is a
-  config-layer way to filter an event stream by which payload it carries (no existing transform
-  does this directly; `keep`/`remove` filter attributes, not `event.metrics`/`event.log`/
-  `event.span` themselves -- `aggregate` only does it as a side effect of absorbing metrics for a
-  different purpose) or a per-signal partial-failure mode on `OtlpOutput::send` that doesn't abort
-  sibling signals already in flight and doesn't let one incompatible signal alone trip the
-  sustained-failure guard for signals that are succeeding. `demo/logit.yaml`'s `trace_windowed`/
-  `trace_out` components carry this same explanation inline.
+  destination accepts would never hit either half of this. `has_signal` (and its
+  payload-stripping siblings `keep_signals`/`drop_signals`) is the general config-layer fix; a
+  per-signal partial-failure mode on `OtlpOutput::send` that doesn't abort sibling signals already
+  in flight and doesn't let one incompatible signal alone trip the sustained-failure guard for
+  signals that are succeeding remains a separate, unfiled possible improvement to `otlp_out`
+  itself. `demo/logit.yaml`'s `trace_only`/`trace_out` components carry this same explanation
+  inline.
 
-- **`otlp_out` has no custom headers, no compression, no gRPC TLS, and no per-signal filter** —
-  found evaluating whether it could replace the demo's `syslog_out` → Alloy → Loki log leg, and
-  later used to do exactly that
-  ([docs/plans/otlp-logs-and-resource-identity.md](plans/otlp-logs-and-resource-identity.md)'s
-  workstream E). No `X-Scope-OrgID`-equivalent header support rules out any multi-tenant Loki/Mimir/
-  Grafana Cloud target; `crates/logit-outputs/src/otlp.rs`'s frame encoder never sets the compressed
-  flag; `reject_insecure_grpc_endpoint` hard-rejects `https://` under `protocol: grpc` rather than
-  supporting it; and there's no way to say "logs only" at the sink — it sends whatever signals a
-  batch's events happen to carry. None of these block the demo (single-tenant, plaintext gRPC to
-  Tempo and plaintext HTTP to Loki); all of them block a real deployment. The compression half of
-  this mirrors the `otlp_in` gap above but was never itself filed until now.
+- **No mechanism exists anywhere in `logit` to attach a static attribute to a batch's resource** —
+  found in the same investigation
+  ([docs/plans/otlp-logs-and-resource-identity.md](plans/otlp-logs-and-resource-identity.md),
+  workstream A). Not config (no `attributes`/`labels`/`tags`/`resource` field on any input), not any
+  transform (`keep`/`json`/`kv_metrics`/`aggregate` only filter or derive), and Lua can mutate only
+  *event* attributes (`crates/logit-script/src/proxy.rs`'s `AttrsProxy`), never a resource. This is
+  what blocks giving `syslog_in`/`statsd_in` traffic a real `service.name` for OTLP-native backends
+  (Loki's index labels among them) without the just-landed rule that `logit`'s own code must not
+  invent one. The plan's workstream A sketches the fix — an operator-declared `resource:` config
+  field, landing on a new ADR distinguishing "code invents an identity" (still forbidden) from "an
+  operator configuring the pipeline declares one" (fine, same category as `syslog_out`'s existing
+  `hostname`/`app_name` fields) — plus the demo-stack workstreams (B, C, D) it would unblock.
 
-- **`otlp_out`'s gRPC transport opens a fresh connection per request, never pooled.** Every gRPC
-  `send` (`crates/logit-outputs/src/otlp.rs`'s `grpc_roundtrip`) connects, performs a fresh HTTP/2
-  handshake, sends exactly one framed request, reads the response, then drops the connection —
-  leaving its spawned connection-driver task to exit once the drop is observed. A mixed-signal
-  batch pays connect+handshake three times; a steady stream of batches pays it once per signal per
-  batch, where the HTTP transport gets `reqwest`'s connection pooling for free. Deliberate for this
-  PR, not an oversight: [ADR `hand-rolled-grpc-over-hyper`](adr/hand-rolled-grpc-over-hyper.md) is explicit about
-  keeping the hand-rolled gRPC surface minimal (the three unary `Export` RPCs, nothing else), and a
-  real connection pool — reuse keyed by endpoint, handling a server-initiated GOAWAY, concurrent
-  in-flight streams over one connection — is real infrastructure `tonic`/`hyper-util`'s own client
-  pooling would normally supply. Worth revisiting if `otlp_out`'s gRPC transport shows up as a
-  bottleneck under sustained load (connect+TLS-less-handshake cost per request, not per batch of
-  requests); until then this is a documented, deliberate simplicity-over-throughput trade, not a
-  silent one.
+- **TLS certificates (`otlp_out`'s `tls:`, `otlp_in`'s `tls:`) are loaded once at startup; rotation
+  needs a restart.** `OtlpOutput::with_tls`/`OtlpInput::with_tls`
+  (`crates/logit-outputs/`/`crates/logit-inputs/src/otlp.rs`) read every PEM file at construction
+  time (`logit run` startup) and build a static `rustls::ClientConfig`/`ServerConfig` from it — a
+  renewed certificate (a 90-day Let's Encrypt cert, a `cert-manager`-issued one) has no effect until
+  the process restarts. [ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)
+  files this as deliberately out of scope; closing it means `rustls::ServerConfig`'s
+  `ResolvesServerCert` (a file-watcher hook) on the server side, or an equivalent reload on the
+  client side, either behind a SIGHUP or a poll.
+- **`otlp_out`'s TLS client has no `server_name` override.** Useful when an endpoint is reached by
+  IP or through a proxy whose certificate names something else (OTel's own
+  `tls.server_name_override` knob). Cheap to add via `hyper-rustls`'s
+  `HttpsConnectorBuilder::with_server_name_resolver` and an equivalent override on the `reqwest`
+  side; left out of the initial TLS work to keep it small
+  ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)).
