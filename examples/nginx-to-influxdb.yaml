@@ -90,9 +90,9 @@ components:
     type: stdio_out
     sources: [nginx_metrics]
 
-  # The span nginx_trace minted, isolated from the log+metrics event it rides in on -- `has_signal`/
-  # `keep_signals` never mutate a forwarded event (ADR signal-filtering-components), so this is
-  # exactly the span nginx_trace produced, with nothing stripped. Its own `stdio_out` rather than
+  # The span nginx_trace minted, isolated from the log+metrics event it rides in on --
+  # `keep_signals` clears the payload slots it isn't given (ADR signal-filtering-components), so
+  # this branch carries just the span nginx_trace produced. Its own `stdio_out` rather than
   # sharing `tap` above purely so a reader can tell log/metric lines from span lines at a glance;
   # nothing stops one sink from taking both sources.
   nginx_spans:
