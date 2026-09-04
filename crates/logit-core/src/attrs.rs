@@ -30,6 +30,15 @@ impl AttrMap {
 
     pub fn insert(&mut self, key: &str, value: impl Into<Value>) {
         let key = intern(key);
+        self.insert_sym(key, value);
+    }
+
+    /// Same as [`AttrMap::insert`], but for a caller that already holds an interned [`Symbol`] --
+    /// skips the interner lookup `insert` would otherwise redo on every call. `logit-transforms`'
+    /// `set` transform is the first caller: it interns its configured keys once, at construction,
+    /// then inserts the same `Symbol`s into every event's/resource's map on the per-event hot
+    /// path.
+    pub fn insert_sym(&mut self, key: Symbol, value: impl Into<Value>) {
         match self.0.binary_search_by_key(&key, |(k, _)| *k) {
             Ok(i) => self.0[i].1 = value.into(),
             Err(i) => self.0.insert(i, (key, value.into())),

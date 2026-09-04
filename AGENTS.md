@@ -16,7 +16,9 @@ something that looks broken — it's likely a documented, deliberate gap, not an
 Lua enrichment stage, InfluxDB 2.x out, via `logit run <config>` (see
 [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml), `script/server`). Since then,
 `syslog_in`, `stdio_out`, `otlp_in`, and `otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`,
-`crates/logit-proto`'s `otlp` codec) and `json`, `kv_metrics`, `keep`, `remove`, `has_signal`,
+`crates/logit-proto`'s `otlp` codec) and `json`, `kv_metrics`, `keep`, `remove`, `set`,
+`trace_context` (the last giving a `LogRecord` a native application trace/span reference,
+[ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md)), `has_signal`,
 `keep_signals`, and `drop_signals` (`crates/logit-transforms`) have all landed as real, implemented
 `ComponentKind`s —
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises the syslog/InfluxDB
@@ -31,13 +33,16 @@ Loki, InfluxDB, and Tempo respectively
 ([docs/plans/demo-stack.md](docs/plans/demo-stack.md),
 [docs/plans/otlp-end-to-end.md](docs/plans/otlp-end-to-end.md)). `syslog_out` (RFC
 3164/5424 over UDP or TCP, header fields round-tripped from an event's `syslog.*` attributes,
-[ADR `syslog-output`](docs/adr/syslog-output.md)) is live in `demo/logit.yaml`'s `log_out`, writing to
-`alloy` → Loki. `otlp_in`/`otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`, OTLP for logs,
+[ADR `syslog-output`](docs/adr/syslog-output.md)) is implemented and fully covered by its own
+unit/integration tests but no longer exercised by the demo, which moved its log leg onto
+`otlp_out` straight to Loki ([docs/plans/otlp-logs-and-resource-identity.md](docs/plans/otlp-logs-and-resource-identity.md)'s
+workstream B) — the demo isn't meant to stay exhaustive over every component as more land.
+`otlp_in`/`otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`, OTLP for logs,
 metrics, and traces, both OTLP/HTTP and a hand-rolled OTLP/gRPC transport,
 [ADR `committed-pregenerated-otlp-protobuf`](docs/adr/committed-pregenerated-otlp-protobuf.md)/
 [ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md)) are real, implemented `ComponentKind`s —
-`otlp_out` is live in `demo/logit.yaml`'s `trace_out`, writing to Tempo over gRPC; `otlp_in` ships
-tested but unexercised by the demo. Config is a flat graph of named components (ADR `component-graph-configuration`,
+`otlp_out` is live in `demo/logit.yaml`'s both `log_out` (HTTP, straight to Loki) and `trace_out`
+(gRPC, to Tempo); `otlp_in` ships tested but unexercised by the demo. Config is a flat graph of named components (ADR `component-graph-configuration`,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively
@@ -192,7 +197,7 @@ crates/
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, internal (self-telemetry)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, syslog
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove, has_signal, keep_signals, drop_signals
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove, set, trace_context, has_signal, keep_signals, drop_signals
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
 ```

@@ -7,9 +7,10 @@
 //! script-visible contract these two types implement.
 
 use crate::value::{attrmap_to_lua_table, lua_to_value, lua_value_matches, value_to_lua};
-use logit_core::Event;
+use logit_core::trace::{parse_span_id, parse_trace_id, to_hex};
+use logit_core::{BodyFormat, Event, LogRecord, Severity, TraceRef};
 use mlua::{
-    AnyUserData, Lua, MetaMethod, RegistryKey, UserData, UserDataMethods, Value as LuaValue,
+    AnyUserData, Lua, MetaMethod, RegistryKey, Table, UserData, UserDataMethods, Value as LuaValue,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -59,11 +60,20 @@ pub struct EventProxy {
     /// the event (or its attributes) for `flush()` to use later, the same pattern this module's
     /// docs already call out as supported for `event` itself.
     attrs: RefCell<Option<RegistryKey>>,
+    /// `event.log`'s sub-proxy, cached the same way and for the same reason as `attrs` above.
+    /// Only ever populated when `event.log.is_some()` -- nothing in this crate's Lua surface can
+    /// clear a log once an event has one (only fields *within* it, via [`LogProxy`]), so "cached
+    /// once" and "log is present" stay equivalent for this event's whole lifetime.
+    log: RefCell<Option<RegistryKey>>,
 }
 
 impl EventProxy {
     pub fn new(event: Event) -> Self {
-        Self { event: Rc::new(RefCell::new(event)), attrs: RefCell::new(None) }
+        Self {
+            event: Rc::new(RefCell::new(event)),
+            attrs: RefCell::new(None),
+            log: RefCell::new(None),
+        }
     }
 
     /// Returns this event's `AttrsProxy` userdata, creating and caching it on the first call and
@@ -74,6 +84,17 @@ impl EventProxy {
         }
         let ud = lua.create_userdata(AttrsProxy(self.event.clone()))?;
         *self.attrs.borrow_mut() = Some(lua.create_registry_value(ud.clone())?);
+        Ok(ud)
+    }
+
+    /// As [`Self::attrs_userdata`], for `event.log` -- caller must only invoke this when
+    /// `event.log.is_some()` (the `"log"` `__index` arm checks first).
+    fn log_userdata<'lua>(&self, lua: &'lua Lua) -> mlua::Result<AnyUserData<'lua>> {
+        if let Some(key) = self.log.borrow().as_ref() {
+            return lua.registry_value(key);
+        }
+        let ud = lua.create_userdata(LogProxy(self.event.clone()))?;
+        *self.log.borrow_mut() = Some(lua.create_registry_value(ud.clone())?);
         Ok(ud)
     }
 
@@ -95,6 +116,12 @@ impl EventProxy {
         if let Some(key) = self.attrs.into_inner() {
             if let Ok(ud) = lua.registry_value::<AnyUserData>(&key) {
                 let _ = ud.take::<AttrsProxy>();
+            }
+            let _ = lua.remove_registry_value(key);
+        }
+        if let Some(key) = self.log.into_inner() {
+            if let Ok(ud) = lua.registry_value::<AnyUserData>(&key) {
+                let _ = ud.take::<LogProxy>();
             }
             let _ = lua.remove_registry_value(key);
         }
@@ -120,6 +147,13 @@ impl UserData for EventProxy {
                     lua.create_string(this.event.borrow().timestamp.to_string())?,
                 )),
                 "attributes" => Ok(LuaValue::UserData(this.attrs_userdata(lua)?)),
+                // Typed access to the log record -- trace_id/span_id/trace_flags read+write,
+                // message/severity/body_format read-only for now (`docs/design/lua-api.md`).
+                // `nil` when the event has no log, exactly like `has_log` says it should.
+                "log" => match this.event.borrow().log.is_some() {
+                    true => Ok(LuaValue::UserData(this.log_userdata(lua)?)),
+                    false => Ok(LuaValue::Nil),
+                },
                 // Presence flags, not a classification string: an event can carry a log, several
                 // metrics, and a span all at once now, so "what type is this event" has no single
                 // right answer (docs/adr/multi-payload-events.md) -- a script or native
@@ -159,7 +193,7 @@ impl UserData for EventProxy {
                         this.event.borrow_mut().timestamp = ts;
                         Ok(())
                     }
-                    "attributes" | "has_log" | "has_metrics" | "has_span" => {
+                    "attributes" | "log" | "has_log" | "has_metrics" | "has_span" => {
                         Err(mlua::Error::RuntimeError(format!("event.{key} is read-only")))
                     }
                     other => {
@@ -183,6 +217,13 @@ impl UserData for EventProxy {
             let table = lua.create_table()?;
             table.set("timestamp", event.timestamp.to_string())?; // string -- see __index above
             table.set("attributes", attrmap_to_lua_table(lua, &event.attributes)?)?;
+            table.set(
+                "log",
+                match &event.log {
+                    Some(log) => LuaValue::Table(log_to_table(lua, log)?),
+                    None => LuaValue::Nil,
+                },
+            )?;
             table.set("has_log", event.log.is_some())?;
             table.set("has_metrics", !event.metrics.is_empty())?;
             table.set("has_span", event.span.is_some())?;
@@ -235,6 +276,213 @@ impl UserData for AttrsProxy {
         // No __pairs: not available under LuaJIT/Lua 5.1 (mlua's MetaMethod::Pairs requires Lua
         // 5.2+). A script that needs to enumerate every attribute uses
         // `event:to_table().attributes` and native `pairs()` on that real table instead.
+    }
+}
+
+/// The `event.log` sub-object. Shares the same `Rc<RefCell<Event>>` as its parent [`EventProxy`],
+/// like [`AttrsProxy`] -- but unlike that one, exposes a fixed, typed field set rather than an
+/// open map, closer in shape to `EventProxy` itself: `trace_id`/`span_id`/`trace_flags` are
+/// read+write (`docs/adr/log-record-trace-context.md`); `message`/`severity`/`body_format` are
+/// read-only for now (`docs/design/lua-api.md` -- a later design pass, not an oversight). Callers
+/// must only construct this when `event.log.is_some()`; every method below panics via `.expect`
+/// on a borrow it assumes is upheld by that precondition, which `EventProxy::log_userdata`'s only
+/// call site enforces.
+struct LogProxy(Rc<RefCell<Event>>);
+
+impl LogProxy {
+    fn with_log<R>(&self, f: impl FnOnce(&LogRecord) -> R) -> R {
+        let event = self.0.borrow();
+        f(event.log.as_ref().expect("LogProxy is only ever created when event.log.is_some()"))
+    }
+
+    fn with_log_mut<R>(&self, f: impl FnOnce(&mut LogRecord) -> R) -> R {
+        let mut event = self.0.borrow_mut();
+        f(event.log.as_mut().expect("LogProxy is only ever created when event.log.is_some()"))
+    }
+}
+
+impl UserData for LogProxy {
+    fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
+        methods.add_meta_method(MetaMethod::Index, |lua, this, key: mlua::String| {
+            this.with_log(|log| match key.to_str()? {
+                "trace_id" => match log.trace {
+                    Some(t) => Ok(LuaValue::String(lua.create_string(to_hex(&t.trace_id))?)),
+                    None => Ok(LuaValue::Nil),
+                },
+                "span_id" => match log.trace.and_then(|t| t.span_id) {
+                    Some(id) => Ok(LuaValue::String(lua.create_string(to_hex(&id))?)),
+                    None => Ok(LuaValue::Nil),
+                },
+                // `nil`, not `0`, when there's no trace at all -- so a script checking
+                // `event.log.trace_flags == nil` agrees with `event.log.trace_id == nil` instead
+                // of a flags read silently implying a trace that isn't there.
+                "trace_flags" => match log.trace {
+                    Some(t) => Ok(LuaValue::Integer(t.flags as i64)),
+                    None => Ok(LuaValue::Nil),
+                },
+                "message" => value_to_lua(lua, &log.message),
+                "severity" => match log.severity {
+                    Some(s) => Ok(LuaValue::String(lua.create_string(severity_name(s))?)),
+                    None => Ok(LuaValue::Nil),
+                },
+                "body_format" => {
+                    Ok(LuaValue::String(lua.create_string(body_format_name(log.body_format))?))
+                }
+                _ => Ok(LuaValue::Nil),
+            })
+        });
+
+        methods.add_meta_method(
+            MetaMethod::NewIndex,
+            |_, this, (key, value): (mlua::String, LuaValue)| {
+                let key = key.to_str()?;
+                match key {
+                    "trace_id" => this.with_log_mut(|log| match value {
+                        LuaValue::Nil => {
+                            log.trace = None; // clears the whole TraceRef, span/flags included
+                            Ok(())
+                        }
+                        LuaValue::String(s) => {
+                            let trace_id = parse_trace_id(s.to_str()?).ok_or_else(|| {
+                                mlua::Error::RuntimeError(
+                                    "event.log.trace_id must be a 32-character hex string \
+                                     (or nil), and not all-zero"
+                                        .to_string(),
+                                )
+                            })?;
+                            // A changed trace_id replaces the whole TraceRef, not just the
+                            // id field -- an old span_id/flags belongs to the old trace and
+                            // must not be carried over onto the new one.
+                            log.trace = Some(TraceRef { trace_id, span_id: None, flags: 0 });
+                            Ok(())
+                        }
+                        other => Err(mlua::Error::RuntimeError(format!(
+                            "event.log.trace_id must be a hex string or nil, got {}",
+                            other.type_name()
+                        ))),
+                    }),
+                    "span_id" => this.with_log_mut(|log| {
+                        let Some(trace) = &mut log.trace else {
+                            return Err(mlua::Error::RuntimeError(
+                                "event.log.span_id can't be set without a trace_id -- set \
+                                 event.log.trace_id first"
+                                    .to_string(),
+                            ));
+                        };
+                        match value {
+                            LuaValue::Nil => {
+                                trace.span_id = None;
+                                Ok(())
+                            }
+                            LuaValue::String(s) => {
+                                trace.span_id =
+                                    Some(parse_span_id(s.to_str()?).ok_or_else(|| {
+                                        mlua::Error::RuntimeError(
+                                            "event.log.span_id must be a 16-character hex string \
+                                         (or nil), and not all-zero"
+                                                .to_string(),
+                                        )
+                                    })?);
+                                Ok(())
+                            }
+                            other => Err(mlua::Error::RuntimeError(format!(
+                                "event.log.span_id must be a hex string or nil, got {}",
+                                other.type_name()
+                            ))),
+                        }
+                    }),
+                    "trace_flags" => this.with_log_mut(|log| {
+                        let Some(trace) = &mut log.trace else {
+                            return Err(mlua::Error::RuntimeError(
+                                "event.log.trace_flags can't be set without a trace_id -- set \
+                                 event.log.trace_id first"
+                                    .to_string(),
+                            ));
+                        };
+                        let LuaValue::Integer(n) = value else {
+                            return Err(mlua::Error::RuntimeError(format!(
+                                "event.log.trace_flags must be an integer 0-255, got {}",
+                                value.type_name()
+                            )));
+                        };
+                        let flags = u8::try_from(n).map_err(|_| {
+                            mlua::Error::RuntimeError(format!(
+                                "event.log.trace_flags must be an integer 0-255, got {n}"
+                            ))
+                        })?;
+                        trace.flags = flags;
+                        Ok(())
+                    }),
+                    "message" | "severity" | "body_format" => Err(mlua::Error::RuntimeError(
+                        format!("event.log.{key} is read-only for now"),
+                    )),
+                    other => {
+                        Err(mlua::Error::RuntimeError(format!("event.log has no field '{other}'")))
+                    }
+                }
+            },
+        );
+
+        methods.add_method("to_table", |lua, this, ()| this.with_log(|log| log_to_table(lua, log)));
+    }
+}
+
+/// Shared by `LogProxy::to_table` and `EventProxy::to_table` (the latter's `log` key) -- one
+/// definition of what a log record looks like as a plain table.
+fn log_to_table<'lua>(lua: &'lua Lua, log: &LogRecord) -> mlua::Result<Table<'lua>> {
+    let table = lua.create_table()?;
+    table.set(
+        "trace_id",
+        match log.trace {
+            Some(t) => LuaValue::String(lua.create_string(to_hex(&t.trace_id))?),
+            None => LuaValue::Nil,
+        },
+    )?;
+    table.set(
+        "span_id",
+        match log.trace.and_then(|t| t.span_id) {
+            Some(id) => LuaValue::String(lua.create_string(to_hex(&id))?),
+            None => LuaValue::Nil,
+        },
+    )?;
+    table.set(
+        "trace_flags",
+        match log.trace {
+            Some(t) => LuaValue::Integer(t.flags as i64),
+            None => LuaValue::Nil,
+        },
+    )?;
+    table.set("message", value_to_lua(lua, &log.message)?)?;
+    table.set(
+        "severity",
+        match log.severity {
+            Some(s) => LuaValue::String(lua.create_string(severity_name(s))?),
+            None => LuaValue::Nil,
+        },
+    )?;
+    table.set("body_format", body_format_name(log.body_format))?;
+    Ok(table)
+}
+
+/// Lowercase severity names for Lua -- matches `crates/logit-outputs/src/stdio.rs`'s own
+/// rendering of the same values, so `event.log.severity == "info"` reads the way the `stdio_out`
+/// line a script is looking at already does.
+fn severity_name(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Trace => "trace",
+        Severity::Debug => "debug",
+        Severity::Info => "info",
+        Severity::Warn => "warn",
+        Severity::Error => "error",
+        Severity::Fatal => "fatal",
+    }
+}
+
+fn body_format_name(format: BodyFormat) -> &'static str {
+    match format {
+        BodyFormat::Raw => "raw",
+        BodyFormat::Json => "json",
+        BodyFormat::Structured => "structured",
     }
 }
 
@@ -309,11 +557,11 @@ pub(crate) fn clarify_destructed_handle_use(err: mlua::Error) -> mlua::Error {
     }
     if is_destructed_handle_use(&err) {
         return mlua::Error::RuntimeError(
-            "this event, or its attributes (event.attributes), was already returned/emitted \
-             elsewhere and can no longer be used -- an event handle, and the attributes handle \
-             obtained from event.attributes, are both consumed once the event is returned from \
+            "this event, or a handle obtained from it (event.attributes or event.log), was \
+             already returned/emitted elsewhere and can no longer be used -- an event handle, and \
+             any sub-handle obtained from it, are all consumed once the event is returned from \
              process() or included in a flush() table; use event:clone() before returning if you \
-             need to keep using either afterward"
+             need to keep using any of them afterward"
                 .to_string(),
         );
     }

@@ -864,6 +864,7 @@ mod tests {
                 message: Value::str("hello"),
                 severity: None,
                 body_format: logit_core::BodyFormat::Raw,
+                trace: None,
             },
         );
         let passed = agg.process(&resource, log);
@@ -1160,6 +1161,7 @@ mod tests {
                 message: Value::str("hello"),
                 severity: None,
                 body_format: logit_core::BodyFormat::Raw,
+                trace: None,
             },
         );
         event.metrics.push(MetricRecord {
