@@ -76,6 +76,25 @@ pub struct MetricSpec {
     pub unit: Option<String>,
 }
 
+/// One value a `set` component (`ComponentKind::Set`) can stamp onto an attribute or a resource
+/// attribute. `#[serde(untagged)]`: YAML's own scalar types decide the variant, so
+/// `resource: {service.name: nginx, retries: 3, ratio: 0.5, sampled: true}` reads exactly as
+/// written, no `!i64`/`!f64` tag needed.
+///
+/// **`I64` must stay ordered before `F64`.** `serde`'s untagged enum deserializer tries variants
+/// in declaration order and keeps the first that parses; `3` parses as both an `i64` and an
+/// `f64`, so `F64` before `I64` would silently turn every whole-number YAML scalar into a float.
+/// `Bool`/`Str` are unambiguous against the others (a YAML boolean/string never also parses as a
+/// number) so their position doesn't matter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum SetValue {
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    Str(String),
+}
+
 /// Which OTLP transport a component speaks -- both `otlp_in` and `otlp_out` carry identical
 /// protobuf payloads (`crates/logit-proto/src/otlp`), differing only in framing and endpoint
 /// shape (`docs/adr/hand-rolled-grpc-over-hyper.md`).
@@ -289,6 +308,48 @@ pub enum ComponentKind {
     Remove {
         fields: Vec<String>,
     },
+    /// Stamps constant values onto every event's attributes and/or the batch's resource --
+    /// the operator-declared counterpart to a wire-carried identity
+    /// (`docs/adr/operator-declared-resource-attributes.md`). Overwrites on key collision in
+    /// both maps: a configured value wins over whatever the wire carried. At least one of
+    /// `resource`/`attributes` must be non-empty -- rejected at graph-validation time otherwise,
+    /// the same "can only ever be a no-op" rule `KvMetrics` already has.
+    Set {
+        /// Applied once per batch, to the batch's `Resource` -- every event in the batch shares
+        /// it (`docs/design/data-model.md`'s "`Resource` is `Arc`-shared" note).
+        #[serde(default)]
+        resource: std::collections::BTreeMap<String, SetValue>,
+        /// Applied per event, to `event.attributes`.
+        #[serde(default)]
+        attributes: std::collections::BTreeMap<String, SetValue>,
+    },
+    /// Lifts an application trace/span reference off an event's attributes onto its `LogRecord`
+    /// (`docs/adr/log-record-trace-context.md`) -- the common "my JSON log body already has a
+    /// `trace_id` field" case, without writing Lua (`event.log.trace_id`,
+    /// `docs/design/lua-api.md`). Overwrites `log.trace` on a successful lift -- operator intent,
+    /// the same posture `Set` has. An event with no log, or missing/unparseable named
+    /// attribute(s), passes through untouched (never an error) -- see
+    /// `crates/logit-transforms/src/trace_context.rs` for the exact skip conditions.
+    TraceContext {
+        /// The attribute holding a 32-character hex trace id. Required, and rejected as an empty
+        /// string at graph-validation time -- an empty field name could never match a real
+        /// attribute, so a component configured that way can only ever be a no-op.
+        trace_id: String,
+        /// The attribute holding a 16-character hex span id, if any. A `Some` field name whose
+        /// attribute is absent means "no span," not a skip -- only present-but-unparseable is an
+        /// error.
+        #[serde(default)]
+        span_id: Option<String>,
+        /// The attribute holding the W3C trace flags (0-255, decimal -- never hex), if any.
+        #[serde(default)]
+        flags: Option<String>,
+        /// Keep the source attribute(s) after a successful lift, instead of removing them (the
+        /// default). Removing matters for OTLP-native backends: Loki turns log attributes into
+        /// structured metadata under their own names, so a leftover `trace_id` attribute would
+        /// collide with the native `trace_id` key `LogRecord.trace_id` already produces.
+        #[serde(default)]
+        keep_source: bool,
+    },
     /// Drops an event that doesn't carry a wanted signal -- e.g. `signals: [traces]` ahead of a
     /// traces-only sink like Tempo, fed from a source (`internal`) whose drains also carry
     /// metrics. Never mutates a forwarded event: under the default `mode: any_of`, an event
@@ -306,14 +367,18 @@ pub enum ComponentKind {
     /// allowlist, the same relationship to `drop_signals` that `keep` has to `remove`. Unlike
     /// `has_signal`, this mutates: an event carrying a log and derived metrics with
     /// `signals: [logs]` loses the metrics but keeps the log. Drops an event left with no
-    /// payload at all. `signals` may not be empty, and may not name all three signals -- either
-    /// can only ever drop every event. See `docs/adr/signal-filtering-components.md`.
+    /// payload at all. `signals` may not be empty (that keeps nothing, dropping every event) and
+    /// may not name all three signals (that keeps everything, a no-op that forwards every event
+    /// untouched) -- both are rejected as config mistakes. See
+    /// `docs/adr/signal-filtering-components.md`.
     KeepSignals {
         signals: Vec<Signal>,
     },
     /// Clears the listed signals' payloads on every event, keeping the rest -- a denylist, the
     /// mirror of `keep_signals`. Drops an event left with no payload at all. `signals` may not be
-    /// empty, and may not name all three signals. See `docs/adr/signal-filtering-components.md`.
+    /// empty (that drops nothing, a no-op that forwards every event untouched) and may not name
+    /// all three signals (that drops everything, dropping every event) -- both are rejected as
+    /// config mistakes. See `docs/adr/signal-filtering-components.md`.
     DropSignals {
         signals: Vec<Signal>,
     },
@@ -371,7 +436,10 @@ pub enum ComponentKind {
         /// without inlining it. A name owned by the protocol itself (`content-type`,
         /// `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`,
         /// `connection`, any `grpc-*` header, or an HTTP/2 pseudo-header starting with `:`) is
-        /// rejected at config-validation time rather than silently overridden.
+        /// rejected at config-validation time rather than silently overridden. Two keys naming
+        /// the same header once case is ignored (e.g. `X-Scope-OrgID` and `x-scope-orgid`) are
+        /// rejected too -- HTTP header names are case-insensitive, so which value would actually
+        /// be sent is otherwise undefined.
         #[serde(default)]
         headers: HashMap<String, String>,
         /// Per-signal HTTP path overrides -- see [`OtlpPaths`]. `protocol: http` only; a
@@ -419,10 +487,10 @@ pub enum ComponentKind {
         #[serde(default)]
         app_name: Option<String>,
         /// Bounds one encoded message (PRI + header + MSG). Defaults to 8192, matching Grafana
-        /// Alloy's `loki.source.syslog` `max_message_length` default -- the receiver the demo
-        /// stack points this at -- rather than RFC 3164 §4.1's traditional 1024, which would
-        /// truncate a JSON-bodied message on every modern relay chain. A string via
-        /// [`human_bytes`], exactly like `BufferConfig::max_bytes`.
+        /// Alloy's `loki.source.syslog` `max_message_length` default -- a real receiver's own
+        /// choice, verified against Alloy v1.19.2 -- rather than RFC 3164 §4.1's traditional
+        /// 1024, which would truncate a JSON-bodied message on every modern relay chain. A string
+        /// via [`human_bytes`], exactly like `BufferConfig::max_bytes`.
         #[serde(default = "default_max_message_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_message_bytes: u64,
@@ -1227,6 +1295,84 @@ mod tests {
                 assert_eq!(fields, vec!["client_ip".to_string(), "user_agent".to_string()]);
             }
             other => panic!("expected Remove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_component_deserializes_resource_and_attributes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "set", "sources": ["in"],
+                "resource": {"service.name": "nginx"},
+                "attributes": {"env": "prod", "tier": 3}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Set { resource, attributes } => {
+                assert_eq!(resource.get("service.name"), Some(&SetValue::Str("nginx".to_string())));
+                assert_eq!(attributes.get("env"), Some(&SetValue::Str("prod".to_string())));
+                assert_eq!(attributes.get("tier"), Some(&SetValue::I64(3)));
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    /// Pins `SetValue`'s untagged-variant order: a whole-number YAML/JSON scalar must decode as
+    /// `I64`, not `F64` (the enum lists `I64` before `F64` specifically so `serde`'s
+    /// first-match-wins untagged search finds it first) -- and a quoted number must stay `Str`,
+    /// never coerced into either numeric variant.
+    #[test]
+    fn set_value_untagged_variant_selection() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "set", "sources": ["in"], "attributes":
+                {"s": "nginx", "i": 3, "f": 1.5, "b": true, "q": "3"}}"#,
+        )
+        .unwrap();
+        let ComponentKind::Set { attributes, .. } = component.kind else {
+            panic!("expected Set");
+        };
+        assert_eq!(attributes.get("s"), Some(&SetValue::Str("nginx".to_string())));
+        assert_eq!(attributes.get("i"), Some(&SetValue::I64(3)), "a whole number must stay I64");
+        assert_eq!(attributes.get("f"), Some(&SetValue::F64(1.5)));
+        assert_eq!(attributes.get("b"), Some(&SetValue::Bool(true)));
+        assert_eq!(
+            attributes.get("q"),
+            Some(&SetValue::Str("3".to_string())),
+            "a quoted number must stay a string, not be coerced into I64"
+        );
+    }
+
+    #[test]
+    fn trace_context_component_deserializes_with_defaults() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "trace_context", "sources": ["in"], "trace_id": "trace_id"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::TraceContext { trace_id, span_id, flags, keep_source } => {
+                assert_eq!(trace_id, "trace_id");
+                assert_eq!(span_id, None);
+                assert_eq!(flags, None);
+                assert!(!keep_source);
+            }
+            other => panic!("expected TraceContext, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trace_context_component_deserializes_every_field() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "trace_context", "sources": ["in"], "trace_id": "trace_id",
+                "span_id": "span_id", "flags": "trace_flags", "keep_source": true}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::TraceContext { trace_id, span_id, flags, keep_source } => {
+                assert_eq!(trace_id, "trace_id");
+                assert_eq!(span_id, Some("span_id".to_string()));
+                assert_eq!(flags, Some("trace_flags".to_string()));
+                assert!(keep_source);
+            }
+            other => panic!("expected TraceContext, got {other:?}"),
         }
     }
 

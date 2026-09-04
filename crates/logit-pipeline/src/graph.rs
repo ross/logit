@@ -44,15 +44,24 @@
 //!     impossible bound, the twin of rule 15.
 //!     `receive.batch_flush_interval: 0s` is **not** rejected: it means "no flush timer," a
 //!     meaningful setting, unlike the count bounds.
-//! 19. An empty `signals:` list on `has_signal`, `keep_signals`, or `drop_signals` is rejected, as
-//!     is a `keep_signals`/`drop_signals` naming all three signals -- each can only ever drop
-//!     every event, the same silent-black-hole failure rule 7 exists to catch. `keep`'s empty
+//! 19. A `trace_context` with an empty `trace_id` field name is rejected -- it could never name a
+//!     real attribute, so the component can only ever be a no-op, the same reasoning rules 10-12
+//!     already apply to `kv_metrics`/`set`.
+//! 20. An empty `signals:` list on `has_signal`, `keep_signals`, or `drop_signals` is rejected.
+//!     `keep_signals`/`drop_signals` additionally reject naming all three signals. Which of the
+//!     two shapes is the silent black hole (rule 7's "no consumer" failure, recast here as "no
+//!     event ever gets through") and which is the no-op (every event forwarded untouched) is
+//!     *opposite* between the two kinds -- an allowlist naming nothing keeps nothing (black
+//!     hole), naming everything keeps everything (no-op); a denylist is the mirror. Both shapes
+//!     are rejected either way, but the error message names the right one. `keep`'s empty
 //!     `fields` list stays legal by contrast -- "drop every attribute" is a real operation,
 //!     "drop every event" is not. See `docs/adr/signal-filtering-components.md`.
 //! 20. An `otlp_out` `headers:` entry naming an empty string, an HTTP/2 pseudo-header (starting
-//!     with `:`), or a header the wire transport itself sets (`content-type`, `grpc-encoding`,
-//!     etc. -- see `RESERVED_OTLP_HEADERS`) is rejected, case-insensitively -- almost certainly a
-//!     config mistake, not a meaningful override.
+//!     with `:`), any `grpc-*` header, or another header the wire transport itself sets
+//!     (`content-type`, etc. -- see `RESERVED_OTLP_HEADERS`) is rejected, case-insensitively --
+//!     almost certainly a config mistake, not a meaningful override. Two entries naming the same
+//!     header once case is ignored (HTTP header names are case-insensitive) are also rejected --
+//!     which value would actually be sent is otherwise undefined.
 //! 21. A non-empty `otlp_out` `paths:` under `protocol: grpc` is rejected -- gRPC method names
 //!     are fixed by the OTLP service definitions, not a mount point `paths` can move, so silently
 //!     ignoring it would be a worse failure mode than a clear error.
@@ -107,6 +116,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | KvMetrics { .. }
         | Keep { .. }
         | Remove { .. }
+        | Set { .. }
+        | TraceContext { .. }
         | HasSignal { .. }
         | KeepSignals { .. }
         | DropSignals { .. }
@@ -150,6 +161,8 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         KvMetrics { .. } => "kv_metrics",
         Keep { .. } => "keep",
         Remove { .. } => "remove",
+        Set { .. } => "set",
+        TraceContext { .. } => "trace_context",
         HasSignal { .. } => "has_signal",
         KeepSignals { .. } => "keep_signals",
         DropSignals { .. } => "drop_signals",
@@ -187,6 +200,8 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::KvMetrics { .. }
             | ComponentKind::Keep { .. }
             | ComponentKind::Remove { .. }
+            | ComponentKind::Set { .. }
+            | ComponentKind::TraceContext { .. }
             | ComponentKind::HasSignal { .. }
             | ComponentKind::KeepSignals { .. }
             | ComponentKind::DropSignals { .. }
@@ -209,6 +224,14 @@ fn interval(kind: &ComponentKind) -> Option<Duration> {
         }
         _ => None,
     }
+}
+
+/// `true` if `signals` names all three of `Logs`/`Metrics`/`Traces` -- rule 19's shared test for
+/// `keep_signals`/`drop_signals`'s two opposite black-hole shapes.
+fn names_all_three(signals: &[logit_config::Signal]) -> bool {
+    signals.contains(&logit_config::Signal::Logs)
+        && signals.contains(&logit_config::Signal::Metrics)
+        && signals.contains(&logit_config::Signal::Traces)
 }
 
 pub struct ResolvedComponent {
@@ -244,13 +267,14 @@ pub struct Graph {
     pub topological_order: Vec<String>,
 }
 
-/// Header names `otlp_out`'s two wire transports set themselves -- `content-type` and the
-/// hand-rolled gRPC framing's own `grpc-*`/`te`/`connection`/etc. headers
-/// (`crates/logit-outputs/src/otlp.rs`'s `send_http`/`grpc_roundtrip`). A config `headers:` entry
-/// naming one of these is almost certainly a config mistake, not a meaningful override -- checked
-/// case-insensitively, matching HTTP's own header-name semantics. `OtlpOutput::with_headers`
-/// guards the same thing in code, as defense in depth; this is what gives an operator a clear,
-/// component-scoped error at config-load time instead.
+/// Non-gRPC header names `otlp_out`'s HTTP transport sets itself, or that HTTP/1.1's own
+/// connection-management semantics reserve regardless of transport
+/// (`crates/logit-outputs/src/otlp.rs`'s `send_http`). Checked case-insensitively, matching
+/// HTTP's own header-name semantics. Every `grpc-*` name is reserved too -- checked separately,
+/// by prefix, in `resolve` -- since the gRPC wire protocol defines a whole namespace of them
+/// (`grpc-encoding`, `grpc-status`, `grpc-trace-bin`, ...), not just the handful
+/// `crates/logit-outputs/src/otlp.rs`'s `grpc_roundtrip` happens to set today; a fixed list here
+/// would silently stop covering a `grpc-*` header this project starts setting later.
 const RESERVED_OTLP_HEADERS: &[&str] = &[
     "content-type",
     "content-length",
@@ -259,11 +283,6 @@ const RESERVED_OTLP_HEADERS: &[&str] = &[
     "te",
     "transfer-encoding",
     "connection",
-    "grpc-encoding",
-    "grpc-accept-encoding",
-    "grpc-timeout",
-    "grpc-status",
-    "grpc-message",
 ];
 
 pub fn resolve(config: Config) -> anyhow::Result<Graph> {
@@ -377,6 +396,19 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     "component '{id}': a kv_metrics counter, gauge, or distribution entry \
                      requires a non-empty 'name' -- influxdb_out cannot encode a metric with no \
                      measurement name"
+                );
+            }
+        }
+    }
+
+    // Rule 12: `set`-specific validation -- neither map configured can only ever be a no-op,
+    // exactly the `kv_metrics` rule above, for the same reason.
+    for (id, component) in &components {
+        if let ComponentKind::Set { resource, attributes } = &component.kind {
+            if resource.is_empty() && attributes.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a set with neither 'resource' nor 'attributes' \
+                     configured can only ever be a no-op"
                 );
             }
         }
@@ -497,9 +529,29 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 19: `has_signal`/`keep_signals`/`drop_signals` need a non-empty `signals:`, and
-    // `keep_signals`/`drop_signals` additionally reject naming all three signals -- either shape
-    // can only ever drop every event, the same silent-black-hole failure rule 7 exists to catch.
+    // Rule 19: `trace_context`-specific validation -- an empty `trace_id` field name could never
+    // name a real attribute, so a component configured that way can only ever be a no-op, the
+    // same reasoning rules 10-12 already apply to `kv_metrics`/`set`.
+    for (id, component) in &components {
+        if let ComponentKind::TraceContext { trace_id, .. } = &component.kind {
+            if trace_id.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a trace_context with an empty 'trace_id' field name can \
+                     only ever be a no-op"
+                );
+            }
+        }
+    }
+
+    // Rule 20: `has_signal`/`keep_signals`/`drop_signals` need a non-empty `signals:`. For
+    // `keep_signals`/`drop_signals`, an empty or all-three list is *always* rejected, but which
+    // of the two is the silent-black-hole shape (rule 7's "no consumer" failure, here recast as
+    // "no event ever gets through") and which is the no-op (every event forwarded completely
+    // untouched, so the component is pointless) is *opposite* between the two kinds -- an
+    // allowlist that names nothing keeps nothing (black hole), one that names everything keeps
+    // everything (no-op); a denylist is the mirror. Both shapes are rejected either way (a no-op
+    // component is exactly as much a config mistake as a black hole one), but the message must
+    // say which is which, or it tells the operator the wrong thing happened.
     // `has_signal` naming all three signals is left alone: under `mode: only` that's a real,
     // if permissive, "forward anything with a payload" filter, not a no-op.
     for (id, component) in &components {
@@ -512,20 +564,31 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     );
                 }
             }
-            ComponentKind::KeepSignals { signals } | ComponentKind::DropSignals { signals } => {
+            ComponentKind::KeepSignals { signals } => {
                 if signals.is_empty() {
                     anyhow::bail!(
                         "component '{id}': 'signals' must name at least one signal -- an empty \
-                         list can only ever drop every event"
+                         list keeps nothing, dropping every event"
                     );
                 }
-                let names_all_three = signals.contains(&logit_config::Signal::Logs)
-                    && signals.contains(&logit_config::Signal::Metrics)
-                    && signals.contains(&logit_config::Signal::Traces);
-                if names_all_three {
+                if names_all_three(signals) {
                     anyhow::bail!(
-                        "component '{id}': 'signals' names all three signals -- that can only \
-                         ever drop every event"
+                        "component '{id}': 'signals' names all three signals -- that keeps \
+                         everything, a no-op that forwards every event untouched"
+                    );
+                }
+            }
+            ComponentKind::DropSignals { signals } => {
+                if signals.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': 'signals' must name at least one signal -- an empty \
+                         list drops nothing, a no-op that forwards every event untouched"
+                    );
+                }
+                if names_all_three(signals) {
+                    anyhow::bail!(
+                        "component '{id}': 'signals' names all three signals -- that drops \
+                         everything, dropping every event"
                     );
                 }
             }
@@ -533,10 +596,15 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 20: an `otlp_out` `headers:` entry may not name a header the protocol itself sets --
-    // see `RESERVED_OTLP_HEADERS`'s own doc comment.
+    // Rule 20: an `otlp_out` `headers:` entry may not name a header the protocol itself sets
+    // (see `RESERVED_OTLP_HEADERS`'s own doc comment for why `grpc-*` is a prefix check here,
+    // not a fixed list), and no two entries may name the same header once case is ignored --
+    // HTTP header names are case-insensitive, so e.g. `X-Scope-OrgID` and `x-scope-orgid` in the
+    // same `headers:` block would silently collide into one `HeaderMap` entry
+    // (`OtlpOutput::with_headers`) with no way to predict which value wins.
     for (id, component) in &components {
         if let ComponentKind::OtlpOut { headers, .. } = &component.kind {
+            let mut seen_lowercase = BTreeSet::new();
             for name in headers.keys() {
                 if name.is_empty() {
                     anyhow::bail!("component '{id}': 'headers' has an empty header name");
@@ -547,10 +615,20 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                          (starting with ':') can't be set as a custom header"
                     );
                 }
-                if RESERVED_OTLP_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+                let lowercase = name.to_ascii_lowercase();
+                if lowercase.starts_with("grpc-")
+                    || RESERVED_OTLP_HEADERS.contains(&lowercase.as_str())
+                {
                     anyhow::bail!(
                         "component '{id}': 'headers' names {name:?}, which this protocol sets \
                          itself -- it can't be overridden"
+                    );
+                }
+                if !seen_lowercase.insert(lowercase) {
+                    anyhow::bail!(
+                        "component '{id}': 'headers' names {name:?}, which differs only in \
+                         case from another entry -- HTTP header names are case-insensitive, so \
+                         which value would actually be sent is undefined"
                     );
                 }
             }
@@ -1053,6 +1131,11 @@ mod tests {
             ("out", vec!["filter"], sink()),
         ]));
         assert!(err.contains("must name at least one signal"), "got: {err}");
+        assert!(
+            err.contains("keeps nothing"),
+            "a keep_signals with an empty list is the black-hole shape (drops every event), \
+             not the no-op shape -- got: {err}"
+        );
     }
 
     #[test]
@@ -1073,6 +1156,55 @@ mod tests {
             ("out", vec!["filter"], sink()),
         ]));
         assert!(err.contains("names all three signals"), "got: {err}");
+        assert!(
+            err.contains("drops everything"),
+            "a drop_signals naming all three signals is the black-hole shape (drops every \
+             event), not the no-op shape -- got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_keep_signals_naming_all_three_signals_is_rejected_as_a_no_op_not_a_black_hole() {
+        // The inverse of the drop_signals case above: for keep_signals (an allowlist), naming
+        // all three signals keeps everything -- a no-op, not the "drop every event" black hole.
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::KeepSignals {
+                    signals: vec![
+                        logit_config::Signal::Logs,
+                        logit_config::Signal::Metrics,
+                        logit_config::Signal::Traces,
+                    ],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("names all three signals"), "got: {err}");
+        assert!(
+            err.contains("keeps everything") && err.contains("no-op"),
+            "a keep_signals naming all three signals is the no-op shape (keeps every event \
+             untouched), not the black-hole shape -- got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_drop_signals_with_an_empty_signals_list_is_rejected_as_a_no_op_not_a_black_hole() {
+        // The inverse of the keep_signals-empty case: for drop_signals (a denylist), an empty
+        // list drops nothing -- a no-op, not the "drop every event" black hole.
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("filter", vec!["in"], ComponentKind::DropSignals { signals: vec![] }),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("must name at least one signal"), "got: {err}");
+        assert!(
+            err.contains("drops nothing") && err.contains("no-op"),
+            "a drop_signals with an empty list is the no-op shape (forwards every event \
+             untouched), not the black-hole shape -- got: {err}"
+        );
     }
 
     #[test]
@@ -1135,6 +1267,35 @@ mod tests {
             ("out", vec!["in"], otlp_out_with_headers(vec![("GRPC-ENCODING", "gzip")])),
         ]));
         assert!(err.contains("sets itself"), "got: {err}");
+    }
+
+    #[test]
+    fn an_otlp_out_with_a_grpc_header_not_on_the_fixed_reserved_list_is_still_rejected() {
+        // Regression guard: RESERVED_OTLP_HEADERS deliberately no longer lists every gRPC header
+        // name individually -- any `grpc-*` header is reserved by prefix, not by exact match, so
+        // a header this project doesn't itself set (e.g. `grpc-trace-bin`, part of the gRPC wire
+        // protocol but never used by `crates/logit-outputs/src/otlp.rs`) is still rejected.
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], otlp_out_with_headers(vec![("grpc-trace-bin", "x")])),
+        ]));
+        assert!(err.contains("sets itself"), "got: {err}");
+    }
+
+    #[test]
+    fn an_otlp_out_with_two_headers_differing_only_in_case_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                otlp_out_with_headers(vec![
+                    ("X-Scope-OrgID", "tenant-a"),
+                    ("x-scope-orgid", "tenant-b"),
+                ]),
+            ),
+        ]));
+        assert!(err.contains("differs only in case"), "got: {err}");
     }
 
     #[test]
@@ -1240,6 +1401,83 @@ mod tests {
         .expect("should resolve");
         assert_eq!(graph.components["keep"].role(), Role::Transform);
         assert_eq!(graph.components["remove"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_set_with_neither_map_configured_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "identity",
+                vec!["in"],
+                ComponentKind::Set {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                },
+            ),
+            ("out", vec!["identity"], sink()),
+        ]));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_set_with_only_resource_configured_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "identity",
+                vec!["in"],
+                ComponentKind::Set {
+                    resource: std::collections::BTreeMap::from([(
+                        "service.name".to_string(),
+                        logit_config::SetValue::Str("nginx".to_string()),
+                    )]),
+                    attributes: std::collections::BTreeMap::new(),
+                },
+            ),
+            ("out", vec!["identity"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["identity"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_trace_context_with_an_empty_trace_id_field_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "trace",
+                vec!["in"],
+                ComponentKind::TraceContext {
+                    trace_id: String::new(),
+                    span_id: None,
+                    flags: None,
+                    keep_source: false,
+                },
+            ),
+            ("out", vec!["trace"], sink()),
+        ]));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_trace_context_with_a_trace_id_field_name_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "trace",
+                vec!["in"],
+                ComponentKind::TraceContext {
+                    trace_id: "trace_id".to_string(),
+                    span_id: None,
+                    flags: None,
+                    keep_source: false,
+                },
+            ),
+            ("out", vec!["trace"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["trace"].role(), Role::Transform);
     }
 
     #[test]
