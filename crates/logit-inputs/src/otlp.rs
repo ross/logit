@@ -188,10 +188,11 @@ impl Input for OtlpInput {
             let tls_acceptor = tls_acceptor.clone();
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection's lifetime; released on drop
-                                      // The TLS handshake itself runs here, inside the spawned task and after the
-                                      // permit above -- a slow or hostile handshake stalls only this connection and
-                                      // counts against `MAX_CONCURRENT_CONNECTIONS` like any other slow request, rather
-                                      // than blocking `run`'s own accept loop (this module's doc comment).
+
+                // The TLS handshake itself runs here, inside the spawned task and after the
+                // permit above -- a slow or hostile handshake stalls only this connection and
+                // counts against `MAX_CONCURRENT_CONNECTIONS` like any other slow request, rather
+                // than blocking `run`'s own accept loop (this module's doc comment).
                 let result = match tls_acceptor {
                     Some(acceptor) => match acceptor.accept(stream).await {
                         Ok(tls_stream) => {
