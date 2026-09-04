@@ -79,10 +79,15 @@ own Django demo app) round-trips exactly. But haproxy's finest available instant
 rejected outright rather than rounded: an `f64`'s 53-bit mantissa can't represent an
 epoch-nanosecond instant exactly (2^53 ≈ 9×10¹⁵, epoch-now nanoseconds is ~1.7×10¹⁸), so a float
 there is a producer bug worth surfacing, not a value worth guessing at. The `_s` (seconds) form is
-the one place a float is legitimate — it's what nginx's JSON-encoded `$msec` and `$request_time`
-actually are — and a quoted decimal string in that form is parsed digit-by-digit
+the one place a float is legitimate — it's what nginx's `$msec` and `$request_time` actually are
+— and a quoted decimal string in that form is parsed digit-by-digit
 (`logit_core::parse_decimal_nanos`), not through `f64`, so a producer that prints more significant
-digits than a float can hold (`"1725400000.123456789"`) still round-trips exactly. Any two of
+digits than a float can hold (`"1725400000.123456789"`) still round-trips exactly. `examples/nginx`
+and `demo/nginx` both quote `$msec`/`$request_time` in their `log_format` for exactly this reason
+— nginx's own JSON-escaping variable copier (`escape=json`) renders a quoted value as a JSON
+string, which then takes the exact path instead of the unquoted-number-into-`f64` one; an unquoted
+number is accepted too, just with an epoch-magnitude float's ~1µs of imprecision on top of
+nginx's own millisecond ceiling. Any two of
 start/end/duration determine the third; a lone start or duration borrows the event's own (receipt)
 timestamp as the missing end, specifically so an *unchanged* nginx line carrying only
 `request_time` still produces a span once `trace_context` is placed after it.
