@@ -26,8 +26,8 @@ pub use span::{SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus};
 pub use telemetry::{
     trace_is_sampled, Registry, SpanGuard, Tag, Telemetry, DEFAULT_SPAN_SAMPLE_RATE,
 };
-pub use time::format_rfc3339_utc;
-pub use trace::TraceRef;
+pub use time::{format_rfc3339_utc, parse_decimal_nanos, parse_rfc3339_to_nanos, TimestampError};
+pub use trace::{parse_traceparent, random_id_bytes, TraceRef};
 pub use value::Value;
 
 /// A normalized, syslog-flavored log severity. Codecs map their native levels onto this.

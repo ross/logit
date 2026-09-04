@@ -1,9 +1,19 @@
 ---
 created: 2026-09-03
-updated: 2026-09-03
+updated: 2026-09-04
 ---
 
 # Enabling plan: a traced demo stack — HAProxy → nginx → app
+
+> **Update 2026-09-04:** partially superseded by
+> [access-log-spans.md](access-log-spans.md)/[ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md).
+> `logit` now parses `traceparent` natively, so the "split fields, decimal-flags-only" row in the
+> decisions table below and the per-tier `map`/`txn`-var splitting workstream A built are no
+> longer necessary (harmless to leave running; `access-log-spans.md`'s workstream D migrates
+> `demo/` off them). More importantly, haproxy's and nginx's access spans are now real spans in
+> Tempo, not logs-only — the "app's spans go straight to Tempo, deliberately not through `logit`"
+> decision still stands for the app tier specifically, but the demo's Tempo trace is no longer
+> single-legged on that account.
 
 ## The target, generically
 

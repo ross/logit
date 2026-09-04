@@ -1028,6 +1028,35 @@ fn trace_context_lifts_a_valid_trace_id() {
     expect_allocs("transform: trace_context, lifting a valid trace_id", stats, 1);
 }
 
+/// `trace_context` with a `span:` block, minting a `SpanRecord` from the convention attributes
+/// (`docs/adr/trace-context-span-lifting.md`) -- **1**, the same `process_batch` `Vec` as the
+/// log-only row above. Everything the span lift does is on the stack or in place: ids parse into
+/// stack arrays (`parse_traceparent`/`parse_trace_id`/`parse_span_id`), the timing arithmetic is
+/// integer, the span's `name` is the transform's pre-built `Value` cloned (a `Bytes` refcount
+/// bump), `events`/`links` are `Vec::new()` (no allocation until a push), and every consumed
+/// attribute is an in-place `AttrMap::remove`. `SpanRecord` itself is inline in `Event`
+/// (`docs/design/memory.md` §1), so setting `event.span` moves 136 bytes, allocating nothing.
+#[test]
+fn trace_context_mints_a_span_from_the_convention() {
+    let mut trace_context = fixtures::trace_context_with_span();
+    let resource = fixtures::resource();
+    let traced = fixtures::nginx_traced_event();
+    let telemetry = Telemetry::default();
+    let warm = EventBatch { resource: resource.clone(), events: vec![traced.clone()] };
+    drop(process_batch(&mut trace_context, warm, &telemetry));
+
+    let batch = EventBatch { resource, events: vec![traced] };
+    let (out, stats) = measure(|| process_batch(&mut trace_context, batch, &telemetry));
+    let out = out.expect("trace_context forwards events, never absorbs");
+    let event = &out.events[0];
+    let span = event.span.as_ref().expect("the span lift should have succeeded");
+    assert_eq!(span.span_id, [0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18]);
+    assert!(span.parent_span_id.is_some(), "parent from the traceparent");
+    assert_eq!(span.end_timestamp - event.timestamp, 4_000_000, "4ms, from span.duration_s");
+    assert!(event.attributes.get("traceparent").is_none(), "consumed");
+    expect_allocs("transform: trace_context, minting a span from the convention", stats, 1);
+}
+
 /// `Set::map_resource`'s one-entry cache (`crates/logit-transforms/src/set.rs`): a second call
 /// with the same input `Arc<Resource>` must hit the cache and cost nothing, in contrast to a
 /// cache miss (`set_resource_map_resource_cache_miss` below), which allocates a rebuilt

@@ -25,7 +25,7 @@ pub use kv_metrics::{KvMetrics, MetricSpec};
 pub use scale::Scale;
 pub use set::Set;
 pub use signals::{DropSignals, HasSignal, KeepSignals, MatchMode, SignalSet};
-pub use trace_context::TraceContext;
+pub use trace_context::{SpanLift, TraceContext};
 
 /// Coerces a `Value` to a finite `f64`: `I64`/`U64`/`F64` directly, or a `Str` that parses
 /// cleanly to a finite `f64` (so it works whether the source JSON quoted the value or not).

@@ -401,30 +401,47 @@ pub enum ComponentKind {
     },
     /// Lifts an application trace/span reference off an event's attributes onto its `LogRecord`
     /// (`docs/adr/log-record-trace-context.md`) -- the common "my JSON log body already has a
-    /// `trace_id` field" case, without writing Lua (`event.log.trace_id`,
-    /// `docs/design/lua-api.md`). Overwrites `log.trace` on a successful lift -- operator intent,
-    /// the same posture `Set` has. An event with no log, or missing/unparseable named
-    /// attribute(s), passes through untouched (never an error) -- see
-    /// `crates/logit-transforms/src/trace_context.rs` for the exact skip conditions.
+    /// `trace.id` field" case, without writing Lua (`event.log.trace_id`,
+    /// `docs/design/lua-api.md`) -- and, with a `span:` block, also turns that log line into a
+    /// real `SpanRecord` on the same event (`docs/adr/trace-context-span-lifting.md`): an
+    /// access log's ids plus its own start/end/duration become a span whose start is the event's
+    /// timestamp. Reads the well-known attribute names in `docs/design/data-model.md`
+    /// (`traceparent`, `trace.id`, `trace.flags`, `span.id`, `span.parent_id`, `span.name`,
+    /// `span.kind`, `span.status`, `span.start`/`span.end`/`span.duration` and their unit-suffixed
+    /// forms) by default; the three id fields below rename their sources. Overwrites `log.trace`
+    /// on a successful lift -- operator intent, the same posture `Set` has. An event with no
+    /// log, or missing/unparseable attribute(s), passes through untouched (never an error) --
+    /// see `crates/logit-transforms/src/trace_context.rs` for the exact skip conditions.
     TraceContext {
-        /// The attribute holding a 32-character hex trace id. Required, and rejected as an empty
-        /// string at graph-validation time -- an empty field name could never match a real
-        /// attribute, so a component configured that way can only ever be a no-op.
+        /// The attribute holding a 32-character hex trace id. Defaults to `trace.id`; rejected
+        /// as an empty string at graph-validation time -- an empty field name could never match
+        /// a real attribute, so a component configured that way can only ever be a no-op. A
+        /// `traceparent` attribute supplies the trace id when this one is absent.
+        #[serde(default = "default_trace_id_field")]
         trace_id: String,
-        /// The attribute holding a 16-character hex span id, if any. A `Some` field name whose
-        /// attribute is absent means "no span," not a skip -- only present-but-unparseable is an
-        /// error.
-        #[serde(default)]
+        /// The attribute holding this line's own 16-character hex span id. Defaults to
+        /// `span.id`; `null` disables the lookup. An absent attribute means "no span id," not a
+        /// skip (unless a `span:` block needs one) -- only present-but-unparseable is an error.
+        #[serde(default = "default_span_id_field")]
         span_id: Option<String>,
-        /// The attribute holding the W3C trace flags (0-255, decimal -- never hex), if any.
-        #[serde(default)]
+        /// The attribute holding the W3C trace flags (0-255, decimal -- never hex). Defaults to
+        /// `trace.flags`; `null` disables the lookup. A `traceparent` attribute supplies the
+        /// flags (from its own hex octet) when this one is absent.
+        #[serde(default = "default_flags_field")]
         flags: Option<String>,
         /// Keep the source attribute(s) after a successful lift, instead of removing them (the
         /// default). Removing matters for OTLP-native backends: Loki turns log attributes into
         /// structured metadata under their own names, so a leftover `trace_id` attribute would
-        /// collide with the native `trace_id` key `LogRecord.trace_id` already produces.
+        /// collide with the native `trace_id` key `LogRecord.trace_id` already produces. With
+        /// `span:`, every convention attribute consumed (`traceparent`, `span.parent_id`,
+        /// `span.name`, `span.kind`, `span.status`, and the timing fields) is removed too.
         #[serde(default)]
         keep_source: bool,
+        /// Opt in to minting a `SpanRecord` from the lifted ids plus the event's `span.start`/
+        /// `span.end`/`span.duration` attributes (any two; see `docs/design/data-model.md`).
+        /// Absent (the default) means today's log-only lift.
+        #[serde(default)]
+        span: Option<SpanLiftConfig>,
     },
     /// Multiplies named numeric attributes by a constant factor, in place -- unit conversion
     /// (nginx's `request_time` in seconds -> milliseconds, say, to share a measurement name with
@@ -624,6 +641,81 @@ fn default_max_retained_gauge_series() -> usize {
 /// hand if this ever changes.
 fn default_syslog_connect_timeout() -> Duration {
     Duration::from_secs(5)
+}
+
+fn default_trace_id_field() -> String {
+    "trace.id".to_string()
+}
+
+fn default_span_id_field() -> Option<String> {
+    Some("span.id".to_string())
+}
+
+fn default_flags_field() -> Option<String> {
+    Some("trace.flags".to_string())
+}
+
+/// `trace_context`'s `span:` block (`docs/adr/trace-context-span-lifting.md`): the defaults a
+/// minted `SpanRecord` falls back on when the event's own `span.name`/`span.kind` attributes
+/// are absent, plus the two knobs that aren't per-event data at all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SpanLiftConfig {
+    /// Mint a fresh span id when the `span_id` attribute is absent, instead of skipping the
+    /// event (`skipped{reason="span_id"}`). Off by default: `logit`'s own code never invents
+    /// identity for data it didn't produce unless an operator asks it to. A missing *trace* id
+    /// is never minted -- that's the edge tier's job.
+    #[serde(default)]
+    pub mint_id: bool,
+    /// The span name when the event carries no `span.name` attribute. Rejected as an empty
+    /// string at graph-validation time -- OTLP requires a span name.
+    #[serde(default = "default_span_name")]
+    pub name: String,
+    /// The span kind when the event carries no `span.kind` attribute. An access log line is a
+    /// server span, so `server` is the default.
+    #[serde(default)]
+    pub kind: SpanKindConfig,
+    /// A resolved start or end further than this from the event's receipt time is rejected
+    /// (`skipped{reason="skew"}`) rather than written -- one sender with a badly wrong clock
+    /// must not be able to write spans years away and quietly poison a trace store. Rejected as
+    /// `0s` at graph-validation time (an impossible window, never a small one).
+    #[serde(default = "default_max_skew", with = "humantime_serde_duration")]
+    #[schemars(with = "String")]
+    pub max_skew: Duration,
+}
+
+impl Default for SpanLiftConfig {
+    fn default() -> Self {
+        SpanLiftConfig {
+            mint_id: false,
+            name: default_span_name(),
+            kind: SpanKindConfig::default(),
+            max_skew: default_max_skew(),
+        }
+    }
+}
+
+fn default_span_name() -> String {
+    "http.request".to_string()
+}
+
+fn default_max_skew() -> Duration {
+    Duration::from_secs(3600)
+}
+
+/// OTLP's span kinds, as config vocabulary -- mirrors `logit_core::SpanKind` one for one
+/// (`crates/logit-cli/src/pipeline.rs` maps between them, the same way `Signal` maps to
+/// `logit-transforms`' `SignalSet`), kept separate so `logit-config`'s schema doesn't depend on
+/// a core type's derives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SpanKindConfig {
+    Internal,
+    #[default]
+    Server,
+    Client,
+    Producer,
+    Consumer,
 }
 
 /// `syslog_out`'s transport. UDP (the default) mirrors `syslog_in` and needs no ordering
@@ -1441,17 +1533,31 @@ mod tests {
     }
 
     #[test]
-    fn trace_context_component_deserializes_with_defaults() {
+    fn trace_context_component_deserializes_with_the_convention_defaults() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "trace_context", "sources": ["in"]}"#).unwrap();
+        match component.kind {
+            ComponentKind::TraceContext { trace_id, span_id, flags, keep_source, span } => {
+                assert_eq!(trace_id, "trace.id");
+                assert_eq!(span_id, Some("span.id".to_string()));
+                assert_eq!(flags, Some("trace.flags".to_string()));
+                assert!(!keep_source);
+                assert_eq!(span, None, "span lifting is opt-in");
+            }
+            other => panic!("expected TraceContext, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trace_context_component_null_disables_an_optional_lookup() {
         let component: Component = serde_json::from_str(
-            r#"{"type": "trace_context", "sources": ["in"], "trace_id": "trace_id"}"#,
+            r#"{"type": "trace_context", "sources": ["in"], "span_id": null, "flags": null}"#,
         )
         .unwrap();
         match component.kind {
-            ComponentKind::TraceContext { trace_id, span_id, flags, keep_source } => {
-                assert_eq!(trace_id, "trace_id");
+            ComponentKind::TraceContext { span_id, flags, .. } => {
                 assert_eq!(span_id, None);
                 assert_eq!(flags, None);
-                assert!(!keep_source);
             }
             other => panic!("expected TraceContext, got {other:?}"),
         }
@@ -1461,18 +1567,53 @@ mod tests {
     fn trace_context_component_deserializes_every_field() {
         let component: Component = serde_json::from_str(
             r#"{"type": "trace_context", "sources": ["in"], "trace_id": "trace_id",
-                "span_id": "span_id", "flags": "trace_flags", "keep_source": true}"#,
+                "span_id": "span_id", "flags": "trace_flags", "keep_source": true,
+                "span": {"mint_id": true, "name": "proxy", "kind": "client", "max_skew": "30s"}}"#,
         )
         .unwrap();
         match component.kind {
-            ComponentKind::TraceContext { trace_id, span_id, flags, keep_source } => {
+            ComponentKind::TraceContext { trace_id, span_id, flags, keep_source, span } => {
                 assert_eq!(trace_id, "trace_id");
                 assert_eq!(span_id, Some("span_id".to_string()));
                 assert_eq!(flags, Some("trace_flags".to_string()));
                 assert!(keep_source);
+                assert_eq!(
+                    span,
+                    Some(SpanLiftConfig {
+                        mint_id: true,
+                        name: "proxy".to_string(),
+                        kind: SpanKindConfig::Client,
+                        max_skew: Duration::from_secs(30),
+                    })
+                );
             }
             other => panic!("expected TraceContext, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn trace_context_empty_span_block_takes_every_default() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "trace_context", "sources": ["in"], "span": {}}"#)
+                .unwrap();
+        let ComponentKind::TraceContext { span, .. } = component.kind else {
+            panic!("expected TraceContext");
+        };
+        let span = span.expect("span block present");
+        assert_eq!(span, SpanLiftConfig::default());
+        assert!(!span.mint_id);
+        assert_eq!(span.name, "http.request");
+        assert_eq!(span.kind, SpanKindConfig::Server);
+        assert_eq!(span.max_skew, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn trace_context_span_block_rejects_unknown_fields() {
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "trace_context", "sources": ["in"], "span": {"nme": "x"}}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     #[test]

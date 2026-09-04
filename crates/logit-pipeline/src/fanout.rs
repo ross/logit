@@ -27,8 +27,8 @@
 //! `docs/design/pipeline-graph.md`'s "Trace context propagation" section for the account of which
 //! node kinds propagate a real parent today and which still mint a root.
 
+use logit_core::random_id_bytes;
 use logit_core::{EventBatch, SpanKind, Telemetry};
-use std::cell::Cell;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -67,63 +67,15 @@ impl TraceContext {
     /// has no parent to inherit) and, for now, at every flush-driven emission (see this type's own
     /// doc comment for why that's a deliberate, tracked gap rather than an oversight).
     pub fn new_root() -> Self {
-        TraceContext { trace_id: next_id_bytes(), span_id: next_id_bytes() }
+        TraceContext { trace_id: random_id_bytes(), span_id: random_id_bytes() }
     }
 
     /// A context for whatever this node emits as a direct, unambiguous result of processing one
     /// incoming batch carrying `self` -- same `trace_id`, a fresh `span_id`. See this type's own
     /// doc comment for which node kinds can call this today.
     pub fn child(&self) -> Self {
-        TraceContext { trace_id: self.trace_id, span_id: next_id_bytes() }
+        TraceContext { trace_id: self.trace_id, span_id: random_id_bytes() }
     }
-}
-
-/// A per-thread SplitMix64, good enough to mint distinct trace/span ids without a new `rand`
-/// dependency or `tracing::span::Id` (a `Registry` recycles those after a span closes, so they're
-/// not a safe source of identity here -- two spans minutes apart could share one). Not
-/// security-relevant: `logit`'s listeners are private by deployment shape
-/// (`docs/OVERVIEW.md`), the same premise `docs/known-gaps.md`'s interner entry leans on, and a
-/// trace id is not a capability.
-fn next_id_bytes<const N: usize>() -> [u8; N] {
-    thread_local! {
-        // Seeded once, lazily, on this thread's first call -- not a compile-time constant.
-        // Caught in review: a `const` seed here is identical on every thread and every process
-        // run, so the *first* `next_id_bytes()` call on any two fresh threads returned the same
-        // bytes, deterministically merging unrelated traces. `initial_seed` below is real
-        // per-run (OS-random) and per-thread entropy instead.
-        static STATE: Cell<u64> = Cell::new(initial_seed());
-    }
-    let mut out = [0u8; N];
-    let mut filled = 0;
-    while filled < N {
-        let mut z = STATE.with(|c| {
-            let z = c.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
-            c.set(z);
-            z
-        });
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        for b in z.to_le_bytes() {
-            if filled >= N {
-                break;
-            }
-            out[filled] = b;
-            filled += 1;
-        }
-    }
-    out
-}
-
-/// This thread's starting seed: real entropy, not a shared constant. `RandomState::new()` is
-/// keyed from OS randomness at process start and refreshed by an internal per-call counter, so it
-/// already differs call to call within one process; mixing in this thread's `ThreadId` makes two
-/// threads calling this at nearly the same instant diverge too, rather than relying on
-/// `RandomState`'s own per-call drift alone. Not security-relevant, same as `next_id_bytes`'s own
-/// doc comment above -- this only needs to not repeat, not resist prediction.
-fn initial_seed() -> u64 {
-    use std::hash::BuildHasher;
-    std::collections::hash_map::RandomState::new().hash_one(std::thread::current().id())
 }
 
 /// What travels one graph edge. `Fanout::send`/`send_blocking` pick the variant per send based on
@@ -359,7 +311,7 @@ mod tests {
     }
 
     /// Two independently-minted roots should (overwhelmingly likely) differ in both halves --
-    /// not a proof of uniqueness, just a smoke test that `next_id_bytes` isn't returning a
+    /// not a proof of uniqueness, just a smoke test that `random_id_bytes` isn't returning a
     /// constant.
     #[test]
     fn two_roots_are_not_the_same_context() {

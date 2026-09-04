@@ -304,8 +304,14 @@ error.
 
 The `trace_context` native transform (`logit_config::ComponentKind::TraceContext`) offers the
 common case -- lifting a trace id already sitting in an attribute (a JSON log body's own
-`trace_id` field, say) onto the log record -- without writing Lua, the same relationship `set` has
-to `resource`/`event.attributes`. See `docs/adr/log-record-trace-context.md`.
+`trace.id` field, or a W3C `traceparent`) onto the log record -- without writing Lua, the same
+relationship `set` has to `resource`/`event.attributes`. See `docs/adr/log-record-trace-context.md`.
+Its `span:` block goes one step further than any script can today: it mints a `SpanRecord` from an
+access line's ids and timing (`docs/adr/trace-context-span-lifting.md`,
+`docs/design/data-model.md`'s "Well-known attribute names"). A script has no span API at all --
+`event.has_span` is the whole surface -- so a Lua component can *prepare* those attributes (compute
+`span.start` from whatever the line carries, say) for a `trace_context` placed after it, but cannot
+create the span itself. Tracked in `docs/known-gaps.md`.
 
 ## Config shape
 

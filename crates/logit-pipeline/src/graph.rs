@@ -44,10 +44,13 @@
 //!     impossible bound, the twin of rule 15.
 //!     `receive.batch_flush_interval: 0s` is **not** rejected: it means "no flush timer," a
 //!     meaningful setting, unlike the count bounds.
-//! 19. A `trace_context` with an empty `trace_id` field name is rejected -- it could never name a
-//!     real attribute, so the component can only ever be a no-op, the same reasoning rules 10-12
-//!     already apply to `kv_metrics`/`set`.
-//! 20. An empty `signals:` list on `has_signal`, `keep_signals`, or `drop_signals` is rejected.
+//! 19. A `trace_context` with an empty `trace_id`, `span_id`, or `flags` field name is rejected
+//!     -- it could never name a real attribute, so that lookup can only ever be a no-op, the same
+//!     reasoning rules 10-12 already apply to `kv_metrics`/`set` (`null`, not `""`, is how an
+//!     optional lookup is disabled).
+//! 20. A `scale` with an empty `fields` map, an empty field name, or a non-finite factor is
+//!     rejected (`docs/adr/scale-transform.md`).
+//! 21. An empty `signals:` list on `has_signal`, `keep_signals`, or `drop_signals` is rejected.
 //!     `keep_signals`/`drop_signals` additionally reject naming all three signals. Which of the
 //!     two shapes is the silent black hole (rule 7's "no consumer" failure, recast here as "no
 //!     event ever gets through") and which is the no-op (every event forwarded untouched) is
@@ -56,15 +59,22 @@
 //!     are rejected either way, but the error message names the right one. `keep`'s empty
 //!     `fields` list stays legal by contrast -- "drop every attribute" is a real operation,
 //!     "drop every event" is not. See `docs/adr/signal-filtering-components.md`.
-//! 20. An `otlp_out` `headers:` entry naming an empty string, an HTTP/2 pseudo-header (starting
+//! 22. An `otlp_out` `headers:` entry naming an empty string, an HTTP/2 pseudo-header (starting
 //!     with `:`), any `grpc-*` header, or another header the wire transport itself sets
 //!     (`content-type`, etc. -- see `RESERVED_OTLP_HEADERS`) is rejected, case-insensitively --
 //!     almost certainly a config mistake, not a meaningful override. Two entries naming the same
 //!     header once case is ignored (HTTP header names are case-insensitive) are also rejected --
 //!     which value would actually be sent is otherwise undefined.
-//! 21. A non-empty `otlp_out` `paths:` under `protocol: grpc` is rejected -- gRPC method names
+//! 23. A non-empty `otlp_out` `paths:` under `protocol: grpc` is rejected -- gRPC method names
 //!     are fixed by the OTLP service definitions, not a mount point `paths` can move, so silently
 //!     ignoring it would be a worse failure mode than a clear error.
+//! 24. An `otlp_out` `tls:` block must be internally consistent (`cert_file`/`key_file`
+//!     together, no `insecure_skip_verify` alongside `ca_file`) and is rejected under a
+//!     non-`https://` endpoint, where it would have no effect
+//!     (`docs/adr/otlp-tls-and-pooled-grpc-client.md`).
+//! 25. A `trace_context` `span:` block with an empty `name` (OTLP requires a span name) or a
+//!     `max_skew` of `0s` (an impossible window -- every span would be rejected as skewed) is
+//!     rejected (`docs/adr/trace-context-span-lifting.md`).
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -532,16 +542,25 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 19: `trace_context`-specific validation -- an empty `trace_id` field name could never
-    // name a real attribute, so a component configured that way can only ever be a no-op, the
-    // same reasoning rules 10-12 already apply to `kv_metrics`/`set`.
+    // Rule 19: `trace_context`-specific validation -- an empty field name could never name a
+    // real attribute, so that lookup can only ever be a no-op, the same reasoning rules 10-12
+    // already apply to `kv_metrics`/`set`. `span_id`/`flags` are disabled with `null`, never
+    // `""` -- an empty string there is a typo, not an opt-out.
     for (id, component) in &components {
-        if let ComponentKind::TraceContext { trace_id, .. } = &component.kind {
+        if let ComponentKind::TraceContext { trace_id, span_id, flags, .. } = &component.kind {
             if trace_id.is_empty() {
                 anyhow::bail!(
                     "component '{id}': a trace_context with an empty 'trace_id' field name can \
                      only ever be a no-op"
                 );
+            }
+            for (field, value) in [("span_id", span_id), ("flags", flags)] {
+                if value.as_deref() == Some("") {
+                    anyhow::bail!(
+                        "component '{id}': a trace_context with an empty '{field}' field name \
+                         could never match an attribute -- use null to disable the lookup"
+                    );
+                }
             }
         }
     }
@@ -708,6 +727,27 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     "component '{id}': 'tls' is set, but 'endpoint' ({endpoint:?}) isn't \
                      'https://' -- TLS is selected by the endpoint's scheme, so a 'tls:' block \
                      here would have no effect"
+                );
+            }
+        }
+    }
+
+    // Rule 25: `trace_context`'s `span:` block (`docs/adr/trace-context-span-lifting.md`). An
+    // empty default `name` would mint spans OTLP requires a name for, and a `max_skew` of zero
+    // rejects every span as skewed -- an impossible window, the same instinct as rule 9's
+    // zero-length `interval` and rule 15's zero-sized buffer.
+    for (id, component) in &components {
+        if let ComponentKind::TraceContext { span: Some(span), .. } = &component.kind {
+            if span.name.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a trace_context 'span.name' default can't be empty -- \
+                     OTLP requires every span to have a name"
+                );
+            }
+            if span.max_skew.is_zero() {
+                anyhow::bail!(
+                    "component '{id}': a trace_context 'span.max_skew' of 0s would reject every \
+                     span as skewed"
                 );
             }
         }
@@ -1611,11 +1651,34 @@ mod tests {
                     span_id: None,
                     flags: None,
                     keep_source: false,
+                    span: None,
                 },
             ),
             ("out", vec!["trace"], sink()),
         ]));
         assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_trace_context_with_an_empty_optional_field_name_is_rejected() {
+        for (span_id, flags) in [(Some(String::new()), None), (None, Some(String::new()))] {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                (
+                    "trace",
+                    vec!["in"],
+                    ComponentKind::TraceContext {
+                        trace_id: "trace.id".to_string(),
+                        span_id,
+                        flags,
+                        keep_source: false,
+                        span: None,
+                    },
+                ),
+                ("out", vec!["trace"], sink()),
+            ]));
+            assert!(err.contains("use null"), "got: {err}");
+        }
     }
 
     #[test]
@@ -1630,12 +1693,43 @@ mod tests {
                     span_id: None,
                     flags: None,
                     keep_source: false,
+                    span: Some(logit_config::SpanLiftConfig::default()),
                 },
             ),
             ("out", vec!["trace"], sink()),
         ]))
         .expect("should resolve");
         assert_eq!(graph.components["trace"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_trace_context_span_block_with_an_empty_name_or_zero_skew_is_rejected() {
+        let empty_name = logit_config::SpanLiftConfig {
+            name: String::new(),
+            ..logit_config::SpanLiftConfig::default()
+        };
+        let zero_skew = logit_config::SpanLiftConfig {
+            max_skew: std::time::Duration::ZERO,
+            ..logit_config::SpanLiftConfig::default()
+        };
+        for (span, needle) in [(empty_name, "requires every span"), (zero_skew, "0s")] {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                (
+                    "trace",
+                    vec!["in"],
+                    ComponentKind::TraceContext {
+                        trace_id: "trace.id".to_string(),
+                        span_id: None,
+                        flags: None,
+                        keep_source: false,
+                        span: Some(span),
+                    },
+                ),
+                ("out", vec!["trace"], sink()),
+            ]));
+            assert!(err.contains(needle), "got: {err}");
+        }
     }
 
     #[test]

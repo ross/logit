@@ -17,8 +17,10 @@ Lua enrichment stage, InfluxDB 2.x out, via `logit run <config>` (see
 [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml), `script/server`). Since then,
 `syslog_in`, `stdio_out`, `otlp_in`, and `otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`,
 `crates/logit-proto`'s `otlp` codec) and `json`, `kv_metrics`, `keep`, `remove`, `set`,
-`trace_context` (giving a `LogRecord` a native application trace/span reference,
-[ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md)), `scale` (multiplying
+`trace_context` (giving a `LogRecord` a native application trace/span reference and, with an
+opt-in `span:` block, turning an access log line into a real `SpanRecord` on the same event,
+[ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md)/
+[ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md)), `scale` (multiplying
 named numeric attributes by a constant factor,
 [ADR `scale-transform`](docs/adr/scale-transform.md)), `has_signal`, `keep_signals`, and
 `drop_signals` (`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —

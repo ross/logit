@@ -250,6 +250,12 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     TLS is selected by `endpoint`'s scheme
     (`docs/adr/otlp-tls-and-pooled-grpc-client.md`), so a `tls:` block with nothing to tune would
     otherwise be silently ignored rather than caught as a likely mistake.
+25. A `trace_context` `span:` block with an empty `name` (OTLP requires every span to have a
+    name) or a `max_skew` of `0s` (an impossible window — every span would be rejected as skewed,
+    the same instinct as rule 9's zero `interval`) is rejected
+    (`docs/adr/trace-context-span-lifting.md`). Rule 19 also covers an empty `span_id`/`flags`
+    field name on the same component now that those default to `span.id`/`trace.flags` — `null`
+    disables a lookup, `""` is a typo.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

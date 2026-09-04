@@ -1,12 +1,17 @@
 ---
 created: 2026-09-03
-updated: 2026-09-03
+updated: 2026-09-04
 ---
 
 # `LogRecord` gains a native application trace/span reference
 
 ## Status
-Accepted
+Accepted. Partially superseded on 2026-09-04 by
+[ADR `trace-context-span-lifting`](trace-context-span-lifting.md): this ADR's "splitting a
+`traceparent` string is a script's job" stance (`trace_context.rs`'s original doc comment, quoted
+below) is revisited there — `trace_context` now parses a `traceparent` header natively for its
+trace id and flags. Everything else here — `TraceRef`'s shape, the lenient-decode/strict-span-id
+asymmetry, the `trace` global vs. `event.log.trace_id` distinction — stands unchanged.
 
 ## Context
 
