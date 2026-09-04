@@ -164,17 +164,25 @@ workstream A, one level up the stack.
 Surfaced while checking Loki compatibility; none block the demo, all block a real deployment:
 
 - No custom headers — no way to send `X-Scope-OrgID`, which rules out any multi-tenant Loki, Mimir,
-  or Grafana Cloud target.
+  or Grafana Cloud target. (Landed: `headers:` on `otlp_out`, applied on both transports, validated
+  against a reserved protocol-owned set — see
+  `docs/plans/signal-filtering-and-otlp-out-config-gaps.md`'s workstream 2.)
 - No compression support (`crates/logit-outputs/src/otlp.rs:479-482` — the frame's compressed flag
-  is always `0`).
+  is always `0`). (Landed: `compression: gzip` on `otlp_out`, both transports, paired with matching
+  bounded decode on `otlp_in` — see ADR `otlp-compression-and-decompression-bounds` and
+  `docs/plans/signal-filtering-and-otlp-out-config-gaps.md`'s workstream 4.)
 - No TLS configuration for gRPC — `reject_insecure_grpc_endpoint`
   (`crates/logit-outputs/src/otlp.rs:359-370`) hard-rejects an `https://` endpoint under
   `protocol: grpc` at construction time, rather than supporting it.
 - No signal filter — a sink sends whatever signal types the events in its batch happen to carry;
-  there's no way to say "logs only" at the sink.
+  there's no way to say "logs only" at the sink. (Landed: `has_signal`/`keep_signals`/
+  `drop_signals`, three insertable transform components rather than a sink field — see ADR
+  `signal-filtering-components` and `docs/plans/signal-filtering-and-otlp-out-config-gaps.md`.)
 - Hardcoded per-signal paths (fine for the standard OTLP layout, blocks any backend using a
-  different mount point).
-- `observed_time_unix_nano` always `0` on encode (`logs.rs:114`).
+  different mount point). (Landed: `paths:` on `otlp_out`, HTTP-only — see
+  `docs/plans/signal-filtering-and-otlp-out-config-gaps.md`'s workstream 3.)
+- `observed_time_unix_nano` always `0` on encode (`logs.rs:114`). (Landed: stamped with
+  `logit_proto::now_nanos()` at encode — same workstream.)
 
 `docs/known-gaps.md:662-673` already files the compression gap for `otlp_in`; `otlp_out`'s half of
 the same gap is currently unfiled.

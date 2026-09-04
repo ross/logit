@@ -21,6 +21,15 @@ hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+# otlp_in's matching gzip request decode (docs/adr/otlp-compression-and-decompression-bounds.md).
+flate2.workspace = true
+# otlp_in's TLS termination, both transports (docs/adr/otlp-tls-and-pooled-grpc-client.md):
+# `rustls`/`rustls-pki-types` build a `rustls::ServerConfig` from config-supplied PEM,
+# `tokio-rustls` is the `TlsAcceptor` wrapping each accepted `TcpStream` before the existing
+# HTTP/1.1+h2c / gRPC-over-HTTP/2 serving paths ever see it.
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tokio-rustls.workspace = true
 
 [dev-dependencies]
 # Test-only: the end-to-end statsd -> aggregate integration test

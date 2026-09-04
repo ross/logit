@@ -42,7 +42,7 @@
 #                                       |
 #   self (internal) --+-> self_windowed (aggregate) --> influx_out --> InfluxDB
 #                      |
-#                      +-> trace_windowed (aggregate) --> tempo_out (otlp_out, gRPC) --> tempo
+#                      +-> trace_only (has_signal) --> tempo_out (otlp_out, gRPC) --> tempo
 components:
   haproxy_in:
     type: syslog_in
@@ -190,34 +190,27 @@ components:
     token: !env INFLUXDB_TOKEN
 
   # `self` is `internal` observing *all* of `logit`'s own telemetry, not just spans -- every drain
-  # also carries this process's own `logit.*` metrics (Counter/Gauge/Distribution, every one of
-  # them mergeable). `trace_windowed` exists to strip those out before `tempo_out` ever sees them:
-  # `aggregate` absorbs every mergeable metric into its window state and forwards a metric-less
-  # event -- a pure span, here -- untouched and immediately, on every `process` call, without
-  # waiting for its own `flush` (`crates/logit-transforms/src/aggregate.rs`'s `process` doc
-  # comment). So on the (overwhelming) majority of ticks, only spans reach `tempo_out` at all.
+  # also carries this process's own `logit.*` metrics (Counter/Gauge/Distribution) alongside its
+  # spans, but `self` never mixes the two *on one event*: each drain is either a metric-only point
+  # or a span-only span event (`crates/logit-core/src/telemetry.rs`'s `drain`), never both at
+  # once. `trace_only` exists to drop the metric-only ones before `tempo_out` ever sees them --
+  # `has_signal` never mutates a forwarded event, so every span that does reach `tempo_out` arrives
+  # exactly as `self` produced it. See `docs/adr/signal-filtering-components.md`.
   #
   # This isn't pipeline hygiene, it's load-bearing: `otlp_out` issues one request per signal and
   # aborts the rest of a `send` call on the first failing one
   # (`crates/logit-outputs/src/otlp.rs`'s module doc), and Tempo is a traces-only gRPC server (it
-  # registers no `MetricsService`) -- a batch mixing spans and metrics would see its traces
-  # request succeed and its metrics request fail with `grpc-status: 12` (UNIMPLEMENTED), correctly
-  # classified `Fault::Permanent` and correctly not retried. That alone is recoverable noise (the
-  # spans already landed). What isn't recoverable: confirmed directly against a first version of
-  # this config that skipped `trace_windowed` -- `self`'s 10s drain interval meant *every* batch
-  # failed this way, `send` never once returned `Ok` for `tempo_out`, and `write_loop`'s ~60s
-  # sustained-permanent-failure guard (`docs/adr/service-lifecycle-and-output-retry.md`,
-  # revised by `docs/adr/buffered-sink-delivery.md`) killed the whole `logit` process a
-  # minute after startup -- taking the InfluxDB metrics path down with it. `trace_windowed`'s own
-  # `flush` (every 60s here) still occasionally emits a real metrics-only batch that fails the same
-  # way, but the many successful pure-span deliveries in between (every ~10s) reset that guard's
-  # streak long before it reaches 60s -- see `docs/known-gaps.md`'s "`otlp_out` aborts an entire
-  # batch's `send`..." entry for the full account, including why this is specific to a mixed-signal
-  # source feeding a signal-partial backend, not a general `otlp_out` problem.
-  trace_windowed:
-    type: aggregate
+  # registers no `MetricsService`) -- an `internal` metric point reaching `tempo_out` would fail
+  # with `grpc-status: 12` (UNIMPLEMENTED), and enough consecutive failures trip `write_loop`'s
+  # ~60s sustained-permanent-failure guard (`docs/adr/service-lifecycle-and-output-retry.md`,
+  # revised by `docs/adr/buffered-sink-delivery.md`), ending the whole `logit` process -- taking
+  # the InfluxDB metrics path down with it, not just Tempo. Confirmed directly against an earlier
+  # version of this config that fed `self` straight into `tempo_out`: see `docs/known-gaps.md`'s
+  # "`otlp_out` aborts an entire batch's `send`..." entry for the full account.
+  trace_only:
+    type: has_signal
     sources: [self]
-    interval: 60s
+    signals: [traces]
 
   # Deliberately gRPC, not HTTP (docs/adr/hand-rolled-grpc-over-hyper.md) -- Tempo's `:4317`
   # receiver, to exercise the transport the rest of this config doesn't otherwise touch;
@@ -225,6 +218,6 @@ components:
   # `crates/logit-outputs/src/otlp.rs`'s `grpc_authority`).
   tempo_out:
     type: otlp_out
-    sources: [trace_windowed]
+    sources: [trace_only]
     protocol: grpc
     endpoint: tempo:4317

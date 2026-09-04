@@ -56,6 +56,11 @@ docker run --rm \
 that stage when actually run. It still needs every `!env` reference in the config to resolve, the
 same as `run` does, so pass the same environment.
 
+`validate` doesn't check that a referenced *file* actually exists or parses — `lua_file`, a
+`stdio_out` path, and `otlp_out`/`otlp_in`'s `tls.*_file` fields are all read only once `run`
+actually constructs the component. A typo'd `tls.ca_file` path passes `validate` and fails at
+startup instead, with the path in the error.
+
 ## Signal and restart behavior
 
 Covered in full by [ADR `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md); the operator-facing
@@ -255,6 +260,70 @@ cardinality. This matters most for a deployment where `otlp_in` faces something 
 `logit`'s own trusted fleet (a third-party exporter, a multi-tenant ingest path) — see
 `docs/known-gaps.md`'s interner entry for when the underlying "listeners are private by deployment
 shape" premise is worth re-checking at all.
+
+## TLS
+
+`otlp_out` (both `protocol: http` and `protocol: grpc`) and `otlp_in` (both transports) can speak
+TLS -- see [ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md) for the
+design. On `otlp_out`, TLS is selected by `endpoint`'s scheme, the same convention every OTel SDK
+uses:
+
+```yaml
+components:
+  trace_out:
+    type: otlp_out
+    endpoint: https://tempo.internal:4317
+    protocol: grpc
+    sources: [enrich]
+    tls:
+      ca_file: /etc/logit/tls/ca.pem   # trust this CA instead of the bundled Mozilla set
+```
+
+`http://`/`grpc://` (or a bare `host:port` under `protocol: grpc`) stays plaintext regardless of
+`tls:` — a non-empty `tls:` block under a plaintext endpoint is a config error (rule 22), not
+silently ignored, since it would otherwise have no effect. `ca_file`/`cert_file`/`key_file` paths
+resolve relative to the config file's own directory, the same rule `lua_file` follows, and (like
+any other field) accept `!env` if the certificate material needs to come from the environment
+rather than a mounted file (ADR `env-yaml-tag`).
+
+Mutual TLS adds a client certificate:
+
+```yaml
+    tls:
+      ca_file: /etc/logit/tls/ca.pem
+      cert_file: /etc/logit/tls/client.pem
+      key_file: /etc/logit/tls/client.key
+```
+
+`otlp_in` has no endpoint of its own to read a scheme from — the presence of a `tls:` block turns
+TLS on for that listener, on both transports:
+
+```yaml
+components:
+  log_in:
+    type: otlp_in
+    bind: 0.0.0.0:4318
+    tls:
+      cert_file: /etc/logit/tls/server.pem
+      key_file: /etc/logit/tls/server.key
+      client_ca_file: /etc/logit/tls/ca.pem   # omit for server-auth-only TLS
+```
+
+`client_ca_file` requires every connecting client to present a certificate chaining to it (mutual
+TLS); omit it to accept any client once the handshake itself completes.
+
+**`tls.insecure_skip_verify`** (`otlp_out` only) disables server-certificate verification — the
+connection is still encrypted, but any certificate is accepted. `logit` logs a startup warning
+whenever it's set; it's meant for a throwaway or pre-production endpoint, not a real deployment,
+and is rejected at config-validation time together with `ca_file` (contradictory: a specific
+trusted CA and "trust nothing" can't both be meant).
+
+**What to watch.** A handshake failure on either side surfaces through the same
+`connection_error`/`network_error` diagnostics and `logit.output.requests{class="network_error"}`/
+listener-side `logit.component.diagnostics` counters as any other transport failure — nothing TLS
+-specific to watch beyond that. `docs/known-gaps.md` tracks two open items: certificates are read
+once at startup (a renewed cert needs a restart, not a live reload), and `otlp_out` has no
+`server_name` override for an endpoint reached by IP or through a proxy.
 
 ## The nginx-side recipe
 
