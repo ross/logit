@@ -698,6 +698,20 @@ already built that have a known, accepted rough edge.
     `SignalDecoder` API change (`crates/logit-proto`), out of scope for the PR that added `otlp_in`
     itself — a natural next step whenever OTLP input volume makes the gap worth closing.
 
+- **`otlp_in` only accepts OTLP/protobuf, not OTLP/JSON.** `crates/logit-inputs/src/otlp.rs`
+  rejects any `Content-Type` other than `application/x-protobuf`/`application/protobuf` with a
+  `415` and an explicit message (line ~194) — a deliberate scope cut for the PR that added
+  `otlp_in`, not an oversight. It's now a real blocker for one concrete consumer:
+  [docs/plans/browser-tracing.md](plans/browser-tracing.md) (workstream C of
+  [demo-tracing-stack.md](plans/demo-tracing-stack.md)) wants a real OpenTelemetry-JS browser SDK
+  exporting spans into the demo, and every browser trace exporter speaks OTLP/JSON —
+  `@opentelemetry/exporter-trace-otlp-proto` is Node-only (protobuf-in-the-browser has been an
+  open upstream request since 2022, `open-telemetry/opentelemetry-js#3118`). Closing this is a
+  bounded, well-specified feature — OTLP/JSON is a documented 1:1 mapping of the same protobuf
+  messages onto JSON, not a new wire format — but it's `logit-proto`/`otlp_in` work, not demo
+  work, which is why `browser-tracing.md` stopped short of it rather than reaching into `logit`
+  to build it in passing.
+
 - **`otlp_out` aborts an entire batch's `send` on the first signal request that fails -- pointed at
   a signal-partial backend fed by a mixed-signal source, that's not just noise, it can end the
   process.** Discovered running `demo/`'s `trace_out` against Tempo

@@ -1,37 +1,33 @@
 #!/usr/bin/env python3
-"""The demo's front door: a one-page app that (a) tells a first-time visitor how to get into
-Grafana, (b) shows the running pipeline as an SVG rendered live from `logit graph`, and (c) is
-itself the traffic source demo/logit.yaml consumes.
+"""The demo's innermost tier: a one-page app that (a) tells a first-time visitor how to get into
+Grafana and (b) shows the running pipeline as an SVG rendered live from `logit graph`.
 
 Stdlib only, on purpose -- demo/compose.yaml bind-mounts this single file into a stock
-python:*-slim image and runs it. No Dockerfile, no requirements.txt, nothing to build.
+python:*-slim image and runs it. No Dockerfile, no requirements.txt, nothing to build. (This
+tier is replaced by a real Django app in docs/plans/demo-tracing-stack.md's workstream B --
+until then, it stays the stdlib stand-in.)
 
-Every log line goes out as RFC 3164 syslog over UDP to logit's syslog_in listener, with a JSON
-body -- the same shape crates/logit-bench/src/fixtures.rs measures (NGINX_SYSLOG_LINE), which is
-what makes demo/logit.yaml's json -> kv_metrics -> keep -> aggregate chain meaningful. Two
-producers share that one emitter:
-
-  - a background thread of synthetic traffic, so the Grafana dashboard has something to draw
-    within seconds of `docker compose up` and keeps moving whether or not anyone visits;
-  - the real HTTP handler, which logs each actual request it served.
-
-The synthetic loop fabricates varied methods/paths/statuses *inside the JSON body only*. Those
-are log-body values, not routes -- this server really does serve exactly two paths.
+Sits behind haproxy -> nginx (docs/plans/demo-tracing-stack.md's workstream A). Every request it
+serves logs one line as RFC 3164 syslog over UDP to logit's `app_in` listener, with a JSON body --
+the same shape crates/logit-bench/src/fixtures.rs measures (NGINX_SYSLOG_LINE) plus the split W3C
+trace context, which is what demo/logit.yaml's json -> trace_context chain expects. The app is no
+longer its own traffic source: demo/compose.yaml's `traffic` service drives requests through the
+whole haproxy -> nginx -> here chain instead, so every log line -- real or synthetic -- carries a
+trace context tying all three tiers' log lines (and, from workstream B on, a Tempo span) together.
 """
 
 import http.server
 import json
 import os
-import random
+import re
 import socket
-import threading
 import time
 
 # `logit` is a network alias on the `demo` network (demo/compose.yaml). UDP is fire-and-forget:
 # if the listener isn't bound yet, or ever, these sends are simply lost, which is why nothing
 # here blocks on or retries them.
 LOGIT_HOST = os.environ.get("LOGIT_HOST", "logit")
-LOGIT_PORT = int(os.environ.get("LOGIT_PORT", "5140"))
+LOGIT_PORT = int(os.environ.get("LOGIT_PORT", "5142"))  # app_in, not haproxy_in/nginx_in
 
 LISTEN_PORT = int(os.environ.get("PORT", "8080"))
 GRAFANA_URL = os.environ.get("GRAFANA_URL", "http://localhost:3000")
@@ -40,8 +36,8 @@ GRAFANA_URL = os.environ.get("GRAFANA_URL", "http://localhost:3000")
 # read-only. May not exist yet on the very first request -- see _load_graph_svg below.
 SVG_PATH = os.environ.get("GRAPH_SVG", "/graph/logit.svg")
 
-# PRI 134 = facility 16 (local0), severity 6 (info) -- the same priority nginx's `access_log
-# syslog:` directive used in the pre-reset demo.
+# PRI 134 = facility 16 (local0), severity 6 (info) -- matches demo/haproxy/haproxy.cfg's and
+# demo/nginx/nginx.conf's own access-log priority, for a consistent look across all three tiers.
 PRI = 134
 SYSLOG_HOST = "demo-hello"     # RFC 3164 HOSTNAME token -- must not end in ':', or syslog_in
                                 # reads it as the TAG instead (crates/logit-inputs/src/syslog.rs).
@@ -49,16 +45,17 @@ SYSLOG_TAG = "demoapp"
 LOG_HOST_FIELD = "demo.local"  # the JSON body's `host` field -- one of the three tags that
                                 # survive `keep` in demo/logit.yaml.
 
+# W3C Trace Context (https://www.w3.org/TR/trace-context/): "00-<32 hex trace id>-<16 hex span
+# id>-<2 hex flags>". `logit` has no traceparent parser (demo/haproxy/haproxy.cfg's header
+# comment explains why) -- so, like the other two tiers, this splits it by hand into separate
+# fields for demo/logit.yaml's `trace_context` transform. `trace_flags` is sent as a DECIMAL int
+# (never the hex octet) -- trace_context's `flags` field rejects hex by design
+# (crates/logit-transforms/src/trace_context.rs::numeric_flags).
+_TRACEPARENT_RE = re.compile(
+    r"^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$"
+)
+
 _sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-_request_id = 0
-_request_id_lock = threading.Lock()
-
-
-def _next_request_id():
-    global _request_id
-    with _request_id_lock:
-        _request_id += 1
-        return _request_id
 
 
 def _syslog_timestamp():
@@ -71,14 +68,35 @@ def _syslog_timestamp():
     )
 
 
-def emit_log_line(method, path, status, bytes_sent, request_time, host=LOG_HOST_FIELD,
-                   request_id=None):
+def _trace_fields(traceparent):
+    """Split an inbound `traceparent` header into the JSON body's trace fields.
+
+    Returns {} when the header is absent or malformed -- trace_context then reports
+    skipped{reason="missing"}, not the noisier "invalid", the same choice demo/nginx/nginx.conf's
+    `map` blocks make (no `default` => empty string => Missing, not Invalid).
+    """
+    if not traceparent:
+        return {}
+    m = _TRACEPARENT_RE.match(traceparent)
+    if not m:
+        return {}
+    trace_id, span_id, flags_hex = m.groups()
+    return {
+        "trace_id": trace_id,
+        "span_id": span_id,
+        "trace_flags": int(flags_hex, 16) & 1,  # decimal, sampled-bit only
+    }
+
+
+def emit_log_line(method, path, status, bytes_sent, request_time, traceparent,
+                   host=LOG_HOST_FIELD):
     """Send one access-log event to `logit`.
 
     `request_method`, `status`, `body_bytes_sent`, `request_time`, and `host` are the fields
-    demo/logit.yaml's `kv_metrics` and `keep` stages name; `path` and `request_id` ride along and
-    are dropped by `keep` (they'd otherwise be per-request cardinality in `aggregate`'s
-    SeriesKey).
+    demo/logit.yaml's `kv_metrics` and `keep` stages name (mirrored here for a consistent shape
+    across tiers, even though the metrics leg sources the nginx tier only); `path` rides along
+    and is dropped by `keep`, same as `trace_id`/`span_id` (per-request cardinality in
+    `aggregate`'s SeriesKey).
     """
     body = {
         "request_method": method,
@@ -87,8 +105,8 @@ def emit_log_line(method, path, status, bytes_sent, request_time, host=LOG_HOST_
         "body_bytes_sent": int(bytes_sent),
         "request_time": round(float(request_time), 3),
         "host": host,
-        "request_id": str(request_id if request_id is not None else _next_request_id()),
     }
+    body.update(_trace_fields(traceparent))
     line = "<%d>%s %s %s: %s" % (
         PRI, _syslog_timestamp(), SYSLOG_HOST, SYSLOG_TAG,
         json.dumps(body, separators=(",", ":")),
@@ -99,33 +117,6 @@ def emit_log_line(method, path, status, bytes_sent, request_time, host=LOG_HOST_
         # Name resolution or the socket itself failing isn't worth taking the web server down
         # for -- the demo is still useful with the metrics half dark.
         pass
-
-
-# -- Synthetic background traffic --------------------------------------------------------------
-#
-# Deliberately small and easy to extend -- add to these lists, or replace _synthetic_once with
-# something with more structure. These are invented log content, not real routes; see the module
-# docstring.
-SYNTH_METHODS = ["GET", "GET", "GET", "GET", "POST", "PUT", "DELETE"]
-SYNTH_PATHS = ["/", "/login", "/api/items", "/api/items/42", "/static/app.js", "/health"]
-SYNTH_STATUSES = [200, 200, 200, 200, 201, 204, 301, 404, 500]
-SYNTH_INTERVAL_SECONDS = float(os.environ.get("SYNTH_INTERVAL", "0.5"))
-
-
-def _synthetic_once():
-    emit_log_line(
-        method=random.choice(SYNTH_METHODS),
-        path=random.choice(SYNTH_PATHS),
-        status=random.choice(SYNTH_STATUSES),
-        bytes_sent=random.randint(200, 20200),
-        request_time=random.randint(0, 999) / 1000.0,
-    )
-
-
-def _synthetic_loop():
-    while True:
-        _synthetic_once()
-        time.sleep(SYNTH_INTERVAL_SECONDS)
 
 
 # -- The one page ---------------------------------------------------------------------------
@@ -146,9 +137,10 @@ PAGE_TEMPLATE = """<!doctype html>
 <body>
 <h1>Hello from the <code>logit</code> demo</h1>
 
-<p>This page is the demo's traffic source. It logs every visit -- and a few synthetic requests a
-second in the background -- as RFC 3164 syslog over UDP to <code>logit</code>, which parses,
-counts, aggregates, and writes the result to InfluxDB.</p>
+<p>This page sits behind haproxy and nginx -- every request through that chain gets a W3C
+<code>traceparent</code> minted at the edge, and all three tiers log the same trace id as RFC 3164
+syslog over UDP to <code>logit</code>, which parses, counts, aggregates, and writes the result to
+Loki, InfluxDB, and Tempo.</p>
 
 <h2>See it in Grafana</h2>
 <ol>
@@ -156,9 +148,6 @@ counts, aggregates, and writes the result to InfluxDB.</p>
   <li>Dashboards &rarr; the <strong>logit</strong> folder &rarr; <strong>logit internals</strong>.</li>
   <li>Give it ten seconds: <code>aggregate</code> flushes on a 10s window.</li>
 </ol>
-<p>Loki and Tempo are up and provisioned too -- Loki is receiving this app's own logs via
-<code>syslog_out</code> and Grafana Alloy, but Tempo stays empty by design: <code>logit</code> has
-no <code>otlp_out</code> yet. See <code>demo/README.md</code>.</p>
 
 <h2>The pipeline</h2>
 <img src="/graph.svg" alt="logit pipeline graph">
@@ -208,23 +197,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         started = time.monotonic()
         path = self.path.split("?", 1)[0]
+        traceparent = self.headers.get("traceparent", "")
 
         if path == "/":
             sent = self._respond(200, "text/html; charset=utf-8", _render_page())
+            status = 200
         elif path == "/graph.svg":
             sent = self._respond(200, "image/svg+xml", _load_graph_svg())
+            status = 200
+        elif path == "/health":
+            sent = self._respond(200, "text/plain; charset=utf-8", b"ok\n")
+            status = 200
         else:
-            self._respond(404, "text/plain; charset=utf-8", b"not found\n")
-            return  # not part of the demo's surface, not worth a metric
+            sent = self._respond(404, "text/plain; charset=utf-8", b"not found\n")
+            status = 404
 
         emit_log_line(
-            method="GET", path=path, status=200, bytes_sent=sent,
-            request_time=time.monotonic() - started,
+            method="GET", path=path, status=status, bytes_sent=sent,
+            request_time=time.monotonic() - started, traceparent=traceparent,
         )
 
 
 def main():
-    threading.Thread(target=_synthetic_loop, daemon=True).start()
     server = http.server.ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler)
     print("listening on 0.0.0.0:%d, logging to %s:%d" % (LISTEN_PORT, LOGIT_HOST, LOGIT_PORT),
           flush=True)

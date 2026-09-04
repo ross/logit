@@ -1,82 +1,147 @@
-# The demo pipeline (demo/README.md, docs/plans/demo-stack.md, docs/plans/
-# otlp-end-to-end.md, docs/plans/otlp-logs-and-resource-identity.md). Exercises exactly what
-# `logit` implements today -- syslog in, set + json + kv_metrics + keep + aggregate, InfluxDB out,
-# OTLP/HTTP out, OTLP/gRPC out, plus `internal` observing the pipeline itself (ADR
+# The demo pipeline (demo/README.md, docs/plans/demo-tracing-stack.md, docs/plans/demo-stack.md,
+# docs/plans/otlp-end-to-end.md, docs/plans/otlp-logs-and-resource-identity.md). Exercises
+# syslog in, set + json + trace_context + kv_metrics + keep + aggregate, InfluxDB out, OTLP/HTTP
+# out, OTLP/gRPC out, plus `internal` observing the pipeline itself (ADR
 # `internal-telemetry-as-pipeline-events`, ADR `internal-span-emission-and-deterministic-sampling`)
-# -- against the traffic `demo/compose.yaml`'s `hello` service emits (real visits plus a background
-# synthetic loop). All three signals -- logs, metrics, traces -- now leave `logit` for a real
-# backend: Loki, InfluxDB, and Tempo respectively.
+# -- against traffic that now crosses three real tiers: haproxy -> nginx -> hello
+# (demo/compose.yaml's `traffic` service drives it; docs/plans/demo-tracing-stack.md's
+# workstream A). All three signals -- logs, metrics, traces -- leave `logit` for a real backend:
+# Loki, InfluxDB, and Tempo respectively.
 #
 # Topology:
 #
-#   hello --syslog/UDP--> access_in (syslog_in)
-#                               |
-#                               v
-#                       access_identity (set)     <- stamps a real service.name/service.namespace
-#                               |                     on the batch's resource (ADR
-#                               v                     operator-declared-resource-attributes)
-#                          access_json (json)     <- merges the JSON body into attributes
-#                             /  |  \
-#                            v   v   v
-#              tap (stdio_out)  |    log_out (otlp_out, HTTP) --> Loki
-#                                |
-#                                v
+#   One `syslog_in` listener per tier -- `set` stamps a resource onto the whole BATCH, not per
+#   event, so three tiers sharing one listener would interleave into one batch and get one wrong
+#   service.name (docs/plans/demo-tracing-stack.md's workstream A).
+#
+#   haproxy --syslog/UDP:5140--> haproxy_in -> haproxy_identity (set) -> haproxy_json (json)
+#                                                                              |
+#   nginx   --syslog/UDP:5141--> nginx_in   -> nginx_identity   (set) -> nginx_json   (json)
+#                                                                              |
+#   demo-hello --syslog/UDP:5142--> app_in  -> app_identity     (set) -> app_json     (json)
+#                                                                              |
+#                                                                              v
+#                                            {haproxy,nginx,app}_trace (trace_context) <- splits
+#                                                                 |             each tier's plain
+#                                                                 |             trace_id/span_id/
+#                                       +-------------------------+             trace_flags fields
+#                                       |                         |             onto LogRecord.trace
+#                                       v                         v
+#                              tap (stdio_out)      log_out (otlp_out, HTTP) --> Loki
+#
+#                        nginx_trace (only -- the metrics source of record)
+#                                       |
+#                                       v
 #                       access_metrics (kv_metrics) <- adds metrics to the event
-#                                          |
-#                                          v
-#                                    trimmed (keep)   <- drops high-cardinality attrs (request_id)
-#                                          |
-#                                          v
-#                                    windowed (aggregate)
-#                                          |
+#                                       |
+#                                       v
+#                                 trimmed (keep)   <- drops high-cardinality attrs (request_id,
+#                                       |             trace_id, span_id)
+#                                       v
+#                                 windowed (aggregate)
+#                                       |
 #   self (internal) --+-> self_windowed (aggregate) --> influx_out --> InfluxDB
 #                      |
 #                      +-> trace_windowed (aggregate) --> trace_out (otlp_out, gRPC) --> tempo
 components:
-  access_in:
+  haproxy_in:
     type: syslog_in
     bind: 0.0.0.0:5140
+  nginx_in:
+    type: syslog_in
+    bind: 0.0.0.0:5141
+  app_in:
+    type: syslog_in
+    bind: 0.0.0.0:5142
 
   # `syslog_in` mustn't invent a resource identity for data it didn't produce
   # (docs/design/internal-telemetry.md's "Resource identity" section) -- `set` is the operator
-  # declaring one instead (ADR `operator-declared-resource-attributes`). `service.name` matches
-  # the value already present in the traffic's own `syslog.hostname` attribute; without this,
-  # `log_out`'s OTLP export below would land in Loki as `{service_name="unknown_service"}`, with
-  # no usable stream label at all.
-  access_identity:
+  # declaring one instead (ADR `operator-declared-resource-attributes`), one per tier since each
+  # has its own listener (see the topology comment above).
+  haproxy_identity:
     type: set
-    sources: [access_in]
+    sources: [haproxy_in]
+    resource:
+      service.name: haproxy
+      service.namespace: demo
+  nginx_identity:
+    type: set
+    sources: [nginx_in]
+    resource:
+      service.name: nginx
+      service.namespace: demo
+  # Not "demo-app": demo/grafana/dashboards/logit-internal.json hardcodes
+  # `{service_name="demo-hello"}` in four places, including a panel title. Renaming this (and
+  # that dashboard) is workstream B's job, alongside the app itself changing.
+  app_identity:
+    type: set
+    sources: [app_in]
     resource:
       service.name: demo-hello
       service.namespace: demo
 
-  access_json:
+  haproxy_json:
     type: json
-    sources: [access_identity]
+    sources: [haproxy_identity]
+  nginx_json:
+    type: json
+    sources: [nginx_identity]
+  app_json:
+    type: json
+    sources: [app_identity]
 
-  # `docker compose logs -f logit` -- the fastest way to see the pipeline doing something.
+  # Lifts each tier's plain trace_id/span_id/trace_flags JSON fields (split from the W3C
+  # traceparent header upstream -- demo/haproxy/haproxy.cfg mints it, demo/nginx/nginx.conf and
+  # demo/hello/app.py relay and re-split it, since `logit` has no traceparent parser) onto
+  # LogRecord.trace (ADR `log-record-trace-context`). `keep_source` left at its default `false`:
+  # the lifted id becomes Loki's *native* trace_id structured metadata via `log_out`'s OTLP
+  # export below, and a surviving `trace_id` attribute would collide with it.
+  haproxy_trace:
+    type: trace_context
+    sources: [haproxy_json]
+    trace_id: trace_id
+    span_id: span_id
+    flags: trace_flags # decimal, never hex
+  nginx_trace:
+    type: trace_context
+    sources: [nginx_json]
+    trace_id: trace_id
+    span_id: span_id
+    flags: trace_flags
+  app_trace:
+    type: trace_context
+    sources: [app_json]
+    trace_id: trace_id
+    span_id: span_id
+    flags: trace_flags
+
+  # `docker compose logs -f logit` -- the fastest way to see the pipeline doing something, now one
+  # block per tier per request, all three sharing a trace_id and differing in span_id.
   tap:
     type: stdio_out
-    sources: [access_json]
+    sources: [haproxy_trace, nginx_trace, app_trace]
 
   # Logs to Loki, direct over OTLP -- no relay service in between (docs/plans/
   # otlp-logs-and-resource-identity.md's workstream B; Loki accepts OTLP logs natively as of
-  # 3.7.7, the version this stack pins). Sources `access_json`, so the message is still the raw
-  # JSON body -- exactly what the dashboard's `| json` LogQL panels parse. `protocol: http`, not
-  # `grpc` like `trace_out` below -- Loki's OTLP ingestion is HTTP-only. `endpoint` is a URL base
-  # for HTTP (unlike gRPC's bare authority): `http://loki:3100/otlp` resolves to exactly
-  # `/otlp/v1/logs` (`crates/logit-proto/src/lib.rs`'s hardcoded per-signal path). Loki's default
-  # index-label set already includes `service.name`/`service.namespace` -- what `access_identity`
-  # stamps above -- so no `demo/loki/loki.yaml` change is needed for real stream labels.
+  # 3.7.7, the version this stack pins). `protocol: http`, not `grpc` like `trace_out` below --
+  # Loki's OTLP ingestion is HTTP-only. `endpoint` is a URL base for HTTP (unlike gRPC's bare
+  # authority): `http://loki:3100/otlp` resolves to exactly `/otlp/v1/logs`
+  # (`crates/logit-proto/src/lib.rs`'s hardcoded per-signal path). Loki's default index-label set
+  # already includes `service.name`/`service.namespace` -- what each `*_identity` stamps above --
+  # so no `demo/loki/loki.yaml` change is needed for real stream labels.
   log_out:
     type: otlp_out
-    sources: [access_json]
+    sources: [haproxy_trace, nginx_trace, app_trace]
     protocol: http
     endpoint: http://loki:3100/otlp
 
+  # The nginx tier only: it's the metrics source of record, and its JSON field names
+  # (host/request_method/status/body_bytes_sent/request_time) are unchanged from before
+  # workstream A, so this chain and demo/grafana/dashboards/logit-internal.json's InfluxDB panels
+  # need no edits.
   access_metrics:
     type: kv_metrics
-    sources: [access_json]
+    sources: [nginx_trace]
     counters:
       - name: web.requests # +1 per event
       - name: web.bytes_sent
@@ -87,7 +152,8 @@ components:
         unit: s
 
   # Before `aggregate`, not after -- otherwise its SeriesKey would key a series per request on
-  # `request_id` alone. `host`/`request_method`/`status` are the only tags meant to survive.
+  # `request_id` (or now, `trace_id`/`span_id`) alone. `host`/`request_method`/`status` are the
+  # only tags meant to survive.
   trimmed:
     type: keep
     sources: [access_metrics]
