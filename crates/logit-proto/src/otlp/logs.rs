@@ -30,15 +30,25 @@
 //! "unknown timestamp" case it exists to cover. Makes `encode_log_record` non-deterministic on
 //! this one field -- no test may assert whole-record equality against a fixed expected value.
 //!
-//! **Dropped, documented, not errors** (mirrors `traces.rs`'s precedent for `Span`):
-//! `trace_id`/`span_id` (a log and its span correlate today only by sharing one `Event` --
-//! `logit_core::LogRecord` has no field of its own to carry a peer's correlation IDs when they
-//! arrive on a separate signal or a bare log-only record), `flags`, `dropped_attributes_count`,
-//! `event_name`.
+//! **`trace_id`/`span_id`/`flags` map to `LogRecord::trace` (`Option<TraceRef>`),** not dropped
+//! any more (`docs/adr/log-record-trace-context.md`). **Decode is lenient, unlike a `Span`'s ids**
+//! (`traces.rs`'s `mod ids`, which rejects a wrong-length id outright): `logs.proto`'s own
+//! contract is "receivers SHOULD assume the log record is not associated with a trace" if
+//! `trace_id` is absent or invalid, so `TraceRef::from_bytes` degrades a malformed id to `None`
+//! rather than failing the whole record -- correlation metadata a log can do without, unlike a
+//! `Span`'s own identity. **Encode falls back to the event's `span`** when the log has no trace
+//! context of its own: an `Event` carrying both a `log` and a `span` (still `logit`'s primary
+//! correlation mechanism -- one `Event`, both payloads) exports the span's `trace_id`/`span_id`
+//! onto the `LogRecord` too, `flags: 0`. This is *not* a round-trip fixed point: `encode_signals`
+//! splits such an `Event` into a separate `LogRecord` and `Span`, and decode makes one `Event` per
+//! record, so the log comes back as its own event, now carrying `trace: Some(..)` where it had
+//! `None` going in -- an enrichment, not a lossless mirror.
+//!
+//! **Still dropped, documented, not errors:** `dropped_attributes_count`, `event_name`.
 
 use crate::otlp::common;
 use crate::otlp::generated::opentelemetry::proto::logs::v1 as pb;
-use logit_core::{AttrMap, BodyFormat, Event, LogRecord, Severity, Value};
+use logit_core::{AttrMap, BodyFormat, Event, LogRecord, Severity, TraceRef, Value};
 
 fn severity_number(sev: Severity) -> i32 {
     let n = match sev {
@@ -107,6 +117,20 @@ fn decode_body_format(attrs: &mut AttrMap) -> BodyFormat {
     format
 }
 
+/// `log.trace`, or -- when the log has none of its own -- `event.span`'s ids with `flags: 0`.
+/// See the module doc's trace-context paragraph for why this fallback exists and why it isn't a
+/// round-trip fixed point.
+fn encode_trace(event: &Event, log: &LogRecord) -> (Vec<u8>, Vec<u8>, u32) {
+    if let Some(trace) = log.trace {
+        let span_id = trace.span_id.map(|id| id.to_vec()).unwrap_or_default();
+        return (trace.trace_id.to_vec(), span_id, trace.flags as u32);
+    }
+    if let Some(span) = &event.span {
+        return (span.trace_id.to_vec(), span.span_id.to_vec(), 0);
+    }
+    (Vec::new(), Vec::new(), 0)
+}
+
 pub(crate) fn encode_log_record(event: &Event, log: &LogRecord) -> pb::LogRecord {
     let mut attributes = common::attrs_to_key_values(&event.attributes);
     attributes.push(crate::otlp::generated::opentelemetry::proto::common::v1::KeyValue {
@@ -120,6 +144,8 @@ pub(crate) fn encode_log_record(event: &Event, log: &LogRecord) -> pb::LogRecord
         None => (pb::SeverityNumber::Unspecified as i32, String::new()),
     };
 
+    let (trace_id, span_id, flags) = encode_trace(event, log);
+
     pb::LogRecord {
         time_unix_nano: event.timestamp.max(0) as u64,
         observed_time_unix_nano: crate::now_nanos().max(0) as u64,
@@ -128,9 +154,9 @@ pub(crate) fn encode_log_record(event: &Event, log: &LogRecord) -> pb::LogRecord
         body: Some(common::value_to_any_value(&log.message)),
         attributes,
         dropped_attributes_count: 0,
-        flags: 0,
-        trace_id: Vec::new(),
-        span_id: Vec::new(),
+        flags,
+        trace_id,
+        span_id,
         event_name: String::new(),
     }
 }
@@ -149,12 +175,17 @@ pub(crate) fn decode_log_record(record: pb::LogRecord, mut attrs: AttrMap) -> Ev
     } else {
         record.observed_time_unix_nano as i64
     };
-    Event::log(timestamp, attrs, LogRecord { message, severity, body_format })
+    // `LOG_RECORD_FLAGS_TRACE_FLAGS_MASK`: the low 8 bits of the `fixed32` are the W3C trace
+    // flags; the rest is reserved. Lenient by construction -- see the module doc.
+    let trace =
+        TraceRef::from_bytes(&record.trace_id, &record.span_id, (record.flags & 0xFF) as u8);
+    Event::log(timestamp, attrs, LogRecord { message, severity, body_format, trace })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logit_core::SpanRecord;
 
     #[test]
     fn every_severity_encodes_to_the_base_of_its_otlp_band() {
@@ -205,7 +236,12 @@ mod tests {
             let event = Event::log(
                 0,
                 AttrMap::new(),
-                LogRecord { message: Value::str("hi"), severity: None, body_format: format },
+                LogRecord {
+                    message: Value::str("hi"),
+                    severity: None,
+                    body_format: format,
+                    trace: None,
+                },
             );
             let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
             let decoded = decode_log_record(encoded, AttrMap::new());
@@ -223,7 +259,12 @@ mod tests {
         let event = Event::log(
             123,
             AttrMap::new(),
-            LogRecord { message: Value::str("hi"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("hi"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
         assert!(
@@ -244,7 +285,12 @@ mod tests {
         let event = Event::log(
             0,
             AttrMap::new(),
-            LogRecord { message: Value::str("hi"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("hi"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
         let decoded = decode_log_record(encoded, AttrMap::new());
@@ -302,10 +348,174 @@ mod tests {
         let event = Event::log(
             0,
             AttrMap::new(),
-            LogRecord { message: Value::str("hi"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("hi"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
         assert_eq!(encoded.severity_number, pb::SeverityNumber::Unspecified as i32);
         assert_eq!(encoded.severity_text, "");
+    }
+
+    fn log_record(trace: Option<TraceRef>) -> pb::LogRecord {
+        let event = Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str("hi"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace,
+            },
+        );
+        encode_log_record(&event, event.log.as_ref().unwrap())
+    }
+
+    #[test]
+    fn a_trace_context_survives_a_full_round_trip() {
+        let trace = TraceRef { trace_id: [7; 16], span_id: Some([8; 8]), flags: 1 };
+        let encoded = log_record(Some(trace));
+        assert_eq!(encoded.trace_id, [7; 16].to_vec());
+        assert_eq!(encoded.span_id, [8; 8].to_vec());
+        assert_eq!(encoded.flags, 1);
+
+        let decoded = decode_log_record(encoded, AttrMap::new());
+        assert_eq!(decoded.log.unwrap().trace, Some(trace));
+    }
+
+    #[test]
+    fn a_trace_with_no_span_survives_a_full_round_trip() {
+        let trace = TraceRef { trace_id: [7; 16], span_id: None, flags: 0 };
+        let encoded = log_record(Some(trace));
+        assert!(encoded.span_id.is_empty());
+
+        let decoded = decode_log_record(encoded, AttrMap::new());
+        assert_eq!(decoded.log.unwrap().trace, Some(trace));
+    }
+
+    #[test]
+    fn no_trace_context_encodes_and_decodes_to_none() {
+        let encoded = log_record(None);
+        assert!(encoded.trace_id.is_empty());
+        assert!(encoded.span_id.is_empty());
+        assert_eq!(encoded.flags, 0);
+
+        let decoded = decode_log_record(encoded, AttrMap::new());
+        assert_eq!(decoded.log.unwrap().trace, None);
+    }
+
+    #[test]
+    fn a_wrong_length_wire_trace_id_decodes_to_none_not_an_error() {
+        let mut record = log_record(None);
+        record.trace_id = vec![1; 15]; // one byte short of valid
+        record.span_id = vec![2; 8];
+        record.flags = 1;
+        let decoded = decode_log_record(record, AttrMap::new());
+        assert_eq!(
+            decoded.log.unwrap().trace,
+            None,
+            "an invalid trace_id must degrade to None, per logs.proto -- never fail the record"
+        );
+    }
+
+    #[test]
+    fn an_all_zero_wire_trace_id_decodes_to_none() {
+        let mut record = log_record(None);
+        record.trace_id = vec![0; 16];
+        let decoded = decode_log_record(record, AttrMap::new());
+        assert_eq!(decoded.log.unwrap().trace, None);
+    }
+
+    #[test]
+    fn a_valid_trace_with_an_invalid_span_keeps_the_trace_and_drops_the_span() {
+        let mut record = log_record(None);
+        record.trace_id = vec![1; 16];
+        record.span_id = vec![0; 8]; // all-zero span id is invalid
+        let decoded = decode_log_record(record, AttrMap::new());
+        assert_eq!(
+            decoded.log.unwrap().trace,
+            Some(TraceRef { trace_id: [1; 16], span_id: None, flags: 0 })
+        );
+    }
+
+    #[test]
+    fn flags_are_masked_to_the_low_8_bits() {
+        let mut record = log_record(None);
+        record.trace_id = vec![1; 16];
+        record.flags = 0x1FF;
+        let decoded = decode_log_record(record, AttrMap::new());
+        assert_eq!(decoded.log.unwrap().trace.unwrap().flags, 0xFF);
+    }
+
+    #[test]
+    fn flags_on_an_invalid_trace_are_dropped_along_with_it() {
+        let mut record = log_record(None);
+        record.flags = 1; // no trace_id at all
+        let decoded = decode_log_record(record, AttrMap::new());
+        assert_eq!(decoded.log.unwrap().trace, None);
+    }
+
+    #[test]
+    fn a_log_with_no_trace_falls_back_to_the_same_events_span() {
+        let mut event = Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str("hi"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
+        );
+        event.span = Some(SpanRecord {
+            trace_id: [3; 16],
+            span_id: [4; 8],
+            parent_span_id: None,
+            name: Value::str("op"),
+            kind: logit_core::SpanKind::Internal,
+            status: logit_core::SpanStatus::Unset,
+            events: Vec::new(),
+            links: Vec::new(),
+            end_timestamp: 0,
+        });
+        let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
+        assert_eq!(encoded.trace_id, [3; 16].to_vec());
+        assert_eq!(encoded.span_id, [4; 8].to_vec());
+        assert_eq!(encoded.flags, 0, "span fallback carries no flags -- SpanRecord has none");
+    }
+
+    #[test]
+    fn a_logs_own_trace_context_takes_priority_over_the_events_span() {
+        let mut event = Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str("hi"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: Some(TraceRef { trace_id: [9; 16], span_id: None, flags: 0 }),
+            },
+        );
+        event.span = Some(SpanRecord {
+            trace_id: [3; 16],
+            span_id: [4; 8],
+            parent_span_id: None,
+            name: Value::str("op"),
+            kind: logit_core::SpanKind::Internal,
+            status: logit_core::SpanStatus::Unset,
+            events: Vec::new(),
+            links: Vec::new(),
+            end_timestamp: 0,
+        });
+        let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
+        assert_eq!(
+            encoded.trace_id,
+            [9; 16].to_vec(),
+            "the log's own trace must win, not the span's"
+        );
+        assert!(encoded.span_id.is_empty());
     }
 }

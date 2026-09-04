@@ -79,11 +79,16 @@ reason other than `aggregate`'s accumulation.
 
 **Config validation (rule 19, `logit-pipeline::graph::resolve`).** An empty `signals:` list is
 rejected on all three — the same silent-black-hole failure rule 7 already guards against elsewhere.
-`keep_signals`/`drop_signals` additionally reject naming all three signals, since either shape can
-only ever drop every event. `has_signal` naming all three signals is deliberately *not* rejected:
-under `mode: only` that's a real, if permissive, "forward anything with a payload" filter, not a
-no-op — unlike the other two, `has_signal` never mutates, so there's no equivalent of "strips
-everything" to catch.
+`keep_signals`/`drop_signals` additionally reject naming all three signals. Which shape is the
+black hole and which is the no-op is *opposite* between the two: `keep_signals` (an allowlist)
+naming nothing keeps nothing — black hole — while naming everything keeps everything — a no-op,
+every event forwarded untouched; `drop_signals` (a denylist) is the mirror, naming everything is
+the black hole and naming nothing the no-op. Both shapes are rejected either way for both kinds —
+a no-op component is as much a config mistake as a black-hole one — but the validation error names
+the right one, not "drop every event" for a case that actually keeps every event. `has_signal`
+naming all three signals is deliberately *not* rejected: under `mode: only` that's a real, if
+permissive, "forward anything with a payload" filter, not a no-op — unlike the other two,
+`has_signal` never mutates, so there's no equivalent "keeps/strips everything" pair to catch.
 
 ## Alternatives considered
 - **A `signals:` field on `otlp_out` (and every future `_out`).** Rejected as the motivating

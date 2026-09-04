@@ -904,6 +904,7 @@ mod tests {
                 message: Value::str("hello"),
                 severity: None,
                 body_format: BodyFormat::Raw,
+                trace: None,
             },
         );
         assert_eq!(encode(vec![log_event]), "");
@@ -1122,6 +1123,7 @@ mod tests {
                 message: Value::str("GET / HTTP/1.1"),
                 severity: None,
                 body_format: BodyFormat::Raw,
+                trace: None,
             },
         );
         event.metrics.push(MetricRecord {

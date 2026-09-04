@@ -14,6 +14,7 @@ mod event;
 mod metric;
 mod resource;
 mod span;
+pub mod trace;
 
 pub use attrs::AttrMap;
 pub use diag::Diagnostics;
@@ -26,6 +27,7 @@ pub use telemetry::{
     trace_is_sampled, Registry, SpanGuard, Tag, Telemetry, DEFAULT_SPAN_SAMPLE_RATE,
 };
 pub use time::format_rfc3339_utc;
+pub use trace::TraceRef;
 pub use value::Value;
 
 /// A normalized, syslog-flavored log severity. Codecs map their native levels onto this.
@@ -52,4 +54,10 @@ pub struct LogRecord {
     pub message: Value,
     pub severity: Option<Severity>,
     pub body_format: BodyFormat,
+    /// The application trace/span this log line was emitted under, if any -- distinct from
+    /// `logit`'s own pipeline trace context. `logit`'s code never sets this on its own; it only
+    /// ever carries what a codec decoded off the wire or what an operator's config/script
+    /// explicitly set (`ComponentKind::TraceContext`, `event.log.trace_id` in Lua). See
+    /// `docs/adr/log-record-trace-context.md`.
+    pub trace: Option<TraceRef>,
 }
