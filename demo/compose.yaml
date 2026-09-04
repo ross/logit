@@ -45,7 +45,7 @@ services:
       - grafana_data:/var/lib/grafana
     networks: [demo]
 
-  # Log backend -- receives `logit`'s own log lines directly over OTLP/HTTP from `log_out`
+  # Log backend -- receives `logit`'s own log lines directly over OTLP/HTTP from `loki_out`
   # (demo/logit.yaml, docs/plans/otlp-logs-and-resource-identity.md's workstream B; no relay
   # service in between). Unlike the old demo writer, `hello` below doesn't also write to Loki
   # directly -- `logit`'s own `otlp_out` is the only path in.
@@ -68,7 +68,7 @@ services:
       - loki_data:/loki
     networks: [demo]
 
-  # Trace backend -- receives `logit`'s own internal spans over OTLP/gRPC from `trace_out`
+  # Trace backend -- receives `logit`'s own internal spans over OTLP/gRPC from `tempo_out`
   # (demo/logit.yaml), provisioned in Grafana with `tracesToLogsV2` pointed at Loki -- both Loki
   # and Tempo receive real data now (demo/grafana/provisioning/datasources/datasources.yaml).
   tempo:
@@ -104,7 +104,7 @@ services:
         condition: service_healthy
       # `service_started`, not `service_healthy` -- `tempo` (above) declares no healthcheck at
       # all, so `service_started` is the honest limit anyway (same reasoning as `hello`'s
-      # dependency on `logit` below). Unlike `influxdb_out`/`otlp_out`'s Loki leg, `trace_out`
+      # dependency on `logit` below). Unlike `influxdb_out`/`otlp_out`'s Loki leg, `tempo_out`
       # doesn't need Tempo up first for a clean start: it retries through `write_loop` like any
       # other sink (ADR `service-lifecycle-and-output-retry`'s bounded output retry), so a `logit`
       # that starts before Tempo finishes booting just retries its first few span exports rather
@@ -176,7 +176,7 @@ services:
   # Step 3: the innermost tier a request reaches -- no longer the demo's front door or its own
   # traffic source (docs/plans/demo-tracing-stack.md's workstream A). Sits behind `nginx` below;
   # `traffic` drives requests through the whole haproxy -> nginx -> hello chain, and only writes
-  # `logit`'s `app_in` listener, the same way `influx_out`/`trace_out` are the only paths into
+  # `logit`'s `app_in` listener, the same way `influx_out`/`tempo_out` are the only paths into
   # InfluxDB and Tempo.
   #
   # A stock image plus a bind-mounted script, not a Dockerfile: it's stdlib-only Python, so

@@ -27,7 +27,7 @@
 #                                       +-------------------------+             trace_flags fields
 #                                       |                         |             onto LogRecord.trace
 #                                       v                         v
-#                              tap (stdio_out)      log_out (otlp_out, HTTP) --> Loki
+#                              stdout (stdio_out)   loki_out (otlp_out, HTTP) --> Loki
 #
 #                        nginx_trace (only -- the metrics source of record)
 #                                       |
@@ -42,7 +42,7 @@
 #                                       |
 #   self (internal) --+-> self_windowed (aggregate) --> influx_out --> InfluxDB
 #                      |
-#                      +-> trace_windowed (aggregate) --> trace_out (otlp_out, gRPC) --> tempo
+#                      +-> trace_windowed (aggregate) --> tempo_out (otlp_out, gRPC) --> tempo
 components:
   haproxy_in:
     type: syslog_in
@@ -94,7 +94,7 @@ components:
   # traceparent header upstream -- demo/haproxy/haproxy.cfg mints it, demo/nginx/nginx.conf and
   # demo/hello/app.py relay and re-split it, since `logit` has no traceparent parser) onto
   # LogRecord.trace (ADR `log-record-trace-context`). `keep_source` left at its default `false`:
-  # the lifted id becomes Loki's *native* trace_id structured metadata via `log_out`'s OTLP
+  # the lifted id becomes Loki's *native* trace_id structured metadata via `loki_out`'s OTLP
   # export below, and a surviving `trace_id` attribute would collide with it.
   haproxy_trace:
     type: trace_context
@@ -117,19 +117,19 @@ components:
 
   # `docker compose logs -f logit` -- the fastest way to see the pipeline doing something, now one
   # block per tier per request, all three sharing a trace_id and differing in span_id.
-  tap:
+  stdout:
     type: stdio_out
     sources: [haproxy_trace, nginx_trace, app_trace]
 
   # Logs to Loki, direct over OTLP -- no relay service in between (docs/plans/
   # otlp-logs-and-resource-identity.md's workstream B; Loki accepts OTLP logs natively as of
-  # 3.7.7, the version this stack pins). `protocol: http`, not `grpc` like `trace_out` below --
+  # 3.7.7, the version this stack pins). `protocol: http`, not `grpc` like `tempo_out` below --
   # Loki's OTLP ingestion is HTTP-only. `endpoint` is a URL base for HTTP (unlike gRPC's bare
   # authority): `http://loki:3100/otlp` resolves to exactly `/otlp/v1/logs`
   # (`crates/logit-proto/src/lib.rs`'s hardcoded per-signal path). Loki's default index-label set
   # already includes `service.name`/`service.namespace` -- what each `*_identity` stamps above --
   # so no `demo/loki/loki.yaml` change is needed for real stream labels.
-  log_out:
+  loki_out:
     type: otlp_out
     sources: [haproxy_trace, nginx_trace, app_trace]
     protocol: http
@@ -191,11 +191,11 @@ components:
 
   # `self` is `internal` observing *all* of `logit`'s own telemetry, not just spans -- every drain
   # also carries this process's own `logit.*` metrics (Counter/Gauge/Distribution, every one of
-  # them mergeable). `trace_windowed` exists to strip those out before `trace_out` ever sees them:
+  # them mergeable). `trace_windowed` exists to strip those out before `tempo_out` ever sees them:
   # `aggregate` absorbs every mergeable metric into its window state and forwards a metric-less
   # event -- a pure span, here -- untouched and immediately, on every `process` call, without
   # waiting for its own `flush` (`crates/logit-transforms/src/aggregate.rs`'s `process` doc
-  # comment). So on the (overwhelming) majority of ticks, only spans reach `trace_out` at all.
+  # comment). So on the (overwhelming) majority of ticks, only spans reach `tempo_out` at all.
   #
   # This isn't pipeline hygiene, it's load-bearing: `otlp_out` issues one request per signal and
   # aborts the rest of a `send` call on the first failing one
@@ -205,7 +205,7 @@ components:
   # classified `Fault::Permanent` and correctly not retried. That alone is recoverable noise (the
   # spans already landed). What isn't recoverable: confirmed directly against a first version of
   # this config that skipped `trace_windowed` -- `self`'s 10s drain interval meant *every* batch
-  # failed this way, `send` never once returned `Ok` for `trace_out`, and `write_loop`'s ~60s
+  # failed this way, `send` never once returned `Ok` for `tempo_out`, and `write_loop`'s ~60s
   # sustained-permanent-failure guard (`docs/adr/service-lifecycle-and-output-retry.md`,
   # revised by `docs/adr/buffered-sink-delivery.md`) killed the whole `logit` process a
   # minute after startup -- taking the InfluxDB metrics path down with it. `trace_windowed`'s own
@@ -223,7 +223,7 @@ components:
   # receiver, to exercise the transport the rest of this config doesn't otherwise touch;
   # `endpoint` is a bare `host:port` authority for gRPC, not a URL (see
   # `crates/logit-outputs/src/otlp.rs`'s `grpc_authority`).
-  trace_out:
+  tempo_out:
     type: otlp_out
     sources: [trace_windowed]
     protocol: grpc

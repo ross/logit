@@ -33,7 +33,7 @@ the demo's front door now; requests flow `haproxy` → `nginx` → `hello`.
 not published on the host.
 
 `docker compose logs -f logit` shows every decoded event as a `stdio_out` block — the fastest way
-to see the pipeline doing something. You may occasionally see a `component 'trace_out': batch
+to see the pipeline doing something. You may occasionally see a `component 'tempo_out': batch
 dropped after a permanent send failure` warning (at most once a minute) — real and harmless, not a
 sign anything is broken: `trace_windowed` (`logit.yaml`) periodically flushes a metrics-only batch
 that Tempo (a traces-only backend) rejects, the same way it would reject any OTLP metrics request;
@@ -62,8 +62,8 @@ Each tier logs its own RFC 3164 + JSON-body access line to its own `syslog_in` l
 tiers sharing one listener would interleave into one batch with one wrong `service.name`. Each
 tier's chain is `set` (`../docs/adr/operator-declared-resource-attributes.md`) → `json` →
 `trace_context` (`../docs/adr/log-record-trace-context.md`), which lifts the split trace fields
-onto `LogRecord.trace` — then all three fan into a shared `tap` (`stdio_out`) and a shared
-`log_out` (`otlp_out` over HTTP straight to Loki — no relay service in between,
+onto `LogRecord.trace` — then all three fan into a shared `stdout` (`stdio_out`) and a shared
+`loki_out` (`otlp_out` over HTTP straight to Loki — no relay service in between,
 `../docs/plans/otlp-logs-and-resource-identity.md`). The nginx tier alone continues on to the
 metrics leg (`kv_metrics` → `keep` → `aggregate` → `influxdb_out`) — plus `logit` observing its own
 pipeline via `internal` (`../docs/design/internal-telemetry.md`) into that same InfluxDB bucket

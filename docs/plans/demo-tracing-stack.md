@@ -73,13 +73,13 @@ one `logit` gap that blocks the clean version.
      nginx   --> :5141  nginx_in   -> nginx_identity   -> nginx_json   -> nginx_trace  --+|
      hello   --> :5142  app_in     -> app_identity     -> app_json     -> app_trace ----+||
                                                                                        vvv
-                                            tap (stdio_out) <---------------------------+++
-                                            log_out (otlp_out/HTTP) --> Loki
+                                            stdout (stdio_out) <------------------------+++
+                                            loki_out (otlp_out/HTTP) --> Loki
 
      nginx_trace -> access_metrics -> trimmed (keep) -> windowed -> influx_out
                                                                         ^
      self (internal) -> self_windowed -------------------------------- -+
-     self -> trace_windowed ------------------------------> trace_out --> Tempo
+     self -> trace_windowed ------------------------------> tempo_out --> Tempo
                                                                  ^
      app --OTLP/HTTP protobuf--> :4318 app_otlp_in -> app_spans -+  (workstream B)
 ```
@@ -119,7 +119,7 @@ it, all three tiers log it as split hex fields, and `trace_context` lifts it ont
   full chain so synthetic traffic also carries a trace context.
 - `demo/logit.yaml` (edit) — three listeners (`haproxy_in`/`nginx_in`/`app_in` on
   5140/5141/5142), three `set` identities, three `json`, three `trace_context` (one per tier),
-  fanning into a shared `tap`/`log_out`. The nginx tier alone continues to the existing metrics
+  fanning into a shared `stdout`/`loki_out`. The nginx tier alone continues to the existing metrics
   leg. `trimmed` (`keep`) now also strips `trace_id`/`span_id` before `aggregate`, same
   per-request-cardinality reasoning it already applies to `request_id`.
 - `demo/compose.yaml` (edit) — added `haproxy` (publishes `8080:8080`), `nginx`, and `traffic`;
@@ -133,7 +133,7 @@ it, all three tiers log it as split hex fields, and `trace_context` lifts it ont
 **Notes from getting this working:**
 
 - Multiple `sources:` on one sink was already supported and already in use (`influx_out` takes
-  `[windowed, self_windowed]`); a single shared `tap`/`log_out` across all three tiers needed no
+  `[windowed, self_windowed]`); a single shared `stdout`/`loki_out` across all three tiers needed no
   new capability.
 - The riskiest HAProxy line turned out to be `bytes(<offset>,<length>)` on a `str`-typed sample
   (`req.hdr(traceparent)`), and it works exactly as the manual's own example implies — confirmed
@@ -193,7 +193,7 @@ structured logs to syslog *and* real OTel spans over OTLP/HTTP protobuf into `lo
   parses, or have the formatter emit an RFC 3164 header itself.
 - `demo/logit.yaml` (edit) — `app_otlp_in` (`otlp_in`, `bind: 0.0.0.0:4318`) → `app_spans`
   (`aggregate`, 60s, stripping non-span signals before Tempo the same way `trace_windowed`
-  already does for `self`) → added onto `trace_out`; rename the app tier's `service.name` to
+  already does for `self`) → added onto `tempo_out`; rename the app tier's `service.name` to
   `demo-app` and update the four dashboard panels that hardcode `demo-hello`.
 - `demo/compose.yaml` (edit) — replace `hello` with `app`, built from `demo/app/`.
 - `demo/hello/` (delete). `demo/README.md`, `docs/known-gaps.md` (edit) — `otlp_in` is exercised

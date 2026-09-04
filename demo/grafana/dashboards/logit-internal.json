@@ -119,7 +119,7 @@
       "id": 8,
       "type": "logs",
       "title": "Loki: raw demo traffic ({service_name=\"demo-hello\"})",
-      "description": "`log_out` (`otlp_out`, docs/plans/otlp-logs-and-resource-identity.md workstream B) exports access_json's events straight to Loki over OTLP/HTTP -- no relay service in between. `service_name`/`service_namespace` stream labels come from `access_identity` (`set`, ADR operator-declared-resource-attributes) stamping the batch's resource, not from any per-event config field.",
+      "description": "`loki_out` (`otlp_out`, docs/plans/otlp-logs-and-resource-identity.md workstream B) exports access_json's events straight to Loki over OTLP/HTTP -- no relay service in between. `service_name`/`service_namespace` stream labels come from `access_identity` (`set`, ADR operator-declared-resource-attributes) stamping the batch's resource, not from any per-event config field.",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
       "datasource": { "type": "loki", "uid": "loki" },
       "options": { "showTime": true, "wrapLogMessage": true, "enableLogDetails": true },
@@ -167,7 +167,7 @@
       "id": 11,
       "type": "table",
       "title": "Tempo: logit's own internal spans",
-      "description": "logit observing itself as *traces*, not just metrics (docs/adr/internal-span-emission-and-deterministic-sampling.md, docs/plans/otlp-end-to-end.md) -- one span per node-visit (listener send, transform process/flush, sink deliver), exported over OTLP/gRPC by demo/logit.yaml's `trace_out`. Click a trace ID to open its waterfall and see the pipeline's real shape: a syslog_in root with json/kv_metrics/keep/aggregate children, or an internal-only root for `self`'s own drain. `{}` matches everything -- `logit` is the only thing sending to this Tempo.\n\nThis is a `table` panel, not a `traces` panel: Grafana's `traces` panel type renders one trace's waterfall, not a searchable list of many -- the Tempo datasource's own response tells Grafana as much (`preferredVisualisationType: \"table\"`), and each row's Trace ID is already a link into the full trace view.",
+      "description": "logit observing itself as *traces*, not just metrics (docs/adr/internal-span-emission-and-deterministic-sampling.md, docs/plans/otlp-end-to-end.md) -- one span per node-visit (listener send, transform process/flush, sink deliver), exported over OTLP/gRPC by demo/logit.yaml's `tempo_out`. Click a trace ID to open its waterfall and see the pipeline's real shape: a syslog_in root with json/kv_metrics/keep/aggregate children, or an internal-only root for `self`'s own drain. `{}` matches everything -- `logit` is the only thing sending to this Tempo.\n\nThis is a `table` panel, not a `traces` panel: Grafana's `traces` panel type renders one trace's waterfall, not a searchable list of many -- the Tempo datasource's own response tells Grafana as much (`preferredVisualisationType: \"table\"`), and each row's Trace ID is already a link into the full trace view.",
       "gridPos": { "h": 10, "w": 24, "x": 0, "y": 36 },
       "datasource": { "type": "tempo", "uid": "tempo" },
       "targets": [
