@@ -16,9 +16,10 @@
 
 <p>This page is served by a real Django app behind haproxy and nginx -- every request through
 that chain gets a W3C <code>traceparent</code> minted at the edge, and all four tiers (haproxy,
-nginx, this app, and <code>logit</code> itself) now agree on the same trace id: this app's own
-request span is a real OpenTelemetry span, exported over OTLP straight into <code>logit</code>'s
-<code>otlp_in</code>, alongside its structured access log over syslog.</p>
+nginx, this app, and <code>logit</code> itself) agree on the same trace id: this app's own
+request span is a real OpenTelemetry span, exported over OTLP straight to Tempo (deliberately
+bypassing <code>logit</code> -- not every telemetry leg needs it), alongside its structured
+access log over syslog through <code>logit</code> as usual.</p>
 
 <h2>See it in Grafana</h2>
 <ol>
@@ -26,6 +27,11 @@ request span is a real OpenTelemetry span, exported over OTLP straight into <cod
   <li>Dashboards &rarr; the <strong>logit</strong> folder &rarr; <strong>logit internals</strong>.</li>
   <li>Give it ten seconds: <code>aggregate</code> flushes on a 10s window.</li>
 </ol>
+
+<h2>The architecture</h2>
+<img src="/architecture.svg" alt="demo stack architecture diagram">
+<p class="caption">Who talks to whom, and what kind of traffic (web / logging / tracing /
+metrics / query) -- hand-maintained, see <code>demo/architecture.dot</code>.</p>
 
 <h2>The pipeline</h2>
 <img src="/graph.svg" alt="logit pipeline graph">

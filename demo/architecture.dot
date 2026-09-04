@@ -1,0 +1,76 @@
+// The demo stack's service architecture -- who talks to whom, and what *kind* of traffic each
+// edge carries (web / logging / tracing / metrics / query), as opposed to demo/logit.yaml's own
+// pipeline diagram (rendered live by `logit graph`, shown just below this one on the landing
+// page), which is about `logit`'s internal component graph and the wire protocol each edge uses.
+// The two are deliberately complementary, not overlapping: this is the macro service topology,
+// that's the pipeline's own internals.
+//
+// Hand-authored, not generated: unlike the pipeline diagram, there's no single machine-readable
+// source this could be derived from -- "traffic type" is a human judgment call spanning
+// demo/compose.yaml, demo/logit.yaml, and demo/app/gunicorn.conf.py. That means it CAN drift from
+// reality if the topology changes and this file isn't updated by hand alongside it -- keep it in
+// sync deliberately, the way the pipeline diagram is kept in sync automatically.
+//
+// Rendered the same way the pipeline diagram is (demo/compose.yaml's `arch-svg`, reusing
+// demo/graph-renderer's Graphviz image) -- just without a generation step first, since this file
+// is already the source, not an intermediate.
+digraph architecture {
+  rankdir=LR;
+  nodesep=0.45;
+  ranksep=0.7;
+  node [fontname="monospace"];
+  edge [fontname="monospace", fontsize=10];
+
+  // `style="filled,..."` with no explicit `fillcolor`, matching crates/logit-cli/src/dot.rs's own
+  // node styling exactly -- both diagrams end up the same default Graphviz lightgrey, not one
+  // white and one grey.
+
+  // One node for both the real browser and demo/compose.yaml's `traffic` generator -- from
+  // haproxy's (or grafana's) point of view they're indistinguishable, and `traffic` exists only
+  // to generate demo load, not as part of the architecture proper.
+  client [shape=box, style="filled,rounded", label="client\n(browser / traffic)"];
+
+  haproxy [shape=box, style="filled,rounded"];
+  nginx   [shape=box, style="filled,rounded"];
+  app     [shape=box, style="filled,rounded", label="app\n(Django)"];
+  logit   [shape=box, style="filled,rounded,bold"];
+  grafana [shape=box, style="filled,rounded"];
+
+  // Cylinders for the three data stores -- the one shape this diagram uses that the pipeline
+  // diagram doesn't, on purpose: nothing in `logit graph`'s own vocabulary distinguishes "a
+  // backend that holds data" from any other sink, but at the architecture level that distinction
+  // is exactly the point.
+  loki     [shape=cylinder, style=filled];
+  tempo    [shape=cylinder, style=filled];
+  influxdb [shape=cylinder, style=filled];
+
+  // -- Web: the request path --------------------------------------------------------------
+  client  -> haproxy [label="web"];
+  haproxy -> nginx   [label="web"];
+  nginx   -> app     [label="web"];
+  client  -> grafana [label="web"];
+
+  // -- Logging: every tier's access log, over syslog into `logit` -------------------------
+  haproxy -> logit [label="logging"];
+  nginx   -> logit [label="logging"];
+  app     -> logit [label="logging"];
+  logit   -> loki  [label="logging"];
+
+  // -- Tracing: two independent paths into Tempo -------------------------------------------
+  // `logit`'s own internal spans go through it as usual; `app`'s real request spans go straight
+  // to Tempo's own OTLP receiver instead, deliberately bypassing `logit`
+  // (docs/plans/demo-tracing-stack.md's "Decisions already settled") -- not every telemetry leg
+  // needs `logit` in front of it, and this diagram shows that honestly rather than drawing an
+  // edge through `logit` that doesn't exist.
+  logit -> tempo [label="tracing"];
+  app   -> tempo [label="tracing"];
+
+  // -- Metrics -------------------------------------------------------------------------------
+  logit -> influxdb [label="metrics"];
+
+  // -- Query: Grafana reading back what everything else wrote, dashed to set it visually apart
+  // from the push/write traffic above -------------------------------------------------------
+  grafana -> loki     [label="query", style=dashed];
+  grafana -> tempo    [label="query", style=dashed];
+  grafana -> influxdb [label="query", style=dashed];
+}

@@ -21,9 +21,11 @@ already carried a `derivedFields` click-through to Tempo
 (`crates/logit-inputs/src/otlp.rs`) was implemented and tested and received no traffic at all.
 
 The target: a real multi-tier request path — **HAProxy → nginx → an app** — where HAProxy mints
-a W3C `traceparent`, every tier logs the same trace id, and the app emits real spans into
-`otlp_in`. One request then produces a correlated HAProxy + nginx + app log triple in Loki *and*
-a real application trace in Tempo, clickable from either side.
+a W3C `traceparent`, every tier logs the same trace id, and the app emits real spans. One request
+then produces a correlated HAProxy + nginx + app log triple in Loki *and* a real application trace
+in Tempo, clickable from either side. The app's spans go straight to Tempo, not through `logit` —
+a deliberate choice, not every telemetry leg needs `logit` in front of it, and this plan shows
+that honestly (§B) rather than routing everything through `logit` to prove it can.
 
 Three PRs. **No `logit` code changes anywhere in this plan.** Browser-side tracing is
 deliberately not implemented — workstream C is a documentation deliverable
@@ -42,6 +44,7 @@ one `logit` gap that blocks the clean version.
 | The demo keeps its own copies of every config | ADR `demo-stack-separate-from-dev-stack`. `demo/nginx/nginx.conf` is a new file adapted from `examples/nginx/nginx.conf`, not an edit of it — that file is a three-vhost njs proof artifact for [nginx-integration.md](nginx-integration.md) and stays as it is. |
 | Host port 8080 stays the front door | It's what `demo/README.md` and the landing page's links promise. HAProxy takes it; nginx and the app become internal-only. |
 | The app tier keeps `service.name: demo-hello` through workstream A | Four panels in `demo/grafana/dashboards/logit-internal.json` hardcode `{service_name="demo-hello"}` (including a panel title). Renaming in A would blank them for no gain; the rename belongs in B, alongside the dashboard edit and the app rewrite. |
+| The app's own spans go straight to Tempo, not through `logit`'s `otlp_in` | A deliberate choice, made after B first landed the `otlp_in` route: not every telemetry leg needs `logit` in front of it, and this demo shows that honestly instead of routing everything through `logit` to prove it can. Tempo already accepts OTLP/HTTP natively (`demo/tempo/tempo.yaml`), so there's nothing for `logit` to add on this leg specifically. Leaves `otlp_in` genuinely unexercised by this demo — an accepted, named trade-off, not an oversight (see the gaps table above). |
 
 ## Gaps this plan exists to schedule
 
@@ -50,8 +53,8 @@ one `logit` gap that blocks the clean version.
 | Nothing shipped emits an application trace context, so `trace_context`, `LogRecord.trace`, and `stdio_out`'s `trace_id=` rendering are untested in anger | A |
 | Grafana's Loki→Tempo `derivedFields` link has never had a matching log line, and is a body regex rather than Loki's native `trace_id` structured metadata | A |
 | The demo is one hop deep — no upstream, no proxy chain, nothing a trace id could usefully *tie together* | A |
-| `otlp_in` receives no traffic from anything, ever | B |
 | The demo app is a stdlib stub, so "real framework integration points" (syslog, drop-in tracing, metrics) are unproven | B |
+| `otlp_in` receives no traffic from anything, ever | **Not closed by this plan** — deliberate; see §B, "the app feeds Tempo directly" |
 | Browser telemetry has no path into `logit`, and nothing records why or what it would take | C ([browser-tracing.md](browser-tracing.md), documented, not built) |
 
 ## Reference topology
@@ -73,15 +76,16 @@ one `logit` gap that blocks the clean version.
      nginx   --> :5141  nginx_in   -> nginx_identity   -> nginx_json   -> nginx_trace  --+|
      hello   --> :5142  app_in     -> app_identity     -> app_json     -> app_trace ----+||
                                                                                        vvv
-                                            tap (stdio_out) <---------------------------+++
-                                            log_out (otlp_out/HTTP) --> Loki
+                                            stdout (stdio_out) <---------------------------+++
+                                            loki_out (otlp_out/HTTP) --> Loki
 
      nginx_trace -> access_metrics -> trimmed (keep) -> windowed -> influx_out
                                                                         ^
      self (internal) -> self_windowed -------------------------------- -+
-     self -> trace_windowed ------------------------------> trace_out --> Tempo
-                                                                 ^
-     app --OTLP/HTTP protobuf--> :4318 app_otlp_in -> app_spans -+  (workstream B)
+     self -> trace_windowed ------------------------------> tempo_out --> Tempo
+                                                                              ^
+     app --OTLP/HTTP protobuf:4318--------------------------------------------+
+     (workstream B -- straight to Tempo's own OTLP/HTTP receiver, bypassing `logit` entirely)
 ```
 
 ## Workstream dependency graph
@@ -119,7 +123,7 @@ it, all three tiers log it as split hex fields, and `trace_context` lifts it ont
   full chain so synthetic traffic also carries a trace context.
 - `demo/logit.yaml` (edit) — three listeners (`haproxy_in`/`nginx_in`/`app_in` on
   5140/5141/5142), three `set` identities, three `json`, three `trace_context` (one per tier),
-  fanning into a shared `tap`/`log_out`. The nginx tier alone continues to the existing metrics
+  fanning into a shared `stdout`/`loki_out`. The nginx tier alone continues to the existing metrics
   leg. `trimmed` (`keep`) now also strips `trace_id`/`span_id` before `aggregate`, same
   per-request-cardinality reasoning it already applies to `request_id`.
 - `demo/compose.yaml` (edit) — added `haproxy` (publishes `8080:8080`), `nginx`, and `traffic`;
@@ -133,7 +137,7 @@ it, all three tiers log it as split hex fields, and `trace_context` lifts it ont
 **Notes from getting this working:**
 
 - Multiple `sources:` on one sink was already supported and already in use (`influx_out` takes
-  `[windowed, self_windowed]`); a single shared `tap`/`log_out` across all three tiers needed no
+  `[windowed, self_windowed]`); a single shared `stdout`/`loki_out` across all three tiers needed no
   new capability.
 - The riskiest HAProxy line turned out to be `bytes(<offset>,<length>)` on a `str`-typed sample
   (`req.hdr(traceparent)`), and it works exactly as the manual's own example implies — confirmed
@@ -170,37 +174,56 @@ unaffected, and the landing page/`graph.svg` rendering through the full chain.
 
 ---
 
-## B. App replaces the stub, and real spans reach `otlp_in`
+## B. App replaces the stub, and gets real spans of its own
 
 **Status: landed.**
 
 A real framework at the bottom of the chain (Django, chosen for drop-in OTel
 instrumentation/logging/metrics — `opentelemetry-instrumentation-django`,
 `opentelemetry-instrumentation-logging`, syslog via `logging.handlers.SysLogHandler`), emitting
-structured logs to syslog *and* real OTel spans over OTLP/HTTP protobuf into `logit`'s own
-`otlp_in`, forwarded to Tempo alongside `logit`'s internal spans and parented to HAProxy's trace.
+structured logs to syslog through `logit` as usual, and real OTel spans over OTLP/HTTP protobuf
+straight to Tempo's own OTLP receiver — deliberately not through `logit`'s `otlp_in` (see the
+"Decisions already settled" row above) — landing alongside `logit`'s internal spans and parented
+to HAProxy's trace regardless.
 
 **Files:**
 
 - `demo/app/` (new) — Django project (`demoproj/`, one app `pages/`), `Dockerfile`,
   `requirements.txt`, `gunicorn.conf.py`. Instrumentation initialized in gunicorn's `post_fork`
   hook, not at import — the batch span processor's exporter thread does not survive `fork`.
-  `OTEL_EXPORTER_OTLP_ENDPOINT=http://logit:4318` (`demo/compose.yaml`) — the exporter appends
-  `/v1/traces` itself, per spec. Protobuf only (`opentelemetry-exporter-otlp-proto-http`):
-  `otlp_in` rejects `application/json` with a 415 (`crates/logit-inputs/src/otlp.rs:194-205`).
-  Default W3C propagator makes Django's server span a child of HAProxy's span with no code.
+  `OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4318` (`demo/compose.yaml`) — Tempo's own OTLP/HTTP
+  receiver (`demo/tempo/tempo.yaml`'s `otlp.protocols.http`), not `logit`'s `otlp_in`; the
+  exporter appends `/v1/traces` itself, per spec. Protobuf either way
+  (`opentelemetry-exporter-otlp-proto-http`), which Tempo's receiver accepts natively. Default W3C
+  propagator makes Django's server span a child of HAProxy's span with no code.
   `LoggingInstrumentor` puts `otelTraceID`/`otelSpanID` on every log record;
   `pages/logging_formatter.py` reads them for the access log's `trace_id`/`span_id`/`trace_flags`
-  fields; `pages/syslog_handler.py` disables `SysLogHandler`'s default trailing-NUL byte, which
+  fields (that log line still goes through `logit`, over syslog, same as every other tier);
+  `pages/syslog_handler.py` disables `SysLogHandler`'s default trailing-NUL byte, which
   `crates/logit-inputs/src/syslog.rs`'s headerless-message path otherwise decodes fine (RFC 3164
   header omitted entirely — no need to hand-roll one).
-- `demo/logit.yaml` (edit) — `app_otlp_in` (`otlp_in`, `bind: 0.0.0.0:4318`) → `app_spans`
-  (`aggregate`, 60s, stripping non-span signals before Tempo the same way `trace_windowed`
-  already does for `self`) → added onto `trace_out`; renamed the app tier's `service.name` to
-  `demo-app` and updated the four dashboard panels that hardcoded `demo-hello`.
-- `demo/compose.yaml` (edit) — replaced `hello` with `app`, built from `demo/app/`.
+- `demo/logit.yaml` (edit) — no `otlp_in` component at all; `tempo_out` keeps its original single
+  source (`trace_windowed`, `logit`'s own internal spans only). Renamed the app tier's
+  `service.name` to `demo-app` and updated the four dashboard panels that hardcoded `demo-hello`.
+- `demo/compose.yaml` (edit) — replaced `hello` with `app`, built from `demo/app/`; `app` depends
+  on `tempo` (`service_started` — the OTLP/HTTP leg gets its own SDK-level export retry, same
+  reasoning `logit`'s own `tempo_out` dependency on `tempo` already uses) alongside `logit` (for
+  the syslog leg).
 - `demo/hello/` (deleted). `demo/README.md`, `docs/known-gaps.md`, `demo/nginx/nginx.conf`
   (`proxy_pass` target) — updated for the new tier.
+- `demo/architecture.dot` (new) — a second, hand-authored diagram: the service topology one level
+  up from the pipeline diagram, labeling each edge by traffic *type* (web/logging/tracing/
+  metrics/query) rather than wire protocol. Rendered by a new `arch-svg` one-shot service
+  (`demo/compose.yaml`, reusing `graph-svg`'s Graphviz image with no generation step first, since
+  this file already is the source), served at `demo/app`'s new `/architecture.svg`
+  (`pages/views.py`'s `_serve_svg`, shared with `graph_svg`) and shown just above the pipeline
+  diagram on the landing page. Unlike the pipeline diagram, this one has no automatic source of
+  truth to stay in sync with — an accepted trade-off, named in the file's own header comment.
+
+*(An earlier version of this workstream routed the app's spans through `logit`'s `otlp_in` —
+`app_otlp_in` → `tempo_out` — genuinely exercising it. Superseded by the decision above; reverting
+to that shape is a small, well-understood change if `otlp_in` coverage is ever wanted here instead
+— point `OTEL_EXPORTER_OTLP_ENDPOINT` at `http://logit:4318` and re-add the `otlp_in` component.)*
 
 **Notes from getting this working:** two real bugs, both found only by actually running the
 stack, neither visible from reading the OTel packages' own top-level docs:
@@ -228,15 +251,22 @@ stack, neither visible from reading the OTel packages' own top-level docs:
 
 **Done when:** one request through HAProxy produces, in Tempo, a trace containing the Django
 server span, reachable by clicking "View trace" from any of the four Loki lines for that request;
-`script/validate` passes. **Verified live** (2026-09-03), cold `script/demo up --build` through
-`down -v`: `logit`'s `stdio_out` shows haproxy and nginx sharing one `span_id` (nginx only relays,
-mints none of its own), `demo-app`'s access log line and its real OTel span both carrying that
-same trace id, and the span's `parent_span_id` matching haproxy's `span_id` exactly — a genuine
-four-tier parent chain, confirmed by pulling the trace straight from Tempo's own API
-(`service.name=demo-app` on the batch). Zero tracebacks in `app`'s logs, zero panics/`error[` in
-`logit`'s, across a full cold start. Loki's `service_name` label values are exactly `demo-app`/
-`haproxy`/`nginx`; the renamed dashboard panels (`{service_name="demo-app"}`) resolve real data;
-the InfluxDB `web.requests` leg (nginx tier only) is unaffected.
+`script/validate` passes.
+
+**Verified live** (2026-09-03), cold `script/demo up --build` through `down -v` — twice: once
+against the original `otlp_in`-routed shape, and again after the direct-to-Tempo change above.
+Both confirmed the same four-tier parent chain: `logit`'s `stdio_out` shows haproxy and nginx
+sharing one `span_id` (nginx only relays, mints none of its own), `demo-app`'s access log line
+carrying that same trace id, and its real OTel span's `parent_span_id` matching haproxy's
+`span_id` exactly — pulled straight from Tempo's own API (`service.name=demo-app` on the batch).
+For the direct-to-Tempo shape specifically: `logit`'s own logs mention `otlp_in` zero times (it's
+not even in the config), confirming the app's spans genuinely never touch `logit`. Zero tracebacks
+in `app`'s logs, zero panics/`error[` in `logit`'s, across both cold starts. Loki's `service_name`
+label values are exactly `demo-app`/`haproxy`/`nginx`; the renamed dashboard panels
+(`{service_name="demo-app"}`) resolve real data; the InfluxDB `web.requests` leg (nginx tier only)
+is unaffected. The architecture diagram addition verified separately: `arch-svg` exits 0,
+`:8080/architecture.svg` serves a real rendered SVG (not the placeholder), and it renders above
+the pipeline diagram on the landing page as intended.
 
 ---
 
@@ -263,5 +293,6 @@ today. Recorded in [known-gaps.md](../known-gaps.md).
    "View trace" resolves in Tempo.
 6. Grafana → the shipped `logit` dashboard: the InfluxDB `web.*` panels look exactly as they did
    before A, proving the metrics leg survived the re-point to the nginx tier.
-7. The landing page at `:8080` still renders the pipeline SVG, now through HAProxy → nginx → app.
+7. The landing page at `:8080` still renders the pipeline SVG, now through HAProxy → nginx → app,
+   with the architecture SVG (`:8080/architecture.svg`) rendered just above it.
 8. `script/demo down -v` and a cold `up --build` — no ordering surprises from the new services.
