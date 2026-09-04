@@ -41,7 +41,12 @@ datasources:
           urlDisplayLabel: "View trace"
         - name: TraceID (body)
           datasourceUid: tempo
-          matcherRegex: '(?:trace_id|traceID|traceid)[=":\s]+([a-fA-F0-9]{16,32})'
+          # `trace\.id` first -- the dotted convention name (docs/design/data-model.md's
+          # "Well-known attribute names") a body only ever carries when `trace_context` skipped
+          # the line (`keep_source: false` removes it on every successful lift); the other three
+          # alternatives are pre-convention/generic spellings, kept for anything not produced by
+          # this demo's own tiers.
+          matcherRegex: '(?:trace\.id|trace_id|traceID|traceid)[=":\s]+([a-fA-F0-9]{16,32})'
           # `$$` (not `$`): Grafana's *provisioning* loader interpolates `${VAR}` as an
           # environment variable first -- `${__value.raw}` is the derived field's own runtime
           # templating syntax, evaluated later, and silently resolves to "" if written unescaped

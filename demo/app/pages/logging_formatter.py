@@ -6,12 +6,14 @@ Trace fields come from `LoggingInstrumentor` (opentelemetry-instrumentation-logg
 demo/app/gunicorn.conf.py's `post_fork`), which stamps every `LogRecord` created while a span is
 active with `otelTraceID`/`otelSpanID` -- 32/16-char lowercase hex, or the literal string `"0"`
 when there's no active span (record created outside a request, or the span's context is invalid).
-`logit` has no traceparent parser and `trace_context`'s `flags` field is decimal-only, never hex
-(crates/logit-transforms/src/trace_context.rs) -- consistent with demo/haproxy/haproxy.cfg and
-demo/nginx/nginx.conf, this formatter emits trace_id/span_id/trace_flags as separate plain fields,
-never a `traceparent` string, and omits them entirely rather than sending "0" when there is no
-real trace (demo/logit.yaml's `trace_context` then reports `skipped{reason="missing"}`, not the
-noisier `invalid`).
+This tier emits no `span:` block of its own (demo/logit.yaml) -- `app`'s span is already a real
+OTel span, not one `trace_context` would mint from these log fields -- so only the log-correlation
+trio matters here: `trace.id`/`span.id`/`trace.flags`, the dotted names
+docs/design/data-model.md's "Well-known attribute names" gives them
+(docs/adr/trace-context-span-lifting.md; the flags field stays decimal-only regardless of the
+dotted rename -- `crates/logit-transforms/src/trace_context.rs`). Omitted entirely rather than
+sent as "0" when there is no real trace (demo/logit.yaml's `trace_context` then reports
+`skipped{reason="missing"}`, not the noisier `invalid`).
 """
 
 import json
@@ -40,13 +42,13 @@ class AccessLogJSONFormatter(logging.Formatter):
 
         trace_id = getattr(record, "otelTraceID", None)
         if _is_valid_hex_id(trace_id, 32):
-            body["trace_id"] = trace_id
+            body["trace.id"] = trace_id
             span_id = getattr(record, "otelSpanID", None)
             if _is_valid_hex_id(span_id, 16):
-                body["span_id"] = span_id
+                body["span.id"] = span_id
             # This demo's `TracerProvider` runs `ALWAYS_ON` (demo/app/gunicorn.conf.py) -- every
             # span it creates is sampled, so `1` is always correct here, not a guess.
-            body["trace_flags"] = 1
+            body["trace.flags"] = 1
 
         body = {k: v for k, v in body.items() if v is not None}
         return json.dumps(body, separators=(",", ":"))

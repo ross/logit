@@ -1,6 +1,8 @@
-# Tempo 2.10.x, monolithic, local filesystem backend, OTLP receivers only. Nothing writes to
-# Tempo yet -- `logit` has no `otlp_out` and no span producer (demo/logit.yaml's commented-out
-# `tempo_out`) -- this exists so the trace path is provisioned and ready the day both land.
+# Tempo 2.10.x, monolithic, local filesystem backend, OTLP receivers only. Three things write
+# here now: `logit`'s own internal pipeline spans, haproxy's/nginx's real access-line spans
+# (demo/logit.yaml's `tempo_out`, docs/adr/trace-context-span-lifting.md), and `demo-app`'s real
+# OpenTelemetry request spans, sent straight to the `http` receiver below rather than through
+# `logit` (demo/logit.yaml's header comment explains why).
 stream_over_http_enabled: true
 
 server:

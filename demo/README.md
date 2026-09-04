@@ -49,33 +49,40 @@ A request crosses three real tiers: **`haproxy` → `nginx` → `app`**
 ([`haproxy/haproxy.cfg`](haproxy/haproxy.cfg), [`nginx/nginx.conf`](nginx/nginx.conf),
 [`app/`](app/) — a real Django project, `gunicorn`-served). `haproxy` mints a W3C `traceparent`
 (https://www.w3.org/TR/trace-context/) if the request doesn't already carry one, or reuses an
-inbound one; `nginx` relays it and splits it by hand (a `map` block) into plain
-`trace_id`/`span_id`/`trace_flags` fields, and `app` reads its own already-split
-`otelTraceID`/`otelSpanID` straight off the request span
-`opentelemetry-instrumentation-django` creates from the same header — `logit` has no `traceparent`
-parser by design (`crates/logit-transforms/src/trace_context.rs`'s doc comment explains why
-decimal-only flags matter), so every tier's syslog line already carries the split fields, never a
-`traceparent` string. [`traffic`](compose.yaml) is the demo's traffic source, driving a low-volume
-request loop through the whole chain.
+inbound one; `nginx` relays the trace but mints its *own* span id and forwards a new `traceparent`
+carrying it, so `app`'s span parents to nginx's, not straight to haproxy's; `app` reads its own
+already-split `otelTraceID`/`otelSpanID` straight off the request span
+`opentelemetry-instrumentation-django` creates from the same header.
+[`traffic`](compose.yaml) is the demo's traffic source, driving a low-volume request loop through
+the whole chain.
 
 Each tier logs its own RFC 3164 + JSON-body access line to its own `syslog_in` listener in
 [`logit.yaml`](logit.yaml) — one listener per tier (`haproxy_in`/`nginx_in`/`app_in` on
 5140/5141/5142), because `set`'s `resource:` block stamps identity onto a whole *batch*, and three
 tiers sharing one listener would interleave into one batch with one wrong `service.name`. Each
 tier's chain is `set` (`../docs/adr/operator-declared-resource-attributes.md`) → `json` →
-`trace_context` (`../docs/adr/log-record-trace-context.md`), which lifts the split trace fields
-onto `LogRecord.trace` — then all three fan into a shared `stdout` (`stdio_out`) and a shared
-`loki_out` (`otlp_out` over HTTP straight to Loki — no relay service in between,
-`../docs/plans/otlp-logs-and-resource-identity.md`). The haproxy and nginx tiers both continue on
-to the metrics leg — nginx's own chain adds a `scale` step first, converting `request_time` from
-seconds to milliseconds so it shares a measurement and a unit with haproxy's already-millisecond
-`%Tr` (`../docs/adr/scale-transform.md`) — before each tier's own `kv_metrics` (`nginx_metrics`/
-`haproxy_metrics`) fans into a shared `keep` → `aggregate` → `influxdb_out` tail, told apart in
-InfluxDB by the `service.name` tag each tier's `set` already stamped. `logit` also observes its own
-pipeline via `internal` (`../docs/design/internal-telemetry.md`) into that same InfluxDB bucket
-*and*, as real spans, over OTLP/gRPC into Tempo, one span per node-visit at `span_sample_rate: 1.0`
-so nothing is thinned out (`../docs/adr/internal-span-emission-and-deterministic-sampling.md`,
-`../docs/adr/hand-rolled-grpc-over-hyper.md`).
+`trace_context` (`../docs/adr/log-record-trace-context.md`), which lifts the trace context onto
+`LogRecord.trace` — parsing the `traceparent` header natively, and the well-known `trace.id`/
+`span.id`/`trace.flags` attributes each access line also carries
+(`../docs/design/data-model.md`'s "Well-known attribute names") — then all three fan into a shared
+`stdout` (`stdio_out`) and, filtered down to logs only, a shared `loki_out` (`otlp_out` over HTTP
+straight to Loki — no relay service in between,
+`../docs/plans/otlp-logs-and-resource-identity.md`). **The haproxy and nginx tiers' `trace_context`
+stages also mint a real `SpanRecord` on the same event** (`span:`,
+`../docs/adr/trace-context-span-lifting.md`) — the access line's own start/end/duration become a
+server span, so those two tiers get a real trace span from their existing log line, no new
+telemetry SDK required. Those spans are filtered out and sent to Tempo (see below); the log side of
+the same event continues on to the metrics leg — nginx's own chain adds a `scale` step first,
+converting `request_time` from seconds to milliseconds so it shares a measurement and a unit with
+haproxy's already-millisecond `%Tr` (`../docs/adr/scale-transform.md`) — before each tier's own
+`kv_metrics` (`nginx_metrics`/`haproxy_metrics`) fans into a shared `keep` → `aggregate` →
+`influxdb_out` tail, told apart in InfluxDB by the `service.name` tag each tier's `set` already
+stamped. `logit` also observes its own pipeline via `internal`
+(`../docs/design/internal-telemetry.md`) into that same InfluxDB bucket *and*, as real spans, over
+OTLP/gRPC into Tempo, one span per node-visit at `span_sample_rate: 1.0` so nothing is thinned out
+(`../docs/adr/internal-span-emission-and-deterministic-sampling.md`,
+`../docs/adr/hand-rolled-grpc-over-hyper.md`) — alongside haproxy's and nginx's own access-line
+spans, sharing that same `tempo_out`.
 
 `app` also has its own real OpenTelemetry request span — but, deliberately, it never goes through
 `logit` at all: it's exported over OTLP/HTTP protobuf straight to Tempo's own OTLP receiver
@@ -85,18 +92,21 @@ so nothing is thinned out (`../docs/adr/internal-span-emission-and-deterministic
 `opentelemetry-exporter-otlp-proto-http`). Not every telemetry leg needs `logit` in front of it,
 and this demo shows that honestly rather than routing everything through `logit` just to prove it
 can — see `demo/logit.yaml`'s header comment. Because the default W3C propagator extracts
-haproxy's `traceparent` automatically regardless of where the span is headed, it's still a genuine
-*child* of haproxy's span, with no code in `app` deciding so.
+whichever `traceparent` it's handed automatically regardless of where the span is headed, it's
+still a genuine *child* of nginx's span, with no code in `app` deciding so.
 
-**All four tiers work end to end and agree on one trace, even though only three of them ever touch
-`logit`** — that's what the shipped Grafana dashboard shows, side by side: the `logit.*` InfluxDB
-panels, a Loki logs panel, and a Tempo traces panel, all over the same pipeline. Each tier's `set`
-(or, for `app`'s spans, its own OTel resource) stamps a real `service.name`/`service.namespace`
-(`haproxy`/`nginx`/`demo-app`, all under `demo`) so Loki gets real stream labels with no extra
-`loki.yaml` config, and Loki's `derivedFields` (both in
+**All four tiers produce a real trace span and agree on one trace, even though only two of them
+(haproxy, nginx) derive theirs from a plain access log via `trace_context`, and only three ever
+touch `logit` at all** — that's what the shipped Grafana dashboard shows, side by side: the
+`logit.*` InfluxDB panels, a Loki logs panel, and two Tempo traces panels (one scoped to `logit`'s
+own internal spans, one to this demo's own request traces), all over the same pipeline. Each
+tier's `set` (or, for `app`'s spans, its own OTel resource) stamps a real
+`service.name`/`service.namespace` (`haproxy`/`nginx`/`demo-app`, all under `demo`) so Loki gets
+real stream labels with no extra `loki.yaml` config, and Loki's `derivedFields` (both in
 `grafana/provisioning/datasources/datasources.yaml`) click straight through to the matching Tempo
-trace — which contains a real application span alongside `logit`'s own internal ones, arrived at
-via two different receivers on the same Tempo, not `logit`'s internal spans alone.
+trace — which contains four real spans (haproxy, nginx, and app's, plus `logit`'s own internal
+ones for that request if sampled), arrived at via two different Tempo receivers, not `logit`'s
+internal spans alone.
 
 The landing page shows two diagrams. The pipeline one (also at `:8080/graph.svg` directly) is
 rendered at startup, not hand-drawn: `graph-dot` runs `logit graph logit.yaml` against the actual

@@ -58,7 +58,7 @@ name: http.request}`) stage between `nginx_json` and `nginx_metrics`, plus a `ke
 A new bench-adjacent fixture line documents the shape. Verify with `nginx -t` in the pinned image
 and `script/validate`.
 
-### C. `demo/` migration — after B
+### C. `demo/` migration — **landed**
 
 Deltas to the already-landed haproxy/nginx/app chain, not a rebuild of it:
 
@@ -90,10 +90,10 @@ Deltas to the already-landed haproxy/nginx/app chain, not a rebuild of it:
 
 ## Verification
 
-`script/cibuild` after A and B. Before any `demo/` `up`: `haproxy -c` against the edited config
-(this is where a dotted `%(name)` item either works or the log-format needs to fall back to
-per-field flags rather than `%{+json}o`) and `nginx -t`. Then `script/demo up --build`: per
-request, `logit`'s `stdio_out` shows a haproxy span and an nginx span sharing one trace id with
+`script/cibuild` after A and B — passes. `haproxy -c` against the edited config confirmed the
+dotted-name risk was real (see workstream C's own note above) and `nginx -t` passes for both
+`examples/nginx/nginx.conf` and `demo/nginx/nginx.conf`. `script/demo up --build`, verified live:
+per request, `logit`'s `stdio_out` shows a haproxy span and an nginx span sharing one trace id with
 nginx's `parent_span_id` equal to haproxy's `span_id`, and Tempo's `/api/traces/<id>` shows
 haproxy (root) → nginx → demo-app with start times in the expected order given each tier's actual
-clock resolution (haproxy µs-ish, nginx ms, app ns).
+clock resolution (haproxy µs-ish, nginx ms, app ns) — full account in workstream C.

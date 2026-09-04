@@ -57,11 +57,13 @@ digraph architecture {
   logit   -> loki  [label="logging"];
 
   // -- Tracing: two independent paths into Tempo -------------------------------------------
-  // `logit`'s own internal spans go through it as usual; `app`'s real request spans go straight
-  // to Tempo's own OTLP receiver instead, deliberately bypassing `logit`
-  // (docs/plans/demo-tracing-stack.md's "Decisions already settled") -- not every telemetry leg
-  // needs `logit` in front of it, and this diagram shows that honestly rather than drawing an
-  // edge through `logit` that doesn't exist.
+  // `logit`'s own internal spans travel this edge, and so do haproxy's/nginx's real access-line
+  // spans (docs/adr/trace-context-span-lifting.md's `span:` block, derived from the same
+  // syslog-carried log line the "logging" edges above already show -- one wire, two signals, no
+  // new edge needed here). `app`'s real request spans go straight to Tempo's own OTLP receiver
+  // instead, deliberately bypassing `logit` (docs/plans/demo-tracing-stack.md's "Decisions
+  // already settled") -- not every telemetry leg needs `logit` in front of it, and this diagram
+  // shows that honestly rather than drawing an edge through `logit` that doesn't exist.
   logit -> tempo [label="tracing"];
   app   -> tempo [label="tracing"];
 
