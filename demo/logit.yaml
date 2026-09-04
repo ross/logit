@@ -161,10 +161,10 @@ components:
   # identical reasoning applied to Tempo). Before `docs/adr/trace-context-span-lifting.md`,
   # `haproxy_trace`/`nginx_trace`/`app_trace` only ever produced log events, so this was never a
   # problem; now that the first two also produce span-only events downstream, `loki_out` needs
-  # this `keep_signals: [logs]` gate in front of it -- `has_signal`/`keep_signals` never mutate a
-  # forwarded event (ADR `signal-filtering-components`), so every log that does reach `loki_out`
-  # arrives exactly as its `*_trace` stage produced it, just without the span-only events that
-  # would otherwise trip Loki's `send`.
+  # this `keep_signals: [logs]` gate in front of it -- `keep_signals` clears the payload slots it
+  # isn't given (ADR `signal-filtering-components`), so every log that does reach `loki_out`
+  # arrives with its log payload intact, just without the span-only events that would otherwise
+  # trip Loki's `send`.
   logs_only:
     type: keep_signals
     sources: [haproxy_trace, nginx_trace, app_trace]

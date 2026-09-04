@@ -247,7 +247,7 @@
       ]
     },
     {
-      "id": 13,
+      "id": 16,
       "type": "timeseries",
       "title": "logit.internal.spans.dropped (buffer_full)",
       "description": "The per-component span buffer's overflow counter (MAX_SPANS_PER_COMPONENT, docs/design/internal-telemetry.md) -- should stay at zero at demo volume; a nonzero value means the demo's traffic is outrunning the bounded buffer between `internal`'s drain ticks, not that traces are being lost silently.",
