@@ -18,15 +18,19 @@ use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_outputs::influxdb::InfluxDbOutput;
-use logit_outputs::otlp::{OtlpOutput, OtlpTransport as OtlpOutTransport};
+use logit_outputs::otlp::{
+    OtlpCompression as OtlpOutCompression, OtlpOutput, OtlpTransport as OtlpOutTransport,
+    SignalPaths,
+};
 use logit_outputs::stdio::StdioOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
 use logit_transforms::{
-    Aggregator, JsonParser, Keep as KeepTransform, KvMetrics as KvMetricsTransform,
-    Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform,
-    TraceContext as TraceContextTransform,
+    Aggregator, DropSignals as DropSignalsTransform, HasSignal as HasSignalTransform, JsonParser,
+    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, KvMetrics as KvMetricsTransform,
+    MatchMode as TransformMatchMode, Remove as RemoveTransform, Scale as ScaleTransform,
+    Set as SetTransform, SignalSet, TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -202,14 +206,15 @@ fn build_spec(
             ),
             input_runtime_config(&component.receive),
         ),
-        OtlpIn { bind, protocol } => NodeSpec::Input(
-            Box::new(
-                OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
-                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                    .with_telemetry(telemetry.clone()),
-            ),
-            input_runtime_config(&component.receive),
-        ),
+        OtlpIn { bind, protocol, tls } => {
+            let mut input = OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
         // `span_sample_rate` is read by `prepare` (above) to build the `Registry` itself, not
         // here -- by the time `build_spec` runs, the `Registry` this handle points at already has
         // it baked in.
@@ -278,6 +283,16 @@ fn build_spec(
             ScaleTransform::new(fields.iter().map(|(k, v)| (k.clone(), *v)).collect())
                 .with_telemetry(telemetry.clone()),
         )),
+        HasSignal { signals, mode } => NodeSpec::Transform(Box::new(
+            HasSignalTransform::new(to_signal_set(signals), to_match_mode(*mode))
+                .with_telemetry(telemetry.clone()),
+        )),
+        KeepSignals { signals } => NodeSpec::Transform(Box::new(
+            KeepSignalsTransform::new(to_signal_set(signals)).with_telemetry(telemetry.clone()),
+        )),
+        DropSignals { signals } => NodeSpec::Transform(Box::new(
+            DropSignalsTransform::new(to_signal_set(signals)).with_telemetry(telemetry.clone()),
+        )),
 
         InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(
             Box::new(
@@ -288,10 +303,14 @@ fn build_spec(
             queue_config(&component.buffer),
             write_config(&component.buffer),
         ),
-        OtlpOut { endpoint, protocol } => {
+        OtlpOut { endpoint, protocol, headers, paths, compression, tls } => {
             let output = OtlpOutput::new(endpoint.clone(), otlp_out_transport(*protocol))?
+                .with_headers(headers)?
+                .with_paths(to_signal_paths(paths))
+                .with_compression(to_otlp_compression(*compression))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone());
+                .with_telemetry(telemetry.clone())
+                .with_tls(&to_tls_client_settings(tls), base_dir)?;
             NodeSpec::Output(
                 Box::new(output),
                 queue_config(&component.buffer),
@@ -409,6 +428,15 @@ fn otlp_out_transport(protocol: logit_config::OtlpProtocol) -> OtlpOutTransport 
     }
 }
 
+/// Translates config's `OtlpCompression` into `logit-outputs`'s own copy of the same choice --
+/// same reasoning as `otlp_out_transport`.
+fn to_otlp_compression(compression: logit_config::OtlpCompression) -> OtlpOutCompression {
+    match compression {
+        logit_config::OtlpCompression::None => OtlpOutCompression::None,
+        logit_config::OtlpCompression::Gzip => OtlpOutCompression::Gzip,
+    }
+}
+
 fn overflow_policy(cfg: logit_config::OverflowPolicy) -> logit_pipeline::OverflowPolicy {
     match cfg {
         logit_config::OverflowPolicy::Block => logit_pipeline::OverflowPolicy::Block,
@@ -463,6 +491,64 @@ fn syslog_format(cfg: logit_config::SyslogFormat) -> logit_outputs::syslog::Form
     match cfg {
         logit_config::SyslogFormat::Rfc3164 => logit_outputs::syslog::Format::Rfc3164,
         logit_config::SyslogFormat::Rfc5424 => logit_outputs::syslog::Format::Rfc5424,
+    }
+}
+
+/// Converts config's `Vec<Signal>` (`logit-config`, which `logit-transforms` deliberately doesn't
+/// depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the transform crate's
+/// boolean-flags `SignalSet`.
+fn to_signal_set(signals: &[logit_config::Signal]) -> SignalSet {
+    let mut set = SignalSet::default();
+    for signal in signals {
+        match signal {
+            logit_config::Signal::Logs => set.logs = true,
+            logit_config::Signal::Metrics => set.metrics = true,
+            logit_config::Signal::Traces => set.traces = true,
+        }
+    }
+    set
+}
+
+fn to_match_mode(mode: logit_config::MatchMode) -> TransformMatchMode {
+    match mode {
+        logit_config::MatchMode::AnyOf => TransformMatchMode::AnyOf,
+        logit_config::MatchMode::Only => TransformMatchMode::Only,
+    }
+}
+
+/// Converts config's `OtlpPaths` (`logit-config`, which `logit-outputs` deliberately doesn't
+/// depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the output crate's own
+/// identically-shaped `SignalPaths`.
+fn to_signal_paths(paths: &logit_config::OtlpPaths) -> SignalPaths {
+    SignalPaths {
+        logs: paths.logs.clone(),
+        metrics: paths.metrics.clone(),
+        traces: paths.traces.clone(),
+    }
+}
+
+/// Converts config's `TlsClientConfig` (`logit-config`, which `logit-outputs` deliberately
+/// doesn't depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the output crate's
+/// own identically-shaped `TlsClientSettings`.
+fn to_tls_client_settings(
+    tls: &logit_config::TlsClientConfig,
+) -> logit_outputs::otlp::TlsClientSettings {
+    logit_outputs::otlp::TlsClientSettings {
+        ca_file: tls.ca_file.clone(),
+        cert_file: tls.cert_file.clone(),
+        key_file: tls.key_file.clone(),
+        insecure_skip_verify: tls.insecure_skip_verify,
+    }
+}
+
+/// The `logit-inputs` mirror of [`to_tls_client_settings`].
+fn to_tls_server_settings(
+    tls: &logit_config::TlsServerConfig,
+) -> logit_inputs::otlp::TlsServerSettings {
+    logit_inputs::otlp::TlsServerSettings {
+        cert_file: tls.cert_file.clone(),
+        key_file: tls.key_file.clone(),
+        client_ca_file: tls.client_ca_file.clone(),
     }
 }
 
@@ -715,7 +801,11 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 consumers: vec!["out".to_string()],
-                kind: ComponentKind::OtlpIn { bind: "127.0.0.1:0".to_string(), protocol },
+                kind: ComponentKind::OtlpIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    protocol,
+                    tls: None,
+                },
             };
             assert!(
                 matches!(
@@ -738,6 +828,10 @@ mod tests {
                 kind: ComponentKind::OtlpOut {
                     endpoint: "http://localhost:4318".to_string(),
                     protocol,
+                    headers: HashMap::new(),
+                    paths: logit_config::OtlpPaths::default(),
+                    compression: logit_config::OtlpCompression::default(),
+                    tls: logit_config::TlsClientConfig::default(),
                 },
             };
             assert!(
@@ -750,12 +844,12 @@ mod tests {
         }
     }
 
-    /// `OtlpOutput::new`'s https-under-grpc guard (`crates/logit-outputs/src/otlp.rs`) surfaces
-    /// through `build_spec` as a clear config error, not a panic or a silently-downgraded
-    /// connection -- `NodeSpec` isn't `Debug` (see `build_spec_reports_a_clear_path_naming_error_
-    /// for_an_unopenable_stdio_target`'s comment for why this can't use `expect_err` directly).
+    /// An `https://` endpoint under `protocol: grpc` used to be rejected outright (the hand-rolled
+    /// gRPC client had no TLS support at all); it's now the normal way to ask for gRPC-over-TLS
+    /// (`docs/adr/otlp-tls-and-pooled-grpc-client.md`) and `build_spec` builds it like any other
+    /// endpoint.
     #[test]
-    fn build_spec_rejects_an_otlp_sink_with_https_under_grpc() {
+    fn build_spec_builds_an_otlp_sink_with_https_under_grpc() {
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
@@ -764,15 +858,100 @@ mod tests {
             kind: ComponentKind::OtlpOut {
                 endpoint: "https://tempo:4317".to_string(),
                 protocol: logit_config::OtlpProtocol::Grpc,
+                headers: HashMap::new(),
+                paths: logit_config::OtlpPaths::default(),
+                compression: logit_config::OtlpCompression::default(),
+                tls: logit_config::TlsClientConfig::default(),
             },
         };
-        let err = match build_spec("out", &component, Path::new(""), None) {
-            Ok(_) => {
-                panic!("expected build_spec to reject an https:// endpoint under protocol: grpc")
-            }
+        assert!(matches!(
+            build_spec("out", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    /// `logit-cli`'s own home for `testdata/tls`'s fixtures -- `crates/logit-cli` is two levels
+    /// under the repo root, same as every other crate's `testdata_dir()` test helper.
+    fn testdata_tls_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
+    }
+
+    #[test]
+    fn build_spec_wires_a_tls_client_config_into_an_otlp_sink() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::OtlpOut {
+                endpoint: "https://localhost:4318".to_string(),
+                protocol: logit_config::OtlpProtocol::Http,
+                headers: HashMap::new(),
+                paths: logit_config::OtlpPaths::default(),
+                compression: logit_config::OtlpCompression::default(),
+                tls: logit_config::TlsClientConfig {
+                    ca_file: Some("ca.pem".to_string()),
+                    ..Default::default()
+                },
+            },
+        };
+        assert!(matches!(
+            build_spec("out", &component, &testdata_tls_dir(), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    /// `build_spec` (via `OtlpOutput::with_tls`) is where a bad `tls.ca_file` path actually loads
+    /// the file and fails -- `graph::resolve`'s rule 22 never touches the filesystem, so it can't
+    /// catch this (`docs/deploying.md`'s TLS section documents that `logit validate` doesn't
+    /// either, since `validate_semantics` only runs `graph::resolve`).
+    #[test]
+    fn build_spec_reports_a_missing_tls_ca_file_clearly() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::OtlpOut {
+                endpoint: "https://localhost:4318".to_string(),
+                protocol: logit_config::OtlpProtocol::Http,
+                headers: HashMap::new(),
+                paths: logit_config::OtlpPaths::default(),
+                compression: logit_config::OtlpCompression::default(),
+                tls: logit_config::TlsClientConfig {
+                    ca_file: Some("does-not-exist.pem".to_string()),
+                    ..Default::default()
+                },
+            },
+        };
+        let err = match build_spec("out", &component, &testdata_tls_dir(), None) {
+            Ok(_) => panic!("expected a missing tls.ca_file to fail build_spec"),
             Err(err) => err,
         };
-        assert!(format!("{err:?}").contains("https"), "got: {err:?}");
+        assert!(format!("{err:?}").contains("does-not-exist.pem"), "got: {err:?}");
+    }
+
+    #[test]
+    fn build_spec_wires_a_tls_server_config_into_an_otlp_input() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::OtlpIn {
+                bind: "127.0.0.1:0".to_string(),
+                protocol: logit_config::OtlpProtocol::Http,
+                tls: Some(logit_config::TlsServerConfig {
+                    cert_file: "server.pem".to_string(),
+                    key_file: "server.key".to_string(),
+                    client_ca_file: None,
+                }),
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
     }
 
     /// The wiring this workstream adds: a non-default `buffer:` on the component actually reaches
@@ -1083,5 +1262,53 @@ mod tests {
             Some(logit_core::Value::F64(v)) => assert!((v - 12.0).abs() < 1e-9, "got {v}"),
             other => panic!("expected a scaled F64, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_spec_builds_a_has_signal_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::HasSignal {
+                signals: vec![logit_config::Signal::Traces],
+                mode: logit_config::MatchMode::AnyOf,
+            },
+        };
+        assert!(matches!(
+            build_spec("has_signal", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_keep_signals_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::KeepSignals { signals: vec![logit_config::Signal::Logs] },
+        };
+        assert!(matches!(
+            build_spec("keep_signals", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_drop_signals_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::DropSignals { signals: vec![logit_config::Signal::Metrics] },
+        };
+        assert!(matches!(
+            build_spec("drop_signals", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
     }
 }

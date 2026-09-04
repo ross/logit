@@ -106,11 +106,133 @@ pub enum OtlpProtocol {
     /// would be silently wrong under any other default.
     #[default]
     Http,
-    /// Unary gRPC over plaintext HTTP/2 -- `crates/logit-outputs/src/otlp.rs`'s hand-rolled gRPC
-    /// transport has no TLS support at all (`docs/adr/hand-rolled-grpc-over-hyper.md`), so an
-    /// `otlp_out` component's `endpoint` under this protocol is rejected at construction time if
-    /// it's written with an `https://` scheme, rather than silently exporting in plaintext.
+    /// Unary gRPC over HTTP/2 -- plaintext (`http://`/`grpc://`) or TLS (`https://`), selected by
+    /// `endpoint`'s scheme (`docs/adr/otlp-tls-and-pooled-grpc-client.md`). `otlp_out`'s `tls:`
+    /// block tunes the TLS case.
     Grpc,
+}
+
+/// Client-side TLS tuning for `otlp_out` (`tls:` in config). On the HTTP transport, TLS itself is
+/// already selected by the endpoint's `https://` scheme, matching every OTel SDK's
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` convention; on the gRPC transport, an `https://` endpoint now
+/// also means TLS (`docs/adr/otlp-tls-and-pooled-grpc-client.md` -- this used to be rejected
+/// outright, since the hand-rolled gRPC client had no TLS support at all). This block only tunes
+/// an already-TLS connection -- a non-default value under a plain `http://`/`grpc://` endpoint is
+/// rejected at config-validation time (rule 22) rather than silently ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TlsClientConfig {
+    /// PEM bundle of CA certificates to trust *instead of* the bundled Mozilla root set. Path is
+    /// resolved relative to the config file's own directory, same as `lua_file`/`stdio_out`'s
+    /// `path`. A plain string, so `!env` works on it (ADR `env-yaml-tag`) if the certificate
+    /// itself needs to come from the environment rather than a mounted file.
+    #[serde(default)]
+    pub ca_file: Option<String>,
+    /// Client certificate chain (PEM) presented for mutual TLS. Requires `key_file`; rejected at
+    /// config-validation time if set without it (rule 22).
+    #[serde(default)]
+    pub cert_file: Option<String>,
+    /// Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`. Requires `cert_file`.
+    #[serde(default)]
+    pub key_file: Option<String>,
+    /// Disables server-certificate verification entirely -- the connection is still encrypted,
+    /// but accepts any certificate the peer presents, self-signed or otherwise. A startup warning
+    /// is logged whenever this is `true`. Never the default; meant for a throwaway or
+    /// pre-production endpoint, not a real deployment. Contradictory (and rejected) together with
+    /// `ca_file` -- a trusted CA and "trust nothing" can't both be meant at once.
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+}
+
+impl TlsClientConfig {
+    /// `true` if every field is at its default -- rule 22's "did the operator actually set a
+    /// `tls:` block" check, the same shape as [`OtlpPaths::is_empty`].
+    pub fn is_empty(&self) -> bool {
+        self.ca_file.is_none()
+            && self.cert_file.is_none()
+            && self.key_file.is_none()
+            && !self.insecure_skip_verify
+    }
+}
+
+/// Server-side TLS for `otlp_in` (`tls:` in config). Its mere presence on a listener turns TLS on
+/// for that component -- there is no separate on/off flag. See [`TlsClientConfig`] for the file
+/// path resolution rule and `!env` compatibility, both identical here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TlsServerConfig {
+    /// Certificate chain (PEM) this listener presents to every client.
+    pub cert_file: String,
+    /// Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`.
+    pub key_file: String,
+    /// PEM bundle of CAs. When set, every connecting client must present a certificate chaining
+    /// to one of them (mutual TLS) -- absent, any client is accepted once the TLS handshake
+    /// itself completes.
+    #[serde(default)]
+    pub client_ca_file: Option<String>,
+}
+
+/// Whether `otlp_out` gzips its request bodies -- both transports (HTTP `Content-Encoding: gzip`,
+/// gRPC's per-message compressed-frame flag plus `grpc-encoding: gzip`). Default `none`,
+/// deliberately: flipping it would change an existing pipeline's wire behavior in a patch, and
+/// would break `otlp_out -> otlp_in` across two `logit` versions where only one side has learned
+/// gzip. `otlp_out` never advertises accepting a compressed *response* regardless of this setting
+/// (`docs/adr/otlp-compression-and-decompression-bounds.md`) -- this only ever compresses what it
+/// sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OtlpCompression {
+    #[default]
+    None,
+    Gzip,
+}
+
+/// A signal an event's payload may carry -- OTLP's vocabulary (`logit_proto::Signal`), not
+/// `Event`'s field names, since that's the vocabulary `has_signal`/`keep_signals`/`drop_signals`
+/// are meant to be read against. `Traces` corresponds to `event.span`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Signal {
+    Logs,
+    Metrics,
+    Traces,
+}
+
+/// `has_signal`'s matching rule. `AnyOf` forwards an event carrying at least one signal named in
+/// `signals`, untouched, even if it also carries a signal that isn't named. `Only` additionally
+/// requires the event carry nothing outside `signals` -- a mixed event that also has a signal not
+/// listed is dropped, not trimmed (`keep_signals` trims; `has_signal` never mutates an event).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchMode {
+    #[default]
+    AnyOf,
+    Only,
+}
+
+/// Per-signal HTTP path overrides for `otlp_out` (`paths:` in config). Not a `HashMap<String,
+/// String>` -- a typo'd key there would silently do nothing, where a struct field gets schema
+/// validation for free. Not a path *prefix* either: `endpoint`'s own trailing text already serves
+/// that role (`endpoint: http://host/otlp` already yields `/otlp/v1/logs` against `Signal::path`'s
+/// default, `crates/logit-outputs/src/otlp.rs`'s `send_http`), so a prefix field would be a second
+/// way to say the same thing. `None` on any field means "use the OTLP-standard default"
+/// (`/v1/logs`, `/v1/metrics`, `/v1/traces`). gRPC method names are fixed by the `.proto` service
+/// definitions, not a mount point an operator can move -- a non-empty `paths:` under
+/// `protocol: grpc` is rejected at config-validation time (rule 21) rather than silently ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OtlpPaths {
+    #[serde(default)]
+    pub logs: Option<String>,
+    #[serde(default)]
+    pub metrics: Option<String>,
+    #[serde(default)]
+    pub traces: Option<String>,
+}
+
+impl OtlpPaths {
+    /// `true` if every field is `None` -- rule 21's "did the operator actually set a path
+    /// override" check.
+    pub fn is_empty(&self) -> bool {
+        self.logs.is_none() && self.metrics.is_none() && self.traces.is_none()
+    }
 }
 
 /// `ComponentKind::Internal`'s `span_sample_rate` default when a config omits it -- re-exported
@@ -147,6 +269,10 @@ pub enum ComponentKind {
         bind: String,
         #[serde(default)]
         protocol: OtlpProtocol,
+        /// Terminates TLS on this listener (both `protocol: http` and `protocol: grpc`) when
+        /// present; plaintext when omitted. See [`TlsServerConfig`].
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
     },
     /// Tail one or more files as a log source, rotation- and checkpoint-aware.
     FileTail {
@@ -312,6 +438,38 @@ pub enum ComponentKind {
         /// and `Set` already have.
         fields: std::collections::BTreeMap<String, f64>,
     },
+    /// Drops an event that doesn't carry a wanted signal -- e.g. `signals: [traces]` ahead of a
+    /// traces-only sink like Tempo, fed from a source (`internal`) whose drains also carry
+    /// metrics. Never mutates a forwarded event: under the default `mode: any_of`, an event
+    /// carrying a listed signal is forwarded exactly as it arrived, including any signal *not*
+    /// listed. `mode: only` additionally requires the event carry nothing outside `signals`.
+    /// Place `keep_signals`/`drop_signals` ahead of this instead if disallowed payloads must
+    /// actually be stripped, not just tolerated. `signals` may not be empty --
+    /// see `docs/adr/signal-filtering-components.md`.
+    HasSignal {
+        signals: Vec<Signal>,
+        #[serde(default)]
+        mode: MatchMode,
+    },
+    /// Retains only the listed signals' payloads on every event, clearing the rest -- an
+    /// allowlist, the same relationship to `drop_signals` that `keep` has to `remove`. Unlike
+    /// `has_signal`, this mutates: an event carrying a log and derived metrics with
+    /// `signals: [logs]` loses the metrics but keeps the log. Drops an event left with no
+    /// payload at all. `signals` may not be empty (that keeps nothing, dropping every event) and
+    /// may not name all three signals (that keeps everything, a no-op that forwards every event
+    /// untouched) -- both are rejected as config mistakes. See
+    /// `docs/adr/signal-filtering-components.md`.
+    KeepSignals {
+        signals: Vec<Signal>,
+    },
+    /// Clears the listed signals' payloads on every event, keeping the rest -- a denylist, the
+    /// mirror of `keep_signals`. Drops an event left with no payload at all. `signals` may not be
+    /// empty (that drops nothing, a no-op that forwards every event untouched) and may not name
+    /// all three signals (that drops everything, dropping every event) -- both are rejected as
+    /// config mistakes. See `docs/adr/signal-filtering-components.md`.
+    DropSignals {
+        signals: Vec<Signal>,
+    },
     // The rest of the built-in native transforms -- not implemented yet (`logit-transforms`),
     // carried over as unimplemented `ComponentKind` variants so config referencing one gets a
     // clear "not implemented yet" at validation time rather than a deserialization error.
@@ -359,6 +517,35 @@ pub enum ComponentKind {
         endpoint: String,
         #[serde(default)]
         protocol: OtlpProtocol,
+        /// Extra headers sent on every export request, on both `protocol: http` and
+        /// `protocol: grpc` -- e.g. `X-Scope-OrgID` for a multi-tenant Loki/Mimir/Grafana Cloud
+        /// target. A value is a plain string like any other field, so `!env` works on it
+        /// (`docs/adr/env-yaml-tag.md`) -- the way to carry an `Authorization: Bearer …` token
+        /// without inlining it. A name owned by the protocol itself (`content-type`,
+        /// `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`,
+        /// `connection`, any `grpc-*` header, or an HTTP/2 pseudo-header starting with `:`) is
+        /// rejected at config-validation time rather than silently overridden. Two keys naming
+        /// the same header once case is ignored (e.g. `X-Scope-OrgID` and `x-scope-orgid`) are
+        /// rejected too -- HTTP header names are case-insensitive, so which value would actually
+        /// be sent is otherwise undefined.
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        /// Per-signal HTTP path overrides -- see [`OtlpPaths`]. `protocol: http` only; a
+        /// non-empty value under `protocol: grpc` is a config error (rule 21), not silently
+        /// ignored, since gRPC method names aren't a mount point an operator can move.
+        #[serde(default)]
+        paths: OtlpPaths,
+        /// Gzips request bodies on both transports -- see [`OtlpCompression`]. Defaults to
+        /// `none`: a receiver has to opt into decoding it, and most (the OTel Collector's own
+        /// receiver included) accept both, so there's rarely a reason to change this except
+        /// against a bandwidth-constrained link.
+        #[serde(default)]
+        compression: OtlpCompression,
+        /// Tunes TLS on an `https://` endpoint -- see [`TlsClientConfig`]. A non-default value
+        /// under a plain `http://`/`grpc://` endpoint is a config error (rule 22), not silently
+        /// ignored.
+        #[serde(default)]
+        tls: TlsClientConfig,
     },
     /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
     LogitOut {
@@ -1303,6 +1490,57 @@ mod tests {
     }
 
     #[test]
+    fn has_signal_component_deserializes_with_mode_defaulting_to_any_of() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "has_signal", "sources": ["in"], "signals": ["traces"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::HasSignal { signals, mode } => {
+                assert_eq!(signals, vec![Signal::Traces]);
+                assert_eq!(mode, MatchMode::AnyOf);
+            }
+            other => panic!("expected HasSignal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn has_signal_component_can_override_mode_to_only() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "has_signal", "sources": ["in"], "signals": ["traces"], "mode": "only"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::HasSignal { mode, .. } => assert_eq!(mode, MatchMode::Only),
+            other => panic!("expected HasSignal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keep_signals_component_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "keep_signals", "sources": ["in"], "signals": ["logs"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::KeepSignals { signals } => assert_eq!(signals, vec![Signal::Logs]),
+            other => panic!("expected KeepSignals, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_signals_component_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "drop_signals", "sources": ["in"], "signals": ["metrics"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DropSignals { signals } => assert_eq!(signals, vec![Signal::Metrics]),
+            other => panic!("expected DropSignals, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn component_with_no_sources_defaults_to_empty() {
         let component: Component =
             serde_json::from_str(r#"{"type": "statsd_in", "bind": "0.0.0.0:8125"}"#).unwrap();
@@ -1328,9 +1566,60 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::OtlpOut { endpoint, protocol } => {
+            ComponentKind::OtlpOut { endpoint, protocol, headers, paths, compression, tls } => {
                 assert_eq!(endpoint, "http://tempo:4318");
                 assert_eq!(protocol, OtlpProtocol::Http);
+                assert!(headers.is_empty());
+                assert!(paths.is_empty());
+                assert_eq!(compression, OtlpCompression::None);
+                assert_eq!(tls, TlsClientConfig::default());
+            }
+            other => panic!("expected OtlpOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otlp_out_compression_defaults_to_none_and_can_be_set_to_gzip() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_out", "sources": ["in"], "endpoint": "http://loki:3100",
+                "compression": "gzip"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpOut { compression, .. } => {
+                assert_eq!(compression, OtlpCompression::Gzip);
+            }
+            other => panic!("expected OtlpOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otlp_out_headers_default_to_empty_and_can_be_set() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_out", "sources": ["in"], "endpoint": "http://tempo:4318",
+                "headers": {"X-Scope-OrgID": "tenant-a"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpOut { headers, .. } => {
+                assert_eq!(headers.get("X-Scope-OrgID"), Some(&"tenant-a".to_string()));
+            }
+            other => panic!("expected OtlpOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otlp_out_paths_default_to_empty_and_can_be_set() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_out", "sources": ["in"], "endpoint": "http://loki:3100",
+                "paths": {"logs": "/otlp/v1/logs"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpOut { paths, .. } => {
+                assert_eq!(paths.logs, Some("/otlp/v1/logs".to_string()));
+                assert_eq!(paths.metrics, None);
+                assert_eq!(paths.traces, None);
             }
             other => panic!("expected OtlpOut, got {other:?}"),
         }
@@ -1343,11 +1632,48 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::OtlpIn { bind, protocol } => {
+            ComponentKind::OtlpIn { bind, protocol, tls } => {
                 assert_eq!(bind, "0.0.0.0:4317");
                 assert_eq!(protocol, OtlpProtocol::Grpc);
+                assert_eq!(tls, None);
             }
             other => panic!("expected OtlpIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otlp_out_tls_defaults_to_empty_and_can_be_set() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_out", "sources": ["in"], "endpoint": "https://tempo:4317",
+                "protocol": "grpc",
+                "tls": {"ca_file": "ca.pem", "cert_file": "client.pem", "key_file": "client.key"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpOut { tls, .. } => {
+                assert_eq!(tls.ca_file, Some("ca.pem".to_string()));
+                assert_eq!(tls.cert_file, Some("client.pem".to_string()));
+                assert_eq!(tls.key_file, Some("client.key".to_string()));
+                assert!(!tls.insecure_skip_verify);
+            }
+            other => panic!("expected OtlpOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otlp_in_tls_defaults_to_none_and_can_be_set() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "otlp_in", "bind": "0.0.0.0:4317", "protocol": "grpc",
+                "tls": {"cert_file": "server.pem", "key_file": "server.key"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::OtlpIn { tls: Some(tls), .. } => {
+                assert_eq!(tls.cert_file, "server.pem");
+                assert_eq!(tls.key_file, "server.key");
+                assert_eq!(tls.client_ca_file, None);
+            }
+            other => panic!("expected OtlpIn with tls set, got {other:?}"),
         }
     }
 

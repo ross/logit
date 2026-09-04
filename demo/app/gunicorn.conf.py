@@ -40,10 +40,10 @@ def post_fork(server, worker):
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
     from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 
-    # `service.name` is what lets Tempo (and, upstream of it, `logit`'s `otlp_in` -> `trace_out`)
-    # resolve a root service for these spans, the same way demo/logit.yaml's `internal` component
-    # stamps `service.name: logit` on its own. `service.namespace` matches every other tier's `set`
-    # component (demo/logit.yaml) so this app's spans and its syslog-carried logs agree on identity.
+    # `service.name` is what lets Tempo resolve a root service for these spans, the same way
+    # demo/logit.yaml's `internal` component stamps `service.name: logit` on its own.
+    # `service.namespace` matches every other tier's `set` component (demo/logit.yaml) so this
+    # app's spans and its syslog-carried logs agree on identity.
     resource = Resource.create(
         {
             "service.name": os.environ.get("OTEL_SERVICE_NAME", "demo-app"),
@@ -51,11 +51,12 @@ def post_fork(server, worker):
         }
     )
     provider = TracerProvider(resource=resource, sampler=ALWAYS_ON)
-    # Reads OTEL_EXPORTER_OTLP_ENDPOINT from the environment (demo/compose.yaml) and appends
-    # `/v1/traces` itself, per the OTLP exporter spec -- exactly the path `otlp_in` routes
-    # (`crates/logit-inputs/src/otlp.rs`'s `route_path`). Protobuf, not OTLP/JSON: `otlp_in`
-    # rejects `application/json` outright (same file, ~line 194), and this exporter package only
-    # ever speaks protobuf.
+    # Reads OTEL_EXPORTER_OTLP_ENDPOINT from the environment (demo/compose.yaml: `http://tempo:4318`)
+    # and appends `/v1/traces` itself, per the OTLP exporter spec -- Tempo's own OTLP/HTTP receiver
+    # (demo/tempo/tempo.yaml's `otlp.protocols.http`), not `logit`'s `otlp_in`. Deliberate --
+    # `logit` isn't in this path at all (demo/logit.yaml's header comment explains why); `otlp_in`
+    # stays unexercised by this demo. Protobuf, not OTLP/JSON: this exporter package only ever
+    # speaks protobuf, which Tempo's receiver accepts natively either way.
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
     trace.set_tracer_provider(provider)
 
