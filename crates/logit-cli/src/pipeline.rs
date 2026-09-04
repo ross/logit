@@ -25,7 +25,8 @@ use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
 use logit_transforms::{
     Aggregator, JsonParser, Keep as KeepTransform, KvMetrics as KvMetricsTransform,
-    Remove as RemoveTransform, Set as SetTransform, TraceContext as TraceContextTransform,
+    Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform,
+    TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -272,6 +273,10 @@ fn build_spec(
                 *keep_source,
             )
             .with_telemetry(telemetry.clone()),
+        )),
+        Scale { fields } => NodeSpec::Transform(Box::new(
+            ScaleTransform::new(fields.iter().map(|(k, v)| (k.clone(), *v)).collect())
+                .with_telemetry(telemetry.clone()),
         )),
 
         InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(
@@ -1038,5 +1043,45 @@ mod tests {
             out.attributes.get("tid").is_some(),
             "keep_source: true should retain the attribute"
         );
+    }
+
+    /// Like `build_spec_builds_a_working_trace_context_transform` above, runs the built transform
+    /// against an event rather than only checking the `NodeSpec` variant -- proving the
+    /// `BTreeMap<String, f64>` config shape actually reaches `Scale::new` as the expected factor.
+    #[test]
+    fn build_spec_builds_a_working_scale_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Scale {
+                fields: std::collections::BTreeMap::from([("request_time".to_string(), 1000.0)]),
+            },
+        };
+        let NodeSpec::Transform(mut transform) =
+            build_spec("scale", &component, Path::new(""), None).unwrap().0
+        else {
+            panic!("expected a Transform node");
+        };
+
+        let mut attrs = logit_core::AttrMap::new();
+        attrs.insert("request_time", logit_core::Value::F64(0.012));
+        let event = logit_core::Event::log(
+            0,
+            attrs,
+            logit_core::LogRecord {
+                message: logit_core::Value::str("msg"),
+                severity: None,
+                body_format: logit_core::BodyFormat::Raw,
+                trace: None,
+            },
+        );
+        let resource = Arc::new(logit_core::Resource::default());
+        let out = transform.process(&resource, event).expect("should forward the event");
+        match out.attributes.get("request_time") {
+            Some(logit_core::Value::F64(v)) => assert!((v - 12.0).abs() < 1e-9, "got {v}"),
+            other => panic!("expected a scaled F64, got {other:?}"),
+        }
     }
 }

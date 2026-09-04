@@ -97,6 +97,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Remove { .. }
         | Set { .. }
         | TraceContext { .. }
+        | Scale { .. }
         | Logfmt
         | Kv
         | Regex { .. }
@@ -139,6 +140,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         Remove { .. } => "remove",
         Set { .. } => "set",
         TraceContext { .. } => "trace_context",
+        Scale { .. } => "scale",
         Logfmt => "logfmt",
         Kv => "kv",
         Regex { .. } => "regex",
@@ -175,6 +177,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Remove { .. }
             | ComponentKind::Set { .. }
             | ComponentKind::TraceContext { .. }
+            | ComponentKind::Scale { .. }
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::OtlpOut { .. }
             | ComponentKind::StdioOut { .. }
@@ -483,6 +486,32 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     "component '{id}': a trace_context with an empty 'trace_id' field name can \
                      only ever be a no-op"
                 );
+            }
+        }
+    }
+
+    // Rule 20: `scale`-specific validation -- an empty `fields` map can only ever be a no-op, the
+    // same reasoning rules 10-12/19 already apply to `kv_metrics`/`set`/`trace_context`; an empty
+    // field name could never match a real attribute for the same reason rule 19 rejects one on
+    // `trace_context`; a non-finite factor would only ever produce values `numeric` then rejects
+    // downstream (`crates/logit-transforms/src/lib.rs::numeric`), which is a confusing way to
+    // learn about what's almost certainly a config typo.
+    for (id, component) in &components {
+        if let ComponentKind::Scale { fields } = &component.kind {
+            if fields.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a scale with no 'fields' configured can only ever be a \
+                     no-op"
+                );
+            }
+            if fields.keys().any(|field| field.is_empty()) {
+                anyhow::bail!(
+                    "component '{id}': a scale field name must not be empty -- it could never \
+                     match a real attribute"
+                );
+            }
+            if fields.values().any(|factor| !factor.is_finite()) {
+                anyhow::bail!("component '{id}': every scale factor must be a finite number");
             }
         }
     }
@@ -1056,6 +1085,75 @@ mod tests {
         ]))
         .expect("should resolve");
         assert_eq!(graph.components["trace"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_scale_with_no_fields_configured_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "scale",
+                vec!["in"],
+                ComponentKind::Scale { fields: std::collections::BTreeMap::new() },
+            ),
+            ("out", vec!["scale"], sink()),
+        ]));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_scale_with_an_empty_field_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "scale",
+                vec!["in"],
+                ComponentKind::Scale {
+                    fields: std::collections::BTreeMap::from([(String::new(), 1000.0)]),
+                },
+            ),
+            ("out", vec!["scale"], sink()),
+        ]));
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn a_scale_with_a_non_finite_factor_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "scale",
+                vec!["in"],
+                ComponentKind::Scale {
+                    fields: std::collections::BTreeMap::from([(
+                        "request_time".to_string(),
+                        f64::NAN,
+                    )]),
+                },
+            ),
+            ("out", vec!["scale"], sink()),
+        ]));
+        assert!(err.contains("finite"), "got: {err}");
+    }
+
+    #[test]
+    fn a_scale_with_a_field_configured_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "scale",
+                vec!["in"],
+                ComponentKind::Scale {
+                    fields: std::collections::BTreeMap::from([(
+                        "request_time".to_string(),
+                        1000.0,
+                    )]),
+                },
+            ),
+            ("out", vec!["scale"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["scale"].role(), Role::Transform);
     }
 
     #[test]

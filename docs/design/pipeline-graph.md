@@ -96,8 +96,8 @@ into one tagged enum creates real collisions — `Otlp { bind }` (a listener) an
 keeps the rule predictable as more protocols gain a second side — `syslog_out` (RFC 3164/5424 over
 UDP or TCP, `docs/adr/syslog-output.md`) is exactly that case, landing well after `SyslogIn`.
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`,
-`remove`, `set`, `trace_context`, and any future native transform — take no suffix; there's only
-ever one direction for a transform to be.
+`remove`, `set`, `trace_context`, `scale`, and any future native transform — take no suffix;
+there's only ever one direction for a transform to be.
 
 **`interval` stays a per-kind optional field, unchanged from today.** `lua`/`lua_file` already carry
 an optional flush interval (`docs/adr/aggregation-window-semantics.md`); `aggregate` requires
@@ -142,7 +142,7 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `syslog_in`, `otlp_in`, `file_tail`, `logit_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `otlp_out`, `logit_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
@@ -216,6 +216,9 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     apply to `kv_metrics`, extended to the two components that landed after this list was written
     (`docs/adr/operator-declared-resource-attributes.md`,
     `docs/adr/log-record-trace-context.md`).
+20. A `scale` with an empty `fields` map is rejected (the same no-op reasoning again), as is an
+    empty field name within it (the same reasoning rule 19 applies to `trace_context`'s `trace_id`)
+    or a non-finite factor (`docs/adr/scale-transform.md`).
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

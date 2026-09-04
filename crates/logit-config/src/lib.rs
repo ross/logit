@@ -300,6 +300,18 @@ pub enum ComponentKind {
         #[serde(default)]
         keep_source: bool,
     },
+    /// Multiplies named numeric attributes by a constant factor, in place -- unit conversion
+    /// (nginx's `request_time` in seconds -> milliseconds, say, to share a measurement name with
+    /// a source that already reports milliseconds) without a Lua script. See
+    /// `docs/adr/scale-transform.md`. A missing or non-numeric attribute is a silent skip for
+    /// that field, never a dropped event -- the same posture `KvMetrics` takes toward its own
+    /// fields.
+    Scale {
+        /// Attribute name -> multiplication factor. At least one entry is required -- rejected at
+        /// graph-validation time otherwise, the same "can only ever be a no-op" rule `KvMetrics`
+        /// and `Set` already have.
+        fields: std::collections::BTreeMap<String, f64>,
+    },
     // The rest of the built-in native transforms -- not implemented yet (`logit-transforms`),
     // carried over as unimplemented `ComponentKind` variants so config referencing one gets a
     // clear "not implemented yet" at validation time rather than a deserialization error.
@@ -1273,6 +1285,20 @@ mod tests {
                 assert!(keep_source);
             }
             other => panic!("expected TraceContext, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scale_component_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "scale", "sources": ["in"], "fields": {"request_time": 1000.0}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Scale { fields } => {
+                assert_eq!(fields.get("request_time"), Some(&1000.0));
+            }
+            other => panic!("expected Scale, got {other:?}"),
         }
     }
 
