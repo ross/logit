@@ -77,6 +77,7 @@
 use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use bytes::Bytes;
+use logit_core::time::{parse_rfc3339_to_nanos, TimestampError};
 use logit_core::{
     AttrMap, BodyFormat, Diagnostics, Event, LogRecord, Resource, Severity, Telemetry, Value,
 };
@@ -642,173 +643,6 @@ fn parse_5424(
     ))
 }
 
-/// Why an RFC 3339 timestamp couldn't become a `syslog.timestamp` attribute -- kept distinct from
-/// a plain `Option`/bare error because the two cases warrant different treatment at the call
-/// site: [`Malformed`](TimestampError::Malformed) means the *line* is bad (same skip-and-continue
-/// path as a bad PRI), while [`OutOfRange`](TimestampError::OutOfRange) means the timestamp is
-/// syntactically fine but names an instant the `i64`-nanosecond [`Value::Timestamp`] can't
-/// represent -- the rest of the line is still good and should be kept, just without that one
-/// attribute.
-enum TimestampError {
-    Malformed,
-    OutOfRange,
-}
-
-/// Parses an RFC 3339 timestamp (the form RFC 5424 mandates for TIMESTAMP) into Unix nanoseconds.
-/// Self-contained here rather than shared through `logit-core` -- this has exactly one caller, and
-/// pulling in a date/time crate for it is an ADR-scale decision (`AGENTS.md`) that doesn't belong
-/// inside one input's PR. Accepts an uppercase `Z` or `+HH:MM`/`-HH:MM` offset and an optional
-/// 1-6 digit fractional seconds component (RFC 5424's `TIME-SECFRAC`), padded to nanosecond
-/// precision. Rejects a calendar date that doesn't exist (`2024-02-31`, `2023-02-29`), an
-/// out-of-range offset, and a leap second (`:60`) -- RFC 5424 forbids all three, and silently
-/// normalizing or truncating them would attach a confidently-typed but wrong `syslog.timestamp`.
-/// Separately, a timestamp that parses cleanly but falls outside the representable `i64`
-/// nanosecond range (roughly 1677-09-21 to 2262-04-11) is [`TimestampError::OutOfRange`], not
-/// [`TimestampError::Malformed`] -- see that type's doc for why the distinction matters.
-/// TODO: replace with a real crate once the crate list is finalized (see `logit-config`'s
-/// hand-rolled humantime duration codec for the precedent this follows).
-fn parse_rfc3339_to_nanos(s: &str) -> Result<i64, TimestampError> {
-    let (days, seconds_of_day, offset_seconds, nanos_frac) =
-        parse_rfc3339_components(s).ok_or(TimestampError::Malformed)?;
-    let total_seconds = days * 86_400 + seconds_of_day - offset_seconds;
-    total_seconds
-        .checked_mul(1_000_000_000)
-        .and_then(|n| n.checked_add(nanos_frac))
-        .ok_or(TimestampError::OutOfRange)
-}
-
-/// The well-formedness half of [`parse_rfc3339_to_nanos`]: validates and decomposes `s` into
-/// `(days since the Unix epoch, seconds of day, offset in seconds, fractional nanoseconds)`,
-/// deferring the final arithmetic (and its overflow check) to the caller. Split out purely so
-/// "malformed" and "out of range" can be told apart -- see [`TimestampError`].
-fn parse_rfc3339_components(s: &str) -> Option<(i64, i64, i64, i64)> {
-    let b = s.as_bytes();
-    if b.len() < 20 {
-        return None; // "YYYY-MM-DDTHH:MM:SSZ" is the shortest legal form.
-    }
-    let digits = |start: usize, n: usize| -> Option<i64> {
-        let slice = s.get(start..start + n)?;
-        slice.bytes().all(|c| c.is_ascii_digit()).then(|| slice.parse().ok())?
-    };
-
-    let year = digits(0, 4)?;
-    if b[4] != b'-' {
-        return None;
-    }
-    let month = digits(5, 2)?;
-    if b[7] != b'-' {
-        return None;
-    }
-    let day = digits(8, 2)?;
-    // RFC 5424 (unlike RFC 3339 itself) requires uppercase `T` and `Z`.
-    if b[10] != b'T' {
-        return None;
-    }
-    let hour = digits(11, 2)?;
-    if b[13] != b':' {
-        return None;
-    }
-    let minute = digits(14, 2)?;
-    if b[16] != b':' {
-        return None;
-    }
-    let second = digits(17, 2)?;
-
-    let mut idx = 19;
-    let mut nanos_frac: i64 = 0;
-    if b.get(idx) == Some(&b'.') {
-        idx += 1;
-        let frac_start = idx;
-        while b.get(idx).is_some_and(u8::is_ascii_digit) {
-            idx += 1;
-        }
-        let frac_len = idx - frac_start;
-        // RFC 5424's `TIME-SECFRAC` is `"." 1*6DIGIT` -- at least one digit, at most six.
-        if !(1..=6).contains(&frac_len) {
-            return None;
-        }
-        let frac = &s[frac_start..idx];
-        let mut padded = [b'0'; 9];
-        for (dst, src) in padded.iter_mut().zip(frac.bytes()) {
-            *dst = src;
-        }
-        nanos_frac = std::str::from_utf8(&padded).ok()?.parse().ok()?;
-    }
-
-    let offset_seconds: i64 = match b.get(idx) {
-        Some(b'Z') => {
-            idx += 1;
-            0
-        }
-        Some(sign @ (b'+' | b'-')) => {
-            let sign: i64 = if *sign == b'-' { -1 } else { 1 };
-            let oh = digits(idx + 1, 2)?;
-            if b.get(idx + 3) != Some(&b':') {
-                return None;
-            }
-            let om = digits(idx + 4, 2)?;
-            if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
-                return None;
-            }
-            idx += 6;
-            sign * (oh * 3600 + om * 60)
-        }
-        _ => return None,
-    };
-    if idx != b.len() {
-        return None; // trailing garbage
-    }
-    // RFC 5424 forbids leap seconds outright (unlike RFC 3339, which allows `:60`) -- `second`
-    // is checked against 0..=59, not 0..=60.
-    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    if day < 1 || day > days_in_month(year, month) {
-        return None;
-    }
-
-    let days = days_from_civil(year, month, day);
-    let seconds_of_day = hour * 3600 + minute * 60 + second;
-    Some((days, seconds_of_day, offset_seconds, nanos_frac))
-}
-
-/// Whether `y` is a Gregorian leap year -- divisible by 4, except century years, which must also
-/// be divisible by 400 (so 2000 is a leap year, 1900 and 2100 are not).
-fn is_leap_year(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-/// Days in `month` (1-12) of `y`, honoring [`is_leap_year`] for February. `month` is assumed
-/// already range-checked by the caller to 1..=12.
-fn days_in_month(y: i64, month: i64) -> i64 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if is_leap_year(y) {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 0,
-    }
-}
-
-/// Howard Hinnant's `days_from_civil` -- proleptic Gregorian, correct for any year (including
-/// negative/pre-1970), and exactly the ~15 lines a hand-rolled date conversion needs; see
-/// <http://howardhinnant.github.io/date_algorithms.html>. `logit-core::time` (workstream D) adds
-/// the inverse (civil-from-days, for formatting); this is the one direction that input needs.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = (m + 9) % 12; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,13 +818,17 @@ mod tests {
     #[test]
     fn rfc5424_invalid_timestamp_is_rejected_rather_than_treated_as_absent() {
         for ts in [
-            "2024-02-31T00:00:00Z",         // February has no 31st day
-            "2023-02-29T00:00:00Z",         // 2023 is not a leap year
-            "2024-13-01T00:00:00Z",         // month 13
-            "2024-01-01T00:00:00+99:99",    // offset hour/minute both out of range
-            "2024-01-01T23:59:60Z",         // RFC 5424 forbids leap seconds
-            "2024-01-01t00:00:00z",         // lowercase t/z
-            "2024-01-01T00:00:00.1234567Z", // 7 fractional digits, RFC 5424 allows at most 6
+            "2024-02-31T00:00:00Z",      // February has no 31st day
+            "2023-02-29T00:00:00Z",      // 2023 is not a leap year
+            "2024-13-01T00:00:00Z",      // month 13
+            "2024-01-01T00:00:00+99:99", // offset hour/minute both out of range
+            "2024-01-01T23:59:60Z",      // RFC 5424 forbids leap seconds
+            "2024-01-01t00:00:00z",      // lowercase t/z
+            // 10 fractional digits -- past what an i64 of nanoseconds can hold. RFC 5424 itself
+            // allows at most 6, but the parser is `logit_core::time`'s shared RFC 3339 one now
+            // (it also serves `trace_context`'s `span.*_rfc3339`), which accepts up to 9; a
+            // 7-9 digit fraction from a syslog sender is harmless leniency, not a rejection.
+            "2024-01-01T00:00:00.1234567890Z",
         ] {
             let line = format!("<134>1 {ts} - - - - - msg");
             assert!(

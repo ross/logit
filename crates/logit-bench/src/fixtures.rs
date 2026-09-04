@@ -172,6 +172,43 @@ pub fn trace_context() -> logit_transforms::TraceContext {
     logit_transforms::TraceContext::new("trace_id".to_string(), None, None, false)
 }
 
+/// A `trace_context` with the convention defaults and a `span:` block (`kind: server`, `name:
+/// http.request`, no minting) -- the shape `demo/logit.yaml`'s `haproxy_trace`/`nginx_trace` run,
+/// for `crates/logit-bench/tests/allocations.rs`'s `trace_context_mints_a_span_from_the_convention`.
+pub fn trace_context_with_span() -> logit_transforms::TraceContext {
+    logit_transforms::TraceContext::new(
+        "trace.id".to_string(),
+        Some("span.id".to_string()),
+        Some("trace.flags".to_string()),
+        false,
+    )
+    .with_span(logit_transforms::SpanLift {
+        mint_id: false,
+        name: "http.request".to_string(),
+        kind: logit_core::SpanKind::Server,
+        max_skew: Duration::from_secs(3600),
+    })
+}
+
+/// [`nginx_event`] plus the span convention's attributes as `demo/nginx/nginx.conf`'s log_format
+/// emits them after `json`: an inbound `traceparent`, this hop's own `trace.id`/`span.id`, and
+/// nginx's ms-resolution `span.end_s` (`$msec`) / `span.duration_s` (`$request_time`) as JSON
+/// floats (`F64` off `serde_json`). The receipt timestamp is set just after the line's `span.end_s`
+/// so the fixture sits inside the default `max_skew` window regardless of the wall clock.
+pub fn nginx_traced_event() -> Event {
+    let mut event = nginx_event();
+    event.attributes.insert(
+        "traceparent",
+        Value::str("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+    );
+    event.attributes.insert("trace.id", Value::str("4bf92f3577b34da6a3ce929d0e0e4736"));
+    event.attributes.insert("span.id", Value::str("a1b2c3d4e5f60718"));
+    event.attributes.insert("span.end_s", Value::F64(1_725_091_200.123));
+    event.attributes.insert("span.duration_s", Value::F64(0.004));
+    event.timestamp = 1_725_091_200_125_000_000;
+    event
+}
+
 pub fn aggregator() -> Aggregator {
     Aggregator::new(Duration::from_secs(10))
 }

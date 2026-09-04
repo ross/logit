@@ -220,6 +220,27 @@ already built that have a known, accepted rough edge.
   not designed around yet: it stamps *logit's* identity onto *application* data, which must stay
   strictly opt-in (never a default, same posture as everything else on this page), and no concrete
   consumer has needed it yet. Revisit once one does.
+- **Lua has no span API at all** — `event.has_span` (a read-only boolean) is the whole surface
+  (`docs/design/lua-api.md`); there is no way for a script to create, read, or mutate a
+  `SpanRecord`. `trace_context`'s `span:` block
+  ([ADR `trace-context-span-lifting`](adr/trace-context-span-lifting.md)) is consequently the
+  *only* way to turn a log line into a span today. A script ahead of it can still prepare the
+  convention attributes (compute `span.start` from whatever the line actually carries, say) for
+  `trace_context` to consume — genuinely useful, just not a substitute for a real API. Real span
+  read/write access is its own design pass, the same posture typed record access on `event.log`
+  already took before it got one.
+- **A haproxy/nginx access line derives only its own server span, not the CLIENT-side child span
+  for the hop to its upstream** — `trace_context`'s `span:` block mints one `SpanRecord` per
+  event, and `Transform::process` is one-in-one-out, so there's nowhere to put a second span for
+  the same line. The math is fully available on the wire already: for haproxy (`docs/adr/
+  trace-context-span-lifting.md`'s "Producer timing model"), a CLIENT span to the upstream would
+  be `start = request_date + TR + Tw`, `duration = Tc + Tr + Td` (`%TR`/`%Tw`/`%Tc`/`%Tr`/`%Td`,
+  logged as plain `haproxy.timer.*` attributes for exactly this reason); for nginx, the
+  `$upstream_connect_time`/`$upstream_header_time`/`$upstream_response_time` triple gives the
+  equivalent breakdown. Building this needs either a `Transform` that can emit more than one event
+  per input (a trait change) or a second, explicitly upstream-flavored lift mode — not designed,
+  since no config needs it yet and the attributes needed to build it later are already on the
+  event.
 - ~~**A benchmark of the event proxy against plain table conversion is still outstanding**~~ —
   **closed.** Measured in `crates/logit-bench/benches/pipeline.rs` (`lua::proxy` vs
   `lua::to_table`): the proxy is faster, widening in its favour for scripts that read few
@@ -559,12 +580,16 @@ already built that have a known, accepted rough edge.
        `metrics_generator` (`service-graphs`/`span-metrics` processors) enabled with
        `remote_write` to a Prometheus-compatible store, that store added as a Grafana datasource,
        and `serviceMap.datasourceUid` set on the Tempo datasource — none of which
-       `demo/compose.yaml`/`demo/tempo/tempo.yaml` have. Even wired up, today's demo traces are all
-       single-service (`internal`'s own spans; `hello` sends plain syslog, not OTLP), so the graph
-       would show one degenerate node — not worth the added stack pieces until the demo has a real
-       cross-service trace to draw. Worth exploring later whether `logit` itself should compute a
-       service graph as a component, rather than depending on external `metrics_generator`
-       infrastructure to do it — unexplored, no decision made.
+       `demo/compose.yaml`/`demo/tempo/tempo.yaml` have. This is no longer blocked on the demo
+       lacking a real cross-service trace to draw: `docs/plans/demo-tracing-stack.md`'s HAProxy →
+       nginx → app chain and [ADR `trace-context-span-lifting`](adr/trace-context-span-lifting.md)'s
+       `span:` block together give Tempo a genuine multi-service trace (`haproxy`/`nginx`'s access
+       spans plus `demo-app`'s own OTel span). Still deferred — it's added stack pieces
+       (`metrics_generator`, a Prometheus-compatible store) for one dashboard panel, not a
+       `logit`-side gap — but worth doing now that there's something real to draw. Worth exploring
+       later whether `logit` itself should compute a service graph as a component, rather than
+       depending on external `metrics_generator` infrastructure to do it — unexplored, no decision
+       made.
   - **Internal logs** — routing `Diagnostics`' stderr output into the graph as `LogRecord` events
     is the natural next layer, and what the still-deferred `tracing` migration (above) should build
     on rather than duplicate.

@@ -19,20 +19,24 @@
 #                          nginx_json (json)          <- merges the JSON body into attributes
 #                              |
 #                              v
+#                         nginx_trace (trace_context)  <- lifts trace.id/span.id onto LogRecord.trace
+#                              |                           and mints a real span on the same event
+#                              v                           (docs/adr/trace-context-span-lifting.md)
 #                          nginx_metrics (kv_metrics) <- adds metrics to the same event
-#                  +-----------+-----------+
-#                  v                       v
-#             stdio_out              trimmed (keep)   <- drops high-cardinality attrs
-#                                          |
-#                                          v
-#                                    windowed (aggregate)
+#                  +-----------+-----------+-----------------------------+
+#                  v                       v                             v
+#             stdio_out              trimmed (keep)   <- drops   nginx_spans (keep_signals: [traces])
+#                                          |             high-cardinality        |
+#                                          v             attrs                   v
+#                                    windowed (aggregate)              span_tap (stdio_out)
 #                                          |
 #                                          v
 #                                     influx_out
 #
 # `nginx.conf`'s lean `access_json_syslog` log_format is sized to carry exactly the fields
-# `nginx_metrics` reads below -- see that file's comments and docs/known-gaps.md for what happens
-# to the one field it can't bound ($host) on a pathologically oversized Host header.
+# `nginx_metrics` reads below plus the trace/span convention `nginx_trace` reads -- see that
+# file's comments and docs/known-gaps.md for what happens to the one field it can't bound ($host)
+# on a pathologically oversized Host header.
 components:
   nginx_in:
     type: syslog_in
@@ -53,9 +57,23 @@ components:
     type: json
     sources: [nginx_identity]
 
+  # Lifts the access line's own trace.id/span.id onto LogRecord.trace and, via the `span:` block,
+  # mints a real SpanRecord on the same event -- start/end/duration come from `span.end_s`/
+  # `span.duration_s` (docs/design/data-model.md's "Well-known attribute names";
+  # docs/adr/trace-context-span-lifting.md's "Producer timing model" is why nginx's fields pair
+  # this way, not `span.start_s`). `keep_source` left at its default `false`: the consumed
+  # attributes (including the raw `traceparent`) are removed so `nginx_metrics`/`trimmed` below
+  # see exactly the fields they did before this stage existed.
+  nginx_trace:
+    type: trace_context
+    sources: [nginx_json]
+    span:
+      kind: server
+      name: http.request
+
   nginx_metrics:
     type: kv_metrics
-    sources: [nginx_json]
+    sources: [nginx_trace]
     counters:
       - name: nginx.requests # +1 per event
       - name: nginx.bytes_sent
@@ -71,6 +89,20 @@ components:
   tap:
     type: stdio_out
     sources: [nginx_metrics]
+
+  # The span nginx_trace minted, isolated from the log+metrics event it rides in on --
+  # `keep_signals` clears the payload slots it isn't given (ADR signal-filtering-components), so
+  # this branch carries just the span nginx_trace produced. Its own `stdio_out` rather than
+  # sharing `tap` above purely so a reader can tell log/metric lines from span lines at a glance;
+  # nothing stops one sink from taking both sources.
+  nginx_spans:
+    type: keep_signals
+    sources: [nginx_trace]
+    signals: [traces]
+
+  span_tap:
+    type: stdio_out
+    sources: [nginx_spans]
 
   # `keep` before `aggregate`, not after -- otherwise `aggregate`'s SeriesKey would key a series
   # per request on every syslog.* attribute (syslog.timestamp is unique per line), exploding both

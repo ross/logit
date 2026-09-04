@@ -214,7 +214,7 @@
       "id": 11,
       "type": "table",
       "title": "Tempo: logit's own internal spans",
-      "description": "logit observing itself as *traces*, not just metrics (docs/adr/internal-span-emission-and-deterministic-sampling.md, docs/plans/otlp-end-to-end.md) -- one span per node-visit (listener send, transform process/flush, sink deliver), exported over OTLP/gRPC by demo/logit.yaml's `tempo_out`. Click a trace ID to open its waterfall and see the pipeline's real shape: a syslog_in root with json/scale/kv_metrics/keep/aggregate children, or an internal-only root for `self`'s own drain. `{}` matches everything -- `logit` is the only thing sending to this Tempo.\n\nThis is a `table` panel, not a `traces` panel: Grafana's `traces` panel type renders one trace's waterfall, not a searchable list of many -- the Tempo datasource's own response tells Grafana as much (`preferredVisualisationType: \"table\"`), and each row's Trace ID is already a link into the full trace view.",
+      "description": "logit observing itself as *traces*, not just metrics (docs/adr/internal-span-emission-and-deterministic-sampling.md, docs/plans/otlp-end-to-end.md) -- one span per node-visit (listener send, transform process/flush, sink deliver), exported over OTLP/gRPC by demo/logit.yaml's `tempo_out`. Click a trace ID to open its waterfall and see the pipeline's real shape: a syslog_in root with json/scale/kv_metrics/keep/aggregate children, or an internal-only root for `self`'s own drain. Scoped to `{resource.service.name=\"logit\"}` -- as of docs/adr/trace-context-span-lifting.md, `tempo_out` also carries haproxy's/nginx's real access-line spans (see the panel below), so `{}` would now mix the two.\n\nThis is a `table` panel, not a `traces` panel: Grafana's `traces` panel type renders one trace's waterfall, not a searchable list of many -- the Tempo datasource's own response tells Grafana as much (`preferredVisualisationType: \"table\"`), and each row's Trace ID is already a link into the full trace view.",
       "gridPos": { "h": 10, "w": 24, "x": 0, "y": 52 },
       "datasource": { "type": "tempo", "uid": "tempo" },
       "targets": [
@@ -222,7 +222,7 @@
           "refId": "A",
           "datasource": { "type": "tempo", "uid": "tempo" },
           "queryType": "traceql",
-          "query": "{}",
+          "query": "{resource.service.name=\"logit\"}",
           "tableType": "traces",
           "limit": 20
         }
@@ -230,10 +230,28 @@
     },
     {
       "id": 12,
+      "type": "table",
+      "title": "Tempo: demo request traces (haproxy -> nginx -> app)",
+      "description": "The real per-request trace this demo exists to show (docs/adr/trace-context-span-lifting.md, docs/OVERVIEW.md's \"see a request pass through the stack, server to server to app\"): haproxy mints the trace, both haproxy and nginx contribute a real span derived from their own access log line by `trace_context`'s `span:` block, and `demo-app` contributes a real OpenTelemetry span sent straight to Tempo (never through `logit` -- see demo/logit.yaml's header comment). Scoped to `{resource.service.name=\"haproxy\"}`, the trace's root, so this table and the one above never overlap.",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 62 },
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"haproxy\"}",
+          "tableType": "traces",
+          "limit": 20
+        }
+      ]
+    },
+    {
+      "id": 16,
       "type": "timeseries",
       "title": "logit.internal.spans.dropped (buffer_full)",
       "description": "The per-component span buffer's overflow counter (MAX_SPANS_PER_COMPONENT, docs/design/internal-telemetry.md) -- should stay at zero at demo volume; a nonzero value means the demo's traffic is outrunning the bounded buffer between `internal`'s drain ticks, not that traces are being lost silently.",
-      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 62 },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 72 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "targets": [
         {

@@ -409,11 +409,17 @@ Worked examples, one per shipped component:
   Absent entirely when `set` has no `resource:` configured (`map_resource` returns before touching
   telemetry) — see [ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md).
 - `trace_context` (`crates/logit-transforms/src/trace_context.rs`): `logit.transform.trace_context.lifted`
-  (count) on a successful lift; `.skipped{reason="missing"|"invalid"}` otherwise — `missing` when
-  the configured `trace_id` attribute isn't present at all, `invalid` when it (or a configured
-  `span_id`/`flags`) is present but doesn't parse. The `kv_metrics` `.derived`/`.derived.skipped`
-  pattern, applied to lifting a trace context instead of deriving a metric — see
-  [ADR `log-record-trace-context`](../adr/log-record-trace-context.md).
+  (count) on a successful lift; `.skipped{reason}` otherwise, with `reason` one of `missing` (no
+  trace id at all — neither the configured attribute nor a `traceparent`), `invalid` (something
+  present didn't parse: an id, the flags, a `traceparent`, a `span.kind`/`span.status` name, a
+  timing value, or two forms of one timing quantity at once), and — only with a `span:` block —
+  `span_id` (no own span id and `mint_id` off), `timing` (the timing attributes can't determine a
+  start and an end, or determine an impossible span), `skew` (start or end further from receipt
+  time than `max_skew`). With a `span:` block, `.spans{id="present"|"minted"}` (count) alongside
+  `.lifted` says whether the minted `SpanRecord`'s id came off the line or from `mint_id`. The
+  `kv_metrics` `.derived`/`.derived.skipped` pattern, applied to lifting a trace context instead of
+  deriving a metric — see [ADR `log-record-trace-context`](../adr/log-record-trace-context.md) and
+  [ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md).
 - `has_signal`/`keep_signals`/`drop_signals` (`crates/logit-transforms/src/signals.rs`):
   `logit.transform.events.filtered` (count — an event dropped, by any of the three) and
   `logit.transform.payloads.stripped{signal}` (count — `keep_signals`/`drop_signals` only, one

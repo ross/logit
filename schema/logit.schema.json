@@ -436,36 +436,48 @@
           }
         },
         {
-          "description": "Lifts an application trace/span reference off an event's attributes onto its `LogRecord` (`docs/adr/log-record-trace-context.md`) -- the common \"my JSON log body already has a `trace_id` field\" case, without writing Lua (`event.log.trace_id`, `docs/design/lua-api.md`). Overwrites `log.trace` on a successful lift -- operator intent, the same posture `Set` has. An event with no log, or missing/unparseable named attribute(s), passes through untouched (never an error) -- see `crates/logit-transforms/src/trace_context.rs` for the exact skip conditions.",
+          "description": "Lifts an application trace/span reference off an event's attributes onto its `LogRecord` (`docs/adr/log-record-trace-context.md`) -- the common \"my JSON log body already has a `trace.id` field\" case, without writing Lua (`event.log.trace_id`, `docs/design/lua-api.md`) -- and, with a `span:` block, also turns that log line into a real `SpanRecord` on the same event (`docs/adr/trace-context-span-lifting.md`): an access log's ids plus its own start/end/duration become a span whose start is the event's timestamp. Reads the well-known attribute names in `docs/design/data-model.md` (`traceparent`, `trace.id`, `trace.flags`, `span.id`, `span.parent_id`, `span.name`, `span.kind`, `span.status`, `span.start`/`span.end`/`span.duration` and their unit-suffixed forms) by default; the three id fields below rename their sources. Overwrites `log.trace` on a successful lift -- operator intent, the same posture `Set` has. An event with no log, or missing/unparseable attribute(s), passes through untouched (never an error) -- see `crates/logit-transforms/src/trace_context.rs` for the exact skip conditions.",
           "type": "object",
           "required": [
-            "trace_id",
             "type"
           ],
           "properties": {
             "flags": {
-              "description": "The attribute holding the W3C trace flags (0-255, decimal -- never hex), if any.",
-              "default": null,
+              "description": "The attribute holding the W3C trace flags (0-255, decimal -- never hex). Defaults to `trace.flags`; `null` disables the lookup. A `traceparent` attribute supplies the flags (from its own hex octet) when this one is absent.",
+              "default": "trace.flags",
               "type": [
                 "string",
                 "null"
               ]
             },
             "keep_source": {
-              "description": "Keep the source attribute(s) after a successful lift, instead of removing them (the default). Removing matters for OTLP-native backends: Loki turns log attributes into structured metadata under their own names, so a leftover `trace_id` attribute would collide with the native `trace_id` key `LogRecord.trace_id` already produces.",
+              "description": "Keep the source attribute(s) after a successful lift, instead of removing them (the default). Removing matters for OTLP-native backends: Loki turns log attributes into structured metadata under their own names, so a leftover `trace_id` attribute would collide with the native `trace_id` key `LogRecord.trace_id` already produces. With `span:`, every convention attribute consumed (`traceparent`, `span.parent_id`, `span.name`, `span.kind`, `span.status`, and the timing fields) is removed too.",
               "default": false,
               "type": "boolean"
             },
-            "span_id": {
-              "description": "The attribute holding a 16-character hex span id, if any. A `Some` field name whose attribute is absent means \"no span,\" not a skip -- only present-but-unparseable is an error.",
+            "span": {
+              "description": "Opt in to minting a `SpanRecord` from the lifted ids plus the event's `span.start`/ `span.end`/`span.duration` attributes (any two; see `docs/design/data-model.md`). Absent (the default) means today's log-only lift.",
               "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SpanLiftConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "span_id": {
+              "description": "The attribute holding this line's own 16-character hex span id. Defaults to `span.id`; `null` disables the lookup. An absent attribute means \"no span id,\" not a skip (unless a `span:` block needs one) -- only present-but-unparseable is an error.",
+              "default": "span.id",
               "type": [
                 "string",
                 "null"
               ]
             },
             "trace_id": {
-              "description": "The attribute holding a 32-character hex trace id. Required, and rejected as an empty string at graph-validation time -- an empty field name could never match a real attribute, so a component configured that way can only ever be a no-op.",
+              "description": "The attribute holding a 32-character hex trace id. Defaults to `trace.id`; rejected as an empty string at graph-validation time -- an empty field name could never match a real attribute, so a component configured that way can only ever be a no-op. A `traceparent` attribute supplies the trace id when this one is absent.",
+              "default": "trace.id",
               "type": "string"
             },
             "type": {
@@ -1187,6 +1199,48 @@
         "metrics",
         "traces"
       ]
+    },
+    "SpanKindConfig": {
+      "description": "OTLP's span kinds, as config vocabulary -- mirrors `logit_core::SpanKind` one for one (`crates/logit-cli/src/pipeline.rs` maps between them, the same way `Signal` maps to `logit-transforms`' `SignalSet`), kept separate so `logit-config`'s schema doesn't depend on a core type's derives.",
+      "type": "string",
+      "enum": [
+        "internal",
+        "server",
+        "client",
+        "producer",
+        "consumer"
+      ]
+    },
+    "SpanLiftConfig": {
+      "description": "`trace_context`'s `span:` block (`docs/adr/trace-context-span-lifting.md`): the defaults a minted `SpanRecord` falls back on when the event's own `span.name`/`span.kind` attributes are absent, plus the two knobs that aren't per-event data at all.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "The span kind when the event carries no `span.kind` attribute. An access log line is a server span, so `server` is the default.",
+          "default": "server",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SpanKindConfig"
+            }
+          ]
+        },
+        "max_skew": {
+          "description": "A resolved start or end further than this from the event's receipt time is rejected (`skipped{reason=\"skew\"}`) rather than written -- one sender with a badly wrong clock must not be able to write spans years away and quietly poison a trace store. Rejected as `0s` at graph-validation time (an impossible window, never a small one).",
+          "default": "3600s",
+          "type": "string"
+        },
+        "mint_id": {
+          "description": "Mint a fresh span id when the `span_id` attribute is absent, instead of skipping the event (`skipped{reason=\"span_id\"}`). Off by default: `logit`'s own code never invents identity for data it didn't produce unless an operator asks it to. A missing *trace* id is never minted -- that's the edge tier's job.",
+          "default": false,
+          "type": "boolean"
+        },
+        "name": {
+          "description": "The span name when the event carries no `span.name` attribute. Rejected as an empty string at graph-validation time -- OTLP requires a span name.",
+          "default": "http.request",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "StdioTarget": {
       "type": "string"

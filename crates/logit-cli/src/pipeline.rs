@@ -30,7 +30,7 @@ use logit_transforms::{
     Aggregator, DropSignals as DropSignalsTransform, HasSignal as HasSignalTransform, JsonParser,
     Keep as KeepTransform, KeepSignals as KeepSignalsTransform, KvMetrics as KvMetricsTransform,
     MatchMode as TransformMatchMode, Remove as RemoveTransform, Scale as ScaleTransform,
-    Set as SetTransform, SignalSet, TraceContext as TraceContextTransform,
+    Set as SetTransform, SignalSet, SpanLift, TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -270,15 +270,19 @@ fn build_spec(
             SetTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
                 .with_telemetry(telemetry.clone()),
         )),
-        TraceContext { trace_id, span_id, flags, keep_source } => NodeSpec::Transform(Box::new(
-            TraceContextTransform::new(
+        TraceContext { trace_id, span_id, flags, keep_source, span } => {
+            let mut transform = TraceContextTransform::new(
                 trace_id.clone(),
                 span_id.clone(),
                 flags.clone(),
                 *keep_source,
             )
-            .with_telemetry(telemetry.clone()),
-        )),
+            .with_telemetry(telemetry.clone());
+            if let Some(span) = span {
+                transform = transform.with_span(to_span_lift(span));
+            }
+            NodeSpec::Transform(Box::new(transform))
+        }
         Scale { fields } => NodeSpec::Transform(Box::new(
             ScaleTransform::new(fields.iter().map(|(k, v)| (k.clone(), *v)).collect())
                 .with_telemetry(telemetry.clone()),
@@ -507,6 +511,25 @@ fn to_signal_set(signals: &[logit_config::Signal]) -> SignalSet {
         }
     }
     set
+}
+
+/// Converts config's `span:` block into the transform crate's `SpanLift` -- the same
+/// config-vocabulary-to-transform-type mapping `to_signal_set` does, `SpanKindConfig` to
+/// `logit_core::SpanKind` included.
+fn to_span_lift(span: &logit_config::SpanLiftConfig) -> SpanLift {
+    use logit_config::SpanKindConfig;
+    SpanLift {
+        mint_id: span.mint_id,
+        name: span.name.clone(),
+        kind: match span.kind {
+            SpanKindConfig::Internal => logit_core::SpanKind::Internal,
+            SpanKindConfig::Server => logit_core::SpanKind::Server,
+            SpanKindConfig::Client => logit_core::SpanKind::Client,
+            SpanKindConfig::Producer => logit_core::SpanKind::Producer,
+            SpanKindConfig::Consumer => logit_core::SpanKind::Consumer,
+        },
+        max_skew: span.max_skew,
+    }
 }
 
 fn to_match_mode(mode: logit_config::MatchMode) -> TransformMatchMode {
@@ -1192,6 +1215,7 @@ mod tests {
                 span_id: Some("sid".to_string()),
                 flags: None,
                 keep_source: true,
+                span: None,
             },
         };
         let NodeSpec::Transform(mut transform) =
@@ -1222,6 +1246,57 @@ mod tests {
             out.attributes.get("tid").is_some(),
             "keep_source: true should retain the attribute"
         );
+    }
+
+    /// The `span:` block reaches the transform: a config-vocabulary `kind: client` and the
+    /// default `name` land on the minted `SpanRecord`, and the event's timestamp becomes the
+    /// lifted start -- proving `to_span_lift`'s mapping, not just that the variant builds.
+    #[test]
+    fn build_spec_builds_a_span_lifting_trace_context_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::TraceContext {
+                trace_id: "trace.id".to_string(),
+                span_id: Some("span.id".to_string()),
+                flags: None,
+                keep_source: false,
+                span: Some(logit_config::SpanLiftConfig {
+                    kind: logit_config::SpanKindConfig::Client,
+                    ..logit_config::SpanLiftConfig::default()
+                }),
+            },
+        };
+        let NodeSpec::Transform(mut transform) =
+            build_spec("trace", &component, Path::new(""), None).unwrap().0
+        else {
+            panic!("expected a Transform node");
+        };
+
+        let mut attrs = logit_core::AttrMap::new();
+        attrs.insert("trace.id", logit_core::Value::str("ab".repeat(16)));
+        attrs.insert("span.id", logit_core::Value::str("cd".repeat(8)));
+        attrs.insert("span.start", logit_core::Value::I64(1_725_000_000_000_000_000));
+        attrs.insert("span.duration_ms", logit_core::Value::I64(5));
+        let event = logit_core::Event::log(
+            1_725_000_000_001_000_000,
+            attrs,
+            logit_core::LogRecord {
+                message: logit_core::Value::str("msg"),
+                severity: None,
+                body_format: logit_core::BodyFormat::Raw,
+                trace: None,
+            },
+        );
+        let resource = Arc::new(logit_core::Resource::default());
+        let out = transform.process(&resource, event).expect("should forward the event");
+        let span = out.span.expect("a span should be minted");
+        assert_eq!(span.kind, logit_core::SpanKind::Client);
+        assert_eq!(span.name.as_str(), Some("http.request"));
+        assert_eq!(out.timestamp, 1_725_000_000_000_000_000);
+        assert_eq!(span.end_timestamp, 1_725_000_000_005_000_000);
     }
 
     /// Like `build_spec_builds_a_working_trace_context_transform` above, runs the built transform
