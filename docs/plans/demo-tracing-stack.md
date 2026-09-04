@@ -172,7 +172,7 @@ unaffected, and the landing page/`graph.svg` rendering through the full chain.
 
 ## B. App replaces the stub, and real spans reach `otlp_in`
 
-**Status: not started.**
+**Status: landed.**
 
 A real framework at the bottom of the chain (Django, chosen for drop-in OTel
 instrumentation/logging/metrics — `opentelemetry-instrumentation-django`,
@@ -182,26 +182,61 @@ structured logs to syslog *and* real OTel spans over OTLP/HTTP protobuf into `lo
 
 **Files:**
 
-- `demo/app/` (new) — Django project, `Dockerfile`, `requirements.txt`, `gunicorn.conf.py`.
-  Instrumentation initialized in gunicorn's `post_fork` hook, not at import — the batch span
-  processor's exporter thread does not survive `fork`. `OTEL_EXPORTER_OTLP_ENDPOINT=http://logit:4318`,
-  `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` (`otlp_in` rejects `application/json` with a 415 —
-  `crates/logit-inputs/src/otlp.rs:194-205` — so this must be the protobuf exporter package, not
-  the default). Default W3C propagator makes Django's server span a child of HAProxy's span with
-  no code. `LoggingInstrumentor` puts `otelTraceID`/`otelSpanID` on every log record; confirm
-  against `crates/logit-inputs/src/syslog.rs` whether `SysLogHandler`'s headerless `<PRI>message`
-  parses, or have the formatter emit an RFC 3164 header itself.
+- `demo/app/` (new) — Django project (`demoproj/`, one app `pages/`), `Dockerfile`,
+  `requirements.txt`, `gunicorn.conf.py`. Instrumentation initialized in gunicorn's `post_fork`
+  hook, not at import — the batch span processor's exporter thread does not survive `fork`.
+  `OTEL_EXPORTER_OTLP_ENDPOINT=http://logit:4318` (`demo/compose.yaml`) — the exporter appends
+  `/v1/traces` itself, per spec. Protobuf only (`opentelemetry-exporter-otlp-proto-http`):
+  `otlp_in` rejects `application/json` with a 415 (`crates/logit-inputs/src/otlp.rs:194-205`).
+  Default W3C propagator makes Django's server span a child of HAProxy's span with no code.
+  `LoggingInstrumentor` puts `otelTraceID`/`otelSpanID` on every log record;
+  `pages/logging_formatter.py` reads them for the access log's `trace_id`/`span_id`/`trace_flags`
+  fields; `pages/syslog_handler.py` disables `SysLogHandler`'s default trailing-NUL byte, which
+  `crates/logit-inputs/src/syslog.rs`'s headerless-message path otherwise decodes fine (RFC 3164
+  header omitted entirely — no need to hand-roll one).
 - `demo/logit.yaml` (edit) — `app_otlp_in` (`otlp_in`, `bind: 0.0.0.0:4318`) → `app_spans`
   (`aggregate`, 60s, stripping non-span signals before Tempo the same way `trace_windowed`
-  already does for `self`) → added onto `trace_out`; rename the app tier's `service.name` to
-  `demo-app` and update the four dashboard panels that hardcode `demo-hello`.
-- `demo/compose.yaml` (edit) — replace `hello` with `app`, built from `demo/app/`.
-- `demo/hello/` (delete). `demo/README.md`, `docs/known-gaps.md` (edit) — `otlp_in` is exercised
-  now.
+  already does for `self`) → added onto `trace_out`; renamed the app tier's `service.name` to
+  `demo-app` and updated the four dashboard panels that hardcoded `demo-hello`.
+- `demo/compose.yaml` (edit) — replaced `hello` with `app`, built from `demo/app/`.
+- `demo/hello/` (deleted). `demo/README.md`, `docs/known-gaps.md`, `demo/nginx/nginx.conf`
+  (`proxy_pass` target) — updated for the new tier.
+
+**Notes from getting this working:** two real bugs, both found only by actually running the
+stack, neither visible from reading the OTel packages' own top-level docs:
+
+- **`DjangoInstrumentor().instrument()` must run *after* `DJANGO_SETTINGS_MODULE` is set, not
+  before.** `post_fork` (correctly) runs before `demoproj.wsgi` is ever imported in that worker,
+  but that means `DJANGO_SETTINGS_MODULE` wasn't set yet either — `demoproj/wsgi.py`'s own
+  `setdefault` call hadn't run. Calling `DjangoInstrumentor().instrument()` before it forces
+  Django's lazy `settings` into an empty `UserSettingsHolder` over `global_settings`, and
+  `LazySettings` only ever consults `DJANGO_SETTINGS_MODULE` the *first* time it's forced to
+  configure itself — so `demoproj.settings` was never loaded at all, and every request 500'd:
+  `AttributeError: module 'django.conf.global_settings' has no attribute 'ROOT_URLCONF'`. Fixed
+  by setting the env var at the top of `gunicorn.conf.py`, before `post_fork` is even defined.
+- **Trace-context injection into log records is opt-in, and off by default, in this
+  `opentelemetry-instrumentation-logging` version** — confirmed by reading its own `_instrument`
+  source inside the built container: `inject_context = set_logging_format or
+  kwargs.get("inject_trace_context", False)`, both `False` by default. Calling
+  `LoggingInstrumentor().instrument()` bare left every `LogRecord` exactly as built, no
+  `otelTraceID` attribute at all — `pages/logging_formatter.py`'s `getattr(record, "otelTraceID",
+  None)` silently saw `None`, and every access log line shipped with no trace fields, even though
+  the request's real span (visible in `logit`'s own `stdio_out`) was active the whole time. Fixed
+  with `LoggingInstrumentor().instrument(inject_trace_context=True,
+  enable_log_auto_instrumentation=False)` — the second flag turns off an unrelated OTel *logs*
+  pipeline this app never configured a `LoggerProvider` for.
 
 **Done when:** one request through HAProxy produces, in Tempo, a trace containing the Django
-server span, reachable by clicking "View trace" from any of the three Loki lines for that
-request; `script/validate` passes.
+server span, reachable by clicking "View trace" from any of the four Loki lines for that request;
+`script/validate` passes. **Verified live** (2026-09-03), cold `script/demo up --build` through
+`down -v`: `logit`'s `stdio_out` shows haproxy and nginx sharing one `span_id` (nginx only relays,
+mints none of its own), `demo-app`'s access log line and its real OTel span both carrying that
+same trace id, and the span's `parent_span_id` matching haproxy's `span_id` exactly — a genuine
+four-tier parent chain, confirmed by pulling the trace straight from Tempo's own API
+(`service.name=demo-app` on the batch). Zero tracebacks in `app`'s logs, zero panics/`error[` in
+`logit`'s, across a full cold start. Loki's `service_name` label values are exactly `demo-app`/
+`haproxy`/`nginx`; the renamed dashboard panels (`{service_name="demo-app"}`) resolve real data;
+the InfluxDB `web.requests` leg (nginx tier only) is unaffected.
 
 ---
 

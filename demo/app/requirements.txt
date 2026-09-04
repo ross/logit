@@ -1,0 +1,9 @@
+# The demo's app tier (docs/plans/demo-tracing-stack.md's workstream B) -- a real framework with
+# drop-in tracing/logging integration points, replacing demo/hello/app.py's stdlib stub.
+Django>=5.1,<6
+gunicorn>=23,<24
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation-django
+opentelemetry-instrumentation-logging
+opentelemetry-exporter-otlp-proto-http

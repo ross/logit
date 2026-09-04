@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>logit demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 3rem auto;
+         padding: 0 1rem; line-height: 1.5; }
+  code { background: #f0f0f0; padding: 0.1em 0.3em; }
+  img { max-width: 100%; border: 1px solid #ddd; }
+  .caption { color: #666; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<h1>Hello from the <code>logit</code> demo</h1>
+
+<p>This page is served by a real Django app behind haproxy and nginx -- every request through
+that chain gets a W3C <code>traceparent</code> minted at the edge, and all four tiers (haproxy,
+nginx, this app, and <code>logit</code> itself) now agree on the same trace id: this app's own
+request span is a real OpenTelemetry span, exported over OTLP straight into <code>logit</code>'s
+<code>otlp_in</code>, alongside its structured access log over syslog.</p>
+
+<h2>See it in Grafana</h2>
+<ol>
+  <li>Open <a href="{{ grafana_url }}">{{ grafana_url }}</a> -- anonymous access is on, no login.</li>
+  <li>Dashboards &rarr; the <strong>logit</strong> folder &rarr; <strong>logit internals</strong>.</li>
+  <li>Give it ten seconds: <code>aggregate</code> flushes on a 10s window.</li>
+</ol>
+
+<h2>The pipeline</h2>
+<img src="/graph.svg" alt="logit pipeline graph">
+<p class="caption">Rendered at startup from this stack's own config:
+<code>logit graph demo/logit.yaml | dot -Tsvg</code>.</p>
+</body>
+</html>

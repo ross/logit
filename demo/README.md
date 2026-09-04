@@ -19,7 +19,7 @@ appears. Every run after that reuses the built image.
 
 Once it's up, **start at http://localhost:8080** — a small page that links to Grafana with
 get-started instructions and shows this stack's own pipeline, rendered live. That's `haproxy`,
-the demo's front door now; requests flow `haproxy` → `nginx` → `hello`.
+the demo's front door now; requests flow `haproxy` → `nginx` → `app` (a real Django app).
 
 | Service | URL | What it's for |
 |---|---|---|
@@ -29,7 +29,7 @@ the demo's front door now; requests flow `haproxy` → `nginx` → `hello`.
 | Loki | http://localhost:3100 | Provisioned as a Grafana datasource; receives `logit`'s own logs directly via `otlp_out`. |
 | Tempo | http://localhost:3200 (query), :4317/:4318 (OTLP) | Provisioned as a Grafana datasource; receives `logit`'s own internal spans over OTLP/gRPC. |
 
-`nginx` and `hello` (the landing-page app) are internal-only now — reached through `haproxy`,
+`nginx` and `app` (the landing-page app) are internal-only now — reached through `haproxy`,
 not published on the host.
 
 `docker compose logs -f logit` shows every decoded event as a `stdio_out` block — the fastest way
@@ -44,17 +44,18 @@ doesn't just log a warning, it stops `logit` a minute after startup.
 
 ## What's actually flowing
 
-A request now crosses three real tiers: **`haproxy` → `nginx` → `hello`**
+A request crosses three real tiers: **`haproxy` → `nginx` → `app`**
 ([`haproxy/haproxy.cfg`](haproxy/haproxy.cfg), [`nginx/nginx.conf`](nginx/nginx.conf),
-[`hello/app.py`](hello/app.py)). `haproxy` mints a W3C `traceparent`
+[`app/`](app/) — a real Django project, `gunicorn`-served). `haproxy` mints a W3C `traceparent`
 (https://www.w3.org/TR/trace-context/) if the request doesn't already carry one, or reuses an
-inbound one; `nginx` and `hello` relay it and split it into plain `trace_id`/`span_id`/
-`trace_flags` fields — `logit` has no `traceparent` parser by design
-(`crates/logit-transforms/src/trace_context.rs`'s doc comment explains why decimal-only flags
-matter), so each tier does the split itself before logging. [`traffic`](compose.yaml) is now the
-demo's traffic source, driving a low-volume request loop through the whole chain — `hello`'s old
-in-process synthetic loop is gone, since it fabricated syslog lines directly and never crossed
-`haproxy`/`nginx`, carrying no trace context.
+inbound one; `nginx` relays it and splits it by hand (a `map` block) into plain
+`trace_id`/`span_id`/`trace_flags` fields, and `app` reads its own already-split
+`otelTraceID`/`otelSpanID` straight off the request span
+`opentelemetry-instrumentation-django` creates from the same header — `logit` has no `traceparent`
+parser by design (`crates/logit-transforms/src/trace_context.rs`'s doc comment explains why
+decimal-only flags matter), so every tier's syslog line already carries the split fields, never a
+`traceparent` string. [`traffic`](compose.yaml) is the demo's traffic source, driving a low-volume
+request loop through the whole chain.
 
 Each tier logs its own RFC 3164 + JSON-body access line to its own `syslog_in` listener in
 [`logit.yaml`](logit.yaml) — one listener per tier (`haproxy_in`/`nginx_in`/`app_in` on
@@ -71,18 +72,28 @@ pipeline via `internal` (`../docs/design/internal-telemetry.md`) into that same 
 so nothing is thinned out (`../docs/adr/internal-span-emission-and-deterministic-sampling.md`,
 `../docs/adr/hand-rolled-grpc-over-hyper.md`).
 
-**All three signals work end to end, and now carry a correlated trace id across all three tiers**
-— that's what the shipped Grafana dashboard shows, side by side: the `logit.*` InfluxDB panels, a
-Loki logs panel, and a Tempo traces panel, all over the same pipeline. Each tier's `set` stamps a
-real `service.name`/`service.namespace` (`haproxy`/`nginx`/`demo-hello`, all under `demo`) so Loki
-gets real stream labels with no extra `loki.yaml` config, and Loki's `derivedFields` (both in
-`grafana/provisioning/datasources/datasources.yaml`) click straight through to the matching Tempo
-trace — see "What isn't exercised yet" below for what that trace contains today.
+`app` adds a second, independent path into `logit`: its own real OpenTelemetry request span,
+exported over OTLP/HTTP protobuf straight into `otlp_in` (`demo/logit.yaml`'s `app_otlp_in`, :4318)
+— `logit`'s first genuine third-party OTLP traffic, wired up in
+[`app/gunicorn.conf.py`](app/gunicorn.conf.py)'s `post_fork` hook
+(`opentelemetry-instrumentation-django`, `opentelemetry-instrumentation-logging`,
+`opentelemetry-exporter-otlp-proto-http`). Because the default W3C propagator extracts haproxy's
+`traceparent` automatically, that span is a genuine *child* of haproxy's span, with no code in
+`app` deciding so.
+
+**All four tiers work end to end and agree on one trace** — that's what the shipped Grafana
+dashboard shows, side by side: the `logit.*` InfluxDB panels, a Loki logs panel, and a Tempo traces
+panel, all over the same pipeline. Each tier's `set` (or, for `app`'s spans, its own OTel resource)
+stamps a real `service.name`/`service.namespace` (`haproxy`/`nginx`/`demo-app`, all under `demo`)
+so Loki gets real stream labels with no extra `loki.yaml` config, and Loki's `derivedFields` (both
+in `grafana/provisioning/datasources/datasources.yaml`) click straight through to the matching
+Tempo trace — which now contains a real application span alongside `logit`'s own internal ones,
+not `logit`'s internal spans alone.
 
 The pipeline diagram on the landing page (and at `:8080/graph.svg` directly) is rendered at
 startup, not hand-drawn: `graph-dot` runs `logit graph logit.yaml` against the actual config this
 stack is running, `graph-svg` pipes that DOT through real Graphviz
-([`graph-renderer/Dockerfile`](graph-renderer/Dockerfile)), and `hello` serves the result. Both are
+([`graph-renderer/Dockerfile`](graph-renderer/Dockerfile)), and `app` serves the result. Both are
 one-shot containers gated with `depends_on: condition: service_completed_successfully` — expect to
 see them as `Exited (0)` in `docker compose ps`, that's them having finished, not crashed. (On
 `podman-compose` specifically, that condition is reportedly unimplemented and may be ignored; if
@@ -91,14 +102,12 @@ up — the SVG is read fresh on every request, nothing is cached.)
 
 ## What isn't exercised yet
 
-**`otlp_in`** (`crates/logit-inputs/src/otlp.rs`) ships implemented and tested, but nothing in this
-stack sends *to* it yet — `demo/logit.yaml` only ever uses `otlp_out`, as a client. The Tempo trace
-a log line's "View trace" link resolves to today therefore only ever contains `logit`'s own
-internal spans, not a real application span. Closing that — replacing `hello` with a real
-framework (Django) that exports genuine OTel spans into `otlp_in` — is
-[docs/plans/demo-tracing-stack.md](../docs/plans/demo-tracing-stack.md)'s workstream B. Browser-side
-tracing is sketched, not built, in that plan's workstream C
-([docs/plans/browser-tracing.md](../docs/plans/browser-tracing.md)).
+Every signal now has a real producer and a real backend, including `otlp_in`, which had no traffic
+at all until `app`'s own spans. What's left is client-side: browser-side tracing is sketched, not
+built, in [docs/plans/demo-tracing-stack.md](../docs/plans/demo-tracing-stack.md)'s workstream C
+([docs/plans/browser-tracing.md](../docs/plans/browser-tracing.md)) — same-origin OTLP export
+through `haproxy` needs no `logit` change, but a real OTel browser SDK needs `otlp_in` to accept
+OTLP/JSON, which it doesn't today ([docs/known-gaps.md](../docs/known-gaps.md)).
 
 ## Stopping
 

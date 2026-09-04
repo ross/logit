@@ -175,31 +175,36 @@ services:
 
   # Step 3: the innermost tier a request reaches -- no longer the demo's front door or its own
   # traffic source (docs/plans/demo-tracing-stack.md's workstream A). Sits behind `nginx` below;
-  # `traffic` drives requests through the whole haproxy -> nginx -> hello chain, and only writes
-  # `logit`'s `app_in` listener, the same way `influx_out`/`trace_out` are the only paths into
-  # InfluxDB and Tempo.
-  #
-  # A stock image plus a bind-mounted script, not a Dockerfile: it's stdlib-only Python, so
-  # there's nothing to install and nothing to rebuild after an edit. (Replaced by a real Django
-  # app in workstream B.)
-  hello:
-    image: docker.io/library/python:3.14-slim
-    command: ["python3", "/app/app.py"]
+  # `traffic` drives requests through the whole haproxy -> nginx -> app chain. A real Django app
+  # now (workstream B) -- replaces `hello`'s stdlib stub, so unlike every other bind-mounted script
+  # in this stack, this one is a real image build: `demo/app/Dockerfile`, not "nothing to install."
+  # Writes two independent paths into `logit`: its access log over syslog (`app_in`, :5142, same
+  # reasoning as every other tier's own listener), and its own OTel request spans over OTLP/HTTP
+  # protobuf straight into `otlp_in` (:4318, demo/logit.yaml's `app_otlp_in`) -- the same "only path
+  # in" posture `influx_out`/`trace_out`/`log_out` already have for their own backends.
+  app:
+    build:
+      context: ./app
+    image: logit-demo-app:latest
     depends_on:
       graph-svg:
         condition: service_completed_successfully
       # UDP is fire-and-forget, so `logit` not being bound yet just loses lines silently rather
       # than failing -- `service_started` is the honest limit, there's no way to know a UDP
       # listener is actually bound short of a manual probe (docs/deploying.md's "ordering rule").
+      # The OTLP/HTTP leg above is TCP and does get retried by the exporter's own SDK-level retry,
+      # so `service_started` is no less honest a limit for that path either.
       logit:
         condition: service_started
     environment:
       # The URL a *browser on the host* uses, not a container-network name.
       GRAFANA_URL: http://localhost:3000
       LOGIT_PORT: "5142" # app_in, not haproxy_in/nginx_in -- see demo/logit.yaml
+      OTEL_SERVICE_NAME: demo-app
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://logit:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf # documentation -- see gunicorn.conf.py's comment
     # No longer published -- haproxy is the front door now.
     volumes:
-      - ./hello/app.py:/app/app.py:z,ro
       - graph_data:/graph:ro
     restart: unless-stopped
     networks: [demo]
@@ -209,7 +214,7 @@ services:
   nginx:
     image: docker.io/library/nginx:1.27-alpine
     depends_on:
-      hello:
+      app:
         condition: service_started
       logit:
         condition: service_started

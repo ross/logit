@@ -1,9 +1,9 @@
 # The demo pipeline (demo/README.md, docs/plans/demo-tracing-stack.md, docs/plans/demo-stack.md,
 # docs/plans/otlp-end-to-end.md, docs/plans/otlp-logs-and-resource-identity.md). Exercises
-# syslog in, set + json + trace_context + kv_metrics + keep + aggregate, InfluxDB out, OTLP/HTTP
-# out, OTLP/gRPC out, plus `internal` observing the pipeline itself (ADR
+# syslog in, otlp in, set + json + trace_context + kv_metrics + keep + aggregate, InfluxDB out,
+# OTLP/HTTP out, OTLP/gRPC out, plus `internal` observing the pipeline itself (ADR
 # `internal-telemetry-as-pipeline-events`, ADR `internal-span-emission-and-deterministic-sampling`)
-# -- against traffic that now crosses three real tiers: haproxy -> nginx -> hello
+# -- against traffic that crosses three real tiers: haproxy -> nginx -> app
 # (demo/compose.yaml's `traffic` service drives it; docs/plans/demo-tracing-stack.md's
 # workstream A). All three signals -- logs, metrics, traces -- leave `logit` for a real backend:
 # Loki, InfluxDB, and Tempo respectively.
@@ -18,7 +18,7 @@
 #                                                                              |
 #   nginx   --syslog/UDP:5141--> nginx_in   -> nginx_identity   (set) -> nginx_json   (json)
 #                                                                              |
-#   demo-hello --syslog/UDP:5142--> app_in  -> app_identity     (set) -> app_json     (json)
+#   demo-app --syslog/UDP:5142--> app_in    -> app_identity     (set) -> app_json     (json)
 #                                                                              |
 #                                                                              v
 #                                            {haproxy,nginx,app}_trace (trace_context) <- splits
@@ -42,7 +42,11 @@
 #                                       |
 #   self (internal) --+-> self_windowed (aggregate) --> influx_out --> InfluxDB
 #                      |
-#                      +-> trace_windowed (aggregate) --> trace_out (otlp_out, gRPC) --> tempo
+#                      +-> trace_windowed (aggregate) ---+
+#                                                         +-> trace_out (otlp_out, gRPC) --> tempo
+#   demo-app --OTLP/HTTP protobuf:4318--> app_otlp_in -> app_spans (aggregate) --+
+#   (workstream B -- the app's own real spans, parented to haproxy's, alongside
+#   `logit`'s internal ones; the first traffic `otlp_in` has ever received in this demo)
 components:
   haproxy_in:
     type: syslog_in
@@ -70,14 +74,11 @@ components:
     resource:
       service.name: nginx
       service.namespace: demo
-  # Not "demo-app": demo/grafana/dashboards/logit-internal.json hardcodes
-  # `{service_name="demo-hello"}` in four places, including a panel title. Renaming this (and
-  # that dashboard) is workstream B's job, alongside the app itself changing.
   app_identity:
     type: set
     sources: [app_in]
     resource:
-      service.name: demo-hello
+      service.name: demo-app
       service.namespace: demo
 
   haproxy_json:
@@ -90,10 +91,13 @@ components:
     type: json
     sources: [app_identity]
 
-  # Lifts each tier's plain trace_id/span_id/trace_flags JSON fields (split from the W3C
-  # traceparent header upstream -- demo/haproxy/haproxy.cfg mints it, demo/nginx/nginx.conf and
-  # demo/hello/app.py relay and re-split it, since `logit` has no traceparent parser) onto
-  # LogRecord.trace (ADR `log-record-trace-context`). `keep_source` left at its default `false`:
+  # Lifts each tier's plain trace_id/span_id/trace_flags JSON fields onto LogRecord.trace (ADR
+  # `log-record-trace-context`) -- `logit` has no traceparent parser, so every tier logs the
+  # already-split id: demo/haproxy/haproxy.cfg mints the W3C traceparent and demo/nginx/nginx.conf
+  # splits it by hand via `map`, while demo/app's access log reads its already-split
+  # otelTraceID/otelSpanID straight off the active OpenTelemetry span
+  # (opentelemetry-instrumentation-django's own W3C-propagator extraction of the same header --
+  # demo/app/pages/logging_formatter.py). `keep_source` left at its default `false`:
   # the lifted id becomes Loki's *native* trace_id structured metadata via `log_out`'s OTLP
   # export below, and a surviving `trace_id` attribute would collide with it.
   haproxy_trace:
@@ -115,11 +119,33 @@ components:
     span_id: span_id
     flags: trace_flags
 
+  # The app's own real OTel spans (demo/app/gunicorn.conf.py), over OTLP/HTTP protobuf -- the
+  # first traffic `otlp_in` has ever received in this demo (`demo/README.md`'s old "What isn't
+  # exercised yet"). `protocol: http`, matching `demo/app`'s exporter
+  # (opentelemetry-exporter-otlp-proto-http; `otlp_in` rejects OTLP/JSON outright,
+  # `crates/logit-inputs/src/otlp.rs`). The default W3C propagator makes each span a genuine child
+  # of haproxy's span with no code in `demo/app` at all.
+  app_otlp_in:
+    type: otlp_in
+    bind: 0.0.0.0:4318
+    protocol: http
+
+  # Same reasoning as `trace_windowed` below: `otlp_out` aborts a whole `send` on the first failing
+  # signal, and Tempo is traces-only, so anything non-span must be stripped before `trace_out` sees
+  # it. `app_otlp_in` only ever carries spans today, so this is currently a no-op pass-through in
+  # practice -- kept for the same reason `trace_windowed` is: correctness that doesn't depend on
+  # staying that way.
+  app_spans:
+    type: aggregate
+    sources: [app_otlp_in]
+    interval: 60s
+
   # `docker compose logs -f logit` -- the fastest way to see the pipeline doing something, now one
-  # block per tier per request, all three sharing a trace_id and differing in span_id.
+  # block per tier per request, all three sharing a trace_id and differing in span_id, plus the
+  # app's own span blocks from `app_otlp_in`.
   tap:
     type: stdio_out
-    sources: [haproxy_trace, nginx_trace, app_trace]
+    sources: [haproxy_trace, nginx_trace, app_trace, app_otlp_in]
 
   # Logs to Loki, direct over OTLP -- no relay service in between (docs/plans/
   # otlp-logs-and-resource-identity.md's workstream B; Loki accepts OTLP logs natively as of
@@ -222,9 +248,12 @@ components:
   # Deliberately gRPC, not HTTP (docs/adr/hand-rolled-grpc-over-hyper.md) -- Tempo's `:4317`
   # receiver, to exercise the transport the rest of this config doesn't otherwise touch;
   # `endpoint` is a bare `host:port` authority for gRPC, not a URL (see
-  # `crates/logit-outputs/src/otlp.rs`'s `grpc_authority`).
+  # `crates/logit-outputs/src/otlp.rs`'s `grpc_authority`). Two sources now: `logit`'s own internal
+  # spans (`trace_windowed`) and `demo-app`'s real request spans (`app_spans`) -- both land in the
+  # same Tempo trace when their trace ids agree, which is exactly the haproxy-rooted trace every
+  # other tier's log lines already carry.
   trace_out:
     type: otlp_out
-    sources: [trace_windowed]
+    sources: [trace_windowed, app_spans]
     protocol: grpc
     endpoint: tempo:4317
