@@ -32,9 +32,13 @@ event with none of the three is legal and representable. A sink emits whatever i
 `influxdb_out` writes every metric on an event and ignores its log/span.
 
 `Resource` is `Arc`-shared rather than copied onto every event — a batch typically comes from one
-socket/file/OTLP request and shares one origin.
+socket/file/OTLP request and shares one origin. It's per-batch, not immutable, though: a transform
+or Lua script may substitute it for the batch currently in hand by minting a new `Arc`, the
+mechanism an operator uses to declare a resource identity `logit`'s own code won't invent on its
+own (`logit_pipeline::Transform::map_resource`,
+[ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md)).
 
-**`Event` is 792 bytes**, and that size is paid unconditionally — a statsd counter with three tags
+**`Event` is 800 bytes**, and that size is paid unconditionally — a statsd counter with three tags
 costs exactly as much to move as a fully-populated nginx access log, because `AttrMap`'s inline
 capacity and `MetricKind`'s inlined `DDSketch` are reserved whether or not they're used. Since an
 event is moved by value on every hop between nodes and deep-cloned once per extra fan-out consumer,
@@ -97,6 +101,13 @@ pub struct LogRecord {
     pub message: Value,
     pub severity: Option<Severity>,   // normalized syslog-style level
     pub body_format: BodyFormat,      // Raw | Json | Structured -- hints downstream parsers
+    pub trace: Option<TraceRef>,      // application trace/span this log was emitted under
+}
+
+pub struct TraceRef {
+    pub trace_id: [u8; 16],
+    pub span_id: Option<[u8; 8]>,     // OTLP: a span_id implies a trace_id, never the reverse
+    pub flags: u8,                    // W3C trace flags; bit 0 is SAMPLED
 }
 
 pub struct MetricRecord {
@@ -127,6 +138,14 @@ pub struct SpanRecord {
     pub end_timestamp: i64,
 }
 ```
+
+**`LogRecord::trace` is the application's trace context, not `logit`'s own.** `logit`'s internal
+pipeline trace context (`logit_pipeline::fanout::TraceContext`, which node-visit produced what) is
+a separate thing, propagated on `Delivered` and exposed to Lua as the `trace` global
+([pipeline-graph.md](pipeline-graph.md)'s "Trace context propagation") -- it never appears on an
+`Event`. A `TraceRef` only ever holds what a codec decoded off the wire, or what an operator's
+config or script explicitly set; `logit`'s own code never invents one. See
+[ADR `log-record-trace-context`](../adr/log-record-trace-context.md).
 
 **Metric kinds are chosen to be mergeable**, because the split-collection topology
 ([overview](../OVERVIEW.md)) means two edge nodes' aggregates may need to combine into one

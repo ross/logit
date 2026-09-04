@@ -657,8 +657,8 @@ fn frame_octet_counting(messages: &MessageBuf, out: &mut Vec<u8>) {
 
 /// The live half of a `syslog_out` sink: `Udp` binds eagerly (a bad local bind is a config error,
 /// matching `StdioOutput::open_path`'s "fail before anything starts listening" precedent); `Tcp`
-/// connects lazily inside `send`, since a not-yet-up receiver must not block `logit` from
-/// starting (`demo/compose.yaml` deliberately has no `depends_on` from `logit` to `alloy`).
+/// connects lazily inside `send`, since a not-yet-up downstream syslog receiver must not block
+/// `logit` from starting -- a compose-level `depends_on` on one would be equally wrong.
 enum Conn {
     Udp(UdpSocket),
     Tcp { stream: Option<TcpStream>, connect_timeout: Duration },
@@ -827,7 +827,8 @@ impl SyslogOutput {
     ///
     /// `endpoint` is resolved to one [`SocketAddr`] here, once per batch -- not once per
     /// message. `UdpSocket::send_to` accepts anything implementing `ToSocketAddrs`, and for a
-    /// non-numeric host (`alloy:5141`, the demo's own endpoint) tokio's `&str` impl re-resolves
+    /// non-numeric host (`relay.internal:5141`, a representative container-DNS endpoint) tokio's
+    /// `&str` impl re-resolves
     /// via DNS on *every* call if handed the raw string directly, which every UDP test here never
     /// exercises since they all pass an IP literal (tokio's `SocketAddr`-parse fast path, no DNS
     /// at all). Resolving once per `send_udp` call still re-resolves every batch rather than
@@ -1003,7 +1004,12 @@ mod tests {
         Event::log(
             ts,
             AttrMap::new(),
-            LogRecord { message: Value::str(message), severity, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str(message),
+                severity,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         )
     }
 
@@ -1079,7 +1085,12 @@ mod tests {
         let event = Event::log(
             0,
             attrs,
-            LogRecord { message: Value::str("hi"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("hi"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let mut encoder = SyslogEncoder::new(Format::Rfc3164, 16);
         let (msgs, _) = encode_with(&mut encoder, vec![event]);
@@ -1106,6 +1117,7 @@ mod tests {
                 message: Value::str("x"),
                 severity: Some(Severity::Fatal), // would otherwise map to 2
                 body_format: BodyFormat::Raw,
+                trace: None,
             },
         );
         let (msgs, _) = encode(vec![event]);
@@ -1150,6 +1162,7 @@ mod tests {
                 message: Value::str("x"),
                 severity: Some(Severity::Warn),
                 body_format: BodyFormat::Raw,
+                trace: None,
             },
         );
         let (msgs, _) = encode(vec![event]);
@@ -1163,7 +1176,12 @@ mod tests {
         let event = Event::log(
             0,
             attrs,
-            LogRecord { message: Value::str("x"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("x"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let mut encoder = SyslogEncoder::new(Format::Rfc5424, 16).with_hostname("from-config");
         let (msgs, _) = encode_with(&mut encoder, vec![event]);
@@ -1232,7 +1250,12 @@ mod tests {
         let event = Event::log(
             0,
             attrs,
-            LogRecord { message: Value::str("x"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("x"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let (msgs, _) = encode(vec![event]);
         assert!(msgs[0].contains("bad_host_"));
@@ -1245,7 +1268,12 @@ mod tests {
         let event = Event::log(
             0,
             attrs,
-            LogRecord { message: Value::str("x"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("x"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let mut encoder = SyslogEncoder::new(Format::Rfc3164, 16);
         let (msgs, _) = encode_with(&mut encoder, vec![event]);
@@ -1259,7 +1287,12 @@ mod tests {
         let event = Event::log(
             0,
             attrs,
-            LogRecord { message: Value::str("x"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("x"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let (msgs, _) = encode(vec![event]);
         let app_name = msgs[0].split(' ').nth(3).unwrap();
@@ -1276,7 +1309,12 @@ mod tests {
         let event = Event::log(
             0,
             attrs,
-            LogRecord { message: Value::str("x"), severity: None, body_format: BodyFormat::Raw },
+            LogRecord {
+                message: Value::str("x"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
         );
         let (msgs, _) = encode(vec![event]);
         assert!(msgs[0].contains(" __ "));

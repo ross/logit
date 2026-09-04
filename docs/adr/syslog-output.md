@@ -13,7 +13,7 @@ Accepted
 `syslog_in` (`crates/logit-inputs/src/syslog.rs`) can ingest RFC 3164/5424 syslog over UDP, but
 `logit` has had no way to emit it: `syslog_out` was not implemented, and was not even a declared
 `ComponentKind` (`docs/plans/demo-stack.md`'s gap table). That gap is the specific reason the
-demo stack's log leg (`demo/compose.yaml`'s `loki` and `alloy` services) has been standing up
+demo stack's log leg (`demo/compose.yaml`'s `loki` service) has been standing up
 provisioned and unfed since `docs/plans/demo-stack.md` landed — `AGENTS.md` names
 `syslog_out`/`otlp_out` as the demo's forcing function, and this ADR is the `syslog_out` half.
 

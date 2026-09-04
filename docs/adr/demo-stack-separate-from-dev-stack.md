@@ -30,7 +30,7 @@ who only wants to see Grafana light up.
 (`Dockerfile`, built with `context: ..`), not the dev container — a demo proves what a consumer
 actually gets, not what compiles inside this repo's own build environment. It has its own InfluxDB
 and Grafana service definitions (deliberately duplicated, not shared via YAML anchors or a second
-compose file layered on the first — see Alternatives), plus Loki, Tempo, and Alloy, none of which
+compose file layered on the first — see Alternatives), plus Loki and Tempo, neither of which
 the dev stack needs, and a hello-world app (`hello`) that doubles as the demo's landing page and
 its traffic source, fed by a small `logit graph`-to-SVG render chain (`graph-dot`/`graph-svg`, two
 one-shot containers) that has no dev-stack analogue at all. Root `compose.yaml`, `script/server`,

@@ -1,19 +1,24 @@
 # The demo pipeline (demo/README.md, docs/plans/demo-stack.md, docs/plans/
-# otlp-end-to-end.md). Exercises exactly what `logit` implements today -- syslog in, json +
-# kv_metrics + keep + aggregate, InfluxDB out, syslog out, OTLP/gRPC out, plus `internal` observing
-# the pipeline itself (ADR `internal-telemetry-as-pipeline-events`, ADR `internal-span-emission-and-deterministic-sampling`) -- against the traffic `demo/compose.yaml`'s `hello`
-# service emits (real visits plus a background synthetic loop). All three signals -- logs, metrics,
-# traces -- now leave `logit` for a real backend: Loki, InfluxDB, and Tempo respectively.
+# otlp-end-to-end.md, docs/plans/otlp-logs-and-resource-identity.md). Exercises exactly what
+# `logit` implements today -- syslog in, set + json + kv_metrics + keep + aggregate, InfluxDB out,
+# OTLP/HTTP out, OTLP/gRPC out, plus `internal` observing the pipeline itself (ADR
+# `internal-telemetry-as-pipeline-events`, ADR `internal-span-emission-and-deterministic-sampling`)
+# -- against the traffic `demo/compose.yaml`'s `hello` service emits (real visits plus a background
+# synthetic loop). All three signals -- logs, metrics, traces -- now leave `logit` for a real
+# backend: Loki, InfluxDB, and Tempo respectively.
 #
 # Topology:
 #
 #   hello --syslog/UDP--> access_in (syslog_in)
 #                               |
 #                               v
+#                       access_identity (set)     <- stamps a real service.name/service.namespace
+#                               |                     on the batch's resource (ADR
+#                               v                     operator-declared-resource-attributes)
 #                          access_json (json)     <- merges the JSON body into attributes
 #                             /  |  \
 #                            v   v   v
-#              tap (stdio_out)  |    log_out (syslog_out) --> alloy --> Loki
+#              tap (stdio_out)  |    log_out (otlp_out, HTTP) --> Loki
 #                                |
 #                                v
 #                       access_metrics (kv_metrics) <- adds metrics to the event
@@ -32,29 +37,42 @@ components:
     type: syslog_in
     bind: 0.0.0.0:5140
 
+  # `syslog_in` mustn't invent a resource identity for data it didn't produce
+  # (docs/design/internal-telemetry.md's "Resource identity" section) -- `set` is the operator
+  # declaring one instead (ADR `operator-declared-resource-attributes`). `service.name` matches
+  # the value already present in the traffic's own `syslog.hostname` attribute; without this,
+  # `log_out`'s OTLP export below would land in Loki as `{service_name="unknown_service"}`, with
+  # no usable stream label at all.
+  access_identity:
+    type: set
+    sources: [access_in]
+    resource:
+      service.name: demo-hello
+      service.namespace: demo
+
   access_json:
     type: json
-    sources: [access_in]
+    sources: [access_identity]
 
   # `docker compose logs -f logit` -- the fastest way to see the pipeline doing something.
   tap:
     type: stdio_out
     sources: [access_json]
 
-  # Logs to Loki, via the `alloy` service's syslog listener (demo/alloy/config.alloy). Sources
-  # `access_json`, so the message is the raw JSON body -- exactly what the dashboard's `| json`
-  # LogQL panels parse. RFC 5424, not 3164: 3164 carries no year and no timezone, so a receiver
-  # has to guess both (docs/adr/syslog-output.md). `facility`/`hostname`/`app_name` are all
-  # left at their defaults on purpose -- the demo's traffic already carries `syslog.facility`,
-  # `syslog.hostname` (`demo-hello`), and `syslog.tag` (`demoapp`) from `access_in`'s own
-  # `syslog_in` decode, and `syslog_out` round-trips those attributes onto every relayed message,
-  # which is what gives Loki real `host`/`app` stream labels from the first line.
+  # Logs to Loki, direct over OTLP -- no relay service in between (docs/plans/
+  # otlp-logs-and-resource-identity.md's workstream B; Loki accepts OTLP logs natively as of
+  # 3.7.7, the version this stack pins). Sources `access_json`, so the message is still the raw
+  # JSON body -- exactly what the dashboard's `| json` LogQL panels parse. `protocol: http`, not
+  # `grpc` like `trace_out` below -- Loki's OTLP ingestion is HTTP-only. `endpoint` is a URL base
+  # for HTTP (unlike gRPC's bare authority): `http://loki:3100/otlp` resolves to exactly
+  # `/otlp/v1/logs` (`crates/logit-proto/src/lib.rs`'s hardcoded per-signal path). Loki's default
+  # index-label set already includes `service.name`/`service.namespace` -- what `access_identity`
+  # stamps above -- so no `demo/loki/loki.yaml` change is needed for real stream labels.
   log_out:
-    type: syslog_out
+    type: otlp_out
     sources: [access_json]
-    endpoint: alloy:5141
-    transport: udp
-    format: rfc5424
+    protocol: http
+    endpoint: http://loki:3100/otlp
 
   access_metrics:
     type: kv_metrics

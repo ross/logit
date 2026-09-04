@@ -402,6 +402,18 @@ Worked examples, one per shipped component:
   suppressing before events reach it. No `Diagnostics` on either (pure attribute filtering has
   nothing to warn about), so `Telemetry` is attached directly rather than through the
   `Diagnostics` bridge.
+- `set` (`crates/logit-transforms/src/set.rs`): `logit.transform.set.resource.rebuilt` (count) —
+  fires only on a `map_resource` cache miss (a batch whose incoming resource `Arc` isn't the one
+  cached from the last call), so a config that defeats the one-entry cache (a listener minting a
+  fresh `Arc` per batch, `otlp_in` chief among them) is visible as a rate rather than invisible.
+  Absent entirely when `set` has no `resource:` configured (`map_resource` returns before touching
+  telemetry) — see [ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md).
+- `trace_context` (`crates/logit-transforms/src/trace_context.rs`): `logit.transform.trace_context.lifted`
+  (count) on a successful lift; `.skipped{reason="missing"|"invalid"}` otherwise — `missing` when
+  the configured `trace_id` attribute isn't present at all, `invalid` when it (or a configured
+  `span_id`/`flags`) is present but doesn't parse. The `kv_metrics` `.derived`/`.derived.skipped`
+  pattern, applied to lifting a trace context instead of deriving a metric — see
+  [ADR `log-record-trace-context`](../adr/log-record-trace-context.md).
 - `has_signal`/`keep_signals`/`drop_signals` (`crates/logit-transforms/src/signals.rs`):
   `logit.transform.events.filtered` (count — an event dropped, by any of the three) and
   `logit.transform.payloads.stripped{signal}` (count — `keep_signals`/`drop_signals` only, one
