@@ -15,7 +15,7 @@
       "type": "timeseries",
       "title": "web.requests (nginx)",
       "description": "Requests reaching the nginx tier -- real visits plus a background synthetic loop -- by status code, proving syslog_in -> json -> scale -> kv_metrics -> keep -> aggregate end to end. Filtered on service.name so this and the haproxy panel beside it don't double-count the shared web.requests measurement.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "targets": [
         {
@@ -30,7 +30,7 @@
       "type": "timeseries",
       "title": "web.requests (haproxy)",
       "description": "The same web.requests measurement as the nginx panel beside it, filtered to HAProxy's own service.name tag instead -- haproxy_metrics (demo/logit.yaml) is the front door's own request count, upstream of nginx's.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "targets": [
         {
@@ -45,7 +45,7 @@
       "type": "timeseries",
       "title": "web.request_time (nginx, p50 / p99)",
       "description": "Milliseconds, not seconds -- nginx_scale (demo/logit.yaml) converts nginx's own $request_time before nginx_metrics ever reads it, so this shares a unit and a measurement with haproxy's panel beside it.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
       "targets": [
@@ -61,7 +61,7 @@
       "type": "timeseries",
       "title": "web.request_time (haproxy, p50 / p99)",
       "description": "HAProxy's %Tr is native milliseconds, so haproxy_metrics needs no scale step -- unlike nginx's panel beside it, this reads request_time_ms directly.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
       "targets": [
