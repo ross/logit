@@ -56,11 +56,18 @@ already-split `otelTraceID`/`otelSpanID` straight off the request span
 [`traffic`](compose.yaml) is the demo's traffic source, driving a low-volume request loop through
 the whole chain.
 
-Each tier logs its own RFC 3164 + JSON-body access line to its own `syslog_in` listener in
-[`logit.yaml`](logit.yaml) — one listener per tier (`haproxy_in`/`nginx_in`/`app_in` on
-5140/5141/5142), because `set`'s `resource:` block stamps identity onto a whole *batch*, and three
-tiers sharing one listener would interleave into one batch with one wrong `service.name`. Each
-tier's chain is `set` (`../docs/adr/operator-declared-resource-attributes.md`) → `json` →
+Each tier logs its own JSON-body access line to its own listener in [`logit.yaml`](logit.yaml) —
+one listener per tier, because `set`'s `resource:` block stamps identity onto a whole *batch*, and
+three tiers sharing one listener would interleave into one batch with one wrong `service.name`.
+`haproxy`/`app` still ship theirs as RFC 3164 to a `syslog_in` (`haproxy_in`/`app_in`, 5140/5142);
+`nginx` logs to stdout only, and `nginx_in` is a `docker_in` tailing its container's own Docker
+json-file log directly off the host instead
+(`../docs/adr/file-tailing-and-docker-json-logs.md` — this demo is that ADR's end-to-end proof).
+Its container's `error_log` shares the same json-file log, told apart only by `log.iostream`; an
+inline `lua` stage, `nginx_stdout`, drops anything that isn't `stdout` before it reaches
+`nginx_identity` (`../docs/adr/file-tailing-and-docker-json-logs.md`'s "Alternatives considered"
+covers why a Lua stage rather than a `docker_in` config field). Each tier's chain is then `set`
+(`../docs/adr/operator-declared-resource-attributes.md`) → `json` →
 `trace_context` (`../docs/adr/log-record-trace-context.md`), which lifts the trace context onto
 `LogRecord.trace` — parsing the `traceparent` header natively, and the well-known `trace.id`/
 `span.id`/`trace.flags` attributes each access line also carries
@@ -84,6 +91,16 @@ OTLP/gRPC into Tempo, one span per node-visit at `span_sample_rate: 1.0` so noth
 `../docs/adr/hand-rolled-grpc-over-hyper.md`) — alongside haproxy's and nginx's own access-line
 spans, sharing that same `tempo_out`.
 
+**The `logit` service runs as root, and reading `nginx`'s log this way only works on native Linux
+Docker Engine.** Docker's per-container state directories are `root:root 0710` and the log files
+`root:root 0640` on a stock install, so `docker_in` needs both root and a read-only bind mount of
+`/var/lib/docker/containers` (`demo/compose.yaml`'s `logit` service) — real cost specific to
+reading the json-file driver directly rather than the docker socket/API (see the ADR's "Root
+privileges" section), paid by this one service alone. Rootless Docker uses
+`~/.local/share/docker/containers` and Docker Desktop's paths live inside its VM, neither matching
+the default `root:` this demo doesn't override; `docker compose down -v` wipes `nginx_in`'s
+checkpoint (the new `logit_state` volume) along with everything else this stack persists.
+
 `app` also has its own real OpenTelemetry request span — but, deliberately, it never goes through
 `logit` at all: it's exported over OTLP/HTTP protobuf straight to Tempo's own OTLP receiver
 (`demo/tempo/tempo.yaml`'s `otlp.protocols.http`, :4318), wired up in
@@ -102,7 +119,11 @@ touch `logit` at all** — that's what the shipped Grafana dashboard shows, side
 own internal spans, one to this demo's own request traces), all over the same pipeline. Each
 tier's `set` (or, for `app`'s spans, its own OTel resource) stamps a real
 `service.name`/`service.namespace` (`haproxy`/`nginx`/`demo-app`, all under `demo`) so Loki gets
-real stream labels with no extra `loki.yaml` config, and Loki's `derivedFields` (both in
+real stream labels with no extra `loki.yaml` config -- `nginx`'s own resource additionally carries
+`container.id`/`container.name`/`container.image.name`/`container.image.tag` from `docker_in`
+itself, surviving `nginx_identity`'s `set` untouched (`set`'s `map_resource` overlays onto the
+resource it's handed, rather than replacing it), visible as Loki structured metadata on that
+tier's log lines -- and Loki's `derivedFields` (both in
 `grafana/provisioning/datasources/datasources.yaml`) click straight through to the matching Tempo
 trace — which contains four real spans (haproxy, nginx, and app's, plus `logit`'s own internal
 ones for that request if sampled), arrived at via two different Tempo receivers, not `logit`'s
@@ -130,7 +151,10 @@ request, nothing is cached.)
 **`otlp_in`** (`crates/logit-inputs/src/otlp.rs`) still ships implemented and tested with nothing
 in this stack sending *to* it — `app`'s spans go straight to Tempo instead, by design (see
 "What's actually flowing" above), so this isn't an oversight to close so much as a deliberate
-choice about where `logit` belongs in the pipeline. If you want to see `otlp_in` exercised with
+choice about where `logit` belongs in the pipeline. **`tail_in`** (plain file tailing, the driver
+`docker_in` builds on) ships tested but unexercised here too — nothing in this stack tails a plain
+file directly; only `docker_in`, its Docker-specific sibling, gets a live workout. If you want to
+see `otlp_in` exercised with
 real traffic, point `app`'s `OTEL_EXPORTER_OTLP_ENDPOINT` (`demo/compose.yaml`) at `http://logit:4318`
 instead of `http://tempo:4318`, and re-add a `tempo_out` source for it in `demo/logit.yaml` — that
 was this demo's shape until this rework; it's a small, well-understood change to reverse.
@@ -145,5 +169,5 @@ OTLP/JSON, which it doesn't today ([docs/known-gaps.md](../docs/known-gaps.md)).
 
 ```sh
 docker compose down        # stop, keep data
-docker compose down -v     # stop, wipe all volumes (InfluxDB/Grafana/Loki/Tempo/graph state)
+docker compose down -v     # stop, wipe all volumes (InfluxDB/Grafana/Loki/Tempo/graph/logit state)
 ```

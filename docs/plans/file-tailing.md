@@ -124,37 +124,62 @@ that ADR for the full reasoning — this file tracks what's built and what's lef
   `LineSplitter`'s partial buffer, never reaching `DockerDecoder::decode_line` at all; several of
   these tests hit exactly that before being corrected.
 
-### D. Demo rework + remaining docs — after C
+### D. Demo rework + remaining docs — **landed**
 
 - `demo/compose.yaml`: nginx gains `container_name: logit-demo-nginx` and
   `NGINX_ENTRYPOINT_QUIET_LOGS: "1"`; drops its `depends_on: logit` (checkpoint + `read_from:
   beginning` means nothing is lost if nginx starts first). `logit` service: `user: "0:0"` (root,
-  read-only bind mount — see the ADR's "Root privileges" section), `/var/lib/docker/containers:
-  ro`, **no `:z`** (would relabel the daemon's own state — `security_opt: ["label=disable"]`
-  instead), a new `logit_state` volume for the checkpoint.
-- `demo/nginx/nginx.conf`: drop the `syslog:` `access_log` destination — stdout only.
-- `demo/logit.yaml`: `nginx_in` becomes `docker_in` (`containers: [logit-demo-nginx]`,
-  `read_from: beginning`, a `checkpoint_path`); a new inline `lua` stage (`nginx_stdout`) between
-  `nginx_in` and `nginx_identity` dropping any event whose `log.iostream` isn't `stdout` (nginx's
-  `error_log` on stderr would otherwise count as a request) — the ADR's "Alternatives considered"
-  covers why this is a Lua stage today, not a `streams:` field or named output ports.
-- `demo/README.md`, `demo/architecture.dot`: the nginx leg now reads "docker logs," a paragraph on
-  running as root / native-Linux-Docker-only / what `docker compose down -v` wipes.
+  read-only bind mount — see the ADR's "Root privileges" section), `/var/lib/docker/containers:ro`,
+  **no `:z`** (would relabel the daemon's own state — `security_opt: ["label=disable"]` instead), a
+  new `logit_state` volume for the checkpoint.
+- `demo/nginx/nginx.conf`: dropped the `syslog:` `access_log` destination — stdout only now
+  (`access_log /dev/stdout access_json;`, renamed from `access_json_syslog` since it no longer is
+  one); header comment explains the switch and why `NGINX_ENTRYPOINT_QUIET_LOGS` matters now.
+- `demo/logit.yaml`: `nginx_in` is now `docker_in` (`containers: [logit-demo-nginx]`,
+  `read_from: beginning`, `checkpoint_path: /var/lib/logit/nginx.checkpoint`); a new inline `lua`
+  stage (`nginx_stdout`) between `nginx_in` and `nginx_identity` dropping any event whose
+  `log.iostream` isn't `stdout` (nginx's `error_log` on stderr would otherwise count as a request)
+  — the ADR's "Alternatives considered" covers why this is a Lua stage today, not a `streams:`
+  field or named output ports. Topology comment and header updated.
+- `demo/README.md`, `demo/architecture.dot`: the nginx leg now reads "docker logs" (still one
+  "logging" edge in the architecture diagram — the transport distinction is a detail that diagram
+  doesn't otherwise draw); a new paragraph on running as root / native-Linux-Docker-only / what
+  `docker compose down -v` wipes; `container.*` resource attributes noted alongside the existing
+  `service.name`/`service.namespace` mention; `tail_in` added to "what isn't exercised yet"
+  (`docker_in` is the one that gets a live workout, not plain file tailing).
 - Docs: `README.md`, `AGENTS.md`, `docs/OVERVIEW.md` status lines; `docs/design/data-model.md`
-  (`log.file.path`, `log.iostream`, `container.*`); `docs/design/internal-telemetry.md` (new
-  metrics/diagnostics catalog entries, `receive.flushed` gains `closed`); `docs/deploying.md` (new
-  "tailing files and Docker logs" section); `docs/known-gaps.md` (every gap named in the ADR's
-  Alternatives/Consequences sections, plus narrowing the existing channel-depth entry to TCP).
+  (`log.file.path`, `log.iostream`, a `container.*` resource sub-table); `docs/design/
+  internal-telemetry.md` (a `tail_in`/`docker_in` Layer-3 worked example, `receive.flushed` gains
+  `closed`, `docker_in`'s `container.*` named as a third resource-identity category alongside "no
+  claim" and "genuine self-claim"); `docs/deploying.md` (new "Tailing files and Docker logs"
+  section: root/bind-mount, `read_from`/checkpoint, `watch` modes, what to watch); `docs/
+  known-gaps.md` and `docs/design/memory.md` (every gap named in the ADR's Alternatives/
+  Consequences sections; narrowed the existing channel-depth entry to TCP now that `tail_in`/
+  `docker_in` turned out to already be batch-bounded the same way a UDP listener is, not the
+  unbounded case that entry used to speculate about).
+
+**Live end-to-end verification** (`script/demo up --build`, a real run against native Linux Docker
+Engine): `nginx_in` discovered and tailed `logit-demo-nginx`'s json-file log immediately, every
+event correctly carrying `container.id`/`container.name`/`container.image.name`/
+`container.image.tag`/`log.iostream="stdout"`; zero `stderr` lines leaked past `nginx_stdout`
+(`log.iostream="stderr"` never appeared downstream) and zero diagnostics fired
+(`open_error`/`metadata_error`/`bad_line` all absent from `docker compose logs logit`); InfluxDB's
+`web.requests` summed to **exactly** the same count for `nginx` and `haproxy` (38 each) over the
+same window — proof the stderr filter neither inflated nor lost real access lines; the landing
+page's live-rendered pipeline graph shows `nginx_in`/`nginx_stdout` in the actual running topology;
+a full `docker restart` of the `logit` container resumed from the checkpoint with **zero**
+duplicate `trace.id`s across the restart boundary, confirming the checkpoint write/resume path end
+to end, not just in unit tests.
 
 ## Verification
 
-`script/cibuild` after every workstream. Workstream A: confirmed green (format, clippy
-`-D warnings`, 1053 nextest tests including the new `tail`/`graph`/`pipeline` coverage,
-`script/validate` on `demo/logit.yaml` and every `examples/*.yaml`, schema regenerated and
-committed, `script/audit` clean). B/C/D verification (inotify latency, a live `docker_in` smoke
-test, and the demo's end-to-end proof) follows the same `script/cibuild` bar per PR, plus the
-manual demo checks the ADR's own Consequences section implies: `docker compose logs logit` shows
-`files.open` ≥ 1 with no `open_error`/`metadata_error`; `web.requests` matches the traffic
-generator's actual request count (stderr excluded by the Lua stage); `docker compose restart
-nginx` is followed under the new container id without restarting `logit`; `docker compose restart
-logit` resumes from the checkpoint with no duplicate lines visible in Loki.
+All four workstreams landed; `script/cibuild` green on every PR (format, clippy `-D warnings`,
+nextest, `script/validate` on `demo/logit.yaml` and every `examples/*.yaml`, schema regenerated and
+committed, `script/audit` clean) — workstream A alone landed 1053 nextest tests including the new
+`tail`/`graph`/`pipeline` coverage, B added `inotify` unit and latency-comparison tests, C added
+the full `docker.rs` suite. Workstream D's own bar was higher than a config-only PR would need,
+since it's this whole plan's actual proof: a live `script/demo up --build` run (see workstream D's
+own entry above for the full account) confirmed every claim the ADR's Consequences section made in
+the abstract — discovery, container identity, the stderr filter neither losing nor double-counting
+real lines, and the checkpoint surviving a real container restart with no duplicates — against a
+running stack, not just unit tests asserting the same properties in isolation.

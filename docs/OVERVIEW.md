@@ -27,7 +27,10 @@ edges.
 
 - **Ingest:** UDP/TCP listeners for statsd and DogStatsD-style tagged metrics, collectd, syslog
   (RFC 3164/5424), OTLP (logs/metrics/traces). File tailing for logs (rotation- and
-  checkpoint-aware). More protocols added incrementally behind the same input trait.
+  checkpoint-aware, `tail_in`), including Docker's json-file container logs enriched with
+  per-container identity (`docker_in`, no docker socket,
+  [ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)). More
+  protocols added incrementally behind the same input trait.
 - **Transform:** built-in parsers for common line shapes (JSON, logfmt, key=value, CSV, regex/grok),
   chainable in front of user logic. User logic is Lua, loaded inline from YAML or from referenced
   `.lua` files, run per pipeline stage. A built-in stateful aggregation processor for metrics

@@ -45,7 +45,14 @@ metrics, and traces, both OTLP/HTTP and a hand-rolled OTLP/gRPC transport,
 [ADR `committed-pregenerated-otlp-protobuf`](docs/adr/committed-pregenerated-otlp-protobuf.md)/
 [ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md)) are real, implemented `ComponentKind`s —
 `otlp_out` is live in `demo/logit.yaml`'s both `log_out` (HTTP, straight to Loki) and `trace_out`
-(gRPC, to Tempo); `otlp_in` ships tested but unexercised by the demo. Config is a flat graph of named components (ADR `component-graph-configuration`,
+(gRPC, to Tempo); `otlp_in` ships tested but unexercised by the demo. `tail_in`/`docker_in`
+(`crates/logit-inputs/src/tail/`, `crates/logit-inputs/src/docker.rs` -- rotation- and
+checkpoint-aware file tailing, plus Docker json-file container logs enriched from a sibling
+`config.v2.json`, no docker socket,
+[ADR `file-tailing-and-docker-json-logs`](docs/adr/file-tailing-and-docker-json-logs.md)) are also
+real, implemented `ComponentKind`s; `docker_in` is live in `demo/logit.yaml`'s `nginx_in`, tailing
+that tier's container directly instead of receiving a `syslog:` stream -- `tail_in` itself ships
+tested but unexercised by the demo, same status as `otlp_in`. Config is a flat graph of named components (ADR `component-graph-configuration`,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively
@@ -203,7 +210,7 @@ crates/
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
-  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, internal (self-telemetry)
+  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, syslog
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`

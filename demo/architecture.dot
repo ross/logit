@@ -50,7 +50,12 @@ digraph architecture {
   nginx   -> app     [label="web"];
   client  -> grafana [label="web"];
 
-  // -- Logging: every tier's access log, over syslog into `logit` -------------------------
+  // -- Logging: every tier's access log reaches `logit` ------------------------------------
+  // haproxy's and app's over syslog; nginx's by `logit` tailing its container's own Docker
+  // json-file log directly off the host instead (docs/adr/file-tailing-and-docker-json-logs.md)
+  // -- this demo is that ADR's end-to-end proof. Still one "logging" edge either way: the
+  // distinction is a transport detail this architecture-level diagram doesn't otherwise draw
+  // (demo/logit.yaml's own topology comment has the tailing-specific detail).
   haproxy -> logit [label="logging"];
   nginx   -> logit [label="logging"];
   app     -> logit [label="logging"];
@@ -58,12 +63,12 @@ digraph architecture {
 
   // -- Tracing: two independent paths into Tempo -------------------------------------------
   // `logit`'s own internal spans travel this edge, and so do haproxy's/nginx's real access-line
-  // spans (docs/adr/trace-context-span-lifting.md's `span:` block, derived from the same
-  // syslog-carried log line the "logging" edges above already show -- one wire, two signals, no
-  // new edge needed here). `app`'s real request spans go straight to Tempo's own OTLP receiver
-  // instead, deliberately bypassing `logit` (docs/plans/demo-tracing-stack.md's "Decisions
-  // already settled") -- not every telemetry leg needs `logit` in front of it, and this diagram
-  // shows that honestly rather than drawing an edge through `logit` that doesn't exist.
+  // spans (docs/adr/trace-context-span-lifting.md's `span:` block, derived from the same log
+  // line the "logging" edges above already show -- one wire, two signals, no new edge needed
+  // here). `app`'s real request spans go straight to Tempo's own OTLP receiver instead,
+  // deliberately bypassing `logit` (docs/plans/demo-tracing-stack.md's "Decisions already
+  // settled") -- not every telemetry leg needs `logit` in front of it, and this diagram shows
+  // that honestly rather than drawing an edge through `logit` that doesn't exist.
   logit -> tempo [label="tracing"];
   app   -> tempo [label="tracing"];
 
