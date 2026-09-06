@@ -399,11 +399,12 @@ Worked examples, one per shipped component:
   `.watch.overflows` (count — which wake source actually fired, and the `inotify` queue overflowing
   into a full rescan). `Diagnostics` keys: `bad_line`/`long_line`/`invalid_utf8` (a line that
   wouldn't decode, exceeded `max_line_bytes`, or needed a lossy UTF-8 conversion),
-  `open_error`/`read_error` (a file this driver is trying to track), `checkpoint_error` (loading or
-  writing the checkpoint file itself), `watch_error` (`auto` falling back to polling, or a
-  directory watch that failed), and, `docker_in` only, `metadata_error` (`config.v2.json` missing
-  or unparseable — degrades to a `container.id`-only resource rather than refusing to tail) and
-  `bad_time` (the envelope's own `time` field didn't parse — falls back to read time).
+  `open_error`/`read_error` (a file this driver is trying to track), `renamed` (a same-inode
+  rebind following a rename), `checkpoint_error` (loading or writing the checkpoint file itself),
+  `watch_error` (`auto` falling back to polling, or a directory watch that failed), and, `docker_in`
+  only, `metadata_error` (`config.v2.json` missing or unparseable — degrades to a `container.id`-
+  only resource rather than refusing to tail) and `bad_time` (the envelope's own `time` field
+  didn't parse — falls back to read time).
 - `aggregate` (`crates/logit-transforms/src/aggregate.rs`): `logit.transform.series.active` and
   `logit.transform.resource.groups`, sampled at the top of `flush` before it touches its own state
   — the peak-of-window series count, which is the visible signal for the cardinality blow-up
