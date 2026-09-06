@@ -69,10 +69,15 @@ field is rejected by name, not silently ignored.
 `inotify`, falls back to `poll` on any setup failure (e.g. an exhausted
 `fs.inotify.max_user_instances`) with a `watch_error` diagnostic; `inotify` is a hard startup error
 on the same failure, or on a non-Linux build, for an operator who wants to know immediately if the
-low-latency path stopped working rather than silently degrading. **This record lands only the
-`poll` variant** — `Watcher::new` accepts every `WatchMode` today and always resolves to `Poll`;
-the hand-rolled `inotify` backend (via `libc` + `tokio::io::unix::AsyncFd`) is a follow-up change
-tracked in this file's own workstream, not a different design.
+low-latency path stopped working rather than silently degrading. The hand-rolled `inotify` backend
+(via `libc` + `tokio::io::unix::AsyncFd`, confined to `tail/watch.rs`'s own `inotify` submodule)
+watches whole directories, not individual files — matching `PathPattern`'s own "scan a directory,
+match names within it" shape — and only ever triggers the same full `scan` the poll tick already
+performs, for either a specific change or an `IN_Q_OVERFLOW`. **Note this only speeds up
+*discovery*** (a new file, a rotation, a truncation) — reading more bytes off an already-tracked
+file is never gated by `poll_interval`/`inotify` at all, since the driver's own read loop
+(`Tailer::drain`) runs after every loop iteration regardless of what woke it, and an already-open
+file handle simply sees new bytes on its next `read()`.
 
 ### Rotation and truncation: identity by `(dev, ino)`
 

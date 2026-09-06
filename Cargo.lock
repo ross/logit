@@ -842,6 +842,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "logit-core",
  "logit-pipeline",
  "logit-proto",

@@ -36,6 +36,11 @@ rustls.workspace = true
 rustls-pki-types.workspace = true
 tokio-rustls.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# tail_in/docker_in's inotify wake source (docs/adr/file-tailing-and-docker-json-logs.md) --
+# already present transitively at this exact version (see the workspace Cargo.toml comment).
+libc.workspace = true
+
 [dev-dependencies]
 # Test-only: the end-to-end statsd -> aggregate integration test
 # (tests/statsd_to_aggregate.rs) needs a real `Aggregator` to prove a decoded `GaugeDelta`

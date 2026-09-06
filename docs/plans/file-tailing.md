@@ -56,22 +56,39 @@ that ADR for the full reasoning — this file tracks what's built and what's lef
 - `script/cibuild` green (format, clippy `-D warnings`, nextest, `script/validate`, schema drift,
   audit).
 
-### B. `inotify` wake source — next
+### B. `inotify` wake source — **landed**
 
 - `crates/logit-inputs/src/tail/watch.rs` grows a `#[cfg(target_os = "linux")]` `inotify` backend
   (hand-rolled via `libc` + `tokio::io::unix::AsyncFd` — no `notify` crate, license-blocked by
   `deny.toml`) implementing the `Wake::Changed`/`Wake::Overflow` variants `driver.rs` already
-  matches on today. `Auto` tries it, falls back to `Poll` (diagnosed `watch_error`) on setup
-  failure; `Inotify` fails startup instead of falling back; non-Linux `Inotify` is a startup error.
-- `Tailer` watches every pattern's parent directory (`docker_in`: the root plus each container
-  directory as it appears); a `Wake::Changed` for a matching name triggers an immediate `scan`
-  rather than waiting for the next `poll_interval` tick, which stays on as reconciliation.
-- Cargo: `libc.workspace = true` under `[target.'cfg(target_os = "linux")'.dependencies]`; confirm
-  `script/audit` stays clean.
-- Tests: `inotify` event parsing (`IN_CREATE`/`IN_MODIFY`/`IN_MOVED_TO`/`IN_MOVED_FROM`/
-  `IN_DELETE`/`IN_DELETE_SELF`/`IN_CLOSE_WRITE`, `IN_Q_OVERFLOW`), a real wake on a child file
-  write, latency comparison against `Poll` at a large `poll_interval`, `Auto`'s fallback when
-  `inotify_init1` fails, and an overflow forcing a full rescan.
+  matched on since workstream A. `Auto` tries it, falls back to `Poll` (diagnosed `watch_error`) on
+  setup failure; `Inotify` fails startup instead of falling back; non-Linux `Inotify` is a startup
+  error (via an uninhabited `PlatformInotify` stand-in on non-Linux builds, so the same `Watcher`
+  code compiles everywhere without a parallel non-Linux implementation).
+- Watches whole directories (matching `PathPattern`'s own "scan a directory, match names" shape),
+  not individual files: `IN_MODIFY | IN_CREATE | IN_MOVED_TO | IN_MOVED_FROM | IN_DELETE |
+  IN_DELETE_SELF | IN_CLOSE_WRITE`. `Tailer` watches every pattern's parent directory (already
+  wired in workstream A); any `Wake` — `Changed` or `Overflow` — triggers the same `scan(false)`
+  the poll tick already used, so a burst of events or an `IN_Q_OVERFLOW` both just cause one full
+  rescan rather than needing per-event bookkeeping.
+- **Finding during implementation:** `poll_interval`/`inotify` only govern *discovering* a path
+  (a new file, a rotation, a truncation) via `scan` — reading more bytes off an *already-tracked*
+  file is not gated by either at all, since `drain`'s round-robin read runs after every loop
+  iteration regardless of what woke it (an open file handle just sees new bytes on its next
+  `read()`). The latency-comparison tests were designed around new-file discovery accordingly, not
+  around appending to an already-open file — an earlier draft of
+  `under_poll_a_write_is_delivered_only_after_the_poll_interval` assumed the latter and failed for
+  exactly this reason before being corrected.
+- Cargo: `libc.workspace = true` (workspace `Cargo.toml`, already pinned at `0.2.189` — matches
+  the transitive version, confirmed via `script/audit`) under
+  `crates/logit-inputs/Cargo.toml`'s `[target.'cfg(target_os = "linux")'.dependencies]`.
+- Tests: `inotify` event parsing (`IN_CREATE`/`IN_MODIFY`, `IN_Q_OVERFLOW`, an unknown watch
+  descriptor ignored, a nameless `IN_DELETE_SELF` reported as the directory itself), a real wake on
+  a child file write (against a live `inotify` fd in the dev container), `Watcher`-level coverage
+  of `Poll`/`Auto`-success/`Auto`-fallback/`Inotify`-hard-failure (via an injectable-constructor
+  test seam, not a real exhausted OS limit), and driver-level latency comparisons: a new file
+  discovered well within seconds under `inotify` against a 30s `poll_interval`, versus only after a
+  300ms `poll_interval` tick under `poll`.
 
 ### C. `docker_in` — after B
 

@@ -134,7 +134,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             self.resume = resume;
         }
 
-        let mut watcher = match super::watch::Watcher::new(self.config.watch) {
+        let mut watcher = match super::watch::Watcher::new(self.config.watch, &mut self.diag) {
             Ok(w) => w,
             Err(err) => {
                 self.diag.warn_throttled("watch_error", err);
@@ -1172,6 +1172,75 @@ mod tests {
             "quick.log's line should arrive well before busy.log fully drains, not after \
              (saw {seen_before_quick} busy events first)"
         );
+
+        shutdown(shutdown_tx, handle).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole point of workstream B: `inotify` discovers a *new* file well before the next
+    /// `poll_interval` tick would ever fire -- `poll_interval` here (30s) is set far longer than
+    /// this test's own timeout, so a discovery at all proves it came from the wake source, not
+    /// from polling. (Reading more bytes appended to an *already-tracked* file isn't gated by
+    /// either `poll_interval` or the watch mode at all -- `drain`'s round-robin read runs after
+    /// every loop iteration regardless of what woke it, since an already-open file handle simply
+    /// sees new bytes on its next `read()`. `poll_interval`/`inotify` only govern *discovering*
+    /// a path -- new files, rotation, truncation -- which is what these two tests exercise.)
+    #[tokio::test]
+    async fn under_inotify_a_new_file_is_discovered_well_before_the_poll_interval() {
+        let dir = scratch_dir("inotify-latency");
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let mut config = fast_config(ReadFrom::End);
+        config.watch = WatchMode::Inotify;
+        config.poll_interval = Duration::from_secs(30);
+        let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config);
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+        // Give the initial scan a moment to run (and start watching `dir`) before the file
+        // appears.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        std::fs::write(dir.join("app.log"), b"woke\n").unwrap();
+
+        let events =
+            tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1)).await.expect(
+                "inotify should discover the new file well within 3s, nowhere near the 30s \
+                 poll_interval",
+            );
+        assert_eq!(messages(&events), vec!["woke"]);
+
+        shutdown(shutdown_tx, handle).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The mirror image: under `poll` (never `auto`/`inotify`), the same new file is only ever
+    /// discovered on the next `poll_interval` tick -- nothing wakes the driver early. The default
+    /// `flush_interval` (15ms) stays on: it can only ever *deliver* what `scan` has already
+    /// discovered (`Outcome::Flush` never calls `scan` itself), so it can't make this test pass
+    /// by accident -- it's what lets the discovered line actually reach `rx` promptly once the
+    /// poll tick does fire, the same as any other test in this module.
+    #[tokio::test]
+    async fn under_poll_a_new_file_is_discovered_only_after_the_poll_interval() {
+        let dir = scratch_dir("poll-latency");
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let mut config = fast_config(ReadFrom::End);
+        config.watch = WatchMode::Poll;
+        config.poll_interval = Duration::from_millis(300);
+        let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config);
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        std::fs::write(dir.join("app.log"), b"woke\n").unwrap();
+
+        // Nothing should arrive well before the poll tick.
+        let too_soon = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await;
+        assert!(
+            too_soon.is_err(),
+            "poll mode must not discover a new file before its own poll_interval tick"
+        );
+
+        let events = expect_events(&mut rx, 1).await;
+        assert_eq!(messages(&events), vec!["woke"]);
 
         shutdown(shutdown_tx, handle).await;
         std::fs::remove_dir_all(&dir).ok();
