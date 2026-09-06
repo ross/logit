@@ -3,7 +3,10 @@
 //! written on an interval and only when dirty (never per line), so a crash between two writes
 //! can replay up to `checkpoint_interval` worth of already-emitted lines on restart -- accepted
 //! at-least-once behavior, not a bug, the same trade-off `buffer:`'s sink-side retry already
-//! makes on the delivery side of this same pipeline.
+//! makes on the delivery side of this same pipeline. A checkpoint write is always preceded by a
+//! flush of every accumulator, and never covers bytes still held as an incomplete line
+//! (`Tailer::write_checkpoint` subtracts `LineSplitter::pending_bytes()`), so the replay window
+//! this accepts is strictly "already-emitted lines re-emitted" -- never "read lines lost".
 
 use logit_core::{Diagnostics, Telemetry};
 use serde::{Deserialize, Serialize};

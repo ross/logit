@@ -136,6 +136,14 @@ impl LineSplitter {
         }
         Some(strip_cr(self.partial.split().freeze()))
     }
+
+    /// How many bytes of the file this splitter has consumed but not yet turned into a complete
+    /// line -- read (and therefore already counted in the tailer's own offset) but never emitted.
+    /// `Tailer::write_checkpoint` subtracts this so a persisted offset never covers a line nothing
+    /// downstream has seen.
+    pub fn pending_bytes(&self) -> u64 {
+        self.partial.len() as u64
+    }
 }
 
 fn strip_cr(b: Bytes) -> Bytes {
