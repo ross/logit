@@ -86,10 +86,15 @@ not its path — the only thing that survives both a rotation (the path keeps it
 doesn't) and a checkpoint resume (the inode is what's persisted). Each `scan`: a path whose inode
 changed since the last scan is a rotation — the old handle drains to EOF, flushes, and closes; the
 new one opens at its own beginning, regardless of `read_from`. A path whose length is now less than
-the tracked offset is a truncation — seek to `0`, diagnosed (`truncated`), same inode. A
+the tracked offset is a truncation — seek to `0`, diagnosed (`truncated`), same inode. The line
+splitter is reset along with the offset, so an unterminated fragment held from the pre-truncation
+generation is dropped rather than spliced onto the first line of the new one. A
 previously-tracked path no longer matched by any pattern is a removal — drain and close. A rotated
 `.1`-suffixed file is never matched in the first place: `PathPattern`'s wildcard is anchored
-(prefix/suffix), so `access.log.1` never satisfies a `*.log` (or `*-json.log`) pattern.
+(prefix/suffix), so `access.log.1` never satisfies a `*.log` (or `*-json.log`) pattern. A pattern
+that matches a file both before and after a rename (`app.log*` matching both `app.log` and
+`app.log.1`) rebinds the existing tracked entry to the new path rather than re-opening the inode,
+so no duplicate re-emission occurs.
 
 ### Checkpoints: optional, written on an interval, only when dirty
 
@@ -110,7 +115,10 @@ the delivery half of this same pipeline, and the same reasoning: a checkpoint wr
 would dominate the cost of tailing an active file for no correctness benefit past "bounds how much
 a crash can replay," and replay is always safe (downstream is expected to tolerate a duplicate the
 same way any at-least-once pipeline stage does). An operator wanting less window trades it directly
-against write volume via `checkpoint_interval`.
+against write volume via `checkpoint_interval`. The interval checkpoint flushes every accumulator
+before it writes and persists only the line-complete, already-emitted offset (excluding bytes still
+held as an incomplete line), so the accepted failure mode is strictly duplicates on restart, never
+loss of a line nothing downstream has seen.
 
 ### Start position: `read_from` only governs what was there before startup
 
