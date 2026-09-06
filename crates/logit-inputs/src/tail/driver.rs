@@ -194,6 +194,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                         Some(tokio::time::Instant::now() + self.config.batching.flush_interval);
                 }
                 Outcome::Checkpoint => {
+                    // Flush before persisting: once every accumulator has been flushed, every
+                    // decoded event is already with `Fanout`, so the offset this is about to
+                    // write can never outrun delivery. The two timers stay independent as
+                    // *timers* (this doesn't touch `next_flush`) -- they're just correctly
+                    // ordered on the tick where the checkpoint one fires.
+                    self.flush_all(&sink, FlushReason::Interval).await;
                     self.write_checkpoint(false).await;
                     next_checkpoint =
                         Some(tokio::time::Instant::now() + self.config.checkpoint_interval);
@@ -216,6 +222,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// files present then follow `config.read_from`; every later discovery starts at the
     /// beginning, since a file that didn't exist yet has no "before startup" to skip.
     async fn scan(&mut self, first: bool) {
+        // Copied out up front so it can be read below while `tracked` (borrowed from
+        // `self.files`) is live -- the same precedent `open_tracked` already follows for
+        // `self.config.batching`.
+        let max_line_bytes = self.config.max_line_bytes;
         let mut discovered: HashMap<PathBuf, std::fs::Metadata> = HashMap::new();
         for pattern in &self.patterns {
             for path in pattern.scan() {
@@ -248,15 +258,19 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                                 self.diag.warn_throttled("read_error", err);
                                 continue;
                             }
+                            let prev_offset = tracked.offset;
                             tracked.offset = 0;
+                            // The pre-truncation generation's partial (or a stale `dropping =
+                            // true`) belongs to file content that no longer exists -- reset the
+                            // splitter along with the offset so it isn't spliced onto (or, mid-
+                            // drop, swallows) the first line of the new generation. The held
+                            // partial is discarded, not emitted: it's an unterminated fragment,
+                            // and emitting it as if it were a whole line is worse than dropping a
+                            // fragment the writer itself never terminated.
+                            tracked.splitter = LineSplitter::new(max_line_bytes);
                             self.diag.warn_throttled(
                                 "truncated",
-                                format!(
-                                    "{} shrank from an offset of {} bytes to {len} -- resuming \
-                                     from the beginning",
-                                    path.display(),
-                                    tracked.offset
-                                ),
+                                truncated_message(&path, prev_offset, len),
                             );
                             self.telemetry.count("logit.input.files.truncated", 1.0, &[]);
                         }
@@ -292,7 +306,38 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         self.telemetry.gauge("logit.input.files.open", self.files.len() as f64, &[]);
     }
 
+    /// Opens a newly-discovered `(path, id)` pair at `start` -- unless `id` is already tracked
+    /// under a different path, in which case that existing entry is rebound to `path` instead of
+    /// being reopened. This happens when one configured pattern matches a file both before and
+    /// after a rename (`app.log*` matching both `app.log` and `app.log.1`): the same inode is then
+    /// discovered a second time under its new name in the same `scan`. The existing entry is
+    /// authoritative -- it holds the correct offset, the in-flight `LineSplitter` partial, decoder
+    /// state, and a possibly non-empty accumulator -- so the only thing that actually changed is
+    /// the name the inode is reachable under; re-opening at offset 0 would throw all of that away
+    /// and re-emit the whole file.
     async fn open_tracked(&mut self, path: PathBuf, id: FileId, start: StartOffset) {
+        if let Some(tracked) = self.files.get_mut(&id) {
+            // Same inode, new name: adopt the existing entry rather than reopening. Reviving a
+            // `Draining` entry back to `Active` is correct here -- the inode is once again matched
+            // by a configured pattern under a real name, so it should keep being tailed, not
+            // reaped; reap is for inodes no pattern reaches any more.
+            let old_path = std::mem::replace(&mut tracked.path, path.clone());
+            tracked.state = FileState::Active;
+            // Removing the stale `by_path` entry is load-bearing, not tidiness: `discovered`
+            // iteration order is nondeterministic, and if the old `path -> id` binding survived, a
+            // later arm processing `old_path` in this same `scan` would see a *different* id now
+            // discovered there and wrongly mark this still-live inode `Draining`. Removing it here
+            // makes both iteration orders converge on the same result.
+            if old_path != path {
+                self.by_path.remove(&old_path);
+            }
+            self.by_path.insert(path, id);
+            self.diag.warn_throttled(
+                "renamed",
+                "a tracked file is now matched under a new name; following the same inode",
+            );
+            return;
+        }
         if !self.factory.accept(&path) {
             return;
         }
@@ -356,6 +401,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     async fn drain(&mut self, sink: &Fanout, shutdown: &mut watch::Receiver<bool>) -> bool {
         loop {
             let mut any_progress = false;
+            let mut at_eof: Vec<FileId> = Vec::new();
             let ids: Vec<FileId> = self.files.keys().copied().collect();
             for id in ids {
                 if *shutdown.borrow() {
@@ -363,9 +409,11 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 }
                 if self.read_one(id, sink).await {
                     any_progress = true;
+                } else {
+                    at_eof.push(id);
                 }
             }
-            self.reap_drained(sink).await;
+            self.reap_drained(&at_eof, sink).await;
             if !any_progress {
                 return false;
             }
@@ -437,15 +485,23 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         true
     }
 
-    /// Closes every tracked file marked [`FileState::Draining`] that has reached EOF: gives its
-    /// decoder a chance to emit anything held back, flushes its accumulator
-    /// (`FlushReason::Closed`), and drops it from the tracked set (which is also what makes it
-    /// disappear from the next checkpoint write -- see `CheckpointStore::write`'s doc comment).
-    async fn reap_drained(&mut self, sink: &Fanout) {
+    /// Closes every tracked file marked [`FileState::Draining`] whose own `read_one` returned
+    /// nothing on the *current* pass (`at_eof`, built by [`Tailer::drain`]) -- not every Draining
+    /// file unconditionally. `read_one` reads at most one [`READ_CHUNK_BYTES`] chunk per call, so
+    /// a file marked Draining with a large unread backlog must be given as many passes as it takes
+    /// to actually reach EOF before it's reaped; reaping it after just one chunk would lose the
+    /// rest, unrecoverably (the entry is also pruned from the next checkpoint write). A read
+    /// *error* also counts as EOF here (`read_one` returns `false` for it too, deliberately): an
+    /// erroring handle will never drain on its own, and waiting for it to would starve every other
+    /// tracked file. Gives the reaped decoder a chance to emit anything held back, flushes its
+    /// accumulator (`FlushReason::Closed`), and drops it from the tracked set (which is also what
+    /// makes it disappear from the next checkpoint write -- see `CheckpointStore::write`'s doc
+    /// comment).
+    async fn reap_drained(&mut self, at_eof: &[FileId], sink: &Fanout) {
         let draining: Vec<FileId> = self
             .files
             .iter()
-            .filter(|(_, f)| f.state == FileState::Draining)
+            .filter(|(id, f)| f.state == FileState::Draining && at_eof.contains(id))
             .map(|(id, _)| *id)
             .collect();
         for id in draining {
@@ -487,7 +543,18 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
 
     async fn write_checkpoint(&mut self, force: bool) {
         let Some(checkpoint) = &mut self.checkpoint else { return };
-        let entries = self.files.values().map(|f| (f.id, f.path.as_path(), f.offset));
+        // Subtract each file's held partial: those bytes are already counted in `offset` (`
+        // read_one` advances it per chunk, not per decoded line) but haven't produced an event, so
+        // persisting them would let a restart skip a line nothing downstream has seen. A file
+        // that's `dropping` an oversized line deliberately contributes nothing here either -- an
+        // empty `partial` while `dropping` -- since those bytes belong to a line already dropped
+        // for exceeding `max_line_bytes`, and replaying them on restart simply re-drops it. At
+        // shutdown this is moot: `close_all_for_shutdown` drains every partial via `take_partial`
+        // before `write_checkpoint(true)` runs, so `pending_bytes()` is already 0 by then.
+        let entries = self
+            .files
+            .values()
+            .map(|f| (f.id, f.path.as_path(), f.offset.saturating_sub(f.splitter.pending_bytes())));
         checkpoint.write(entries, force, &mut self.diag, &self.telemetry);
     }
 }
@@ -544,6 +611,16 @@ fn ensure_utf8(line: Bytes, diag: &mut Diagnostics) -> Bytes {
             Bytes::from(String::from_utf8_lossy(&line).into_owned())
         }
     }
+}
+
+/// The `truncated` diagnostic's text. A free function purely so a test can assert it reports the
+/// *pre*-truncation offset -- the number an operator needs to know how much was in flight -- and
+/// not the freshly-reset one.
+fn truncated_message(path: &Path, prev_offset: u64, len: u64) -> String {
+    format!(
+        "{} shrank from an offset of {prev_offset} bytes to {len} -- resuming from the beginning",
+        path.display()
+    )
 }
 
 async fn emit(sink: &Fanout, telemetry: &Telemetry, batch: EventBatch, reason: FlushReason) {
@@ -999,9 +1076,12 @@ mod tests {
 
         let mut config = fast_config(ReadFrom::Beginning);
         // A batch bound and flush interval this test will never reach on its own -- only
-        // shutdown's own final flush should ever deliver anything.
+        // shutdown's own final flush should ever deliver anything. The checkpoint interval must
+        // be pushed out too: a checkpoint tick now flushes before it persists, so a short one
+        // (fast_config's default) would flush this batch early and defeat the point of this test.
         config.batching.max_events = 1_000;
         config.batching.flush_interval = Duration::from_secs(60);
+        config.checkpoint_interval = Duration::from_secs(60);
         config.checkpoint_path = Some(checkpoint_path.clone());
 
         let (fanout, mut rx) = recording_fanout(8);
@@ -1012,7 +1092,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(
             rx.try_recv().is_err(),
-            "nothing should have flushed yet -- the interval is 60s away"
+            "nothing should have flushed yet -- both intervals are 60s away"
         );
 
         shutdown(shutdown_tx, handle).await;
@@ -1244,5 +1324,199 @@ mod tests {
 
         shutdown(shutdown_tx, handle).await;
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_draining_file_with_more_than_one_chunk_of_backlog_is_fully_read_before_close() {
+        let dir = scratch_dir("drain-backlog");
+        let path = dir.join("app.log");
+        let content: String = (0..8_000).map(|i| format!("drain-{i:05}\n")).collect();
+        assert!(content.len() > 64 * 1024, "fixture must exceed one read chunk");
+        std::fs::write(&path, content.as_bytes()).unwrap();
+
+        // A capacity-1 fanout with one event per batch stalls the driver inside `emit` almost
+        // immediately, so only a small prefix has been read by the time the file is removed --
+        // this is what makes the test deterministic rather than racing the reader.
+        let (tx, mut rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]);
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.batching.max_events = 1;
+        // A directory glob -- so the removal below is what makes the tracked path stale, driving
+        // it into `FileState::Draining`, rather than the pattern itself no longer matching.
+        let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config);
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+        // Don't consume `rx` at all -- the driver stalls with the vast majority of the file still
+        // unread.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        std::fs::remove_file(&path).unwrap();
+        // A poll tick marks the file `Draining` while it is still mostly unread.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let mut received = Vec::new();
+        while received.len() < 8_000 {
+            let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("timed out waiting for the backlog to fully drain")
+                .expect("channel closed");
+            received.extend(unwrap_batch(delivered).events);
+        }
+        assert_eq!(
+            messages(&received),
+            (0..8_000).map(|i| format!("drain-{i:05}")).collect::<Vec<_>>(),
+            "a Draining file with more than one chunk of backlog must be read to real EOF, not \
+             reaped after a single 64KiB chunk"
+        );
+
+        shutdown(shutdown_tx, handle).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_truncation_discards_the_partial_line_held_from_the_previous_generation() {
+        let dir = scratch_dir("truncate-partial");
+        let path = dir.join("app.log");
+        // No trailing newline -- the trailing fragment "partialpartial" is held in the splitter's
+        // `partial` buffer, and is long enough that the post-truncation length (10) is strictly
+        // less than the tracked offset (18), so `scan` classifies this as a truncation at all.
+        std::fs::write(&path, b"a\nb\npartialpartial").unwrap();
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let tailer = Tailer::new(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+        let events = expect_events(&mut rx, 2).await;
+        assert_eq!(messages(&events), vec!["a", "b"]);
+
+        // `std::fs::write` opens with `O_TRUNC` on the existing path -- same inode, 10 < 18 bytes
+        // -- a real truncation, exactly as `truncation_seeks_to_zero_and_reports_truncated` does
+        // it.
+        std::fs::write(&path, b"restarted\n").unwrap();
+
+        let events2 = expect_events(&mut rx, 1).await;
+        assert_eq!(
+            messages(&events2),
+            vec!["restarted"],
+            "the pre-truncation partial must not be spliced onto the first post-truncation line"
+        );
+
+        shutdown(shutdown_tx, handle).await;
+        assert!(rx.try_recv().is_err(), "the discarded partial must not resurface on close");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_matching_both_a_rotated_file_and_its_replacement_keeps_one_entry_per_inode()
+    {
+        let dir = scratch_dir("wildcard-rotation");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"before\n").unwrap();
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let tailer = Tailer::new(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+        let events = expect_events(&mut rx, 1).await;
+        assert_eq!(messages(&events), vec!["before"]);
+
+        // Both the rotated-away file and the fresh replacement now match the same `app.log*`
+        // pattern -- the exact scenario that used to re-open the rotated-away inode from byte 0.
+        std::fs::rename(&path, dir.join("app.log.1")).unwrap();
+        std::fs::write(&path, b"after\n").unwrap();
+
+        let events2 = expect_events(&mut rx, 1).await;
+        assert_eq!(messages(&events2), vec!["after"]);
+
+        // The actual regression: the bug re-emits "before" from byte 0 of `app.log.1`.
+        let extra = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(extra.is_err(), "the renamed inode must not be re-read from byte 0");
+
+        // The entry must have been rebound and kept Active, not silently dropped -- appending to
+        // the renamed file must still be followed under its new name.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("app.log.1"))
+            .unwrap()
+            .write_all(b"late\n")
+            .unwrap();
+        let events3 = expect_events(&mut rx, 1).await;
+        assert_eq!(messages(&events3), vec!["late"]);
+
+        shutdown(shutdown_tx, handle).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_interval_checkpoint_flushes_before_writing_its_offset() {
+        let dir = scratch_dir("checkpoint-flush-order");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\nthree\n").unwrap();
+
+        let mut config = fast_config(ReadFrom::Beginning);
+        // Only the checkpoint tick's own flush can ever deliver anything -- same trick
+        // `shutdown_flushes_every_accumulator_and_writes_the_checkpoint_within_grace` uses.
+        config.batching.flush_interval = Duration::from_secs(60);
+        config.batching.max_events = 1_000;
+        config.checkpoint_interval = Duration::from_millis(25);
+        config.checkpoint_path = Some(dir.join("checkpoint.json"));
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+        // Before the fix, nothing is ever delivered within `expect_events`' 5s bound, because the
+        // only flush is 60s out -- the checkpoint tick itself must be the one that flushes.
+        let events = expect_events(&mut rx, 3).await;
+        assert_eq!(messages(&events), vec!["one", "two", "three"]);
+
+        shutdown(shutdown_tx, handle).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_offset_never_covers_a_line_still_held_as_a_partial() {
+        let dir = scratch_dir("checkpoint-partial");
+        let path = dir.join("app.log");
+        // Complete-line prefix is 14 bytes ("one\ntwo\nthree\n"); the rest is an unterminated
+        // trailing line that must never be counted in a persisted offset.
+        const COMPLETE_PREFIX_LEN: usize = 14;
+        std::fs::write(&path, b"one\ntwo\nthree\nnot-terminated").unwrap();
+
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.checkpoint_path = Some(dir.join("checkpoint.json"));
+        let checkpoint_path = config.checkpoint_path.clone().unwrap();
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
+        let (fanout, mut rx) = recording_fanout(8);
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+        let _ = expect_events(&mut rx, 3).await;
+        tokio::time::sleep(Duration::from_millis(70)).await; // let a checkpoint tick land
+
+        // Read the checkpoint file while the tailer is still running -- `shutdown` would drain
+        // the partial and legitimately advance the offset, masking the bug.
+        let text = std::fs::read_to_string(&checkpoint_path).unwrap();
+        // `serde_json::to_vec_pretty` puts a space after the colon.
+        assert!(
+            text.contains(&format!(r#""offset": {COMPLETE_PREFIX_LEN}"#)),
+            "the checkpoint must not cover the unterminated trailing line: {text}"
+        );
+
+        shutdown(shutdown_tx, handle).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_truncated_diagnostic_reports_the_pre_truncation_offset() {
+        let msg = truncated_message(Path::new("/var/log/app.log"), 4096, 12);
+        assert!(msg.contains("from an offset of 4096 bytes to 12"), "{msg}");
+        assert!(!msg.contains("offset of 0 bytes"));
     }
 }
