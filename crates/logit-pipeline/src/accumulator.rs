@@ -17,6 +17,11 @@ pub enum FlushReason {
     Interval,
     ResourceChange,
     Shutdown,
+    /// A tailed file is being closed (rotated away, removed, or drained past EOF) --
+    /// `logit_inputs::tail`'s only caller. Distinct from `Shutdown`: this fires while the
+    /// listener keeps running, for one file among several it may be tracking, not for the whole
+    /// component's own shutdown.
+    Closed,
 }
 
 impl FlushReason {
@@ -27,6 +32,7 @@ impl FlushReason {
             FlushReason::Interval => "interval",
             FlushReason::ResourceChange => "resource_change",
             FlushReason::Shutdown => "shutdown",
+            FlushReason::Closed => "closed",
         }
     }
 }

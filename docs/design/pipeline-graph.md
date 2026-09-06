@@ -64,7 +64,8 @@ pub enum ComponentKind {
     StatsdIn { bind: String },
     SyslogIn { bind: String },
     OtlpIn { bind: String },
-    FileTail { paths: Vec<String>, checkpoint_path: Option<String> },
+    TailIn { paths: Vec<String>, #[serde(flatten)] tail: TailOptions },
+    DockerIn { root: String, containers: Vec<String>, discover: bool, labels: Vec<String>, #[serde(flatten)] tail: TailOptions },
     LogitIn { bind: String },
 
     Lua { script: String, interval: Option<Duration> },
@@ -149,7 +150,7 @@ the tag's literal argument string instead of failing.
 
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
-| Listener (`statsd_in`, `syslog_in`, `otlp_in`, `file_tail`, `logit_in`) | must be empty | required (≥1 consumer) |
+| Listener (`statsd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `otlp_out`, `logit_out`) | ≥1 required | must not be |
 
@@ -211,13 +212,19 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` — a config error, not
     something to clamp silently.
 17. A non-default `receive:` block is rejected on any kind that is not a **datagram listener**
-    (`docs/adr/decoupled-listener-io.md`), today `statsd_in`/`syslog_in`. Deliberately not
+    (`docs/adr/decoupled-listener-io.md`, `statsd_in`/`syslog_in`) or a **tail listener**
+    (`docs/adr/file-tailing-and-docker-json-logs.md`, `tail_in`/`docker_in`). Deliberately not
     "any non-listener": `internal` is a listener by role but has no socket, no queue, and no
     decoder, so `receive:` on it would be exactly the silently-ignored-setting failure rule 14
-    guards against on the sink side.
+    guards against on the sink side. A tail listener has no receive *queue* at all (the tailed
+    file is its own durable buffer) — only `receive.batch_max_events`, `batch_max_bytes`,
+    `batch_flush_interval`, and `shutdown_grace` are meaningful on one; a queue-bounding field
+    (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) is rejected by name.
 18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, or `receive.batch_max_events`
     of `0` is rejected — the twin of rule 15. `receive.batch_flush_interval: 0s` is **not**
-    rejected — it means "no flush timer," a meaningful setting, unlike the count bounds.
+    rejected — it means "no flush timer," a meaningful setting, unlike the count bounds. A tail
+    listener's `receive.batch_max_events`/`batch_max_bytes` of `0` is rejected the same way (the
+    queue-only bounds don't apply to it at all — see rule 17).
 19. (Also since drifted into the code's numbering, see the note on 12 above.) A `set` with both
     `resource` and `attributes` empty is rejected, and a `trace_context` with an empty `trace_id`
     field name is rejected — both are the same "can only ever be a no-op" reasoning rules 10-12
@@ -256,6 +263,19 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     (`docs/adr/trace-context-span-lifting.md`). Rule 19 also covers an empty `span_id`/`flags`
     field name on the same component now that those default to `span.id`/`trace.flags` — `null`
     disables a lookup, `""` is a typo.
+26. `tail_in`'s `paths:` must name at least one file, no entry may be empty, and a `*` wildcard is
+    permitted only in the final path component (`/var/log/app/*.log`, not `/var/*/app.log`) —
+    the minimal glob subset `PathPattern` implements; a directory-position wildcard would silently
+    never match anything (`docs/adr/file-tailing-and-docker-json-logs.md`).
+27. `docker_in`'s `containers:` must be non-empty or `discover: true` must be set — explicit
+    selection is the default, so a config with neither would silently tail nothing, the same
+    black-hole reasoning rule 7 exists to catch. No empty entry in `containers:`/`labels:`, no
+    duplicate `containers:` entry, and `root:` must be non-empty. Not reachable until `docker_in`
+    itself is implemented (rule 8 rejects it first until then).
+28. A `tail_in`/`docker_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes` of `0` is
+    rejected — `poll_interval`/`checkpoint_interval` at `0s` would busy-loop (the same reasoning
+    as rule 9's zero `interval`), and `max_line_bytes: 0` would drop every line
+    (`docs/adr/file-tailing-and-docker-json-logs.md`).
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

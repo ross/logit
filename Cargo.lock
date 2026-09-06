@@ -848,6 +848,8 @@ dependencies = [
  "logit-transforms",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "socket2",
  "tokio",
  "tokio-rustls",

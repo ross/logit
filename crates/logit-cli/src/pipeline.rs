@@ -17,6 +17,7 @@ use logit_inputs::internal::InternalInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
+use logit_inputs::tail::TailInput;
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::otlp::{
     OtlpCompression as OtlpOutCompression, OtlpOutput, OtlpTransport as OtlpOutTransport,
@@ -214,6 +215,17 @@ fn build_spec(
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+        TailIn { paths, tail } => {
+            let paths = paths.iter().map(|p| base_dir.join(p)).collect();
+            NodeSpec::Input(
+                Box::new(
+                    TailInput::new(paths, tail_config(tail, &component.receive, base_dir))
+                        .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                        .with_telemetry(telemetry.clone()),
+                ),
+                input_runtime_config(&component.receive),
+            )
         }
         // `span_sample_rate` is read by `prepare` (above) to build the `Registry` itself, not
         // here -- by the time `build_spec` runs, the `Registry` this handle points at already has
@@ -467,18 +479,56 @@ fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::U
 
 /// Builds any listener's `InputRuntimeConfig` from its `ReceiveConfig` -- safe to call
 /// unconditionally for every `NodeSpec::Input` arm, including `internal`: graph validation's rule
-/// 16 already guarantees a non-datagram-listener's `receive` is `ReceiveConfig::default()` by the
-/// time a resolved `Graph` reaches `build_spec`, so `internal` always gets `shutdown_grace:
-/// ReceiveConfig::default().shutdown_grace` here (5s today, not `Duration::ZERO`) regardless of
-/// what any `receive:` block would otherwise say. That's harmless, not just unused, only because
-/// `InternalInput` never overrides `Input::run_until_shutdown`: the default impl's own `select!`
-/// always resolves at t=shutdown against a non-overriding input, so `run_input`'s grace backstop
-/// -- built from this value -- never gets a chance to matter. If `internal` ever gains a
-/// cooperative drain of its own, this stops being a harmless default and needs its own
-/// `receive.shutdown_grace`-shaped knob rather than inheriting whatever `ReceiveConfig::default`
-/// happens to say.
+/// 17 already guarantees a non-datagram-, non-tail-listener's `receive` is `ReceiveConfig::
+/// default()` by the time a resolved `Graph` reaches `build_spec`, so `internal` always gets
+/// `shutdown_grace: ReceiveConfig::default().shutdown_grace` here (5s today, not
+/// `Duration::ZERO`) regardless of what any `receive:` block would otherwise say. That's
+/// harmless, not just unused, only because `InternalInput` never overrides `Input::
+/// run_until_shutdown`: the default impl's own `select!` always resolves at t=shutdown against a
+/// non-overriding input, so `run_input`'s grace backstop -- built from this value -- never gets a
+/// chance to matter. If `internal` ever gains a cooperative drain of its own, this stops being a
+/// harmless default and needs its own `receive.shutdown_grace`-shaped knob rather than inheriting
+/// whatever `ReceiveConfig::default` happens to say.
+///
+/// `tail_in`/`docker_in` are the first listeners where this value is genuinely load-bearing
+/// rather than incidentally harmless: `TailInput` (`crates/logit-inputs/src/tail/driver.rs`)
+/// does override `run_until_shutdown` to flush every tracked file's accumulator and write a
+/// final checkpoint, and that drain must fit inside `shutdown_grace` or `run_input`'s backstop
+/// cancels it by drop, losing whatever it hadn't flushed yet.
 fn input_runtime_config(receive: &logit_config::ReceiveConfig) -> InputRuntimeConfig {
     InputRuntimeConfig { shutdown_grace: receive.shutdown_grace }
+}
+
+/// Builds a tailing listener's `TailConfig` from its `TailOptions` plus the shared `receive:`
+/// block (`docs/adr/file-tailing-and-docker-json-logs.md`) -- the tail-side mirror of
+/// `receive_config` above. `checkpoint_path` is resolved against `base_dir` when relative,
+/// exactly like `StdioTarget::Path`/`LuaFile { lua_file, .. }` resolve their own paths.
+fn tail_config(
+    tail: &logit_config::TailOptions,
+    receive: &logit_config::ReceiveConfig,
+    base_dir: &Path,
+) -> logit_inputs::tail::TailConfig {
+    logit_inputs::tail::TailConfig {
+        checkpoint_path: tail.checkpoint_path.as_ref().map(|p| base_dir.join(p)),
+        read_from: match tail.read_from {
+            logit_config::ReadFrom::Beginning => logit_inputs::tail::ReadFrom::Beginning,
+            logit_config::ReadFrom::End => logit_inputs::tail::ReadFrom::End,
+        },
+        watch: match tail.watch {
+            logit_config::WatchMode::Auto => logit_inputs::tail::WatchMode::Auto,
+            logit_config::WatchMode::Inotify => logit_inputs::tail::WatchMode::Inotify,
+            logit_config::WatchMode::Poll => logit_inputs::tail::WatchMode::Poll,
+        },
+        poll_interval: tail.poll_interval,
+        checkpoint_interval: tail.checkpoint_interval,
+        max_line_bytes: tail.max_line_bytes as usize,
+        batching: logit_inputs::tail::TailBatching {
+            max_events: receive.batch_max_events,
+            max_bytes: receive.batch_max_bytes,
+            flush_interval: receive.batch_flush_interval,
+            shutdown_grace: receive.shutdown_grace,
+        },
+    }
 }
 
 fn delivery_posture(cfg: logit_config::DeliveryPosture) -> logit_pipeline::DeliveryPosture {
@@ -838,6 +888,99 @@ mod tests {
                 "protocol {protocol:?}"
             );
         }
+    }
+
+    #[test]
+    fn build_spec_builds_a_tail_input_with_receive_batching_wired() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig {
+                batch_max_events: 42,
+                ..logit_config::ReceiveConfig::default()
+            },
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::TailIn {
+                paths: vec!["/var/log/app.log".to_string()],
+                tail: logit_config::TailOptions::default(),
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    /// `tail_config` is where `checkpoint_path`, `receive:`'s batching fields, and every other
+    /// `TailOptions` field actually turn into a `logit_inputs::tail::TailConfig` -- `build_spec`'s
+    /// own `TailIn` arm just calls it, and `NodeSpec::Input` boxes the result as `dyn Input`, with
+    /// no way to inspect what's inside from the outside. So the conversion logic is exercised
+    /// directly here, the same way `queue_config`/`write_config`/`receive_config` already are
+    /// implicitly through their own callers -- these are this function's only tests.
+    #[test]
+    fn tail_config_resolves_a_relative_checkpoint_path_against_base_dir() {
+        let tail = logit_config::TailOptions {
+            checkpoint_path: Some("state/tail.checkpoint".to_string()),
+            ..logit_config::TailOptions::default()
+        };
+        let cfg =
+            tail_config(&tail, &logit_config::ReceiveConfig::default(), Path::new("/etc/logit"));
+        assert_eq!(cfg.checkpoint_path, Some(PathBuf::from("/etc/logit/state/tail.checkpoint")));
+    }
+
+    #[test]
+    fn tail_config_leaves_an_absolute_checkpoint_path_untouched() {
+        let tail = logit_config::TailOptions {
+            checkpoint_path: Some("/var/lib/logit/tail.checkpoint".to_string()),
+            ..logit_config::TailOptions::default()
+        };
+        let cfg =
+            tail_config(&tail, &logit_config::ReceiveConfig::default(), Path::new("/etc/logit"));
+        assert_eq!(cfg.checkpoint_path, Some(PathBuf::from("/var/lib/logit/tail.checkpoint")));
+    }
+
+    #[test]
+    fn tail_config_defaults_to_no_checkpoint() {
+        let cfg = tail_config(
+            &logit_config::TailOptions::default(),
+            &logit_config::ReceiveConfig::default(),
+            Path::new("/etc/logit"),
+        );
+        assert_eq!(cfg.checkpoint_path, None);
+    }
+
+    #[test]
+    fn tail_config_wires_batching_from_receive() {
+        let receive = logit_config::ReceiveConfig {
+            batch_max_events: 250,
+            batch_max_bytes: 1_000_000,
+            batch_flush_interval: Duration::from_millis(250),
+            shutdown_grace: Duration::from_secs(7),
+            ..logit_config::ReceiveConfig::default()
+        };
+        let cfg = tail_config(&logit_config::TailOptions::default(), &receive, Path::new(""));
+        assert_eq!(cfg.batching.max_events, 250);
+        assert_eq!(cfg.batching.max_bytes, 1_000_000);
+        assert_eq!(cfg.batching.flush_interval, Duration::from_millis(250));
+        assert_eq!(cfg.batching.shutdown_grace, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn tail_config_converts_read_from_watch_mode_and_the_remaining_tail_options() {
+        let tail = logit_config::TailOptions {
+            read_from: logit_config::ReadFrom::Beginning,
+            watch: logit_config::WatchMode::Inotify,
+            poll_interval: Duration::from_millis(500),
+            checkpoint_interval: Duration::from_secs(9),
+            max_line_bytes: 2048,
+            ..logit_config::TailOptions::default()
+        };
+        let cfg = tail_config(&tail, &logit_config::ReceiveConfig::default(), Path::new(""));
+        assert_eq!(cfg.read_from, logit_inputs::tail::ReadFrom::Beginning);
+        assert_eq!(cfg.watch, logit_inputs::tail::WatchMode::Inotify);
+        assert_eq!(cfg.poll_interval, Duration::from_millis(500));
+        assert_eq!(cfg.checkpoint_interval, Duration::from_secs(9));
+        assert_eq!(cfg.max_line_bytes, 2048);
     }
 
     #[test]

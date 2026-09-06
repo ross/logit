@@ -15,6 +15,11 @@ async-trait.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 socket2.workspace = true
+# tail_in/docker_in's checkpoint file (docs/adr/file-tailing-and-docker-json-logs.md) --
+# already present transitively (via schemars/reqwest) at these exact versions, so promoting them
+# to direct dependencies adds no new entry to the dependency tree.
+serde.workspace = true
+serde_json.workspace = true
 # otlp_in's HTTP/1.1+h2c and hand-rolled gRPC-over-HTTP/2 servers
 # (docs/adr/hand-rolled-grpc-over-hyper.md).
 hyper.workspace = true

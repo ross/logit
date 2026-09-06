@@ -10,6 +10,7 @@ pub mod internal;
 pub mod otlp;
 pub mod statsd;
 pub mod syslog;
+pub mod tail;
 pub mod udp;
 
 pub use logit_pipeline::Input;
