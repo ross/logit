@@ -22,7 +22,10 @@ mod watch;
 pub use line::{LineDecoder, TailDecoder};
 pub use pattern::PathPattern;
 
-use driver::{DecoderFactory, Tailer};
+// `pub(crate)`, not a private `use`: `crate::docker`'s `docker_in` builds on this same driver
+// (`docs/adr/file-tailing-and-docker-json-logs.md`), so both need to be reachable as
+// `crate::tail::{Tailer, DecoderFactory}` from outside this module, not just from within it.
+pub(crate) use driver::{DecoderFactory, Tailer};
 use logit_core::{Diagnostics, Resource, Telemetry};
 use logit_pipeline::Fanout;
 use std::path::PathBuf;

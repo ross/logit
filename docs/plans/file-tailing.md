@@ -90,23 +90,39 @@ that ADR for the full reasoning — this file tracks what's built and what's lef
   discovered well within seconds under `inotify` against a 30s `poll_interval`, versus only after a
   300ms `poll_interval` tick under `poll`.
 
-### C. `docker_in` — after B
+### C. `docker_in` — **landed**
 
 - New `crates/logit-inputs/src/docker.rs`: `DockerInput`, `ContainerFilter` (explicit
   name/id-prefix matching, or `discover: true`), `ContainerMeta` (reads `config.v2.json`: `Name`,
   `Config.Image`, `Config.Labels`), `DockerDecoder` (Docker's json-file envelope, partial-line
   reassembly up to `max_line_bytes`, `time` as the event timestamp with a `bad_time` fallback to
   read time).
-- `logit_pipeline::graph`: add `DockerIn` to `is_implemented`; rule 27's body actually runs now
-  (`containers` non-empty or `discover: true`, no empty/duplicate entries, non-empty `root`).
-- `crates/logit-cli/src/pipeline.rs`: `DockerIn` arm in `build_spec`.
-- Tests: envelope decoding (time, stream, `attrs`), partial-line reassembly and its own
-  `max_line_bytes` bound, a dangling partial emitted on close rather than lost, `ContainerMeta`
-  parsing (leading-slash strip, image tag split rules), resource attribute shape (`container.*`,
-  opt-in labels), filter matching (name, id-prefix, `discover`), a recreated container followed by
-  name under a new id, rotated `-json.log.1` never opened, missing `config.v2.json` degraded to
-  `container.id`-only rather than fatal, and confirmation that `docker_in` never parses the inner
-  application line.
+- `crate::tail::PathPattern` grows `docker_containers(root)`: not a wildcard glob (this driver's
+  matcher is still exactly the minimal subset from workstream A) but a dedicated two-level walk
+  over Docker's own deterministic naming (`<root>/<id>/<id>-json.log`, the id appearing both as
+  the directory name and the log file's own prefix) -- `Tailer`/`DecoderFactory` (`driver.rs`) are
+  re-exported `pub(crate)` from `tail/mod.rs` so `crate::docker` can build on them from outside
+  the `tail` module tree.
+- `logit_pipeline::graph`: `DockerIn` added to `is_implemented`; rule 27's body now actually runs
+  (`containers` non-empty or `discover: true`, no empty/duplicate entries, non-empty `root`); the
+  stale `docker_in_is_rejected_as_not_yet_implemented` test replaced with real accept/reject
+  coverage per rule.
+- `crates/logit-cli/src/pipeline.rs`: `DockerIn` arm in `build_spec`, reusing `tail_config` as-is.
+- Tests: envelope decoding (time, stream, `attrs`, an unknown stream or malformed JSON rejected as
+  a bad line), partial-line reassembly and its own `max_line_bytes` bound (including the drop
+  actually resuming cleanly afterward), a dangling partial emitted on close rather than lost,
+  confirmation the inner application line is never parsed, `ContainerMeta` parsing (leading-slash
+  strip, image tag split rules including a registry-port false positive and a digest reference),
+  resource attribute shape (`container.*`, opt-in labels, a stable `Arc` across one container's
+  lines), filter matching (name, id-prefix, `discover`, a too-short/non-hex entry never matching
+  by prefix), and full `DockerInput` driver tests: explicit vs. `discover` selection, a recreated
+  container followed by name under a new id, rotated `-json.log.1` never opened, and a missing
+  `config.v2.json` degraded to `container.id`-only rather than refusing to tail. **Test-fixture
+  pitfall found while writing these**: a raw json-file log line needs an actual trailing newline
+  *byte* terminating the file-level line, on top of (and separate from) the `\n` *inside* the
+  JSON string's own `log` field -- a fixture with only the latter sits forever in the outer
+  `LineSplitter`'s partial buffer, never reaching `DockerDecoder::decode_line` at all; several of
+  these tests hit exactly that before being corrected.
 
 ### D. Demo rework + remaining docs — after C
 
