@@ -97,9 +97,10 @@ Docker Engine.** Docker's per-container state directories are `root:root 0710` a
 `/var/lib/docker/containers` (`demo/compose.yaml`'s `logit` service) — real cost specific to
 reading the json-file driver directly rather than the docker socket/API (see the ADR's "Root
 privileges" section), paid by this one service alone. Rootless Docker uses
-`~/.local/share/docker/containers` and Docker Desktop's paths live inside its VM, neither matching
-the default `root:` this demo doesn't override; `docker compose down -v` wipes `nginx_in`'s
-checkpoint (the new `logit_state` volume) along with everything else this stack persists.
+`~/.local/share/docker/containers`, Docker Desktop's paths live inside its VM, and Podman uses a
+different log format entirely — none of which match the default `root:` this demo doesn't
+override; `docker compose down -v` wipes `nginx_in`'s checkpoint (the new `logit_state` volume)
+along with everything else this stack persists.
 
 `app` also has its own real OpenTelemetry request span — but, deliberately, it never goes through
 `logit` at all: it's exported over OTLP/HTTP protobuf straight to Tempo's own OTLP receiver

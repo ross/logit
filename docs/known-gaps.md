@@ -830,13 +830,16 @@ already built that have a known, accepted rough edge.
 - **`tail_in`/`docker_in`'s `inotify` wake source is Linux-only** — every other platform runs
   `watch: poll` unconditionally regardless of config, and an explicit `watch: inotify` is a startup
   error rather than a silent downgrade.
-- **`docker_in`'s timestamps are the one deliberate exception to "every listener stamps receipt
-  time."** It uses the json-file envelope's own `time` field (the daemon's same-host clock)
-  instead, since replaying a backlog (`read_from: beginning`, or a fresh container's already-
-  written history) as "now" would misrepresent when those lines actually happened — see the ADR's
-  "docker_in timestamps" section. `tail_in` itself still follows the general rule (read time,
-  matching `syslog_in`'s own precedent) — a plain text line carries no timestamp of its own to
-  trust.
+- **`docker_in`'s timestamps are the one deliberate exception among the tailing decoders to
+  "stamp receipt time."** It uses the json-file envelope's own `time` field (the daemon's
+  same-host clock) instead, since replaying a backlog (`read_from: beginning`, or a fresh
+  container's already-written history) as "now" would misrepresent when those lines actually
+  happened — see the ADR's "docker_in timestamps" section. `tail_in` itself still follows the
+  general rule (read time, matching `syslog_in`'s own precedent) — a plain text line carries no
+  timestamp of its own to trust. Receipt time isn't a repo-wide invariant either: `otlp_in`
+  independently prefers a record's own `time_unix_nano` when the sender set one, falling back to
+  `observed_time_unix_nano` only for the zero "unknown" sentinel — a wire format that carries an
+  origin timestamp is trusted for it.
 - **No per-input stream filter on `docker_in`** — an operator who wants only `stdout` (or only
   `stderr`) needs a downstream stage reading `log.iostream` themselves (`demo/logit.yaml`'s
   `nginx_stdout`, an inline `lua` component, is the worked example), not a config field on
