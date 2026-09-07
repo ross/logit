@@ -37,7 +37,7 @@ source:
 
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
-| Listener (`statsd_in`, `syslog_in`, `otlp_in`, `file_tail`, `logit_in`) | must be empty | required (≥1 consumer) |
+| Listener (`statsd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `filter`, …) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `otlp_out`, `logit_out`) | ≥1 required | must not be |
 

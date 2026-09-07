@@ -111,7 +111,7 @@ is lossy by construction — `logit_core::Severity` has six variants where syslo
 `Info`. Preferring the raw attribute is what makes a relay byte-faithful for the severities that
 survive that collapse; the inverse mapping (`syslog_severity_of`) is only the fallback for an
 event whose log record came from somewhere other than `syslog_in` — e.g. a Lua-authored log line,
-or (in the future) `file_tail`. That inverse is itself necessarily lossy in the other direction:
+or `tail_in`/`docker_in`. That inverse is itself necessarily lossy in the other direction:
 `Fatal` maps to `2` (crit), not `0` (emerg), since `Fatal` never claims "system unusable."
 
 ### Injection safety

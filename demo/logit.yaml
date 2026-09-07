@@ -1,13 +1,13 @@
 # The demo pipeline (demo/README.md, docs/plans/demo-tracing-stack.md, docs/plans/demo-stack.md,
 # docs/plans/otlp-end-to-end.md, docs/plans/otlp-logs-and-resource-identity.md,
-# docs/plans/access-log-spans.md). Exercises syslog in, set + json + trace_context + scale +
-# kv_metrics + keep_signals + keep + aggregate, InfluxDB out, OTLP/HTTP out, OTLP/gRPC out, plus
-# `internal` observing the pipeline itself (ADR `internal-telemetry-as-pipeline-events`, ADR
-# `internal-span-emission-and-deterministic-sampling`) -- against traffic that crosses three real
-# tiers: haproxy -> nginx -> app (demo/compose.yaml's `traffic` service drives it;
-# docs/plans/demo-tracing-stack.md's workstream A). Logs and metrics leave `logit` for a real
-# backend (Loki, InfluxDB); traces reach Tempo three ways -- `logit`'s own internal spans via
-# `tempo_out`, haproxy's and nginx's real access-line spans (`docs/adr/
+# docs/plans/access-log-spans.md, docs/plans/file-tailing.md). Exercises syslog in, docker_in,
+# set + json + lua + trace_context + scale + kv_metrics + keep_signals + keep + aggregate,
+# InfluxDB out, OTLP/HTTP out, OTLP/gRPC out, plus `internal` observing the pipeline itself (ADR
+# `internal-telemetry-as-pipeline-events`, ADR `internal-span-emission-and-deterministic-sampling`)
+# -- against traffic that crosses three real tiers: haproxy -> nginx -> app (demo/compose.yaml's
+# `traffic` service drives it; docs/plans/demo-tracing-stack.md's workstream A). Logs and metrics
+# leave `logit` for a real backend (Loki, InfluxDB); traces reach Tempo three ways -- `logit`'s
+# own internal spans via `tempo_out`, haproxy's and nginx's real access-line spans (`docs/adr/
 # trace-context-span-lifting.md`'s `span:` block, also via `tempo_out`), and `demo-app`'s real
 # request spans going straight to Tempo, deliberately not through `logit` at all (see the comment
 # above `stdout` below) -- not every telemetry leg needs `logit` in front of it, and this demo
@@ -16,13 +16,18 @@
 #
 # Topology:
 #
-#   One `syslog_in` listener per tier -- `set` stamps a resource onto the whole BATCH, not per
-#   event, so three tiers sharing one listener would interleave into one batch and get one wrong
-#   service.name (docs/plans/demo-tracing-stack.md's workstream A).
+#   One listener per tier -- `set` stamps a resource onto the whole BATCH, not per event, so
+#   three tiers sharing one listener would interleave into one batch and get one wrong
+#   service.name (docs/plans/demo-tracing-stack.md's workstream A). nginx's is `docker_in`, not
+#   `syslog_in` (docs/adr/file-tailing-and-docker-json-logs.md, docs/plans/file-tailing.md's
+#   workstream D) -- this demo is that ADR's end-to-end proof; `nginx_stdout` (`lua`) drops its
+#   container's own error_log lines (`log.iostream: stderr`) before they'd otherwise reach
+#   `nginx_identity`/`nginx_json` as if they were access lines.
 #
 #   haproxy --syslog/UDP:5140--> haproxy_in -> haproxy_identity (set) -> haproxy_json (json)
 #                                                                              |
-#   nginx   --syslog/UDP:5141--> nginx_in   -> nginx_identity   (set) -> nginx_json   (json)
+#   nginx   --stdout--> json-file --tail(docker_in)--> nginx_in -> nginx_stdout (lua, drops
+#                                       stderr) -> nginx_identity (set) -> nginx_json (json)
 #                                                                              |
 #   demo-app --syslog/UDP:5142--> app_in    -> app_identity     (set) -> app_json     (json)
 #                                                                              |
@@ -75,9 +80,36 @@ components:
   haproxy_in:
     type: syslog_in
     bind: 0.0.0.0:5140
+  # docker_in, not syslog_in -- `nginx` (demo/compose.yaml) logs to stdout only now, and this
+  # tails its container's own Docker json-file log directly off the host
+  # (docs/adr/file-tailing-and-docker-json-logs.md; this demo is that ADR's end-to-end proof).
+  # `containers:` names the fixed `container_name` demo/compose.yaml gives the `nginx` service --
+  # explicit, not `discover: true`, since there's exactly one container to follow and naming it
+  # is clearer than opting into every container on the host. `read_from: beginning` plus the
+  # checkpoint below mean nothing is lost even if nginx logs a request before `logit` first
+  # discovers its container directory.
   nginx_in:
-    type: syslog_in
-    bind: 0.0.0.0:5141
+    type: docker_in
+    containers: [logit-demo-nginx]
+    read_from: beginning
+    checkpoint_path: /var/lib/logit/nginx.checkpoint
+
+  # nginx's own error_log shares the same container (and so the same Docker json-file log) as its
+  # access log, distinguished only by `log.iostream` (`stdout` vs `stderr`) -- `docker_in` itself
+  # has no per-stream filter (deliberately; see the ADR's "Alternatives considered"), so this
+  # inline `lua` stage is the filter, dropping anything that isn't an access line before it ever
+  # reaches `nginx_identity`/`nginx_json` below (an error_log line isn't the JSON `nginx_json`
+  # expects, and would otherwise inflate `web.requests` by one per error line too).
+  nginx_stdout:
+    type: lua
+    sources: [nginx_in]
+    script: |
+      function process(event)
+        if event.attributes["log.iostream"] ~= "stdout" then
+          return nil
+        end
+        return event
+      end
   app_in:
     type: syslog_in
     bind: 0.0.0.0:5142
@@ -94,7 +126,7 @@ components:
       service.namespace: demo
   nginx_identity:
     type: set
-    sources: [nginx_in]
+    sources: [nginx_stdout]
     resource:
       service.name: nginx
       service.namespace: demo

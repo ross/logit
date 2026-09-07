@@ -91,6 +91,10 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 # The bundled Mozilla root set otlp_out's HTTP transport already trusts by default via `reqwest`;
 # promoted to a direct dependency so otlp_out's gRPC transport can use the identical default.
 webpki-roots = "1"
+# tail_in/docker_in's inotify wake source, Linux only (docs/adr/file-tailing-and-docker-json-logs.md).
+# Already present transitively (via `mio`) at this exact version -- a direct, Linux-only dependency
+# on it adds no new crate version to the graph.
+libc = "0.2.189"
 
 [profile.release]
 lto = true

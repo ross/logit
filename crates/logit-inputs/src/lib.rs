@@ -6,10 +6,12 @@
 //! for the trait, not the other way around, so the pipeline runtime never has to know about any
 //! concrete protocol.
 
+pub mod docker;
 pub mod internal;
 pub mod otlp;
 pub mod statsd;
 pub mod syslog;
+pub mod tail;
 pub mod udp;
 
 pub use logit_pipeline::Input;

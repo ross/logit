@@ -111,8 +111,32 @@ services:
       # than failing.
       tempo:
         condition: service_started
+    # `nginx_in` (demo/logit.yaml) tails `nginx`'s own Docker json-file log directly off the host
+    # (`docker_in`, docs/adr/file-tailing-and-docker-json-logs.md) rather than receiving a
+    # `syslog:` stream -- this stack's end-to-end proof for that ADR. Docker's per-container state
+    # directories are `root:root 0710` and the logs `root:root 0640` on a stock install, so
+    # `logit` needs both `user: "0:0"` and the bind mount below; this is real cost specific to
+    # reading the json-file driver directly rather than the docker socket/API (see the ADR's
+    # "Root privileges" section) -- only this one service pays it, and only for this one reason.
+    # **Native Linux Docker Engine only**: rootless Docker uses `~/.local/share/docker/containers`
+    # and Docker Desktop's paths live inside its VM, neither matching `/var/lib/docker/containers`
+    # -- `docker_in`'s own `root:` config field (unset here, so it keeps its stock default) is
+    # where a non-default install would point it instead.
+    user: "0:0"
     volumes:
       - ./logit.yaml:/config.yaml:ro
+      # `:ro`, and deliberately **not** `:z`: an SELinux relabel of the *daemon's own* live state
+      # directory (not a directory this stack owns) would be actively harmful, unlike every other
+      # bind mount in this file. `security_opt` below is the SELinux accommodation instead.
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      # `nginx_in`'s checkpoint (demo/logit.yaml) -- survives a `logit` restart so it resumes
+      # without replaying/losing lines; `docker compose down -v` wipes it along with everything
+      # else this stack persists.
+      - logit_state:/var/lib/logit
+    # Only meaningful on an SELinux host (Fedora/RHEL and derivatives) -- a no-op elsewhere.
+    # Disables SELinux confinement for this one container rather than relabeling the bind mount
+    # above (`:z` would do that, and is exactly what must NOT happen to the daemon's own state).
+    security_opt: ["label=disable"]
     environment:
       INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-logit-demo-token}
     networks:
@@ -240,11 +264,22 @@ services:
   # demo/nginx/nginx.conf's header comment.
   nginx:
     image: docker.io/library/nginx:1.27-alpine
+    # Fixed, not Compose's default `<project>-nginx-<n>` -- `nginx_in` (demo/logit.yaml) names
+    # this container explicitly (`docker_in`'s `containers:`), and a project-derived name would
+    # be one more thing to keep in sync by hand across two files for no benefit.
+    container_name: logit-demo-nginx
+    environment:
+      # Keeps the entrypoint script's own non-JSON startup lines off stdout -- see
+      # demo/nginx/nginx.conf's header comment for why that matters now that `logit` tails this
+      # container's stdout directly.
+      NGINX_ENTRYPOINT_QUIET_LOGS: "1"
     depends_on:
       app:
         condition: service_started
-      logit:
-        condition: service_started
+      # No `logit` dependency any more -- nginx no longer sends it anything directly (no more
+      # `syslog:` destination), and `nginx_in`'s `read_from: beginning` plus its checkpoint mean
+      # nothing is lost even if `nginx` happens to start, and log a few lines, before `logit`
+      # first discovers its container directory.
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:z,ro
     networks: [demo]
@@ -310,3 +345,4 @@ volumes:
   loki_data: {}
   tempo_data: {}
   graph_data: {}
+  logit_state: {}

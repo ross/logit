@@ -274,11 +274,44 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: Option<TlsServerConfig>,
     },
-    /// Tail one or more files as a log source, rotation- and checkpoint-aware.
-    FileTail {
+    /// Tails one or more files as a log source, one line per event -- rotation-, truncation-,
+    /// and checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the
+    /// final path component (e.g. `/var/log/app/*.log`), matching any run of non-`/` characters.
+    /// See `docs/adr/file-tailing-and-docker-json-logs.md`.
+    TailIn {
         paths: Vec<String>,
+        #[serde(flatten)]
+        tail: TailOptions,
+    },
+    /// Tails Docker's json-file container logs (`<root>/<id>/<id>-json.log`) and stamps
+    /// per-container resource attributes read from the sibling `config.v2.json` -- no docker
+    /// socket, no HTTP client. Built on the same driver as [`ComponentKind::TailIn`]. See
+    /// `docs/adr/file-tailing-and-docker-json-logs.md`.
+    DockerIn {
+        /// The Docker daemon's container-state directory. Only the stock native-Linux-Docker
+        /// path is right by default; rootless Docker, Podman, and Docker Desktop all use a
+        /// different layout or log format -- see the ADR's "Alternatives considered".
+        #[serde(default = "default_docker_root")]
+        root: String,
+        /// Container names (the `docker ps` name, without a leading `/`) or id prefixes (at
+        /// least 12 hex characters) to follow. Explicit by default -- a container not named here
+        /// is never tailed, even if it exists under `root` -- so a typo'd or forgotten name is a
+        /// silent no-op rather than an accident that tails every container on the host.
         #[serde(default)]
-        checkpoint_path: Option<String>,
+        containers: Vec<String>,
+        /// Follow every container under `root`, including ones that appear after startup,
+        /// instead of only what `containers` names. `containers` may still be given alongside
+        /// this to document intent, but has no additional filtering effect once set.
+        #[serde(default)]
+        discover: bool,
+        /// Container label keys to stamp as `container.label.<key>` resource attributes. Empty
+        /// by default -- a label's value is operator-controlled data, not `logit`'s to expose
+        /// without being asked, and every key here becomes a permanent entry in the process-wide
+        /// attribute interner (`docs/design/memory.md` §4), so this is opt-in, not "all labels".
+        #[serde(default)]
+        labels: Vec<String>,
+        #[serde(flatten)]
+        tail: TailOptions,
     },
     /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
     LogitIn {
@@ -620,6 +653,116 @@ pub enum ComponentKind {
 
 fn default_max_message_bytes() -> u64 {
     8192
+}
+
+fn default_docker_root() -> String {
+    "/var/lib/docker/containers".to_string()
+}
+
+/// Where a tailed file starts reading the first time it's seen, when no checkpoint entry names
+/// it -- meaningless once a checkpoint entry exists (that always wins; see [`TailOptions::
+/// checkpoint_path`]) and meaningless for a file discovered after startup, which always starts
+/// at [`ReadFrom::Beginning`] regardless of this setting (a file that didn't exist yet has no
+/// "before `logit` started" to skip).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadFrom {
+    /// Skip whatever the file already holds and tail only new lines -- matches `syslog_in`'s own
+    /// receive-only-what-arrives-after-startup behavior for a file present before `logit` starts.
+    #[default]
+    End,
+    /// Replay the file's entire existing content, then continue tailing.
+    Beginning,
+}
+
+/// How a tailed source notices new lines and new/removed files. See
+/// `docs/adr/file-tailing-and-docker-json-logs.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchMode {
+    /// `inotify` where available (Linux only), falling back to `poll` if it can't be set up
+    /// (e.g. an exhausted `fs.inotify.max_user_instances`). The right default everywhere this
+    /// runs today.
+    #[default]
+    Auto,
+    /// Always `inotify`; a startup error on a non-Linux build or if `inotify` can't be set up,
+    /// rather than a silent fallback -- for an operator who wants to know immediately if the low-
+    /// latency path stopped working.
+    Inotify,
+    /// Always the `poll_interval` tick, even on Linux. Higher latency (new data waits up to
+    /// `poll_interval`) but has no OS-specific dependency and works over filesystems (some
+    /// network or FUSE mounts) where `inotify` events don't reliably fire.
+    Poll,
+}
+
+/// Options shared by every tailing listener kind ([`ComponentKind::TailIn`],
+/// [`ComponentKind::DockerIn`]) -- flattened into each variant with `#[serde(flatten)]` rather
+/// than nested under a sub-block, matching [`ReceiveConfig`]'s own flat-fields precedent. Not
+/// `#[serde(deny_unknown_fields)]`: that attribute cannot be combined with `#[serde(flatten)]`
+/// (a serde limitation, not a choice) -- an unrecognized field here is silently ignored, exactly
+/// like every other `ComponentKind` variant today, none of which deny unknown fields either.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct TailOptions {
+    /// Where read offsets are persisted, so a restart resumes instead of replaying or skipping.
+    /// `None` -- the default -- means no checkpoint at all: every restart re-applies `read_from`
+    /// to every file as if it were newly discovered. Resolved against the config file's own
+    /// directory when relative, exactly like `stdio_out`'s `path` target.
+    #[serde(default)]
+    pub checkpoint_path: Option<String>,
+    #[serde(default)]
+    pub read_from: ReadFrom,
+    #[serde(default)]
+    pub watch: WatchMode,
+    /// The read/rescan cadence used as-is under `watch: poll`, and as a reconciliation pass
+    /// under `watch: inotify`/`auto` (catching a rename, a rotation, or an event `inotify`
+    /// missed) -- never disabled, since a wake source alone can't safely be trusted as the only
+    /// path to correctness. Also the busy-loop guard: rejected at `0s` (graph validation).
+    #[serde(default = "default_poll_interval", with = "humantime_serde_duration")]
+    #[schemars(with = "String")]
+    pub poll_interval: Duration,
+    /// How long a dirty (unwritten) checkpoint may sit before being flushed to disk, in addition
+    /// to being flushed on every file close and on shutdown -- deliberately not "every line": a
+    /// checkpoint written that often would dominate the cost of tailing an active file for no
+    /// correctness benefit, since a checkpoint only bounds *how much* a crash can replay, and
+    /// replay itself is always safe (downstream is expected to tolerate a duplicate the same way
+    /// any at-least-once pipeline stage does). Rejected at `0s` (graph validation) for the same
+    /// busy-loop reason as `poll_interval`.
+    #[serde(default = "default_checkpoint_interval", with = "humantime_serde_duration")]
+    #[schemars(with = "String")]
+    pub checkpoint_interval: Duration,
+    /// A line longer than this is dropped whole (not truncated) and diagnosed -- truncating
+    /// would silently hand a downstream JSON parser (`docker_in`'s own envelope, or a `json`
+    /// transform an operator chains after `tail_in`) a value that looks well-formed but isn't
+    /// the real line. A string via [`human_bytes`], exactly like `BufferConfig::max_bytes`.
+    #[serde(default = "default_max_line_bytes", with = "human_bytes")]
+    #[schemars(with = "String")]
+    pub max_line_bytes: u64,
+}
+
+impl Default for TailOptions {
+    fn default() -> Self {
+        Self {
+            checkpoint_path: None,
+            read_from: ReadFrom::default(),
+            watch: WatchMode::default(),
+            poll_interval: default_poll_interval(),
+            checkpoint_interval: default_checkpoint_interval(),
+            max_line_bytes: default_max_line_bytes(),
+        }
+    }
+}
+
+fn default_poll_interval() -> Duration {
+    Duration::from_secs(1)
+}
+
+fn default_checkpoint_interval() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_max_line_bytes() -> u64 {
+    1024 * 1024
 }
 
 /// `Aggregate::gauge_retention`'s default: retention is on by default, at a modest depth --

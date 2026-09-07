@@ -61,6 +61,16 @@ ingest belongs to whatever service sent it (one statsd listener may well serve s
 stamping `logit` there would misattribute it. `otlp_in` gets this for free: it preserves whatever
 resource the sender attached, rather than manufacturing one.
 
+`docker_in` is a third category, alongside "no claim" (`syslog_in`/`statsd_in`) and "genuine
+self-claim" (`internal`): it stamps `container.*` (id, name, image, opt-in labels) because those
+*are* discovered facts about where the data came from, read locally off the container's own
+`config.v2.json` — the same standing `syslog_in`'s parsed hostname already has, not an assertion
+`logit` is making up. It still never claims `service.name`/`service.namespace` on the operator's
+behalf — that stays a `set` transform's job downstream ([ADR
+`operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md)), which
+is exactly what the demo does (`nginx_identity`) — `set`'s `map_resource` overlays onto whatever
+resource it's handed, so `container.*` survives sitting downstream of it untouched.
+
 `influx_out` also sources `self` in the demo, and its encoder folds resource attributes into
 InfluxDB tags (`crates/logit-outputs/src/influxdb.rs`'s `render_tag_suffix`) — so this attribute is
 also a tag on every `logit.*` series. That's why it's `service.name` alone and not
@@ -343,7 +353,7 @@ point every datagram passes through:
 | `logit.component.receive.push.blocked.duration` | timing | only under `overflow: block`, only when a push actually waited |
 | `logit.component.receive.latency` | timing | arrival (`Datagram::received_at`) → dequeue, per datagram — the number that says whether event timestamps are trustworthy under load |
 | `logit.component.datagrams.dropped{reason=...}` / `.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction) |
-| `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown` — a `BatchAccumulator` emission |
+| `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown`/`closed` — a `BatchAccumulator` emission. `closed` (`tail_in`/`docker_in` only) is a single tracked file's own accumulator flushing because that file rotated away or was removed, while the listener itself keeps running — distinct from `shutdown`, the whole component stopping. |
 | `logit.input.receive_buffer.bytes` / `.requested.bytes` | gauge | granted `SO_RCVBUF` after any kernel clamp, and what was actually requested (absent when unset) — sampled once at bind |
 
 Three naming choices worth calling out, since the obvious names collide with existing ones: drops
@@ -378,6 +388,23 @@ Worked examples, one per shipped component:
   separate counter needed, since the bridge already mirrors every occurrence.
 - `syslog_in` (`crates/logit-inputs/src/syslog.rs`): the same pair, `logit.input.datagrams`/
   `.datagram.bytes` — direct parity with `statsd_in`, the other UDP listener.
+- `tail_in`/`docker_in` (`crates/logit-inputs/src/tail/driver.rs`, `docker.rs` — one shared
+  `Tailer<D, F>` driver, [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)):
+  `logit.input.lines` / `.line.bytes` — the read-side parity with `statsd_in`'s per-datagram pair,
+  at line rather than datagram granularity, since a tailed file has no `ReceiveQueue` for the
+  layer-2 table above to instrument. `logit.input.files.open` (gauge, sampled after every `scan`),
+  `.files.rotated` / `.files.truncated` (count — a new inode at a known path, or the same inode
+  shrinking), `.checkpoint.writes` (count — only on an actual write; `checkpoint_interval` ticks
+  that find nothing dirty record nothing), and `.watch.wakes{source="inotify"|"poll"}` /
+  `.watch.overflows` (count — which wake source actually fired, and the `inotify` queue overflowing
+  into a full rescan). `Diagnostics` keys: `bad_line`/`long_line`/`invalid_utf8` (a line that
+  wouldn't decode, exceeded `max_line_bytes`, or needed a lossy UTF-8 conversion),
+  `open_error`/`read_error` (a file this driver is trying to track), `renamed` (a same-inode
+  rebind following a rename), `checkpoint_error` (loading or writing the checkpoint file itself),
+  `watch_error` (`auto` falling back to polling, or a directory watch that failed), and, `docker_in`
+  only, `metadata_error` (`config.v2.json` missing or unparseable — degrades to a `container.id`-
+  only resource rather than refusing to tail) and `bad_time` (the envelope's own `time` field
+  didn't parse — falls back to read time).
 - `aggregate` (`crates/logit-transforms/src/aggregate.rs`): `logit.transform.series.active` and
   `logit.transform.resource.groups`, sampled at the top of `flush` before it touches its own state
   — the peak-of-window series count, which is the visible signal for the cardinality blow-up

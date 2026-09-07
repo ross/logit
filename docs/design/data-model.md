@@ -129,6 +129,22 @@ unchanged nginx line carrying only `request_time` still yield a span. Everything
 computed as `i64` nanoseconds with checked arithmetic — `logit` never rounds a value below the
 precision the source actually offered.
 
+`tail_in`/`docker_in` (`crates/logit-inputs/src/tail/`, `crates/logit-inputs/src/docker.rs`,
+[ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)) stamp two
+more event attributes, and a resource sub-convention of their own:
+
+| Attribute | Value | Meaning |
+|---|---|---|
+| `log.file.path` | `Value::Str` | `tail_in` only. The absolute path of the file this line was read from. |
+| `log.iostream` | `Value::Str`: `stdout`\|`stderr` | `docker_in` only. Which of the container's own two streams this line came from — `docker_in` has no per-stream filter of its own (a downstream stage, e.g. a `lua` component reading this attribute, does that). |
+
+`docker_in`'s resource carries `container.id`, `container.name`, `container.image.name`,
+`container.image.tag` (absent for an untagged/digest reference), and `container.label.<key>` for
+every key named in its `labels:` config (opt-in, never every label — see the ADR's event/resource
+shape section). These are read locally from the sibling `config.v2.json` at open time, once per
+container, never re-read afterward — a `docker rename` after that point is a known gap
+([docs/known-gaps.md](../known-gaps.md)).
+
 ## Record types
 
 The three record types an event can independently carry ([ADR `multi-payload-events`](../adr/multi-payload-events.md)) —

@@ -33,15 +33,20 @@
 //! 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` -- a config error, not
 //!     something to clamp silently.
 //! 17. A non-default `receive:` block is rejected on any kind that is not a datagram listener
-//!     (today `statsd_in`/`syslog_in`) -- `receive:` (`docs/adr/decoupled-listener-io.md`)
-//!     configures a listener's socket-side receive queue, which only a datagram listener has.
-//!     Deliberately **not** `role(&kind) != Role::Listener`: `internal` is a listener by role but
-//!     has no socket, no queue, and no decoder, so `receive:` on it would be a silently-ignored
-//!     setting -- exactly what this rule exists to catch on the sink side (rule 14). A future
-//!     listener kind rejects `receive:` until it is actually wired to the UDP driver.
-//! 18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`,
-//!     `receive.batch_max_events`, or `receive.batch_max_bytes` of `0` is rejected -- an
-//!     impossible bound, the twin of rule 15.
+//!     (today `statsd_in`/`syslog_in`) or a tail listener (`tail_in`/`docker_in`) --
+//!     `receive:` (`docs/adr/decoupled-listener-io.md`) configures a listener's receive-side
+//!     batch assembly, and a datagram listener's socket-side receive queue on top of that. A
+//!     tail listener has no such queue (the tailed file is its own durable buffer), so it may
+//!     only set `receive`'s batch-assembly/shutdown-grace fields -- a queue-bounding field
+//!     (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) is rejected by name on
+//!     one. Deliberately **not** `role(&kind) != Role::Listener`: `internal` is a listener by
+//!     role but has no socket, no queue, and no decoder, so `receive:` on it would be a
+//!     silently-ignored setting -- exactly what this rule exists to catch on the sink side (rule
+//!     14). A future listener kind rejects `receive:` until it is actually wired to one of these
+//!     two drivers.
+//! 18. A datagram listener's `receive.max_datagrams` or `receive.max_bytes` of `0` is rejected;
+//!     a datagram or tail listener's `receive.batch_max_events` or `receive.batch_max_bytes` of
+//!     `0` is rejected -- each an impossible bound, the twin of rule 15.
 //!     `receive.batch_flush_interval: 0s` is **not** rejected: it means "no flush timer," a
 //!     meaningful setting, unlike the count bounds.
 //! 19. A `trace_context` with an empty `trace_id`, `span_id`, or `flags` field name is rejected
@@ -75,6 +80,14 @@
 //! 25. A `trace_context` `span:` block with an empty `name` (OTLP requires a span name) or a
 //!     `max_skew` of `0s` (an impossible window -- every span would be rejected as skewed) is
 //!     rejected (`docs/adr/trace-context-span-lifting.md`).
+//! 26. A `tail_in` with an empty `paths`, an empty `paths` entry, or a `*` outside the final
+//!     path component is rejected (`docs/adr/file-tailing-and-docker-json-logs.md`).
+//! 27. A `docker_in` with an empty `containers` and no `discover: true`, an empty `containers`/
+//!     `labels` entry, a duplicate `containers` entry, or an empty `root` is rejected
+//!     (`docs/adr/file-tailing-and-docker-json-logs.md`).
+//! 28. A `tail_in`/`docker_in` with a `poll_interval`, `checkpoint_interval`, or `max_line_bytes`
+//!     of `0` is rejected -- each would busy-loop, thrash the checkpoint file, or drop every
+//!     line, the same "0 is impossible" reasoning as rule 9.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -116,7 +129,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         StatsdIn { .. }
         | SyslogIn { .. }
         | OtlpIn { .. }
-        | FileTail { .. }
+        | TailIn { .. }
+        | DockerIn { .. }
         | LogitIn { .. }
         | Internal { .. } => Role::Listener,
         Lua { .. }
@@ -162,7 +176,8 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         StatsdIn { .. } => "statsd_in",
         SyslogIn { .. } => "syslog_in",
         OtlpIn { .. } => "otlp_in",
-        FileTail { .. } => "file_tail",
+        TailIn { .. } => "tail_in",
+        DockerIn { .. } => "docker_in",
         LogitIn { .. } => "logit_in",
         Internal { .. } => "internal",
         Lua { .. } => "lua",
@@ -204,6 +219,8 @@ fn is_implemented(kind: &ComponentKind) -> bool {
         ComponentKind::StatsdIn { .. }
             | ComponentKind::SyslogIn { .. }
             | ComponentKind::OtlpIn { .. }
+            | ComponentKind::TailIn { .. }
+            | ComponentKind::DockerIn { .. }
             | ComponentKind::Internal { .. }
             | ComponentKind::Lua { .. }
             | ComponentKind::LuaFile { .. }
@@ -497,22 +514,56 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 17: `receive:` is a datagram-listener-only concept -- see this module's own doc
-    // comment on why this checks a dedicated predicate rather than `role() == Role::Listener`
-    // (which would wrongly also permit `internal`).
+    // Rule 17: `receive:` is a datagram- or tail-listener-only concept -- see this module's own
+    // doc comment on why this checks dedicated predicates rather than `role() == Role::Listener`
+    // (which would wrongly also permit `internal`). A tail listener has no receive *queue* (the
+    // tailed file is its own durable buffer), so it may only set the batch-assembly/shutdown-
+    // grace fields `receive:` also carries -- the queue-bounding fields
+    // (`max_datagrams`/`max_bytes`/`overflow`/`receive_buffer_bytes`) stay datagram-only and are
+    // named individually here, not just rejected as "any non-default field", so the error points
+    // at exactly what doesn't apply rather than making an operator guess.
     for (id, component) in &components {
-        if component.receive != ReceiveConfig::default() && !is_datagram_listener(&component.kind) {
-            anyhow::bail!(
-                "component '{id}': 'receive' is only meaningful on a datagram listener \
-                 (statsd_in, syslog_in), but '{id}' is a {}",
-                role(&component.kind).as_str()
-            );
+        if component.receive == ReceiveConfig::default() {
+            continue;
         }
+        if is_datagram_listener(&component.kind) {
+            continue;
+        }
+        if is_tail_listener(&component.kind) {
+            let default = ReceiveConfig::default();
+            let queue_only_field = if component.receive.max_datagrams != default.max_datagrams {
+                Some("max_datagrams")
+            } else if component.receive.max_bytes != default.max_bytes {
+                Some("max_bytes")
+            } else if component.receive.overflow != default.overflow {
+                Some("overflow")
+            } else if component.receive.receive_buffer_bytes != default.receive_buffer_bytes {
+                Some("receive_buffer_bytes")
+            } else {
+                None
+            };
+            if let Some(field) = queue_only_field {
+                anyhow::bail!(
+                    "component '{id}': 'receive.{field}' is only meaningful on a datagram \
+                     listener (statsd_in, syslog_in) -- a tail listener has no receive queue; \
+                     only receive.batch_max_events, batch_max_bytes, batch_flush_interval, and \
+                     shutdown_grace apply"
+                );
+            }
+            continue;
+        }
+        anyhow::bail!(
+            "component '{id}': 'receive' is only meaningful on a datagram or tail listener \
+             (statsd_in, syslog_in, tail_in, docker_in), but '{id}' is a {}",
+            role(&component.kind).as_str()
+        );
     }
 
-    // Rule 18: the twin of rule 15, for a listener's receive queue -- `0` on any of the four
-    // count/byte bounds is an impossible bound, never a small one. `batch_flush_interval: 0s` is
-    // deliberately not checked here: zero there means "no timer," a meaningful setting.
+    // Rule 18: the twin of rule 15, for a listener's receive-side batch assembly -- `0` on any
+    // of the four count/byte bounds is an impossible bound, never a small one.
+    // `batch_flush_interval: 0s` is deliberately not checked here: zero there means "no timer,"
+    // a meaningful setting. `max_datagrams`/`max_bytes` (the receive *queue*'s own bounds) are
+    // datagram-listener-only, since a tail listener has no such queue (rule 17).
     for (id, component) in &components {
         if is_datagram_listener(&component.kind) {
             if component.receive.max_datagrams == 0 {
@@ -527,6 +578,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      datagram can ever be queued"
                 );
             }
+        }
+        if is_datagram_listener(&component.kind) || is_tail_listener(&component.kind) {
             if component.receive.batch_max_events == 0 {
                 anyhow::bail!(
                     "component '{id}': 'receive.batch_max_events' must be at least 1 -- 0 means \
@@ -537,6 +590,91 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': 'receive.batch_max_bytes' must be at least 1 -- 0 means no \
                      datagram could ever be accumulated"
+                );
+            }
+        }
+    }
+
+    // Rule 26: `tail_in`'s `paths` -- at least one, none empty, and a `*` (this driver's only
+    // wildcard) permitted only in the final path component. An unrestricted `*` (e.g.
+    // `/var/*/app.log`) would make the same glob match a moving set of *directories*, not just
+    // files, which this driver's minimal matcher doesn't attempt to reason about.
+    for (id, component) in &components {
+        if let ComponentKind::TailIn { paths, .. } = &component.kind {
+            if paths.is_empty() {
+                anyhow::bail!("component '{id}': 'paths' must name at least one file");
+            }
+            for path in paths {
+                if path.is_empty() {
+                    anyhow::bail!("component '{id}': 'paths' has an empty entry");
+                }
+                check_tail_glob(id, path)?;
+            }
+        }
+    }
+
+    // Rule 27: `docker_in`'s `containers`/`discover`/`root`/`labels` shape. `containers` empty
+    // and `discover` unset would silently tail nothing -- the same black-hole reasoning rule 7
+    // exists to catch, just not derivable from arity alone here. No empty entry in `containers`/
+    // `labels` (an empty string can never match a real container or a real label key), no
+    // duplicate `containers` entry (a repeated selector is always a config mistake, never
+    // meaningful), and `root` must be non-empty (an empty path would resolve to the process's own
+    // working directory, almost certainly not intended).
+    for (id, component) in &components {
+        if let ComponentKind::DockerIn { root, containers, discover, labels, .. } = &component.kind
+        {
+            if containers.is_empty() && !discover {
+                anyhow::bail!(
+                    "component '{id}': 'containers' must name at least one container, or \
+                     'discover: true' must be set -- otherwise this listener would tail nothing"
+                );
+            }
+            if root.is_empty() {
+                anyhow::bail!("component '{id}': 'root' must not be empty");
+            }
+            let mut seen = std::collections::HashSet::new();
+            for name in containers {
+                if name.is_empty() {
+                    anyhow::bail!("component '{id}': 'containers' has an empty entry");
+                }
+                if !seen.insert(name.as_str()) {
+                    anyhow::bail!("component '{id}': 'containers' has a duplicate entry '{name}'");
+                }
+            }
+            for key in labels {
+                if key.is_empty() {
+                    anyhow::bail!("component '{id}': 'labels' has an empty entry");
+                }
+            }
+        }
+    }
+
+    // Rule 28: a tail listener's timing knobs must be positive -- `0s` on either would busy-loop
+    // (`poll_interval`) or write the checkpoint on every single tick (`checkpoint_interval`), the
+    // same "0 is impossible, not just small" reasoning as rule 9's flush interval.
+    for (id, component) in &components {
+        let tail_options = match &component.kind {
+            ComponentKind::TailIn { tail, .. } => Some(tail),
+            ComponentKind::DockerIn { tail, .. } => Some(tail),
+            _ => None,
+        };
+        if let Some(tail) = tail_options {
+            if tail.poll_interval.is_zero() {
+                anyhow::bail!(
+                    "component '{id}': 'poll_interval' must be greater than 0s -- 0 would \
+                     busy-loop"
+                );
+            }
+            if tail.checkpoint_interval.is_zero() {
+                anyhow::bail!(
+                    "component '{id}': 'checkpoint_interval' must be greater than 0s -- 0 would \
+                     write the checkpoint on every tick"
+                );
+            }
+            if tail.max_line_bytes == 0 {
+                anyhow::bail!(
+                    "component '{id}': 'max_line_bytes' must be greater than 0 -- 0 would drop \
+                     every line"
                 );
             }
         }
@@ -774,6 +912,39 @@ fn is_datagram_listener(kind: &ComponentKind) -> bool {
     matches!(kind, ComponentKind::StatsdIn { .. } | ComponentKind::SyslogIn { .. })
 }
 
+/// The predicate rules 17/18/28 need: which `ComponentKind`s the file-tailing driver
+/// (`docs/adr/file-tailing-and-docker-json-logs.md`, `logit_inputs::tail::Tailer`) backs. A tail
+/// listener has no receive *queue* at all -- the tailed file is its own durable buffer, so only
+/// `receive`'s batch-assembly and shutdown-grace fields apply to it, never the queue-bounding
+/// ones a datagram listener's socket needs (`max_datagrams`, `max_bytes`, `overflow`,
+/// `receive_buffer_bytes`). Kept explicit, alongside [`is_datagram_listener`], rather than
+/// derived from [`Role`] -- the same reasoning: a future listener kind rejects `receive:` until
+/// it is actually wired to one of these two drivers.
+///
+fn is_tail_listener(kind: &ComponentKind) -> bool {
+    matches!(kind, ComponentKind::TailIn { .. } | ComponentKind::DockerIn { .. })
+}
+
+/// Rule 26: rejects a `*` anywhere in `path` except its final `/`-separated component --
+/// `logit_inputs::tail::pattern::PathPattern`'s matcher only ever treats the last component as a
+/// pattern, so a wildcard earlier (`/var/*/app.log`) would silently never match anything rather
+/// than doing what its author probably meant.
+fn check_tail_glob(id: &str, path: &str) -> anyhow::Result<()> {
+    let Some((parent, _last)) = path.rsplit_once('/') else {
+        // No `/` at all isn't a path this driver can use either way, but that's not this rule's
+        // job to say -- an absolute-path requirement is a deployment convention this driver
+        // trusts the operator on, not something graph validation enforces.
+        return Ok(());
+    };
+    if parent.contains('*') {
+        anyhow::bail!(
+            "component '{id}': 'paths' entry {path:?} uses '*' outside the final path \
+             component -- only a trailing '<dir>/<prefix>*<suffix>' pattern is supported"
+        );
+    }
+    Ok(())
+}
+
 /// Kahn's algorithm over the `sources` edges (a source's data flows *into* the component that
 /// names it, so indegree is `sources.len()`). Returns a listener-first order, or a cycle error
 /// naming one concrete cycle recovered from the components still unresolved once no more
@@ -916,6 +1087,23 @@ mod tests {
 
     fn listener() -> ComponentKind {
         ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }
+    }
+
+    fn tail_in(paths: Vec<&str>) -> ComponentKind {
+        ComponentKind::TailIn {
+            paths: paths.into_iter().map(String::from).collect(),
+            tail: logit_config::TailOptions::default(),
+        }
+    }
+
+    fn docker_in(containers: Vec<&str>, discover: bool) -> ComponentKind {
+        ComponentKind::DockerIn {
+            root: "/var/lib/docker/containers".to_string(),
+            containers: containers.into_iter().map(String::from).collect(),
+            discover,
+            labels: Vec::new(),
+            tail: logit_config::TailOptions::default(),
+        }
     }
 
     fn lua() -> ComponentKind {
@@ -2040,7 +2228,10 @@ mod tests {
             ("out", vec!["agg"], sink(), ReceiveConfig::default()),
         ]));
         assert!(err.contains("'agg'"), "got: {err}");
-        assert!(err.contains("'receive' is only meaningful on a datagram listener"), "got: {err}");
+        assert!(
+            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -2050,7 +2241,10 @@ mod tests {
             ("out", vec!["in"], sink(), non_default_receive()),
         ]));
         assert!(err.contains("'out'"), "got: {err}");
-        assert!(err.contains("'receive' is only meaningful on a datagram listener"), "got: {err}");
+        assert!(
+            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            "got: {err}"
+        );
     }
 
     /// The reason rule 17 checks a dedicated predicate rather than `role() == Role::Listener`:
@@ -2064,7 +2258,10 @@ mod tests {
             ("out", vec!["in", "self"], sink(), ReceiveConfig::default()),
         ]));
         assert!(err.contains("'self'"), "got: {err}");
-        assert!(err.contains("'receive' is only meaningful on a datagram listener"), "got: {err}");
+        assert!(
+            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -2160,5 +2357,220 @@ mod tests {
         ]))
         .expect("a zero batch_flush_interval should validate fine -- it means 'no timer'");
         assert_eq!(graph.components["in"].receive.batch_flush_interval, Duration::ZERO);
+    }
+
+    // -- tail_in / docker_in ------------------------------------------------------------------
+
+    #[test]
+    fn a_receive_batch_override_on_a_tail_listener_validates_fine() {
+        let graph = resolve(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                tail_in(vec!["/var/log/app.log"]),
+                ReceiveConfig { batch_max_events: 1, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("batch_max_events is one of the fields a tail listener may override");
+        assert_eq!(graph.components["in"].receive.batch_max_events, 1);
+    }
+
+    #[test]
+    fn a_receive_queue_field_on_a_tail_listener_is_rejected_naming_the_field() {
+        let err = expect_err(cfg_with_receive(vec![
+            ("in", vec![], tail_in(vec!["/var/log/app.log"]), non_default_receive()),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("'receive.max_datagrams'"), "got: {err}");
+        assert!(err.contains("has no receive queue"), "got: {err}");
+    }
+
+    #[test]
+    fn a_zero_batch_max_events_on_a_tail_listener_is_rejected() {
+        let err = expect_err(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                tail_in(vec!["/var/log/app.log"]),
+                ReceiveConfig { batch_max_events: 0, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("batch_max_events"), "got: {err}");
+    }
+
+    #[test]
+    fn tail_in_with_no_paths_is_rejected() {
+        let err =
+            expect_err(cfg(vec![("in", vec![], tail_in(vec![])), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("'paths' must name at least one file"), "got: {err}");
+    }
+
+    #[test]
+    fn tail_in_with_an_empty_paths_entry_is_rejected() {
+        let err =
+            expect_err(cfg(vec![("in", vec![], tail_in(vec![""])), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'paths' has an empty entry"), "got: {err}");
+    }
+
+    #[test]
+    fn tail_in_with_a_star_in_a_directory_component_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], tail_in(vec!["/var/*/app.log"])),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("outside the final path component"), "got: {err}");
+    }
+
+    #[test]
+    fn tail_in_with_a_trailing_star_validates_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], tail_in(vec!["/var/log/app/*.log"])),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("a '*' in only the final path component should validate fine");
+    }
+
+    #[test]
+    fn docker_in_with_explicit_containers_validates_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], docker_in(vec!["nginx"], false)),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("an explicit non-empty containers list should validate fine");
+    }
+
+    #[test]
+    fn docker_in_with_discover_and_no_containers_validates_fine() {
+        resolve(cfg(vec![("in", vec![], docker_in(vec![], true)), ("out", vec!["in"], sink())]))
+            .expect("discover: true alone should validate fine");
+    }
+
+    #[test]
+    fn docker_in_with_no_containers_and_no_discover_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], docker_in(vec![], false)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("must name at least one container"), "got: {err}");
+    }
+
+    #[test]
+    fn docker_in_with_an_empty_containers_entry_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], docker_in(vec![""], false)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("'containers' has an empty entry"), "got: {err}");
+    }
+
+    #[test]
+    fn docker_in_with_a_duplicate_containers_entry_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], docker_in(vec!["nginx", "nginx"], false)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("duplicate entry 'nginx'"), "got: {err}");
+    }
+
+    #[test]
+    fn docker_in_with_an_empty_root_is_rejected() {
+        let mut kind = docker_in(vec!["nginx"], false);
+        if let ComponentKind::DockerIn { root, .. } = &mut kind {
+            *root = String::new();
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'root' must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn docker_in_with_an_empty_labels_entry_is_rejected() {
+        let mut kind = docker_in(vec!["nginx"], false);
+        if let ComponentKind::DockerIn { labels, .. } = &mut kind {
+            labels.push(String::new());
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'labels' has an empty entry"), "got: {err}");
+    }
+
+    #[test]
+    fn a_zero_poll_interval_on_docker_in_is_rejected() {
+        let mut kind = docker_in(vec!["nginx"], false);
+        if let ComponentKind::DockerIn { tail, .. } = &mut kind {
+            tail.poll_interval = Duration::ZERO;
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'poll_interval' must be greater than 0s"), "got: {err}");
+    }
+
+    #[test]
+    fn a_zero_poll_interval_is_rejected() {
+        let err = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                ComponentKind::TailIn {
+                    paths: vec!["/var/log/app.log".to_string()],
+                    tail: logit_config::TailOptions {
+                        poll_interval: Duration::ZERO,
+                        ..logit_config::TailOptions::default()
+                    },
+                },
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("'poll_interval' must be greater than 0s"), "got: {err}");
+    }
+
+    #[test]
+    fn a_zero_checkpoint_interval_on_tail_in_is_rejected() {
+        let err = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                ComponentKind::TailIn {
+                    paths: vec!["/var/log/app.log".to_string()],
+                    tail: logit_config::TailOptions {
+                        checkpoint_interval: Duration::ZERO,
+                        ..logit_config::TailOptions::default()
+                    },
+                },
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("'checkpoint_interval' must be greater than 0s"), "got: {err}");
+    }
+
+    #[test]
+    fn a_zero_max_line_bytes_on_tail_in_is_rejected() {
+        let err = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                ComponentKind::TailIn {
+                    paths: vec!["/var/log/app.log".to_string()],
+                    tail: logit_config::TailOptions {
+                        max_line_bytes: 0,
+                        ..logit_config::TailOptions::default()
+                    },
+                },
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("'max_line_bytes' must be greater than 0"), "got: {err}");
+    }
+
+    #[test]
+    fn kind_name_and_role_are_implemented_for_tail_in_and_docker_in() {
+        assert_eq!(kind_name(&tail_in(vec!["/x"])), "tail_in");
+        assert_eq!(role(&tail_in(vec!["/x"])), Role::Listener);
+        assert_eq!(kind_name(&docker_in(vec!["x"], false)), "docker_in");
+        assert_eq!(role(&docker_in(vec!["x"], false)), Role::Listener);
     }
 }

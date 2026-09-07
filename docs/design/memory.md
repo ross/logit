@@ -867,7 +867,10 @@ tens of megabytes with nothing in the config saying so, and total in-flight memo
 number of graph edges.
 
 This has not bitten anything yet because the datagram size caps batch size in practice. It becomes
-a real problem with a TCP or file-tail input, where nothing caps how many events one read produces.
+a real problem with a TCP input, where nothing caps how many events one read produces --
+`tail_in`/`docker_in` (`docs/adr/file-tailing-and-docker-json-logs.md`) turned out not to be this
+case: each tracked file gets its own `BatchAccumulator` under the same config-visible
+`receive.batch_max_events`/`batch_max_bytes` bound a UDP listener already uses.
 
 The byte-aware bound is `EventBatch::estimated_heap_bytes()` (`crates/logit-core/src/event.rs`): a
 deliberately approximate, O(events) walk. The dominant term, added after an initial pass
@@ -1113,8 +1116,8 @@ traffic, which doesn't exist yet and can't be synthesized honestly.
     encoders merge-join instead of clone-and-reinsert). What's left is `json`'s final merge into
     `event.attributes` (the per-key intern step itself is already gone; only the map insertion
     still takes `&str`) and `keep`'s rebuild.
-16. **Byte-aware channel bounds** (§5), before a TCP or file-tail input makes batch size unbounded
-    in practice.
+16. **Byte-aware channel bounds** (§5), before a TCP input makes batch size unbounded in
+    practice (`tail_in`/`docker_in` turned out not to need this after all -- see §5).
 17. **~~Bound the interner~~ — accepted as-is, see §4.** Listeners are private, so the namespace is
     user-controlled; the metric store and `logit`'s own aggregation window both fail earlier and
     harder under the same abuse. Revisit only if a listener stops being private.

@@ -338,8 +338,12 @@ already built that have a known, accepted rough edge.
   remains open is every *other* edge — a transform's outbound batch size is still unbounded, so a
   65 KB syslog datagram parsed into hundreds of events and then re-batched by a downstream transform
   can still produce an oversized batch with nothing in the config saying so, and total in-flight
-  memory still scales with edge count. Becomes real with a TCP or file-tail input feeding a
-  transform directly, where nothing caps how many events one read produces.
+  memory still scales with edge count. Becomes real with a TCP input feeding a transform directly,
+  where nothing caps how many events one read produces -- `tail_in`/`docker_in`
+  (`docs/adr/file-tailing-and-docker-json-logs.md`) turned out *not* to be this case after all:
+  each tracked file gets its own `BatchAccumulator` under the identical config-visible
+  `receive.batch_max_events`/`batch_max_bytes` bound `statsd_in`/`syslog_in` already use, so a
+  busy file's outbound batch is bounded the same way a UDP listener's already is.
 - **`!env` is invisible to `schema/logit.schema.json`** ([ADR `env-yaml-tag`](adr/env-yaml-tag.md)) —
   resolution happens on the parsed YAML tree before serde ever sees it
   (`crates/logit-cli/src/config.rs`), so the schema describes the substituted shape, never the tag
@@ -803,3 +807,55 @@ already built that have a known, accepted rough edge.
   `HttpsConnectorBuilder::with_server_name_resolver` and an equivalent override on the `reqwest`
   side; left out of the initial TLS work to keep it small
   ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)).
+
+- **`docker_in` never notices a `docker rename` after a container's log file is first opened.**
+  `container.name` is read once, from `config.v2.json`, at open time, and never re-read for the
+  life of that file handle — a rename after that point is invisible until the container restarts
+  (a new inode, a fresh `open`). Closing this would mean either watching `config.v2.json` itself
+  (a second file per container to track) or moving to the docker socket/API, which reports renames
+  as events. See [ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md).
+- **`docker_in` only speaks the json-file log driver.** Docker also supports `local`,
+  `journald`, `syslog`, and others as the configured logging driver; none of the others write a
+  per-container file this driver could tail at all. Genuinely different work per driver, not a
+  parameter on this one.
+- **`tail_in`/`docker_in`'s checkpoint identity is `(dev, ino)`, which doesn't survive a bind
+  mount or filesystem migration that preserves content but not inode numbers.** A restored backup,
+  a volume moved to different storage, or a bind mount re-created from a snapshot all resume from
+  the beginning rather than the checkpointed offset — safe (at-least-once still holds), just not
+  the seamless resume the common case gets.
+- **`inotify` doesn't reliably fire over network or FUSE-backed mounts** (NFS chief among them) —
+  `watch: auto` falls back to polling only on outright setup failure, not on a mount type it can't
+  detect in advance, so a config on such a mount should set `watch: poll` explicitly rather than
+  relying on `auto` to notice. `poll_interval` is the only mechanism proven to work everywhere.
+- **`tail_in`/`docker_in`'s `inotify` wake source is Linux-only** — every other platform runs
+  `watch: poll` unconditionally regardless of config, and an explicit `watch: inotify` is a startup
+  error rather than a silent downgrade.
+- **`docker_in`'s timestamps are the one deliberate exception among the tailing decoders to
+  "stamp receipt time."** It uses the json-file envelope's own `time` field (the daemon's
+  same-host clock) instead, since replaying a backlog (`read_from: beginning`, or a fresh
+  container's already-written history) as "now" would misrepresent when those lines actually
+  happened — see the ADR's "docker_in timestamps" section. `tail_in` itself still follows the
+  general rule (read time, matching `syslog_in`'s own precedent) — a plain text line carries no
+  timestamp of its own to trust. Receipt time isn't a repo-wide invariant either: `otlp_in`
+  independently prefers a record's own `time_unix_nano` when the sender set one, falling back to
+  `observed_time_unix_nano` only for the zero "unknown" sentinel — a wire format that carries an
+  origin timestamp is trusted for it.
+- **No per-input stream filter on `docker_in`** — an operator who wants only `stdout` (or only
+  `stderr`) needs a downstream stage reading `log.iostream` themselves (`demo/logit.yaml`'s
+  `nginx_stdout`, an inline `lua` component, is the worked example), not a config field on
+  `docker_in` itself. Considered and set aside alongside named output ports (next entry) — see the
+  ADR's "Alternatives considered".
+- **Named output ports on a component (a listener publishing separate named streams other
+  components subscribe to individually, e.g. `docker_in` publishing `stdout`/`stderr` as two
+  distinct sources) don't exist.** Touches the component graph's core arity/wiring model broadly
+  enough to be its own design, not a `docker_in`-sized increment — deferred when scoping the
+  file-tailing work, revisit if a second, unrelated need for the same shape shows up (a future
+  `splitter`-style component fanning a multi-signal event out into separate logs/metrics/traces
+  streams was the other motivating case raised and set aside at the same time). See the ADR's
+  "Alternatives considered".
+- **`config.v2.json` is an internal Docker daemon format, not a documented public API** — `docker_in`
+  reads it directly (no socket, no HTTP client) because it's already sitting right next to the log
+  file it's already reading, but a Docker version bump could change its shape with no deprecation
+  notice. A missing or unparseable file already degrades gracefully (a `container.id`-only
+  resource, diagnosed `metadata_error`); a *silently reshaped* file that still parses but means
+  something different is the residual risk this doesn't catch.

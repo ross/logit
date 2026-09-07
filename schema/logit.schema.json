@@ -145,19 +145,30 @@
           }
         },
         {
-          "description": "Tail one or more files as a log source, rotation- and checkpoint-aware.",
+          "description": "Tails one or more files as a log source, one line per event -- rotation-, truncation-, and checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final path component (e.g. `/var/log/app/*.log`), matching any run of non-`/` characters. See `docs/adr/file-tailing-and-docker-json-logs.md`.",
           "type": "object",
           "required": [
             "paths",
             "type"
           ],
           "properties": {
+            "checkpoint_interval": {
+              "description": "How long a dirty (unwritten) checkpoint may sit before being flushed to disk, in addition to being flushed on every file close and on shutdown -- deliberately not \"every line\": a checkpoint written that often would dominate the cost of tailing an active file for no correctness benefit, since a checkpoint only bounds *how much* a crash can replay, and replay itself is always safe (downstream is expected to tolerate a duplicate the same way any at-least-once pipeline stage does). Rejected at `0s` (graph validation) for the same busy-loop reason as `poll_interval`.",
+              "default": "5s",
+              "type": "string"
+            },
             "checkpoint_path": {
+              "description": "Where read offsets are persisted, so a restart resumes instead of replaying or skipping. `None` -- the default -- means no checkpoint at all: every restart re-applies `read_from` to every file as if it were newly discovered. Resolved against the config file's own directory when relative, exactly like `stdio_out`'s `path` target.",
               "default": null,
               "type": [
                 "string",
                 "null"
               ]
+            },
+            "max_line_bytes": {
+              "description": "A line longer than this is dropped whole (not truncated) and diagnosed -- truncating would silently hand a downstream JSON parser (`docker_in`'s own envelope, or a `json` transform an operator chains after `tail_in`) a value that looks well-formed but isn't the real line. A string via [`human_bytes`], exactly like `BufferConfig::max_bytes`.",
+              "default": "1048576",
+              "type": "string"
             },
             "paths": {
               "type": "array",
@@ -165,10 +176,111 @@
                 "type": "string"
               }
             },
+            "poll_interval": {
+              "description": "The read/rescan cadence used as-is under `watch: poll`, and as a reconciliation pass under `watch: inotify`/`auto` (catching a rename, a rotation, or an event `inotify` missed) -- never disabled, since a wake source alone can't safely be trusted as the only path to correctness. Also the busy-loop guard: rejected at `0s` (graph validation).",
+              "default": "1s",
+              "type": "string"
+            },
+            "read_from": {
+              "default": "end",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ReadFrom"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "enum": [
-                "file_tail"
+                "tail_in"
+              ]
+            },
+            "watch": {
+              "default": "auto",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/WatchMode"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "Tails Docker's json-file container logs (`<root>/<id>/<id>-json.log`) and stamps per-container resource attributes read from the sibling `config.v2.json` -- no docker socket, no HTTP client. Built on the same driver as [`ComponentKind::TailIn`]. See `docs/adr/file-tailing-and-docker-json-logs.md`.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "checkpoint_interval": {
+              "description": "How long a dirty (unwritten) checkpoint may sit before being flushed to disk, in addition to being flushed on every file close and on shutdown -- deliberately not \"every line\": a checkpoint written that often would dominate the cost of tailing an active file for no correctness benefit, since a checkpoint only bounds *how much* a crash can replay, and replay itself is always safe (downstream is expected to tolerate a duplicate the same way any at-least-once pipeline stage does). Rejected at `0s` (graph validation) for the same busy-loop reason as `poll_interval`.",
+              "default": "5s",
+              "type": "string"
+            },
+            "checkpoint_path": {
+              "description": "Where read offsets are persisted, so a restart resumes instead of replaying or skipping. `None` -- the default -- means no checkpoint at all: every restart re-applies `read_from` to every file as if it were newly discovered. Resolved against the config file's own directory when relative, exactly like `stdio_out`'s `path` target.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "containers": {
+              "description": "Container names (the `docker ps` name, without a leading `/`) or id prefixes (at least 12 hex characters) to follow. Explicit by default -- a container not named here is never tailed, even if it exists under `root` -- so a typo'd or forgotten name is a silent no-op rather than an accident that tails every container on the host.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "discover": {
+              "description": "Follow every container under `root`, including ones that appear after startup, instead of only what `containers` names. `containers` may still be given alongside this to document intent, but has no additional filtering effect once set.",
+              "default": false,
+              "type": "boolean"
+            },
+            "labels": {
+              "description": "Container label keys to stamp as `container.label.<key>` resource attributes. Empty by default -- a label's value is operator-controlled data, not `logit`'s to expose without being asked, and every key here becomes a permanent entry in the process-wide attribute interner (`docs/design/memory.md` §4), so this is opt-in, not \"all labels\".",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "max_line_bytes": {
+              "description": "A line longer than this is dropped whole (not truncated) and diagnosed -- truncating would silently hand a downstream JSON parser (`docker_in`'s own envelope, or a `json` transform an operator chains after `tail_in`) a value that looks well-formed but isn't the real line. A string via [`human_bytes`], exactly like `BufferConfig::max_bytes`.",
+              "default": "1048576",
+              "type": "string"
+            },
+            "poll_interval": {
+              "description": "The read/rescan cadence used as-is under `watch: poll`, and as a reconciliation pass under `watch: inotify`/`auto` (catching a rename, a rotation, or an event `inotify` missed) -- never disabled, since a wake source alone can't safely be trusted as the only path to correctness. Also the busy-loop guard: rejected at `0s` (graph validation).",
+              "default": "1s",
+              "type": "string"
+            },
+            "read_from": {
+              "default": "end",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ReadFrom"
+                }
+              ]
+            },
+            "root": {
+              "description": "The Docker daemon's container-state directory. Only the stock native-Linux-Docker path is right by default; rootless Docker, Podman, and Docker Desktop all use a different layout or log format -- see the ADR's \"Alternatives considered\".",
+              "default": "/var/lib/docker/containers",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "docker_in"
+              ]
+            },
+            "watch": {
+              "default": "auto",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/WatchMode"
+                }
               ]
             }
           }
@@ -1115,6 +1227,25 @@
         "drop_newest"
       ]
     },
+    "ReadFrom": {
+      "description": "Where a tailed file starts reading the first time it's seen, when no checkpoint entry names it -- meaningless once a checkpoint entry exists (that always wins; see [`TailOptions:: checkpoint_path`]) and meaningless for a file discovered after startup, which always starts at [`ReadFrom::Beginning`] regardless of this setting (a file that didn't exist yet has no \"before `logit` started\" to skip).",
+      "oneOf": [
+        {
+          "description": "Skip whatever the file already holds and tail only new lines -- matches `syslog_in`'s own receive-only-what-arrives-after-startup behavior for a file present before `logit` starts.",
+          "type": "string",
+          "enum": [
+            "end"
+          ]
+        },
+        {
+          "description": "Replay the file's entire existing content, then continue tailing.",
+          "type": "string",
+          "enum": [
+            "beginning"
+          ]
+        }
+      ]
+    },
     "ReceiveConfig": {
       "description": "Per-listener receive queue and datagram-\\>batch assembly (`docs/adr/decoupled-listener-io.md`). Meaningful only on a datagram listener (today `statsd_in`/`syslog_in`); graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind, including `internal` (a listener by role, but one with no socket, no queue, and no decoder). Flat, following [`BufferConfig`]'s own `retry_budget`/`retry_max_delay` precedent rather than nesting a `batch:` sub-block -- two levels of optional-with-defaults is harder to scan in YAML than a flat prefix. Every field defaults, so a `receive:` block is never required -- **but an omitted block is not byte-for- byte the pre-ADR `decoupled-listener-io` behavior**, and isn't meant to be: `batch_max_events: 1_000` and `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into batches (up to 1000 events, or up to 100ms of added latency before a send) rather than sending one batch per datagram immediately, matching what every established UDP listener researched for ADR `decoupled-listener-io` does out of the box. A deployment that genuinely needs the old one-send-per- datagram, no-added-latency behavior gets it back explicitly with `batch_max_events: 1`, not by omitting `receive:`.",
       "type": "object",
@@ -1351,6 +1482,32 @@
           "type": "string"
         }
       }
+    },
+    "WatchMode": {
+      "description": "How a tailed source notices new lines and new/removed files. See `docs/adr/file-tailing-and-docker-json-logs.md`.",
+      "oneOf": [
+        {
+          "description": "`inotify` where available (Linux only), falling back to `poll` if it can't be set up (e.g. an exhausted `fs.inotify.max_user_instances`). The right default everywhere this runs today.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        },
+        {
+          "description": "Always `inotify`; a startup error on a non-Linux build or if `inotify` can't be set up, rather than a silent fallback -- for an operator who wants to know immediately if the low- latency path stopped working.",
+          "type": "string",
+          "enum": [
+            "inotify"
+          ]
+        },
+        {
+          "description": "Always the `poll_interval` tick, even on Linux. Higher latency (new data waits up to `poll_interval`) but has no OS-specific dependency and works over filesystems (some network or FUSE mounts) where `inotify` events don't reliably fire.",
+          "type": "string",
+          "enum": [
+            "poll"
+          ]
+        }
+      ]
     }
   }
 }

@@ -25,11 +25,15 @@ by choice (`docs/known-gaps.md`).
 **Status:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a Lua
 enrichment stage, InfluxDB 2.x out, via `logit run <config>`. Since then, `syslog_in` (RFC 3164/5424
 over UDP), `stdio_out`, `syslog_out` (RFC 3164/5424 over UDP or TCP,
-[ADR `syslog-output`](docs/adr/syslog-output.md)), and `otlp_in`/`otlp_out` (OpenTelemetry Protocol for
+[ADR `syslog-output`](docs/adr/syslog-output.md)), `otlp_in`/`otlp_out` (OpenTelemetry Protocol for
 logs, metrics, and traces, over OTLP/HTTP or a hand-rolled OTLP/gRPC transport,
 [ADR `committed-pregenerated-otlp-protobuf`](docs/adr/committed-pregenerated-otlp-protobuf.md)/
-[ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md)) have joined statsd/InfluxDB as implemented
-protocols — `otlp_out` is what carries `logit`'s own internal spans to Tempo in the demo above, and
+[ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md)), and `tail_in`/`docker_in`
+(rotation- and checkpoint-aware file tailing, plus Docker json-file container logs enriched from
+`config.v2.json` — no docker socket,
+[ADR `file-tailing-and-docker-json-logs`](docs/adr/file-tailing-and-docker-json-logs.md)) have joined
+statsd/InfluxDB as implemented protocols — `otlp_out` is what carries `logit`'s own internal spans to
+Tempo in the demo above, and
 `logit` now emits those spans itself, one per pipeline node-visit, deterministically sampled on
 `trace_id` ([ADR `internal-span-emission-and-deterministic-sampling`](docs/adr/internal-span-emission-and-deterministic-sampling.md),
 [docs/plans/otlp-end-to-end.md](docs/plans/otlp-end-to-end.md)). `json`, `kv_metrics`,
@@ -104,7 +108,7 @@ crates/
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution, the node runtime
-  logit-inputs      per-protocol listeners; statsd, syslog
+  logit-inputs      per-protocol listeners; statsd, syslog, otlp, tail (tail_in/docker_in)
   logit-outputs     per-protocol sinks; InfluxDB, stdio, syslog
   logit-transforms  built-in native transform components; aggregate, json, kv_metrics, keep, remove, set, trace_context, scale
   logit-cli         the `logit` binary

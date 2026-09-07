@@ -147,9 +147,11 @@ queue that decouples reading the socket from decoding and batching what it recei
 ([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md)) — the listener-side sibling of the sink delivery
 buffering above. This is what lets a slow or backed-up destination downstream be ridden out without
 the socket itself going unread. It's tunable per listener via a `receive:` block on that component
-(`receive:` is rejected at validation time on anything but a datagram listener) — see the commented
-example in [`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml). Every field
-defaults, so an omitted `receive:` is the values below.
+(`receive:` is rejected at validation time on any kind but a datagram listener or a tail listener
+(`tail_in`/`docker_in`) — and a tail listener has no receive *queue* at all, so only its four
+batch-assembly fields apply; see "Tailing files and Docker logs" below) — see the commented example
+in [`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml). Every field defaults,
+so an omitted `receive:` is the values below.
 
 ### Failure semantics: `drop_oldest`, not `block` — the opposite default from `buffer:`
 
@@ -208,6 +210,80 @@ kernel default before deciding whether to raise it.
   runs on its own loop, this is the number that says whether event timestamps (always receipt time,
   stamped at arrival, never decode time) are still trustworthy under load — a healthy listener keeps
   this small; a climbing value under sustained load means decode is genuinely falling behind.
+
+## Tailing files and Docker logs
+
+`tail_in` reads one or more files line by line; `docker_in` builds on the same driver to tail
+Docker's json-file container logs, enriched with per-container identity read locally from the
+sibling `config.v2.json` — no docker socket, no HTTP client
+([ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)). Both are
+rotation- and truncation-aware, and optionally checkpointed so a restart resumes instead of
+replaying or skipping.
+
+### Root, and a read-only bind mount, for `docker_in`
+
+Docker's per-container state directories are `root:root 0710` and the log files `root:root 0640`
+on a stock install — `docker_in` needs the process to run as root, with the host's
+`/var/lib/docker/containers` (or wherever `root:` points) bind-mounted read-only. This is real,
+unavoidable cost specific to reading the json-file driver directly rather than through the docker
+socket/API (which brokers access via group membership on the socket instead) — see the ADR's "Root
+privileges" section. `demo/compose.yaml`'s `logit` service is the worked example: `user: "0:0"`,
+the bind mount, and (SELinux hosts only) `security_opt: ["label=disable"]` — never `:z` on that
+mount, which would relabel the daemon's own live state, not something this stack owns.
+**Native Linux Docker Engine only**: rootless Docker uses `~/.local/share/docker/containers`,
+Docker Desktop's paths live inside its VM, and Podman uses a different log format entirely — none
+of these match `docker_in`'s `root:` default, which is the only layout this driver understands.
+
+### `read_from`, and why a checkpoint matters more here than for a plain UDP listener
+
+`read_from: end` (the default) skips whatever a file already holds and tails only new lines;
+`read_from: beginning` replays it first. Either way, this only governs a file present at the very
+first scan with no checkpoint entry naming it — a file discovered afterward (a new log, a rotated
+one, a newly-selected container) always starts at its own beginning, since it has nothing "before
+`logit` started" to skip. A checkpoint entry, when present, always wins over `read_from` for the
+file it names.
+
+Optional (`checkpoint_path`, unset by default — every restart re-applies `read_from` as if every
+file were newly discovered), but usually worth setting for `docker_in` specifically: a
+long-running container's log easily exceeds what a re-read-from-end restart would silently skip.
+The checkpoint is written on `checkpoint_interval` (5s default) only when dirty, plus on every
+file close and on shutdown — never per line, so a crash between two writes can replay up to
+`checkpoint_interval` worth of already-emitted lines on restart. This is a deliberate at-least-once
+boundary, the same trade-off `buffer:`'s sink-side retry already makes on the delivery half of this
+pipeline: bounds how much a crash can replay, and replay itself is always safe. Give the
+checkpoint file a persistent volume (`demo/compose.yaml`'s `logit_state`) or it resets on every
+container recreate.
+
+### `watch: auto | inotify | poll`
+
+`auto` (the default) uses `inotify` where available (Linux only) for near-immediate discovery of a
+new or rotated file, falling back to polling (`watch_error` diagnosed) if `inotify` setup fails;
+`poll` always uses the `poll_interval` tick (1s default) instead, with no OS-specific dependency —
+the right choice over some network/FUSE mounts, where `inotify` events don't reliably fire; `inotify`
+fails startup outright on setup failure rather than degrading silently. **This only speeds up
+*discovering* a path** (a new file, a rotation, a truncation) — reading more bytes off an
+already-tracked file is never gated by either the watch mode or `poll_interval`, since the driver's
+own read loop runs on every iteration regardless of what woke it, and an already-open file handle
+simply sees new bytes on its next read.
+
+### What to watch
+
+- `logit.input.files.open` (gauge) — how many files this listener currently has open. Zero when a
+  `docker_in` config's `containers:`/`discover:` selection matches nothing, or a `tail_in` config's
+  `paths:` glob matches no files yet — both silent by design (a directory that doesn't exist yet is
+  the ordinary "not there yet" case, retried next cycle), so this is the number to alert on if
+  "nothing is flowing" needs to be distinguished from "nothing to flow yet."
+- `logit.input.watch.overflows` (count) — the `inotify` event queue overflowed; the driver responds
+  with a full rescan rather than losing track of what changed, but a sustained nonzero rate means
+  `poll_interval` is doing more of the real work than the wake source is.
+- `logit.component.diagnostics{key="long_line"|"truncated"}` (count, via the `Diagnostics` bridge)
+  — a line dropped whole for exceeding `max_line_bytes` (never truncated and passed through — a
+  truncated line would silently hand a downstream JSON parser something that looks well-formed but
+  isn't the real line), or a tracked file's length shrinking underneath it (real, if rare, on a
+  tool that recreates a log file in place rather than renaming it away first).
+- `logit.component.diagnostics{key="metadata_error"}` (`docker_in` only) — a container's
+  `config.v2.json` couldn't be read or parsed; that container's lines still flow, just with a
+  `container.id`-only resource instead of the full identity.
 
 ## Gauge retention
 
