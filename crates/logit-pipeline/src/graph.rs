@@ -88,6 +88,13 @@
 //! 28. A `tail_in`/`docker_in` with a `poll_interval`, `checkpoint_interval`, or `max_line_bytes`
 //!     of `0` is rejected -- each would busy-loop, thrash the checkpoint file, or drop every
 //!     line, the same "0 is impossible" reasoning as rule 9.
+//! 29. A `kv` with an empty `pair_sep` or `kv_sep`, with `pair_sep == kv_sep`, or with a `kv_sep`
+//!     that *contains* `pair_sep`, is rejected. An empty separator makes splitting yield a
+//!     boundary between every character; identical separators mean every segment is split away
+//!     from its own separator, so no line could ever produce a pair; and a `kv_sep` containing
+//!     `pair_sep` can never appear intact inside a segment, since the `pair_sep` split runs
+//!     first -- each is a certain no-op or a certain garbage result, catchable at `logit
+//!     validate` time.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -146,8 +153,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | HasSignal { .. }
         | KeepSignals { .. }
         | DropSignals { .. }
-        | Logfmt
-        | Kv
+        | Logfmt { .. }
+        | Kv { .. }
         | Regex { .. }
         | Csv
         | Rename { .. }
@@ -193,8 +200,8 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         HasSignal { .. } => "has_signal",
         KeepSignals { .. } => "keep_signals",
         DropSignals { .. } => "drop_signals",
-        Logfmt => "logfmt",
-        Kv => "kv",
+        Logfmt { .. } => "logfmt",
+        Kv { .. } => "kv",
         Regex { .. } => "regex",
         Csv => "csv",
         Rename { .. } => "rename",
@@ -235,6 +242,8 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::HasSignal { .. }
             | ComponentKind::KeepSignals { .. }
             | ComponentKind::DropSignals { .. }
+            | ComponentKind::Logfmt { .. }
+            | ComponentKind::Kv { .. }
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::OtlpOut { .. }
             | ComponentKind::StdioOut { .. }
@@ -891,6 +900,36 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 29: `kv`'s separators. An empty `pair_sep` or `kv_sep` makes splitting yield a
+    // boundary between every character; `pair_sep == kv_sep` means every segment is split away
+    // from its own separator, so no line could ever produce a pair; and a `kv_sep` that
+    // *contains* `pair_sep` can never appear intact inside a segment, since the `pair_sep` split
+    // always runs first -- each shape is a certain no-op or a certain garbage result, catchable
+    // here rather than surfacing as silently-wrong output at runtime.
+    for (id, component) in &components {
+        if let ComponentKind::Kv { pair_sep, kv_sep, .. } = &component.kind {
+            if pair_sep.is_empty() {
+                anyhow::bail!("component '{id}': a kv 'pair_sep' must not be empty");
+            }
+            if kv_sep.is_empty() {
+                anyhow::bail!("component '{id}': a kv 'kv_sep' must not be empty");
+            }
+            if pair_sep == kv_sep {
+                anyhow::bail!(
+                    "component '{id}': a kv 'pair_sep' and 'kv_sep' must differ -- identical \
+                     separators mean every segment is split away from its own separator, so no \
+                     line could ever produce a pair"
+                );
+            }
+            if kv_sep.contains(pair_sep.as_str()) {
+                anyhow::bail!(
+                    "component '{id}': a kv 'kv_sep' must not contain 'pair_sep' -- it could \
+                     never appear intact inside a segment, since the 'pair_sep' split runs first"
+                );
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         let Component { sources, buffer, receive, kind } = component;
@@ -1114,6 +1153,18 @@ mod tests {
         ComponentKind::Json { skip_to_brace: false }
     }
 
+    fn logfmt() -> ComponentKind {
+        ComponentKind::Logfmt { bare_keys: false }
+    }
+
+    fn kv(pair_sep: &str, kv_sep: &str) -> ComponentKind {
+        ComponentKind::Kv {
+            pair_sep: pair_sep.to_string(),
+            kv_sep: kv_sep.to_string(),
+            bare_keys: false,
+        }
+    }
+
     fn metric_spec(name: &str, field: Option<&str>) -> logit_config::MetricSpec {
         logit_config::MetricSpec {
             name: name.to_string(),
@@ -1258,6 +1309,68 @@ mod tests {
         ]))
         .expect("should resolve");
         assert_eq!(graph.components["parse"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_logfmt_component_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("parse", vec!["in"], logfmt()),
+            ("out", vec!["parse"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["parse"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_kv_component_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("parse", vec!["in"], kv("&", "=")),
+            ("out", vec!["parse"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["parse"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn kv_with_an_empty_pair_sep_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("parse", vec!["in"], kv("", "=")),
+            ("out", vec!["parse"], sink()),
+        ]));
+        assert!(err.contains("pair_sep") && err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn kv_with_an_empty_kv_sep_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("parse", vec!["in"], kv("&", "")),
+            ("out", vec!["parse"], sink()),
+        ]));
+        assert!(err.contains("kv_sep") && err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn kv_with_identical_separators_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("parse", vec!["in"], kv("=", "=")),
+            ("out", vec!["parse"], sink()),
+        ]));
+        assert!(err.contains("must differ"), "got: {err}");
+    }
+
+    #[test]
+    fn kv_with_a_kv_sep_containing_pair_sep_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("parse", vec!["in"], kv("=", "==")),
+            ("out", vec!["parse"], sink()),
+        ]));
+        assert!(err.contains("must not contain"), "got: {err}");
     }
 
     #[test]
