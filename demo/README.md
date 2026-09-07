@@ -130,6 +130,22 @@ trace — which contains four real spans (haproxy, nginx, and app's, plus `logit
 ones for that request if sampled), arrived at via two different Tempo receivers, not `logit`'s
 internal spans alone.
 
+None of that trace has any real *shape* on its own, though — every request the same chain, the
+same latency, the same `200`. Two routes on `app` exist purely to fix that
+(`docs/plans/demo-richer-traces.md`): `/work` sleeps a jittered amount and occasionally answers a
+real `503`, and `/boom` always fails with an uncaught exception, so its OTel span carries a real
+`exception` event — `trace_context` never mints span *events* on the spans it lifts from a plain
+access log line, so that's the only path to one anywhere in this demo. `/work` also calls back into
+**`nginx`, not `haproxy`** — `pages/views.py`'s `INNER_URL` — deliberately: the request re-enters
+the chain partway rather than from the front door, and the resulting `nginx` server span (still
+`logit`-minted, from the same Docker json-file log) becomes a genuine subtree under `app`'s own
+`requests` CLIENT span rather than a second top-level branch. Two honest side effects worth
+knowing rather than being surprised by: `nginx`'s `web.requests` counter now runs roughly double
+`haproxy`'s (it serves this inner hop too), and its `host` tag gains a second value — `nginx`
+itself, from `proxy_set_header Host $host` on a request whose `Host` genuinely is `nginx`.
+`traffic`'s own loop (`compose.yaml`) drives all of this — weighted toward `/work`, since a
+guaranteed `500` on every cycle would swamp the dashboard's error panel.
+
 The landing page shows two diagrams. The pipeline one (also at `:8080/graph.svg` directly) is
 rendered at startup, not hand-drawn: `graph-dot` runs `logit graph logit.yaml` against the actual
 config this stack is running, `graph-svg` pipes that DOT through real Graphviz

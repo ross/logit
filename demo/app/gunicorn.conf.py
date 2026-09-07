@@ -35,6 +35,7 @@ def post_fork(server, worker):
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.instrumentation.django import DjangoInstrumentor
     from opentelemetry.instrumentation.logging import LoggingInstrumentor
+    from opentelemetry.instrumentation.requests import RequestsInstrumentor
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -79,3 +80,10 @@ def post_fork(server, worker):
     # The default W3C `tracecontext` propagator extracts haproxy's `traceparent` automatically, so
     # this request's server span is a genuine child of haproxy's span with no code here at all.
     DjangoInstrumentor().instrument()
+
+    # `pages/views.py`'s `work` calls back into `nginx` (`docs/plans/demo-richer-traces.md`
+    # workstream B) via the stdlib `requests` library -- this instruments every such call into a
+    # real CLIENT span, and, the mirror of `DjangoInstrumentor` above, injects a fresh `traceparent`
+    # onto the outbound request via the same default W3C propagator, again with no code at the call
+    # site itself.
+    RequestsInstrumentor().instrument()

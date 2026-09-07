@@ -9,4 +9,5 @@ urlpatterns = [
     path("health", views.health, name="health"),
     path("work", views.work, name="work"),
     path("boom", views.boom, name="boom"),
+    path("inner", views.inner, name="inner"),
 ]

@@ -6,4 +6,6 @@ opentelemetry-api
 opentelemetry-sdk
 opentelemetry-instrumentation-django
 opentelemetry-instrumentation-logging
+opentelemetry-instrumentation-requests
 opentelemetry-exporter-otlp-proto-http
+requests

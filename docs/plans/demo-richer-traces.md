@@ -73,7 +73,7 @@ previously-empty panels now have real data.
 
 ## B. Outbound HTTP, back in through nginx
 
-**Status: not started.**
+**Status: landed.**
 
 - `demo/app/requirements.txt` — `requests`, `opentelemetry-instrumentation-requests`.
 - `demo/app/gunicorn.conf.py` — `RequestsInstrumentor().instrument()`.
@@ -84,6 +84,15 @@ previously-empty panels now have real data.
 
 **Done when:** one `/work` trace shows `demo-app` → `requests` CLIENT → a second, logit-minted
 `nginx` server span → `demo-app`'s `/inner` span.
+
+**Verified live** (2026-09-07), `script/demo up --build` through `down -v`: pulled a `/work` trace
+straight from Tempo's `/api/traces` and confirmed the full six-span chain by parent id — haproxy →
+nginx → `demo-app "GET work"` (server) → `demo-app "GET"` (CLIENT, `requests`) → nginx (server, a
+*second* nginx span, logit-minted from the same Docker json-file log) → `demo-app "GET inner"`
+(server). `WEB_CONCURRENCY: 4` confirmed via `gunicorn`'s own startup log (4 workers booted); no
+deadlock across ten back-to-back `/work` requests. `web.requests` in InfluxDB: nginx's total (56)
+now exceeds haproxy's (39) over the same window, and the `host` tag carries both `haproxy:8080`
+and a genuine `nginx` value, exactly as `demo/README.md` now documents.
 
 ---
 

@@ -254,6 +254,18 @@ services:
       # :4318) -- not `logit`. See the comment above and demo/logit.yaml's header comment for why.
       OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf # documentation -- see gunicorn.conf.py's comment
+      # `/work` (pages/views.py) calls back into nginx's own `/inner` -- a container-network name,
+      # unlike GRAFANA_URL above, since this call never leaves the `demo` network. `docs/plans/
+      # demo-richer-traces.md` workstream B: nginx, not haproxy, so this hop takes a different path
+      # than the request that triggered it, while still landing on a tier `logit` mints a real span
+      # from (demo/logit.yaml's `nginx_trace`).
+      INNER_URL: http://nginx/inner
+      # 4, not `gunicorn.conf.py`'s own default of 2 -- `/work` blocks one worker on its own
+      # inbound call to `/inner`, which needs a *different* worker of this same pool to answer. At
+      # 2, two concurrent `/work` requests self-deadlock: both hold a worker waiting on `/inner`,
+      # and neither request the inner call is waiting for can ever be served. `traffic`'s loop
+      # (below) is serial, so 4 is ample headroom, not a value tuned against real concurrency.
+      WEB_CONCURRENCY: "4"
     # No longer published -- haproxy is the front door now.
     volumes:
       - graph_data:/graph:ro
