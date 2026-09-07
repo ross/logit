@@ -29,10 +29,11 @@ use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
 use logit_transforms::{
-    Aggregator, DropSignals as DropSignalsTransform, HasSignal as HasSignalTransform, JsonParser,
-    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, KvMetrics as KvMetricsTransform,
-    MatchMode as TransformMatchMode, Remove as RemoveTransform, Scale as ScaleTransform,
-    Set as SetTransform, SignalSet, SpanLift, TraceContext as TraceContextTransform,
+    Aggregator, CsvParser, DropSignals as DropSignalsTransform, HasSignal as HasSignalTransform,
+    JsonParser, Keep as KeepTransform, KeepSignals as KeepSignalsTransform,
+    KvMetrics as KvMetricsTransform, MatchMode as TransformMatchMode, Remove as RemoveTransform,
+    Scale as ScaleTransform, Set as SetTransform, SignalSet, SpanLift,
+    TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -280,6 +281,11 @@ fn build_spec(
         Json { skip_to_brace } => NodeSpec::Transform(Box::new(
             JsonParser::new(*skip_to_brace)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
+        )),
+        Csv { columns, delimiter } => NodeSpec::Transform(Box::new(
+            CsvParser::new(columns.clone(), *delimiter as u8)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
         )),
         KvMetrics { counters, gauges, distributions } => NodeSpec::Transform(Box::new(
             KvMetricsTransform::new(

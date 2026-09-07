@@ -392,6 +392,26 @@ pub enum ComponentKind {
         #[serde(default)]
         skip_to_brace: bool,
     },
+    /// Splits a log record's message as one CSV row, merging the named columns into the event's
+    /// attributes -- the delimiter-separated sibling of `Json`. See
+    /// `docs/adr/csv-positional-columns.md` for why there is deliberately no header-row mode, why
+    /// every field stays a string, and what happens to a row with the wrong number of fields.
+    Csv {
+        /// Attribute names for each field, left to right -- the schema, declared in config rather
+        /// than read from the data. Required and non-empty; rejected at graph-validation time when
+        /// empty (the same "can only ever be a no-op" rule `KvMetrics`/`Set`/`Scale` already have),
+        /// when any entry is empty (it could never be a useful attribute name), or when two entries
+        /// name the same attribute (the later field would silently overwrite the earlier one on
+        /// every event, leaving one configured column permanently unreachable).
+        columns: Vec<String>,
+        /// The field separator -- one ASCII character. `,` by default; `"\t"` (double-quoted, so
+        /// YAML resolves the escape) for TSV, or `;`/`|`. Rejected at graph-validation time as `"`
+        /// (RFC 4180's quote character, which this parser reads as field framing, not data), as
+        /// `\n`/`\r` (already consumed as line framing by every input), or as any non-ASCII
+        /// character.
+        #[serde(default = "default_csv_delimiter")]
+        delimiter: char,
+    },
     /// Turns attributes already on an event (typically merged there by `json`) into metrics on
     /// that same event. See `docs/adr/kv-metrics-semantics.md` for the skip rules, the
     /// numeric coercion rules, and why there is deliberately no `tags:` field here -- tag
@@ -528,7 +548,6 @@ pub enum ComponentKind {
     Regex {
         pattern: String,
     },
-    Csv,
     Rename {
         from: String,
         to: String,
@@ -763,6 +782,11 @@ fn default_checkpoint_interval() -> Duration {
 
 fn default_max_line_bytes() -> u64 {
     1024 * 1024
+}
+
+/// `Csv::delimiter`'s default -- a plain comma, the overwhelmingly common case.
+fn default_csv_delimiter() -> char {
+    ','
 }
 
 /// `Aggregate::gauge_retention`'s default: retention is on by default, at a modest depth --

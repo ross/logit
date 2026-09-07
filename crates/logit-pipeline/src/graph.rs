@@ -88,6 +88,12 @@
 //! 28. A `tail_in`/`docker_in` with a `poll_interval`, `checkpoint_interval`, or `max_line_bytes`
 //!     of `0` is rejected -- each would busy-loop, thrash the checkpoint file, or drop every
 //!     line, the same "0 is impossible" reasoning as rule 9.
+//! 29. A `csv` with an empty `columns` list, an empty column name, or a duplicate column name is
+//!     rejected, as is a `delimiter` that is `"` (RFC 4180's quote character), `\n`/`\r`
+//!     (already consumed as line framing by every input), or non-ASCII. The empty-list and
+//!     empty-name clauses are the "can only ever be a no-op" rule again; the duplicate clause is
+//!     the "a repeated entry silently doubles rather than erroring" rule applied to columns
+//!     instead of sources.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -137,6 +143,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | LuaFile { .. }
         | Aggregate { .. }
         | Json { .. }
+        | Csv { .. }
         | KvMetrics { .. }
         | Keep { .. }
         | Remove { .. }
@@ -149,7 +156,6 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Logfmt
         | Kv
         | Regex { .. }
-        | Csv
         | Rename { .. }
         | Filter { .. }
         | Sample { .. }
@@ -184,6 +190,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         LuaFile { .. } => "lua_file",
         Aggregate { .. } => "aggregate",
         Json { .. } => "json",
+        Csv { .. } => "csv",
         KvMetrics { .. } => "kv_metrics",
         Keep { .. } => "keep",
         Remove { .. } => "remove",
@@ -196,7 +203,6 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         Logfmt => "logfmt",
         Kv => "kv",
         Regex { .. } => "regex",
-        Csv => "csv",
         Rename { .. } => "rename",
         Filter { .. } => "filter",
         Sample { .. } => "sample",
@@ -226,6 +232,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::LuaFile { .. }
             | ComponentKind::Aggregate { .. }
             | ComponentKind::Json { .. }
+            | ComponentKind::Csv { .. }
             | ComponentKind::KvMetrics { .. }
             | ComponentKind::Keep { .. }
             | ComponentKind::Remove { .. }
@@ -886,6 +893,50 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': a trace_context 'span.max_skew' of 0s would reject every \
                      span as skewed"
+                );
+            }
+        }
+    }
+
+    // Rule 29: a `csv`'s `columns`/`delimiter` shape (`docs/adr/csv-positional-columns.md`). An
+    // empty `columns` list can only ever be a no-op, the same reasoning rules 10-12/19/20 already
+    // apply elsewhere; an empty column name could never be a useful attribute name, the same
+    // reasoning as rule 20's empty scale field name; a duplicate column name would let the later
+    // field silently overwrite the earlier one on every event, leaving one configured column
+    // permanently unreachable -- the "a repeated entry silently doubles rather than erroring" rule
+    // applied to columns instead of sources (rule 4). `delimiter` must be a single ASCII
+    // character, and not `"` (RFC 4180's quote character, which this parser reads as field
+    // framing, not data) or `\n`/`\r` (already consumed as line framing by every input).
+    for (id, component) in &components {
+        if let ComponentKind::Csv { columns, delimiter } = &component.kind {
+            if columns.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a csv with no 'columns' configured can only ever be a no-op"
+                );
+            }
+            if columns.iter().any(|c| c.is_empty()) {
+                anyhow::bail!(
+                    "component '{id}': a csv column name must not be empty -- it could never be \
+                     a useful attribute name"
+                );
+            }
+            let mut seen = std::collections::HashSet::with_capacity(columns.len());
+            for column in columns {
+                if !seen.insert(column.as_str()) {
+                    anyhow::bail!(
+                        "component '{id}': 'columns' names '{column}' twice -- the later field \
+                         would silently overwrite the earlier one, leaving one column unreachable"
+                    );
+                }
+            }
+            if !delimiter.is_ascii() {
+                anyhow::bail!("component '{id}': 'delimiter' must be a single ASCII character");
+            }
+            if matches!(delimiter, '"' | '\n' | '\r') {
+                anyhow::bail!(
+                    "component '{id}': 'delimiter' must not be {delimiter:?} -- '\"' is the \
+                     quote character and '\\n'/'\\r' are line framing every input already \
+                     consumes"
                 );
             }
         }
@@ -1987,6 +2038,126 @@ mod tests {
         ]))
         .expect("should resolve");
         assert_eq!(graph.components["scale"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_csv_with_no_columns_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("csv", vec!["in"], ComponentKind::Csv { columns: vec![], delimiter: ',' }),
+            ("out", vec!["csv"], sink()),
+        ]));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_csv_with_an_empty_column_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "csv",
+                vec!["in"],
+                ComponentKind::Csv {
+                    columns: vec!["a".to_string(), String::new()],
+                    delimiter: ',',
+                },
+            ),
+            ("out", vec!["csv"], sink()),
+        ]));
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn a_csv_with_a_duplicate_column_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "csv",
+                vec!["in"],
+                ComponentKind::Csv {
+                    columns: vec!["a".to_string(), "b".to_string(), "a".to_string()],
+                    delimiter: ',',
+                },
+            ),
+            ("out", vec!["csv"], sink()),
+        ]));
+        assert!(err.contains("twice"), "got: {err}");
+    }
+
+    #[test]
+    fn a_csv_with_a_quote_delimiter_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "csv",
+                vec!["in"],
+                ComponentKind::Csv { columns: vec!["a".to_string()], delimiter: '"' },
+            ),
+            ("out", vec!["csv"], sink()),
+        ]));
+        assert!(err.contains("delimiter"), "got: {err}");
+    }
+
+    #[test]
+    fn a_csv_with_a_newline_delimiter_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "csv",
+                vec!["in"],
+                ComponentKind::Csv { columns: vec!["a".to_string()], delimiter: '\n' },
+            ),
+            ("out", vec!["csv"], sink()),
+        ]));
+        assert!(err.contains("delimiter"), "got: {err}");
+    }
+
+    #[test]
+    fn a_csv_with_a_non_ascii_delimiter_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "csv",
+                vec!["in"],
+                ComponentKind::Csv { columns: vec!["a".to_string()], delimiter: 'é' },
+            ),
+            ("out", vec!["csv"], sink()),
+        ]));
+        assert!(err.contains("ASCII"), "got: {err}");
+    }
+
+    #[test]
+    fn a_csv_with_columns_configured_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "csv",
+                vec!["in"],
+                ComponentKind::Csv {
+                    columns: vec!["remote_addr".to_string(), "status".to_string()],
+                    delimiter: ',',
+                },
+            ),
+            ("out", vec!["csv"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["csv"].role(), Role::Transform);
+        assert_eq!(graph.components["csv"].kind_name(), "csv");
+    }
+
+    #[test]
+    fn a_csv_with_a_tab_delimiter_resolves() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "csv",
+                vec!["in"],
+                ComponentKind::Csv { columns: vec!["a".to_string()], delimiter: '\t' },
+            ),
+            ("out", vec!["csv"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["csv"].role(), Role::Transform);
     }
 
     #[test]

@@ -88,7 +88,7 @@ pub enum ComponentKind {
     KeepSignals { signals: Vec<Signal> },
     // A denylist: clears the listed signals' payloads, keeping the rest.
     DropSignals { signals: Vec<Signal> },
-    // logfmt, kv, regex, csv, rename, filter, sample, throttle, dedup —
+    // logfmt, kv, regex, rename, filter, sample, throttle, dedup —
     // as each lands in logit-transforms, same shape: a `ComponentKind` variant, no `sources`
     // opinion of its own (that lives on `Component`, uniformly).
 
@@ -104,7 +104,7 @@ into one tagged enum creates real collisions — `Otlp { bind }` (a listener) an
 `Logit` variants. Suffixing *every* protocol kind uniformly, not just the two that collide today,
 keeps the rule predictable as more protocols gain a second side — `syslog_out` (RFC 3164/5424 over
 UDP or TCP, `docs/adr/syslog-output.md`) is exactly that case, landing well after `SyslogIn`.
-Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`,
+Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
 `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, and any
 future native transform — take no suffix; there's only ever one direction for a transform to be.
 
@@ -151,7 +151,7 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `otlp_out`, `logit_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
@@ -276,6 +276,11 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     rejected — `poll_interval`/`checkpoint_interval` at `0s` would busy-loop (the same reasoning
     as rule 9's zero `interval`), and `max_line_bytes: 0` would drop every line
     (`docs/adr/file-tailing-and-docker-json-logs.md`).
+29. A `csv` with an empty `columns` list, an empty column name, or a duplicate column name is
+    rejected (the "can only ever be a no-op" and "a repeated entry silently doubles" rules again,
+    the latter applied to columns instead of sources), as is a `delimiter` that is `"` (RFC
+    4180's quote character), `\n`/`\r` (already consumed as line framing by every input), or
+    non-ASCII (`docs/adr/csv-positional-columns.md`).
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that
