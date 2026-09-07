@@ -520,14 +520,30 @@ pub enum ComponentKind {
     DropSignals {
         signals: Vec<Signal>,
     },
+    /// Matches a pattern against a log message (or, with `field:`, a named attribute), turning
+    /// every *named* capture group -- `(?P<name>...)` or `(?<name>...)` -- into an attribute of
+    /// that name; an unnamed group is grouping/alternation only and contributes nothing. See
+    /// `docs/adr/regex-transform.md`. Compiled at graph-validation time, so an invalid pattern (or
+    /// one with no named capture group) is a `logit validate` error, not a run-time surprise.
+    Regex {
+        /// The pattern. Every named capture group becomes an attribute; first match only -- a
+        /// second match would just overwrite the first's attributes under this flat-`AttrMap`
+        /// model. A non-matching line, or one with no `field` attribute, passes through
+        /// unchanged, with no diagnostic -- only `logit.transform.matched{,.skipped}` counters
+        /// (`docs/adr/scale-transform.md`'s "silent skip is documented behavior" precedent).
+        pattern: String,
+        /// The attribute to match against, instead of the log message. Absent (the default) reads
+        /// `log.message`, like `json`. `demo/logit.yaml`'s postgres tier is the case this exists
+        /// for: the SQL statement arrives inside a Postgres jsonlog record, so `json` has already
+        /// lifted it to `attributes.message` by the time a pattern can be run over it.
+        #[serde(default)]
+        field: Option<String>,
+    },
     // The rest of the built-in native transforms -- not implemented yet (`logit-transforms`),
     // carried over as unimplemented `ComponentKind` variants so config referencing one gets a
     // clear "not implemented yet" at validation time rather than a deserialization error.
     Logfmt,
     Kv,
-    Regex {
-        pattern: String,
-    },
     Csv,
     Rename {
         from: String,

@@ -22,8 +22,10 @@ opt-in `span:` block, turning an access log line into a real `SpanRecord` on the
 [ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md)/
 [ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md)), `scale` (multiplying
 named numeric attributes by a constant factor,
-[ADR `scale-transform`](docs/adr/scale-transform.md)), `has_signal`, `keep_signals`, and
-`drop_signals` (`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —
+[ADR `scale-transform`](docs/adr/scale-transform.md)), `has_signal`, `keep_signals`,
+`drop_signals`, and `regex` (named capture groups into attributes, replacing a `lua` component in
+`demo/logit.yaml`'s postgres tier, [ADR `regex-transform`](docs/adr/regex-transform.md))
+(`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises the syslog/InfluxDB
 side together against a real nginx (`examples/nginx/`), and
 [docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside
@@ -214,7 +216,7 @@ crates/
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, syslog
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, regex
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
 ```

@@ -88,6 +88,15 @@
 //! 28. A `tail_in`/`docker_in` with a `poll_interval`, `checkpoint_interval`, or `max_line_bytes`
 //!     of `0` is rejected -- each would busy-loop, thrash the checkpoint file, or drop every
 //!     line, the same "0 is impossible" reasoning as rule 9.
+//! 29. A `regex` `pattern` that doesn't compile, or that declares no named capture group, is
+//!     rejected -- and so is an empty `field` name. The pattern is compiled here, not deferred
+//!     to `build_spec`, so an invalid one is a `logit validate` error rather than a run-time
+//!     surprise. The compiled `Regex` is then dropped and rebuilt in `build_spec`, matching how
+//!     every other kind re-derives from its raw `ComponentKind` -- one `Regex::new` at process
+//!     start is not worth inventing a mechanism for. A pattern with no named group could only
+//!     ever be a no-op; an empty `field` name could never match a real attribute. A duplicate
+//!     capture-group name needs no separate check -- the `regex` crate rejects it at compile
+//!     time already.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -235,6 +244,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::HasSignal { .. }
             | ComponentKind::KeepSignals { .. }
             | ComponentKind::DropSignals { .. }
+            | ComponentKind::Regex { .. }
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::OtlpOut { .. }
             | ComponentKind::StdioOut { .. }
@@ -886,6 +896,31 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': a trace_context 'span.max_skew' of 0s would reject every \
                      span as skewed"
+                );
+            }
+        }
+    }
+
+    // Rule 29: `regex`-specific validation -- an empty `field` name could never match a real
+    // attribute for the same reason rule 19 rejects one on `trace_context`; a pattern that
+    // doesn't compile, or declares no named capture group, can only ever be a no-op (or worse, a
+    // run-time surprise) if left for `build_spec` to discover.
+    for (id, component) in &components {
+        if let ComponentKind::Regex { pattern, field } = &component.kind {
+            if field.as_deref() == Some("") {
+                anyhow::bail!(
+                    "component '{id}': a regex with an empty 'field' name could never match an \
+                     attribute -- omit 'field' to match the log message instead"
+                );
+            }
+            let re = ::regex::Regex::new(pattern).map_err(|err| {
+                anyhow::anyhow!("component '{id}': 'pattern' is not a valid regex: {err}")
+            })?;
+            if !re.capture_names().skip(1).any(|n| n.is_some()) {
+                anyhow::bail!(
+                    "component '{id}': a regex whose 'pattern' declares no named capture group \
+                     can only ever be a no-op -- name the groups you want as attributes, e.g. \
+                     (?P<status>\\d+)"
                 );
             }
         }
@@ -1987,6 +2022,101 @@ mod tests {
         ]))
         .expect("should resolve");
         assert_eq!(graph.components["scale"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_regex_with_a_named_capture_resolves() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "regex",
+                vec!["in"],
+                ComponentKind::Regex {
+                    pattern: r"status=(?P<status>\d+)".to_string(),
+                    field: None,
+                },
+            ),
+            ("out", vec!["regex"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["regex"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_regex_with_a_field_naming_an_attribute_resolves() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "regex",
+                vec!["in"],
+                ComponentKind::Regex {
+                    pattern: r"status=(?P<status>\d+)".to_string(),
+                    field: Some("message".to_string()),
+                },
+            ),
+            ("out", vec!["regex"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["regex"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_regex_with_an_invalid_pattern_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "regex",
+                vec!["in"],
+                ComponentKind::Regex { pattern: "(?P<a>".to_string(), field: None },
+            ),
+            ("out", vec!["regex"], sink()),
+        ]));
+        assert!(err.contains("not a valid regex"), "got: {err}");
+    }
+
+    #[test]
+    fn a_regex_with_no_named_capture_groups_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "regex",
+                vec!["in"],
+                ComponentKind::Regex { pattern: r"(\d+)".to_string(), field: None },
+            ),
+            ("out", vec!["regex"], sink()),
+        ]));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_regex_with_a_duplicate_named_capture_group_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "regex",
+                vec!["in"],
+                ComponentKind::Regex { pattern: "(?P<a>x)(?P<a>y)".to_string(), field: None },
+            ),
+            ("out", vec!["regex"], sink()),
+        ]));
+        assert!(err.contains("not a valid regex"), "got: {err}");
+    }
+
+    #[test]
+    fn a_regex_with_an_empty_field_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "regex",
+                vec!["in"],
+                ComponentKind::Regex {
+                    pattern: r"status=(?P<status>\d+)".to_string(),
+                    field: Some(String::new()),
+                },
+            ),
+            ("out", vec!["regex"], sink()),
+        ]));
+        assert!(err.contains("could never match"), "got: {err}");
     }
 
     #[test]

@@ -88,7 +88,10 @@ pub enum ComponentKind {
     KeepSignals { signals: Vec<Signal> },
     // A denylist: clears the listed signals' payloads, keeping the rest.
     DropSignals { signals: Vec<Signal> },
-    // logfmt, kv, regex, csv, rename, filter, sample, throttle, dedup —
+    // Matches a pattern against a log message (or a named attribute), turning named capture
+    // groups into attributes (docs/adr/regex-transform.md).
+    Regex { pattern: String, field: Option<String> },
+    // logfmt, kv, csv, rename, filter, sample, throttle, dedup —
     // as each lands in logit-transforms, same shape: a `ComponentKind` variant, no `sources`
     // opinion of its own (that lives on `Component`, uniformly).
 
@@ -105,8 +108,9 @@ into one tagged enum creates real collisions — `Otlp { bind }` (a listener) an
 keeps the rule predictable as more protocols gain a second side — `syslog_out` (RFC 3164/5424 over
 UDP or TCP, `docs/adr/syslog-output.md`) is exactly that case, landing well after `SyslogIn`.
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`,
-`remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, and any
-future native transform — take no suffix; there's only ever one direction for a transform to be.
+`remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `regex`,
+and any future native transform — take no suffix; there's only ever one direction for a transform
+to be.
 
 **`interval` stays a per-kind optional field, unchanged from today.** `lua`/`lua_file` already carry
 an optional flush interval (`docs/adr/aggregation-window-semantics.md`); `aggregate` requires

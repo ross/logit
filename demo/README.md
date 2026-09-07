@@ -156,10 +156,11 @@ path. Postgres's own log line for that statement still ends up in Loki carrying 
 id, though, with no SDK on Postgres's side at all: `opentelemetry-instrumentation-psycopg`'s
 sqlcommenter (`enable_commenter=True`, `app/demoproj/telemetry.py`) appends a trailing SQL comment
 carrying `traceparent='...'` to the statement text itself, Postgres logs the whole statement
-verbatim (`log_min_duration_statement=0`), and `postgres_trace_lift` — a five-line `lua` stage in
-`demo/logit.yaml` — regexes that substring back out and hands it to `trace_context` exactly as it
-would a real HTTP header. `postgres_in` (`tail_in`) is this demo's first plain-file tail, not a
-`docker_in` container log — Postgres's own jsonlog rotates into a fresh `postgresql-<timestamp>.json`
+verbatim (`log_min_duration_statement=0`), and `postgres_trace_lift` — a `regex` stage in
+`demo/logit.yaml` (docs/adr/regex-transform.md) — extracts that substring back out and hands it to
+`trace_context` exactly as it would a real HTTP header. `postgres_in` (`tail_in`) is this demo's
+first plain-file tail, not a `docker_in` container log — Postgres's own jsonlog rotates into a
+fresh `postgresql-<timestamp>.json`
 file periodically, so `postgres_in`'s `paths:` glob is doing real, live discovery work, not tailing
 one static file for the life of the stack.
 

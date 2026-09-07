@@ -341,6 +341,53 @@ fn json_parse_wide_json_event() {
     expect_allocs("json: parse + merge 1 wide-JSON event", stats, 1);
 }
 
+/// Three named captures onto a bare event whose `AttrMap` starts empty -- well inside its 8-entry
+/// inline capacity even after the captures land, so nothing spills to the heap.
+/// `docs/adr/regex-transform.md`'s zero-allocation claim: `captures_read` fills a struct-held
+/// `CaptureLocations` rather than allocating a fresh `Captures`, and every capture is
+/// `haystack.slice(start..end)` -- a `Bytes` refcount bump, never a `String`.
+#[test]
+fn regex_capture_into_an_inline_map() {
+    let mut re = fixtures::regex_parser();
+    let resource = fixtures::resource();
+    drop(re.process(&resource, fixtures::sshd_message_event()));
+
+    let event = fixtures::sshd_message_event();
+    let (event, stats) = measure(|| re.process(&resource, event).expect("regex forwards"));
+    assert_eq!(event.attributes.len(), 3, "ssh_user, client_address, client_port");
+    expect_allocs("regex: capture into an inline map", stats, 0);
+}
+
+/// The sshd shape: `syslog_in` has already put six `syslog.*` attributes on the event, so
+/// `regex`'s three captures push the map from 6 to 9 entries -- past `AttrMap`'s 8-entry inline
+/// capacity, spilling to the heap once.
+#[test]
+fn regex_parse_one_event() {
+    let mut re = fixtures::regex_parser();
+    let resource = fixtures::resource();
+    drop(re.process(&resource, fixtures::sshd_event()));
+
+    let event = fixtures::sshd_event();
+    let (event, stats) = measure(|| re.process(&resource, event).expect("regex forwards"));
+    assert_eq!(event.attributes.len(), 9, "6 syslog.* attributes plus 3 captures");
+    expect_allocs("regex: parse 1 event (sshd shape)", stats, 1);
+}
+
+/// A non-matching line: no capture is written, so nothing beyond the transform's own bookkeeping
+/// happens -- confirms the no-match path is exactly as cheap as the design predicts.
+#[test]
+fn regex_no_match_one_event() {
+    let mut re = fixtures::regex_parser();
+    let resource = fixtures::resource();
+    drop(re.process(&resource, fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let attrs_before = event.attributes.len();
+    let (event, stats) = measure(|| re.process(&resource, event).expect("regex forwards"));
+    assert_eq!(event.attributes.len(), attrs_before, "no match, no attribute added");
+    expect_allocs("regex: no match, 1 event", stats, 0);
+}
+
 /// Four metrics attached: one `MetricList` spill (past its single inline slot) and one `bins` Vec
 /// for each of the two single-sample `DDSketch` distributions. That is the cost of describing two
 /// `f64`s -- see `docs/design/memory.md` on `MetricKind::Distribution`.

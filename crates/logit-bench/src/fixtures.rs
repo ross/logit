@@ -18,14 +18,14 @@
 
 use bytes::Bytes;
 use logit_core::{
-    AttrMap, DdSketch, Event, EventBatch, MetricKind, MetricRecord, Resource, SpanEvent, SpanKind,
-    SpanLink, SpanRecord, SpanStatus, Value,
+    AttrMap, BodyFormat, DdSketch, Event, EventBatch, LogRecord, MetricKind, MetricRecord,
+    Resource, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus, Value,
 };
 use logit_inputs::statsd::StatsdDecoder;
 use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
 use logit_proto::Decoder;
-use logit_transforms::{Aggregator, JsonParser, Keep, KvMetrics, MetricSpec, Set};
+use logit_transforms::{Aggregator, JsonParser, Keep, KvMetrics, MetricSpec, RegexParser, Set};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -350,6 +350,51 @@ pub const SSHD_SYSLOG_LINE: &str = "<34>Aug 31 06:52:01 auth-edge-3 sshd[8843]: 
 /// [`nginx_syslog_datagram`].
 pub fn logs_only_syslog_datagram(count: usize) -> Bytes {
     join_lines(SSHD_SYSLOG_LINE, count)
+}
+
+/// `regex`'s fixture: three named captures onto [`SSHD_SYSLOG_LINE`]'s auth-failure shape --
+/// `docs/adr/regex-transform.md`.
+pub fn regex_parser() -> RegexParser {
+    RegexParser::new(
+        r"for invalid user (?P<ssh_user>\S+) from (?P<client_address>\S+) port (?P<client_port>\d+)",
+        None,
+    )
+    .expect("fixture pattern should compile")
+}
+
+/// A bare log event carrying [`SSHD_SYSLOG_LINE`]'s full text as its message, with no attributes
+/// yet -- exercises [`regex_parser`]'s three captures landing while `AttrMap` is still well
+/// inside its 8-entry inline capacity (`crates/logit-bench/tests/allocations.rs`'s
+/// `regex_capture_into_an_inline_map`).
+///
+/// `Bytes::from_static`, not `Value::str` (`Bytes::from(String)`) -- a message that actually
+/// arrives off the wire is always already a `Bytes` slice of a decoder's buffer, never a freshly
+/// heap-allocated, not-yet-shared one. `bytes::Bytes`'s `Vec`-backed representation defers one
+/// allocation to its *first* `slice`/`clone` (promoting from a uniquely-owned buffer to a shared
+/// one) regardless of who calls it -- real, but a property of how this fixture would build the
+/// buffer, not of what `regex` costs. `Bytes::from_static` (like a decoded message already sliced
+/// out of its datagram) carries no such one-time cost, so this fixture isolates the thing it's
+/// named for: `AttrMap` capacity, not buffer provenance.
+pub fn sshd_message_event() -> Event {
+    Event::log(
+        0,
+        AttrMap::new(),
+        LogRecord {
+            message: Value::Str(Bytes::from_static(SSHD_SYSLOG_LINE.as_bytes())),
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+        },
+    )
+}
+
+/// [`SSHD_SYSLOG_LINE`] decoded by `syslog_in` -- six `syslog.*` attributes already on the event
+/// before [`regex_parser`] adds three more captures, pushing past `AttrMap`'s 8-entry inline
+/// capacity (`crates/logit-bench/tests/allocations.rs`'s `regex_parse_one_event`).
+pub fn sshd_event() -> Event {
+    let mut decoder = syslog_decoder();
+    let batch = decoder.decode(logs_only_syslog_datagram(1)).expect("fixture line should decode");
+    batch.events.into_iter().next().expect("fixture line should produce one event")
 }
 
 // -------------------------------------------------------------------------------------------

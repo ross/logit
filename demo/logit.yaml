@@ -93,8 +93,8 @@
 #   diagram above since neither touches haproxy/nginx/app's own listeners:
 #
 #   postgres --jsonlog file--> tail(tail_in)--> postgres_in -> postgres_identity (set)
-#             -> postgres_json (json) -> postgres_trace_lift (lua, regexes a `traceparent` out of
-#             a sqlcommenter-tagged statement) -> postgres_trace (trace_context, no `span:` --
+#             -> postgres_json (json) -> postgres_trace_lift (regex, extracts a `traceparent` out
+#             of a sqlcommenter-tagged statement) -> postgres_trace (trace_context, no `span:` --
 #             demo-app's own psycopg CLIENT span is already real) -> stdout / logs_only -> loki_out
 #
 #   demo-worker --syslog/UDP:5143--> worker_in -> worker_identity (set) -> worker_json (json)
@@ -251,27 +251,18 @@ components:
   # demo/app/gunicorn.conf.py) appends a trailing SQL comment carrying `traceparent='<header>'`
   # (among other, irrelevant keys) to every statement `pages/views.py`'s `work` issues --
   # `log_min_duration_statement=0` (demo/compose.yaml) then logs that statement, comment included,
-  # verbatim into `message`. No native `traceparent` parser exists outside `trace_context` itself
-  # (docs/adr/trace-context-span-lifting.md), so this small `lua` stage's only job is finding that
-  # substring and copying it onto its own `traceparent` attribute -- `trace_context` below then
-  # parses it exactly as it would a real HTTP header. A line with no match (Postgres's own
-  # startup/checkpointer/autovacuum lines, or a statement issued outside a request's span) is
-  # returned unchanged, not dropped -- `trace_context` reports `skipped{reason="missing"}` for
-  # those and passes them through as plain logs, same as any tier's own untraced line.
+  # verbatim into `message`. `regex` (docs/adr/regex-transform.md) extracts it: `field: message`
+  # matches `postgres_json`'s already-lifted `attributes.message` instead of `log.message`, and
+  # the pattern's one named capture, `traceparent`, becomes that same attribute for `trace_context`
+  # below to parse exactly as it would a real HTTP header. A line with no match (Postgres's own
+  # startup/checkpointer/autovacuum lines, or a statement issued outside a request's span) passes
+  # through unchanged, not dropped -- `trace_context` reports `skipped{reason="missing"}` for those
+  # and passes them through as plain logs, same as any tier's own untraced line.
   postgres_trace_lift:
-    type: lua
+    type: regex
     sources: [postgres_json]
-    script: |
-      function process(event)
-        local msg = event.attributes.message
-        if type(msg) == "string" then
-          local tp = string.match(msg, "traceparent='([^']+)'")
-          if tp then
-            event.attributes.traceparent = tp
-          end
-        end
-        return event
-      end
+    field: message
+    pattern: "traceparent='(?P<traceparent>[^']+)'"
   postgres_trace:
     type: trace_context
     sources: [postgres_trace_lift]
