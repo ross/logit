@@ -325,10 +325,15 @@ services:
     # argv entry -- exactly what `-c` needs -- with no compose-side splitting at all. `|` (literal
     # block) inside that one element keeps every line break a real newline, which the shell inside
     # the container treats as a statement separator exactly like `;`.
+    # `/work` repeated three times, not once, so it's the majority of the loop's traffic --
+    # `docs/plans/demo-richer-traces.md` workstream A's whole point is a Tempo/Grafana story worth
+    # looking at, which means enough `/work` traces (jittered latency, an occasional real 503) to
+    # fill in `web.request_time`'s p50/p99 spread and the "Loki: 5xx lines/sec" panel without `/boom`
+    # (a guaranteed 500, kept rare here) dominating either one.
     command:
       - |
         while true; do
-          for p in / /health /graph.svg /missing; do
+          for p in / /health /graph.svg /missing /work /work /work /boom; do
             curl -s -o /dev/null "http://haproxy:8080$$p" || true
             sleep 2
           done

@@ -21,6 +21,13 @@ request span is a real OpenTelemetry span, exported over OTLP straight to Tempo 
 bypassing <code>logit</code> -- not every telemetry leg needs it), alongside its structured
 access log over syslog through <code>logit</code> as usual.</p>
 
+<h2>Generate some traffic by hand</h2>
+<p><code>traffic</code> (demo/compose.yaml) already drives a low-volume loop through these, but
+you can trigger them directly too: <a href="/work">/work</a> (jittered latency, an occasional real
+503) and <a href="/boom">/boom</a> (always a real 500, with a real exception recorded on its
+OpenTelemetry span) -- both give the demo's Tempo traces a shape worth looking at, instead of a
+flat chain of 200s.</p>
+
 <h2>See it in Grafana</h2>
 <ol>
   <li>Open <a href="{{ grafana_url }}">{{ grafana_url }}</a> -- anonymous access is on, no login.</li>

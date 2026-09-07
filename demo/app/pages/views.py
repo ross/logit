@@ -6,6 +6,8 @@ routes plus one more, now behind Django's URL dispatcher, template engine, and
 """
 
 import os
+import random
+import time
 
 from django.http import HttpResponse
 from django.shortcuts import render
@@ -57,3 +59,34 @@ def architecture_svg(request):
 
 def health(request):
     return HttpResponse(b"ok\n", content_type="text/plain; charset=utf-8")
+
+
+# Both views below exist to give the demo's trace a real *shape*: some latency spread, and some
+# real errors -- `docs/plans/demo-richer-traces.md` workstream A. Without them, `traffic`
+# (demo/compose.yaml) only ever produces flat 200s, and two of the shipped dashboard panels
+# ("Loki: 5xx lines/sec", the `web.request_time` p50/p99 pair) plot nothing or a flat line.
+
+
+def work(request):
+    # Jittered, not fixed -- a flat sleep would still leave `web.request_time`'s p50/p99 collapsed
+    # onto one value. Kept short (well under a second): `demo/app/gunicorn.conf.py`'s sync workers
+    # are a shared, finite pool, and workstream B goes on to make this same view issue its own
+    # blocking inbound request, which needs a *different* worker to answer -- long sleeps here
+    # shrink that headroom for no benefit.
+    time.sleep(random.uniform(0.02, 0.25))
+    # A real error path, not a hand-set status code: `SpanStatus::Error` on haproxy's and nginx's
+    # logit-minted spans (demo/haproxy/haproxy.cfg, demo/nginx/nginx.conf) is keyed off the status
+    # actually observed on the wire, so this has to be a genuine 5xx response, not a 200 that
+    # merely claims one in its body.
+    if random.random() < 0.08:
+        return HttpResponse(b"temporarily overloaded\n", status=503)
+    return HttpResponse(b"work done\n", content_type="text/plain; charset=utf-8")
+
+
+def boom(request):
+    # Deliberately uncaught: Django turns this into a 500 with no `try` here to catch it, so the
+    # OTel SDK's own request span (opentelemetry-instrumentation-django,
+    # demo/app/gunicorn.conf.py) records it as a real exception span *event* -- `trace_context`
+    # (crates/logit-transforms/src/trace_context.rs) never mints span events on the spans it lifts
+    # from a plain access log line, so this is the only path to a span event anywhere in this demo.
+    raise RuntimeError("boom: this route always fails, on purpose")
