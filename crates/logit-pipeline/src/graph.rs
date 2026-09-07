@@ -82,12 +82,12 @@
 //!     rejected (`docs/adr/trace-context-span-lifting.md`).
 //! 26. A `tail_in` with an empty `paths`, an empty `paths` entry, or a `*` outside the final
 //!     path component is rejected (`docs/adr/file-tailing-and-docker-json-logs.md`).
-//! 27. Reserved for `docker_in`'s `containers`/`discover`/`root`/`labels` shape -- lands with
-//!     `docker_in`'s own implementation (`is_implemented` rejects every `docker_in` config
-//!     before this point today, the same way it did `file_tail` before `tail_in` existed).
-//! 28. A `tail_in` with a `poll_interval`, `checkpoint_interval`, or `max_line_bytes` of `0` is
-//!     rejected -- each would busy-loop, thrash the checkpoint file, or drop every line, the
-//!     same "0 is impossible" reasoning as rule 9. Extends to `docker_in` alongside rule 27.
+//! 27. A `docker_in` with an empty `containers` and no `discover: true`, an empty `containers`/
+//!     `labels` entry, a duplicate `containers` entry, or an empty `root` is rejected
+//!     (`docs/adr/file-tailing-and-docker-json-logs.md`).
+//! 28. A `tail_in`/`docker_in` with a `poll_interval`, `checkpoint_interval`, or `max_line_bytes`
+//!     of `0` is rejected -- each would busy-loop, thrash the checkpoint file, or drop every
+//!     line, the same "0 is impossible" reasoning as rule 9.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -220,6 +220,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::SyslogIn { .. }
             | ComponentKind::OtlpIn { .. }
             | ComponentKind::TailIn { .. }
+            | ComponentKind::DockerIn { .. }
             | ComponentKind::Internal { .. }
             | ComponentKind::Lua { .. }
             | ComponentKind::LuaFile { .. }
@@ -612,19 +613,49 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 27 (`docker_in`'s `containers`/`discover`/`root`/`labels` shape) is not implemented
-    // yet -- `docker_in` isn't in `is_implemented` until it has a real driver behind it, and
-    // rule 8 above already bails on any config referencing it before this point could ever run.
-    // Lands alongside `is_implemented`'s `DockerIn` arm (`docs/adr/file-tailing-and-docker-json-
-    // logs.md`), the same way `FileTail` carried no kind-specific validation while unimplemented.
+    // Rule 27: `docker_in`'s `containers`/`discover`/`root`/`labels` shape. `containers` empty
+    // and `discover` unset would silently tail nothing -- the same black-hole reasoning rule 7
+    // exists to catch, just not derivable from arity alone here. No empty entry in `containers`/
+    // `labels` (an empty string can never match a real container or a real label key), no
+    // duplicate `containers` entry (a repeated selector is always a config mistake, never
+    // meaningful), and `root` must be non-empty (an empty path would resolve to the process's own
+    // working directory, almost certainly not intended).
+    for (id, component) in &components {
+        if let ComponentKind::DockerIn { root, containers, discover, labels, .. } = &component.kind
+        {
+            if containers.is_empty() && !discover {
+                anyhow::bail!(
+                    "component '{id}': 'containers' must name at least one container, or \
+                     'discover: true' must be set -- otherwise this listener would tail nothing"
+                );
+            }
+            if root.is_empty() {
+                anyhow::bail!("component '{id}': 'root' must not be empty");
+            }
+            let mut seen = std::collections::HashSet::new();
+            for name in containers {
+                if name.is_empty() {
+                    anyhow::bail!("component '{id}': 'containers' has an empty entry");
+                }
+                if !seen.insert(name.as_str()) {
+                    anyhow::bail!("component '{id}': 'containers' has a duplicate entry '{name}'");
+                }
+            }
+            for key in labels {
+                if key.is_empty() {
+                    anyhow::bail!("component '{id}': 'labels' has an empty entry");
+                }
+            }
+        }
+    }
 
     // Rule 28: a tail listener's timing knobs must be positive -- `0s` on either would busy-loop
     // (`poll_interval`) or write the checkpoint on every single tick (`checkpoint_interval`), the
-    // same "0 is impossible, not just small" reasoning as rule 9's flush interval. Only `TailIn`
-    // reaches this today -- see [`is_tail_listener`]'s doc comment on why `DockerIn` doesn't yet.
+    // same "0 is impossible, not just small" reasoning as rule 9's flush interval.
     for (id, component) in &components {
         let tail_options = match &component.kind {
             ComponentKind::TailIn { tail, .. } => Some(tail),
+            ComponentKind::DockerIn { tail, .. } => Some(tail),
             _ => None,
         };
         if let Some(tail) = tail_options {
@@ -890,13 +921,8 @@ fn is_datagram_listener(kind: &ComponentKind) -> bool {
 /// derived from [`Role`] -- the same reasoning: a future listener kind rejects `receive:` until
 /// it is actually wired to one of these two drivers.
 ///
-/// `DockerIn` isn't included here yet -- like every unimplemented kind (rule 8 bails on it
-/// before any later rule's loop ever runs), it stays out of every kind-specific rule below until
-/// it's actually implemented and added to [`is_implemented`], the same way `FileTail`
-/// (`TailIn`'s predecessor) carried no kind-specific validation at all while it sat
-/// unimplemented. Extended alongside `is_implemented` when `docker_in` lands.
 fn is_tail_listener(kind: &ComponentKind) -> bool {
-    matches!(kind, ComponentKind::TailIn { .. })
+    matches!(kind, ComponentKind::TailIn { .. } | ComponentKind::DockerIn { .. })
 }
 
 /// Rule 26: rejects a `*` anywhere in `path` except its final `/`-separated component --
@@ -2410,19 +2436,77 @@ mod tests {
         .expect("a '*' in only the final path component should validate fine");
     }
 
-    /// `docker_in` isn't in [`is_implemented`] yet (`docs/adr/file-tailing-and-docker-json-
-    /// logs.md`'s Workstream C) -- rule 8 rejects any config referencing it, before rules
-    /// 26-28's own kind-specific loops (none of which reach a `docker_in` component today) ever
-    /// run. This pins that down explicitly so it fails loudly, not silently, the moment
-    /// `docker_in` is implemented without also updating this test.
     #[test]
-    fn docker_in_is_rejected_as_not_yet_implemented() {
-        let err = expect_err(cfg(vec![
+    fn docker_in_with_explicit_containers_validates_fine() {
+        resolve(cfg(vec![
             ("in", vec![], docker_in(vec!["nginx"], false)),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("an explicit non-empty containers list should validate fine");
+    }
+
+    #[test]
+    fn docker_in_with_discover_and_no_containers_validates_fine() {
+        resolve(cfg(vec![("in", vec![], docker_in(vec![], true)), ("out", vec!["in"], sink())]))
+            .expect("discover: true alone should validate fine");
+    }
+
+    #[test]
+    fn docker_in_with_no_containers_and_no_discover_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], docker_in(vec![], false)),
             ("out", vec!["in"], sink()),
         ]));
         assert!(err.contains("'in'"), "got: {err}");
-        assert!(err.contains("is not implemented yet"), "got: {err}");
+        assert!(err.contains("must name at least one container"), "got: {err}");
+    }
+
+    #[test]
+    fn docker_in_with_an_empty_containers_entry_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], docker_in(vec![""], false)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("'containers' has an empty entry"), "got: {err}");
+    }
+
+    #[test]
+    fn docker_in_with_a_duplicate_containers_entry_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], docker_in(vec!["nginx", "nginx"], false)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("duplicate entry 'nginx'"), "got: {err}");
+    }
+
+    #[test]
+    fn docker_in_with_an_empty_root_is_rejected() {
+        let mut kind = docker_in(vec!["nginx"], false);
+        if let ComponentKind::DockerIn { root, .. } = &mut kind {
+            *root = String::new();
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'root' must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn docker_in_with_an_empty_labels_entry_is_rejected() {
+        let mut kind = docker_in(vec!["nginx"], false);
+        if let ComponentKind::DockerIn { labels, .. } = &mut kind {
+            labels.push(String::new());
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'labels' has an empty entry"), "got: {err}");
+    }
+
+    #[test]
+    fn a_zero_poll_interval_on_docker_in_is_rejected() {
+        let mut kind = docker_in(vec!["nginx"], false);
+        if let ComponentKind::DockerIn { tail, .. } = &mut kind {
+            tail.poll_interval = Duration::ZERO;
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'poll_interval' must be greater than 0s"), "got: {err}");
     }
 
     #[test]

@@ -13,6 +13,7 @@ use crate::config;
 use anyhow::Context;
 use logit_config::{BufferConfig, Config, StdioTarget};
 use logit_core::{Diagnostics, Registry, Telemetry};
+use logit_inputs::docker::{ContainerFilter, DockerInput};
 use logit_inputs::internal::InternalInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::statsd::StatsdInput;
@@ -223,6 +224,23 @@ fn build_spec(
                     TailInput::new(paths, tail_config(tail, &component.receive, base_dir))
                         .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                         .with_telemetry(telemetry.clone()),
+                ),
+                input_runtime_config(&component.receive),
+            )
+        }
+        DockerIn { root, containers, discover, labels, tail } => {
+            let root = base_dir.join(root);
+            let filter = ContainerFilter::new(containers.clone(), *discover);
+            NodeSpec::Input(
+                Box::new(
+                    DockerInput::new(
+                        root,
+                        filter,
+                        labels.clone(),
+                        tail_config(tail, &component.receive, base_dir),
+                    )
+                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                    .with_telemetry(telemetry.clone()),
                 ),
                 input_runtime_config(&component.receive),
             )
@@ -902,6 +920,27 @@ mod tests {
             consumers: vec!["out".to_string()],
             kind: ComponentKind::TailIn {
                 paths: vec!["/var/log/app.log".to_string()],
+                tail: logit_config::TailOptions::default(),
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_docker_input_with_filter_and_labels_wired() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::DockerIn {
+                root: "/var/lib/docker/containers".to_string(),
+                containers: vec!["nginx".to_string()],
+                discover: false,
+                labels: vec!["team".to_string()],
                 tail: logit_config::TailOptions::default(),
             },
         };

@@ -10,7 +10,7 @@ use super::TailConfig;
 use bytes::Bytes;
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
 use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -88,6 +88,7 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     resume: HashMap<FileId, (PathBuf, u64)>,
     diag: Diagnostics,
     telemetry: Telemetry,
+    watched_dirs: HashSet<PathBuf>,
 }
 
 impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
@@ -102,6 +103,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             resume: HashMap::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
+            watched_dirs: HashSet::new(),
         }
     }
 
@@ -141,11 +143,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 return Err(anyhow::anyhow!("setting up file watching: could not proceed"));
             }
         };
-        for pattern in &self.patterns {
-            let _ = watcher.watch_dir(pattern.dir());
-        }
-
-        self.scan(true).await;
+        self.scan(true, &mut watcher).await;
 
         let mut next_poll = tokio::time::Instant::now() + self.config.poll_interval;
         let has_flush_interval = !self.config.batching.flush_interval.is_zero();
@@ -181,12 +179,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     if matches!(wake, super::watch::Wake::Overflow) {
                         self.telemetry.count("logit.input.watch.overflows", 1.0, &[]);
                     }
-                    self.scan(false).await;
+                    self.scan(false, &mut watcher).await;
                 }
                 Outcome::Poll => {
                     self.telemetry.count("logit.input.watch.wakes", 1.0, &[("source", "poll")]);
                     next_poll = tokio::time::Instant::now() + self.config.poll_interval;
-                    self.scan(false).await;
+                    self.scan(false, &mut watcher).await;
                 }
                 Outcome::Flush => {
                     self.flush_all(&sink, FlushReason::Interval).await;
@@ -217,11 +215,32 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         Ok(())
     }
 
+    /// Brings the set of watched directories in line with what the patterns currently reach --
+    /// `watch_dir` on anything newly present, `unwatch_dir` on anything gone. Called at the top of
+    /// every `scan`, before discovery, deliberately: `docker_in`'s log file appears inside a
+    /// container directory a moment *after* the directory itself does, so the directory has to be
+    /// watched on the strength of existing at all, not on already holding a matching file. A no-op
+    /// under `WatchMode::Poll` (both `Watcher` methods are), and effectively a no-op for `tail_in`,
+    /// whose patterns' `watch_dirs()` is always exactly the single `dir()` already watched -- the
+    /// existing `by_path` short-circuit in `InotifyWatcher::watch_dir` makes the repeat call free.
+    fn reconcile_watches(&mut self, watcher: &mut super::watch::Watcher) {
+        let desired: HashSet<PathBuf> =
+            self.patterns.iter().flat_map(PathPattern::watch_dirs).collect();
+        for dir in desired.difference(&self.watched_dirs) {
+            let _ = watcher.watch_dir(dir); // same ignore-the-error policy the startup loop used
+        }
+        for dir in self.watched_dirs.difference(&desired) {
+            watcher.unwatch_dir(dir);
+        }
+        self.watched_dirs = desired;
+    }
+
     /// Discovers matched files, opens newly-seen ones, and reconciles rotation/truncation/
     /// removal for ones already tracked. `first` is `true` only for the very first call --
     /// files present then follow `config.read_from`; every later discovery starts at the
     /// beginning, since a file that didn't exist yet has no "before startup" to skip.
-    async fn scan(&mut self, first: bool) {
+    async fn scan(&mut self, first: bool, watcher: &mut super::watch::Watcher) {
+        self.reconcile_watches(watcher);
         // Copied out up front so it can be read below while `tracked` (borrowed from
         // `self.files`) is live -- the same precedent `open_tracked` already follows for
         // `self.config.batching`.
@@ -266,8 +285,13 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                             // drop, swallows) the first line of the new generation. The held
                             // partial is discarded, not emitted: it's an unterminated fragment,
                             // and emitting it as if it were a whole line is worse than dropping a
-                            // fragment the writer itself never terminated.
+                            // fragment the writer itself never terminated. The decoder can hold
+                            // the exact same kind of cross-line state of its own -- `docker_in`'s
+                            // `DockerDecoder` reassembles a Docker json-file entry split across
+                            // more than one line, in `partial`/`dropping` fields that mirror this
+                            // splitter's own -- so it gets the same reset, for the same reason.
                             tracked.splitter = LineSplitter::new(max_line_bytes);
+                            tracked.decoder.reset();
                             self.diag.warn_throttled(
                                 "truncated",
                                 truncated_message(&path, prev_offset, len),
@@ -1479,7 +1503,7 @@ mod tests {
             LineFactory,
             fast_config(ReadFrom::Beginning),
         );
-        tailer.scan(true).await;
+        tailer.scan(true, &mut crate::tail::watch::Watcher::Poll).await;
         let a = FileId::from_metadata(&std::fs::metadata(dir.join("app.log")).unwrap());
         assert_eq!(tailer.by_path.get(&dir.join("app.log")), Some(&a));
 
