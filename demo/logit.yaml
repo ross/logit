@@ -4,18 +4,20 @@
 # Exercises syslog in, tail_in, docker_in, set + json + lua + trace_context + scale + kv_metrics +
 # keep_signals + keep + aggregate, InfluxDB out, OTLP/HTTP out, OTLP/gRPC out, plus `internal`
 # observing the pipeline itself (ADR `internal-telemetry-as-pipeline-events`, ADR
-# `internal-span-emission-and-deterministic-sampling`) -- against traffic that crosses four real
-# tiers: haproxy -> nginx -> app -> postgres (demo/compose.yaml's `traffic` service drives the
-# first three; docs/plans/demo-tracing-stack.md's workstream A, docs/plans/demo-richer-traces.md's
-# workstream C). Logs and metrics leave `logit` for a real backend (Loki, InfluxDB); traces reach
-# Tempo three ways -- `logit`'s own internal spans via `tempo_out`, haproxy's and nginx's real
-# access-line spans (`docs/adr/trace-context-span-lifting.md`'s `span:` block, also via
-# `tempo_out`), and `demo-app`'s real request and database-client spans going straight to Tempo,
-# deliberately not through `logit` at all (see the comment above `stdout` below) -- not every
-# telemetry leg needs `logit` in front of it, and this demo shows that honestly rather than
-# routing everything through `logit` just to prove it can. `postgres`'s own log lines still carry
-# that same trace id back into Loki, though (`postgres_trace_lift`/`postgres_trace` below) -- a
-# `traceparent` lifted out of a sqlcommenter-tagged SQL statement, not a second SDK.
+# `internal-span-emission-and-deterministic-sampling`) -- against traffic that crosses five real
+# tiers: haproxy -> nginx -> app -> postgres, plus an async worker over Redis
+# (demo/compose.yaml's `traffic` service drives the first three; docs/plans/demo-tracing-stack.md's
+# workstream A, docs/plans/demo-richer-traces.md's workstreams C and D). Logs and metrics leave
+# `logit` for a real backend (Loki, InfluxDB); traces reach Tempo three ways -- `logit`'s own
+# internal spans via `tempo_out`, haproxy's and nginx's real access-line spans (`docs/adr/
+# trace-context-span-lifting.md`'s `span:` block, also via `tempo_out`), and every real SDK-carried
+# span (`demo-app`'s request/database-client/Celery-producer spans, `demo-worker`'s own
+# Celery-consumer/database-client spans) going straight to Tempo, deliberately not through `logit`
+# at all (see the comment above `stdout` below) -- not every telemetry leg needs `logit` in front
+# of it, and this demo shows that honestly rather than routing everything through `logit` just to
+# prove it can. `postgres`'s own log lines still carry that same trace id back into Loki, though
+# (`postgres_trace_lift`/`postgres_trace` below) -- a `traceparent` lifted out of a
+# sqlcommenter-tagged SQL statement, not a second SDK.
 # `otlp_in` (`crates/logit-inputs/src/otlp.rs`) is consequently still unexercised by this demo.
 #
 # Topology:
@@ -35,8 +37,10 @@
 #                                                                              |
 #   demo-app --syslog/UDP:5142--> app_in    -> app_identity     (set) -> app_json     (json)
 #                                                                              |
+#   demo-worker --syslog/UDP:5143--> worker_in -> worker_identity (set) -> worker_json (json)
+#                                                                              |
 #                                                                              v
-#                                            {haproxy,nginx,app}_trace (trace_context) <- lifts
+#                                       {haproxy,nginx,app,worker}_trace (trace_context) <- lifts
 #                                                                 |             trace.id/span.id
 #                                                                 |             onto LogRecord.trace;
 #                                                                 |             haproxy_trace/
@@ -55,7 +59,7 @@
 #                                                                                         v
 #                                                              access_spans (keep_signals: [traces],
 #                                                                             haproxy_trace/nginx_trace only --
-#                                                                             app_trace carries no span)
+#                                                                             app_trace/worker_trace carry no span)
 #                                                                                         |
 #          haproxy_trace                       nginx_trace                               |
 #                |                                   |                                   |
@@ -80,14 +84,22 @@
 #   parented to nginx's span (docs/adr/trace-context-span-lifting.md: nginx now mints and forwards
 #   its own span id, rather than only relaying haproxy's), since the default W3C propagator
 #   extracts whichever `traceparent` it's given regardless of which backend the span is headed for.
+#   demo-worker does the same, straight to the same tempo:4318 -- its own Celery CONSUMER span
+#   parents to demo-app's Celery PRODUCER span (`.delay()`, docs/plans/demo-richer-traces.md
+#   workstream D), which parents to whichever request enqueued it, same propagator, no code either
+#   side of that hop.
 #
-#   A fifth, parallel leg (docs/plans/demo-richer-traces.md workstream C), untied to the diagram
-#   above since it never touches haproxy/nginx/app's own listeners:
+#   Two more parallel legs (docs/plans/demo-richer-traces.md workstreams C and D), untied to the
+#   diagram above since neither touches haproxy/nginx/app's own listeners:
 #
 #   postgres --jsonlog file--> tail(tail_in)--> postgres_in -> postgres_identity (set)
 #             -> postgres_json (json) -> postgres_trace_lift (lua, regexes a `traceparent` out of
 #             a sqlcommenter-tagged statement) -> postgres_trace (trace_context, no `span:` --
 #             demo-app's own psycopg CLIENT span is already real) -> stdout / logs_only -> loki_out
+#
+#   demo-worker --syslog/UDP:5143--> worker_in -> worker_identity (set) -> worker_json (json)
+#             -> worker_trace (trace_context, no `span:` -- the worker's own Celery/psycopg spans
+#             are already real) -> stdout / logs_only -> loki_out
 components:
   haproxy_in:
     type: syslog_in
@@ -126,6 +138,15 @@ components:
     type: syslog_in
     bind: 0.0.0.0:5142
 
+  # The `worker` service's own log line for `pages/tasks.py`'s one task
+  # (docs/plans/demo-richer-traces.md workstream D) -- a separate listener from `app_in`, same
+  # reasoning as every other tier: one `service.name` per batch. Its own OTel spans (Celery
+  # CONSUMER, psycopg CLIENT) go straight to Tempo, exactly like `app`'s -- this listener only
+  # ever sees the one log line `pages/tasks.py`'s `worker_logger` emits per task run.
+  worker_in:
+    type: syslog_in
+    bind: 0.0.0.0:5143
+
   # This demo's first real `tail_in` (docs/plans/demo-richer-traces.md workstream C) -- every
   # other tier so far is `syslog_in` or `docker_in`, `tail_in`'s own Docker-specific sibling.
   # `paths`' `*` is permitted only in the final path component (`crates/logit-config/src/lib.rs`),
@@ -162,6 +183,12 @@ components:
     resource:
       service.name: demo-app
       service.namespace: demo
+  worker_identity:
+    type: set
+    sources: [worker_in]
+    resource:
+      service.name: demo-worker
+      service.namespace: demo
   postgres_identity:
     type: set
     sources: [postgres_in]
@@ -178,6 +205,9 @@ components:
   app_json:
     type: json
     sources: [app_identity]
+  worker_json:
+    type: json
+    sources: [worker_identity]
   # Parses each raw jsonlog line itself -- Postgres already writes one JSON object per line
   # (`log_destination=jsonlog`, demo/compose.yaml), so this needs no field remapping, the same way
   # every other tier's own JSON access line doesn't.
@@ -210,6 +240,12 @@ components:
   app_trace:
     type: trace_context
     sources: [app_json]
+  # No `span:` block, same reasoning as `app_trace` above -- the worker's own spans (Celery
+  # CONSUMER, psycopg CLIENT) are already real (`demoproj/telemetry.py`), so lifting one from this
+  # log line would only be redundant.
+  worker_trace:
+    type: trace_context
+    sources: [worker_json]
 
   # `opentelemetry-instrumentation-psycopg`'s sqlcommenter (`enable_commenter=True`,
   # demo/app/gunicorn.conf.py) appends a trailing SQL comment carrying `traceparent='<header>'`
@@ -249,12 +285,14 @@ components:
   # `docker compose logs -f logit` -- the fastest way to see the pipeline doing something, now one
   # block per tier per request (haproxy's and nginx's carrying a real `span` section too), all
   # three sharing a trace id and differing in span id. The app's own spans don't appear here --
-  # they never reach `logit` (see above). `postgres_trace` joins the other four tiers as a fifth
-  # source -- most of its lines carry no trace at all (Postgres logs far more than one line per
-  # request), and that's expected, not a bug.
+  # they never reach `logit` (see above). `postgres_trace`/`worker_trace` join the other four
+  # tiers -- most of `postgres_trace`'s lines carry no trace at all (Postgres logs far more than
+  # one line per request), and `worker_trace`'s block for a given trace typically arrives well
+  # after the other tiers' own, since the task itself runs after the response already went back
+  # to the client. Both are expected, not bugs.
   stdout:
     type: stdio_out
-    sources: [haproxy_trace, nginx_trace, app_trace, postgres_trace]
+    sources: [haproxy_trace, nginx_trace, app_trace, worker_trace, postgres_trace]
 
   # Loki's OTLP ingestion accepts logs only -- it registers no `TracesService`/`MetricsService` --
   # and `otlp_out` aborts an entire batch's `send` on the first signal request that fails
@@ -268,7 +306,7 @@ components:
   # trip Loki's `send`.
   logs_only:
     type: keep_signals
-    sources: [haproxy_trace, nginx_trace, app_trace, postgres_trace]
+    sources: [haproxy_trace, nginx_trace, app_trace, worker_trace, postgres_trace]
     signals: [logs]
 
   # Logs to Loki, direct over OTLP -- no relay service in between (docs/plans/

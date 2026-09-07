@@ -143,7 +143,7 @@ didn't exist yet. Fixed by adding `depends_on: logit: condition: service_started
 
 ## D. Async work: Redis + a Celery worker
 
-**Status: not started.**
+**Status: landed.**
 
 - `demo/compose.yaml` — `redis:7-alpine`; a `worker` service reusing `logit-demo-app:latest` (no
   second `build:`), running `celery worker`.
@@ -159,6 +159,22 @@ didn't exist yet. Fixed by adding `depends_on: logit: condition: service_started
 **Done when:** `/work`'s trace gains Redis CLIENT + Celery PRODUCER spans, and the worker's
 CONSUMER span and its own DB span arrive under the same trace after the response has already
 returned.
+
+**Verified live** (2026-09-07), `script/demo up --build` through `down -v`: pulled a `/work` trace
+straight from Tempo and confirmed all 12 spans by parent id — the richest trace anywhere in this
+demo. Notably, `opentelemetry-instrumentation-celery` produces a genuine cross-process
+**parent-child** relationship, not a `SpanLink` as this plan originally assumed: `demo-worker`'s
+CONSUMER span (`run/pages.background_work`) parents directly to `demo-app`'s PRODUCER span
+(`apply_async/pages.background_work`), which itself parents to the `/work` request's own server
+span, with a Redis `LPUSH` CLIENT span (the broker publish) as the PRODUCER span's other child and
+the worker's own `psycopg` INSERT nested under its CONSUMER span. Simpler than a link, and no less
+correct. Real temporal proof the trace outlives its response: cross-checking one trace id across
+`logit`'s `stdio_out` showed the worker's own `INSERT` landing ~0.65s *after* `/work`'s haproxy
+access line had already been logged — the response had already reached the client by then. The
+worker's log line reaches Loki with `trace_id` as a genuine stream label, same as every other
+tier. Ten back-to-back `/work` requests and six `/boom` requests produced zero panics/tracebacks
+across `logit`, `app`, and `worker`, and `docker compose ps` showed all twelve containers stable
+(no restart loops) throughout.
 
 ---
 

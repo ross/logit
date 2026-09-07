@@ -14,6 +14,7 @@ from django.http import HttpResponse, JsonResponse
 from django.shortcuts import render
 
 from pages.models import WorkRecord
+from pages.tasks import background_work
 
 GRAFANA_URL = os.environ.get("GRAFANA_URL", "http://localhost:3000")
 
@@ -103,6 +104,16 @@ def work(request):
     # what `demo/logit.yaml`'s `postgres_trace` stage lifts back out of Postgres's own jsonlog.
     WorkRecord.objects.create()
     count = WorkRecord.objects.count()
+
+    # `docs/plans/demo-richer-traces.md` workstream D: hands the rest of the "work" off to a real
+    # background worker, over Redis. `.delay()` is fire-and-forget -- this view never waits on the
+    # result -- but it's still a real Celery PRODUCER span
+    # (opentelemetry-instrumentation-celery, demoproj/telemetry.py) parented to this request's own
+    # span, with a real Redis CLIENT span (opentelemetry-instrumentation-redis) underneath it for
+    # the publish itself. The `worker` service picks it up seconds later, arriving in Tempo well
+    # after this request's own response has already gone back to the client -- one trace whose
+    # spans don't all finish before the HTTP response does.
+    background_work.delay()
 
     # The re-entrant hop `docs/plans/demo-richer-traces.md` workstream B adds: back through nginx
     # (not haproxy -- see `INNER_URL`'s own comment above), giving one trace a real subtree instead

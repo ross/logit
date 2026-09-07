@@ -78,6 +78,19 @@ services:
       - postgres_logs:/var/log/postgresql
     networks: [demo]
 
+  # Celery's broker (`docs/plans/demo-richer-traces.md` workstream D) -- `app`'s `.delay()` and
+  # `worker`'s own consumption both go through here. No persistence configured: this demo has
+  # nothing worth surviving a restart on the broker side, unlike `postgres_data` above.
+  redis:
+    image: docker.io/library/redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks: [demo]
+
   grafana:
     image: docker.io/grafana/grafana:latest
     environment:
@@ -338,8 +351,15 @@ services:
       # exactly the ordering bug this dependency exists to rule out.
       app-migrate:
         condition: service_completed_successfully
+      # `.delay()` (pages/views.py's `work`) publishes to Redis synchronously, in the request
+      # thread -- unlike `tempo`/`logit` above, there's no background retry queue underneath it,
+      # so `service_healthy` here (Redis's own healthcheck is fast: 5s interval, 5s start period)
+      # is worth the small extra startup wait.
+      redis:
+        condition: service_healthy
     environment:
       <<: *postgres-env
+      CELERY_BROKER_URL: redis://redis:6379/0
       # The URL a *browser on the host* uses, not a container-network name.
       GRAFANA_URL: http://localhost:3000
       LOGIT_PORT: "5142" # app_in, not haproxy_in/nginx_in -- see demo/logit.yaml
@@ -363,6 +383,38 @@ services:
     # No longer published -- haproxy is the front door now.
     volumes:
       - graph_data:/graph:ro
+    restart: unless-stopped
+    networks: [demo]
+
+  # The demo's async tier (`docs/plans/demo-richer-traces.md` workstream D) -- `pages/tasks.py`'s
+  # one task, run here, never in a gunicorn worker. Reuses `logit-demo-app:latest` with no second
+  # `build:` of its own, the same trick `app-migrate`/`graph-dot` already use: `--build` builds
+  # every image once, regardless of how many services reference the tag afterward. Its own real
+  # OTel spans (`demoproj/telemetry.py`) go straight to Tempo, exactly like `app`'s -- `logit`
+  # isn't in this leg either, consistent with every other tier's own SDK-carried spans in this
+  # demo.
+  worker:
+    image: logit-demo-app:latest
+    depends_on:
+      redis:
+        condition: service_healthy
+      app-migrate:
+        condition: service_completed_successfully
+      logit:
+        condition: service_started
+      tempo:
+        condition: service_started
+    entrypoint: ["celery", "-A", "demoproj.celery", "worker"]
+    command: ["--loglevel=info", "--concurrency=2"]
+    environment:
+      <<: *postgres-env
+      CELERY_BROKER_URL: redis://redis:6379/0
+      OTEL_SERVICE_NAME: demo-worker
+      # worker_in, not app_in -- pages/tasks.py logs through `demoapp.worker`
+      # (demoproj/settings.py), a separate logger/handler/port from `app`'s own `demoapp.access`.
+      WORKER_LOGIT_PORT: "5143"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
     restart: unless-stopped
     networks: [demo]
 

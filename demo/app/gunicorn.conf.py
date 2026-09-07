@@ -31,70 +31,18 @@ workers = int(os.environ.get("WEB_CONCURRENCY", "2"))
 
 
 def post_fork(server, worker):
-    from opentelemetry import trace
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.instrumentation.django import DjangoInstrumentor
-    from opentelemetry.instrumentation.logging import LoggingInstrumentor
-    from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
-    from opentelemetry.instrumentation.requests import RequestsInstrumentor
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 
-    # `service.name` is what lets Tempo resolve a root service for these spans, the same way
-    # demo/logit.yaml's `internal` component stamps `service.name: logit` on its own.
-    # `service.namespace` matches every other tier's `set` component (demo/logit.yaml) so this
-    # app's spans and its syslog-carried logs agree on identity.
-    resource = Resource.create(
-        {
-            "service.name": os.environ.get("OTEL_SERVICE_NAME", "demo-app"),
-            "service.namespace": "demo",
-        }
-    )
-    provider = TracerProvider(resource=resource, sampler=ALWAYS_ON)
-    # Reads OTEL_EXPORTER_OTLP_ENDPOINT from the environment (demo/compose.yaml: `http://tempo:4318`)
-    # and appends `/v1/traces` itself, per the OTLP exporter spec -- Tempo's own OTLP/HTTP receiver
-    # (demo/tempo/tempo.yaml's `otlp.protocols.http`), not `logit`'s `otlp_in`. Deliberate --
-    # `logit` isn't in this path at all (demo/logit.yaml's header comment explains why); `otlp_in`
-    # stays unexercised by this demo. Protobuf, not OTLP/JSON: this exporter package only ever
-    # speaks protobuf, which Tempo's receiver accepts natively either way.
-    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
-    trace.set_tracer_provider(provider)
+    from demoproj.telemetry import setup
 
-    # Stamps otelTraceID/otelSpanID onto every LogRecord created while a span is active --
-    # demo/app/pages/logging_formatter.py reads those to build the access log's trace_id/span_id
-    # fields. `inject_trace_context=True` is NOT the default -- confirmed by reading this
-    # package's own `_instrument` (both `set_logging_format` and `inject_trace_context` default to
-    # `False`); calling `instrument()` bare leaves every LogRecord exactly as `old_factory` built
-    # it, no `otelTraceID` attribute at all, so demo/app/pages/logging_formatter.py's
-    # `getattr(record, "otelTraceID", None)` silently saw `None` and every access log line shipped
-    # with no trace fields whatsoever. `set_logging_format=False` (still the default): this app
-    # supplies its own formatter rather than asking LoggingInstrumentor to rewrite the root
-    # logger's default format string. `enable_log_auto_instrumentation=False`: this app doesn't
-    # want a second OTel *logs* pipeline (a `LoggerProvider`/log exporter) it never configured --
-    # only the trace-context injection above.
-    LoggingInstrumentor().instrument(
-        inject_trace_context=True, enable_log_auto_instrumentation=False
-    )
+    # Everything but Django's own request-span instrumentation is shared with the Celery worker's
+    # identical `post_fork`-shaped hook (`demoproj/celery.py`'s `worker_process_init`,
+    # `docs/plans/demo-richer-traces.md` workstream D) -- factored into `demoproj/telemetry.py`
+    # rather than duplicated. See that module for what each instrumentor call is for.
+    setup(default_service_name="demo-app")
 
     # The default W3C `tracecontext` propagator extracts haproxy's `traceparent` automatically, so
     # this request's server span is a genuine child of haproxy's span with no code here at all.
+    # Django-specific, so it stays here rather than in the shared `telemetry.setup` -- the worker
+    # never serves HTTP.
     DjangoInstrumentor().instrument()
-
-    # `pages/views.py`'s `work` calls back into `nginx` (`docs/plans/demo-richer-traces.md`
-    # workstream B) via the stdlib `requests` library -- this instruments every such call into a
-    # real CLIENT span, and, the mirror of `DjangoInstrumentor` above, injects a fresh `traceparent`
-    # onto the outbound request via the same default W3C propagator, again with no code at the call
-    # site itself.
-    RequestsInstrumentor().instrument()
-
-    # `docs/plans/demo-richer-traces.md` workstream C: a real driver-level CLIENT span per SQL
-    # statement `pages/views.py`'s `work` issues, and -- via `enable_commenter` -- a `traceparent`
-    # appended to the SQL text itself (sqlcommenter,
-    # https://google.github.io/sqlcommenter/), the same default W3C propagator injecting it as
-    # everywhere else in this file. Postgres logs the whole statement verbatim
-    # (`log_min_duration_statement=0`, demo/compose.yaml), so that `traceparent` lands in
-    # Postgres's own jsonlog -- what `demo/logit.yaml`'s `postgres_trace` stage lifts back out via
-    # a small inline `lua` regex, no SDK on Postgres's side at all.
-    PsycopgInstrumentor().instrument(enable_commenter=True)
