@@ -123,7 +123,9 @@ components:
   # has no per-stream filter (deliberately; see the ADR's "Alternatives considered"), so this
   # inline `lua` stage is the filter, dropping anything that isn't an access line before it ever
   # reaches `nginx_identity`/`nginx_json` below (an error_log line isn't the JSON `nginx_json`
-  # expects, and would otherwise inflate `web.requests` by one per error line too).
+  # expects, and would otherwise inflate `web.requests` by one per error line too). `lua`, not a
+  # native `filter` component -- there isn't one; `logit` ships no native predicate language, and
+  # this five-line stage is the worked example for why (docs/adr/routing-by-condition-is-lua.md).
   nginx_stdout:
     type: lua
     sources: [nginx_in]
