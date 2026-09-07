@@ -65,6 +65,33 @@ impl PathPattern {
         &self.dir
     }
 
+    /// Every directory that must be watched for this pattern to notice a change to something it
+    /// can match. For a literal or wildcard pattern that's exactly [`PathPattern::dir`] -- the file
+    /// lives directly in it. [`Matcher::DockerContainers`] is the exception its two-level walk
+    /// implies: the log file lives one level below `root`, so `root` alone only reveals a
+    /// container's *directory* appearing, never the log file created inside it a moment later, nor
+    /// that file rotating or being truncated. `root` stays in the set regardless -- that's what
+    /// notices a new container directory at all -- with one entry per container subdirectory that
+    /// currently exists. Recomputed each `scan` (`Tailer::scan`), which is what lets a container's
+    /// directory be unwatched again when it goes away.
+    pub fn watch_dirs(&self) -> Vec<PathBuf> {
+        if self.matcher != Matcher::DockerContainers {
+            return vec![self.dir.clone()];
+        }
+        let mut out = vec![self.dir.clone()];
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let Ok(is_dir) = entry.file_type().map(|t| t.is_dir()) else { continue };
+            if !is_dir {
+                continue;
+            }
+            out.push(self.dir.join(entry.file_name()));
+        }
+        out
+    }
+
     fn matches_name(&self, name: &str) -> bool {
         match &self.matcher {
             Matcher::Literal(literal) => name == literal,
@@ -225,5 +252,38 @@ mod tests {
         assert_eq!(p.scan(), Vec::<PathBuf>::new());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn docker_containers_watch_dirs_covers_the_root_and_every_container_directory() {
+        let root = crate::tail::test_support::scratch_dir("pattern-docker-watch-dirs");
+        let id_a = "aaaa000000000000000000000000000000000000000000000000000000000000";
+        let id_b = "bbbb111111111111111111111111111111111111111111111111111111111111";
+        let dir_a = root.join(id_a);
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::write(dir_a.join(format!("{id_a}-json.log")), b"").unwrap();
+        // `id_b` has no log file yet -- this is the load-bearing case: it must still be watched,
+        // since the log file only appears a moment after the directory does.
+        std::fs::create_dir_all(root.join(id_b)).unwrap();
+        // A stray plain file directly under `root` -- must never be treated as a container
+        // directory.
+        std::fs::write(root.join("stray.txt"), b"").unwrap();
+
+        let p = PathPattern::docker_containers(&root);
+        let mut watched = p.watch_dirs();
+        watched.sort();
+        let mut expected = vec![root.clone(), dir_a, root.join(id_b)];
+        expected.sort();
+        assert_eq!(watched, expected);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_wildcard_patterns_watch_dirs_is_just_its_own_directory() {
+        let dir = crate::tail::test_support::scratch_dir("pattern-wildcard-watch-dirs");
+        let p = PathPattern::new(dir.join("*.log"));
+        assert_eq!(p.watch_dirs(), vec![dir.clone()]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

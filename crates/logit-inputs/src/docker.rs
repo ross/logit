@@ -301,6 +301,15 @@ impl TailDecoder for DockerDecoder {
         }
     }
 
+    fn reset(&mut self) {
+        // Both halves of the reassembly state, not just `partial`: a stale `dropping == true`
+        // surviving a truncation silently *swallows* the new generation's first complete entry
+        // (the entry that clears the flag is itself discarded), the mirror of the splicing a
+        // stale `partial` causes.
+        self.partial = None;
+        self.dropping = false;
+    }
+
     fn resource(&self) -> Arc<Resource> {
         self.resource.clone()
     }
@@ -982,6 +991,217 @@ mod tests {
 
         let events = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["hi"]);
+
+        shutdown(tx, handle).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// F1: `PathPattern::docker_containers`'s old `watch_dirs()`-less behavior watched only `root`
+    /// -- a container's own subdirectory (where its log file actually lives) was never watched, so
+    /// under `inotify` the log file's own creation never woke a scan; only the 30s `poll_interval`
+    /// here ever would. `discover: true` -- selection isn't what's under test.
+    #[tokio::test]
+    async fn under_inotify_a_container_log_created_after_its_directory_is_discovered_before_the_poll_interval(
+    ) {
+        let root = scratch_dir("docker-inotify-new-log");
+        let mut config = fast_tail_config();
+        config.watch = WatchMode::Inotify;
+        config.poll_interval = Duration::from_secs(30);
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let filter = ContainerFilter::new(vec![], true);
+        let input = DockerInput::new(root.clone(), filter, vec![], config);
+        let (tx, handle) = spawn(input, fanout);
+
+        // Let the initial scan run (and start watching `root`) against an empty directory before
+        // the container appears at all.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let id = "6".repeat(64);
+        // Directory + config.v2.json only -- no log file yet, exactly the race Docker itself
+        // creates (the container directory appears a moment before the log file inside it).
+        let log_path = container(&root, &id, "web", "nginx:1.25");
+
+        // Long enough that a scan woken only by `root`'s own IN_CREATE (the container directory
+        // appearing) has already run and found no log file -- this delay is what makes the test
+        // fail before the fix, since nothing would then wake a further scan short of the 30s poll.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        std::fs::write(
+            &log_path,
+            format!(
+                "{}\n",
+                r#"{"log":"hello\n","stream":"stdout","time":"2026-08-17T19:35:46.000000000Z"}"#
+            ),
+        )
+        .unwrap();
+
+        let events =
+            tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1)).await.expect(
+                "inotify should discover the container's log file well within 3s, nowhere near \
+                 the 30s poll_interval -- this requires the container's own subdirectory to be \
+                 watched, not just root",
+            );
+        assert_eq!(messages(&events), vec!["hello"]);
+
+        shutdown(tx, handle).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// F1's other half: a truncation of an already-tracked container log must also be noticed via
+    /// `inotify`, not just the initial appearance -- both rely on the container's own subdirectory
+    /// being watched, not only `root`.
+    #[tokio::test]
+    async fn under_inotify_a_truncated_container_log_is_noticed_before_the_poll_interval() {
+        let root = scratch_dir("docker-inotify-truncate");
+        let id = "7".repeat(64);
+        let log_path = container(&root, &id, "web", "nginx:1.25");
+        std::fs::write(
+            &log_path,
+            format!(
+                "{}\n",
+                r#"{"log":"first\n","stream":"stdout","time":"2026-08-17T19:35:46.000000000Z"}"#
+            ),
+        )
+        .unwrap();
+
+        let mut config = fast_tail_config();
+        config.watch = WatchMode::Inotify;
+        config.poll_interval = Duration::from_secs(30);
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let filter = ContainerFilter::new(vec![], true);
+        let input = DockerInput::new(root.clone(), filter, vec![], config);
+        let (tx, handle) = spawn(input, fanout);
+
+        let events = expect_events(&mut rx, 1).await;
+        assert_eq!(messages(&events), vec!["first"]);
+
+        // `std::fs::write` opens with `O_TRUNC` on the existing path -- same inode, shorter length
+        // -- a real truncation, not a rotation.
+        std::fs::write(
+            &log_path,
+            format!(
+                "{}\n",
+                r#"{"log":"new\n","stream":"stdout","time":"2026-08-17T19:35:46.500000000Z"}"#
+            ),
+        )
+        .unwrap();
+
+        let events2 =
+            tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1)).await.expect(
+                "inotify should notice the truncation well within 3s, nowhere near the 30s \
+                 poll_interval",
+            );
+        assert_eq!(messages(&events2), vec!["new"]);
+
+        shutdown(tx, handle).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// F2: a docker log truncation must reset `DockerDecoder`'s own `partial`, not just
+    /// `LineSplitter`'s -- modeled on `driver.rs`'s
+    /// `a_truncation_discards_the_partial_line_held_from_the_previous_generation`.
+    #[tokio::test]
+    async fn a_truncation_discards_a_docker_partial_entry_held_from_the_previous_generation() {
+        let root = scratch_dir("docker-truncate-partial");
+        let id = "8".repeat(64);
+        let log_path = container(&root, &id, "web", "nginx:1.25");
+        // A fragment (no trailing `\n` in `log`) padded long enough that the post-truncation
+        // generation is unambiguously shorter.
+        let padding = "x".repeat(48);
+        let gen1 = format!(
+            r#"{{"log":"partial-{padding}","stream":"stdout","time":"2026-08-17T19:35:46.000000000Z"}}"#
+        ) + "\n";
+        std::fs::write(&log_path, &gen1).unwrap();
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let filter = ContainerFilter::new(vec![], true);
+        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
+        let (tx, handle) = spawn(input, fanout);
+
+        // Give the tailer time to read the fragment and hold it -- nothing should emit yet.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(rx.try_recv().is_err(), "an unterminated fragment must not emit before its close");
+
+        let gen2 = format!(
+            "{}\n",
+            r#"{"log":"restarted\n","stream":"stdout","time":"2026-08-17T19:35:47.000000000Z"}"#
+        );
+        assert!(
+            gen2.len() < gen1.len(),
+            "fixture must be a genuine truncation: gen2 ({}) must be shorter than gen1 ({})",
+            gen2.len(),
+            gen1.len()
+        );
+        // `std::fs::write` opens with `O_TRUNC` on the existing path -- same inode, shorter length.
+        std::fs::write(&log_path, &gen2).unwrap();
+
+        let events = expect_events(&mut rx, 1).await;
+        assert_eq!(
+            messages(&events),
+            vec!["restarted"],
+            "the pre-truncation partial must not be spliced onto the first post-truncation entry"
+        );
+
+        shutdown(tx, handle).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the discarded partial must not resurface on close -- proves reset() ran, not close()"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// F2's other half: a truncation must also clear a stale `dropping == true`, or the very next
+    /// generation's first complete entry is silently swallowed clearing it.
+    #[tokio::test]
+    async fn a_truncation_clears_a_docker_dropping_state_so_the_next_generation_is_not_swallowed() {
+        let root = scratch_dir("docker-truncate-dropping");
+        let id = "9".repeat(64);
+        let log_path = container(&root, &id, "web", "nginx:1.25");
+
+        // Three fragment entries, none terminated -- individually each envelope line is well under
+        // 200 bytes (the splitter passes each through fine), but the three fragments' `log` values
+        // accumulate past `max_line_bytes` (200) inside `DockerDecoder`'s own reassembly, which
+        // then starts (and stays) `dropping` until an entry finally closes the line.
+        let fragment = "y".repeat(80);
+        let mut gen1 = String::new();
+        for i in 0..3 {
+            let entry = format!(
+                r#"{{"log":"{fragment}-{i}","stream":"stdout","time":"2026-08-17T19:35:46.00000000{i}Z"}}"#
+            );
+            assert!(entry.len() < 200, "one envelope line must stay under max_line_bytes: {entry}");
+            gen1.push_str(&entry);
+            gen1.push('\n');
+        }
+        assert!(
+            fragment.len() * 3 > 200,
+            "the accumulated fragments must exceed max_line_bytes for `dropping` to engage"
+        );
+        std::fs::write(&log_path, &gen1).unwrap();
+
+        let mut config = fast_tail_config();
+        config.max_line_bytes = 200;
+        let (fanout, mut rx) = recording_fanout(8);
+        let filter = ContainerFilter::new(vec![], true);
+        let input = DockerInput::new(root.clone(), filter, vec![], config);
+        let (tx, handle) = spawn(input, fanout);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(rx.try_recv().is_err(), "a dropped oversized reassembly must never emit");
+
+        let gen2 = format!(
+            "{}\n",
+            r#"{"log":"ok\n","stream":"stdout","time":"2026-08-17T19:35:47.000000000Z"}"#
+        );
+        assert!(gen2.len() < gen1.len(), "fixture must be a genuine truncation");
+        std::fs::write(&log_path, &gen2).unwrap();
+
+        let events = expect_events(&mut rx, 1).await;
+        assert_eq!(
+            messages(&events),
+            vec!["ok"],
+            "a stale dropping flag must not swallow the next generation's first complete entry"
+        );
 
         shutdown(tx, handle).await;
         std::fs::remove_dir_all(&root).ok();

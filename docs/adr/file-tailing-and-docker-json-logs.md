@@ -1,6 +1,6 @@
 ---
 created: 2026-09-06
-updated: 2026-09-06
+updated: 2026-09-07
 ---
 
 # `tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs
@@ -77,7 +77,13 @@ performs, for either a specific change or an `IN_Q_OVERFLOW`. **Note this only s
 *discovery*** (a new file, a rotation, a truncation) — reading more bytes off an already-tracked
 file is never gated by `poll_interval`/`inotify` at all, since the driver's own read loop
 (`Tailer::drain`) runs after every loop iteration regardless of what woke it, and an already-open
-file handle simply sees new bytes on its next `read()`.
+file handle simply sees new bytes on its next `read()`. The set of watched directories is itself
+reconciled on every `scan`, not fixed once at startup (`PathPattern::watch_dirs`,
+`Tailer::reconcile_watches`): `tail_in`'s patterns always reconcile to the same single directory
+they always watched, but `docker_in`'s reaches `root` plus every container subdirectory that
+currently exists, so a container's own subdirectory — where its log file actually appears, a
+moment after the directory itself does — is watched as soon as it exists, and unwatched again once
+it's gone.
 
 ### Rotation and truncation: identity by `(dev, ino)`
 
@@ -88,10 +94,17 @@ changed since the last scan is a rotation — the old handle drains to EOF, flus
 new one opens at its own beginning, regardless of `read_from`. A path whose length is now less than
 the tracked offset is a truncation — seek to `0`, diagnosed (`truncated`), same inode. The line
 splitter is reset along with the offset, so an unterminated fragment held from the pre-truncation
-generation is dropped rather than spliced onto the first line of the new one. A
+generation is dropped rather than spliced onto the first line of the new one — and so is each
+decoder's own cross-line state (`TailDecoder::reset`), for the same reason: a no-op for `tail_in`'s
+stateless `LineDecoder`, but real for `docker_in`'s `DockerDecoder`, whose own reassembly state
+(`partial`, `dropping`) would otherwise either splice a stale fragment onto the new generation's
+first entry, or silently swallow it clearing a stale `dropping` flag. A
 previously-tracked path no longer matched by any pattern is a removal — drain and close. A rotated
-`.1`-suffixed file is never matched in the first place: `PathPattern`'s wildcard is anchored
-(prefix/suffix), so `access.log.1` never satisfies a `*.log` (or `*-json.log`) pattern. A pattern
+`.1`-suffixed file is never matched in the first place, though for different reasons per kind:
+`tail_in`'s wildcard is anchored (prefix/suffix), so `access.log.1` never satisfies a `*.log`
+pattern; `docker_in`'s own two-position discovery (`PathPattern::docker_containers`) isn't a glob at
+all and never looks for anything but the exact `<id>-json.log` name a container's own directory
+implies, so `<id>-json.log.1` is simply never a name it looks for in the first place. A pattern
 that matches a file both before and after a rename (`app.log*` matching both `app.log` and
 `app.log.1`) rebinds the existing tracked entry to the new path rather than re-opening the inode,
 so no duplicate re-emission occurs.
@@ -227,10 +240,15 @@ trade-off, not hidden in a compose file comment alone.
   tree fails `deny.toml`'s license allowlist. `libc` (already present transitively at the exact
   pinned version) is enough to call `inotify_init1`/`inotify_add_watch`/`read` directly, confined
   to one small module.
-- **A glob crate instead of a hand-rolled pattern.** Both callers only ever need "a literal path"
-  or "a `*` in exactly the final path component" (`tail_in`'s own config-validated `paths`,
-  `docker_in`'s internally-built `<root>/*/*-json.log`) — `**`, `?`, `[...]`, and escaping are all
-  unused surface a real glob crate would carry for nothing.
+- **A glob crate instead of a hand-rolled pattern.** `tail_in`'s own config-validated `paths` only
+  ever need "a literal path" or "a `*` in exactly the final path component" — `**`, `?`, `[...]`,
+  and escaping are all unused surface a real glob crate would carry for nothing. `docker_in` isn't
+  in that shape at all, and a glob crate wouldn't have served it either: its discovery is a
+  correlation between two path positions, not a pattern against one — the log file's name has to be
+  derived from its own containing directory's name (`<root>/<id>/<id>-json.log`), which no
+  positional glob expresses. A naive `<root>/*/*-json.log` would come closer but still be wrong: it
+  would also accept a mismatched pair like `<root>/foo/bar-json.log`, which the real two-position
+  walk (`PathPattern::docker_containers`) correctly rejects.
 - **Per-line checkpoint writes.** Rejected as the busy-loop-adjacent cost this whole design exists
   to avoid — see "Checkpoints" above.
 - **`tail_in` using sender/embedded time like `docker_in`.** A plain text line carries no

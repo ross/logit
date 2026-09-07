@@ -10,7 +10,7 @@ use super::TailConfig;
 use bytes::Bytes;
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
 use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -88,6 +88,7 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     resume: HashMap<FileId, (PathBuf, u64)>,
     diag: Diagnostics,
     telemetry: Telemetry,
+    watched_dirs: HashSet<PathBuf>,
 }
 
 impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
@@ -102,6 +103,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             resume: HashMap::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
+            watched_dirs: HashSet::new(),
         }
     }
 
@@ -141,11 +143,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 return Err(anyhow::anyhow!("setting up file watching: could not proceed"));
             }
         };
-        for pattern in &self.patterns {
-            let _ = watcher.watch_dir(pattern.dir());
-        }
-
-        self.scan(true).await;
+        self.scan(true, &mut watcher).await;
 
         let mut next_poll = tokio::time::Instant::now() + self.config.poll_interval;
         let has_flush_interval = !self.config.batching.flush_interval.is_zero();
@@ -181,12 +179,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     if matches!(wake, super::watch::Wake::Overflow) {
                         self.telemetry.count("logit.input.watch.overflows", 1.0, &[]);
                     }
-                    self.scan(false).await;
+                    self.scan(false, &mut watcher).await;
                 }
                 Outcome::Poll => {
                     self.telemetry.count("logit.input.watch.wakes", 1.0, &[("source", "poll")]);
                     next_poll = tokio::time::Instant::now() + self.config.poll_interval;
-                    self.scan(false).await;
+                    self.scan(false, &mut watcher).await;
                 }
                 Outcome::Flush => {
                     self.flush_all(&sink, FlushReason::Interval).await;
@@ -217,11 +215,32 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         Ok(())
     }
 
+    /// Brings the set of watched directories in line with what the patterns currently reach --
+    /// `watch_dir` on anything newly present, `unwatch_dir` on anything gone. Called at the top of
+    /// every `scan`, before discovery, deliberately: `docker_in`'s log file appears inside a
+    /// container directory a moment *after* the directory itself does, so the directory has to be
+    /// watched on the strength of existing at all, not on already holding a matching file. A no-op
+    /// under `WatchMode::Poll` (both `Watcher` methods are), and effectively a no-op for `tail_in`,
+    /// whose patterns' `watch_dirs()` is always exactly the single `dir()` already watched -- the
+    /// existing `by_path` short-circuit in `InotifyWatcher::watch_dir` makes the repeat call free.
+    fn reconcile_watches(&mut self, watcher: &mut super::watch::Watcher) {
+        let desired: HashSet<PathBuf> =
+            self.patterns.iter().flat_map(PathPattern::watch_dirs).collect();
+        for dir in desired.difference(&self.watched_dirs) {
+            let _ = watcher.watch_dir(dir); // same ignore-the-error policy the startup loop used
+        }
+        for dir in self.watched_dirs.difference(&desired) {
+            watcher.unwatch_dir(dir);
+        }
+        self.watched_dirs = desired;
+    }
+
     /// Discovers matched files, opens newly-seen ones, and reconciles rotation/truncation/
     /// removal for ones already tracked. `first` is `true` only for the very first call --
     /// files present then follow `config.read_from`; every later discovery starts at the
     /// beginning, since a file that didn't exist yet has no "before startup" to skip.
-    async fn scan(&mut self, first: bool) {
+    async fn scan(&mut self, first: bool, watcher: &mut super::watch::Watcher) {
+        self.reconcile_watches(watcher);
         // Copied out up front so it can be read below while `tracked` (borrowed from
         // `self.files`) is live -- the same precedent `open_tracked` already follows for
         // `self.config.batching`.
@@ -266,8 +285,13 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                             // drop, swallows) the first line of the new generation. The held
                             // partial is discarded, not emitted: it's an unterminated fragment,
                             // and emitting it as if it were a whole line is worse than dropping a
-                            // fragment the writer itself never terminated.
+                            // fragment the writer itself never terminated. The decoder can hold
+                            // the exact same kind of cross-line state of its own -- `docker_in`'s
+                            // `DockerDecoder` reassembles a Docker json-file entry split across
+                            // more than one line, in `partial`/`dropping` fields that mirror this
+                            // splitter's own -- so it gets the same reset, for the same reason.
                             tracked.splitter = LineSplitter::new(max_line_bytes);
+                            tracked.decoder.reset();
                             self.diag.warn_throttled(
                                 "truncated",
                                 truncated_message(&path, prev_offset, len),
@@ -323,12 +347,17 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             // reaped; reap is for inodes no pattern reaches any more.
             let old_path = std::mem::replace(&mut tracked.path, path.clone());
             tracked.state = FileState::Active;
-            // Removing the stale `by_path` entry is load-bearing, not tidiness: `discovered`
-            // iteration order is nondeterministic, and if the old `path -> id` binding survived, a
-            // later arm processing `old_path` in this same `scan` would see a *different* id now
-            // discovered there and wrongly mark this still-live inode `Draining`. Removing it here
-            // makes both iteration orders converge on the same result.
-            if old_path != path {
+            // Removing the stale `by_path` entry is load-bearing, not tidiness -- but only if it
+            // still belongs to this inode. `discovered` iteration order is nondeterministic: a
+            // rotation replacement discovered earlier in the same `scan` may already have claimed
+            // `old_path` for a different id (e.g. `app.log*` matching both the rotated `app.log`
+            // and its replacement, with the replacement's arm running first). Removing the entry
+            // unconditionally would then delete that other inode's freshly-inserted binding,
+            // orphaning it from `by_path` while it stays `Active` in `self.files` -- and since the
+            // stale-detection loop only walks `by_path.keys()`, an orphaned live inode can never be
+            // marked `Draining` or reaped. Checking ownership first makes both iteration orders
+            // converge on the same result without ever evicting a binding this rebind doesn't own.
+            if self.by_path.get(&old_path) == Some(&id) {
                 self.by_path.remove(&old_path);
             }
             self.by_path.insert(path, id);
@@ -1451,6 +1480,67 @@ mod tests {
         assert_eq!(messages(&events3), vec!["late"]);
 
         shutdown(shutdown_tx, handle).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// White-box regression for the `by_path` orphaning bug in `open_tracked`'s rebind branch:
+    /// removing the old `path -> id` entry whenever `old_path != path` (rather than only when
+    /// that entry still belongs to this inode) could delete a replacement inode's freshly-inserted
+    /// binding if that replacement's `scan` arm ran first. This can't be pinned by driving the
+    /// spawned tailer's event stream -- the very next `scan` rediscovers the orphaned inode under
+    /// its own name and re-adds the `by_path` entry, so the observable events self-heal either way
+    /// and look identical whether the bug is present or fixed. Only inspecting `by_path`/`files`
+    /// state directly, at the one problematic iteration order, distinguishes them -- so this test
+    /// calls `scan`/`open_tracked` directly instead of spawning `run_until_shutdown`.
+    #[tokio::test]
+    async fn rebinding_a_renamed_inode_never_removes_a_by_path_entry_another_inode_now_owns() {
+        let dir = scratch_dir("rebind-by-path-ownership");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"before\n").unwrap();
+
+        let mut tailer = Tailer::new(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        tailer.scan(true, &mut crate::tail::watch::Watcher::Poll).await;
+        let a = FileId::from_metadata(&std::fs::metadata(dir.join("app.log")).unwrap());
+        assert_eq!(tailer.by_path.get(&dir.join("app.log")), Some(&a));
+
+        std::fs::rename(dir.join("app.log"), dir.join("app.log.1")).unwrap();
+        std::fs::write(dir.join("app.log"), b"after\n").unwrap();
+        let b = FileId::from_metadata(&std::fs::metadata(dir.join("app.log")).unwrap());
+        assert_ne!(a, b, "test is vacuous if the filesystem reused the old inode for the new file");
+
+        // Replay, by hand, the one iteration order of `scan`'s `discovered` map that trips the
+        // bug: the rotation-replacement arm for `app.log` (now inode `b`) runs before the
+        // rebind arm for the renamed-away `app.log.1` (still inode `a`). `discovered` is a
+        // `HashMap`, so the real `scan` picks either order nondeterministically; this pins the
+        // one where the bug is observable.
+        tailer.files.get_mut(&a).unwrap().state = FileState::Draining;
+        tailer.by_path.remove(&dir.join("app.log"));
+        tailer.open_tracked(dir.join("app.log"), b, StartOffset::Beginning).await;
+        tailer.open_tracked(dir.join("app.log.1"), a, StartOffset::Beginning).await;
+
+        assert_eq!(
+            tailer.by_path.get(&dir.join("app.log")),
+            Some(&b),
+            "the replacement inode's by_path entry must survive the rebind of the renamed inode"
+        );
+        assert_eq!(tailer.by_path.get(&dir.join("app.log.1")), Some(&a));
+        assert_eq!(tailer.by_path.len(), 2);
+        assert_eq!(tailer.files.len(), 2);
+        for (id, f) in &tailer.files {
+            if f.state == FileState::Active {
+                assert_eq!(
+                    tailer.by_path.get(&f.path),
+                    Some(id),
+                    "an Active tracked file orphaned from by_path can never be marked Draining or reaped"
+                );
+            }
+        }
+        assert_eq!(tailer.files.get(&a).unwrap().state, FileState::Active);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
