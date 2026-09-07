@@ -79,10 +79,9 @@ impl Watcher {
         }
     }
 
-    /// Unused until a caller ever needs to stop watching a directory mid-run (`docker_in`'s
-    /// container churn, landing with `docker_in` itself) -- present now so `Tailer` has a stable
-    /// method to call once it does.
-    #[allow(dead_code)]
+    /// Called by `Tailer::reconcile_watches` whenever a directory a pattern's `watch_dirs()` used
+    /// to reach no longer is -- `docker_in`'s container churn, most concretely: a container
+    /// directory that's gone must stop being watched, not linger forever.
     pub fn unwatch_dir(&mut self, dir: &Path) {
         match self {
             Watcher::Poll => {}

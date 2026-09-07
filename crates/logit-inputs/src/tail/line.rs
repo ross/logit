@@ -36,6 +36,17 @@ pub trait TailDecoder: Send {
     /// Default: nothing held.
     fn close(&mut self, _out: &mut Vec<Event>) {}
 
+    /// The file this decoder is reading was truncated in place: everything held across lines
+    /// belongs to a generation of the file that no longer exists, and must be dropped -- **not**
+    /// emitted. That's the same policy `Tailer::scan`'s truncation branch already applies to
+    /// [`LineSplitter`]'s own held partial (rebuilt, not drained through `take_partial`): an
+    /// unterminated fragment from content that's gone is worse spliced onto the new generation's
+    /// first line, or emitted as if it were whole, than simply dropped. Distinct from
+    /// [`TailDecoder::close`] for exactly that reason -- `close` *emits* what's held, which is right
+    /// when the file is ending and wrong when it's restarting. Default: nothing held, nothing to do
+    /// (`tail_in`'s [`LineDecoder`] is stateless across lines and relies on this).
+    fn reset(&mut self) {}
+
     /// This decoder's resource, without decoding a line -- needed to seed accounting before
     /// anything has been read. Every decoder here builds one `Resource` per file and never
     /// changes it afterward (`docs/adr/decoupled-listener-io.md`'s "never merges across a
