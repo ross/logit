@@ -7,5 +7,7 @@ opentelemetry-sdk
 opentelemetry-instrumentation-django
 opentelemetry-instrumentation-logging
 opentelemetry-instrumentation-requests
+opentelemetry-instrumentation-psycopg
 opentelemetry-exporter-otlp-proto-http
 requests
+psycopg[binary]

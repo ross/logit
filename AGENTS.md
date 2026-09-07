@@ -51,8 +51,10 @@ checkpoint-aware file tailing, plus Docker json-file container logs enriched fro
 `config.v2.json`, no docker socket,
 [ADR `file-tailing-and-docker-json-logs`](docs/adr/file-tailing-and-docker-json-logs.md)) are also
 real, implemented `ComponentKind`s; `docker_in` is live in `demo/logit.yaml`'s `nginx_in`, tailing
-that tier's container directly instead of receiving a `syslog:` stream -- `tail_in` itself ships
-tested but unexercised by the demo, same status as `otlp_in`. Config is a flat graph of named components (ADR `component-graph-configuration`,
+that tier's container directly instead of receiving a `syslog:` stream, and `tail_in` itself is
+live in the same config's `postgres_in`, tailing Postgres's own rotating jsonlog directory
+(`docs/plans/demo-richer-traces.md`'s workstream C) -- `otlp_in` is the one still unexercised by
+the demo. Config is a flat graph of named components (ADR `component-graph-configuration`,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively

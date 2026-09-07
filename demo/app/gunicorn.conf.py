@@ -35,6 +35,7 @@ def post_fork(server, worker):
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.instrumentation.django import DjangoInstrumentor
     from opentelemetry.instrumentation.logging import LoggingInstrumentor
+    from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
     from opentelemetry.instrumentation.requests import RequestsInstrumentor
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
@@ -87,3 +88,13 @@ def post_fork(server, worker):
     # onto the outbound request via the same default W3C propagator, again with no code at the call
     # site itself.
     RequestsInstrumentor().instrument()
+
+    # `docs/plans/demo-richer-traces.md` workstream C: a real driver-level CLIENT span per SQL
+    # statement `pages/views.py`'s `work` issues, and -- via `enable_commenter` -- a `traceparent`
+    # appended to the SQL text itself (sqlcommenter,
+    # https://google.github.io/sqlcommenter/), the same default W3C propagator injecting it as
+    # everywhere else in this file. Postgres logs the whole statement verbatim
+    # (`log_min_duration_statement=0`, demo/compose.yaml), so that `traceparent` lands in
+    # Postgres's own jsonlog -- what `demo/logit.yaml`'s `postgres_trace` stage lifts back out via
+    # a small inline `lua` regex, no SDK on Postgres's side at all.
+    PsycopgInstrumentor().instrument(enable_commenter=True)

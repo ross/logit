@@ -56,9 +56,21 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "demoproj.wsgi.application"
 
-# No database -- this tier holds no state of its own (docs/plans/demo-tracing-stack.md's
-# workstream B), and nothing installed above needs one.
-DATABASES = {}
+# `docs/plans/demo-richer-traces.md` workstream C: real state, and a real driver-level CLIENT
+# span (opentelemetry-instrumentation-psycopg, demo/app/gunicorn.conf.py) rather than the
+# request-only spans every other route produces. Django auto-selects the psycopg 3 backend once
+# `psycopg` (not `psycopg2`) is the importable driver (Django 4.2+); still spelled
+# `django.db.backends.postgresql` either way.
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.environ.get("POSTGRES_DB", "demo"),
+        "USER": os.environ.get("POSTGRES_USER", "demo"),
+        "PASSWORD": os.environ.get("POSTGRES_PASSWORD", ""),
+        "HOST": os.environ.get("POSTGRES_HOST", "postgres"),
+        "PORT": os.environ.get("POSTGRES_PORT", "5432"),
+    }
+}
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 

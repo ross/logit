@@ -1,17 +1,21 @@
 # The demo pipeline (demo/README.md, docs/plans/demo-tracing-stack.md, docs/plans/demo-stack.md,
 # docs/plans/otlp-end-to-end.md, docs/plans/otlp-logs-and-resource-identity.md,
-# docs/plans/access-log-spans.md, docs/plans/file-tailing.md). Exercises syslog in, docker_in,
-# set + json + lua + trace_context + scale + kv_metrics + keep_signals + keep + aggregate,
-# InfluxDB out, OTLP/HTTP out, OTLP/gRPC out, plus `internal` observing the pipeline itself (ADR
-# `internal-telemetry-as-pipeline-events`, ADR `internal-span-emission-and-deterministic-sampling`)
-# -- against traffic that crosses three real tiers: haproxy -> nginx -> app (demo/compose.yaml's
-# `traffic` service drives it; docs/plans/demo-tracing-stack.md's workstream A). Logs and metrics
-# leave `logit` for a real backend (Loki, InfluxDB); traces reach Tempo three ways -- `logit`'s
-# own internal spans via `tempo_out`, haproxy's and nginx's real access-line spans (`docs/adr/
-# trace-context-span-lifting.md`'s `span:` block, also via `tempo_out`), and `demo-app`'s real
-# request spans going straight to Tempo, deliberately not through `logit` at all (see the comment
-# above `stdout` below) -- not every telemetry leg needs `logit` in front of it, and this demo
-# shows that honestly rather than routing everything through `logit` just to prove it can.
+# docs/plans/access-log-spans.md, docs/plans/file-tailing.md, docs/plans/demo-richer-traces.md).
+# Exercises syslog in, tail_in, docker_in, set + json + lua + trace_context + scale + kv_metrics +
+# keep_signals + keep + aggregate, InfluxDB out, OTLP/HTTP out, OTLP/gRPC out, plus `internal`
+# observing the pipeline itself (ADR `internal-telemetry-as-pipeline-events`, ADR
+# `internal-span-emission-and-deterministic-sampling`) -- against traffic that crosses four real
+# tiers: haproxy -> nginx -> app -> postgres (demo/compose.yaml's `traffic` service drives the
+# first three; docs/plans/demo-tracing-stack.md's workstream A, docs/plans/demo-richer-traces.md's
+# workstream C). Logs and metrics leave `logit` for a real backend (Loki, InfluxDB); traces reach
+# Tempo three ways -- `logit`'s own internal spans via `tempo_out`, haproxy's and nginx's real
+# access-line spans (`docs/adr/trace-context-span-lifting.md`'s `span:` block, also via
+# `tempo_out`), and `demo-app`'s real request and database-client spans going straight to Tempo,
+# deliberately not through `logit` at all (see the comment above `stdout` below) -- not every
+# telemetry leg needs `logit` in front of it, and this demo shows that honestly rather than
+# routing everything through `logit` just to prove it can. `postgres`'s own log lines still carry
+# that same trace id back into Loki, though (`postgres_trace_lift`/`postgres_trace` below) -- a
+# `traceparent` lifted out of a sqlcommenter-tagged SQL statement, not a second SDK.
 # `otlp_in` (`crates/logit-inputs/src/otlp.rs`) is consequently still unexercised by this demo.
 #
 # Topology:
@@ -76,6 +80,14 @@
 #   parented to nginx's span (docs/adr/trace-context-span-lifting.md: nginx now mints and forwards
 #   its own span id, rather than only relaying haproxy's), since the default W3C propagator
 #   extracts whichever `traceparent` it's given regardless of which backend the span is headed for.
+#
+#   A fifth, parallel leg (docs/plans/demo-richer-traces.md workstream C), untied to the diagram
+#   above since it never touches haproxy/nginx/app's own listeners:
+#
+#   postgres --jsonlog file--> tail(tail_in)--> postgres_in -> postgres_identity (set)
+#             -> postgres_json (json) -> postgres_trace_lift (lua, regexes a `traceparent` out of
+#             a sqlcommenter-tagged statement) -> postgres_trace (trace_context, no `span:` --
+#             demo-app's own psycopg CLIENT span is already real) -> stdout / logs_only -> loki_out
 components:
   haproxy_in:
     type: syslog_in
@@ -114,6 +126,20 @@ components:
     type: syslog_in
     bind: 0.0.0.0:5142
 
+  # This demo's first real `tail_in` (docs/plans/demo-richer-traces.md workstream C) -- every
+  # other tier so far is `syslog_in` or `docker_in`, `tail_in`'s own Docker-specific sibling.
+  # `paths`' `*` is permitted only in the final path component (`crates/logit-config/src/lib.rs`),
+  # which is exactly Postgres's own jsonlog rotation shape: a fresh `postgresql-<timestamp>.json`
+  # file every `log_rotation_age` (demo/compose.yaml), never a rename-in-place. `read_from:
+  # beginning` plus the checkpoint below mean a `logit` restart resumes rather than replaying or
+  # skipping, the same contract `nginx_in` already has. Unlike `docker_in`, `tail_in` stamps no
+  # resource attributes of its own -- `postgres_identity` below is load-bearing, not decorative.
+  postgres_in:
+    type: tail_in
+    paths: ["/var/log/postgresql/*.json"]
+    read_from: beginning
+    checkpoint_path: /var/lib/logit/postgres.checkpoint
+
   # `syslog_in` mustn't invent a resource identity for data it didn't produce
   # (docs/design/internal-telemetry.md's "Resource identity" section) -- `set` is the operator
   # declaring one instead (ADR `operator-declared-resource-attributes`), one per tier since each
@@ -136,6 +162,12 @@ components:
     resource:
       service.name: demo-app
       service.namespace: demo
+  postgres_identity:
+    type: set
+    sources: [postgres_in]
+    resource:
+      service.name: postgres
+      service.namespace: demo
 
   haproxy_json:
     type: json
@@ -146,6 +178,12 @@ components:
   app_json:
     type: json
     sources: [app_identity]
+  # Parses each raw jsonlog line itself -- Postgres already writes one JSON object per line
+  # (`log_destination=jsonlog`, demo/compose.yaml), so this needs no field remapping, the same way
+  # every other tier's own JSON access line doesn't.
+  postgres_json:
+    type: json
+    sources: [postgres_identity]
 
   # Lifts each tier's trace.id/span.id/trace.flags (or an inbound `traceparent`, parsed natively
   # as of `docs/adr/trace-context-span-lifting.md`) onto `LogRecord.trace`. `haproxy_trace`/
@@ -173,6 +211,35 @@ components:
     type: trace_context
     sources: [app_json]
 
+  # `opentelemetry-instrumentation-psycopg`'s sqlcommenter (`enable_commenter=True`,
+  # demo/app/gunicorn.conf.py) appends a trailing SQL comment carrying `traceparent='<header>'`
+  # (among other, irrelevant keys) to every statement `pages/views.py`'s `work` issues --
+  # `log_min_duration_statement=0` (demo/compose.yaml) then logs that statement, comment included,
+  # verbatim into `message`. No native `traceparent` parser exists outside `trace_context` itself
+  # (docs/adr/trace-context-span-lifting.md), so this small `lua` stage's only job is finding that
+  # substring and copying it onto its own `traceparent` attribute -- `trace_context` below then
+  # parses it exactly as it would a real HTTP header. A line with no match (Postgres's own
+  # startup/checkpointer/autovacuum lines, or a statement issued outside a request's span) is
+  # returned unchanged, not dropped -- `trace_context` reports `skipped{reason="missing"}` for
+  # those and passes them through as plain logs, same as any tier's own untraced line.
+  postgres_trace_lift:
+    type: lua
+    sources: [postgres_json]
+    script: |
+      function process(event)
+        local msg = event.attributes.message
+        if type(msg) == "string" then
+          local tp = string.match(msg, "traceparent='([^']+)'")
+          if tp then
+            event.attributes.traceparent = tp
+          end
+        end
+        return event
+      end
+  postgres_trace:
+    type: trace_context
+    sources: [postgres_trace_lift]
+
   # No component here for the app's own OTel spans (demo/app/gunicorn.conf.py) -- they go straight
   # to Tempo's own `otlp.protocols.http` receiver on :4318 (`demo/tempo/tempo.yaml`), alongside the
   # gRPC one `tempo_out` below uses, never touching `logit` (see the header comment for why). The
@@ -182,10 +249,12 @@ components:
   # `docker compose logs -f logit` -- the fastest way to see the pipeline doing something, now one
   # block per tier per request (haproxy's and nginx's carrying a real `span` section too), all
   # three sharing a trace id and differing in span id. The app's own spans don't appear here --
-  # they never reach `logit` (see above).
+  # they never reach `logit` (see above). `postgres_trace` joins the other four tiers as a fifth
+  # source -- most of its lines carry no trace at all (Postgres logs far more than one line per
+  # request), and that's expected, not a bug.
   stdout:
     type: stdio_out
-    sources: [haproxy_trace, nginx_trace, app_trace]
+    sources: [haproxy_trace, nginx_trace, app_trace, postgres_trace]
 
   # Loki's OTLP ingestion accepts logs only -- it registers no `TracesService`/`MetricsService` --
   # and `otlp_out` aborts an entire batch's `send` on the first signal request that fails
@@ -199,7 +268,7 @@ components:
   # trip Loki's `send`.
   logs_only:
     type: keep_signals
-    sources: [haproxy_trace, nginx_trace, app_trace]
+    sources: [haproxy_trace, nginx_trace, app_trace, postgres_trace]
     signals: [logs]
 
   # Logs to Loki, direct over OTLP -- no relay service in between (docs/plans/

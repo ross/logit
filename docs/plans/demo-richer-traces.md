@@ -98,7 +98,7 @@ and a genuine `nginx` value, exactly as `demo/README.md` now documents.
 
 ## C. Postgres, and the demo's first `tail_in`
 
-**Status: not started.**
+**Status: landed.**
 
 - `demo/compose.yaml` — `postgres:17-alpine`, `jsonlog` destination, `log_min_duration_statement:
   0`.
@@ -113,6 +113,31 @@ and a genuine `nginx` value, exactly as `demo/README.md` now documents.
 
 **Done when:** a postgres log line in Loki carries the real `trace_id` of the request whose
 psycopg CLIENT span issued it, and `logit.input.files.open` is nonzero for this tier.
+
+**Verified live** (2026-09-07), `script/demo up --build` through `down -v`, including the exact
+mechanics this workstream was uncertain about (verified against a real, throwaway
+`psycopg`+`opentelemetry-instrumentation-psycopg` + Postgres 17 probe before touching
+`demo/logit.yaml`): `enable_commenter=True` does append `traceparent='<header>'` to every
+statement (alongside four other, ignored keys, sorted so `traceparent` isn't reliably last —
+`postgres_trace_lift`'s regex doesn't assume position), and `log_min_duration_statement=0` logs it
+verbatim. Confirmed against the real stack: a `/work` request's `trace_id` appears identically on
+haproxy's, both nginx hops', `demo-app`'s, *and* postgres's own `INSERT`/`SELECT` log lines
+(cross-checked by grepping `logit`'s `stdio_out` for one trace id across all five). Loki's own
+`query_range` API shows `trace_id` as a genuine stream label (not just a body match) on the
+postgres stream, confirming the derived-field click-through works unmodified. `app-migrate`
+applied its migration cleanly (after one real fix below); `logit.input.files.open{component:
+postgres_in}` read `3`, and Postgres's own `log_rotation_age: 5min` genuinely rotated to a new
+`postgresql-<timestamp>.json` file mid-session, which `postgres_in`'s glob picked up with no
+restart -- real live proof this is directory discovery, not a single static file. `arch-svg`
+exited 0 against the edited `architecture.dot` (new `postgres` node/edges), and both `graph.svg`
+and `architecture.svg` served 200 through the landing page.
+
+**One real bug, found only by running the stack:** `app-migrate` crashed with
+`ValueError: Unable to configure handler 'access_syslog'` -- `manage.py`'s `django.setup()` loads
+`LOGGING` (and so resolves the syslog handler's `logit` hostname) regardless of which management
+command runs, and `app-migrate` had no dependency on `logit` at all, so its DNS alias sometimes
+didn't exist yet. Fixed by adding `depends_on: logit: condition: service_started` to
+`app-migrate`, the identical dependency (and identical reasoning) `app` itself already has.
 
 ---
 

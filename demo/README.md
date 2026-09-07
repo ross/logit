@@ -30,7 +30,9 @@ the demo's front door now; requests flow `haproxy` → `nginx` → `app` (a real
 | Tempo | http://localhost:3200 (query), :4317/:4318 (OTLP) | Provisioned as a Grafana datasource; receives `logit`'s own internal spans over OTLP/gRPC. |
 
 `nginx` and `app` (the landing-page app) are internal-only now — reached through `haproxy`,
-not published on the host.
+not published on the host. So is `postgres` — `app`'s own database (`docs/plans/
+demo-richer-traces.md`), reached only from `app` and from `logit`'s own `postgres_in` tailing its
+jsonlog.
 
 `docker compose logs -f logit` shows every decoded event as a `stdio_out` block — the fastest way
 to see the pipeline doing something. `self` (`internal`, observing `logit`'s own telemetry) mixes
@@ -146,6 +148,20 @@ itself, from `proxy_set_header Host $host` on a request whose `Host` genuinely i
 `traffic`'s own loop (`compose.yaml`) drives all of this — weighted toward `/work`, since a
 guaranteed `500` on every cycle would swamp the dashboard's error panel.
 
+`/work` also writes to, and counts rows in, a real Postgres now (`docs/plans/
+demo-richer-traces.md`'s workstream C) — `app`'s own `psycopg` driver, instrumented the same way
+`requests` is above, so every statement gets a real CLIENT span straight to Tempo, the app's usual
+path. Postgres's own log line for that statement still ends up in Loki carrying the *same* trace
+id, though, with no SDK on Postgres's side at all: `opentelemetry-instrumentation-psycopg`'s
+sqlcommenter (`enable_commenter=True`, `app/gunicorn.conf.py`) appends a trailing SQL comment
+carrying `traceparent='...'` to the statement text itself, Postgres logs the whole statement
+verbatim (`log_min_duration_statement=0`), and `postgres_trace_lift` — a five-line `lua` stage in
+`demo/logit.yaml` — regexes that substring back out and hands it to `trace_context` exactly as it
+would a real HTTP header. `postgres_in` (`tail_in`) is this demo's first plain-file tail, not a
+`docker_in` container log — Postgres's own jsonlog rotates into a fresh `postgresql-<timestamp>.json`
+file periodically, so `postgres_in`'s `paths:` glob is doing real, live discovery work, not tailing
+one static file for the life of the stack.
+
 The landing page shows two diagrams. The pipeline one (also at `:8080/graph.svg` directly) is
 rendered at startup, not hand-drawn: `graph-dot` runs `logit graph logit.yaml` against the actual
 config this stack is running, `graph-svg` pipes that DOT through real Graphviz
@@ -168,13 +184,15 @@ request, nothing is cached.)
 **`otlp_in`** (`crates/logit-inputs/src/otlp.rs`) still ships implemented and tested with nothing
 in this stack sending *to* it — `app`'s spans go straight to Tempo instead, by design (see
 "What's actually flowing" above), so this isn't an oversight to close so much as a deliberate
-choice about where `logit` belongs in the pipeline. **`tail_in`** (plain file tailing, the driver
-`docker_in` builds on) ships tested but unexercised here too — nothing in this stack tails a plain
-file directly; only `docker_in`, its Docker-specific sibling, gets a live workout. If you want to
-see `otlp_in` exercised with
+choice about where `logit` belongs in the pipeline. If you want to see `otlp_in` exercised with
 real traffic, point `app`'s `OTEL_EXPORTER_OTLP_ENDPOINT` (`demo/compose.yaml`) at `http://logit:4318`
 instead of `http://tempo:4318`, and re-add a `tempo_out` source for it in `demo/logit.yaml` — that
 was this demo's shape until this rework; it's a small, well-understood change to reverse.
+
+`tail_in` (plain file tailing, the driver `docker_in` builds on) used to ship tested but
+unexercised here too — `postgres_in` (`demo/logit.yaml`, `docs/plans/demo-richer-traces.md`)
+closes that: a `paths:` glob over Postgres's own rotating jsonlog directory, checkpointed on the
+same `logit_state` volume `nginx_in` already uses.
 
 What's left client-side: browser-side tracing is sketched, not built, in
 [docs/plans/demo-tracing-stack.md](../docs/plans/demo-tracing-stack.md)'s workstream C

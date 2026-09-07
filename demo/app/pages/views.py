@@ -13,6 +13,8 @@ import requests
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import render
 
+from pages.models import WorkRecord
+
 GRAFANA_URL = os.environ.get("GRAFANA_URL", "http://localhost:3000")
 
 # nginx, not haproxy (`docs/plans/demo-richer-traces.md` workstream B) -- so this hop takes a
@@ -94,6 +96,14 @@ def work(request):
     if random.random() < 0.08:
         return HttpResponse(b"temporarily overloaded\n", status=503)
 
+    # `docs/plans/demo-richer-traces.md` workstream C: a real write and a real read against
+    # Postgres, each its own driver-level CLIENT span
+    # (opentelemetry-instrumentation-psycopg, demo/app/gunicorn.conf.py) -- and, via that same
+    # instrumentation's sqlcommenter, a `traceparent` riding along in the SQL text itself, which is
+    # what `demo/logit.yaml`'s `postgres_trace` stage lifts back out of Postgres's own jsonlog.
+    WorkRecord.objects.create()
+    count = WorkRecord.objects.count()
+
     # The re-entrant hop `docs/plans/demo-richer-traces.md` workstream B adds: back through nginx
     # (not haproxy -- see `INNER_URL`'s own comment above), giving one trace a real subtree instead
     # of a single chain. A failure here (nginx or `/inner` itself down, or the timeout below) is
@@ -105,7 +115,9 @@ def work(request):
     except requests.RequestException as exc:
         return HttpResponse(f"inner call failed: {exc}\n".encode(), status=502)
 
-    return HttpResponse(b"work done\n", content_type="text/plain; charset=utf-8")
+    return HttpResponse(
+        f"work done ({count} records)\n".encode(), content_type="text/plain; charset=utf-8"
+    )
 
 
 def inner(request):
