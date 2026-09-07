@@ -4,6 +4,17 @@
 # This is deliberately separate from the repo root's compose.yaml, which is the contributor dev
 # stack (bind-mounted source, `script/server`, `cargo run` inside a long-lived container). This
 # stack instead builds and runs the production image (../Dockerfile) -- what a real user gets.
+
+# Shared via YAML's merge key (`<<:`), not repeated per service -- `app` and `app-migrate` both
+# need the same Postgres connection settings (`demo/app/demoproj/settings.py`'s `DATABASES`), and
+# duplicating five env vars invites exactly one of them drifting.
+x-postgres-env: &postgres-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: demo
+  POSTGRES_USER: demo
+  POSTGRES_PASSWORD: demo-postgres-password
+
 services:
   influxdb:
     image: docker.io/library/influxdb:2
@@ -24,6 +35,60 @@ services:
       - "8086:8086"
     volumes:
       - influxdb_data:/var/lib/influxdb2
+    networks: [demo]
+
+  # `demo/app`'s state (`docs/plans/demo-richer-traces.md` workstream C), and this stack's first
+  # real exercise of `tail_in` (`crates/logit-inputs/src/tail/`) -- `nginx_in` below is `docker_in`,
+  # `tail_in`'s Docker-specific sibling, so nothing here has tailed a plain file directly until now
+  # (see demo/README.md's old "What isn't exercised yet"). `jsonlog` (Postgres 15+), not the plain-
+  # text default, so `logit`'s existing `json` transform reads it unchanged, the same way every
+  # other tier's access line already does. `log_min_duration_statement=0` logs every statement, not
+  # just slow ones -- this is a demo meant to show the mechanism, not a production sampling policy.
+  # `log_rotation_age` is minutes, not the default 24h, deliberately: `tail_in`'s directory-glob
+  # discovery (demo/logit.yaml's `postgres_in`, `paths: [.../*.json]`) only sees a rotation if one
+  # actually happens during a demo session. Wrapped in a `/bin/sh -c` entrypoint, not passed as
+  # `command:` alone, because `log_directory` points outside `PGDATA` -- the official image's own
+  # entrypoint only prepares `PGDATA` itself, so the directory has to exist (and be owned by the
+  # `postgres` user postgres eventually drops privileges to) before `docker-entrypoint.sh` runs.
+  postgres:
+    image: docker.io/library/postgres:17-alpine
+    # The official image only ever reads its own POSTGRES_DB/USER/PASSWORD out of this map --
+    # POSTGRES_HOST/PORT (also in `*postgres-env`, for `app`'s/`app-migrate`'s benefit) are simply
+    # ignored here, not meaningful to this service itself.
+    environment:
+      <<: *postgres-env
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /var/log/postgresql && chown postgres:postgres /var/log/postgresql
+        exec docker-entrypoint.sh postgres \
+          -c logging_collector=on \
+          -c log_destination=jsonlog \
+          -c log_directory=/var/log/postgresql \
+          -c log_min_duration_statement=0 \
+          -c log_rotation_age=5min
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - postgres_logs:/var/log/postgresql
+    networks: [demo]
+
+  # Celery's broker (`docs/plans/demo-richer-traces.md` workstream D) -- `app`'s `.delay()` and
+  # `worker`'s own consumption both go through here. No persistence configured: this demo has
+  # nothing worth surviving a restart on the broker side, unlike `postgres_data` above.
+  redis:
+    image: docker.io/library/redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
     networks: [demo]
 
   grafana:
@@ -111,6 +176,12 @@ services:
       # than failing.
       tempo:
         condition: service_started
+      # `service_started`, same reasoning as `tempo` above -- `postgres_in` (demo/logit.yaml) is a
+      # `tail_in` glob over `postgres`'s own log directory, and a glob matching nothing yet is a
+      # silent, retried no-op by design (`docs/deploying.md`'s "What to watch"), not a startup
+      # ordering `logit` needs `postgres` healthy first to avoid.
+      postgres:
+        condition: service_started
     # `nginx_in` (demo/logit.yaml) tails `nginx`'s own Docker json-file log directly off the host
     # (`docker_in`, docs/adr/file-tailing-and-docker-json-logs.md) rather than receiving a
     # `syslog:` stream -- this stack's end-to-end proof for that ADR. Docker's per-container state
@@ -129,10 +200,13 @@ services:
       # directory (not a directory this stack owns) would be actively harmful, unlike every other
       # bind mount in this file. `security_opt` below is the SELinux accommodation instead.
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      # `nginx_in`'s checkpoint (demo/logit.yaml) -- survives a `logit` restart so it resumes
-      # without replaying/losing lines; `docker compose down -v` wipes it along with everything
-      # else this stack persists.
+      # `nginx_in`'s and `postgres_in`'s checkpoints (demo/logit.yaml) -- survive a `logit` restart
+      # so it resumes without replaying/losing lines; `docker compose down -v` wipes both along
+      # with everything else this stack persists.
       - logit_state:/var/lib/logit
+      # `postgres_in`'s own source (demo/logit.yaml) -- `:ro`, unlike the Docker-state mount above,
+      # since this is a directory this stack owns outright, not the daemon's live state.
+      - postgres_logs:/var/log/postgresql:ro
     # Only meaningful on an SELinux host (Fedora/RHEL and derivatives) -- a no-op elsewhere.
     # Disables SELinux confinement for this one container rather than relabeling the bind mount
     # above (`:z` would do that, and is exactly what must NOT happen to the daemon's own state).
@@ -214,6 +288,32 @@ services:
       - graph_data:/graph
     networks: [demo]
 
+  # One-shot: `manage.py migrate` against a real Postgres, gated on `postgres` being ready to
+  # accept connections -- `service_healthy`, not `service_started`, since (unlike `docker_in`'s
+  # tolerant treatment of `postgres` above) a migration that runs before Postgres can accept
+  # connections just fails outright, no retry built in. Same `service_completed_successfully`
+  # pattern as `graph-dot`/`graph-svg` below: expect `Exited (0)` in `docker compose ps`, not a
+  # crash. Reuses `logit-demo-app:latest` with no second `build:` of its own, the same trick
+  # `graph-dot` already uses against `logit-demo:latest` -- `--build` builds every image once,
+  # regardless of how many services reference the tag afterward.
+  app-migrate:
+    image: logit-demo-app:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Every `manage.py` invocation loads `demoproj/settings.py`'s `LOGGING` regardless of which
+      # command runs, and `SysLogHandler.__init__` resolves its `address` host synchronously at
+      # handler-configuration time -- so `migrate` needs `logit`'s network alias to exist before it
+      # runs, even though it never actually logs anything. `service_started`, the same limit `app`
+      # itself accepts below for the identical reason (UDP is fire-and-forget either way).
+      logit:
+        condition: service_started
+    entrypoint: ["python", "manage.py"]
+    command: ["migrate", "--noinput"]
+    environment:
+      <<: *postgres-env
+    networks: [demo]
+
   # Step 3: the innermost tier a request reaches -- no longer the demo's front door or its own
   # traffic source (docs/plans/demo-tracing-stack.md's workstream A). Sits behind `nginx` below;
   # `traffic` drives requests through the whole haproxy -> nginx -> app chain. A real Django app
@@ -245,7 +345,21 @@ services:
       # `logit`'s own dependency on `tempo` above already uses for `tempo_out`.
       tempo:
         condition: service_started
+      # The schema `pages/models.py`'s `WorkRecord` needs must exist before the first `/work`
+      # request, not just before this container starts serving -- `service_completed_successfully`,
+      # not `service_started`, since `app-migrate` racing its own `migrate` against live traffic is
+      # exactly the ordering bug this dependency exists to rule out.
+      app-migrate:
+        condition: service_completed_successfully
+      # `.delay()` (pages/views.py's `work`) publishes to Redis synchronously, in the request
+      # thread -- unlike `tempo`/`logit` above, there's no background retry queue underneath it,
+      # so `service_healthy` here (Redis's own healthcheck is fast: 5s interval, 5s start period)
+      # is worth the small extra startup wait.
+      redis:
+        condition: service_healthy
     environment:
+      <<: *postgres-env
+      CELERY_BROKER_URL: redis://redis:6379/0
       # The URL a *browser on the host* uses, not a container-network name.
       GRAFANA_URL: http://localhost:3000
       LOGIT_PORT: "5142" # app_in, not haproxy_in/nginx_in -- see demo/logit.yaml
@@ -254,9 +368,53 @@ services:
       # :4318) -- not `logit`. See the comment above and demo/logit.yaml's header comment for why.
       OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf # documentation -- see gunicorn.conf.py's comment
+      # `/work` (pages/views.py) calls back into nginx's own `/inner` -- a container-network name,
+      # unlike GRAFANA_URL above, since this call never leaves the `demo` network. `docs/plans/
+      # demo-richer-traces.md` workstream B: nginx, not haproxy, so this hop takes a different path
+      # than the request that triggered it, while still landing on a tier `logit` mints a real span
+      # from (demo/logit.yaml's `nginx_trace`).
+      INNER_URL: http://nginx/inner
+      # 4, not `gunicorn.conf.py`'s own default of 2 -- `/work` blocks one worker on its own
+      # inbound call to `/inner`, which needs a *different* worker of this same pool to answer. At
+      # 2, two concurrent `/work` requests self-deadlock: both hold a worker waiting on `/inner`,
+      # and neither request the inner call is waiting for can ever be served. `traffic`'s loop
+      # (below) is serial, so 4 is ample headroom, not a value tuned against real concurrency.
+      WEB_CONCURRENCY: "4"
     # No longer published -- haproxy is the front door now.
     volumes:
       - graph_data:/graph:ro
+    restart: unless-stopped
+    networks: [demo]
+
+  # The demo's async tier (`docs/plans/demo-richer-traces.md` workstream D) -- `pages/tasks.py`'s
+  # one task, run here, never in a gunicorn worker. Reuses `logit-demo-app:latest` with no second
+  # `build:` of its own, the same trick `app-migrate`/`graph-dot` already use: `--build` builds
+  # every image once, regardless of how many services reference the tag afterward. Its own real
+  # OTel spans (`demoproj/telemetry.py`) go straight to Tempo, exactly like `app`'s -- `logit`
+  # isn't in this leg either, consistent with every other tier's own SDK-carried spans in this
+  # demo.
+  worker:
+    image: logit-demo-app:latest
+    depends_on:
+      redis:
+        condition: service_healthy
+      app-migrate:
+        condition: service_completed_successfully
+      logit:
+        condition: service_started
+      tempo:
+        condition: service_started
+    entrypoint: ["celery", "-A", "demoproj.celery", "worker"]
+    command: ["--loglevel=info", "--concurrency=2"]
+    environment:
+      <<: *postgres-env
+      CELERY_BROKER_URL: redis://redis:6379/0
+      OTEL_SERVICE_NAME: demo-worker
+      # worker_in, not app_in -- pages/tasks.py logs through `demoapp.worker`
+      # (demoproj/settings.py), a separate logger/handler/port from `app`'s own `demoapp.access`.
+      WORKER_LOGIT_PORT: "5143"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
     restart: unless-stopped
     networks: [demo]
 
@@ -325,10 +483,15 @@ services:
     # argv entry -- exactly what `-c` needs -- with no compose-side splitting at all. `|` (literal
     # block) inside that one element keeps every line break a real newline, which the shell inside
     # the container treats as a statement separator exactly like `;`.
+    # `/work` repeated three times, not once, so it's the majority of the loop's traffic --
+    # `docs/plans/demo-richer-traces.md` workstream A's whole point is a Tempo/Grafana story worth
+    # looking at, which means enough `/work` traces (jittered latency, an occasional real 503) to
+    # fill in `web.request_time`'s p50/p99 spread and the "Loki: 5xx lines/sec" panel without `/boom`
+    # (a guaranteed 500, kept rare here) dominating either one.
     command:
       - |
         while true; do
-          for p in / /health /graph.svg /missing; do
+          for p in / /health /graph.svg /missing /work /work /work /boom; do
             curl -s -o /dev/null "http://haproxy:8080$$p" || true
             sleep 2
           done
@@ -346,3 +509,5 @@ volumes:
   tempo_data: {}
   graph_data: {}
   logit_state: {}
+  postgres_data: {}
+  postgres_logs: {}

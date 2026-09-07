@@ -247,11 +247,29 @@
       ]
     },
     {
+      "id": 17,
+      "type": "table",
+      "title": "Tempo: demo traces with an error (any tier)",
+      "description": "docs/plans/demo-richer-traces.md workstream A: /boom (demo/app/pages/views.py) always 500s, and /work's occasional 503 keys the same span.status: error on haproxy's/nginx's logit-minted spans (demo/haproxy/haproxy.cfg, demo/nginx/nginx.conf) a real backend failure would. {status=error} matches a trace with at least one error span from any tier -- unlike the two tables above, this one isn't scoped to a single root service.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 72 },
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "tempo", "uid": "tempo" },
+          "queryType": "traceql",
+          "query": "{status=error}",
+          "tableType": "traces",
+          "limit": 20
+        }
+      ]
+    },
+    {
       "id": 16,
       "type": "timeseries",
       "title": "logit.internal.spans.dropped (buffer_full)",
       "description": "The per-component span buffer's overflow counter (MAX_SPANS_PER_COMPONENT, docs/design/internal-telemetry.md) -- should stay at zero at demo volume; a nonzero value means the demo's traffic is outrunning the bounded buffer between `internal`'s drain ticks, not that traces are being lost silently.",
-      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 72 },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 80 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "targets": [
         {

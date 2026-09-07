@@ -56,26 +56,43 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "demoproj.wsgi.application"
 
-# No database -- this tier holds no state of its own (docs/plans/demo-tracing-stack.md's
-# workstream B), and nothing installed above needs one.
-DATABASES = {}
+# `docs/plans/demo-richer-traces.md` workstream C: real state, and a real driver-level CLIENT
+# span (opentelemetry-instrumentation-psycopg, demo/app/gunicorn.conf.py) rather than the
+# request-only spans every other route produces. Django auto-selects the psycopg 3 backend once
+# `psycopg` (not `psycopg2`) is the importable driver (Django 4.2+); still spelled
+# `django.db.backends.postgresql` either way.
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.environ.get("POSTGRES_DB", "demo"),
+        "USER": os.environ.get("POSTGRES_USER", "demo"),
+        "PASSWORD": os.environ.get("POSTGRES_PASSWORD", ""),
+        "HOST": os.environ.get("POSTGRES_HOST", "postgres"),
+        "PORT": os.environ.get("POSTGRES_PORT", "5432"),
+    }
+}
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 USE_TZ = True
 
-# `logit`'s own syslog listener for this tier (demo/logit.yaml's `app_in`, :5142) -- distinct from
-# haproxy's :5140 and nginx's :5141, same reasoning as both: `set`'s `resource:` block stamps a
-# whole *batch*, so each tier needs its own listener or they'd interleave into one batch with one
-# wrong `service.name`.
+# `logit`'s own syslog listeners for this app -- one per tier (demo/logit.yaml's `app_in`, :5142,
+# `worker_in`, :5143, docs/plans/demo-richer-traces.md workstream D), distinct from haproxy's
+# :5140 and nginx's :5141 for the identical reason: `set`'s `resource:` block stamps a whole
+# *batch*, so each tier needs its own listener or they'd interleave into one batch with one wrong
+# `service.name`. This one settings module is shared by both processes (gunicorn's own workers and
+# the `worker` service, demo/compose.yaml) -- each only ever logs through its own logger below, so
+# both handlers existing in both processes is harmless.
 LOGIT_HOST = os.environ.get("LOGIT_HOST", "logit")
 LOGIT_PORT = int(os.environ.get("LOGIT_PORT", "5142"))
+WORKER_LOGIT_PORT = int(os.environ.get("WORKER_LOGIT_PORT", "5143"))
 
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
         "access_json": {"()": "pages.logging_formatter.AccessLogJSONFormatter"},
+        "worker_json": {"()": "pages.logging_formatter.WorkerLogJSONFormatter"},
     },
     "handlers": {
         "access_syslog": {
@@ -89,6 +106,13 @@ LOGGING = {
             "facility": "local0",
             "formatter": "access_json",
         },
+        "worker_syslog": {
+            "class": "pages.syslog_handler.NoNulSysLogHandler",
+            "address": (LOGIT_HOST, WORKER_LOGIT_PORT),
+            "socktype": socket.SOCK_DGRAM,
+            "facility": "local0",
+            "formatter": "worker_json",
+        },
     },
     "loggers": {
         # `propagate: False` -- this logger's only purpose is the one `access_syslog` line per
@@ -96,6 +120,13 @@ LOGGING = {
         # print to stderr.
         "demoapp.access": {
             "handlers": ["access_syslog"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        # Same reasoning as `demoapp.access` above -- `pages/tasks.py`'s only log line per task,
+        # nothing else.
+        "demoapp.worker": {
+            "handlers": ["worker_syslog"],
             "level": "INFO",
             "propagate": False,
         },

@@ -6,4 +6,12 @@ opentelemetry-api
 opentelemetry-sdk
 opentelemetry-instrumentation-django
 opentelemetry-instrumentation-logging
+opentelemetry-instrumentation-requests
+opentelemetry-instrumentation-psycopg
+opentelemetry-instrumentation-celery
+opentelemetry-instrumentation-redis
 opentelemetry-exporter-otlp-proto-http
+requests
+psycopg[binary]
+celery
+redis

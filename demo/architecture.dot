@@ -1,5 +1,6 @@
 // The demo stack's service architecture -- who talks to whom, and what *kind* of traffic each
-// edge carries (web / logging / tracing / metrics / query), as opposed to demo/logit.yaml's own
+// edge carries (web / logging / tracing / metrics / db / queue / query), as opposed to
+// demo/logit.yaml's own
 // pipeline diagram (rendered live by `logit graph`, shown just below this one on the landing
 // page), which is about `logit`'s internal component graph and the wire protocol each edge uses.
 // The two are deliberately complementary, not overlapping: this is the macro service topology,
@@ -33,44 +34,76 @@ digraph architecture {
   haproxy [shape=box, style="filled,rounded"];
   nginx   [shape=box, style="filled,rounded"];
   app     [shape=box, style="filled,rounded", label="app\n(Django)"];
+  worker  [shape=box, style="filled,rounded", label="worker\n(Celery)"];
   logit   [shape=box, style="filled,rounded,bold"];
   grafana [shape=box, style="filled,rounded"];
 
-  // Cylinders for the three data stores -- the one shape this diagram uses that the pipeline
+  // Cylinders for the five data stores -- the one shape this diagram uses that the pipeline
   // diagram doesn't, on purpose: nothing in `logit graph`'s own vocabulary distinguishes "a
   // backend that holds data" from any other sink, but at the architecture level that distinction
-  // is exactly the point.
+  // is exactly the point. `redis` is a broker, not really "held data" the way the other four are
+  // -- grouped here anyway rather than invented a sixth shape for one node.
   loki     [shape=cylinder, style=filled];
   tempo    [shape=cylinder, style=filled];
   influxdb [shape=cylinder, style=filled];
+  postgres [shape=cylinder, style=filled];
+  redis    [shape=cylinder, style=filled];
 
-  // -- Web: the request path --------------------------------------------------------------
+  // -- Web: the request path, plus the re-entrant hop `/work` adds -------------------------
+  // (docs/plans/demo-richer-traces.md's workstream B): app calling back into nginx's own /inner
+  // is a second, independent "web" edge in the opposite direction from nginx -> app below, not a
+  // reuse of it -- the request genuinely re-enters the chain partway rather than looping in place.
   client  -> haproxy [label="web"];
   haproxy -> nginx   [label="web"];
   nginx   -> app     [label="web"];
+  app     -> nginx   [label="web"];
   client  -> grafana [label="web"];
 
   // -- Logging: every tier's access log reaches `logit` ------------------------------------
-  // haproxy's and app's over syslog; nginx's by `logit` tailing its container's own Docker
-  // json-file log directly off the host instead (docs/adr/file-tailing-and-docker-json-logs.md)
-  // -- this demo is that ADR's end-to-end proof. Still one "logging" edge either way: the
-  // distinction is a transport detail this architecture-level diagram doesn't otherwise draw
-  // (demo/logit.yaml's own topology comment has the tailing-specific detail).
-  haproxy -> logit [label="logging"];
-  nginx   -> logit [label="logging"];
-  app     -> logit [label="logging"];
-  logit   -> loki  [label="logging"];
+  // haproxy's and app's over syslog; nginx's and postgres's by `logit` tailing their own logs
+  // directly off the host instead -- nginx's Docker json-file log
+  // (docs/adr/file-tailing-and-docker-json-logs.md, this demo's end-to-end proof for that ADR)
+  // and postgres's plain rotating jsonlog directory (`tail_in`, docs/plans/demo-richer-traces.md's
+  // workstream C). Still one "logging" edge either way: the distinction is a transport detail
+  // this architecture-level diagram doesn't otherwise draw (demo/logit.yaml's own topology
+  // comment has the tailing-specific detail).
+  haproxy  -> logit [label="logging"];
+  nginx    -> logit [label="logging"];
+  app      -> logit [label="logging"];
+  worker   -> logit [label="logging"];
+  postgres -> logit [label="logging"];
+  logit    -> loki  [label="logging"];
+
+  // -- db: reads/writes against Postgres, from either app-tier process ---------------------
+  // A distinct category from "query" below -- that's Grafana reading back what this stack itself
+  // wrote; this is `app`/`worker` reading and writing their own state, over `psycopg`
+  // (docs/plans/demo-richer-traces.md's workstream C). Both, not just `app` -- `pages/tasks.py`'s
+  // task writes too, from the `worker` process specifically (workstream D).
+  app    -> postgres [label="db"];
+  worker -> postgres [label="db"];
+
+  // -- queue: Celery's own broker traffic ---------------------------------------------------
+  // `app` publishes (`.delay()`, pages/views.py's `work`); `worker` consumes -- two edges, one
+  // real exchange, same as `nginx -> app`/`app -> nginx` above being drawn as two directed edges
+  // rather than implying a single bidirectional one (docs/plans/demo-richer-traces.md workstream D).
+  app    -> redis [label="queue"];
+  worker -> redis [label="queue"];
 
   // -- Tracing: two independent paths into Tempo -------------------------------------------
   // `logit`'s own internal spans travel this edge, and so do haproxy's/nginx's real access-line
   // spans (docs/adr/trace-context-span-lifting.md's `span:` block, derived from the same log
   // line the "logging" edges above already show -- one wire, two signals, no new edge needed
-  // here). `app`'s real request spans go straight to Tempo's own OTLP receiver instead,
+  // here). `app`'s real request/database-client/Celery-producer spans, and `worker`'s own
+  // Celery-consumer/database-client spans, go straight to Tempo's own OTLP receiver instead,
   // deliberately bypassing `logit` (docs/plans/demo-tracing-stack.md's "Decisions already
   // settled") -- not every telemetry leg needs `logit` in front of it, and this diagram shows
-  // that honestly rather than drawing an edge through `logit` that doesn't exist.
-  logit -> tempo [label="tracing"];
-  app   -> tempo [label="tracing"];
+  // that honestly rather than drawing an edge through `logit` that doesn't exist. `postgres` and
+  // `redis` themselves get no edge into `tempo` -- neither runs an SDK; postgres's trace id
+  // reaches Loki only, via the "logging" edge above, and redis's isn't captured by this demo at
+  // all (the broker traffic is instrumented from both endpoints, not the broker itself).
+  logit  -> tempo [label="tracing"];
+  app    -> tempo [label="tracing"];
+  worker -> tempo [label="tracing"];
 
   // -- Metrics -------------------------------------------------------------------------------
   logit -> influxdb [label="metrics"];

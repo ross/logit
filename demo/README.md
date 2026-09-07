@@ -30,7 +30,10 @@ the demo's front door now; requests flow `haproxy` → `nginx` → `app` (a real
 | Tempo | http://localhost:3200 (query), :4317/:4318 (OTLP) | Provisioned as a Grafana datasource; receives `logit`'s own internal spans over OTLP/gRPC. |
 
 `nginx` and `app` (the landing-page app) are internal-only now — reached through `haproxy`,
-not published on the host.
+not published on the host. So are `postgres` — `app`'s own database (`docs/plans/
+demo-richer-traces.md`), reached only from `app`/`worker` and from `logit`'s own `postgres_in`
+tailing its jsonlog — and `redis`/`worker`, Celery's own broker and the background worker process
+that consumes from it (same doc, workstream D).
 
 `docker compose logs -f logit` shows every decoded event as a `stdio_out` block — the fastest way
 to see the pipeline doing something. `self` (`internal`, observing `logit`'s own telemetry) mixes
@@ -130,6 +133,52 @@ trace — which contains four real spans (haproxy, nginx, and app's, plus `logit
 ones for that request if sampled), arrived at via two different Tempo receivers, not `logit`'s
 internal spans alone.
 
+None of that trace has any real *shape* on its own, though — every request the same chain, the
+same latency, the same `200`. Two routes on `app` exist purely to fix that
+(`docs/plans/demo-richer-traces.md`): `/work` sleeps a jittered amount and occasionally answers a
+real `503`, and `/boom` always fails with an uncaught exception, so its OTel span carries a real
+`exception` event — `trace_context` never mints span *events* on the spans it lifts from a plain
+access log line, so that's the only path to one anywhere in this demo. `/work` also calls back into
+**`nginx`, not `haproxy`** — `pages/views.py`'s `INNER_URL` — deliberately: the request re-enters
+the chain partway rather than from the front door, and the resulting `nginx` server span (still
+`logit`-minted, from the same Docker json-file log) becomes a genuine subtree under `app`'s own
+`requests` CLIENT span rather than a second top-level branch. Two honest side effects worth
+knowing rather than being surprised by: `nginx`'s `web.requests` counter now runs roughly double
+`haproxy`'s (it serves this inner hop too), and its `host` tag gains a second value — `nginx`
+itself, from `proxy_set_header Host $host` on a request whose `Host` genuinely is `nginx`.
+`traffic`'s own loop (`compose.yaml`) drives all of this — weighted toward `/work`, since a
+guaranteed `500` on every cycle would swamp the dashboard's error panel.
+
+`/work` also writes to, and counts rows in, a real Postgres now (`docs/plans/
+demo-richer-traces.md`'s workstream C) — `app`'s own `psycopg` driver, instrumented the same way
+`requests` is above, so every statement gets a real CLIENT span straight to Tempo, the app's usual
+path. Postgres's own log line for that statement still ends up in Loki carrying the *same* trace
+id, though, with no SDK on Postgres's side at all: `opentelemetry-instrumentation-psycopg`'s
+sqlcommenter (`enable_commenter=True`, `app/demoproj/telemetry.py`) appends a trailing SQL comment
+carrying `traceparent='...'` to the statement text itself, Postgres logs the whole statement
+verbatim (`log_min_duration_statement=0`), and `postgres_trace_lift` — a five-line `lua` stage in
+`demo/logit.yaml` — regexes that substring back out and hands it to `trace_context` exactly as it
+would a real HTTP header. `postgres_in` (`tail_in`) is this demo's first plain-file tail, not a
+`docker_in` container log — Postgres's own jsonlog rotates into a fresh `postgresql-<timestamp>.json`
+file periodically, so `postgres_in`'s `paths:` glob is doing real, live discovery work, not tailing
+one static file for the life of the stack.
+
+`/work`'s last step (`docs/plans/demo-richer-traces.md`'s workstream D) hands off to a real
+background worker over Redis, rather than doing everything inline: `.delay()` enqueues a task and
+returns immediately, well before that task ever runs. `opentelemetry-instrumentation-celery` turns
+that into a real Celery PRODUCER span in `app` (parented to the request that called `.delay()`,
+same as `requests`'s CLIENT span above) and a real CONSUMER span in the separate `worker` process
+that picks the task up — `opentelemetry-instrumentation-redis` covers the broker traffic in
+between. Both spans, and the task's own `psycopg` write, go straight to Tempo exactly like every
+other app-tier span; `worker`'s one log line per task reaches Loki through `logit`'s own
+`worker_in`, the fourth per-tier `syslog_in` (`app_in`'s own sibling, not a shared listener, for
+the identical resource-identity reason every tier already has one). The result is the one trace
+shape nothing else in this demo produces: spans that keep arriving in Tempo *after* the HTTP
+response that started them has already reached the client — `app`'s gunicorn workers and the
+`worker` service both run the identical `TracerProvider`/instrumentor setup
+(`app/demoproj/telemetry.py`, factored out once both processes needed it), each fed its own
+`service.name` by `OTEL_SERVICE_NAME` (`demo-app`/`demo-worker`, `compose.yaml`).
+
 The landing page shows two diagrams. The pipeline one (also at `:8080/graph.svg` directly) is
 rendered at startup, not hand-drawn: `graph-dot` runs `logit graph logit.yaml` against the actual
 config this stack is running, `graph-svg` pipes that DOT through real Graphviz
@@ -152,13 +201,15 @@ request, nothing is cached.)
 **`otlp_in`** (`crates/logit-inputs/src/otlp.rs`) still ships implemented and tested with nothing
 in this stack sending *to* it — `app`'s spans go straight to Tempo instead, by design (see
 "What's actually flowing" above), so this isn't an oversight to close so much as a deliberate
-choice about where `logit` belongs in the pipeline. **`tail_in`** (plain file tailing, the driver
-`docker_in` builds on) ships tested but unexercised here too — nothing in this stack tails a plain
-file directly; only `docker_in`, its Docker-specific sibling, gets a live workout. If you want to
-see `otlp_in` exercised with
+choice about where `logit` belongs in the pipeline. If you want to see `otlp_in` exercised with
 real traffic, point `app`'s `OTEL_EXPORTER_OTLP_ENDPOINT` (`demo/compose.yaml`) at `http://logit:4318`
 instead of `http://tempo:4318`, and re-add a `tempo_out` source for it in `demo/logit.yaml` — that
 was this demo's shape until this rework; it's a small, well-understood change to reverse.
+
+`tail_in` (plain file tailing, the driver `docker_in` builds on) used to ship tested but
+unexercised here too — `postgres_in` (`demo/logit.yaml`, `docs/plans/demo-richer-traces.md`)
+closes that: a `paths:` glob over Postgres's own rotating jsonlog directory, checkpointed on the
+same `logit_state` volume `nginx_in` already uses.
 
 What's left client-side: browser-side tracing is sketched, not built, in
 [docs/plans/demo-tracing-stack.md](../docs/plans/demo-tracing-stack.md)'s workstream C
