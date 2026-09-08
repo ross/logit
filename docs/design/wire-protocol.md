@@ -31,7 +31,11 @@ deliberately the same function pair a socket write and a file append both use �
 **Only `lz4` is encodable today.** The real `zstd` crate builds C via `zstd-sys`, breaking
 [ADR `containerized-development`](../adr/containerized-development.md)'s "no host toolchain needed"
 property, and the pure-Rust alternatives aren't yet competitive on ratio or speed — `Zstd = 2`
-stays a reserved discriminant `read_frame` rejects with `CodecError::Unsupported`, per the same ADR.
+stays a reserved discriminant `write_frame` and `read_frame` both reject with
+`CodecError::Unsupported`, per the same ADR.
+
+`uncompressed_len` is bounded at 64 MiB (`MAX_SANE_UNCOMPRESSED_LEN`) before it is used to size a
+decompression buffer — a frame declaring more is rejected as `Malformed` on the header alone.
 
 ## Payload: dictionary-first batches
 

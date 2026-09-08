@@ -28,6 +28,16 @@ const TAG_TIMESTAMP: u8 = 7;
 const TAG_ARRAY: u8 = 8;
 const TAG_MAP: u8 = 9;
 
+/// The deepest `Value::Array`/`Value::Map` nesting this reader will follow. Generous -- real
+/// telemetry attribute values are flat or one level deep, and this is in the same range as
+/// `serde_json`'s own 128-level recursion limit, which bounds the deepest `Value` the `json`
+/// transform can construct in the first place -- but bounded, because the decode side is
+/// recursive: without a cap, a crafted payload of nothing but nested array headers overflows the
+/// stack and aborts the process rather than returning an error. Encode-side (`write_value`) is
+/// deliberately NOT capped: it only ever encodes a `Value` that already exists in memory, so a
+/// depth that would overflow the encoder would already have overflowed whatever built the value.
+const MAX_VALUE_DEPTH: usize = 128;
+
 pub fn write_value(out: &mut BytesMut, dict: &mut DictBuilder, value: &Value) {
     match value {
         Value::Null => {
@@ -96,6 +106,15 @@ fn write_varint_payload(out: &mut BytesMut, tag: u8, payload: BytesMut) {
 }
 
 pub fn read_value(bytes: &mut Bytes, dict: &Dict) -> Result<Value, CodecError> {
+    read_value_at(bytes, dict, 0)
+}
+
+fn read_value_at(bytes: &mut Bytes, dict: &Dict, depth: usize) -> Result<Value, CodecError> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(CodecError::Malformed(format!(
+            "value nesting deeper than the {MAX_VALUE_DEPTH}-level cap"
+        )));
+    }
     let tag = read_u8(bytes)?;
     let len = read_uvarint(bytes)? as usize;
     if bytes.len() < len {
@@ -137,11 +156,11 @@ pub fn read_value(bytes: &mut Bytes, dict: &Dict) -> Result<Value, CodecError> {
             let count = read_uvarint(&mut payload)? as usize;
             let mut items = Vec::with_capacity(count.min(4096));
             for _ in 0..count {
-                items.push(read_value(&mut payload, dict)?);
+                items.push(read_value_at(&mut payload, dict, depth + 1)?);
             }
             Ok(Value::Array(items))
         }
-        TAG_MAP => Ok(Value::Map(Box::new(read_attr_map(&mut payload, dict)?))),
+        TAG_MAP => Ok(Value::Map(Box::new(read_attr_map_at(&mut payload, dict, depth + 1)?))),
         // Forward compatibility: a tag this reader doesn't recognize (a future Value variant)
         // was still framed as tag+len+payload, so the `len`-byte skip above already consumed it
         // in full -- there is nothing left to do but degrade to the documented "absent" sentinel.
@@ -159,12 +178,16 @@ pub fn write_attr_map(out: &mut BytesMut, dict: &mut DictBuilder, map: &AttrMap)
 }
 
 pub fn read_attr_map(bytes: &mut Bytes, dict: &Dict) -> Result<AttrMap, CodecError> {
+    read_attr_map_at(bytes, dict, 0)
+}
+
+fn read_attr_map_at(bytes: &mut Bytes, dict: &Dict, depth: usize) -> Result<AttrMap, CodecError> {
     let count = read_uvarint(bytes)? as usize;
     let mut map = AttrMap::new();
     for _ in 0..count {
         let idx = read_uvarint(bytes)? as u32;
         let key = dict.get(idx)?;
-        let value = read_value(bytes, dict)?;
+        let value = read_value_at(bytes, dict, depth)?;
         map.insert_sym(key, value);
     }
     Ok(map)
@@ -261,5 +284,50 @@ mod tests {
         let known = read_value(&mut bytes, &dict).unwrap();
         assert_eq!(known, Value::I64(99));
         assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn rejects_value_nesting_past_the_depth_cap() {
+        let mut value = Value::I64(1);
+        for _ in 0..(MAX_VALUE_DEPTH + 2) {
+            value = Value::Array(vec![value]);
+        }
+        let mut builder = DictBuilder::default();
+        let mut buf = BytesMut::new();
+        write_value(&mut buf, &mut builder, &value);
+        let mut dict_bytes = BytesMut::new();
+        builder.write(&mut dict_bytes);
+        let dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+
+        let mut bytes = buf.freeze();
+        assert!(matches!(read_value(&mut bytes, &dict), Err(CodecError::Malformed(_))));
+    }
+
+    #[test]
+    fn rejects_map_nesting_past_the_depth_cap() {
+        let mut value = Value::I64(1);
+        for _ in 0..(MAX_VALUE_DEPTH + 2) {
+            let mut m = AttrMap::new();
+            m.insert("n", value);
+            value = Value::Map(Box::new(m));
+        }
+        let mut builder = DictBuilder::default();
+        let mut buf = BytesMut::new();
+        write_value(&mut buf, &mut builder, &value);
+        let mut dict_bytes = BytesMut::new();
+        builder.write(&mut dict_bytes);
+        let dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+
+        let mut bytes = buf.freeze();
+        assert!(matches!(read_value(&mut bytes, &dict), Err(CodecError::Malformed(_))));
+    }
+
+    #[test]
+    fn a_value_nested_to_exactly_the_depth_cap_still_round_trips() {
+        let mut value = Value::I64(1);
+        for _ in 0..MAX_VALUE_DEPTH {
+            value = Value::Array(vec![value]);
+        }
+        assert_eq!(dict_round_trip(&value), value);
     }
 }

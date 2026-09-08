@@ -56,10 +56,12 @@ impl DictBuilder {
 /// interner round trip.
 pub struct Dict(Vec<Symbol>);
 
-/// A dictionary this large would mean over a gigabyte of index storage alone -- almost certainly a
-/// corrupt or hostile length field, not a real batch. Bounds the up-front `Vec::with_capacity`
-/// below so a bad count can't be used to force a huge allocation before a single byte of the
-/// dictionary's actual content has even been validated.
+/// A dictionary this large -- ~64 MiB of index storage alone, since a `Symbol` is 4 bytes
+/// (`crates/logit-core/tests/type_sizes.rs`) -- is almost certainly a corrupt or hostile length
+/// field, not a real batch. This is the outer bound; the `Vec::with_capacity` below is separately
+/// clamped to a 4096-entry starting hint, so even a count well under this cap can't be used to
+/// force a large eager allocation before a single byte of the dictionary's actual content has been
+/// validated.
 const MAX_SANE_DICT_ENTRIES: usize = 16 * 1024 * 1024;
 
 impl Dict {
@@ -70,7 +72,7 @@ impl Dict {
                 "dictionary declares {count} entries, over the {MAX_SANE_DICT_ENTRIES} sanity cap"
             )));
         }
-        let mut symbols = Vec::with_capacity(count);
+        let mut symbols = Vec::with_capacity(count.min(4096));
         for _ in 0..count {
             let len = read_uvarint(bytes)? as usize;
             if bytes.len() < len {
@@ -161,6 +163,22 @@ mod tests {
         write_uvarint(&mut buf, 1);
         write_uvarint(&mut buf, 2);
         buf.extend_from_slice(&[0xff, 0xfe]); // invalid utf-8
+        let mut bytes = buf.freeze();
+        assert!(matches!(Dict::read(&mut bytes), Err(CodecError::Malformed(_))));
+    }
+
+    #[test]
+    fn read_rejects_a_count_over_the_sanity_cap() {
+        let mut buf = BytesMut::new();
+        write_uvarint(&mut buf, MAX_SANE_DICT_ENTRIES as u64 + 1);
+        let mut bytes = buf.freeze();
+        assert!(matches!(Dict::read(&mut bytes), Err(CodecError::Malformed(_))));
+    }
+
+    #[test]
+    fn read_rejects_a_large_count_with_no_content_behind_it() {
+        let mut buf = BytesMut::new();
+        write_uvarint(&mut buf, 1_000_000);
         let mut bytes = buf.freeze();
         assert!(matches!(Dict::read(&mut bytes), Err(CodecError::Malformed(_))));
     }

@@ -14,6 +14,14 @@ use crate::CodecError;
 pub const MAGIC: [u8; 4] = *b"LGIT";
 pub const VERSION: u16 = 1;
 
+/// The largest payload a single frame may declare, checked before `uncompressed_len` -- a raw,
+/// unvalidated `u32` off the wire -- is ever used to size an allocation. A frame at this cap is
+/// already far larger than any batch `logit` produces; a crafted 30-byte lz4 frame could otherwise
+/// name a multi-gigabyte `uncompressed_len` and force the allocation attempt before a single byte
+/// of payload had been looked at. Same reasoning as `crate::native::dict`'s
+/// `MAX_SANE_DICT_ENTRIES` and `crate::native`'s `MAX_SANE_EVENT_COUNT`.
+const MAX_SANE_UNCOMPRESSED_LEN: u32 = 64 * 1024 * 1024;
+
 /// The fixed header size in bytes: 4 (magic) + 2 (version) + 2 (flags) + 1 (codec) +
 /// 1 (compression) + 2 (reserved) + 4 (uncompressed_len) + 4 (compressed_len) + 4 (crc32c) = 24.
 /// Chosen over the 20 bytes an earlier skeleton comment named so every multi-byte field after
@@ -30,8 +38,8 @@ pub enum Compression {
     /// Reserved, not encodable or decodable yet -- the real `zstd` crate builds C via `zstd-sys`,
     /// which breaks ADR `containerized-development`'s "no host toolchain" property, and the
     /// pure-Rust alternatives aren't yet competitive on ratio or speed. See
-    /// `docs/adr/native-wire-format-encoding.md`. `decode_frame` rejects this discriminant with
-    /// [`CodecError::Unsupported`] rather than silently treating it as `None`.
+    /// `docs/adr/native-wire-format-encoding.md`. `write_frame` and `read_frame` both reject this
+    /// discriminant with [`CodecError::Unsupported`] rather than silently treating it as `None`.
     Zstd = 2,
 }
 
@@ -118,12 +126,23 @@ impl FrameHeader {
 /// `docs/design/wire-protocol.md`'s "crc32c over the (possibly compressed) payload" -- a corrupt
 /// compressed stream is caught before decompression ever runs on it, rather than handing
 /// `lz4_flex` untrusted input and hoping it fails safely).
-pub fn write_frame(codec: u8, compression: Compression, payload: &[u8]) -> Bytes {
+///
+/// Rejects `Compression::Zstd` with [`CodecError::Unsupported`] rather than panicking, symmetric
+/// with [`read_frame`]'s existing decode-side rejection -- `Compression` is a public enum whose
+/// `Zstd` variant any caller may construct.
+pub fn write_frame(
+    codec: u8,
+    compression: Compression,
+    payload: &[u8],
+) -> Result<Bytes, CodecError> {
     let compressed = match compression {
         Compression::None => payload.to_vec(),
         Compression::Lz4 => lz4_compress(payload),
         Compression::Zstd => {
-            unreachable!("Compression::Zstd is not yet encodable -- see its own doc comment")
+            return Err(CodecError::Unsupported(
+                "zstd frames are not encodable yet -- see Compression::Zstd's own doc comment"
+                    .to_string(),
+            ))
         }
     };
     let crc = crc32c::crc32c(&compressed);
@@ -139,7 +158,7 @@ pub fn write_frame(codec: u8, compression: Compression, payload: &[u8]) -> Bytes
     let mut out = BytesMut::with_capacity(HEADER_LEN + compressed.len());
     header.write(&mut out);
     out.put_slice(&compressed);
-    out.freeze()
+    Ok(out.freeze())
 }
 
 /// The inverse of [`write_frame`]: reads one frame off the front of `bytes` (advancing it past
@@ -147,6 +166,12 @@ pub fn write_frame(codec: u8, compression: Compression, payload: &[u8]) -> Bytes
 /// can call this in a loop), verifies the checksum, decompresses, and returns `(codec, payload)`.
 pub fn read_frame(bytes: &mut Bytes) -> Result<(u8, Bytes), CodecError> {
     let header = FrameHeader::read(bytes)?;
+    if header.uncompressed_len > MAX_SANE_UNCOMPRESSED_LEN {
+        return Err(CodecError::Malformed(format!(
+            "frame declares {} uncompressed bytes, over the {MAX_SANE_UNCOMPRESSED_LEN} sanity cap",
+            header.uncompressed_len
+        )));
+    }
     if (bytes.len() as u64) < header.compressed_len as u64 {
         return Err(CodecError::Malformed(format!(
             "frame declares {} compressed bytes but only {} remain",
@@ -196,12 +221,17 @@ fn lz4_compress(payload: &[u8]) -> Vec<u8> {
 
 /// The inverse of [`lz4_compress`]. `uncompressed_len` comes straight from this frame's own
 /// header, so the output buffer is allocated at exactly the right size -- no guessing, no resize.
+/// The buffer is then truncated to what `decompress_into` actually wrote: `lz4_flex` is happy to
+/// write *fewer* bytes than the buffer holds, so without this the returned `Vec` would always be
+/// `uncompressed_len` long regardless, and [`read_frame`]'s length check below would be a
+/// tautology that silently accepted a short decompression padded with zero bytes.
 fn lz4_decompress(
     compressed: &[u8],
     uncompressed_len: usize,
 ) -> Result<Vec<u8>, lz4_flex::block::DecompressError> {
     let mut out = vec![0u8; uncompressed_len];
-    lz4_flex::block::decompress_into(compressed, &mut out)?;
+    let written = lz4_flex::block::decompress_into(compressed, &mut out)?;
+    out.truncate(written);
     Ok(out)
 }
 
@@ -223,7 +253,7 @@ mod tests {
     #[test]
     fn round_trips_uncompressed() {
         let payload = b"hello logit";
-        let framed = write_frame(1, Compression::None, payload);
+        let framed = write_frame(1, Compression::None, payload).unwrap();
         let mut bytes = framed;
         let (codec, out) = read_frame(&mut bytes).unwrap();
         assert_eq!(codec, 1);
@@ -234,7 +264,7 @@ mod tests {
     #[test]
     fn round_trips_lz4_compressed() {
         let payload = "repeat ".repeat(200);
-        let framed = write_frame(7, Compression::Lz4, payload.as_bytes());
+        let framed = write_frame(7, Compression::Lz4, payload.as_bytes()).unwrap();
         // A real repeated payload should actually compress -- otherwise this test isn't
         // exercising the lz4 path at all.
         assert!(framed.len() < payload.len(), "expected compression to shrink the payload");
@@ -246,8 +276,8 @@ mod tests {
 
     #[test]
     fn concatenated_frames_are_each_independently_decodable() {
-        let a = write_frame(1, Compression::None, b"first");
-        let b = write_frame(2, Compression::Lz4, b"second, a bit longer to compress");
+        let a = write_frame(1, Compression::None, b"first").unwrap();
+        let b = write_frame(2, Compression::Lz4, b"second, a bit longer to compress").unwrap();
         let mut both = BytesMut::new();
         both.put_slice(&a);
         both.put_slice(&b);
@@ -266,7 +296,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_magic() {
-        let mut bad = write_frame(1, Compression::None, b"x");
+        let mut bad = write_frame(1, Compression::None, b"x").unwrap();
         // Corrupt the first magic byte.
         let mut mutated = BytesMut::from(&bad[..]);
         mutated[0] = b'X';
@@ -276,7 +306,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_version() {
-        let framed = write_frame(1, Compression::None, b"x");
+        let framed = write_frame(1, Compression::None, b"x").unwrap();
         let mut mutated = BytesMut::from(&framed[..]);
         mutated[4] = 0xFF; // version low byte
         mutated[5] = 0xFF;
@@ -286,7 +316,7 @@ mod tests {
 
     #[test]
     fn rejects_corrupt_crc() {
-        let framed = write_frame(1, Compression::None, b"hello");
+        let framed = write_frame(1, Compression::None, b"hello").unwrap();
         let mut mutated = BytesMut::from(&framed[..]);
         let last = mutated.len() - 1;
         mutated[last] ^= 0xFF; // flip a payload byte without touching the header's crc field
@@ -297,9 +327,18 @@ mod tests {
     }
 
     #[test]
+    fn write_frame_rejects_zstd_rather_than_panicking() {
+        assert!(matches!(
+            write_frame(1, Compression::Zstd, b"payload"),
+            Err(CodecError::Unsupported(_))
+        ));
+    }
+
+    #[test]
     fn rejects_zstd_as_unsupported_until_it_is_implemented() {
-        // write_frame itself can't be asked to encode Zstd (it would panic -- see its own
-        // unreachable!), so this constructs the header by hand to test the decode-side rejection.
+        // write_frame now rejects Compression::Zstd with Unsupported directly (see the test
+        // above), so this constructs the header by hand to reach the *decode*-side rejection
+        // specifically.
         let mut header = BytesMut::new();
         header.put_slice(&MAGIC);
         header.put_u16_le(VERSION);
@@ -317,7 +356,7 @@ mod tests {
     #[test]
     fn resync_finds_the_next_frame_start_after_garbage() {
         let garbage = b"not a frame, just noise";
-        let framed = write_frame(1, Compression::None, b"payload");
+        let framed = write_frame(1, Compression::None, b"payload").unwrap();
         let mut buf = BytesMut::new();
         buf.put_slice(garbage);
         buf.put_slice(&framed);
@@ -334,5 +373,27 @@ mod tests {
     #[test]
     fn resync_returns_none_when_magic_never_occurs() {
         assert_eq!(resync(b"nothing here looks like a frame"), None);
+    }
+
+    #[test]
+    fn rejects_a_frame_that_decompresses_shorter_than_its_header_declares() {
+        let payload = "repeat ".repeat(200);
+        let framed = write_frame(1, Compression::Lz4, payload.as_bytes()).unwrap();
+        let mut mutated = BytesMut::from(&framed[..]);
+        let inflated = (payload.len() + 16) as u32;
+        mutated[12..16].copy_from_slice(&inflated.to_le_bytes());
+        let mut bad = mutated.freeze();
+        assert!(matches!(read_frame(&mut bad), Err(CodecError::Malformed(_))));
+    }
+
+    #[test]
+    fn rejects_an_uncompressed_len_over_the_sanity_cap() {
+        let framed = write_frame(1, Compression::Lz4, b"small").unwrap();
+        let mut mutated = BytesMut::from(&framed[..]);
+        mutated[12..16].copy_from_slice(&(MAX_SANE_UNCOMPRESSED_LEN + 1).to_le_bytes());
+        let mut bad = mutated.freeze();
+        assert!(
+            matches!(read_frame(&mut bad), Err(CodecError::Malformed(msg)) if msg.contains("sanity cap"))
+        );
     }
 }

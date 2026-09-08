@@ -120,7 +120,7 @@ impl NativeEncoder {
 impl Encoder for NativeEncoder {
     fn encode(&mut self, batch: &EventBatch) -> Result<Bytes, CodecError> {
         let payload = encode_batch(batch);
-        Ok(write_frame(CODEC_NATIVE_V1, self.compression, &payload))
+        write_frame(CODEC_NATIVE_V1, self.compression, &payload)
     }
 }
 
@@ -255,6 +255,12 @@ mod tests {
     }
 
     #[test]
+    fn encoding_with_zstd_returns_unsupported_rather_than_panicking() {
+        let mut encoder = NativeEncoder::new(Compression::Zstd);
+        assert!(matches!(encoder.encode(&sample_batch()), Err(CodecError::Unsupported(_))));
+    }
+
+    #[test]
     fn an_empty_batch_round_trips() {
         let batch = EventBatch { resource: Arc::new(Resource::default()), events: Vec::new() };
         let payload = encode_batch(&batch);
@@ -267,7 +273,7 @@ mod tests {
     fn decode_rejects_a_frame_with_a_foreign_codec_byte() {
         let batch = sample_batch();
         let payload = encode_batch(&batch);
-        let framed = write_frame(0xEE, Compression::None, &payload);
+        let framed = write_frame(0xEE, Compression::None, &payload).unwrap();
 
         let mut decoder = NativeDecoder;
         let mut events = Vec::new();

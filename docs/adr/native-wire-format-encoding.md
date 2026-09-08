@@ -203,8 +203,8 @@ above should not be quoted as a production expectation.
   builds C via `zstd-sys`, breaking [ADR `containerized-development`](containerized-development.md)'s
   "no host toolchain needed" property, and the pure-Rust alternatives (`ruzstd` and forks) aren't yet
   competitive with `libzstd` on ratio or speed. `crate::frame::Compression::Zstd` is a reserved
-  discriminant `read_frame` rejects with `CodecError::Unsupported` rather than silently omitted —
-  revisit once a pure-Rust zstd implementation is genuinely competitive, or once
+  discriminant `write_frame`/`read_frame` both reject with `CodecError::Unsupported` rather than
+  silently omitted — revisit once a pure-Rust zstd implementation is genuinely competitive, or once
   `containerized-development` is revisited for a good enough reason.
 
 ## Consequences
