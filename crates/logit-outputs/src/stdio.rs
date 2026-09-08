@@ -1,7 +1,9 @@
 //! A general-purpose, human-facing debug sink: dumps a whole pipeline's events as readable text
 //! to stdout (default), stderr, or a file -- the dev loop for this project, and the first thing
 //! anyone getting started with `logit` reaches for before standing up a real backend like
-//! InfluxDB.
+//! InfluxDB. Also the home of [`StreamOutput`], the sink `file_out` builds on too (`crate::file`)
+//! for the rotating-file case: `stdio_out`'s file target *is* `file_out` with an empty rotation
+//! policy, not a second implementation next to it -- see `docs/adr/rotating-file-output.md`.
 //!
 //! **This deliberately renders a readable text block, not one JSON object per event.** The
 //! original `docs/plans/nginx-integration.md` sketch called for JSON before workstream A
@@ -13,9 +15,12 @@
 //! section (marked superseded there) and `docs/known-gaps.md` for the accepted consequences.
 //!
 //! Split the way `InfluxDbOutput`/`InfluxLineEncoder` are (`crates/logit-outputs/src/influxdb.rs`):
-//! a pure [`EventDump`] encoder (`&EventBatch` -> `String`, no file descriptor anywhere) plus the
-//! thin [`StdioOutput`] that owns the open target and writes/flushes it. Every format test below
-//! runs against the encoder alone.
+//! a pure [`EventDump`] encoder (`&EventBatch` -> readable text, no file descriptor anywhere) plus
+//! the thin [`StreamOutput`] that owns the open target and writes/flushes it. Every format test
+//! below runs against the encoder alone. `EventDump` also implements `logit_proto::Encoder`
+//! (`&EventBatch` -> `Bytes`) -- the same seam `InfluxLineEncoder` is already on -- which is what
+//! lets `StreamOutput` be generic over its encoder rather than hardcoding this one: a future
+//! binary/NDJSON encoder plugs into the same sink with no change to the destination half.
 //!
 //! The encoder is deliberately built around a [`Format`] enum with a single variant today
 //! (`Format::Human`), and the per-value/per-metric rendering (`render_value`/`render_metric`) is
@@ -31,15 +36,18 @@
 //! plain identifier-shaped string (so a key containing a space, `=`, or newline can't be
 //! misread as extra tokens or an injected fake line).
 
+use crate::file::{FileTarget, RotatePolicy};
 use crate::Output;
 use anyhow::Context;
+use bytes::Bytes;
 use logit_core::interner::resolve;
 use logit_core::time::format_rfc3339_utc;
 use logit_core::trace::push_hex;
 use logit_core::{
-    AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource, Severity, SpanEvent, SpanKind,
-    SpanLink, SpanRecord, SpanStatus, Telemetry, Value,
+    AttrMap, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Severity,
+    SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus, Telemetry, Value,
 };
+use logit_proto::{CodecError, Encoder};
 use std::cmp::Ordering;
 // `std::fmt::Write`, for `write!` into a `String` -- formatting straight into the output buffer
 // instead of building an intermediate `String` per number via `to_string()`/`format!`
@@ -68,7 +76,7 @@ impl EventDump {
         Self { format }
     }
 
-    /// Encodes `batch` as one readable block per event, in batch order. Never fails and never
+    /// Renders `batch` as one readable block per event, in batch order. Never fails and never
     /// panics -- a debug sink's whole job is staying up when everything else is falling over, so
     /// even a `Set` metric (no real encoding yet, see `logit_core::HyperLogLog`) or a
     /// non-finite/absurd numeric value renders *something* rather than erroring.
@@ -85,7 +93,12 @@ impl EventDump {
     /// reusable state. `out` itself is still a fresh `String` per call, exactly as
     /// `InfluxLineEncoder::encode`'s `buf` is -- see that function's doc comment for why the
     /// per-batch output buffer is left as is.
-    pub fn encode(&self, batch: &EventBatch) -> String {
+    ///
+    /// Named `render`, not `encode`, specifically so it doesn't collide with
+    /// `Encoder::encode` below -- Rust resolves an inherent method over a trait method of the
+    /// same name with no ambiguity error, which would silently keep every `dump.encode(..)` call
+    /// site on this `String`-returning method even after `EventDump` implements `Encoder`.
+    pub fn render(&self, batch: &EventBatch) -> String {
         match self.format {
             Format::Human => {
                 let mut out = String::new();
@@ -98,6 +111,17 @@ impl EventDump {
                 out
             }
         }
+    }
+}
+
+/// `EventDump` is the same seam `InfluxLineEncoder` is already on (`logit-outputs::influxdb`) --
+/// joining it is what lets [`StreamOutput`] be generic over its encoder instead of hardcoding this
+/// one. The trait's `&mut self` is satisfied trivially: [`EventDump::render`] needs only `&self`.
+/// Always returns `Ok` -- `render` "never fails and never panics" by its own contract, so there is
+/// no `CodecError` this could ever produce.
+impl Encoder for EventDump {
+    fn encode(&mut self, batch: &EventBatch) -> Result<Bytes, CodecError> {
+        Ok(Bytes::from(self.render(batch).into_bytes()))
     }
 }
 
@@ -495,45 +519,56 @@ fn push_escaped_char(out: &mut String, b: u8) {
     }
 }
 
-/// The open sink `StdioOutput` writes to. An enum over the three concrete `tokio` I/O types rather
-/// than a boxed `dyn AsyncWrite`: there are exactly three, known up front, and a `match` in `send`
-/// costs nothing an indirect call wouldn't also cost.
+/// The open destination [`StreamOutput`] writes to. An enum rather than a boxed `dyn AsyncWrite`:
+/// there are exactly three shapes, known up front, and a `match` in `send` costs nothing an
+/// indirect call wouldn't also cost. `File` carries a [`FileTarget`] rather than a bare
+/// `tokio::fs::File` -- the file case always has a [`RotatePolicy`], `stdio_out`'s plain file
+/// target simply uses [`RotatePolicy::never`], which is what makes "`stdio_out`'s file target is
+/// `file_out` without rotation" true in the type system rather than only in a doc comment.
 #[derive(Debug)]
-enum Sink {
+enum Target {
     Stdout(io::Stdout),
     Stderr(io::Stderr),
-    File(tokio::fs::File),
+    File(FileTarget),
 }
 
-/// `logit_pipeline::Output` for `stdio_out`. Built via [`StdioOutput::stdout`],
-/// [`StdioOutput::stderr`], or [`StdioOutput::open_path`] -- never a bare constructor, since which
-/// one is legal to call depends on which `StdioTarget` config resolved to
-/// (`crates/logit-cli/src/pipeline.rs::build_spec`).
+/// `logit_pipeline::Output`, generic over its [`Encoder`] -- what `stdio_out` and `file_out` are
+/// both built from (`docs/adr/rotating-file-output.md`), differing only in `target`: `stdio_out`
+/// never rotates ([`RotatePolicy::never`]), `file_out` always carries a real policy. Built via
+/// [`StreamOutput::stdout`], [`StreamOutput::stderr`], [`StreamOutput::open_path`], or
+/// [`StreamOutput::rotating`] -- never a bare constructor, since which one is legal to call
+/// depends on which config resolved to it (`crates/logit-cli/src/pipeline.rs::build_spec`).
 #[derive(Debug)]
-pub struct StdioOutput {
-    sink: Sink,
-    encoder: EventDump,
-    /// No `Diagnostics` here, unlike most other shipped outputs: a write error propagates as an
-    /// `anyhow::Error` today (matching `InfluxDbOutput`'s hard-failure stance for a non-transient
-    /// sink error), so there's no `warn_throttled` call site for one to bridge -- see
-    /// `docs/design/internal-telemetry.md`'s `keep`/`remove` note for the same reasoning.
+pub struct StreamOutput<E> {
+    target: Target,
+    encoder: E,
     telemetry: Telemetry,
+    /// Unlike most other shipped outputs, only ever used for a rotating file target's two
+    /// non-fatal failure modes (`FileTarget::rotate`'s `rotate_failure`/`retention_failure`) --
+    /// every other write error here still propagates as a fatal `anyhow::Error`, matching
+    /// `InfluxDbOutput`'s hard-failure stance for a non-transient sink error (see
+    /// `docs/design/internal-telemetry.md`'s `keep`/`remove` note for the same reasoning). A
+    /// `stdio_out`/unrotated `file_out` target never exercises either key, so this is additive,
+    /// not a behavior change, for the target this module used to be built around alone.
+    diagnostics: Diagnostics,
 }
 
-impl StdioOutput {
+impl StreamOutput<EventDump> {
     pub fn stdout() -> Self {
         Self {
-            sink: Sink::Stdout(io::stdout()),
+            target: Target::Stdout(io::stdout()),
             encoder: EventDump::default(),
             telemetry: Telemetry::default(),
+            diagnostics: Diagnostics::default(),
         }
     }
 
     pub fn stderr() -> Self {
         Self {
-            sink: Sink::Stderr(io::stderr()),
+            target: Target::Stderr(io::stderr()),
             encoder: EventDump::default(),
             telemetry: Telemetry::default(),
+            diagnostics: Diagnostics::default(),
         }
     }
 
@@ -543,59 +578,105 @@ impl StdioOutput {
     /// variable or a missing `lua_file` already do. `path` is used exactly as given -- resolving a
     /// relative `StdioTarget::Path` against the config file's directory (rather than the process's
     /// current working directory) is `build_spec`'s job, the same way it resolves `LuaFile`'s
-    /// script path, not this constructor's.
+    /// script path, not this constructor's. Never rotates ([`RotatePolicy::never`]).
     pub fn open_path(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let path = path.as_ref();
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .with_context(|| format!("opening stdio_out target {}", path.display()))?;
-        Ok(Self {
-            sink: Sink::File(tokio::fs::File::from_std(file)),
-            encoder: EventDump::default(),
-            telemetry: Telemetry::default(),
-        })
+        Self::rotating(path, RotatePolicy::never())
     }
 
+    /// The `file_out` constructor: opens `path` exactly as [`Self::open_path`] does, but under a
+    /// real [`RotatePolicy`]. `path` resolution is `build_spec`'s job here too.
+    pub fn rotating(path: impl AsRef<Path>, policy: RotatePolicy) -> anyhow::Result<Self> {
+        let file = FileTarget::open(path, policy)?;
+        Ok(Self {
+            target: Target::File(file),
+            encoder: EventDump::default(),
+            telemetry: Telemetry::default(),
+            diagnostics: Diagnostics::default(),
+        })
+    }
+}
+
+impl<E> StreamOutput<E> {
     /// Attaches a telemetry handle -- see `send`'s `logit.output.batch.bytes`.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
     }
+
+    /// Attaches a diagnostics handle -- see the `diagnostics` field's doc comment for exactly
+    /// which two keys this can ever report.
+    pub fn with_diagnostics(mut self, diagnostics: Diagnostics) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
 }
 
 #[async_trait::async_trait]
-impl Output for StdioOutput {
+impl<E: Encoder + Send> Output for StreamOutput<E> {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let text = self.encoder.encode(batch);
-        if text.is_empty() {
-            // An empty batch (`batch.events` is empty). Every *non-empty* batch always produces
-            // at least a timestamp line per event -- see `render_event_block` -- so this can only
-            // happen here, never because a real event encoded to nothing.
+        // `EventDump::encode` never actually returns `Err` (see its own doc comment), but a
+        // future non-`EventDump` encoder might, so this is handled for real rather than
+        // `.expect()`-ed away.
+        let bytes = self.encoder.encode(batch).context("encoding batch")?;
+        if bytes.is_empty() {
+            // An empty batch (`batch.events` is empty). Every *non-empty* batch `EventDump`
+            // encodes always produces at least a timestamp line per event -- see
+            // `render_event_block` -- so this can only happen here, never because a real event
+            // encoded to nothing.
             return Ok(());
         }
-        let bytes = text.into_bytes();
+
+        // Rotation is decided *before* the write, never mid-batch -- a batch is always written
+        // whole into whichever file it lands in, never split across a rotation boundary. See
+        // `FileTarget::should_rotate`'s doc comment for what "a threshold, not a hard cap" means
+        // for a batch bigger than `max_bytes`.
+        if let Target::File(file) = &mut self.target {
+            let now = crate::file::now_unix();
+            if file.should_rotate(now, bytes.len()) {
+                file.rotate(&mut self.diagnostics).await?;
+                // Counted here, not inside `FileTarget::rotate` -- `FileTarget` holds no
+                // `Telemetry` handle of its own, only the `Diagnostics` its two non-fatal failure
+                // keys need. Keeping telemetry on `StreamOutput` alone is what lets
+                // `crate::file`'s pure `should_rotate`/`note_written` stay free of it too.
+                self.telemetry.count("logit.output.file.rotations", 1.0, &[]);
+            }
+            file.note_written(now, bytes.len());
+        }
+
         self.telemetry.count("logit.output.batch.bytes", bytes.len() as f64, &[]);
-        // One `write_all` plus one `flush` per batch: `Output` has no close/flush hook of its own
-        // (a documented known gap, `docs/known-gaps.md`), so flushing every batch immediately is
-        // what guarantees nothing sits buffered in `tokio`'s (or the OS's) write path at shutdown.
-        // A write error propagates as an `anyhow::Error`, matching `InfluxDbOutput` -- a sink
-        // whose file has gone away should fail the process, not silently discard. No retry: unlike
-        // an HTTP 5xx, a broken stdio/file target isn't a transient condition worth waiting out.
-        match &mut self.sink {
-            Sink::Stdout(w) => {
+        // One `write_all` plus one `flush` per batch: this guarantees nothing sits buffered in
+        // `tokio`'s (or the OS's) write path between batches, on top of `Output::flush`'s own
+        // shutdown-time call. A write error propagates as an `anyhow::Error`, matching
+        // `InfluxDbOutput` -- a sink whose file has gone away should fail the process, not
+        // silently discard. No retry: unlike an HTTP 5xx, a broken stdio/file target isn't a
+        // transient condition worth waiting out.
+        match &mut self.target {
+            Target::Stdout(w) => {
                 w.write_all(&bytes).await?;
                 w.flush().await?;
             }
-            Sink::Stderr(w) => {
+            Target::Stderr(w) => {
                 w.write_all(&bytes).await?;
                 w.flush().await?;
             }
-            Sink::File(w) => {
-                w.write_all(&bytes).await?;
-                w.flush().await?;
+            Target::File(f) => {
+                f.file_mut().write_all(&bytes).await?;
+                f.file_mut().flush().await?;
             }
+        }
+        Ok(())
+    }
+
+    /// Explicit rather than the default no-op, mirroring `SyslogOutput::flush`'s reasoning: `send`
+    /// already flushes after every batch, so this is normally a no-op in practice too -- but
+    /// spelling it out means `finish_and_flush`'s one guaranteed call at shutdown
+    /// (`crates/logit-pipeline/src/runtime.rs`) still holds even if that per-batch discipline ever
+    /// changes.
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        match &mut self.target {
+            Target::Stdout(w) => w.flush().await.context("flushing stdout")?,
+            Target::Stderr(w) => w.flush().await.context("flushing stderr")?,
+            Target::File(f) => f.file_mut().flush().await.context("flushing file target")?,
         }
         Ok(())
     }
@@ -612,7 +693,7 @@ mod tests {
     }
 
     fn encode(events: Vec<Event>) -> String {
-        EventDump::default().encode(&batch_with(events))
+        EventDump::default().render(&batch_with(events))
     }
 
     fn log_event(ts: i64, message: &str, severity: Option<Severity>) -> Event {
@@ -782,7 +863,7 @@ mod tests {
         let mut event = Event::empty(0, AttrMap::new());
         event.attributes.insert("env", "prod");
         let batch = EventBatch { resource: Arc::new(resource), events: vec![event] };
-        let out = EventDump::default().encode(&batch);
+        let out = EventDump::default().render(&batch);
 
         assert!(out.contains(r#"host="web-1""#), "got: {out}");
         assert!(out.contains(r#"env="prod""#), "event's own env should win over resource's: {out}");
@@ -798,11 +879,11 @@ mod tests {
         let mut resource_b = Resource::default();
         resource_b.attributes.insert("host", "web-2");
 
-        let out_a = EventDump::default().encode(&EventBatch {
+        let out_a = EventDump::default().render(&EventBatch {
             resource: Arc::new(resource_a),
             events: vec![Event::empty(0, AttrMap::new())],
         });
-        let out_b = EventDump::default().encode(&EventBatch {
+        let out_b = EventDump::default().render(&EventBatch {
             resource: Arc::new(resource_b),
             events: vec![Event::empty(0, AttrMap::new())],
         });
@@ -1021,7 +1102,7 @@ mod tests {
         let path = dir.join(format!("logit-stdio-out-test-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
-        let mut output = StdioOutput::open_path(&path).expect("path should open");
+        let mut output = StreamOutput::open_path(&path).expect("path should open");
         output
             .send(&batch_with(vec![metric_event(0, "x", MetricKind::Counter(1.0))]))
             .await
@@ -1038,7 +1119,7 @@ mod tests {
         let path = dir.join(format!("logit-stdio-out-test-append-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
-        let mut output = StdioOutput::open_path(&path).expect("path should open");
+        let mut output = StreamOutput::open_path(&path).expect("path should open");
         output
             .send(&batch_with(vec![metric_event(0, "first", MetricKind::Counter(1.0))]))
             .await
@@ -1059,7 +1140,7 @@ mod tests {
         // A path inside a directory that doesn't exist can never be opened, regardless of
         // permissions -- a reliable, environment-independent way to trigger the open failure.
         let path = std::env::temp_dir().join("logit-stdio-out-test-no-such-dir").join("x.log");
-        let err = StdioOutput::open_path(&path).expect_err("expected an error");
+        let err = StreamOutput::open_path(&path).expect_err("expected an error");
         assert!(format!("{err:?}").contains(&path.display().to_string()), "got: {err:?}");
     }
 
@@ -1069,7 +1150,7 @@ mod tests {
         let path = dir.join(format!("logit-stdio-out-test-empty-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
-        let mut output = StdioOutput::open_path(&path).expect("path should open");
+        let mut output = StreamOutput::open_path(&path).expect("path should open");
         output.send(&batch_with(vec![])).await.expect("send should succeed");
 
         let contents = std::fs::read_to_string(&path).unwrap_or_default();
@@ -1088,7 +1169,7 @@ mod tests {
         let registry = logit_core::Registry::new();
         let telemetry = registry.telemetry_for("tap", "stdio_out", "sink");
         let mut output =
-            StdioOutput::open_path(&path).expect("path should open").with_telemetry(telemetry);
+            StreamOutput::open_path(&path).expect("path should open").with_telemetry(telemetry);
         output
             .send(&batch_with(vec![metric_event(0, "x", MetricKind::Counter(1.0))]))
             .await
@@ -1112,5 +1193,87 @@ mod tests {
             })
             .expect("logit.output.batch.bytes should have been recorded");
         assert_eq!(recorded, contents.len() as f64);
+    }
+
+    /// `stdio_out`'s file target is `file_out` with `RotatePolicy::never()` -- this pins that the
+    /// unification actually holds end to end through `send`, not just at the type level: writing
+    /// well past what would be a rotation threshold under any real policy must never rotate.
+    #[tokio::test]
+    async fn open_path_never_rotates_no_matter_how_much_is_written() {
+        let dir = std::env::temp_dir();
+        let path =
+            dir.join(format!("logit-stdio-out-test-never-rotate-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut output = StreamOutput::open_path(&path).expect("path should open");
+        for i in 0..20 {
+            output
+                .send(&batch_with(vec![metric_event(0, "x", MetricKind::Counter(i as f64))]))
+                .await
+                .expect("send should succeed");
+        }
+
+        assert!(
+            !dir.join(format!("logit-stdio-out-test-never-rotate-{}.log.1", std::process::id()))
+                .exists(),
+            "an unrotated target must never create a .1"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `file_out`'s end-to-end path: `StreamOutput::rotating`, driven through real `send` calls
+    /// rather than calling `FileTarget::rotate` directly (that's `file.rs`'s own test module) --
+    /// this is what actually exercises `send`'s should_rotate/rotate/note_written sequencing and
+    /// the `logit.output.file.rotations` metric.
+    #[tokio::test]
+    async fn rotating_via_stream_output_rotates_and_counts_the_rotation() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("logit-stdio-out-test-rotating-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let rotated =
+            dir.join(format!("logit-stdio-out-test-rotating-{}.log.1", std::process::id()));
+        let _ = std::fs::remove_file(&rotated);
+
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("tap", "file_out", "sink");
+        let policy = RotatePolicy { max_bytes: Some(1), interval: None, max_files: 5 };
+        let mut output = StreamOutput::rotating(&path, policy)
+            .expect("path should open")
+            .with_telemetry(telemetry);
+
+        output
+            .send(&batch_with(vec![metric_event(0, "first", MetricKind::Counter(1.0))]))
+            .await
+            .expect("send should succeed");
+        output
+            .send(&batch_with(vec![metric_event(0, "second", MetricKind::Counter(2.0))]))
+            .await
+            .expect("send should succeed");
+
+        assert!(rotated.exists(), "the first batch should have been rotated out to .1");
+        let rotated_contents = std::fs::read_to_string(&rotated).unwrap();
+        assert!(rotated_contents.contains("first"), "got: {rotated_contents}");
+        let active_contents = std::fs::read_to_string(&path).unwrap();
+        assert!(active_contents.contains("second"), "got: {active_contents}");
+
+        let events = registry.drain(0);
+        let rotations = events
+            .iter()
+            .find_map(|e| {
+                e.metrics.iter().find_map(|m| match &m.kind {
+                    MetricKind::Counter(v)
+                        if logit_core::interner::resolve(m.name)
+                            == "logit.output.file.rotations" =>
+                    {
+                        Some(*v)
+                    }
+                    _ => None,
+                })
+            })
+            .expect("logit.output.file.rotations should have been recorded");
+        assert_eq!(rotations, 1.0, "exactly one rotation should have happened");
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&rotated).ok();
     }
 }

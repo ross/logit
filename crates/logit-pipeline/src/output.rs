@@ -97,9 +97,9 @@ pub fn classify(err: &anyhow::Error) -> Fault {
 /// opposed to [`classify`]'s conservative default when no `Fault` was found at all. Only an
 /// explicit classification should ever count toward `write_loop`'s sustained-permanent-failure
 /// exit window -- an unclassified error (a sink that hasn't opted into `Fault` at all, e.g.
-/// `StdioOutput`'s bare I/O errors) is correctly treated as non-retryable by [`classify`]'s
+/// `StreamOutput`'s bare I/O errors) is correctly treated as non-retryable by [`classify`]'s
 /// default, but must never be mistaken for a *positively identified* configuration error that
-/// should eventually end the process. A `StdioOutput` hitting a transient disk-full condition
+/// should eventually end the process. A `StreamOutput` hitting a transient disk-full condition
 /// forever is a very different situation from `InfluxDbOutput` hitting a bad token forever, and
 /// only the latter should ever trip that window.
 pub fn is_explicitly_permanent(err: &anyhow::Error) -> bool {

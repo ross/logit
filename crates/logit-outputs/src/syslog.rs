@@ -656,7 +656,7 @@ fn frame_octet_counting(messages: &MessageBuf, out: &mut Vec<u8>) {
 }
 
 /// The live half of a `syslog_out` sink: `Udp` binds eagerly (a bad local bind is a config error,
-/// matching `StdioOutput::open_path`'s "fail before anything starts listening" precedent); `Tcp`
+/// matching `StreamOutput::open_path`'s "fail before anything starts listening" precedent); `Tcp`
 /// connects lazily inside `send`, since a not-yet-up downstream syslog receiver must not block
 /// `logit` from starting -- a compose-level `depends_on` on one would be equally wrong.
 enum Conn {
@@ -665,7 +665,7 @@ enum Conn {
 }
 
 /// `logit_pipeline::Output` for `syslog_out`. Built via [`SyslogOutput::udp`] or
-/// [`SyslogOutput::tcp`] -- never a bare constructor, mirroring `StdioOutput`'s three named
+/// [`SyslogOutput::tcp`] -- never a bare constructor, mirroring `StreamOutput`'s named
 /// constructors for the same reason: which one is legal depends on config
 /// (`crates/logit-cli/src/pipeline.rs::build_spec`).
 pub struct SyslogOutput {

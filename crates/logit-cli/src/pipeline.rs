@@ -24,7 +24,7 @@ use logit_outputs::otlp::{
     OtlpCompression as OtlpOutCompression, OtlpOutput, OtlpTransport as OtlpOutTransport,
     SignalPaths,
 };
-use logit_outputs::stdio::StdioOutput;
+use logit_outputs::stdio::StreamOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
@@ -353,8 +353,8 @@ fn build_spec(
         }
         StdioOut { target } => {
             let output = match target {
-                StdioTarget::Stdout => StdioOutput::stdout(),
-                StdioTarget::Stderr => StdioOutput::stderr(),
+                StdioTarget::Stdout => StreamOutput::stdout(),
+                StdioTarget::Stderr => StreamOutput::stderr(),
                 // Resolved against `base_dir` (the config file's own directory), exactly as
                 // `LuaFile { lua_file, .. }` resolves its script path above -- `Path::join`
                 // leaves an already-absolute `path` untouched, so this is correct whether `path`
@@ -363,7 +363,7 @@ fn build_spec(
                 // /etc/logit/config.yaml` run from an unrelated directory silently writes
                 // somewhere other than "next to the config" (what this kind's own doc comment
                 // promises).
-                StdioTarget::Path(path) => StdioOutput::open_path(base_dir.join(path))?,
+                StdioTarget::Path(path) => StreamOutput::open_path(base_dir.join(path))?,
             };
             NodeSpec::Output(
                 Box::new(output.with_telemetry(telemetry.clone())),
@@ -382,7 +382,7 @@ fn build_spec(
             max_message_bytes,
             connect_timeout,
         } => {
-            // Eager for UDP (a bad local bind is a config error, `StdioOutput::open_path`'s
+            // Eager for UDP (a bad local bind is a config error, `StreamOutput::open_path`'s
             // precedent) -- requires an active tokio runtime, which holds here since `build_spec`
             // only ever runs from inside `logit run`'s `runtime.block_on` (`main.rs`), never from
             // `validate`/`graph`. Lazy for TCP -- see `logit_outputs::syslog::Conn`'s doc comment.
