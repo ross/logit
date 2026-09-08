@@ -79,13 +79,20 @@ condition worth discovering event-by-event.
 only a `log` event with a `Value::Str`/`Value::Bytes` message is a candidate (a metric- or
 span-only event, or a log with a non-string message, passes through untouched). The one place this
 transform diverges from `json` is types: `json` types by JSON syntax; `csv` has no syntax to type
-by, so it deliberately makes no attempt to guess.
+by, so it deliberately makes no attempt to guess. A `Value::Bytes` message carries no UTF-8
+guarantee (an OTLP body's `bytes_value` decodes straight into one), while every field this
+transform produces is handed to `Value::Str`, whose invariant *is* valid UTF-8 -- so the whole
+message is validated as UTF-8 once, up front, before any field is sliced out of it. One check
+suffices for every field: `delimiter` is a single ASCII byte and `"` is ASCII (rule 29), so every
+boundary `split_row` computes lands on an ASCII byte and never inside a multi-byte sequence, and
+`unescape` only ever deletes an ASCII `"` -- both keep a valid whole valid in its parts.
 
 **Diagnostic keys are distinct and independently throttled** (`Diagnostics::warn_throttled`, each
 auto-mirrored to `logit.component.diagnostics{key=...}`): `field_count` (schema drift — actionable),
-`parse_failure` (malformed quoting), `header_row` (the recognized header line). An empty message is
-a silent, un-throttled skip (`logit.transform.rows.skipped{reason="empty"}`) — routine, not
-exceptional, the same way an empty line from a tailed file needs no diagnostic at all.
+`parse_failure` (malformed quoting), `header_row` (the recognized header line), `invalid_utf8` (the
+message failed the up-front UTF-8 check). An empty message is a silent, un-throttled skip
+(`logit.transform.rows.skipped{reason="empty"}`) — routine, not exceptional, the same way an empty
+line from a tailed file needs no diagnostic at all.
 
 **No new `Cargo.toml` dependency — a hand-rolled ~60-line state machine**, not the `csv` or
 `csv_core` crate. `csv::Reader` copies every record into its own buffer regardless; `csv_core::

@@ -66,12 +66,15 @@ impl Transform for CsvParser {
     /// An event with no log, or a log whose message isn't a string, passes through untouched --
     /// there's nothing to parse. Any metrics/span already on the event ride through unaffected
     /// either way. An empty message is a routine, silently-skipped case (no diagnostic) --
-    /// `logit.transform.rows.skipped{reason="empty"}` records it. A message equal to the
-    /// configured header line passes through unparsed with a throttled `header_row` diagnostic.
-    /// A malformed row (bad quoting) or one with the wrong field count also passes through
-    /// unchanged, attributes untouched, with a throttled `parse_failure`/`field_count`
-    /// diagnostic naming what went wrong. Otherwise every column lands as `Value::Str`,
-    /// last-writer-wins on collision with a pre-existing attribute of the same name.
+    /// `logit.transform.rows.skipped{reason="empty"}` records it. A message that isn't valid
+    /// UTF-8 also passes through unparsed with a throttled `invalid_utf8` diagnostic -- checked
+    /// once for the whole message, since every column would otherwise be minted as `Value::Str`,
+    /// whose invariant is valid UTF-8. A message equal to the configured header line passes
+    /// through unparsed with a throttled `header_row` diagnostic. A malformed row (bad quoting)
+    /// or one with the wrong field count also passes through unchanged, attributes untouched,
+    /// with a throttled `parse_failure`/`field_count` diagnostic naming what went wrong.
+    /// Otherwise every column lands as `Value::Str`, last-writer-wins on collision with a
+    /// pre-existing attribute of the same name.
     fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
         let Some(log) = &event.log else { return Some(event) };
         let raw = match &log.message {
@@ -82,6 +85,24 @@ impl Transform for CsvParser {
         // An empty line is routine, not exceptional. Silent skip, no diagnostic.
         if raw.is_empty() {
             self.telemetry.count("logit.transform.rows.skipped", 1.0, &[("reason", "empty")]);
+            return Some(event);
+        }
+
+        // Every field below is handed to `Value::Str`, whose invariant is valid UTF-8 -- four
+        // `.expect("Value::Str is always valid UTF-8")` call sites downstream
+        // (`logit_core::Value::as_str`, `logit-proto`'s OTLP encoder, `stdio`/`syslog`'s
+        // renderers) panic outright if that's violated. A `Value::Bytes` message carries no such
+        // guarantee (an OTLP body's `bytes_value` decodes straight into one,
+        // `crates/logit-proto/src/otlp/common.rs`), so validate here -- once, for the whole
+        // message, not per field. One check is sufficient: `delimiter` is a single ASCII byte and
+        // `"` is ASCII (rule 29, `crates/logit-pipeline/src/graph.rs`), so every boundary
+        // `split_row` computes falls on an ASCII byte and never inside a multi-byte sequence, and
+        // `unescape` only ever deletes an ASCII `"` -- both keep a valid whole valid in its parts.
+        if std::str::from_utf8(&raw).is_err() {
+            self.diag.warn_throttled(
+                "invalid_utf8",
+                "message is not valid UTF-8, passing event through unparsed",
+            );
             return Some(event);
         }
 
@@ -265,6 +286,19 @@ mod tests {
             AttrMap::new(),
             LogRecord {
                 message: Value::str(message),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
+        )
+    }
+
+    fn bytes_log_event(message: &'static [u8]) -> Event {
+        Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::Bytes(Bytes::from_static(message)),
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
@@ -494,6 +528,52 @@ mod tests {
         let event = csv.process(&resource, log_event("1,2")).expect("always forwards");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(attr(&event, "b"), Some(&Value::str("2")));
+    }
+
+    // -- UTF-8 validation --------------------------------------------------------------------
+
+    /// The bytes here are valid CSV *framing* (two fields around a comma) but invalid UTF-8, so
+    /// `split_row` would happily produce two fields -- proving the gate is the UTF-8 check and
+    /// not some incidental parse failure.
+    #[test]
+    fn an_invalid_utf8_message_passes_the_event_through_untouched() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("csv", "csv", "transform");
+        let diag = Diagnostics::new("csv").with_telemetry(telemetry);
+        let mut csv = parser(&["a", "b"]).with_diagnostics(diag);
+        let resource = default_resource();
+        let event = bytes_log_event(&[0xff, b',', 0xfe]);
+        let event = csv.process(&resource, event).expect("always forwards");
+        assert!(event.attributes.is_empty(), "no Value::Str may be minted from invalid UTF-8");
+        assert_eq!(message_of(&event), &Value::Bytes(Bytes::from_static(&[0xff, b',', 0xfe])));
+
+        let events = registry.drain(0);
+        let fired = events
+            .iter()
+            .any(|e| e.attributes.get("key").and_then(|v| v.as_str()) == Some("invalid_utf8"));
+        assert!(fired, "expected logit.component.diagnostics{{key=\"invalid_utf8\"}}");
+    }
+
+    /// The check rejects invalid UTF-8, not `Value::Bytes` as a message kind -- a bytes-valued
+    /// OTLP body that happens to be text still parses exactly like a `Value::Str` one.
+    #[test]
+    fn a_valid_utf8_bytes_message_parses_like_a_string_message() {
+        let mut csv = parser(&["a", "b"]);
+        let resource = default_resource();
+        let event = csv.process(&resource, bytes_log_event(b"1,2")).expect("always forwards");
+        assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
+        assert_eq!(attr(&event, "b"), Some(&Value::str("2")));
+    }
+
+    /// Why one whole-message check is enough for every field: the delimiter and `"` are both
+    /// ASCII (rule 29), so no field boundary can land inside a multi-byte sequence.
+    #[test]
+    fn a_multi_byte_utf8_field_is_sliced_intact() {
+        let mut csv = parser(&["a", "b"]);
+        let resource = default_resource();
+        let event = csv.process(&resource, log_event("héllo,wörld")).expect("always forwards");
+        assert_eq!(attr(&event, "a").and_then(Value::as_str), Some("héllo"));
+        assert_eq!(attr(&event, "b").and_then(Value::as_str), Some("wörld"));
     }
 
     // -- Empty/non-candidates ----------------------------------------------------------------
