@@ -3,6 +3,7 @@
 
 pub mod buffer;
 pub mod frame;
+pub mod native;
 pub mod otlp;
 
 use logit_core::{Event, EventBatch, Resource};

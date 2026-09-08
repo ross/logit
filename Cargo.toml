@@ -34,6 +34,15 @@ bytes = "1"
 # OTLP codec only (crates/logit-proto/src/otlp) -- messages generated once, offline, and committed
 # (docs/adr/committed-pregenerated-otlp-protobuf.md); no `prost-build`/`protoc` at build time.
 prost = "0.14"
+# The native wire format's compression (docs/design/wire-protocol.md) -- pure Rust, no C toolchain
+# (ADR `containerized-development`). `zstd` is deliberately not a dependency: the real `zstd` crate
+# builds C via `zstd-sys`, and the pure-Rust alternatives aren't yet competitive -- see
+# `docs/adr/native-wire-format-encoding.md`.
+lz4_flex = { version = "0.14", default-features = false, features = ["safe-encode", "safe-decode", "checked-decode"] }
+# CRC-32C (Castagnoli) for the native frame header -- distinct polynomial from the CRC-32/IEEE
+# `crc32fast` already pulls in transitively; hardware-accelerated on x86-64/aarch64 with a pure-Rust
+# software fallback, no C dependency.
+crc32c = "0.6"
 smallvec = { version = "1", features = ["union"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

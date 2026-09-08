@@ -1764,3 +1764,45 @@ fn re_interning_an_existing_string_is_free() {
     });
     expect_allocs("interner: re-intern 1000 known names", stats, 0);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Native wire format (logit_proto::native)
+// ---------------------------------------------------------------------------------------------
+
+/// `NativeEncoder::encode`, one event, warmed so the dictionary's interner lookups have already
+/// happened once (see this file's own doc comment). Not part of the reference nginx pipeline
+/// chain above -- no `ComponentKind` consumes this codec yet
+/// ([ADR `native-wire-format-encoding`](../../../docs/adr/native-wire-format-encoding.md),
+/// `docs/known-gaps.md`) -- so this stands as its own section rather than extending the "full
+/// ingest chain" story those tests tell. It exists for the same reason every other
+/// exact-equality assertion here does: an allocation regression in `crates/logit-proto/src/native/`
+/// should fail `script/test`, not wait for someone to notice
+/// `crates/logit-bench/benches/wire_format.rs`'s numbers drift.
+#[test]
+fn native_encode_one_event() {
+    let batch = fixtures::nginx_batch(1);
+    let mut encoder = logit_proto::native::NativeEncoder::default();
+    drop(encoder.encode(&batch));
+
+    let (framed, stats) = measure(|| encoder.encode(&batch).expect("should encode"));
+    assert!(!framed.is_empty());
+    expect_allocs("native: encode 1 event", stats, 23);
+}
+
+/// The decode-side mirror of [`native_encode_one_event`]. `decode_into` appends into a caller-held
+/// `Vec<Event>` the same way every other decoder in this suite does (`docs/design/memory.md` §2).
+#[test]
+fn native_decode_one_event() {
+    let batch = fixtures::nginx_batch(1);
+    let mut encoder = logit_proto::native::NativeEncoder::default();
+    let framed = encoder.encode(&batch).expect("should encode");
+    let mut decoder = logit_proto::native::NativeDecoder;
+    let mut warm_events = Vec::new();
+    drop(decoder.decode_into(framed.clone(), 0, &mut warm_events));
+
+    let mut events = Vec::new();
+    let (_, stats) =
+        measure(|| decoder.decode_into(framed.clone(), 0, &mut events).expect("should decode"));
+    assert_eq!(events.len(), 1);
+    expect_allocs("native: decode 1 event", stats, 8);
+}
