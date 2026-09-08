@@ -139,7 +139,7 @@ mod encode {
     #[divan::bench(args = [1, 100])]
     fn stdio(bencher: Bencher, events: usize) {
         let batch = fixtures::nginx_batch(events);
-        let dump = EventDump::new(Format::Human);
+        let mut dump = EventDump::new(Format::Human);
         bencher.bench_local(|| dump.encode(divan::black_box(&batch)));
     }
 
