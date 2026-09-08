@@ -36,7 +36,7 @@
 //! plain identifier-shaped string (so a key containing a space, `=`, or newline can't be
 //! misread as extra tokens or an injected fake line).
 
-use crate::file::{FileTarget, RotatePolicy};
+use crate::file::{FileTarget, RotateOutcome, RotatePolicy};
 use crate::Output;
 use anyhow::Context;
 use bytes::Bytes;
@@ -633,12 +633,17 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
         if let Target::File(file) = &mut self.target {
             let now = crate::file::now_unix();
             if file.should_rotate(now, bytes.len()) {
-                file.rotate(&mut self.diagnostics).await?;
+                let outcome = file.rotate(&mut self.diagnostics).await?;
                 // Counted here, not inside `FileTarget::rotate` -- `FileTarget` holds no
                 // `Telemetry` handle of its own, only the `Diagnostics` its two non-fatal failure
                 // keys need. Keeping telemetry on `StreamOutput` alone is what lets
-                // `crate::file`'s pure `should_rotate`/`note_written` stay free of it too.
-                self.telemetry.count("logit.output.file.rotations", 1.0, &[]);
+                // `crate::file`'s pure `should_rotate`/`note_written` stay free of it too. Only
+                // counted on an actual `RotateOutcome::Rotated` -- a failed active-file rename
+                // (`RotateOutcome::NotRotated`) left nothing on disk touched, so it must not be
+                // reported as a rotation that happened.
+                if outcome == RotateOutcome::Rotated {
+                    self.telemetry.count("logit.output.file.rotations", 1.0, &[]);
+                }
             }
             file.note_written(now, bytes.len());
         }
@@ -660,8 +665,8 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
                 w.flush().await?;
             }
             Target::File(f) => {
-                f.file_mut().write_all(&bytes).await?;
-                f.file_mut().flush().await?;
+                f.write_all(&bytes).await?;
+                f.flush().await?;
             }
         }
         Ok(())
@@ -676,7 +681,7 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
         match &mut self.target {
             Target::Stdout(w) => w.flush().await.context("flushing stdout")?,
             Target::Stderr(w) => w.flush().await.context("flushing stderr")?,
-            Target::File(f) => f.file_mut().flush().await.context("flushing file target")?,
+            Target::File(f) => f.flush().await.context("flushing file target")?,
         }
         Ok(())
     }
@@ -1275,5 +1280,52 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&rotated).ok();
+    }
+
+    /// A failed active-file rename (`RotateOutcome::NotRotated`, `crate::file`'s own tests cover
+    /// the mechanism) must not be miscounted as a rotation here, at the one place that actually
+    /// increments `logit.output.file.rotations`.
+    #[tokio::test]
+    async fn a_rotation_that_could_not_rename_the_active_file_is_never_counted_as_a_rotation() {
+        let dir = std::env::temp_dir();
+        let path =
+            dir.join(format!("logit-stdio-out-test-failed-rotate-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("tap", "file_out", "sink");
+        let policy = RotatePolicy { max_bytes: Some(1), interval: None, max_files: 5 };
+        let mut output = StreamOutput::rotating(&path, policy)
+            .expect("path should open")
+            .with_telemetry(telemetry);
+
+        output
+            .send(&batch_with(vec![metric_event(0, "first", MetricKind::Counter(1.0))]))
+            .await
+            .expect("send should succeed");
+
+        // Unlink the active file out from under the still-open handle -- the fd stays valid, but
+        // the rename `rotate` is about to attempt now has nothing at `path` to rename.
+        std::fs::remove_file(&path).ok();
+
+        output
+            .send(&batch_with(vec![metric_event(0, "second", MetricKind::Counter(2.0))]))
+            .await
+            .expect("send should still succeed even though the rename underneath it failed");
+
+        let events = registry.drain(0);
+        let rotations = events.iter().find_map(|e| {
+            e.metrics.iter().find_map(|m| match &m.kind {
+                MetricKind::Counter(v)
+                    if logit_core::interner::resolve(m.name) == "logit.output.file.rotations" =>
+                {
+                    Some(*v)
+                }
+                _ => None,
+            })
+        });
+        assert!(rotations.is_none(), "a failed rotation must never be counted, got: {rotations:?}");
+
+        std::fs::remove_file(&path).ok();
     }
 }

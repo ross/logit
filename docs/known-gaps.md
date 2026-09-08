@@ -473,6 +473,17 @@ already built that have a known, accepted rough edge.
   plain `max_files` count; there is no age-based eviction and no built-in compression of rotated
   files, both left to an external tool. `format:` is inherited from `stdio_out` — the same fixed
   human-readable render, with the same `Format::Ndjson`-shaped extension point left unbuilt.
+  `FileTarget::open` seeds `RotationState`'s calendar period from an existing file's own mtime (not
+  just `written` from its length), so a restart under an `interval` policy correctly picks up
+  mid-period rather than merging two periods' events into one file or silently never rotating —
+  the residual is an unreadable mtime (a failed `metadata()` call) or a backwards clock jump across
+  the restart, either of which falls back to the pre-seeding behavior (period learned fresh on the
+  first write after open). Rotation is commit-point-first: the active file is renamed to a
+  transient staging path before anything retained is touched, so a rename failure leaves the active
+  file unrotated-and-growing with every retained file completely untouched (not the destructive
+  cascade-before-rename order this replaced), and a `.rotating` staging file orphaned by a process
+  killed between that rename and its promotion is picked up and promoted to `.1` on the very next
+  rotation, never silently lost.
 - **A pathological Host header can truncate the syslog-bound JSON line -- but nginx's own header-size
   limit turns out to make that hard to actually trigger.** The example's lean `access_json_syslog`
   `log_format` (`examples/nginx/nginx.conf`) sizes its fixed fields well under nginx's syslog
