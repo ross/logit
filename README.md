@@ -24,7 +24,8 @@ by choice (`docs/known-gaps.md`).
 
 **Status:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a Lua
 enrichment stage, InfluxDB 2.x out, via `logit run <config>`. Since then, `syslog_in` (RFC 3164/5424
-over UDP), `stdio_out`, `syslog_out` (RFC 3164/5424 over UDP or TCP,
+over UDP), `stdio_out`, `file_out` (a rotating file sink sharing `stdio_out`'s implementation,
+[ADR `rotating-file-output`](docs/adr/rotating-file-output.md)), `syslog_out` (RFC 3164/5424 over UDP or TCP,
 [ADR `syslog-output`](docs/adr/syslog-output.md)), `otlp_in`/`otlp_out` (OpenTelemetry Protocol for
 logs, metrics, and traces, over OTLP/HTTP or a hand-rolled OTLP/gRPC transport,
 [ADR `committed-pregenerated-otlp-protobuf`](docs/adr/committed-pregenerated-otlp-protobuf.md)/

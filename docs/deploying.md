@@ -57,8 +57,8 @@ that stage when actually run. It still needs every `!env` reference in the confi
 same as `run` does, so pass the same environment.
 
 `validate` doesn't check that a referenced *file* actually exists or parses — `lua_file`, a
-`stdio_out` path, and `otlp_out`/`otlp_in`'s `tls.*_file` fields are all read only once `run`
-actually constructs the component. A typo'd `tls.ca_file` path passes `validate` and fails at
+`stdio_out`/`file_out` path, and `otlp_out`/`otlp_in`'s `tls.*_file` fields are all read only once
+`run` actually constructs the component. A typo'd `tls.ca_file` path passes `validate` and fails at
 startup instead, with the path in the error.
 
 ## Signal and restart behavior
@@ -82,8 +82,8 @@ summary:
 
 ## Sink delivery buffering
 
-Every sink (`influxdb_out`, `stdio_out`, ...) sits behind a per-component, in-memory delivery
-queue that decouples receiving events from delivering them
+Every sink (`influxdb_out`, `stdio_out`, `file_out`, ...) sits behind a per-component, in-memory
+delivery queue that decouples receiving events from delivering them
 ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md)). This is what lets a slow or temporarily-down
 destination be ridden out instead of stalling or killing the whole pipeline. It's tunable per sink
 via a `buffer:` block on that component (`buffer:` is rejected at validation time on anything but a

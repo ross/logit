@@ -159,6 +159,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | OtlpOut { .. }
         | LogitOut { .. }
         | StdioOut { .. }
+        | FileOut { .. }
         | SyslogOut { .. } => Role::Sink,
     }
 }
@@ -206,6 +207,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         OtlpOut { .. } => "otlp_out",
         LogitOut { .. } => "logit_out",
         StdioOut { .. } => "stdio_out",
+        FileOut { .. } => "file_out",
         SyslogOut { .. } => "syslog_out",
     }
 }
@@ -238,6 +240,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::OtlpOut { .. }
             | ComponentKind::StdioOut { .. }
+            | ComponentKind::FileOut { .. }
             | ComponentKind::SyslogOut { .. }
     )
 }
@@ -891,6 +894,36 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 29: `file_out`'s `rotate:` block. Neither trigger set would silently never rotate at
+    // all -- the same "would silently do nothing" reasoning rule 7/27 already apply, just not
+    // derivable from arity alone here; `stdio_out` already covers the never-rotate case on
+    // purpose, so this rejects rather than treats it as a quiet no-op. `max_bytes: 0`/
+    // `max_files: 0` are each an impossible bound, the same "0 is impossible, not just small"
+    // instinct as rule 9/15/18/28.
+    for (id, component) in &components {
+        if let ComponentKind::FileOut { path, rotate } = &component.kind {
+            if rotate.max_bytes.is_none() && rotate.interval.is_none() {
+                anyhow::bail!(
+                    "component '{id}': 'file_out' needs at least one of 'rotate.max_bytes' or \
+                     'rotate.interval' -- for an unrotated file, use 'stdio_out' with \
+                     'target: {path}'"
+                );
+            }
+            if rotate.max_bytes == Some(0) {
+                anyhow::bail!(
+                    "component '{id}': 'rotate.max_bytes' must be at least 1 -- 0 means every \
+                     batch would rotate"
+                );
+            }
+            if rotate.max_files == 0 {
+                anyhow::bail!(
+                    "component '{id}': 'rotate.max_files' must be at least 1 -- 0 would delete \
+                     the file it just rotated"
+                );
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         let Component { sources, buffer, receive, kind } = component;
@@ -1129,6 +1162,10 @@ mod tests {
             bucket: "bucket".to_string(),
             token: "TOKEN".to_string(),
         }
+    }
+
+    fn file_out(rotate: logit_config::RotateConfig) -> ComponentKind {
+        ComponentKind::FileOut { path: "events.log".to_string(), rotate }
     }
 
     /// `Graph` isn't `Debug` (it embeds `ComponentKind`, which isn't either), so
@@ -2564,6 +2601,99 @@ mod tests {
             ("out", vec!["in"], sink()),
         ]));
         assert!(err.contains("'max_line_bytes' must be greater than 0"), "got: {err}");
+    }
+
+    #[test]
+    fn file_out_with_neither_rotate_trigger_set_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], file_out(logit_config::RotateConfig::default())),
+        ]));
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(
+            err.contains("needs at least one of 'rotate.max_bytes' or 'rotate.interval'"),
+            "got: {err}"
+        );
+        assert!(err.contains("'target: events.log'"), "got: {err}");
+    }
+
+    #[test]
+    fn file_out_with_max_bytes_alone_validates_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                file_out(logit_config::RotateConfig {
+                    max_bytes: Some(1024),
+                    interval: None,
+                    max_files: 5,
+                }),
+            ),
+        ]))
+        .expect("max_bytes alone should validate fine");
+    }
+
+    #[test]
+    fn file_out_with_interval_alone_validates_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                file_out(logit_config::RotateConfig {
+                    max_bytes: None,
+                    interval: Some(logit_config::RotateInterval::Daily),
+                    max_files: 5,
+                }),
+            ),
+        ]))
+        .expect("interval alone should validate fine");
+    }
+
+    #[test]
+    fn file_out_with_zero_max_bytes_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                file_out(logit_config::RotateConfig {
+                    max_bytes: Some(0),
+                    interval: None,
+                    max_files: 5,
+                }),
+            ),
+        ]));
+        assert!(err.contains("'rotate.max_bytes' must be at least 1"), "got: {err}");
+    }
+
+    #[test]
+    fn file_out_with_zero_max_files_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                file_out(logit_config::RotateConfig {
+                    max_bytes: Some(1024),
+                    interval: None,
+                    max_files: 0,
+                }),
+            ),
+        ]));
+        assert!(err.contains("'rotate.max_files' must be at least 1"), "got: {err}");
+    }
+
+    #[test]
+    fn kind_name_and_role_are_implemented_for_file_out() {
+        let kind = file_out(logit_config::RotateConfig {
+            max_bytes: Some(1024),
+            interval: None,
+            max_files: 5,
+        });
+        assert_eq!(kind_name(&kind), "file_out");
+        assert_eq!(role(&kind), Role::Sink);
     }
 
     #[test]

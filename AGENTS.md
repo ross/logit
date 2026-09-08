@@ -15,7 +15,10 @@ something that looks broken — it's likely a documented, deliberate gap, not an
 **Current state:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a
 Lua enrichment stage, InfluxDB 2.x out, via `logit run <config>` (see
 [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml), `script/server`). Since then,
-`syslog_in`, `stdio_out`, `otlp_in`, and `otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`,
+`syslog_in`, `stdio_out`, `file_out` (a rotating file sink sharing `stdio_out`'s implementation --
+`stdio_out`'s own file target is `file_out` with an empty rotation policy,
+[ADR `rotating-file-output`](docs/adr/rotating-file-output.md)), `otlp_in`, and `otlp_out`
+(`crates/logit-inputs`/`crates/logit-outputs`,
 `crates/logit-proto`'s `otlp` codec) and `json`, `kv_metrics`, `keep`, `remove`, `set`,
 `trace_context` (giving a `LogRecord` a native application trace/span reference and, with an
 opt-in `span:` block, turning an access log line into a real `SpanRecord` on the same event,
@@ -213,7 +216,7 @@ crates/
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry)
-  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, syslog
+  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)

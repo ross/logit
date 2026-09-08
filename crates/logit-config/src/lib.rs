@@ -608,6 +608,18 @@ pub enum ComponentKind {
         #[serde(default)]
         target: StdioTarget,
     },
+    /// A rotating file sink -- `stdio_out`'s file target grown into an operational destination:
+    /// size- and/or calendar-interval-triggered rotation, with logrotate-style numbered-suffix
+    /// retention. Renders the same human-readable text `stdio_out` does (`logit_outputs::stdio::
+    /// EventDump`) -- both share one sink implementation, `logit_outputs::stdio::StreamOutput`,
+    /// differing only in rotation policy. See `docs/adr/rotating-file-output.md`.
+    FileOut {
+        /// Resolved against the config file's own directory when relative, exactly like
+        /// `stdio_out`'s `StdioTarget::Path`.
+        path: String,
+        #[serde(default)]
+        rotate: RotateConfig,
+    },
     /// RFC 3164 / RFC 5424 syslog egress over UDP or TCP -- the mirror of `SyslogIn`, and a real
     /// relay: header fields round-trip from an event's `syslog.*` attributes when present,
     /// falling back to the defaults below only when an event carries none (e.g. one that never
@@ -989,6 +1001,47 @@ impl JsonSchema for StdioTarget {
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         String::json_schema(generator)
     }
+}
+
+/// `file_out`'s rotation policy. Every field defaults, but graph validation (rule 29,
+/// `crates/logit-pipeline/src/graph.rs`) rejects the all-default shape (neither trigger set) as a
+/// config that would never rotate at all -- use `stdio_out` for that instead. `max_files` counts
+/// *every* file `file_out` maintains, active plus rotated, so `max_files * max_bytes` reads
+/// directly as a disk budget.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct RotateConfig {
+    /// A quoted string in YAML -- `"64MiB"` or a plain `"134217728"` -- via the [`human_bytes`]
+    /// codec, exactly like `BufferConfig::max_bytes`. `None` (the default) means size never
+    /// triggers a rotation.
+    #[serde(with = "human_bytes::option")]
+    #[schemars(with = "Option<String>")]
+    pub max_bytes: Option<u64>,
+    /// `None` (the default) means the calendar never triggers a rotation.
+    #[serde(default)]
+    pub interval: Option<RotateInterval>,
+    pub max_files: u32,
+}
+
+impl Default for RotateConfig {
+    fn default() -> Self {
+        Self { max_bytes: None, interval: None, max_files: default_max_files() }
+    }
+}
+
+fn default_max_files() -> u32 {
+    5
+}
+
+/// Which calendar boundary `file_out` rotates on -- UTC only, never the host's local zone. A
+/// calendar period, not a `Duration`: a duration measured from an arbitrary start (process start,
+/// first write) drifts against the wall clock, which is the opposite of what a daily log file is
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RotateInterval {
+    Hourly,
+    Daily,
 }
 
 /// Per-sink delivery buffer (`docs/adr/buffered-sink-delivery.md`). Meaningful only on a
@@ -2027,6 +2080,63 @@ mod tests {
     fn stdio_out_target_anything_else_is_a_path() {
         let target: StdioTarget = serde_json::from_str(r#""/var/log/logit.log""#).unwrap();
         assert_eq!(target, StdioTarget::Path("/var/log/logit.log".to_string()));
+    }
+
+    #[test]
+    fn file_out_requires_a_path_but_defaults_its_rotate_block() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "file_out", "sources": ["in"], "path": "/var/log/logit/events.log"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::FileOut { path, rotate } => {
+                assert_eq!(path, "/var/log/logit/events.log");
+                assert_eq!(rotate, RotateConfig::default());
+            }
+            other => panic!("expected FileOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_out_without_a_path_is_a_clear_deserialize_error() {
+        let result: Result<Component, _> =
+            serde_json::from_str(r#"{"type": "file_out", "sources": ["in"]}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rotate_config_defaults_to_no_triggers_and_five_max_files() {
+        let rotate = RotateConfig::default();
+        assert_eq!(rotate.max_bytes, None);
+        assert_eq!(rotate.interval, None);
+        assert_eq!(rotate.max_files, 5);
+    }
+
+    #[test]
+    fn a_fully_specified_rotate_block_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "file_out", "sources": ["in"], "path": "events.log",
+                "rotate": {"max_bytes": "64MiB", "interval": "daily", "max_files": 3}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::FileOut { rotate, .. } => {
+                assert_eq!(rotate.max_bytes, Some(64 * 1024 * 1024));
+                assert_eq!(rotate.interval, Some(RotateInterval::Daily));
+                assert_eq!(rotate.max_files, 3);
+            }
+            other => panic!("expected FileOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_rotate_interval_variant_deserializes() {
+        for (raw, expected) in
+            [("hourly", RotateInterval::Hourly), ("daily", RotateInterval::Daily)]
+        {
+            let interval: RotateInterval = serde_json::from_str(&format!(r#""{raw}""#)).unwrap();
+            assert_eq!(interval, expected);
+        }
     }
 
     #[test]

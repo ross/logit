@@ -152,7 +152,7 @@ the tag's literal argument string instead of failing.
 |---|---|---|
 | Listener (`statsd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`) | ≥1 required | required (≥1 consumer) |
-| Sink (`influxdb_out`, `stdio_out`, `otlp_out`, `logit_out`) | ≥1 required | must not be |
+| Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
 considered and rejected (ADR `component-graph-configuration`): a typo'd source reference would silently turn a real sink into
@@ -276,6 +276,12 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     rejected — `poll_interval`/`checkpoint_interval` at `0s` would busy-loop (the same reasoning
     as rule 9's zero `interval`), and `max_line_bytes: 0` would drop every line
     (`docs/adr/file-tailing-and-docker-json-logs.md`).
+29. A `file_out` whose `rotate:` block sets neither `max_bytes` nor `interval` is rejected — that
+    would silently never rotate at all, and `stdio_out` already covers the deliberate never-rotate
+    case, so this is a config error rather than a quiet no-op. `rotate.max_bytes: 0` (every batch
+    would rotate) and `rotate.max_files: 0` (would delete the file it just rotated) are each an
+    impossible bound, the same "0 is impossible, not just small" instinct as rules 9/15/18/28
+    (`docs/adr/rotating-file-output.md`).
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that
