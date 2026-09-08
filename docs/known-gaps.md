@@ -18,9 +18,9 @@ already built that have a known, accepted rough edge.
   reason — each is already expressible as a `lua` component — but not closed: `logfmt`, `kv`,
   `csv`, and `regex` remain declared-and-unimplemented (real future work, tracked as ordinary
   scope, not a gap of this kind), and `logit_in`/`logit_out` stay published until the native wire
-  protocol exists (the entry directly below). There is no fix short of implementing each kind or
-  removing it from the enum — the schema can't be hand-annotated independently of `ComponentKind`
-  without reopening the drift ADR `config-yaml-jsonschema` exists to prevent.
+  protocol exists (the **Native wire protocol** entry below). There is no fix short of implementing
+  each kind or removing it from the enum — the schema can't be hand-annotated independently of
+  `ComponentKind` without reopening the drift ADR `config-yaml-jsonschema` exists to prevent.
 - **Predicate-shaped work (routing by condition, sampling, throttling, dedup) costs a Lua VM, an OS
   thread, and roughly 9× the per-event allocations of a native transform, because `logit` has no
   native predicate language and there's currently no native component for any of those verbs at

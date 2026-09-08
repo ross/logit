@@ -338,8 +338,8 @@ pub enum ComponentKind {
         /// traces rather than a representative sample would set this explicitly. Named
         /// `span_sample_rate`, not `sample_rate` -- `internal` may grow other sampling knobs
         /// later, and the name should keep meaning "which knob" even though the per-event
-        /// `sample` transform this once also disambiguated against was retired (`docs/adr/
-        /// routing-by-condition-is-lua.md`). See
+        /// `sample` transform this once also disambiguated against was retired
+        /// (`docs/adr/routing-by-condition-is-lua.md`). See
         /// `docs/adr/internal-span-emission-and-deterministic-sampling.md`.
         #[serde(default = "default_span_sample_rate")]
         span_sample_rate: f64,
