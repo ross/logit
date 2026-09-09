@@ -453,14 +453,20 @@ same shape `otlp_out`'s own timeout has. `buffer.retry_budget` (default 60s, see
 buffering" above) is the *outer* bound across every retried attempt. Keep `request_timeout`
 comfortably under `retry_budget` -- a `request_timeout` close to or above the retry budget leaves
 room for at most one attempt before the budget itself expires, which defeats retry's purpose.
-`request_timeout` also bounds `logit_in`'s own 5s handshake grace on the far end only loosely: a
+`request_timeout` also bounds `logit_in`'s own handshake grace on the far end only loosely: a
 `logit_out` configured with a shorter `request_timeout` than its peer's handshake patience just
-means *this* side gives up first, not that the connection is unsafe. A peer that gets
-`Reject{code: REJECT_INTERNAL}` from a `logit_in` at its connection cap classifies it `clean` (or
-`ambiguous`, if a frame had already been sent on that connection) and retries -- not `permanent` --
-so a `logit_out` backing off against a temporarily-full `logit_in` recovers on its own once the
-peer has capacity again, with no operator intervention needed. The same holds for
-`Reject{code: REJECT_GOING_AWAY}` during the peer's own shutdown.
+means *this* side gives up first, not that the connection is unsafe. That far-end grace is 5s per
+pre-`Hello` phase, applied independently to the TLS accept and to the `Hello` read that follows
+it -- so a TLS peer that connects and then goes silent is dropped after at most 10s, not 5s.
+A peer that gets `Reject{code: REJECT_INTERNAL}` from a `logit_in` at its connection cap never
+classifies it `permanent`: at the handshake (nothing of the batch written yet) it's `clean` and
+the batch is retried within `retry_budget`; once a frame has already left on that connection it's
+`ambiguous`, which under `logit_out`'s default `at_most_once` posture is *not* retried -- that
+batch is dropped and counted, and only the connection itself recovers. Either way the sink
+reconnects on its own once the peer has capacity again, with no operator intervention needed; set
+`buffer.delivery: at_least_once` on the `logit_out` component if you would rather risk a duplicate
+than lose that batch. The same holds for `Reject{code: REJECT_GOING_AWAY}` during the peer's own
+shutdown.
 
 **What to watch.** `logit_out`: `logit.output.requests{class}` (`ok`/`clean`/`ambiguous`/
 `permanent`, one per `send` attempt), `logit.output.reconnects` (should stay near zero in steady

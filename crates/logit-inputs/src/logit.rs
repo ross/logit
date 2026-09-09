@@ -34,12 +34,17 @@
 //! no `Reject` at all when TLS is on) reintroduces exactly the opaque failure a clean `Reject` is
 //! for.
 //!
-//! **Pre-`Hello` timeout.** [`LogitInput::handshake_timeout`] (field, defaulted to 5s) now bounds
-//! the *whole* pre-`Hello` budget on both the TLS and plaintext paths: the TLS accept itself
-//! (wrapped in `tokio::time::timeout` in the accept loop) and, after it, the `Hello` read inside
-//! [`handshake`]. Before this, only the `Hello` read was bounded -- an unbounded TLS accept let a
-//! client that opened a connection and sent nothing pin a connection-limit permit forever, which
-//! at 1024 connections could turn every subsequent legitimate peer into an immediate `Reject`.
+//! **Pre-`Hello` timeout.** [`LogitInput::handshake_timeout`] (field, defaulted to 5s) bounds each
+//! of the two pre-`Hello` phases *independently*: the TLS accept itself (wrapped in
+//! `tokio::time::timeout` in the accept loop) and, after it, the `Hello` read inside
+//! [`handshake`], which starts a fresh timeout of the same length rather than inheriting a shared
+//! deadline. So on the TLS path the worst case is *two* of these back to back -- 10s at the
+//! default -- before a connection that has sent no `Hello` gives up its connection-limit permit.
+//! That is deliberate: one knob applied per phase, rather than a shared deadline threaded through
+//! the accept loop, and what this fixes is that the wait is bounded at all. Before this, only the
+//! `Hello` read was bounded -- an unbounded TLS accept let a client that opened a connection and
+//! sent nothing pin a connection-limit permit forever, which at 1024 connections could turn every
+//! subsequent legitimate peer into an immediate `Reject`.
 
 use crate::Input;
 use bytes::{Bytes, BytesMut};
@@ -432,11 +437,11 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
 }
 
 /// Reads and negotiates the connection handshake: expects `Hello` within `handshake_timeout`
-/// (this is the *remainder* of the connection's pre-`Hello` budget -- the accept loop's TLS
-/// accept, when TLS is configured, is bounded by the same knob and already-spent before this
-/// runs; see this module's own "Pre-`Hello` timeout" doc section), replies `HelloAck` (codec/
-/// compression = the intersection with what this listener offers) or `Reject` and returns an
-/// error either way a client can't proceed.
+/// (a *fresh* timeout of that length, not the remainder of one shared with the accept loop's TLS
+/// accept -- which is bounded by the same knob independently, so the two together are the
+/// worst-case pre-`Hello` wait; see this module's own "Pre-`Hello` timeout" doc section), replies
+/// `HelloAck` (codec/compression = the intersection with what this listener offers) or `Reject`
+/// and returns an error either way a client can't proceed.
 async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     max_frame_bytes: u32,
