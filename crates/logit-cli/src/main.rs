@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod admin;
 mod config;
 mod dot;
 mod pipeline;
@@ -50,6 +51,13 @@ enum Command {
     Run { path: std::path::PathBuf },
     /// Print the config's resolved component graph as graphviz DOT (docs/design/pipeline-graph.md).
     Graph { path: std::path::PathBuf },
+    /// Probe a running `logit`'s `/readyz` (docs/plans/operator-surface.md) -- exit 0 and print
+    /// the status word on `200`, exit 1 and print it otherwise. What `Dockerfile`'s `HEALTHCHECK`
+    /// runs; needs `admin.bind` set in the target's own config.
+    Ready {
+        #[arg(long, default_value = "http://127.0.0.1:9600")]
+        admin: String,
+    },
 }
 
 /// Builds and installs the process-wide `tracing` subscriber for `Command::Run` -- the only
@@ -75,6 +83,44 @@ fn init_logging(level: &str, format: LogFormat) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `GET {admin}/readyz` via `hyper_util`'s legacy client (the workspace's `hyper` entry already
+/// carries the `client` feature this needs) -- no `reqwest` in this crate, matching
+/// `docs/plans/operator-surface.md`'s "no new HTTP client dependency" decision. Returns the
+/// status word on `200`, or an error (naming the status code or the connection failure) that
+/// `main` prints and turns into exit 1.
+fn check_ready(admin: &str) -> anyhow::Result<String> {
+    use http_body_util::BodyExt;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building the tokio runtime")?;
+    runtime.block_on(async {
+        let uri: hyper::Uri = format!("{}/readyz", admin.trim_end_matches('/'))
+            .parse()
+            .with_context(|| format!("--admin: '{admin}' is not a valid URL"))?;
+        let client = Client::builder(TokioExecutor::new())
+            .build_http::<http_body_util::Empty<bytes::Bytes>>();
+        let response =
+            client.get(uri).await.with_context(|| format!("requesting {admin}/readyz"))?;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .context("reading the /readyz response body")?
+            .to_bytes();
+        let word = String::from_utf8_lossy(&body).trim().to_string();
+        if status.is_success() {
+            Ok(word)
+        } else {
+            anyhow::bail!("{word} ({status})")
+        }
+    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -135,5 +181,15 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Ready { admin } => match check_ready(&admin) {
+            Ok(word) => {
+                println!("{word}");
+                Ok(())
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        },
     }
 }

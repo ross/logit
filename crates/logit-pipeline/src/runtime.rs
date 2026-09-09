@@ -1658,7 +1658,8 @@ mod tests {
                 },
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
@@ -1754,7 +1755,8 @@ mod tests {
                 },
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
@@ -1919,7 +1921,8 @@ mod tests {
                 kind: influxdb_out(),
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (tx_a, rx_a) = std::sync::mpsc::channel();
         let (tx_b, rx_b) = std::sync::mpsc::channel();
@@ -2084,7 +2087,8 @@ mod tests {
                 },
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
@@ -2435,7 +2439,8 @@ mod tests {
                 kind: influxdb_out(),
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
@@ -2541,7 +2546,8 @@ mod tests {
                 kind: influxdb_out(),
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
@@ -2669,7 +2675,8 @@ mod tests {
                 kind: influxdb_out(),
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
@@ -2771,7 +2778,8 @@ mod tests {
                 kind: influxdb_out(),
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (result_tx, _result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
@@ -2871,7 +2879,8 @@ mod tests {
                 kind: influxdb_out(),
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
@@ -2967,7 +2976,8 @@ mod tests {
                 kind: influxdb_out(),
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
@@ -3175,7 +3185,8 @@ mod tests {
                 kind: influxdb_out(),
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let batches: Vec<EventBatch> = (0..5)
             .map(|i| EventBatch {
@@ -3282,7 +3293,8 @@ mod tests {
                 kind: influxdb_out(),
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
@@ -3342,7 +3354,8 @@ mod tests {
                 kind: influxdb_out(),
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
@@ -3403,7 +3416,8 @@ mod tests {
                 kind: influxdb_out(),
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let batches: Vec<EventBatch> = (0..5)
             .map(|i| EventBatch {
@@ -4326,7 +4340,8 @@ mod tests {
                 kind: influxdb_out(),
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (bad_tx, bad_rx) = mpsc::unbounded_channel();
         let (good_tx, good_rx) = mpsc::unbounded_channel();
@@ -4543,7 +4558,8 @@ mod tests {
                 kind: influxdb_out(),
             },
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (bad1_tx, bad1_rx) = mpsc::unbounded_channel();
         let (bad2_tx, bad2_rx) = mpsc::unbounded_channel();
@@ -4663,7 +4679,8 @@ mod tests {
         components.insert("a_in".to_string(), plain_component(vec![], statsd_in()));
         components
             .insert("out".to_string(), plain_component(vec!["a_in".to_string()], influxdb_out()));
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (tx, rx) = std::sync::mpsc::channel();
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
@@ -4711,7 +4728,8 @@ mod tests {
             "out".to_string(),
             plain_component(vec!["a_in".to_string(), "z_in".to_string()], influxdb_out()),
         );
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
@@ -4738,7 +4756,8 @@ mod tests {
         components.insert("in".to_string(), plain_component(vec![], statsd_in()));
         components
             .insert("out".to_string(), plain_component(vec!["in".to_string()], influxdb_out()));
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (readiness, mut rx) = Readiness::channel();
         assert_eq!(rx.borrow().phase, Phase::Starting);
@@ -4793,7 +4812,8 @@ mod tests {
         components.insert("err_in".to_string(), plain_component(vec![], statsd_in()));
         components
             .insert("out".to_string(), plain_component(vec!["err_in".to_string()], influxdb_out()));
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (readiness, rx) = Readiness::channel();
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
@@ -4831,7 +4851,8 @@ mod tests {
         components.insert("bad_in".to_string(), plain_component(vec![], statsd_in()));
         components
             .insert("bad".to_string(), plain_component(vec!["bad_in".to_string()], influxdb_out()));
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (bad_tx, bad_rx) = mpsc::unbounded_channel();
         let (bad_output, mut bad_handles) = faulty_output(Fault::Permanent, u32::MAX, false);
@@ -4903,7 +4924,8 @@ mod tests {
         components.insert("in".to_string(), plain_component(vec![], statsd_in()));
         components
             .insert("out".to_string(), plain_component(vec!["in".to_string()], influxdb_out()));
-        let g = graph::resolve(Config { components }).expect("should resolve");
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(

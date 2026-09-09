@@ -3,6 +3,17 @@
   "title": "Config",
   "type": "object",
   "properties": {
+    "admin": {
+      "description": "The readiness/liveness HTTP endpoint (`docs/plans/operator-surface.md`, `docs/adr/admin-readiness-endpoint.md`) -- off unless `bind` is set. A top-level block, not a component: it's process-level (one admin server per `logit run`, not per graph node), and a component kind with no `sources` and no consumers would trip graph rule 7's \"nothing reads what it produces\" check.",
+      "default": {
+        "bind": null
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/AdminConfig"
+        }
+      ]
+    },
     "components": {
       "default": {},
       "type": "object",
@@ -13,6 +24,21 @@
     }
   },
   "definitions": {
+    "AdminConfig": {
+      "description": "See [`Config::admin`]'s own doc comment. Every field defaults, so an omitted `admin:` block (today's universal case -- no shipped config sets one) is exactly \"the admin server is off.\"",
+      "type": "object",
+      "properties": {
+        "bind": {
+          "description": "`host:port` to serve `/readyz`/`/healthz` on -- `None` (the default) means off. No TLS, by design: this is a loopback/pod-local endpoint, not one exposed past the process's own network namespace (`docs/deploying.md`).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "BufferConfig": {
       "description": "Per-sink delivery buffer (`docs/adr/buffered-sink-delivery.md`). Meaningful only on a sink; graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind. Every field defaults, so an omitted `buffer:` block is exactly today's behavior.",
       "type": "object",

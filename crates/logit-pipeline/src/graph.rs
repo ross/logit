@@ -337,7 +337,7 @@ const RESERVED_OTLP_HEADERS: &[&str] = &[
 ];
 
 pub fn resolve(config: Config) -> anyhow::Result<Graph> {
-    let Config { components } = config;
+    let Config { components, .. } = config;
 
     if components.is_empty() {
         anyhow::bail!("config defines no components");
@@ -1214,7 +1214,7 @@ mod tests {
                 },
             );
         }
-        Config { components: map }
+        Config { components: map, ..Default::default() }
     }
 
     /// Same as [`cfg`], but with an explicit `buffer` on one component -- for rule 14's tests.
@@ -1231,7 +1231,7 @@ mod tests {
                 },
             );
         }
-        Config { components: map }
+        Config { components: map, ..Default::default() }
     }
 
     /// Same as [`cfg`], but with an explicit `receive` on one component -- for rules 16/17's
@@ -1251,7 +1251,7 @@ mod tests {
                 },
             );
         }
-        Config { components: map }
+        Config { components: map, ..Default::default() }
     }
 
     fn listener() -> ComponentKind {
