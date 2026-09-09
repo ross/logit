@@ -278,6 +278,14 @@ async fn fsync_path(path: &Path) -> io::Result<()> {
     tokio::fs::File::open(path).await?.sync_data().await
 }
 
+/// Whether `err` means the filesystem is out of space -- checked via the raw OS errno (`ENOSPC`
+/// is `28` on Linux, the only platform this project targets, `docs/adr/containerized-development.md`)
+/// rather than `io::ErrorKind::StorageFull` alone, since that variant's exact stabilization and
+/// exhaustiveness across platforms is not something to depend on here.
+fn is_disk_full(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(28)
+}
+
 #[derive(Clone, Copy)]
 struct Segment {
     seq: u64,
@@ -310,6 +318,9 @@ struct State {
     /// discovered at the next [`DiskQueue::open`] instead.
     write_in_flight: bool,
     write_len_before_flight: u64,
+    /// Set alongside `write_in_flight` staying `true` on a failed write, so `push` can classify
+    /// the drop it counts for that batch. Meaningless when `write_in_flight` is `false`.
+    last_write_error_disk_full: bool,
     read_file: Option<(u64, tokio::fs::File)>,
     last_checkpoint: Instant,
     diag: Diagnostics,
@@ -502,6 +513,7 @@ impl DiskQueue {
             write_file: None,
             write_in_flight: false,
             write_len_before_flight: write_len,
+            last_write_error_disk_full: false,
             read_file: None,
             last_checkpoint: Instant::now(),
             diag,
@@ -648,7 +660,18 @@ impl DiskQueue {
         }
         drop(blocked_timer);
 
-        self.write_record(&record).await;
+        if !self.write_record(&record).await {
+            // The write itself failed (e.g. `ENOSPC`) -- `write_record` has already left
+            // `write_in_flight` set for the next call to repair, and logged why. The batch was
+            // never durably written, so it must not be counted as queued: drop it here, under
+            // `disk_full` when the cause was actually running out of space (the one case the
+            // block/drop_oldest/drop_newest policies above can't have prevented, since none of
+            // them can free real disk space) and a generic reason otherwise.
+            let reason =
+                if self.last_write_error_was_disk_full() { "disk_full" } else { "disk_io_error" };
+            self.count_dropped(reason, events);
+            return;
+        }
 
         {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -661,9 +684,15 @@ impl DiskQueue {
         self.after_change();
     }
 
+    fn last_write_error_was_disk_full(&self) -> bool {
+        let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        state.last_write_error_disk_full
+    }
+
     /// The write path proper: repair a torn tail from a previously-cancelled call, rotate if the
-    /// active segment is already over `segment_bytes`, then append `record`.
-    async fn write_record(&self, record: &[u8]) {
+    /// active segment is already over `segment_bytes`, then append `record`. Returns whether the
+    /// record actually landed durably in the active segment.
+    async fn write_record(&self, record: &[u8]) -> bool {
         let (needs_repair, repair_len, repair_seq) = {
             let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             (
@@ -723,8 +752,11 @@ impl DiskQueue {
                             "disk_io_error",
                             format!("opening segment {seq} for append: {err}"),
                         );
+                        // Nothing was written -- no torn state to repair, unlike a failed
+                        // `write_all` below.
                         state.write_in_flight = false;
-                        return;
+                        state.last_write_error_disk_full = is_disk_full(&err);
+                        return false;
                     }
                 }
             }
@@ -737,11 +769,14 @@ impl DiskQueue {
             Ok(()) => {
                 state.write_file = Some(file);
                 state.write_in_flight = false;
+                true
             }
             Err(err) => {
                 state.diag.warn_throttled("disk_io_error", format!("writing segment {seq}: {err}"));
+                state.last_write_error_disk_full = is_disk_full(&err);
                 // Leave `write_in_flight = true` and `write_file = None` -- the next push
                 // repairs by truncating back to the length recorded before this attempt.
+                false
             }
         }
     }
@@ -1427,6 +1462,42 @@ mod tests {
             Some(("reason", "frame_too_large")),
         );
         assert_eq!(dropped, 1.0, "frame_too_large should have been counted exactly once");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_drops_and_counts_the_batch_rather_than_silently_counting_it_queued() {
+        let dir = scratch_dir("write-fails");
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("test", "output", "sink");
+        let q = DiskQueue::open(config(dir.clone()), telemetry, Diagnostics::new("test")).unwrap();
+
+        // Make the active segment unwritable -- `write_all` then fails with a permission error,
+        // exercising the same "batch never actually landed" path a real `ENOSPC` would.
+        let mut perms = std::fs::metadata(segment_path(&dir, 0)).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(segment_path(&dir, 0), perms).unwrap();
+
+        q.push((batch("never-lands"), ctx())).await;
+
+        // Restore write access so the queue can be inspected/closed cleanly.
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(segment_path(&dir, 0)).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(segment_path(&dir, 0), perms).unwrap();
+
+        q.close();
+        assert!(
+            q.peek().await.is_none(),
+            "a batch whose write failed must never be counted as queued"
+        );
+        let events = registry.drain(0);
+        let dropped = metric_sum(
+            &events,
+            SINK_QUEUE_METRICS.items_dropped,
+            Some(("reason", "disk_io_error")),
+        );
+        assert_eq!(dropped, 1.0, "the failed write should have been counted dropped");
         std::fs::remove_dir_all(&dir).ok();
     }
 
