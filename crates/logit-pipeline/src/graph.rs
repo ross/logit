@@ -2531,7 +2531,11 @@ mod tests {
     }
 
     fn internal_with_rate(span_sample_rate: f64) -> ComponentKind {
-        ComponentKind::Internal { interval: Duration::from_secs(10), span_sample_rate }
+        ComponentKind::Internal {
+            interval: Duration::from_secs(10),
+            span_sample_rate,
+            logs: logit_config::InternalLogs::default(),
+        }
     }
 
     #[test]
@@ -2567,6 +2571,7 @@ mod tests {
                 ComponentKind::Internal {
                     interval: Duration::ZERO,
                     span_sample_rate: logit_core::DEFAULT_SPAN_SAMPLE_RATE,
+                    logs: logit_config::InternalLogs::default(),
                 },
             ),
             ("out", vec!["self"], sink()),

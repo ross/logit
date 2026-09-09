@@ -91,17 +91,23 @@ impl InternalInput {
         // statsd client's own self-telemetry (packets sent/dropped) works the same way, for the
         // same reason: a drain can't include a count of itself.
         //
-        // Split by shape, not just totalled: `drain` now returns metric-point events and
-        // span-carrying events in one flat list (`docs/design/internal-telemetry.md`'s "Spans"
-        // section), and `logit.internal.points.emitted` naming *points* specifically would become
-        // wrong the moment a span rode along inside its count uncounted-for.
-        // `logit.internal.spans.emitted` is the symmetric counter for the other half.
-        let (points_emitted, spans_emitted) =
-            events.iter().fold((0u64, 0u64), |(points, spans), event| {
-                if event.span.is_some() {
-                    (points, spans + 1)
+        // Split by shape, not just totalled: `drain` now returns metric-point, span-carrying,
+        // and (workstream D) log-carrying events in one flat list
+        // (`docs/design/internal-telemetry.md`'s "Spans" and "Logs" sections), and
+        // `logit.internal.points.emitted` naming *points* specifically would become wrong the
+        // moment a span or a log rode along inside its count uncounted-for. `event.log` is
+        // checked *before* falling through to "point" -- a log event carries neither `metrics`
+        // nor `span`, so without this check it would be miscounted as a point.
+        // `logit.internal.spans.emitted`/`logs.emitted` are the symmetric counters for the other
+        // two shapes.
+        let (points_emitted, spans_emitted, logs_emitted) =
+            events.iter().fold((0u64, 0u64, 0u64), |(points, spans, logs), event| {
+                if event.log.is_some() {
+                    (points, spans, logs + 1)
+                } else if event.span.is_some() {
+                    (points, spans + 1, logs)
                 } else {
-                    (points + 1, spans)
+                    (points + 1, spans, logs)
                 }
             });
         if points_emitted > 0 {
@@ -109,6 +115,9 @@ impl InternalInput {
         }
         if spans_emitted > 0 {
             self.telemetry.count("logit.internal.spans.emitted", spans_emitted as f64, &[]);
+        }
+        if logs_emitted > 0 {
+            self.telemetry.count("logit.internal.logs.emitted", logs_emitted as f64, &[]);
         }
 
         sink.send(EventBatch { resource: self.resource.clone(), events }).await;
@@ -299,5 +308,54 @@ mod tests {
         }
         assert!(found_points, "a points.emitted counter should still be recorded");
         assert!(found_spans, "a spans.emitted counter should also be recorded, separately");
+    }
+
+    /// The same property as the span/point split above, for workstream D's log events
+    /// (`docs/plans/operator-surface.md`): a log event carries neither `metrics` nor `span`, so
+    /// without the `event.log.is_some()` check landing *before* the "point" fallback, it would be
+    /// miscounted as a point.
+    #[tokio::test]
+    async fn a_drain_carrying_a_log_reports_logs_emitted_separately_from_points_emitted() {
+        let registry = logit_core::Registry::new();
+        let own_telemetry = registry.telemetry_for("self", "internal", "listener");
+        let component_telemetry = registry.telemetry_for("stat", "statsd_in", "listener");
+        component_telemetry.count("logit.input.datagrams", 1.0, &[]);
+
+        // Through the public path -- `TelemetryLayer`, activated, capturing a real `tracing`
+        // event -- rather than reaching into `logit_core::telemetry`'s own private plumbing.
+        use tracing_subscriber::layer::SubscriberExt;
+        let layer = logit_core::TelemetryLayer::new();
+        layer.activate(registry.clone(), logit_core::Severity::Warn, "self");
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "logit", component = "stat", key = "bad_datagram", "malformed");
+        });
+
+        let input =
+            InternalInput::new(Duration::from_millis(1), registry).with_telemetry(own_telemetry);
+        let (tx, mut rx) = mpsc::channel(4);
+        let fanout = Fanout::new(vec![tx]);
+
+        input.tick(Instant::now(), &fanout).await; // drains the point + the log; buffers both counts
+        input.tick(Instant::now(), &fanout).await; // now drains the emitted-counts from the first tick
+
+        let (mut found_points, mut found_logs) = (false, false);
+        while let Ok(delivered) = rx.try_recv() {
+            let batch = match delivered {
+                logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
+                logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
+            };
+            for event in &batch.events {
+                for metric in &event.metrics {
+                    match logit_core::interner::resolve(metric.name) {
+                        "logit.internal.points.emitted" => found_points = true,
+                        "logit.internal.logs.emitted" => found_logs = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(found_points, "a points.emitted counter should still be recorded");
+        assert!(found_logs, "a logs.emitted counter should also be recorded, separately");
     }
 }

@@ -355,6 +355,13 @@ pub enum ComponentKind {
         /// `docs/adr/internal-span-emission-and-deterministic-sampling.md`.
         #[serde(default = "default_span_sample_rate")]
         span_sample_rate: f64,
+        /// Which of `logit`'s own `tracing` events (`docs/plans/operator-surface.md`, workstream
+        /// D) get captured into the pipeline as ordinary log events, alongside the points/spans
+        /// above -- `warn` (the default) and `error` mirror the two severities every shipped
+        /// `Diagnostics` call already reports at; `off` installs no capturing layer at all, the
+        /// same zero-cost-when-unconfigured guarantee the rest of internal telemetry has.
+        #[serde(default)]
+        logs: InternalLogs,
     },
 
     /// Inline Lua source (a YAML block scalar in practice). See `docs/design/lua-api.md`.
@@ -736,11 +743,26 @@ fn default_docker_root() -> String {
     "/var/lib/docker/containers".to_string()
 }
 
+/// [`ComponentKind::Internal`]'s `logs` field -- see its own doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InternalLogs {
+    /// Capture `warn` and `error` events -- every shipped `Diagnostics::warn`/`warn_throttled`
+    /// call, plus `error`.
+    #[default]
+    Warn,
+    /// Capture only `error` events.
+    Error,
+    /// Install no capturing layer at all.
+    Off,
+}
+
 /// Where a tailed file starts reading the first time it's seen, when no checkpoint entry names
 /// it -- meaningless once a checkpoint entry exists (that always wins; see [`TailOptions::
 /// checkpoint_path`]) and meaningless for a file discovered after startup, which always starts
 /// at [`ReadFrom::Beginning`] regardless of this setting (a file that didn't exist yet has no
 /// "before `logit` started" to skip).
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadFrom {

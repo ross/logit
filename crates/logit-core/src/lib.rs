@@ -24,7 +24,7 @@ pub use metric::{DdSketch, HyperLogLog, MetricKind, MetricRecord};
 pub use resource::Resource;
 pub use span::{SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus};
 pub use telemetry::{
-    trace_is_sampled, Registry, SpanGuard, Tag, Telemetry, DEFAULT_SPAN_SAMPLE_RATE,
+    trace_is_sampled, Registry, SpanGuard, Tag, Telemetry, TelemetryLayer, DEFAULT_SPAN_SAMPLE_RATE,
 };
 pub use time::{format_rfc3339_utc, parse_decimal_nanos, parse_rfc3339_to_nanos, TimestampError};
 pub use trace::{parse_traceparent, random_id_bytes, TraceRef};

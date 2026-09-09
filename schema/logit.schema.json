@@ -342,6 +342,15 @@
               "description": "Both the drain cadence for every component's buffered points and the sampling tick for this component's own process-level gauges (interner size, uptime). Should divide evenly into any downstream `aggregate` interval, or the two windows beat against each other.",
               "type": "string"
             },
+            "logs": {
+              "description": "Which of `logit`'s own `tracing` events (`docs/plans/operator-surface.md`, workstream D) get captured into the pipeline as ordinary log events, alongside the points/spans above -- `warn` (the default) and `error` mirror the two severities every shipped `Diagnostics` call already reports at; `off` installs no capturing layer at all, the same zero-cost-when-unconfigured guarantee the rest of internal telemetry has.",
+              "default": "warn",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/InternalLogs"
+                }
+              ]
+            },
             "span_sample_rate": {
               "description": "Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id` the same way at every node -- a kept trace is kept at every hop, never partially. Below `1.0` by default: span volume is a different shape than metric volume (one span per node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full traces rather than a representative sample would set this explicitly. Named `span_sample_rate`, not `sample_rate` -- `internal` may grow other sampling knobs later, and the name should keep meaning \"which knob\" even though the per-event `sample` transform this once also disambiguated against was retired (`docs/adr/routing-by-condition-is-lua.md`). See `docs/adr/internal-span-emission-and-deterministic-sampling.md`.",
               "default": 0.1,
@@ -1175,6 +1184,32 @@
       "enum": [
         "at_least_once",
         "at_most_once"
+      ]
+    },
+    "InternalLogs": {
+      "description": "[`ComponentKind::Internal`]'s `logs` field -- see its own doc comment.",
+      "oneOf": [
+        {
+          "description": "Capture `warn` and `error` events -- every shipped `Diagnostics::warn`/`warn_throttled` call, plus `error`.",
+          "type": "string",
+          "enum": [
+            "warn"
+          ]
+        },
+        {
+          "description": "Capture only `error` events.",
+          "type": "string",
+          "enum": [
+            "error"
+          ]
+        },
+        {
+          "description": "Install no capturing layer at all.",
+          "type": "string",
+          "enum": [
+            "off"
+          ]
+        }
       ]
     },
     "MatchMode": {

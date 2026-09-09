@@ -65,15 +65,29 @@ enum Command {
 /// self-logging (`Schema`/`Validate`/`Graph` are print-only and stay exactly that way).
 ///
 /// A bad `--log-level`/`LOGIT_LOG` directive is a config error the same as a bad `bind` address:
-/// reported and exited on the spot, before anything else has started.
-fn init_logging(level: &str, format: LogFormat) -> anyhow::Result<()> {
+/// reported and exited on the spot, before anything else has started -- deliberately *before*
+/// the config is even loaded (`Command::Run` calls this first), so a bad flag fails fast
+/// regardless of whether the config itself would also fail, and `pipeline::run_pipelines`'s own
+/// `starting` log always fires, even for a config that goes on to fail resolution.
+///
+/// `telemetry_layer` (`docs/plans/operator-surface.md`, workstream D) is stacked in unconditionally
+/// -- it starts inactive (every event a no-op) and stays that way until
+/// `pipeline::run_pipelines` calls `TelemetryLayer::activate` once the config's own `internal`
+/// component (if any) is known, which happens strictly *after* this call: there is no stable API
+/// to add a layer to an already-`.init()`-ed subscriber, so the layer has to already be here,
+/// even inactive.
+fn init_logging(
+    level: &str,
+    format: LogFormat,
+    telemetry_layer: logit_core::TelemetryLayer,
+) -> anyhow::Result<()> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_new(level)
         .with_context(|| format!("--log-level/LOGIT_LOG: '{level}' is not a valid directive"))?;
-    let registry = tracing_subscriber::registry().with(filter);
+    let registry = tracing_subscriber::registry().with(filter).with(telemetry_layer);
     match format {
         LogFormat::Text => {
             registry.with(tracing_subscriber::fmt::layer().with_target(false)).init();
@@ -144,14 +158,15 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Run { path } => {
-            init_logging(&cli.log_level, cli.log_format)?;
+            let telemetry_layer = logit_core::TelemetryLayer::new();
+            init_logging(&cli.log_level, cli.log_format, telemetry_layer.clone())?;
             // Schema/Validate/Graph stay synchronous above -- only Run needs an async runtime, so
             // only Run pays for building one.
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .context("building the tokio runtime")?;
-            match runtime.block_on(pipeline::run_pipelines(path)) {
+            match runtime.block_on(pipeline::run_pipelines(path, telemetry_layer)) {
                 Ok(()) => Ok(()),
                 Err(err) => {
                     // `err.exit_code()` -- 1 for a startup failure (same class as a bad config),

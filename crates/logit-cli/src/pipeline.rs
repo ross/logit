@@ -44,6 +44,26 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// The operator-chosen id, live [`Registry`], and `logs` threshold of a config's `internal`
+/// component -- what [`run_pipelines`] needs to [`logit_core::TelemetryLayer::activate`] it
+/// (`docs/plans/operator-surface.md`, workstream D). `None` means no `internal` component, so no
+/// `Registry` was built and the layer is never activated.
+pub struct InternalInfo {
+    pub registry: Arc<Registry>,
+    pub id: String,
+    pub logs: logit_config::InternalLogs,
+}
+
+/// `InternalInfo::logs` -> the threshold [`logit_core::TelemetryLayer::activate`] takes, or
+/// `None` for `off` (which means: never activate the layer at all).
+fn severity_for_logs(logs: logit_config::InternalLogs) -> Option<logit_core::Severity> {
+    match logs {
+        logit_config::InternalLogs::Off => None,
+        logit_config::InternalLogs::Warn => Some(logit_core::Severity::Warn),
+        logit_config::InternalLogs::Error => Some(logit_core::Severity::Error),
+    }
+}
+
 /// Loads `path`, resolves its component graph, and runs it until the first component fails or a
 /// shutdown signal is received.
 ///
@@ -56,7 +76,15 @@ use std::sync::Arc;
 /// than lost. A second signal before that drain finishes exits immediately (exit code 130): a
 /// wedged drain must stay killable by the same signal that started it, which matters once an
 /// unattended restart policy is the thing waiting on this process to actually exit.
-pub async fn run_pipelines(path: PathBuf) -> Result<(), RunError> {
+///
+/// `telemetry_layer` is `main`'s already-`.init()`-ed `TelemetryLayer` handle
+/// (`docs/plans/operator-surface.md`, workstream D) -- installed inactive, before any of this
+/// ran (there is no stable API to add a layer to an already-`.init()`-ed subscriber), and
+/// activated here, once the config's own `internal` component (if any) is known.
+pub async fn run_pipelines(
+    path: PathBuf,
+    telemetry_layer: logit_core::TelemetryLayer,
+) -> Result<(), RunError> {
     // An unset `!env` variable (a missing token, most likely) fails here, before anything starts
     // listening.
     let config = config::load(&path).map_err(RunError::Startup)?;
@@ -76,7 +104,14 @@ pub async fn run_pipelines(path: PathBuf) -> Result<(), RunError> {
 
     let admin_bind = config.admin.bind.clone();
     let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let (graph, specs, telemetry) = prepare(config, base_dir).map_err(RunError::Startup)?;
+    let (graph, specs, telemetry, internal) =
+        prepare(config, base_dir).map_err(RunError::Startup)?;
+
+    if let Some(info) = &internal {
+        if let Some(threshold) = severity_for_logs(info.logs) {
+            telemetry_layer.activate(info.registry.clone(), threshold, info.id.clone());
+        }
+    }
 
     // Independent listener from the one `run_with_shutdown` races internally (below) -- multiple
     // concurrent listeners on the same signal kind are supported and all get notified, so this
@@ -131,13 +166,19 @@ pub async fn run_pipelines(path: PathBuf) -> Result<(), RunError> {
     result
 }
 
-/// A resolved `Graph` plus one built `NodeSpec` and one [`Telemetry`] handle per component --
-/// [`prepare`]'s return type, factored out purely to keep clippy's `type_complexity` lint happy.
-type Prepared = (graph::Graph, HashMap<String, NodeSpec>, HashMap<String, Telemetry>);
+/// A resolved `Graph`, one built `NodeSpec` and one [`Telemetry`] handle per component, and the
+/// config's own [`InternalInfo`] if it has an `internal` component -- [`prepare`]'s return type,
+/// factored out purely to keep clippy's `type_complexity` lint happy. Not [`Prepared`]: that type
+/// is this crate's own public shape for `main`/[`run_pipelines`]; this one is `prepare`'s private
+/// implementation detail (it also carries the still-consumed `Config`'s admin block, which
+/// `Prepared` reads separately in [`prepare_for_run`]).
+type PrepareResult =
+    (graph::Graph, HashMap<String, NodeSpec>, HashMap<String, Telemetry>, Option<InternalInfo>);
 
-/// Resolves a config into a `Graph`, one built `NodeSpec` per component, and one [`Telemetry`]
-/// handle per component -- the shared setup between [`run_pipelines`] and [`run_config`] (the
-/// latter used directly by tests below, which don't need shutdown wiring).
+/// Resolves a config into a `Graph`, one built `NodeSpec` per component, one [`Telemetry`] handle
+/// per component, and the config's [`InternalInfo`] if it has an `internal` component -- the
+/// shared setup between [`prepare_for_run`] and [`run_config`] (the latter used directly by tests
+/// below, which don't need shutdown wiring).
 ///
 /// The telemetry map is empty (every handle [`Telemetry::default`], the disabled no-op) unless
 /// `config` contains an `internal` component, in which case a single process-wide [`Registry`] is
@@ -145,19 +186,21 @@ type Prepared = (graph::Graph, HashMap<String, NodeSpec>, HashMap<String, Teleme
 /// own instrumentation (`build_spec`, layer 3) and the node runtime's uniform instrumentation
 /// (`logit_pipeline::run_with_telemetry`, layer 2), so both land in the same buffer and drain
 /// together. See `docs/design/internal-telemetry.md`.
-fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<Prepared> {
+fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<PrepareResult> {
     let graph = graph::resolve(config)?;
 
-    // The rate comes off the config's own `internal` component (graph rule 13 already
-    // guarantees at most one), rather than always calling `Registry::new`'s default -- an operator
-    // who set `span_sample_rate` explicitly (`demo/logit.yaml`'s `1.0`, say) would otherwise have
-    // their choice silently ignored.
-    let internal_span_sample_rate = graph.components.values().find_map(|c| match &c.kind {
-        logit_config::ComponentKind::Internal { span_sample_rate, .. } => Some(*span_sample_rate),
+    // Read off the config's own `internal` component (graph rule 13 already guarantees at most
+    // one), rather than always calling `Registry::new`'s default -- an operator who set
+    // `span_sample_rate` explicitly (`demo/logit.yaml`'s `1.0`, say) would otherwise have their
+    // choice silently ignored.
+    let internal_component = graph.components.iter().find_map(|(id, c)| match &c.kind {
+        logit_config::ComponentKind::Internal { span_sample_rate, logs, .. } => {
+            Some((id.clone(), *span_sample_rate, *logs))
+        }
         _ => None,
     });
     let registry: Option<Arc<Registry>> =
-        internal_span_sample_rate.map(Registry::with_span_sampling);
+        internal_component.as_ref().map(|(_, rate, _)| Registry::with_span_sampling(*rate));
 
     // Sorted, not raw `HashMap` iteration order: a startup failure (a missing lua_file) should be
     // reproducible across runs, not depend on hash-seed-driven iteration order -- two
@@ -177,7 +220,12 @@ fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<Prepared> {
         telemetry.insert(id.clone(), component_telemetry);
     }
 
-    Ok((graph, specs, telemetry))
+    let internal = match (internal_component, registry) {
+        (Some((id, _, logs)), Some(registry)) => Some(InternalInfo { registry, id, logs }),
+        _ => None,
+    };
+
+    Ok((graph, specs, telemetry, internal))
 }
 
 /// Waits for one SIGTERM or SIGINT (Ctrl-C on non-Unix, where `SignalKind` doesn't exist). Each
@@ -205,7 +253,7 @@ async fn shutdown_signal() {
 /// an in-memory `Config` directly without a signal handler racing their assertions.
 #[cfg(test)]
 async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
-    let (graph, specs, telemetry) = prepare(config, base_dir)?;
+    let (graph, specs, telemetry, _internal) = prepare(config, base_dir)?;
     logit_pipeline::run_with_telemetry(
         graph,
         specs,
@@ -311,10 +359,11 @@ fn build_spec(
                 input_runtime_config(&component.receive),
             )
         }
-        // `span_sample_rate` is read by `prepare` (above) to build the `Registry` itself, not
-        // here -- by the time `build_spec` runs, the `Registry` this handle points at already has
-        // it baked in.
-        Internal { interval, span_sample_rate: _ } => {
+        // `span_sample_rate`/`logs` are both read by `prepare` (above) -- the former to build the
+        // `Registry` itself (already baked into the handle this arm receives), the latter to
+        // decide whether `main::init_logging` stacks a `TelemetryLayer` at all. Neither is this
+        // arm's concern.
+        Internal { interval, span_sample_rate: _, logs: _ } => {
             let registry = registry
                 .cloned()
                 .expect("graph::resolve's rule 13 guarantees a Registry whenever an 'internal' component does");
@@ -934,7 +983,7 @@ mod tests {
     #[test]
     fn prepare_builds_no_registry_and_only_disabled_handles_without_an_internal_component() {
         let cfg = config(vec![("in", statsd_in()), ("out", influxdb_out(vec!["in"]))]);
-        let (_, _, telemetry) = prepare(cfg, PathBuf::new()).unwrap();
+        let (_, _, telemetry, _) = prepare(cfg, PathBuf::new()).unwrap();
         assert_eq!(telemetry.len(), 2);
         assert!(
             telemetry.values().all(|t| !t.is_enabled()),
@@ -954,12 +1003,13 @@ mod tests {
                     kind: ComponentKind::Internal {
                         interval: Duration::from_secs(10),
                         span_sample_rate: logit_core::DEFAULT_SPAN_SAMPLE_RATE,
+                        logs: logit_config::InternalLogs::default(),
                     },
                 },
             ),
             ("out", influxdb_out(vec!["self"])),
         ]);
-        let (_, _, telemetry) = prepare(cfg, PathBuf::new()).unwrap();
+        let (_, _, telemetry, _) = prepare(cfg, PathBuf::new()).unwrap();
         assert!(
             telemetry.values().all(|t| t.is_enabled()),
             "an 'internal' component should give every component a live telemetry handle"
@@ -977,6 +1027,7 @@ mod tests {
             kind: ComponentKind::Internal {
                 interval: Duration::from_secs(10),
                 span_sample_rate: logit_core::DEFAULT_SPAN_SAMPLE_RATE,
+                logs: logit_config::InternalLogs::default(),
             },
         };
         let (spec, telemetry) =
