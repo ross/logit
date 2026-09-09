@@ -7,6 +7,7 @@
 
 pub mod file;
 pub mod influxdb;
+pub mod logit;
 pub mod otlp;
 pub mod stdio;
 pub mod syslog;
