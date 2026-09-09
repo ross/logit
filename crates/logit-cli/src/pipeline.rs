@@ -33,8 +33,7 @@ use logit_transforms::{
     Keep as KeepTransform, KeepSignals as KeepSignalsTransform, Kv as KvTransform,
     KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
     RegexParser, Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform,
-    SignalSet, SpanLift,
-    TraceContext as TraceContextTransform,
+    SignalSet, SpanLift, TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
