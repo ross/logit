@@ -84,22 +84,41 @@ enum Command {
 /// component (if any) is known, which happens strictly *after* this call: there is no stable API
 /// to add a layer to an already-`.init()`-ed subscriber, so the layer has to already be here,
 /// even inactive.
+///
+/// `--log-level`/`LOGIT_LOG` filters *only* the stderr `fmt` layer, via a per-layer
+/// `.with_filter(...)` rather than a subscriber-wide `.with(filter)`: a global filter
+/// short-circuits every layer beneath it (and `tracing-core` caches that verdict per callsite
+/// forever), which would make `--log-level error` silently override the config's own
+/// `internal.logs` threshold. `telemetry_layer` carries `logit_core::TelemetryLayer::capture_filter`
+/// of its own instead.
 fn init_logging(
     level: &str,
     format: LogFormat,
     telemetry_layer: logit_core::TelemetryLayer,
 ) -> anyhow::Result<()> {
+    use tracing_subscriber::layer::Layer;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_new(level)
         .with_context(|| format!("--log-level/LOGIT_LOG: '{level}' is not a valid directive"))?;
-    let registry = tracing_subscriber::registry().with(filter).with(telemetry_layer);
+    // `with_filter` on each layer, never a bare `.with(filter)` on the registry: a plain
+    // `.with(EnvFilter)` is a *global* filter -- `Layered::enabled`/`register_callsite`
+    // short-circuit the whole stack, and a `never` verdict is cached at the callsite by
+    // `tracing-core` for the life of the process -- so `--log-level error` (or `LOGIT_LOG=off`)
+    // would kill every `warn` before `TelemetryLayer::on_event` ever ran, silently downgrading
+    // `internal: { logs: warn }` to `error` upstream of anywhere the drop could even be counted.
+    // Scoped per layer, the two are independent knobs: `--log-level` is stderr verbosity,
+    // `internal.logs` is what the pipeline captures (`TelemetryLayer::capture_filter`).
+    let registry = tracing_subscriber::registry()
+        .with(telemetry_layer.with_filter(logit_core::TelemetryLayer::capture_filter()));
     match format {
         LogFormat::Text => {
-            let layer =
-                tracing_subscriber::fmt::layer().with_target(false).with_writer(std::io::stderr);
+            let layer = tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(std::io::stderr)
+                .with_filter(filter);
             registry.with(layer).init();
         }
         LogFormat::Json => {
@@ -110,7 +129,8 @@ fn init_logging(
             let layer = tracing_subscriber::fmt::layer()
                 .json()
                 .flatten_event(true)
-                .with_writer(std::io::stderr);
+                .with_writer(std::io::stderr)
+                .with_filter(filter);
             registry.with(layer).init();
         }
     }

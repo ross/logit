@@ -165,16 +165,15 @@ pub async fn run_pipelines(
 
 /// A resolved `Graph`, one built `NodeSpec` and one [`Telemetry`] handle per component, and the
 /// config's own [`InternalInfo`] if it has an `internal` component -- [`prepare`]'s return type,
-/// factored out purely to keep clippy's `type_complexity` lint happy. Not [`Prepared`]: that type
-/// is this crate's own public shape for `main`/[`run_pipelines`]; this one is `prepare`'s private
-/// implementation detail (it also carries the still-consumed `Config`'s admin block, which
-/// `Prepared` reads separately in [`prepare_for_run`]).
+/// factored out purely to keep clippy's `type_complexity` lint happy. The config's `admin` block
+/// is deliberately not in here: [`run_pipelines`] clones it off the `Config` before handing the
+/// config to [`prepare`], which consumes it.
 type PrepareResult =
     (graph::Graph, HashMap<String, NodeSpec>, HashMap<String, Telemetry>, Option<InternalInfo>);
 
 /// Resolves a config into a `Graph`, one built `NodeSpec` per component, one [`Telemetry`] handle
 /// per component, and the config's [`InternalInfo`] if it has an `internal` component -- the
-/// shared setup between [`prepare_for_run`] and [`run_config`] (the latter used directly by tests
+/// shared setup between [`run_pipelines`] and [`run_config`] (the latter used directly by tests
 /// below, which don't need shutdown wiring).
 ///
 /// The telemetry map is empty (every handle [`Telemetry::default`], the disabled no-op) unless
@@ -871,9 +870,18 @@ fn to_set_pairs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_config::{Component, ComponentKind};
+    use logit_config::{Component, ComponentKind, InternalLogs};
     use std::collections::HashMap as Map;
     use std::time::Duration;
+
+    #[test]
+    fn every_internal_logs_threshold_is_at_or_above_warn() {
+        for logs in [InternalLogs::Warn, InternalLogs::Error, InternalLogs::Off] {
+            if let Some(severity) = severity_for_logs(logs) {
+                assert!(severity >= logit_core::Severity::Warn, "{logs:?} maps below warn");
+            }
+        }
+    }
 
     fn statsd_in() -> Component {
         Component {

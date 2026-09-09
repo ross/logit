@@ -858,6 +858,34 @@ impl TelemetryLayer {
         *inner =
             Some(ActiveTelemetryLayer { registry, threshold, internal_id: internal_id.into() });
     }
+
+    /// The per-layer filter this layer must be installed *with* -- `logit-cli::main::init_logging`
+    /// applies it via `tracing_subscriber::Layer::with_filter`, and scopes the
+    /// `--log-level`/`LOGIT_LOG` `EnvFilter` the same way onto the stderr `fmt` layer, so that
+    /// stderr verbosity and internal-log capture stay two independent knobs.
+    ///
+    /// Installed as a *global* filter instead (`registry().with(env_filter)`), an operator's
+    /// `--log-level error` would return `Interest::never()` for every `warn` callsite -- a verdict
+    /// `tracing-core` caches at that callsite for the life of the process -- and this layer's
+    /// `on_event` would simply never run: `internal: { logs: warn }` would silently become
+    /// `error`, and the drop would happen upstream of the registry, where not even a
+    /// `logit.internal.logs.dropped` counter can see it. `LOGIT_LOG=off` would disable capture
+    /// outright.
+    ///
+    /// `target: "logit"` is exactly what `on_event` already requires (this crate's own
+    /// self-diagnostics, never a dependency's `tracing` instrumentation). `WARN` is a static cap
+    /// rather than the configured threshold because this layer is built before the config is even
+    /// loaded -- sound because `logit_config::InternalLogs` offers only `warn`/`error`/`off`
+    /// (`logit-cli::pipeline::severity_for_logs`), so `WARN` is never stricter than a reachable
+    /// threshold and the real gate stays `on_event`'s own `threshold` check. It is a cap rather
+    /// than *no* filter for a reason: an unfiltered layer reports no `max_level_hint`, which drags
+    /// the process-wide static max level up to `TRACE` and makes every `debug!`/`trace!` callsite
+    /// in every dependency evaluate dynamically -- moving the bug rather than fixing it. If
+    /// `InternalLogs` ever gains a level below `warn`, this cap moves down with it.
+    pub fn capture_filter() -> tracing_subscriber::filter::Targets {
+        tracing_subscriber::filter::Targets::new()
+            .with_target("logit", tracing_subscriber::filter::LevelFilter::WARN)
+    }
 }
 
 fn severity_from_level(level: tracing::Level) -> Severity {
@@ -1463,6 +1491,7 @@ mod tests {
 
     // -- workstream D: `TelemetryLayer` (docs/plans/operator-surface.md) --
 
+    use tracing_subscriber::layer::Layer as _;
     use tracing_subscriber::layer::SubscriberExt;
 
     fn find_log_event(events: &[Event]) -> Option<&Event> {
@@ -1547,6 +1576,38 @@ mod tests {
 
         let events = registry.drain(0);
         assert!(find_log_event(&events).is_none(), "an inactive layer must capture nothing");
+    }
+
+    #[test]
+    fn a_strict_env_filter_does_not_suppress_capture() {
+        // The regression this pins: with `--log-level`/`LOGIT_LOG`'s `EnvFilter` installed
+        // globally (`registry().with(filter)`) rather than scoped to the stderr layer,
+        // `EnvFilter::register_callsite` returns `Interest::never()` for a `warn` callsite under
+        // `error` -- a verdict `tracing-core` caches at that callsite for the life of the process
+        // -- so `on_event` never runs at all and `internal: { logs: warn }` silently becomes
+        // `error`. This builds the same shape `logit-cli::main::init_logging` builds: the
+        // `EnvFilter` scoped to the rendering layer, `TelemetryLayer::capture_filter` on this one.
+        let registry = Registry::new();
+        registry.telemetry_for("x", "json", "transform");
+        let layer = TelemetryLayer::new();
+        layer.activate(registry.clone(), Severity::Warn, "self");
+
+        let subscriber = tracing_subscriber::registry()
+            .with(layer.with_filter(TelemetryLayer::capture_filter()))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::sink)
+                    .with_filter(tracing_subscriber::EnvFilter::new("error")),
+            );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "logit", component = "x", key = "bad_frame", "malformed input");
+        });
+
+        let events = registry.drain(0);
+        let event = find_log_event(&events)
+            .expect("a warn must still reach the pipeline under --log-level error");
+        let record = event.log.as_ref().unwrap();
+        assert_eq!(record.severity, Some(Severity::Warn));
     }
 
     #[test]

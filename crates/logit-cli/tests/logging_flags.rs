@@ -93,3 +93,24 @@ fn log_format_json_emits_one_parseable_object_per_line() {
         "expected a top-level message=\"starting\" JSON line on stderr, got: {stderr}"
     );
 }
+
+#[test]
+fn a_strict_log_level_still_silences_stderr_self_logging() {
+    // The complement of `TelemetryLayer::capture_filter`'s independence: scoping the `EnvFilter`
+    // to the stderr `fmt` layer (rather than the whole subscriber, which would gate internal-log
+    // capture with it) must not stop it filtering stderr. `starting` is an `info` event, so
+    // `--log-level error` has to swallow it.
+    let config = BrokenConfig::new("strict-level");
+    let output = Command::new(env!("CARGO_BIN_EXE_logit"))
+        .args(["--log-level", "error", "run"])
+        .arg(&config.0)
+        .output()
+        .expect("spawning the logit binary");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("starting"),
+        "--log-level error must still silence the info-level 'starting' line, got: {stderr}"
+    );
+}
