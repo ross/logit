@@ -1472,19 +1472,20 @@ mod tests {
         let telemetry = registry.telemetry_for("test", "output", "sink");
         let q = DiskQueue::open(config(dir.clone()), telemetry, Diagnostics::new("test")).unwrap();
 
-        // Make the active segment unwritable -- `write_all` then fails with a permission error,
-        // exercising the same "batch never actually landed" path a real `ENOSPC` would.
-        let mut perms = std::fs::metadata(segment_path(&dir, 0)).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(segment_path(&dir, 0), perms).unwrap();
+        // Replace the active segment with a directory of the same name -- opening it for append
+        // then fails with `EISDIR`, a type mismatch rather than a permission check, so it fails
+        // the same way whether the test runs as an ordinary user or as root (a `chmod`-readonly
+        // file would silently succeed for root, e.g. CI's containers, which is exactly what a
+        // first version of this test got wrong). Exercises the same "batch never actually
+        // landed" path a real write failure (permissions, `ENOSPC`, the device gone) would.
+        std::fs::remove_file(segment_path(&dir, 0)).unwrap();
+        std::fs::create_dir(segment_path(&dir, 0)).unwrap();
 
         q.push((batch("never-lands"), ctx())).await;
 
-        // Restore write access so the queue can be inspected/closed cleanly.
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(segment_path(&dir, 0)).unwrap().permissions();
-        perms.set_mode(0o644);
-        std::fs::set_permissions(segment_path(&dir, 0), perms).unwrap();
+        // Restore a real file so the queue can be inspected/closed cleanly.
+        std::fs::remove_dir(segment_path(&dir, 0)).unwrap();
+        std::fs::File::create(segment_path(&dir, 0)).unwrap();
 
         q.close();
         assert!(
