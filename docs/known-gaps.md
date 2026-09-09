@@ -448,6 +448,56 @@ already built that have a known, accepted rough edge.
   UTF-8 validation to the MSG slice alone — a real change, not a one-line fix, and nginx's
   `escape=json` access-log writer never emits invalid UTF-8 in practice, so there's no production
   producer forcing the issue yet.
+
+  **UTF-8 rejection is not the only thing standing between a syslog line and an arbitrary-binary
+  payload.** `SyslogDecoder::decode_into` (`crates/logit-inputs/src/syslog.rs:190-197`) splits a
+  datagram on `\n` *before* any UTF-8 check runs, so a binary payload containing a `0x0A` byte is
+  cut mid-value by the framing regardless of what this entry's fix would do — see the HAProxy CBOR
+  entry below, where this framing gap is what actually blocks the case that motivated writing it
+  down. Fixing UTF-8 validation alone would not be sufficient for a binary payload that isn't
+  newline-safe by construction (nginx's `escape=json` output happens to be; not every binary format
+  is).
+- **HAProxy's native CBOR log output (`%{+cbor}o`/`%{+cbor+bin}o`) was evaluated as a cheaper way to
+  source its access logs and deliberately not pursued** — a considered "not now," not an
+  unexplored idea, recorded here so the investigation doesn't get redone. Three findings, each
+  independently sufficient to defer it:
+  - **The reachable mode is bigger than JSON, not smaller.** HAProxy's default CBOR encoding
+    (`%{+cbor}o`, no `+bin`) is hex-encoded ASCII — a line like `BF69636C69656E745F6970…`, an
+    indefinite-length map rendered as hex text, ~2 bytes on the wire per payload byte. Only
+    `%{+cbor+bin}o` emits raw binary, which is the mode that would actually be more compact than
+    the demo's hand-rolled JSON — but see the next point.
+  - **Binary CBOR cannot reach `logit` over any transport it has today.** Beyond the non-UTF-8
+    rejection above, `syslog_in` splits every datagram on `\n` before any UTF-8 check runs at all
+    (`crates/logit-inputs/src/syslog.rs:190-197`), and `0x0A` occurs freely inside CBOR — it's the
+    encoding of the integer 10, and turns up throughout length headers and float payloads — so a
+    binary payload is chopped mid-value by the framing itself, independent of the UTF-8 question.
+    `tail_in`/`docker_in` are line-framed too, and Docker's json-file driver wraps each line in a
+    JSON string that can't carry arbitrary octets at all. Nothing in the tree offers
+    length-delimited framing, which is the actual prerequisite; a `cbor_in` listener, a unix-socket
+    input, or an opt-out of `syslog_in`'s newline splitting would each qualify.
+  - **HAProxy's log-format item-name grammar rejects a literal `.` in a custom name, and `%{+json}o`
+    and `%{+cbor}o` share that grammar** (already recorded at `demo/haproxy/haproxy.cfg:99-117`,
+    confirmed empirically against `haproxy -c`) — but the two encodings aren't equally stuck by it.
+    JSON has an escape hatch: `demo/haproxy/haproxy.cfg:140` hand-writes the JSON text itself, with
+    per-value `json(ascii)` escaping, to get its dotted `span.*`/`trace.*` keys past the grammar.
+    CBOR has no equivalent, because binary can't be typed into a `log-format` string — `%{+cbor}o`
+    is the only way to emit it, so a CBOR-sourced HAProxy tier is stuck with undotted keys and would
+    need a rename stage the JSON tier doesn't. `SpanLiftConfig`
+    (`crates/logit-config/src/lib.rs:806-828`) has no source-field override for `span.status`,
+    `span.start_us`, or `span.duration_ms`, so `trace_context` can't absorb that rename on its own
+    either. Worth being precise about *whose* limitation this is: CBOR's own text-string keys are
+    arbitrary UTF-8 and handle dots fine — every constraint above belongs to HAProxy's log-format
+    grammar or to `logit`'s current transports, not to CBOR as a format.
+
+  If length-delimited framing ever lands and this is revisited, three design constraints are
+  already known and don't need rediscovering: `Value::as_str` **panics** on an invalid-UTF-8
+  `Value::Str` (`crates/logit-core/src/value.rs:33-41`), so CBOR's only-nominally-UTF-8 text-string
+  type would need validation before becoming one; a hand-rolled decoder needs an explicit recursion
+  depth bound, since `json`'s `serde_json`-based one inherits a limit for free that a hand-rolled
+  CBOR reader would not; and a length header must never size an allocation directly (an attacker can
+  claim a multi-gigabyte array in a handful of bytes). CBOR tag 1 (epoch time), decodable straight
+  into `Value::Timestamp`, is the one thing the format would offer that JSON doesn't — the reason
+  it's worth this entry rather than a closed door.
 - **A syslog event's `timestamp` is receipt time, not the sender's** — every event is stamped with
   the instant its datagram came off the socket (`received_at`, captured by the read half and
   threaded through to `Decoder::decode_into` explicitly since
