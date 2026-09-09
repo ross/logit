@@ -29,8 +29,8 @@ use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
 use logit_transforms::{
-    Aggregator, DropSignals as DropSignalsTransform, HasSignal as HasSignalTransform, JsonParser,
-    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, Kv as KvTransform,
+    Aggregator, CsvParser, DropSignals as DropSignalsTransform, HasSignal as HasSignalTransform,
+    JsonParser, Keep as KeepTransform, KeepSignals as KeepSignalsTransform, Kv as KvTransform,
     KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
     RegexParser, Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform,
     SignalSet, SpanLift, TraceContext as TraceContextTransform,
@@ -281,6 +281,11 @@ fn build_spec(
         Json { skip_to_brace } => NodeSpec::Transform(Box::new(
             JsonParser::new(*skip_to_brace)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
+        )),
+        Csv { columns, delimiter } => NodeSpec::Transform(Box::new(
+            CsvParser::new(columns.clone(), *delimiter as u8)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
         )),
         Logfmt { bare_keys } => NodeSpec::Transform(Box::new(
             LogfmtTransform::new(*bare_keys)

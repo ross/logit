@@ -2,12 +2,13 @@
 //! "built-in native processors ... meant to sit in front of user Lua" split. Each implements
 //! `logit_pipeline::Transform`, letting the node runtime run it as an ordinary tokio task (no
 //! dedicated OS thread, unlike a Lua component -- `docs/design/pipeline-graph.md`'s "Node kinds"
-//! section). `aggregate`, `json`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`,
-//! `has_signal`, `keep_signals`, `drop_signals`, `logfmt`, `kv`, and `regex` are implemented so
-//! far; `csv` is expected to land here too (`rename`/`filter`/`sample`/`throttle`/`dedup` were
-//! retired rather than landing -- `docs/adr/routing-by-condition-is-lua.md`).
+//! section). `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`,
+//! `scale`, `has_signal`, `keep_signals`, `drop_signals`, `logfmt`, `kv`, and `regex` are
+//! implemented (`rename`/`filter`/`sample`/`throttle`/`dedup` were retired rather than landing --
+//! `docs/adr/routing-by-condition-is-lua.md`).
 
 mod aggregate;
+mod csv;
 mod json;
 mod keep;
 mod kv_metrics;
@@ -21,6 +22,7 @@ mod trace_context;
 use logit_core::Value;
 
 pub use aggregate::Aggregator;
+pub use csv::CsvParser;
 pub use json::JsonParser;
 pub use keep::{Keep, Remove};
 pub use kv_metrics::{KvMetrics, MetricSpec};
@@ -316,5 +318,102 @@ mod chained_pipeline_test {
             Value::str(raw),
             "the log body is untouched"
         );
+    }
+
+    /// Proves `csv`'s all-`Str` output (`docs/adr/csv-positional-columns.md`) feeds
+    /// `kv_metrics`/`scale` correctly through `numeric`'s string branch -- exactly the same
+    /// coercion `json`'s ADR relies on `numeric` for, but starting from a value that was *never*
+    /// anything but a string, unlike JSON's own numeric syntax.
+    #[test]
+    fn csv_kv_metrics_keep_aggregate_chain_produces_correctly_tagged_metrics() {
+        let resource = Arc::new(Resource::default());
+
+        let event = Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str("10.0.0.1,GET,200,612,0.012"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
+        );
+
+        let mut csv = CsvParser::new(
+            vec![
+                "client_ip".to_string(),
+                "request_method".to_string(),
+                "status".to_string(),
+                "body_bytes_sent".to_string(),
+                "request_time".to_string(),
+            ],
+            b',',
+        );
+        let event = csv.process(&resource, event).expect("csv always forwards");
+        for (key, expected) in [
+            ("client_ip", "10.0.0.1"),
+            ("request_method", "GET"),
+            ("status", "200"),
+            ("body_bytes_sent", "612"),
+            ("request_time", "0.012"),
+        ] {
+            assert_eq!(
+                event.attributes.get(key),
+                Some(&Value::str(expected)),
+                "every csv field should be a Value::Str"
+            );
+        }
+
+        let mut scale = Scale::new(vec![("request_time".to_string(), 1000.0)]);
+        let event = scale.process(&resource, event).expect("scale always forwards");
+        assert_eq!(event.attributes.get("request_time"), Some(&Value::F64(12.0)));
+
+        let mut kv = KvMetrics::new(
+            vec![MetricSpec {
+                name: "nginx.bytes_sent".to_string(),
+                field: Some("body_bytes_sent".to_string()),
+                unit: None,
+            }],
+            vec![],
+            vec![MetricSpec {
+                name: "nginx.request_time".to_string(),
+                field: Some("request_time".to_string()),
+                unit: Some("ms".to_string()),
+            }],
+        );
+        let event = kv.process(&resource, event).expect("kv_metrics always forwards");
+        assert_eq!(event.metrics.len(), 2, "one counter (from a string) and one distribution");
+
+        let mut keep = Keep::new(vec!["status".to_string()]);
+        let event = keep.process(&resource, event).expect("keep always forwards");
+        let kept: Vec<&str> = event.attributes.iter().map(|(k, _)| resolve(k)).collect();
+        assert_eq!(kept, vec!["status"], "only the kept attribute should survive");
+
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let passed = agg.process(&resource, event).expect("the log half should be forwarded");
+        assert!(passed.metrics.is_empty(), "every metric should have been absorbed");
+
+        let flushed = agg.flush(1_000_000_000);
+        assert_eq!(flushed.len(), 1, "one resource group");
+        let (_, events) = &flushed[0];
+        assert_eq!(events.len(), 2, "two distinct series");
+        for (series_event, _links) in events {
+            let tags: Vec<&str> = series_event.attributes.iter().map(|(k, _)| resolve(k)).collect();
+            assert_eq!(tags, vec!["status"]);
+            let record = &series_event.metrics[0];
+            match resolve(record.name) {
+                "nginx.bytes_sent" => {
+                    assert!(matches!(record.kind, MetricKind::Counter(v) if v == 612.0));
+                }
+                "nginx.request_time" => match &record.kind {
+                    MetricKind::Distribution(sketch) => {
+                        let q = sketch.quantile(0.5).expect("single-sample sketch has a median");
+                        assert!((q - 12.0).abs() < 0.1, "got {q}, scale should have run first");
+                    }
+                    other => panic!("expected Distribution, got {other:?}"),
+                },
+                other => panic!("unexpected series name: {other}"),
+            }
+        }
     }
 }

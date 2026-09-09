@@ -341,6 +341,58 @@ fn json_parse_wide_json_event() {
     expect_allocs("json: parse + merge 1 wide-JSON event", stats, 1);
 }
 
+/// `csv`'s counterpart to [`json_parse_one_event`]: seven columns, one a quoted field containing
+/// the delimiter (`"/a,b"`) but no doubled quote, so it still slices the message buffer directly
+/// rather than allocating -- `docs/adr/csv-positional-columns.md`'s zero-copy path. `columns` and
+/// `header_line` are interned/built once at construction (`fixtures::csv_parser`), not per event.
+#[test]
+fn csv_parse_one_event() {
+    let mut csv = fixtures::csv_parser();
+    let resource = fixtures::resource();
+
+    let warm = fixtures::csv_event(fixtures::CSV_ACCESS_LINE);
+    drop(csv.process(&resource, warm));
+
+    let event = fixtures::csv_event(fixtures::CSV_ACCESS_LINE);
+    let (event, stats) = measure(|| csv.process(&resource, event).expect("csv forwards"));
+    assert_eq!(event.attributes.len(), 7, "seven csv columns, no pre-existing attributes");
+    expect_allocs("csv: parse + merge 1 event (quoted, no escaping)", stats, 0);
+}
+
+/// The one path in `csv` that allocates: a quoted field containing a doubled `""`, which
+/// `unescape` (`crates/logit-transforms/src/csv.rs`) must copy into a fresh buffer rather than
+/// slicing the message -- every other field on this same line stays zero-copy.
+#[test]
+fn csv_parse_quoted_field_with_doubled_quotes() {
+    let mut csv = fixtures::csv_parser();
+    let resource = fixtures::resource();
+    let line = r#"10.0.0.1,2026-09-07T06:52:01Z,GET,"/a""b",200,612,0.012"#;
+
+    let warm = fixtures::csv_event(line);
+    drop(csv.process(&resource, warm));
+
+    let event = fixtures::csv_event(line);
+    let (event, stats) = measure(|| csv.process(&resource, event).expect("csv forwards"));
+    assert_eq!(event.attributes.get("path"), Some(&Value::str(r#"/a"b"#)));
+    expect_allocs("csv: parse + merge 1 event (one doubled-quote field)", stats, 1);
+}
+
+/// Sixteen unquoted columns -- past `AttrMap`'s 8 inline slots, so `event.attributes` itself must
+/// spill to the heap once (the only allocation `csv` doesn't directly cause).
+#[test]
+fn csv_parse_wide_row_event() {
+    let mut csv = fixtures::csv_wide_parser();
+    let resource = fixtures::resource();
+
+    let warm = fixtures::csv_event(fixtures::CSV_WIDE_LINE);
+    drop(csv.process(&resource, warm));
+
+    let event = fixtures::csv_event(fixtures::CSV_WIDE_LINE);
+    let (event, stats) = measure(|| csv.process(&resource, event).expect("csv forwards"));
+    assert_eq!(event.attributes.len(), 16, "sixteen csv columns");
+    expect_allocs("csv: parse + merge 1 wide row (16 columns)", stats, 1);
+}
+
 /// Three named captures onto a bare event whose `AttrMap` starts empty -- well inside its 8-entry
 /// inline capacity even after the captures land, so nothing spills to the heap.
 /// `docs/adr/regex-transform.md`'s zero-allocation claim: `captures_read` fills a struct-held

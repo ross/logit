@@ -91,7 +91,9 @@ pub enum ComponentKind {
     // Matches a pattern against a log message (or a named attribute), turning named capture
     // groups into attributes (docs/adr/regex-transform.md).
     Regex { pattern: String, field: Option<String> },
-    // csv —
+    // Splits each row of a delimited line into positional attributes named by a configured
+    // `columns` list (docs/adr/csv-positional-columns.md).
+    Csv { columns: Vec<String>, delimiter: char },
     // as each lands in logit-transforms, same shape: a `ComponentKind` variant, no `sources`
     // opinion of its own (that lives on `Component`, uniformly). `rename`/`filter`/`sample`/
     // `throttle`/`dedup` used to be sketched here too -- retired before landing, not merely
@@ -111,7 +113,7 @@ into one tagged enum creates real collisions — `Otlp { bind }` (a listener) an
 `Logit` variants. Suffixing *every* protocol kind uniformly, not just the two that collide today,
 keeps the rule predictable as more protocols gain a second side — `syslog_out` (RFC 3164/5424 over
 UDP or TCP, `docs/adr/syslog-output.md`) is exactly that case, landing well after `SyslogIn`.
-Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`,
+Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
 `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `logfmt`,
 `kv`, `regex`, and any future native transform — take no suffix; there's only ever one direction
 for a transform to be.
@@ -159,7 +161,7 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `logfmt`, `kv`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `otlp_out`, `logit_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
@@ -288,6 +290,15 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     that *contains* `pair_sep`, is rejected — each is a certain no-op or a certain garbage result
     (`docs/adr/logfmt-and-kv-parsing.md`). `logfmt` needs no rule of its own: past `bare_keys`,
     its only field is a `bool`, which can't be malformed.
+30. A `regex` with an empty `field` name, a `pattern` that fails to compile, or a `pattern` that
+    declares no named capture group, is rejected — the first is the usual "empty is useless" case,
+    the second can only ever be a config mistake, and the third can only ever be a no-op
+    (`docs/adr/regex-transform.md`).
+31. A `csv` with an empty `columns` list, an empty column name, or a duplicate column name is
+    rejected (the "can only ever be a no-op" and "a repeated entry silently doubles" rules again,
+    the latter applied to columns instead of sources), as is a `delimiter` that is `"` (RFC
+    4180's quote character), `\n`/`\r` (already consumed as line framing by every input), or
+    non-ASCII (`docs/adr/csv-positional-columns.md`).
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

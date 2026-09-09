@@ -437,6 +437,36 @@
           }
         },
         {
+          "description": "Splits a log record's message as one CSV row, merging the named columns into the event's attributes -- the delimiter-separated sibling of `Json`. See `docs/adr/csv-positional-columns.md` for why there is deliberately no header-row mode, why every field stays a string, and what happens to a row with the wrong number of fields.",
+          "type": "object",
+          "required": [
+            "columns",
+            "type"
+          ],
+          "properties": {
+            "columns": {
+              "description": "Attribute names for each field, left to right -- the schema, declared in config rather than read from the data. Required and non-empty; rejected at graph-validation time when empty (the same \"can only ever be a no-op\" rule `KvMetrics`/`Set`/`Scale` already have), when any entry is empty (it could never be a useful attribute name), or when two entries name the same attribute (the later field would silently overwrite the earlier one on every event, leaving one configured column permanently unreachable).",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "delimiter": {
+              "description": "The field separator -- one ASCII character. `,` by default; `\"\\t\"` (double-quoted, so YAML resolves the escape) for TSV, or `;`/`|`. Rejected at graph-validation time as `\"` (RFC 4180's quote character, which this parser reads as field framing, not data), as `\\n`/`\\r` (already consumed as line framing by every input), or as any non-ASCII character.",
+              "default": ",",
+              "type": "string",
+              "maxLength": 1,
+              "minLength": 1
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "csv"
+              ]
+            }
+          }
+        },
+        {
           "description": "Turns attributes already on an event (typically merged there by `json`) into metrics on that same event. See `docs/adr/kv-metrics-semantics.md` for the skip rules, the numeric coercion rules, and why there is deliberately no `tags:` field here -- tag selection is `Keep`'s job, since every metrics sink already reads `event.attributes`.",
           "type": "object",
           "required": [
@@ -772,20 +802,6 @@
               "type": "string",
               "enum": [
                 "regex"
-              ]
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "type"
-          ],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "csv"
               ]
             }
           }

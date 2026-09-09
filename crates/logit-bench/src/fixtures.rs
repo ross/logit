@@ -26,7 +26,7 @@ use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
 use logit_proto::Decoder;
 use logit_transforms::{
-    Aggregator, JsonParser, Keep, Kv, KvMetrics, Logfmt, MetricSpec, RegexParser, Set,
+    Aggregator, CsvParser, JsonParser, Keep, Kv, KvMetrics, Logfmt, MetricSpec, RegexParser, Set,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -200,6 +200,62 @@ pub fn logfmt_parser() -> Logfmt {
 /// `pair_sep: "&"`, `kv_sep: "="` -- [`KV_LINE`]'s shape.
 pub fn kv_parser() -> Kv {
     Kv::new("&".to_string(), "=".to_string(), false)
+}
+
+/// One line of a CSV access log -- seven columns, one a quoted request line containing the
+/// delimiter, exercising the quoted path rather than a simplified one.
+pub const CSV_ACCESS_LINE: &str = "10.0.0.1,2026-09-07T06:52:01Z,GET,\"/a,b\",200,612,0.012";
+/// The header row [`CSV_ACCESS_LINE`]'s columns would render as -- for exercising the
+/// header-row-recognition path (`docs/adr/csv-positional-columns.md`).
+pub const CSV_ACCESS_HEADER: &str =
+    "remote_addr,time_local,request_method,path,status,bytes_sent,request_time";
+/// Sixteen columns, no quoting -- past `AttrMap`'s 8 inline slots.
+pub const CSV_WIDE_LINE: &str = "a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p";
+
+/// The seven-column schema [`CSV_ACCESS_LINE`] matches, comma-delimited.
+pub fn csv_parser() -> CsvParser {
+    CsvParser::new(
+        vec![
+            "remote_addr".to_string(),
+            "time_local".to_string(),
+            "request_method".to_string(),
+            "path".to_string(),
+            "status".to_string(),
+            "bytes_sent".to_string(),
+            "request_time".to_string(),
+        ],
+        b',',
+    )
+}
+
+/// The sixteen-column schema [`CSV_WIDE_LINE`] matches, comma-delimited. Column names are
+/// `field0`..`field15`, deliberately distinct from `CSV_WIDE_LINE`'s own single-letter values --
+/// naming the columns `a`..`p` to match the data would make the header line and a data row
+/// byte-identical, tripping the header-row-recognition path this fixture isn't meant to exercise.
+pub fn csv_wide_parser() -> CsvParser {
+    CsvParser::new((0..16).map(|i| format!("field{i}")).collect(), b',')
+}
+
+/// One log event whose message is `line` -- the shape `csv` reads (a `LogRecord`, no attributes
+/// pre-populated), for measuring `CsvParser::process` in isolation the same way [`json_parser`]'s
+/// callers measure `JsonParser::process` starting from a decoded event.
+///
+/// Every other input fixture in this file hands `process` a message `Bytes` that was already
+/// cloned or sliced at least once during (unmeasured) decode -- `bytes::Bytes`'s `Vec`-backed
+/// representation lazily promotes to an atomically-refcounted one on its *first* `clone`/`slice`
+/// call, a one-time allocation. A message built straight from a fresh `Bytes::from(String)` and
+/// handed to `process` untouched would pay that promotion cost on the very first clone inside
+/// `process` itself, measuring the fixture's own construction rather than the transform's real
+/// per-event cost -- so this clones the message once before it's ever seen by a transform, the
+/// same "already decoded" starting shape [`nginx_event`]/[`statsd_event`] get from a real decoder.
+pub fn csv_event(line: &str) -> Event {
+    let message = Value::str(line);
+    let _ = message.clone();
+    Event::log(
+        0,
+        AttrMap::new(),
+        LogRecord { message, severity: None, body_format: BodyFormat::Raw, trace: None },
+    )
 }
 
 /// The exact metric specs from `examples/nginx-to-influxdb.yaml`: two counters (one per-event,

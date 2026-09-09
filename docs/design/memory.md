@@ -207,6 +207,9 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `regex` capture into an inline map (3 named groups, empty-attrs event) | **0** | `captures_read` + `haystack.slice` -- zero-copy, no spill |
 | `regex` parse 1 event (sshd shape, 3 captures onto 6 existing `syslog.*` attrs) | **1** | spills past `AttrMap`'s 8-entry inline capacity |
 | `regex` no match, 1 event | **0** | nothing written, nothing allocated |
+| `csv` parse + merge (7-column access line, one quoted-but-unescaped field) | **0** | interned columns, `insert_sym`, `Bytes::slice` throughout -- fits `AttrMap`'s inline capacity |
+| `csv` parse + merge (one doubled-quote field) | **1** | `unescape`'s own copy -- the only path in `csv` that allocates (`crates/logit-transforms/src/csv.rs`) |
+| `csv` parse + merge (16-column wide row) | **1** | `AttrMap` inline-capacity spill only -- every field itself is still a zero-copy slice |
 | `kv_metrics` derive 4 metrics | **3** | `MetricList` spill + one `bins` Vec per sketch |
 | `keep` filter to 3 attrs | **0** | 3 attributes fit inline |
 | `set` through `process_batch`, attributes only | **1** | `process_batch`'s own `Vec::with_capacity` -- `map_resource` returns `None` immediately, same as `keep` |
