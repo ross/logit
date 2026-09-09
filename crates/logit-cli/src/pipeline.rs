@@ -15,12 +15,14 @@ use logit_config::{BufferConfig, Config, StdioTarget};
 use logit_core::{Diagnostics, Registry, Telemetry};
 use logit_inputs::docker::{ContainerFilter, DockerInput};
 use logit_inputs::internal::InternalInput;
+use logit_inputs::logit::LogitInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_inputs::tail::TailInput;
 use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::influxdb::InfluxDbOutput;
+use logit_outputs::logit::LogitOutput;
 use logit_outputs::otlp::{
     OtlpCompression as OtlpOutCompression, OtlpOutput, OtlpTransport as OtlpOutTransport,
     SignalPaths,
@@ -223,6 +225,18 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
+        LogitIn { bind, tls, max_frame_bytes } => {
+            let mut input = LogitInput::new(bind.clone())
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
+            }
+            if let Some(max_frame_bytes) = max_frame_bytes {
+                input = input.with_max_frame_bytes(*max_frame_bytes as u32);
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
         TailIn { paths, tail } => {
             let paths = paths.iter().map(|p| base_dir.join(p)).collect();
             NodeSpec::Input(
@@ -378,6 +392,24 @@ fn build_spec(
                 write_config(&component.buffer),
             )
         }
+        LogitOut { endpoint, compression, tls, request_timeout } => {
+            let mut output = LogitOutput::new(endpoint.clone())
+                .with_compression(to_native_compression(*compression))
+                .with_timeout(*request_timeout)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            if let Some(tls) = tls {
+                // `logit_outputs::logit::TlsClientSettings` and `logit_outputs::otlp::
+                // TlsClientSettings` are the same type (`logit_outputs::tls::TlsClientSettings`,
+                // re-exported at both paths) -- `to_tls_client_settings` already builds it.
+                output = output.with_tls(&to_tls_client_settings(tls), base_dir)?;
+            }
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
         StdioOut { target, format, compression } => {
             let output = match target {
                 StdioTarget::Stdout => StreamOutput::stdout(),
@@ -450,8 +482,6 @@ fn build_spec(
                 write_config(&component.buffer),
             )
         }
-
-        other => unreachable!("graph::resolve already rejected any unimplemented kind: {other:?}"),
     };
     Ok((spec, telemetry))
 }
@@ -594,19 +624,24 @@ fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::U
 /// 17 already guarantees a non-datagram-, non-tail-listener's `receive` is `ReceiveConfig::
 /// default()` by the time a resolved `Graph` reaches `build_spec`, so `internal` always gets
 /// `shutdown_grace: ReceiveConfig::default().shutdown_grace` here (5s today, not
-/// `Duration::ZERO`) regardless of what any `receive:` block would otherwise say. That's
-/// harmless, not just unused, only because `InternalInput` never overrides `Input::
+/// `Duration::ZERO`) regardless of what any `receive:` block would otherwise say. For `internal`
+/// that's harmless, not just unused, only because `InternalInput` never overrides `Input::
 /// run_until_shutdown`: the default impl's own `select!` always resolves at t=shutdown against a
 /// non-overriding input, so `run_input`'s grace backstop -- built from this value -- never gets a
 /// chance to matter. If `internal` ever gains a cooperative drain of its own, this stops being a
 /// harmless default and needs its own `receive.shutdown_grace`-shaped knob rather than inheriting
 /// whatever `ReceiveConfig::default` happens to say.
 ///
-/// `tail_in`/`docker_in` are the first listeners where this value is genuinely load-bearing
-/// rather than incidentally harmless: `TailInput` (`crates/logit-inputs/src/tail/driver.rs`)
-/// does override `run_until_shutdown` to flush every tracked file's accumulator and write a
-/// final checkpoint, and that drain must fit inside `shutdown_grace` or `run_input`'s backstop
-/// cancels it by drop, losing whatever it hadn't flushed yet.
+/// `tail_in`/`docker_in` and, now, `logit_in` are the listeners where this value is genuinely
+/// load-bearing rather than incidentally harmless: `TailInput` (`crates/logit-inputs/src/tail/
+/// driver.rs`) overrides `run_until_shutdown` to flush every tracked file's accumulator and
+/// write a final checkpoint, and `LogitInput` (`crates/logit-inputs/src/logit.rs`) overrides it
+/// to close every idle connection with `Reject{GOING_AWAY}` -- either drain must fit inside
+/// `shutdown_grace` or `run_input`'s backstop cancels it by drop, losing whatever it hadn't
+/// flushed/closed yet. `logit_in` falls under rule 17's non-datagram, non-tail bucket, so unlike
+/// `tail_in`/`docker_in` it always gets the fixed 5s default here -- there is no
+/// `receive:`-shaped knob to override it with (`docs/known-gaps.md` tracks this as the one
+/// currently un-tunable case).
 fn input_runtime_config(receive: &logit_config::ReceiveConfig) -> InputRuntimeConfig {
     InputRuntimeConfig { shutdown_grace: receive.shutdown_grace }
 }
@@ -1250,6 +1285,91 @@ mod tests {
         assert!(matches!(
             build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0,
             NodeSpec::Input(..)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_logit_input() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::LogitIn {
+                bind: "127.0.0.1:0".to_string(),
+                tls: None,
+                max_frame_bytes: None,
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    #[test]
+    fn build_spec_wires_tls_and_max_frame_bytes_into_a_logit_input() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::LogitIn {
+                bind: "127.0.0.1:0".to_string(),
+                tls: Some(logit_config::TlsServerConfig {
+                    cert_file: "server.pem".to_string(),
+                    key_file: "server.key".to_string(),
+                    client_ca_file: None,
+                }),
+                max_frame_bytes: Some(32 * 1024 * 1024),
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_logit_sink() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::LogitOut {
+                endpoint: "central:5140".to_string(),
+                compression: logit_config::Compression::Lz4,
+                tls: None,
+                request_timeout: Duration::from_secs(10),
+            },
+        };
+        assert!(matches!(
+            build_spec("out", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    #[test]
+    fn build_spec_wires_a_tls_client_config_into_a_logit_sink() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::LogitOut {
+                endpoint: "central:5140".to_string(),
+                compression: logit_config::Compression::None,
+                tls: Some(logit_config::TlsClientConfig {
+                    ca_file: Some("ca.pem".to_string()),
+                    ..Default::default()
+                }),
+                request_timeout: Duration::from_secs(10),
+            },
+        };
+        assert!(matches!(
+            build_spec("out", &component, &testdata_tls_dir(), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
         ));
     }
 

@@ -53,7 +53,11 @@ use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::Fault;
 use logit_proto::otlp::OtlpEncoder;
 use logit_proto::{Signal, SignalEncoder};
+// Only the test module's own canned TLS server (`test_server_tls_config`) still reads PEM files
+// directly -- client-side TLS config building moved to `crate::tls` (workstream B).
+#[cfg(test)]
 use rustls_pki_types::pem::PemObject;
+#[cfg(test)]
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashMap;
 use std::path::Path;
@@ -95,29 +99,12 @@ pub enum OtlpCompression {
     Gzip,
 }
 
-/// Mirrors `logit_config::TlsClientConfig` -- this crate doesn't depend on `logit-config`
-/// (`docs/design/pipeline-graph.md`'s crate layout), the same reason [`SignalPaths`]/
-/// [`OtlpCompression`] exist as local copies rather than re-exports. See that type's own doc
-/// comment for what each field means; `logit-cli::pipeline::build_spec` converts one into the
-/// other at construction time.
-#[derive(Debug, Clone, Default)]
-pub struct TlsClientSettings {
-    pub ca_file: Option<String>,
-    pub cert_file: Option<String>,
-    pub key_file: Option<String>,
-    pub insecure_skip_verify: bool,
-}
-
-impl TlsClientSettings {
-    /// `true` if every field is at its default -- [`OtlpOutput::with_tls`]'s "was a `tls:` block
-    /// actually set" check, mirroring `logit_config::TlsClientConfig::is_empty`.
-    pub fn is_empty(&self) -> bool {
-        self.ca_file.is_none()
-            && self.cert_file.is_none()
-            && self.key_file.is_none()
-            && !self.insecure_skip_verify
-    }
-}
+/// `crate::tls::TlsClientSettings`, re-exported at this path -- `logit_out` (`crates/
+/// logit-outputs/src/logit.rs`) shares the same type and TLS-config builder now
+/// (`docs/plans/native-transport.md` workstream B); kept reachable as `otlp::TlsClientSettings`
+/// so `logit-cli::pipeline::build_spec`'s existing `logit_outputs::otlp::TlsClientSettings` path
+/// needs no change.
+pub use crate::tls::TlsClientSettings;
 
 pub struct OtlpOutput {
     endpoint: String,
@@ -201,7 +188,7 @@ impl OtlpOutput {
                  output will accept any certificate the peer presents, self-signed or otherwise",
             );
         }
-        let cfg = build_rustls_client_config(settings, base_dir)?;
+        let cfg = crate::tls::build_client_config(settings, base_dir)?;
         self.client = build_client(self.request_timeout, Some(&cfg));
         self.grpc_client = build_grpc_client(&cfg);
         self.tls = Some(cfg);
@@ -484,9 +471,9 @@ fn build_client(timeout: Duration, tls: Option<&rustls::ClientConfig>) -> reqwes
 /// TLS configuration uses for the HTTP transport, via the `ring` crypto provider (never
 /// `aws-lc-rs` -- `docs/adr/otlp-tls-and-pooled-grpc-client.md`). Built once at [`OtlpOutput::new`]
 /// so the gRPC transport's pooled client exists (and can dial an `https://` endpoint) even when no
-/// `tls:` block is ever set; superseded by [`build_rustls_client_config`]'s output once one is.
-/// Infallible: `with_safe_default_protocol_versions` only fails if the provider supports no usable
-/// cipher suite for TLS 1.2/1.3, which `ring`'s bundled suite list never triggers.
+/// `tls:` block is ever set; superseded by [`crate::tls::build_client_config`]'s output once one
+/// is. Infallible: `with_safe_default_protocol_versions` only fails if the provider supports no
+/// usable cipher suite for TLS 1.2/1.3, which `ring`'s bundled suite list never triggers.
 fn default_client_tls_config() -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -497,127 +484,12 @@ fn default_client_tls_config() -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
-/// Builds a `rustls::ClientConfig` from a non-empty [`TlsClientSettings`] -- the customized
-/// counterpart to [`default_client_tls_config`]. Every path is resolved against `base_dir` (the
-/// config file's own directory) first, exactly as `logit-cli::pipeline::build_spec` resolves
-/// `lua_file`/`stdio_out`'s `path`.
-fn build_rustls_client_config(
-    settings: &TlsClientSettings,
-    base_dir: &Path,
-) -> anyhow::Result<rustls::ClientConfig> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .expect("the ring crypto provider always supports TLS 1.2/1.3");
-
-    // Both arms land in the same `WantsClientCert` builder state -- `with_root_certificates` and
-    // `dangerous().with_custom_certificate_verifier` are just two different ways to supply a
-    // verifier -- so client-cert material (below) is layered on identically either way.
-    // `graph::resolve`'s rule 22 already rejects `insecure_skip_verify` together with `ca_file`,
-    // so this crate doesn't need to re-reject that combination; `insecure_skip_verify` together
-    // with a client certificate is legal (mTLS with no server verification) and reaches the
-    // `with_client_auth_cert` branch below like any other case.
-    let builder = if settings.insecure_skip_verify {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert((*provider).clone())))
-    } else {
-        let mut roots = rustls::RootCertStore::empty();
-        match &settings.ca_file {
-            Some(ca_file) => {
-                let path = base_dir.join(ca_file);
-                let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&path)
-                    .with_context(|| format!("otlp_out: reading tls.ca_file {}", path.display()))?
-                    .collect::<Result<_, _>>()
-                    .with_context(|| format!("otlp_out: parsing tls.ca_file {}", path.display()))?;
-                roots.add_parsable_certificates(certs);
-            }
-            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
-        }
-        builder.with_root_certificates(roots)
-    };
-
-    match (&settings.cert_file, &settings.key_file) {
-        (Some(cert_file), Some(key_file)) => {
-            let cert_path = base_dir.join(cert_file);
-            let key_path = base_dir.join(key_file);
-            let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&cert_path)
-                .with_context(|| {
-                    format!("otlp_out: reading tls.cert_file {}", cert_path.display())
-                })?
-                .collect::<Result<_, _>>()
-                .with_context(|| {
-                    format!("otlp_out: parsing tls.cert_file {}", cert_path.display())
-                })?;
-            let key = PrivateKeyDer::from_pem_file(&key_path).with_context(|| {
-                format!("otlp_out: reading tls.key_file {}", key_path.display())
-            })?;
-            Ok(builder.with_client_auth_cert(chain, key)?)
-        }
-        _ => Ok(builder.with_no_client_auth()),
-    }
-}
-
-/// A [`rustls::client::danger::ServerCertVerifier`] that accepts any certificate the peer
-/// presents -- `tls.insecure_skip_verify`'s implementation. The connection is still encrypted;
-/// only the "is this actually who I meant to talk to" check is skipped. Still verifies the
-/// handshake *signature* itself via `provider`'s own algorithms (`verify_tls12_signature`/
-/// `verify_tls13_signature`) -- only certificate-chain and hostname validation are skipped, not
-/// cryptographic signature verification.
-#[derive(Debug)]
-struct AcceptAnyServerCert(rustls::crypto::CryptoProvider);
-
-impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls_pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls_pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
 /// Builds the gRPC transport's pooled, TLS-capable connection manager -- `enable_http2` selects
 /// prior-knowledge h2c for a plaintext `http://` target and ALPN `h2` for an `https://` one;
 /// `https_or_http` (not `https_only`) is what lets the same connector serve both, since a single
 /// `OtlpOutput` only fixes its transport (HTTP vs. gRPC), not TLS-vs-plaintext, which is decided
 /// per-endpoint. `tls`'s `alpn_protocols` must be empty when passed in -- `with_tls_config`
-/// panics otherwise -- which both `default_client_tls_config` and `build_rustls_client_config`
+/// panics otherwise -- which both `default_client_tls_config` and `crate::tls::build_client_config`
 /// satisfy by construction (neither ever sets it); `enable_http2` fills it in.
 fn build_grpc_client(
     tls: &rustls::ClientConfig,

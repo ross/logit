@@ -2099,6 +2099,64 @@ fn native_decode_one_event() {
     expect_allocs("native: decode 1 event", stats, 8);
 }
 
+/// `logit_out::send`'s own encode+frame step, exercised through the exact primitives it calls
+/// (`native::encode_batch` then `frame::write_frame_with_flags`) rather than through
+/// `NativeEncoder` -- `docs/plans/native-transport.md` workstream F. Same cost as
+/// [`native_encode_one_event`] today (both paths do the same two steps), but pinned separately so
+/// a future change to just one of the two sinks' code paths is caught here.
+#[test]
+fn logit_out_encode_and_frame_one_batch() {
+    let batch = fixtures::nginx_batch(1);
+    let warm_payload = logit_proto::native::encode_batch(&batch);
+    drop(logit_proto::frame::write_frame_with_flags(
+        logit_proto::native::CODEC_NATIVE_V1,
+        logit_proto::frame::Compression::None,
+        0,
+        &warm_payload,
+    ));
+
+    let (framed, stats) = measure(|| {
+        let payload = logit_proto::native::encode_batch(&batch);
+        logit_proto::frame::write_frame_with_flags(
+            logit_proto::native::CODEC_NATIVE_V1,
+            logit_proto::frame::Compression::None,
+            0,
+            &payload,
+        )
+        .expect("should frame")
+    });
+    assert!(!framed.is_empty());
+    expect_allocs("logit_out: encode + frame 1 batch", stats, 23);
+}
+
+/// `logit_in`'s own read+decode step, exercised through the exact primitives its per-connection
+/// loop calls once a whole frame's bytes are already in memory (`frame::read_frame_with_header`
+/// then `native::decode_batch`) -- `docs/plans/native-transport.md` workstream F. One allocation
+/// cheaper than [`native_decode_one_event`]: `NativeDecoder::decode_into` additionally
+/// `out.extend(batch.events)`s into a caller-held `Vec`, but `logit_in` has no such buffer to
+/// extend -- `decode_batch` already returns an owned `EventBatch` with its own freshly allocated
+/// `Vec<Event>` directly, which `Fanout::send` takes as-is (see `crates/logit-inputs/src/
+/// logit.rs`'s own module doc comment for why there is no scratch buffer to warm here).
+#[test]
+fn logit_in_read_and_decode_one_batch() {
+    let batch = fixtures::nginx_batch(1);
+    let mut encoder = logit_proto::native::NativeEncoder::default();
+    let framed = encoder.encode(&batch).expect("should encode");
+
+    let mut warm = framed.clone();
+    let (_, mut warm_payload) = logit_proto::frame::read_frame_with_header(&mut warm).unwrap();
+    drop(logit_proto::native::decode_batch(&mut warm_payload));
+
+    let (event_count, stats) = measure(|| {
+        let mut bytes = framed.clone();
+        let (_, mut payload) =
+            logit_proto::frame::read_frame_with_header(&mut bytes).expect("should read frame");
+        logit_proto::native::decode_batch(&mut payload).expect("should decode").events.len()
+    });
+    assert_eq!(event_count, 1);
+    expect_allocs("logit_in: read + decode 1 batch", stats, 7);
+}
+
 /// Pins `Dict::read`'s `Vec::with_capacity(count.min(4096))` clamp with a byte-count assertion --
 /// the thing `crates/logit-proto/src/native/dict.rs`'s own unit tests can't do, since a plain
 /// `assert!(matches!(.., Err(_)))` on a rejected count passes identically whether or not the

@@ -22,14 +22,19 @@ pub enum CodecError {
     /// wire, just not something this codec speaks.
     #[error("unsupported: {0}")]
     Unsupported(String),
-    /// The buffer ends before a complete frame does -- distinct from [`CodecError::Malformed`],
-    /// which means the bytes present are provably wrong. A stream or file reader needs the
-    /// difference: `Truncated` means "come back once more bytes exist" (a live socket) or "this is
-    /// where a torn write ends, truncate here" (a durable buffer's segment file), where
-    /// `Malformed` means the bytes read so far can never become valid and the reader should resync
-    /// past them instead (`crate::frame::resync`). `needed` is the additional byte count that
-    /// would make the read succeed, when known.
-    #[error("truncated: need {needed} more byte(s)")]
+    /// The input is a *valid prefix* of something this codec could decode -- the buffer simply
+    /// ends before a complete frame does, and it doesn't have `needed` more bytes yet. Distinct
+    /// from [`CodecError::Malformed`], which means the bytes present are provably wrong and more
+    /// of them won't help.
+    ///
+    /// A stream or file reader needs that difference to decide what to do next: `Truncated` means
+    /// "come back once more bytes exist" (a live socket, a `logit_in` connection) or "this is where
+    /// a torn write ends, truncate here" (a durable buffer's segment file, a reader resuming
+    /// mid-file), where `Malformed` means the reader should give up on this frame and resync past
+    /// it instead (`crate::frame::resync`). `needed` is the additional byte count that would make
+    /// the read succeed, when known. `frame::read_frame`/`FrameHeader::read` are the first callers,
+    /// on a short header or a short body.
+    #[error("truncated input: need {needed} more byte(s)")]
     Truncated { needed: usize },
 }
 

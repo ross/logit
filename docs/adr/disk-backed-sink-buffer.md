@@ -41,7 +41,7 @@ already makes.
 until full, then disk" design has to answer how ordering survives a batch sitting in memory while
 older ones are on disk, and makes "what survives a crash" depend on timing. Vector's model (a
 buffer is memory *or* disk) is the precedent. `buffer.max_batches`/`max_bytes` are rejected when
-non-default alongside `buffer.disk` (graph rule 34) — a knob that would silently do nothing is a
+non-default alongside `buffer.disk` (graph rule 35) — a knob that would silently do nothing is a
 config error, the same reasoning rule 33 already applies to `stdio_out`/`file_out`'s
 `compression:`.
 
@@ -170,7 +170,7 @@ actual code; each is resolved as follows.
    call sites) only on a segment crossing or when `checkpoint_interval` has elapsed. This means
    `drain_inbox`/`write_loop` need no signature change beyond `Arc<SinkQueue>` becoming
    `Arc<SinkStore>` — no new `.await` points.
-3. **Rule 34 compares literal paths, not canonical ones.** `graph::resolve(config)` never receives
+3. **Rule 35 compares literal paths, not canonical ones.** `graph::resolve(config)` never receives
    `base_dir` (it runs before any path resolution), so the graph-time uniqueness check compares
    `disk.path` strings as written, sorted for a deterministic error message the way rule 13
    already does for `internal` components. `DiskQueue::open`'s exclusive lock catches the aliased
@@ -221,7 +221,7 @@ actual code; each is resolved as follows.
 - `crates/logit-config`: `BufferConfig.disk: Option<DiskBufferConfig>`; new `DiskBufferConfig`
   (presence of `path` is the on-switch, following `TlsServerConfig`'s precedent);
   `schema/logit.schema.json` regenerated.
-- `crates/logit-pipeline/src/graph.rs`: rule 34 (the shape above);
+- `crates/logit-pipeline/src/graph.rs`: rule 35 (the shape above);
   `docs/design/pipeline-graph.md`'s rule list gains it.
 - `crates/logit-cli/src/pipeline.rs`: `queue_config` returns `SinkStoreConfig` and resolves
   `disk.path` against `base_dir`.

@@ -1,0 +1,64 @@
+# The native-transport forwarding pair (docs/plans/native-transport.md): a sidecar-shaped `logit`
+# collecting statsd locally and forwarding everything, unaggregated, to a central `logit` over the
+# native logit-to-logit protocol -- the "split collection from processing across nodes" shape
+# docs/OVERVIEW.md names as the whole point of the native wire format existing.
+#
+# Run alongside examples/forwarder-central.yaml (start the central process first, or logit_out
+# will just keep retrying the connection -- lazy connect, not a config error either way):
+#
+#   logit run examples/forwarder-central.yaml &
+#   logit run examples/forwarder-edge.yaml
+#
+# Topology (this file):
+#
+#   statsd (UDP) --> edge_in (statsd_in) --> central_out (logit_out) --> [the wire] --> central
+#
+# No aggregate/keep/influxdb_out here on purpose -- the edge's whole job is collection, not
+# processing; see examples/forwarder-central.yaml for where the 60s window and the sink live.
+components:
+  edge_in:
+    type: statsd_in
+    bind: 0.0.0.0:8125
+
+    # Every field below defaults (docs/adr/decoupled-listener-io.md) -- an omitted `receive:`
+    # block is exactly the values shown here, commented out purely as a reference for tuning a
+    # real deployment.
+    # receive:
+    #   max_datagrams: 10000        # receive-queue depth, in datagrams -- whichever of this or max_bytes trips first
+    #   max_bytes: "32MiB"          # bound on undecoded datagram bytes held in the queue
+    #   overflow: drop_oldest       # block | drop_oldest | drop_newest -- what happens once both bounds are full;
+    #                               # drop_oldest (not buffer:'s block) is the default here on purpose -- blocking a
+    #                               # UDP reader relocates loss into the kernel where nothing counts it
+    #   batch_max_events: 1000      # events accumulated across datagrams before one send downstream; 1 means
+    #                               # one send per datagram, today's pre-ADR `decoupled-listener-io` behavior
+    #   batch_max_bytes: "1MiB"     # the other accumulation bound -- whichever trips first
+    #   batch_flush_interval: 100ms # longest an accumulated batch waits before being sent regardless of size;
+    #                               # 0s disables the timer, leaving the two bounds above as the only trigger
+    #   receive_buffer_bytes: null  # SO_RCVBUF requested at bind; null leaves the kernel default alone
+    #   shutdown_grace: 5s          # how long a graceful shutdown waits to drain in-flight work
+
+  central_out:
+    type: logit_out
+    sources: [edge_in]
+    endpoint: central:5140
+    # compression: none          # none | lz4 -- offered in this sink's Hello; the peer may still
+    #                               negotiate it down to none if it doesn't support lz4
+    # request_timeout: 10s        # connect, handshake, and per-batch ack-wait, all one knob
+    # tls:                        # presence turns TLS on -- `endpoint` is a bare host:port with
+    #                               no scheme to read a TLS signal from, unlike otlp_out
+    #   ca_file: ca.pem
+    #   cert_file: client.pem     # cert_file/key_file together, for mutual TLS
+    #   key_file: client.key
+    #   insecure_skip_verify: false
+
+    # buffer: (docs/adr/buffered-sink-delivery.md) tunes this sink's delivery queue and retry --
+    # shown commented out at its defaults:
+    # buffer:
+    #   max_batches: 1024
+    #   max_bytes: 64MiB
+    #   overflow: block
+    #   delivery: null             # null derives from duplicate_safe() -- logit_out is false, so
+    #                                 at_most_once; explicit at_least_once/at_most_once overrides it
+    #   retry_budget: 60s
+    #   retry_max_delay: 10s
+    #   shutdown_grace: 5s

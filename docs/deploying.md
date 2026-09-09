@@ -450,6 +450,86 @@ listener-side `logit.component.diagnostics` counters as any other transport fail
 once at startup (a renewed cert needs a restart, not a live reload), and `otlp_out` has no
 `server_name` override for an endpoint reached by IP or through a proxy.
 
+## Forwarding between `logit` nodes
+
+`logit_out`/`logit_in` are the native `logit`-to-`logit` transport
+([ADR `native-transport-handshake-and-ack`](adr/native-transport-handshake-and-ack.md)) -- the
+"split collection from processing across nodes" shape [`docs/OVERVIEW.md`](OVERVIEW.md) names as
+the whole point of the native wire format existing. A sidecar/edge process collects and forwards
+unaggregated; a central process receives, aggregates, and delivers. See
+[`examples/forwarder-edge.yaml`](../examples/forwarder-edge.yaml)/
+[`examples/forwarder-central.yaml`](../examples/forwarder-central.yaml) for a complete, runnable
+pair.
+
+```yaml
+# edge
+components:
+  central_out:
+    type: logit_out
+    sources: [edge_in]
+    endpoint: central.internal:5140
+```
+
+```yaml
+# central
+components:
+  central_in:
+    type: logit_in
+    bind: 0.0.0.0:5140
+```
+
+**TLS.** `logit_out`'s `endpoint` is a bare `host:port` with no scheme to read a TLS signal from
+(unlike `otlp_out`'s URL-shaped endpoint) -- a `tls:` block's mere presence turns TLS on, the same
+convention `otlp_in` already uses server-side:
+
+```yaml
+# edge
+    tls:
+      ca_file: /etc/logit/tls/ca.pem
+```
+
+```yaml
+# central
+    tls:
+      cert_file: /etc/logit/tls/server.pem
+      key_file: /etc/logit/tls/server.key
+      client_ca_file: /etc/logit/tls/ca.pem   # omit for server-auth-only TLS
+```
+
+**Sizing `request_timeout` against `buffer.retry_budget`.** `logit_out.request_timeout` (default
+10s) bounds one attempt -- connect, handshake, and the ack wait, all sharing that one knob, the
+same shape `otlp_out`'s own timeout has. `buffer.retry_budget` (default 60s, see "Sink delivery
+buffering" above) is the *outer* bound across every retried attempt. Keep `request_timeout`
+comfortably under `retry_budget` -- a `request_timeout` close to or above the retry budget leaves
+room for at most one attempt before the budget itself expires, which defeats retry's purpose.
+`request_timeout` also bounds `logit_in`'s own handshake grace on the far end only loosely: a
+`logit_out` configured with a shorter `request_timeout` than its peer's handshake patience just
+means *this* side gives up first, not that the connection is unsafe. That far-end grace is 5s per
+pre-`Hello` phase, applied independently to the TLS accept and to the `Hello` read that follows
+it -- so a TLS peer that connects and then goes silent is dropped after at most 10s, not 5s.
+A peer that gets `Reject{code: REJECT_INTERNAL}` from a `logit_in` at its connection cap never
+classifies it `permanent`: at the handshake (nothing of the batch written yet) it's `clean` and
+the batch is retried within `retry_budget`; once a frame has already left on that connection it's
+`ambiguous`, which under `logit_out`'s default `at_most_once` posture is *not* retried -- that
+batch is dropped and counted, and only the connection itself recovers. Either way the sink
+reconnects on its own once the peer has capacity again, with no operator intervention needed; set
+`buffer.delivery: at_least_once` on the `logit_out` component if you would rather risk a duplicate
+than lose that batch. The same holds for `Reject{code: REJECT_GOING_AWAY}` during the peer's own
+shutdown.
+
+**What to watch.** `logit_out`: `logit.output.requests{class}` (`ok`/`clean`/`ambiguous`/
+`permanent`, one per `send` attempt), `logit.output.reconnects` (should stay near zero in steady
+state -- a climbing count means the peer or the network is unstable), `logit.output.ack.duration`.
+`logit_in`: `logit.input.connections` (a gauge; should match the number of `logit_out` peers
+actually connected), `logit.input.connections.rejected{reason="limit"}` (nonzero means the 1024
+-connection cap is actually binding -- raise it or shed load upstream), `logit.proto.errors{reason}`
+(`magic`/`version`/`crc`/`truncated`/`too_large`/`codec`/`handshake` -- any of these on a healthy
+link points at a version-mismatched or misbehaving peer, not routine loss). Both sides:
+`logit.proto.frames{direction,codec,compression}` and `logit.proto.frame.bytes` for throughput.
+`docs/known-gaps.md` tracks what's still open: no credit-based flow control (this plan's sender
+never has more than one frame outstanding), and `logit_in`'s shutdown grace is fixed at 5s with no
+`receive:`-shaped knob to change it.
+
 ## The nginx-side recipe
 
 Concrete, working reference config lives in this repo: [`examples/nginx/nginx.conf`](../examples/nginx/nginx.conf)
