@@ -24,6 +24,10 @@ logit-pipeline.workspace = true
 logit-inputs.workspace = true
 logit-outputs.workspace = true
 logit-transforms.workspace = true
+# `to_native_compression` (pipeline.rs) crosses `logit_config::Compression` into
+# `logit_proto::frame::Compression` -- already a transitive dependency via `logit-outputs`, named
+# directly here because `build_spec` names its type.
+logit-proto.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 serde_norway.workspace = true

@@ -305,6 +305,9 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     the latter applied to columns instead of sources), as is a `delimiter` that is `"` (RFC
     4180's quote character), `\n`/`\r` (already consumed as line framing by every input), or
     non-ASCII (`docs/adr/csv-positional-columns.md`).
+33. `stdio_out`/`file_out`'s `compression:` is rejected whenever set to anything but `none` under
+    the default `format: human` — it would silently do nothing, since compression is
+    `NativeEncoder`'s own knob (`docs/adr/file-output-native-format.md`).
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

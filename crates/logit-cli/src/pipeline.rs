@@ -29,6 +29,7 @@ use logit_outputs::stdio::StreamOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
+use logit_proto::frame::Compression as NativeCompression;
 use logit_transforms::{
     Aggregator, CsvParser, DropSignals as DropSignalsTransform, HasSignal as HasSignalTransform,
     JsonParser, Keep as KeepTransform, KeepSignals as KeepSignalsTransform, Kv as KvTransform,
@@ -374,7 +375,7 @@ fn build_spec(
                 write_config(&component.buffer),
             )
         }
-        StdioOut { target } => {
+        StdioOut { target, format, compression } => {
             let output = match target {
                 StdioTarget::Stdout => StreamOutput::stdout(),
                 StdioTarget::Stderr => StreamOutput::stderr(),
@@ -388,15 +389,17 @@ fn build_spec(
                 // promises).
                 StdioTarget::Path(path) => StreamOutput::open_path(base_dir.join(path))?,
             };
+            let output = output.with_format(to_stream_encoder(*format, *compression));
             NodeSpec::Output(
                 Box::new(output.with_telemetry(telemetry.clone())),
                 queue_config(&component.buffer),
                 write_config(&component.buffer),
             )
         }
-        FileOut { path, rotate } => {
+        FileOut { path, rotate, format, compression } => {
             // Resolved against `base_dir`, exactly as `StdioTarget::Path` above.
             let output = StreamOutput::rotating(base_dir.join(path), to_rotate_policy(rotate))?
+                .with_format(to_stream_encoder(*format, *compression))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
             NodeSpec::Output(
@@ -520,6 +523,30 @@ fn to_rotate_interval(interval: logit_config::RotateInterval) -> OutputRotateInt
     match interval {
         logit_config::RotateInterval::Hourly => OutputRotateInterval::Hourly,
         logit_config::RotateInterval::Daily => OutputRotateInterval::Daily,
+    }
+}
+
+/// The sole place `logit_config::StreamFormat`/`Compression` cross into
+/// `logit_outputs::stdio::StreamEncoder` -- same crate-layout reason as `to_rotate_policy` above.
+/// `compression` is read regardless of `format`; graph rule 33 already guarantees it's `none`
+/// whenever `format` isn't `native`, so ignoring it under `Human` here is never a silent
+/// behavior change, just dead weight `resolve` already rejected.
+fn to_stream_encoder(
+    format: logit_config::StreamFormat,
+    compression: logit_config::Compression,
+) -> logit_outputs::stdio::StreamEncoder {
+    match format {
+        logit_config::StreamFormat::Human => logit_outputs::stdio::StreamEncoder::human(),
+        logit_config::StreamFormat::Native => {
+            logit_outputs::stdio::StreamEncoder::native(to_native_compression(compression))
+        }
+    }
+}
+
+fn to_native_compression(compression: logit_config::Compression) -> NativeCompression {
+    match compression {
+        logit_config::Compression::None => NativeCompression::None,
+        logit_config::Compression::Lz4 => NativeCompression::Lz4,
     }
 }
 
@@ -1308,12 +1335,24 @@ mod tests {
     }
 
     fn stdio_out_component(target: StdioTarget) -> ResolvedComponent {
+        stdio_out_component_with_format(
+            target,
+            logit_config::StreamFormat::default(),
+            logit_config::Compression::default(),
+        )
+    }
+
+    fn stdio_out_component_with_format(
+        target: StdioTarget,
+        format: logit_config::StreamFormat,
+        compression: logit_config::Compression,
+    ) -> ResolvedComponent {
         ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec![],
-            kind: ComponentKind::StdioOut { target },
+            kind: ComponentKind::StdioOut { target, format, compression },
         }
     }
 
@@ -1394,12 +1433,26 @@ mod tests {
     }
 
     fn file_out_component(path: &str, rotate: logit_config::RotateConfig) -> ResolvedComponent {
+        file_out_component_with_format(
+            path,
+            rotate,
+            logit_config::StreamFormat::default(),
+            logit_config::Compression::default(),
+        )
+    }
+
+    fn file_out_component_with_format(
+        path: &str,
+        rotate: logit_config::RotateConfig,
+        format: logit_config::StreamFormat,
+        compression: logit_config::Compression,
+    ) -> ResolvedComponent {
         ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
             consumers: vec![],
-            kind: ComponentKind::FileOut { path: path.to_string(), rotate },
+            kind: ComponentKind::FileOut { path: path.to_string(), rotate, format, compression },
         }
     }
 
@@ -1420,6 +1473,40 @@ mod tests {
         ));
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn build_spec_builds_a_file_out_sink_with_format_native_and_compression_lz4() {
+        let dir = std::env::temp_dir();
+        let path =
+            dir.join(format!("logit-build-spec-file-out-native-test-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let component = file_out_component_with_format(
+            &path.display().to_string(),
+            size_rotate_config(),
+            logit_config::StreamFormat::Native,
+            logit_config::Compression::Lz4,
+        );
+        assert!(matches!(
+            build_spec("tap", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn build_spec_builds_a_stdio_sink_for_stdout_with_format_native() {
+        let component = stdio_out_component_with_format(
+            StdioTarget::Stdout,
+            logit_config::StreamFormat::Native,
+            logit_config::Compression::None,
+        );
+        assert!(matches!(
+            build_spec("tap", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
     }
 
     /// A *relative* `path:` must resolve against the config file's own directory (`base_dir`),

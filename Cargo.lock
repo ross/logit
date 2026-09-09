@@ -868,6 +868,7 @@ dependencies = [
  "logit-inputs",
  "logit-outputs",
  "logit-pipeline",
+ "logit-proto",
  "logit-transforms",
  "serde_json",
  "serde_norway",
