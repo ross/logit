@@ -29,7 +29,10 @@ struct Cli {
     #[arg(long, env = "LOGIT_LOG", default_value = "info", global = true)]
     log_level: String,
     /// `text` is one line per event, human-formatted; `json` is one JSON object per line
-    /// (`timestamp`, `level`, `target`, `component`, `key`, `message`) -- for a log collector.
+    /// (`timestamp`, `level`, `target`, `component`, `key`, `message`, every one of them
+    /// top-level -- `flatten_event`, and `target` left displayed, so a collector reads the
+    /// fields named here rather than unwrapping a nested `fields` object) -- for a log
+    /// collector. Both formats write to stderr; see `init_logging`.
     #[arg(long, value_enum, default_value = "text", global = true)]
     log_format: LogFormat,
 }
@@ -58,6 +61,11 @@ enum Command {
 ///
 /// A bad `--log-level`/`LOGIT_LOG` directive is a config error the same as a bad `bind` address:
 /// reported and exited on the spot, before anything else has started.
+///
+/// Everything the subscriber renders goes to stderr, never stdout: `stdio_out` defaults to
+/// `target: stdout` (`StdioTarget::Stdout`), so stdout belongs to the pipeline's own event
+/// stream -- `logit run c.yaml > events.log` has to stay parseable, and lifecycle lines
+/// interleaved into it would corrupt exactly the output an operator is capturing.
 fn init_logging(level: &str, format: LogFormat) -> anyhow::Result<()> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -68,10 +76,20 @@ fn init_logging(level: &str, format: LogFormat) -> anyhow::Result<()> {
     let registry = tracing_subscriber::registry().with(filter);
     match format {
         LogFormat::Text => {
-            registry.with(tracing_subscriber::fmt::layer().with_target(false)).init();
+            let layer =
+                tracing_subscriber::fmt::layer().with_target(false).with_writer(std::io::stderr);
+            registry.with(layer).init();
         }
         LogFormat::Json => {
-            registry.with(tracing_subscriber::fmt::layer().with_target(false).json()).init();
+            // `target` stays displayed here (unlike the text arm): every `logit` event sets it
+            // explicitly to `"logit"`, and it's one of the six fields `--log-format`'s doc
+            // comment promises a collector. `flatten_event` lifts `message`/`component`/`key`
+            // out of the nested `fields` object the JSON formatter otherwise wraps them in.
+            let layer = tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_writer(std::io::stderr);
+            registry.with(layer).init();
         }
     }
     Ok(())

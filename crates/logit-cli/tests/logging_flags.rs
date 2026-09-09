@@ -64,20 +64,32 @@ fn log_format_json_emits_one_parseable_object_per_line() {
         .output()
         .expect("spawning the logit binary");
 
-    // `tracing_subscriber::fmt`'s default writer is stdout, not stderr -- verified by hand
-    // (`anyhow`'s own `Error: {err:?}` line, from `Result`'s `Termination` impl, is the one that
-    // goes to stderr). An empty `components: {}` config fails graph resolution (rule: at least
-    // one component) -- exit 1, but only *after* `run_pipelines` has already logged `starting`.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut saw_a_line = false;
-    for line in stdout.lines() {
+    // Self-logging goes to stderr deliberately: stdout is the pipeline's (`stdio_out` defaults
+    // to `target: stdout`), so `logit run c.yaml > events.log` stays a clean event stream.
+    // An empty `components: {}` config fails graph resolution (rule: at least one component) --
+    // exit 1, but only *after* `run_pipelines` has already logged `starting`.
+    assert!(
+        output.stdout.is_empty(),
+        "stdout must carry no self-logging, got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut saw_starting = false;
+    for line in stderr.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        saw_a_line = true;
         assert!(value.get("timestamp").is_some(), "line missing 'timestamp': {line}");
         assert!(value.get("level").is_some(), "line missing 'level': {line}");
+        if value.get("message").and_then(serde_json::Value::as_str) == Some("starting") {
+            saw_starting = true;
+            assert_eq!(
+                value.get("target").and_then(serde_json::Value::as_str),
+                Some("logit"),
+                "'starting' line missing target=logit: {line}"
+            );
+        }
     }
-    // Not asserting `saw_a_line` unconditionally would let this test pass even if JSON formatting
-    // were silently broken and nothing ever parsed -- but `run_pipelines` always logs `starting`
-    // before config resolution can fail, so at least one line is guaranteed.
-    assert!(saw_a_line, "expected at least one JSON log line on stdout, got: {stdout}");
+    assert!(
+        saw_starting,
+        "expected a top-level message=\"starting\" JSON line on stderr, got: {stderr}"
+    );
 }
