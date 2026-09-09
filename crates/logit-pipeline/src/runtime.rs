@@ -114,10 +114,23 @@ pub async fn run_with_telemetry(
     // both this clone and `shutdown_tx_for_driver` (via `shutdown` resolving on its own, e.g. a
     // real SIGTERM under `run_with_shutdown`) end up calling `send(true)`.
     let shutdown_tx_for_driver = shutdown_tx.clone();
+    // Set once, by whichever of this task or the join loop's first-error branch below notices
+    // shutdown first -- `OnceLock::set` is a no-op once already set, the same idempotency
+    // `shutdown_tx`'s own `send(true)` already relies on. Read back at the very end to log how
+    // long the drain actually took (`docs/plans/operator-surface.md`'s `drain complete` event).
+    let drain_started: Arc<std::sync::OnceLock<tokio::time::Instant>> = Arc::default();
+    let drain_started_for_driver = drain_started.clone();
     let shutdown_driver = tokio::spawn(async move {
         shutdown.await;
+        tracing::info!(target: "logit", "shutdown signal received");
+        let _ = drain_started_for_driver.set(tokio::time::Instant::now());
         let _ = shutdown_tx_for_driver.send(true);
     });
+
+    // Total batches this run ever had to abandon in a sink's own inbox because shutdown grace
+    // expired before `write_loop` drained it (`run_output`'s own comment on the sweep) -- summed
+    // across every sink so the `drain complete` event can say whether the drain was clean.
+    let shutdown_dropped_batches = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let ids: Vec<String> = graph.components.keys().cloned().collect();
 
@@ -169,6 +182,7 @@ pub async fn run_with_telemetry(
                     queue_config,
                     write_config,
                     shutdown_rx.clone(),
+                    shutdown_dropped_batches.clone(),
                 ));
             }
             NodeSpec::Transform(transform) => {
@@ -212,6 +226,10 @@ pub async fn run_with_telemetry(
     // forever waiting on tasks that are themselves waiting on inboxes that can never close.
     drop(senders);
 
+    // Every socket bound, every task/thread spawned and running, nothing has failed yet --
+    // `docs/plans/operator-surface.md`'s stable lifecycle event names, for log-based alerting.
+    tracing::info!(target: "logit", "ready");
+
     // On the first error (from either arm below), record it and trigger the same shutdown signal
     // SIGTERM already drives -- every remaining task then gets the graceful-shutdown treatment it
     // already knows how to handle (a listener's inbox closes normally, cascading through to
@@ -231,6 +249,7 @@ pub async fn run_with_telemetry(
         };
         if result.is_ok() {
             result = Err(outcome);
+            let _ = drain_started.set(tokio::time::Instant::now());
             let _ = shutdown_tx.send(true);
         }
     }
@@ -241,6 +260,24 @@ pub async fn run_with_telemetry(
     // flipping `shutdown_tx` itself), so abort rather than leave it parked forever holding its own
     // clone of `shutdown_tx`.
     shutdown_driver.abort();
+
+    // `drain_started` is only ever set once shutdown began (by whichever of the driver task or
+    // the join loop's own first-error branch above noticed first) -- unset means every node ran
+    // to completion on its own (every `Input` implementor that returns, e.g. a finite one) with
+    // no shutdown or failure in the mix, so there's no meaningful drain duration to report.
+    if let Some(started) = drain_started.get() {
+        let dropped = shutdown_dropped_batches.load(std::sync::atomic::Ordering::Relaxed);
+        if dropped > 0 {
+            tracing::warn!(
+                target: "logit",
+                duration = ?started.elapsed(),
+                batches_dropped = dropped,
+                "drain complete"
+            );
+        } else {
+            tracing::info!(target: "logit", duration = ?started.elapsed(), "drain complete");
+        }
+    }
     result
 }
 
@@ -293,6 +330,7 @@ async fn run_input(
 /// itself, *after* `drain` can no longer push anything new, rather than `write_loop` doing it from
 /// inside a race it cannot see the other half of (a real bug an earlier version of this split had:
 /// see `finish_and_flush`'s doc comment).
+#[allow(clippy::too_many_arguments)]
 async fn run_output(
     id: String,
     mut output: Box<dyn Output + Send>,
@@ -301,6 +339,7 @@ async fn run_output(
     queue_config: SinkQueueConfig,
     write_config: WriteLoopConfig,
     shutdown: watch::Receiver<bool>,
+    shutdown_dropped_batches: Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<()> {
     let queue = Arc::new(SinkQueue::new(queue_config, telemetry.clone()));
     let diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
@@ -384,6 +423,7 @@ async fn run_output(
         abandoned_events += batch.events.len() as u64;
     }
     if abandoned_batches > 0 {
+        shutdown_dropped_batches.fetch_add(abandoned_batches, std::sync::atomic::Ordering::Relaxed);
         telemetry.count(
             "logit.component.batches.dropped",
             abandoned_batches as f64,
@@ -740,6 +780,12 @@ async fn write_loop(
     let mut last_success: Option<tokio::time::Instant> = None;
     let mut permanent_streak_since: Option<tokio::time::Instant> = None;
     let mut shutdown_deadline: Option<tokio::time::Instant> = None;
+    // Set on the first failed delivery after a success (or after startup) and cleared on the next
+    // successful one -- what turns a *stream* of `send_failed` warnings into the two edge events
+    // an operator actually wants alerted on (`docs/plans/operator-surface.md`): `degraded` once,
+    // then silence until either delivery resumes (`recovered`) or the permanent-failure window
+    // ends the loop outright.
+    let mut degraded = false;
 
     loop {
         // Two-step, rather than touching `output` from inside either `select!`'s handler arms:
@@ -806,6 +852,10 @@ async fn write_loop(
                 queue.commit();
                 last_success = Some(tokio::time::Instant::now());
                 permanent_streak_since = None;
+                if degraded {
+                    degraded = false;
+                    diag.info("recovered", "delivery succeeded after a prior failure");
+                }
             }
             Delivery::Dropped { fault, explicit_permanent } => {
                 queue.commit();
@@ -831,6 +881,10 @@ async fn write_loop(
                          {since_success})"
                     ),
                 );
+                if !degraded {
+                    degraded = true;
+                    diag.warn("degraded");
+                }
 
                 if explicit_permanent {
                     let now = tokio::time::Instant::now();
@@ -1091,6 +1145,12 @@ fn run_lua(
     };
     let _ = ready_tx.send(Ok(()));
 
+    // No `logit-cli::pipeline::build_spec` attaches one the way every other kind's own
+    // `with_diagnostics` builder does -- `ScriptWorker` can't be constructed outside this thread
+    // (see `NodeSpec::Lua`'s own doc comment), so there's no earlier point to attach one at.
+    // Built from `telemetry` directly, the same `write_loop`/`run_output` precedent.
+    let mut diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
+
     let mut next_flush = configured_interval.map(|interval| tokio::time::Instant::now() + interval);
     let mut last_resource = Arc::new(Resource::default());
 
@@ -1102,7 +1162,14 @@ fn run_lua(
     // internal-spans entry, and the existing resource-stamping gap this same imprecision already
     // has: `last_resource` above is the identical shape of approximation, just for `Resource`
     // instead of `TraceContext`).
-    let flush_now = |worker: &ScriptWorker, resource: &mut Arc<Resource>, fanout: &Fanout| {
+    //
+    // Takes `diag` as a parameter rather than capturing it: the loop body below also needs its
+    // own `&mut diag` (for `script_error`), and a closure capturing it by unique reference would
+    // hold that borrow for the closure's entire lifetime, conflicting with every other use.
+    let flush_now = |diag: &mut Diagnostics,
+                     worker: &ScriptWorker,
+                     resource: &mut Arc<Resource>,
+                     fanout: &Fanout| {
         let ctx = TraceContext::new_root();
         let mut span = telemetry.span("flush", SpanKind::Internal, ctx.trace_id, ctx.span_id, None);
 
@@ -1136,7 +1203,7 @@ fn run_lua(
             Ok(_) => {}
             Err(err) => {
                 telemetry.count("logit.component.errors", 1.0, &[("reason", "flush")]);
-                eprintln!("component '{id}': script flush error: {err}");
+                diag.error("flush_error", format_args!("script flush error: {err}"));
                 span.error();
             }
         }
@@ -1146,7 +1213,7 @@ fn run_lua(
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
-                flush_now(&worker, &mut last_resource, &fanout);
+                flush_now(&mut diag, &worker, &mut last_resource, &fanout);
                 let interval = configured_interval
                     .expect("next_flush is only ever Some for a component with an interval");
                 next_flush = Some(advance_flush_deadline(deadline, now_instant, interval));
@@ -1170,7 +1237,7 @@ fn run_lua(
         };
         let Some(batch) = batch else {
             if next_flush.is_some() {
-                flush_now(&worker, &mut last_resource, &fanout);
+                flush_now(&mut diag, &worker, &mut last_resource, &fanout);
             }
             return;
         };
@@ -1196,7 +1263,10 @@ fn run_lua(
         // registry-held table is independent of whatever a script does to the `trace` global),
         // logged rather than treated as fatal on the off chance it isn't.
         if let Err(err) = worker.set_trace_context(parent.trace_id, parent.span_id) {
-            eprintln!("component '{id}': setting trace context failed: {err}");
+            diag.warn_throttled(
+                "trace_context_error",
+                format_args!("setting trace context failed: {err}"),
+            );
         }
         let batch = unwrap_batch(batch);
         // Lets the script's own `process()`/`flush()` read (and write) `resource`
@@ -1228,7 +1298,7 @@ fn run_lua(
                 Ok(ProcessOutcome::Drop) => dropped += 1,
                 Err(err) => {
                     errors += 1;
-                    eprintln!("component '{id}': script error: {err}");
+                    diag.warn_throttled("script_error", format_args!("script error: {err}"));
                 }
             }
         }
@@ -3867,6 +3937,7 @@ mod tests {
             SinkQueueConfig::default(),
             write_config,
             shutdown_rx,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
 
         // One batch, permanently failing to send -- write_loop will be mid-retry when shutdown
@@ -3964,6 +4035,7 @@ mod tests {
             queue_config,
             write_config,
             shutdown_rx,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
 
         // Batch 1: drained into the queue (filling its one slot), then peeked -- and so

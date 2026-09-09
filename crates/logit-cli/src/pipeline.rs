@@ -57,6 +57,20 @@ pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
     // An unset `!env` variable (a missing token, most likely) fails here, before anything starts
     // listening.
     let config = config::load(&path)?;
+
+    // `docs/plans/operator-surface.md`'s stable lifecycle event names, for log-based alerting.
+    // Logged before `prepare` (which can still reject the config -- an empty graph, an unknown
+    // source, a cycle) so a config that never gets that far still leaves a `starting` line behind
+    // naming what was attempted; `config.components` (the raw, unresolved map) is what's on hand
+    // at this point, not yet the resolved `Graph`.
+    tracing::info!(
+        target: "logit",
+        config = %path.display(),
+        components = config.components.len(),
+        version = env!("CARGO_PKG_VERSION"),
+        "starting"
+    );
+
     let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let (graph, specs, telemetry) = prepare(config, base_dir)?;
 
@@ -73,6 +87,10 @@ pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
     let result =
         logit_pipeline::run_with_telemetry(graph, specs, telemetry, shutdown_signal()).await;
     kill_switch.abort();
+    match &result {
+        Ok(()) => tracing::info!(target: "logit", code = 0, "exiting"),
+        Err(err) => tracing::error!(target: "logit", code = 1, reason = %err, "exiting"),
+    }
     result
 }
 

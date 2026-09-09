@@ -16,6 +16,10 @@ async-trait.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 regex.workspace = true
+# `run_lua`'s remaining `eprintln!`s go through `Diagnostics`, and its own lifecycle events
+# (`ready`, `shutdown signal received`, `drain complete`, `degraded`/`recovered`) go straight
+# through `tracing` (docs/plans/operator-surface.md).
+tracing.workspace = true
 
 [dev-dependencies]
 # `test-util` (for `tokio::time::pause`/`#[tokio::test(start_paused = true)]`) only needs to be
