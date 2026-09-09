@@ -951,6 +951,38 @@
           }
         },
         {
+          "description": "A rotating file sink -- `stdio_out`'s file target grown into an operational destination: size- and/or calendar-interval-triggered rotation, with logrotate-style numbered-suffix retention. Renders the same human-readable text `stdio_out` does (`logit_outputs::stdio:: EventDump`) -- both share one sink implementation, `logit_outputs::stdio::StreamOutput`, differing only in rotation policy. See `docs/adr/rotating-file-output.md`.",
+          "type": "object",
+          "required": [
+            "path",
+            "type"
+          ],
+          "properties": {
+            "path": {
+              "description": "Resolved against the config file's own directory when relative, exactly like `stdio_out`'s `StdioTarget::Path`.",
+              "type": "string"
+            },
+            "rotate": {
+              "default": {
+                "interval": null,
+                "max_bytes": null,
+                "max_files": 5
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/RotateConfig"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "file_out"
+              ]
+            }
+          }
+        },
+        {
           "description": "RFC 3164 / RFC 5424 syslog egress over UDP or TCP -- the mirror of `SyslogIn`, and a real relay: header fields round-trip from an event's `syslog.*` attributes when present, falling back to the defaults below only when an event carries none (e.g. one that never passed through `syslog_in`). See `docs/adr/syslog-output.md`.",
           "type": "object",
           "required": [
@@ -1249,6 +1281,47 @@
         }
       },
       "additionalProperties": false
+    },
+    "RotateConfig": {
+      "description": "`file_out`'s rotation policy. Every field defaults, but graph validation (rule 29, `crates/logit-pipeline/src/graph.rs`) rejects the all-default shape (neither trigger set) as a config that would never rotate at all -- use `stdio_out` for that instead. `max_files` counts *every* file `file_out` maintains, active plus rotated, so `max_files * max_bytes` reads directly as a disk budget.",
+      "type": "object",
+      "properties": {
+        "interval": {
+          "description": "`None` (the default) means the calendar never triggers a rotation.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RotateInterval"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_bytes": {
+          "description": "A quoted string in YAML -- `\"64MiB\"` or a plain `\"134217728\"` -- via the [`human_bytes`] codec, exactly like `BufferConfig::max_bytes`. `None` (the default) means size never triggers a rotation.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_files": {
+          "default": 5,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "RotateInterval": {
+      "description": "Which calendar boundary `file_out` rotates on -- UTC only, never the host's local zone. A calendar period, not a `Duration`: a duration measured from an arbitrary start (process start, first write) drifts against the wall clock, which is the opposite of what a daily log file is for.",
+      "type": "string",
+      "enum": [
+        "hourly",
+        "daily"
+      ]
     },
     "SetValue": {
       "description": "One value a `set` component (`ComponentKind::Set`) can stamp onto an attribute or a resource attribute. `#[serde(untagged)]`: YAML's own scalar types decide the variant, so `resource: {service.name: nginx, retries: 3, ratio: 0.5, sampled: true}` reads exactly as written, no `!i64`/`!f64` tag needed.\n\n**`I64` must stay ordered before `F64`.** `serde`'s untagged enum deserializer tries variants in declaration order and keeps the first that parses; `3` parses as both an `i64` and an `f64`, so `F64` before `I64` would silently turn every whole-number YAML scalar into a float. `Bool`/`Str` are unambiguous against the others (a YAML boolean/string never also parses as a number) so their position doesn't matter.",

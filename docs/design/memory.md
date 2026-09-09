@@ -224,7 +224,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `Event::clone` (statsd shape) | **0** | fits entirely inline |
 | `Event::clone` (distribution-heavy, 5 metrics) | **6** | 1 `MetricList` spill + 1 `bins` Vec per sketch |
 | `Event::clone` (span shape) | **2** | 1 per `Vec` (`events`, `links`) -- every `AttrMap` here stays inline |
-| `stdio_out` encode 100 events | **101** | ~1/event -- fixed, see below, was 1801 |
+| `stdio_out` encode 100 events | **102** | ~1/event -- fixed, see below, was 1801; +1 since measured through `Encoder::encode` (`&EventBatch` -> `Bytes`) rather than the inherent `render` (`&EventBatch` -> `String`) directly, ADR `rotating-file-output` -- `Bytes::from(String)`'s own small shared-refcount allocation |
 | `influxdb_out` encode 100 events | **30** | ~0.3/event — see below |
 | receive queue: push then pop, warm | **0** | `BoundedQueue<Datagram>`, ADR `decoupled-listener-io` -- see below |
 | accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR `decoupled-listener-io` -- see below |

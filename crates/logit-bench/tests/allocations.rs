@@ -1669,17 +1669,26 @@ fn influx_encode_100_events() {
 /// for the output `String`'s own first growth -- `influxdb_out` still comes out ahead at ~0.3
 /// allocations/event, since it also reuses its per-line buffers across events, which this encoder
 /// doesn't need (every `render_*` function here already writes straight into the one buffer this
-/// returns; see `EventDump::encode`'s doc comment for why there's no equivalent scratch state left
+/// returns; see `EventDump::render`'s doc comment for why there's no equivalent scratch state left
 /// to hoist onto the struct).
+///
+/// Measured through `Encoder::encode` (`&EventBatch` -> `Bytes`), the same trait
+/// `InfluxLineEncoder` above is measured through and what `StreamOutput::send` actually calls in
+/// production -- not the inherent `EventDump::render` (`&EventBatch` -> `String`) directly. That
+/// costs one allocation on top of `render`'s own 101 (measured: 102): `Bytes::from(String)` still
+/// reuses `render`'s `String` buffer rather than copying its bytes, but converting it into `Bytes`
+/// needs its own small shared-refcount allocation, which a bare `String` never carries. Accepted
+/// as the (tiny, one-time-per-batch) price of `EventDump` joining the same `Encoder` seam
+/// `InfluxLineEncoder` is already on -- see `docs/adr/rotating-file-output.md`.
 #[test]
 fn stdio_encode_100_events() {
-    let dump = EventDump::new(Format::Human);
+    let mut dump = EventDump::new(Format::Human);
     let batch = fixtures::nginx_batch(100);
     drop(dump.encode(&batch));
 
-    let (text, stats) = measure(|| dump.encode(&batch));
-    assert!(!text.is_empty());
-    expect_allocs("stdio_out: encode 100 events", stats, 101);
+    let (result, stats) = measure(|| dump.encode(&batch));
+    assert!(!result.expect("should encode").is_empty());
+    expect_allocs("stdio_out: encode 100 events", stats, 102);
 }
 
 /// First measured at 401 (~4/event): `encode_event`'s header/message text, the pre-sanitize
