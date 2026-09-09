@@ -44,10 +44,15 @@ already built that have a known, accepted rough edge.
   through unaggregated rather than fake-merging it
   ([ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)); `logit-outputs::influxdb` errors on it
   rather than writing a wrong encoding.
-- **Native wire protocol** (`crates/logit-proto/src/frame.rs`) — the frame header type exists; no
-  actual encode/decode, no connection/handshake, no dictionary encoding. The `rkyv`-vs-hand-rolled
-  encoding choice is an explicit open, benchmark-gated decision
-  ([wire-protocol.md](design/wire-protocol.md)).
+- **Native wire protocol: the format is done, the transport isn't.** `crates/logit-proto/src/frame.rs`
+  (framing/compression/CRC) and `crates/logit-proto/src/native/` (the dictionary-first payload
+  codec, `NativeEncoder`/`NativeDecoder`) are real, tested, `Encoder`/`Decoder` implementations —
+  the `rkyv`-vs-hand-rolled encoding choice is decided
+  ([ADR `native-wire-format-encoding`](adr/native-wire-format-encoding.md)). What's still open: no
+  connection/handshake state machine, no credit-based flow control, and `ComponentKind::LogitIn`/
+  `LogitOut` remain unimplemented in `crates/logit-pipeline/src/graph.rs`'s `is_implemented` — a
+  `logit run` config naming either is still rejected. The format existing is what unblocks the two
+  entries directly below.
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`), and
   every sink now sits behind a bounded, byte-aware `SinkQueue`
@@ -62,9 +67,12 @@ already built that have a known, accepted rough edge.
     [ADR `decoupled-listener-io`](adr/decoupled-listener-io.md)) a UDP listener's `ReceiveQueue` are in-memory
     only; a process restart, SIGKILL, or a shutdown grace that expires mid-drain loses whatever
     either was holding. Plausibly config-optional even once it lands, since not every deployment
-    needs cross-restart durability; blocked on the `rkyv`-vs-hand-rolled wire encoding decision
-    ([wire-protocol.md](design/wire-protocol.md)), which this deliberately does not settle in
-    passing.
+    needs cross-restart durability. Was blocked on the wire encoding decision
+    ([wire-protocol.md](design/wire-protocol.md)); that decision is now made
+    ([ADR `native-wire-format-encoding`](adr/native-wire-format-encoding.md)) and
+    `logit_proto::native`'s frames are already designed to be independently decodable and
+    file-appendable, so a disk-backed `Buffer<T>` over them is real, unblocked follow-up work, not
+    designed yet.
   - **No end-to-end acknowledgement** — delivery is confirmed only as far as the immediate
     destination accepting the write; nothing tracks whether the data survives past that point. The
     receive-side loss this used to also name (a UDP listener losing datagrams before anything

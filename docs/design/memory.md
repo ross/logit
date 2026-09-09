@@ -659,6 +659,26 @@ sink can hold events for seconds, that is a far worse failure mode than one smal
 datagram. `datagram_copy_is_one_right_sized_allocation` guards the current behavior. Don't
 "fix" this.
 
+### The native wire format (`logit_proto::native`)
+
+Not part of the nginx reference pipeline above — no `ComponentKind` consumes this codec yet
+([ADR `native-wire-format-encoding`](../adr/native-wire-format-encoding.md), `docs/known-gaps.md`)
+— so it gets its own small table rather than a row in §2's chain. One event
+(`fixtures::nginx_batch(1)`), `crates/logit-bench/tests/allocations.rs`'s
+`native_encode_one_event`/`native_decode_one_event`:
+
+| Stage | allocs | Notes |
+|---|---:|---|
+| `NativeEncoder::encode`, 1 event | **23** | dictionary build + the per-field TLV scratch buffers `native::record::write_field` allocates for each of `Event`'s up-to-five fields (`docs/adr/native-wire-format-encoding.md`'s own Decision section notes this as a known, unoptimized cost of the field-level skip-unknown framing) |
+| `NativeDecoder::decode_into`, 1 event | **8** | dictionary re-intern + `AttrMap`/`Event` construction; no intermediate object graph, unlike the bake-off's `rkyv`/`postcard` arms, which run through a `WireBatch` mirror first (`docs/adr/native-wire-format-encoding.md`'s finding 4) |
+
+The full bake-off comparison against `otlp`, `rkyv`, and `postcard` — across two shapes and three
+batch sizes, both timing and encoded bytes — lives in
+[ADR `native-wire-format-encoding`](../adr/native-wire-format-encoding.md), not here: those numbers
+came from `script/bench wire_format` (`crates/logit-bench/benches/wire_format.rs`), one-off
+comparison data rather than a per-build assertion, which is exactly the encode/decode split this
+file's own intro draws between the two harnesses.
+
 ## 3. Sharing versus copying
 
 What is shared today:

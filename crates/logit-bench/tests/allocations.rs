@@ -1962,3 +1962,74 @@ fn re_interning_an_existing_string_is_free() {
     });
     expect_allocs("interner: re-intern 1000 known names", stats, 0);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Native wire format (logit_proto::native)
+// ---------------------------------------------------------------------------------------------
+
+/// `NativeEncoder::encode`, one event, warmed so the dictionary's interner lookups have already
+/// happened once (see this file's own doc comment). Not part of the reference nginx pipeline
+/// chain above -- no `ComponentKind` consumes this codec yet
+/// ([ADR `native-wire-format-encoding`](../../../docs/adr/native-wire-format-encoding.md),
+/// `docs/known-gaps.md`) -- so this stands as its own section rather than extending the "full
+/// ingest chain" story those tests tell. It exists for the same reason every other
+/// exact-equality assertion here does: an allocation regression in `crates/logit-proto/src/native/`
+/// should fail `script/test`, not wait for someone to notice
+/// `crates/logit-bench/benches/wire_format.rs`'s numbers drift.
+#[test]
+fn native_encode_one_event() {
+    let batch = fixtures::nginx_batch(1);
+    let mut encoder = logit_proto::native::NativeEncoder::default();
+    drop(encoder.encode(&batch));
+
+    let (framed, stats) = measure(|| encoder.encode(&batch).expect("should encode"));
+    assert!(!framed.is_empty());
+    expect_allocs("native: encode 1 event", stats, 23);
+}
+
+/// The decode-side mirror of [`native_encode_one_event`]. `decode_into` appends into a caller-held
+/// `Vec<Event>` the same way every other decoder in this suite does (`docs/design/memory.md` §2).
+#[test]
+fn native_decode_one_event() {
+    let batch = fixtures::nginx_batch(1);
+    let mut encoder = logit_proto::native::NativeEncoder::default();
+    let framed = encoder.encode(&batch).expect("should encode");
+    let mut decoder = logit_proto::native::NativeDecoder;
+    let mut warm_events = Vec::new();
+    drop(decoder.decode_into(framed.clone(), 0, &mut warm_events));
+
+    let mut events = Vec::new();
+    let (_, stats) =
+        measure(|| decoder.decode_into(framed.clone(), 0, &mut events).expect("should decode"));
+    assert_eq!(events.len(), 1);
+    expect_allocs("native: decode 1 event", stats, 8);
+}
+
+/// Pins `Dict::read`'s `Vec::with_capacity(count.min(4096))` clamp with a byte-count assertion --
+/// the thing `crates/logit-proto/src/native/dict.rs`'s own unit tests can't do, since a plain
+/// `assert!(matches!(.., Err(_)))` on a rejected count passes identically whether or not the
+/// allocation was actually clamped (see the re-review of ADR `native-wire-format-encoding`'s fix
+/// commit, which flagged exactly this gap). A frame declaring a dictionary count of 1,000,000 with
+/// no entries behind it makes `Dict::read` allocate its `Vec` and then fail on the very first
+/// entry's length read, so the measured region is (almost) entirely that one allocation: clamped,
+/// it's ~4096 `Symbol`s (4 bytes each, `crates/logit-core/tests/type_sizes.rs`) -- under 20 KB;
+/// unclamped, it would be ~3.8 MB. The two orders of magnitude apart is exactly what would fail
+/// loudly if the `.min(4096)` clamp were ever removed.
+#[test]
+fn native_dict_read_clamps_its_capacity_to_a_count_far_larger_than_4096() {
+    use logit_proto::native::dict::Dict;
+    use logit_proto::native::varint::write_uvarint;
+
+    let mut buf = bytes::BytesMut::new();
+    write_uvarint(&mut buf, 1_000_000);
+    let declared = buf.freeze();
+
+    let (result, stats) = measure(|| Dict::read(&mut declared.clone()));
+    assert!(result.is_err(), "a count with nothing behind it should still fail to decode");
+    assert!(
+        stats.bytes < 100_000,
+        "Dict::read allocated {} bytes for a declared count of 1,000,000 -- \
+         the with_capacity(count.min(4096)) clamp appears to be gone (unclamped would be ~3.8 MB)",
+        stats.bytes
+    );
+}

@@ -60,7 +60,14 @@ real, implemented `ComponentKind`s; `docker_in` is live in `demo/logit.yaml`'s `
 that tier's container directly instead of receiving a `syslog:` stream, and `tail_in` itself is
 live in the same config's `postgres_in`, tailing Postgres's own rotating jsonlog directory
 (`docs/plans/demo-richer-traces.md`'s workstream C) -- `otlp_in` is the one still unexercised by
-the demo. Config is a flat graph of named components (ADR `component-graph-configuration`,
+the demo. The native `logit`-to-`logit` wire format is also real now, not just designed:
+`logit_proto::native` (`crates/logit-proto/src/frame.rs` + `src/native/`) is a tested
+`Encoder`/`Decoder` -- dictionary-first, hand-rolled, framed by a 24-byte header with CRC-32C and
+optional lz4 -- decided by a four-arm bake-off against `rkyv`, `postcard`, and OTLP itself
+([ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md)). No component uses
+it yet: `ComponentKind::LogitIn`/`LogitOut` remain unimplemented in `graph.rs`'s `is_implemented`,
+pending the connection/handshake layer `docs/design/wire-protocol.md` still describes as future
+work. Config is a flat graph of named components (ADR `component-graph-configuration`,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively
@@ -185,9 +192,12 @@ not a style preference:
   `logit-core::metric::DdSketch` is a real wrapper with a working `merge` (`crates/logit-transforms`'
   `aggregate` is its first caller); `HyperLogLog` is still a stub pending a real crate — don't fill
   it with a non-mergeable implementation to get `Set` aggregation working faster.
-- **The wire encoding (`rkyv` vs. hand-rolled) is an open, benchmark-gated decision** — see
-  `docs/design/wire-protocol.md`. Don't pick one in passing while implementing something else;
-  benchmark it and record the outcome as an ADR. `crates/logit-bench` is the harness to do it in.
+- **The wire encoding is decided: hand-rolled, shipped as `logit_proto::native`** — a four-arm
+  bake-off (`crates/logit-bench/src/bakeoff/`) settled it against `rkyv`, `postcard`, and OTLP
+  itself; see [ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md) and
+  `docs/design/wire-protocol.md`. Still open: the connection/handshake state machine, credit-based
+  flow control, and a disk-backed `Buffer<T>` — don't design those in passing either; they're real
+  future work, not yet started.
 - **Memory behavior is measured, not assumed** — `docs/design/memory.md` records what every
   pipeline stage allocates and what `Event` costs to move, and both are enforced by tests:
   `crates/logit-core/tests/type_sizes.rs` asserts exact `size_of`s, and
