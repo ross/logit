@@ -14,6 +14,13 @@ use crate::CodecError;
 pub const MAGIC: [u8; 4] = *b"LGIT";
 pub const VERSION: u16 = 1;
 
+/// Bit 0 of [`FrameHeader::flags`]: this frame carries a control payload (a `logit_in`/`logit_out`
+/// handshake or ack, `crate::native::control`) rather than a native-v1 batch. `flags`/the header's
+/// reserved bytes were always spare room for exactly this kind of later use -- see `HEADER_LEN`'s
+/// own doc comment and `docs/design/wire-protocol.md`. The bit clear means an ordinary data frame;
+/// no other bit is assigned yet.
+pub const FLAG_CONTROL: u16 = 1 << 0;
+
 /// The largest payload a single frame may declare, checked before `uncompressed_len` -- a raw,
 /// unvalidated `u32` off the wire -- is ever used to size an allocation. A frame at this cap is
 /// already far larger than any batch `logit` produces; a crafted 30-byte lz4 frame could otherwise
@@ -27,7 +34,11 @@ pub const VERSION: u16 = 1;
 /// produces a batch anywhere near 64 MiB -- but worth an encode-side assertion (or raising this
 /// constant) once the durable-buffer work (`docs/known-gaps.md`) starts producing batches large
 /// enough to make it a real possibility, rather than a theoretical one.
-const MAX_SANE_UNCOMPRESSED_LEN: u32 = 64 * 1024 * 1024;
+///
+/// `pub`: `logit_in` (`crates/logit-inputs/src/logit.rs`) checks an incoming frame's declared
+/// lengths against `min(MAX_SANE_UNCOMPRESSED_LEN, peer.max_frame_bytes)` *before* reading the
+/// body off the socket, not just after -- this constant is that shared ceiling.
+pub const MAX_SANE_UNCOMPRESSED_LEN: u32 = 64 * 1024 * 1024;
 
 /// The fixed header size in bytes: 4 (magic) + 2 (version) + 2 (flags) + 1 (codec) +
 /// 1 (compression) + 2 (reserved) + 4 (uncompressed_len) + 4 (compressed_len) + 4 (crc32c) = 24.
@@ -91,12 +102,14 @@ impl FrameHeader {
     /// so the caller's remaining slice is the payload. Rejects a wrong magic or an unrecognized
     /// version outright -- both mean this isn't a frame this reader can make sense of at all,
     /// as opposed to a within-format decode error.
-    fn read(bytes: &mut Bytes) -> Result<Self, CodecError> {
+    ///
+    /// `pub`: a streaming reader (`logit_in`'s per-connection loop) needs this to parse a header
+    /// it has already `read_exact`'d off a socket, separately from reading the (possibly much
+    /// larger) body -- `read_frame`'s all-at-once shape doesn't fit a socket, which doesn't hand
+    /// over a whole frame's bytes atomically the way a `Bytes` buffer does.
+    pub fn read(bytes: &mut Bytes) -> Result<Self, CodecError> {
         if bytes.len() < HEADER_LEN {
-            return Err(CodecError::Malformed(format!(
-                "frame shorter than the {HEADER_LEN}-byte header: {} bytes",
-                bytes.len()
-            )));
+            return Err(CodecError::Truncated { needed: HEADER_LEN - bytes.len() });
         }
         let mut magic = [0u8; 4];
         bytes.copy_to_slice(&mut magic);
@@ -142,6 +155,17 @@ pub fn write_frame(
     compression: Compression,
     payload: &[u8],
 ) -> Result<Bytes, CodecError> {
+    write_frame_with_flags(codec, compression, 0, payload)
+}
+
+/// [`write_frame`], with the header's `flags` field set to `flags` instead of always `0` -- the
+/// entry point a control frame (`crate::native::control`, [`FLAG_CONTROL`]) writes through.
+pub fn write_frame_with_flags(
+    codec: u8,
+    compression: Compression,
+    flags: u16,
+    payload: &[u8],
+) -> Result<Bytes, CodecError> {
     let compressed = match compression {
         Compression::None => payload.to_vec(),
         Compression::Lz4 => lz4_compress(payload),
@@ -155,7 +179,7 @@ pub fn write_frame(
     let crc = crc32c::crc32c(&compressed);
     let header = FrameHeader {
         version: VERSION,
-        flags: 0,
+        flags,
         codec,
         compression,
         uncompressed_len: payload.len() as u32,
@@ -171,7 +195,16 @@ pub fn write_frame(
 /// The inverse of [`write_frame`]: reads one frame off the front of `bytes` (advancing it past
 /// that frame, so a caller holding a longer buffer of concatenated frames -- a file, a stream --
 /// can call this in a loop), verifies the checksum, decompresses, and returns `(codec, payload)`.
+/// Drops the header's `flags` -- see [`read_frame_with_header`] for a caller (`logit_in`) that
+/// needs them, e.g. to tell a control frame from a data frame before decoding either.
 pub fn read_frame(bytes: &mut Bytes) -> Result<(u8, Bytes), CodecError> {
+    let (header, payload) = read_frame_with_header(bytes)?;
+    Ok((header.codec, payload))
+}
+
+/// [`read_frame`], returning the full [`FrameHeader`] (so a caller can read `flags`,
+/// `compression`, etc.) instead of just `codec`.
+pub fn read_frame_with_header(bytes: &mut Bytes) -> Result<(FrameHeader, Bytes), CodecError> {
     let header = FrameHeader::read(bytes)?;
     if header.uncompressed_len > MAX_SANE_UNCOMPRESSED_LEN {
         return Err(CodecError::Malformed(format!(
@@ -180,11 +213,7 @@ pub fn read_frame(bytes: &mut Bytes) -> Result<(u8, Bytes), CodecError> {
         )));
     }
     if (bytes.len() as u64) < header.compressed_len as u64 {
-        return Err(CodecError::Malformed(format!(
-            "frame declares {} compressed bytes but only {} remain",
-            header.compressed_len,
-            bytes.len()
-        )));
+        return Err(CodecError::Truncated { needed: header.compressed_len as usize - bytes.len() });
     }
     let compressed = bytes.split_to(header.compressed_len as usize);
     if crc32c::crc32c(&compressed) != header.crc32c {
@@ -211,7 +240,7 @@ pub fn read_frame(bytes: &mut Bytes) -> Result<(u8, Bytes), CodecError> {
             header.uncompressed_len
         )));
     }
-    Ok((header.codec, payload))
+    Ok((header, payload))
 }
 
 /// `lz4_flex::block::compress_into` needs a pre-sized output buffer rather than allocating one
@@ -402,5 +431,36 @@ mod tests {
         assert!(
             matches!(read_frame(&mut bad), Err(CodecError::Malformed(msg)) if msg.contains("sanity cap"))
         );
+    }
+
+    #[test]
+    fn a_header_short_by_one_byte_is_truncated_not_malformed() {
+        let framed = write_frame(1, Compression::None, b"hello").unwrap();
+        let mut short = framed.slice(0..HEADER_LEN - 1);
+        assert!(matches!(read_frame(&mut short), Err(CodecError::Truncated { needed: 1 })));
+    }
+
+    #[test]
+    fn a_body_short_by_one_byte_is_truncated_not_malformed() {
+        let framed = write_frame(1, Compression::None, b"hello").unwrap();
+        let mut short = framed.slice(0..framed.len() - 1);
+        assert!(matches!(read_frame(&mut short), Err(CodecError::Truncated { needed: 1 })));
+    }
+
+    #[test]
+    fn flag_control_round_trips_through_the_header() {
+        let framed = write_frame_with_flags(1, Compression::None, FLAG_CONTROL, b"hello").unwrap();
+        let mut bytes = framed;
+        let (header, payload) = read_frame_with_header(&mut bytes).unwrap();
+        assert_eq!(header.flags & FLAG_CONTROL, FLAG_CONTROL);
+        assert_eq!(&payload[..], b"hello");
+    }
+
+    #[test]
+    fn write_frame_still_writes_flags_zero() {
+        let framed = write_frame(1, Compression::None, b"hello").unwrap();
+        let mut bytes = framed;
+        let (header, _) = read_frame_with_header(&mut bytes).unwrap();
+        assert_eq!(header.flags, 0);
     }
 }

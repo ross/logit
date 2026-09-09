@@ -22,6 +22,14 @@ pub enum CodecError {
     /// wire, just not something this codec speaks.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// The input is a *valid prefix* of something this codec could decode -- it simply doesn't
+    /// have `needed` more bytes yet, as opposed to [`CodecError::Malformed`]'s "this is corrupt,
+    /// more bytes won't help." A streaming reader (a `logit_in` connection, a durable buffer
+    /// resuming mid-file) needs this distinction to tell "wait for more bytes and retry" apart
+    /// from "give up on this frame" -- `frame::read_frame`/`FrameHeader::read` are the first
+    /// callers, on a short header or a short body.
+    #[error("truncated input: need {needed} more byte(s)")]
+    Truncated { needed: usize },
 }
 
 /// Turns wire bytes into events sharing one [`Resource`]. Every input (statsd, syslog, OTLP, the
