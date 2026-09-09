@@ -88,9 +88,13 @@ pub enum ComponentKind {
     KeepSignals { signals: Vec<Signal> },
     // A denylist: clears the listed signals' payloads, keeping the rest.
     DropSignals { signals: Vec<Signal> },
-    // regex, csv, rename, filter, sample, throttle, dedup —
+    // regex, csv —
     // as each lands in logit-transforms, same shape: a `ComponentKind` variant, no `sources`
-    // opinion of its own (that lives on `Component`, uniformly).
+    // opinion of its own (that lives on `Component`, uniformly). `rename`/`filter`/`sample`/
+    // `throttle`/`dedup` used to be sketched here too -- retired before landing, not merely
+    // deferred: each is already expressible as a `lua` component, and
+    // `docs/adr/routing-by-condition-is-lua.md` records why a native equivalent wasn't worth
+    // building yet.
 
     InfluxDbOut { url: String, org: String, bucket: String, token: String },
     OtlpOut { endpoint: String },
@@ -405,9 +409,13 @@ context — one emission forking into several consumers is still one hop, not se
 
 ## Backpressure: diamonds are the normal shape now
 
-With filter components as the only branching mechanism (ADR `component-graph-configuration`), a config where one listener feeds
-several filters that reconverge on shared sinks isn't a rare topology — it's the *expected* way to
-express "route by condition." Two consequences worth stating rather than discovering in production:
+With a chain of ordinary transform components as the only branching mechanism (ADR
+`component-graph-configuration` — one component drops what a branch doesn't want, a sibling drops
+the rest, downstream components choose a branch by naming it as a source; today that's a `lua`
+component per branch, per `docs/adr/routing-by-condition-is-lua.md`), a config where one listener
+feeds several such branches that reconverge on shared sinks isn't a rare topology — it's the
+*expected* way to express "route by condition." Two consequences worth stating rather than
+discovering in production:
 
 - **Backpressure crosses branches.** A stalled sink backs up through every branch sharing an
   upstream with it, not just its own path — this is correct bounded-channel behavior, but it means

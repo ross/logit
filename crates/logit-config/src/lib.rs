@@ -336,8 +336,10 @@ pub enum ComponentKind {
         /// node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans
         /// off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full
         /// traces rather than a representative sample would set this explicitly. Named
-        /// `span_sample_rate`, not `sample_rate` -- there is already a `ComponentKind::Sample`
-        /// transform, and `internal` may grow other sampling knobs later. See
+        /// `span_sample_rate`, not `sample_rate` -- `internal` may grow other sampling knobs
+        /// later, and the name should keep meaning "which knob" even though the per-event
+        /// `sample` transform this once also disambiguated against was retired
+        /// (`docs/adr/routing-by-condition-is-lua.md`). See
         /// `docs/adr/internal-span-emission-and-deterministic-sampling.md`.
         #[serde(default = "default_span_sample_rate")]
         span_sample_rate: f64,
@@ -548,32 +550,19 @@ pub enum ComponentKind {
         #[serde(default)]
         bare_keys: bool,
     },
-    // The rest of the built-in native transforms -- not implemented yet (`logit-transforms`),
-    // carried over as unimplemented `ComponentKind` variants so config referencing one gets a
-    // clear "not implemented yet" at validation time rather than a deserialization error.
+    // The rest of the built-in native parsers -- not implemented yet (`logit-transforms`), carried
+    // over as unimplemented `ComponentKind` variants so config referencing one gets a clear "not
+    // implemented yet" at validation time rather than a deserialization error. `filter`/`rename`/
+    // `sample`/`throttle`/`dedup` used to live here too -- retired, not merely unimplemented, by
+    // `docs/adr/routing-by-condition-is-lua.md`: each is already expressible as a `lua` component
+    // (`demo/logit.yaml`'s `nginx_stdout` is the worked filter example), and the ADR records why
+    // building a second, native way to say the same thing wasn't worth it yet. Referencing one of
+    // those five kinds is now a deserialization error naming the valid kinds, not a graph-
+    // validation "not implemented" -- see the ADR's Consequences for why that trade was accepted.
     Regex {
         pattern: String,
     },
     Csv,
-    Rename {
-        from: String,
-        to: String,
-    },
-    Filter {
-        r#where: String,
-    },
-    Sample {
-        rate: f64,
-    },
-    Throttle {
-        limit: u64,
-        #[serde(with = "humantime_serde_duration")]
-        #[schemars(with = "String")]
-        window: Duration,
-    },
-    Dedup {
-        key: String,
-    },
 
     /// `rename`d explicitly: `rename_all = "snake_case"` alone would tag this `influx_db_out`
     /// (a word break at the embedded capital `Db`), not `influxdb_out` as published in
@@ -1590,6 +1579,18 @@ mod tests {
             ComponentKind::Json { skip_to_brace } => assert!(skip_to_brace),
             other => panic!("expected Json, got {other:?}"),
         }
+    }
+
+    /// `docs/adr/routing-by-condition-is-lua.md`: `filter`/`rename`/`sample`/`throttle`/`dedup`
+    /// were retired, not merely left unimplemented -- a config referencing one is now a
+    /// deserialization error (naming the valid kinds) rather than `graph::resolve`'s "not
+    /// implemented yet" (`crates/logit-pipeline/src/graph.rs`'s `unimplemented_kind_is_rejected`
+    /// covers a still-unimplemented-but-declared kind; this is the different, now-gone case).
+    #[test]
+    fn a_retired_kind_is_a_deserialization_error_not_an_unimplemented_kind() {
+        let err = serde_json::from_str::<Component>(r#"{"type": "filter", "sources": ["in"]}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown variant"), "got: {err}");
     }
 
     #[test]
