@@ -25,8 +25,10 @@ use logit_inputs::statsd::StatsdDecoder;
 use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
 use logit_proto::Decoder;
-use logit_transforms::{Aggregator, CsvParser, JsonParser, Keep, KvMetrics, MetricSpec, Set};
-use std::sync::Arc;
+use logit_transforms::{
+    Aggregator, CsvParser, JsonParser, Keep, Kv, KvMetrics, Logfmt, MetricSpec, RegexParser, Set,
+};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// One nginx access-log line exactly as `examples/nginx/nginx.conf`'s `access_json_syslog` format
@@ -60,6 +62,18 @@ pub const STATSD_DISTRIBUTION_LINE: &str = "request.latency:120|ms";
 /// instead of one, exercising `DdSketch::add_weighted`'s `add_with_count` delegation on the decode
 /// path.
 pub const STATSD_SAMPLED_DISTRIBUTION_LINE: &str = "request.latency:120|ms|@0.1";
+
+/// A logfmt-shaped log line (go-kit style), used to exercise the quoted-value scan path.
+pub const LOGFMT_LINE: &str = "level=info ts=2026-09-07T06:52:01Z caller=metrics.go:159 \
+    component=frontend org_id=fake latency=fast duration=12.3ms status=200 \
+    msg=\"query stats\"";
+
+/// The same shape with an escaped quote inside the quoted value. Isolates the one path that
+/// cannot slice.
+pub const LOGFMT_ESCAPED_LINE: &str = "level=info query=\"{job=\\\"nginx\\\"}\" status=200";
+
+/// nginx-ish `a=1&b=2`, the `kv` shape.
+pub const KV_LINE: &str = "a=1&b=2&c=hello";
 
 /// `count` copies of [`NGINX_SYSLOG_LINE`] newline-separated, as one UDP datagram would arrive.
 ///
@@ -113,6 +127,79 @@ pub fn statsd_decoder() -> StatsdDecoder {
 /// already stripped the header, so the whole message really is the JSON body.
 pub fn json_parser() -> JsonParser {
     JsonParser::new(false)
+}
+
+/// Caches one [`bytes::Bytes`] per distinct `line`, built once (via `f`) and `.clone()`d on every
+/// call after that -- the fixture-side mirror of [`nginx_syslog_datagram`]'s own pattern, where a
+/// test holds one base `Bytes` in a local and clones it for both the warm-up and the measured call
+/// so the allocation counter only ever sees the *second-or-later* clone. That matters here
+/// specifically because `bytes::Bytes` defers its shared, atomically-refcounted representation
+/// until a buffer is *first* cloned or sliced (`bytes-1.x`'s `promotable_{even,odd}_clone` ->
+/// `shallow_clone_vec`, a real, `#[cold]`, one-time `Box<Shared>` allocation) -- a `Bytes` built
+/// fresh from a `&str`/`Vec<u8>` on every call (as a naive `logfmt_event()` did originally) pays
+/// that promotion on *every* call's first clone, since each call's buffer is a distinct,
+/// never-before-shared allocation. Memoizing here, rather than changing `logfmt_event`'s zero-arg
+/// signature, keeps every call after the first returning a `.clone()` of the *same* already-shared
+/// buffer -- the identical "warm the thing being measured" discipline this crate already applies
+/// to the interner (`docs/design/memory.md`'s "Fixtures" section).
+fn cached_message(line: &'static str, cache: &'static OnceLock<Bytes>) -> Bytes {
+    cache.get_or_init(|| Bytes::copy_from_slice(line.as_bytes())).clone()
+}
+
+/// A directly-constructed log event whose message is [`LOGFMT_LINE`] -- no decoder needed, since
+/// `logfmt`/`kv` read `event.log.message` directly (`docs/design/memory.md`'s "Fixtures" section).
+pub fn logfmt_event() -> Event {
+    static MESSAGE: OnceLock<Bytes> = OnceLock::new();
+    Event::log(
+        0,
+        AttrMap::new(),
+        LogRecord {
+            message: Value::Str(cached_message(LOGFMT_LINE, &MESSAGE)),
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+        },
+    )
+}
+
+/// [`logfmt_event`], with [`LOGFMT_ESCAPED_LINE`] as the message instead.
+pub fn logfmt_escaped_event() -> Event {
+    static MESSAGE: OnceLock<Bytes> = OnceLock::new();
+    Event::log(
+        0,
+        AttrMap::new(),
+        LogRecord {
+            message: Value::Str(cached_message(LOGFMT_ESCAPED_LINE, &MESSAGE)),
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+        },
+    )
+}
+
+/// A directly-constructed log event whose message is [`KV_LINE`].
+pub fn kv_event() -> Event {
+    static MESSAGE: OnceLock<Bytes> = OnceLock::new();
+    Event::log(
+        0,
+        AttrMap::new(),
+        LogRecord {
+            message: Value::Str(cached_message(KV_LINE, &MESSAGE)),
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+        },
+    )
+}
+
+/// `bare_keys` off, the default.
+pub fn logfmt_parser() -> Logfmt {
+    Logfmt::new(false)
+}
+
+/// `pair_sep: "&"`, `kv_sep: "="` -- [`KV_LINE`]'s shape.
+pub fn kv_parser() -> Kv {
+    Kv::new("&".to_string(), "=".to_string(), false)
 }
 
 /// One line of a CSV access log -- seven columns, one a quoted request line containing the
@@ -406,6 +493,51 @@ pub const SSHD_SYSLOG_LINE: &str = "<34>Aug 31 06:52:01 auth-edge-3 sshd[8843]: 
 /// [`nginx_syslog_datagram`].
 pub fn logs_only_syslog_datagram(count: usize) -> Bytes {
     join_lines(SSHD_SYSLOG_LINE, count)
+}
+
+/// `regex`'s fixture: three named captures onto [`SSHD_SYSLOG_LINE`]'s auth-failure shape --
+/// `docs/adr/regex-transform.md`.
+pub fn regex_parser() -> RegexParser {
+    RegexParser::new(
+        r"for invalid user (?P<ssh_user>\S+) from (?P<client_address>\S+) port (?P<client_port>\d+)",
+        None,
+    )
+    .expect("fixture pattern should compile")
+}
+
+/// A bare log event carrying [`SSHD_SYSLOG_LINE`]'s full text as its message, with no attributes
+/// yet -- exercises [`regex_parser`]'s three captures landing while `AttrMap` is still well
+/// inside its 8-entry inline capacity (`crates/logit-bench/tests/allocations.rs`'s
+/// `regex_capture_into_an_inline_map`).
+///
+/// `Bytes::from_static`, not `Value::str` (`Bytes::from(String)`) -- a message that actually
+/// arrives off the wire is always already a `Bytes` slice of a decoder's buffer, never a freshly
+/// heap-allocated, not-yet-shared one. `bytes::Bytes`'s `Vec`-backed representation defers one
+/// allocation to its *first* `slice`/`clone` (promoting from a uniquely-owned buffer to a shared
+/// one) regardless of who calls it -- real, but a property of how this fixture would build the
+/// buffer, not of what `regex` costs. `Bytes::from_static` (like a decoded message already sliced
+/// out of its datagram) carries no such one-time cost, so this fixture isolates the thing it's
+/// named for: `AttrMap` capacity, not buffer provenance.
+pub fn sshd_message_event() -> Event {
+    Event::log(
+        0,
+        AttrMap::new(),
+        LogRecord {
+            message: Value::Str(Bytes::from_static(SSHD_SYSLOG_LINE.as_bytes())),
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+        },
+    )
+}
+
+/// [`SSHD_SYSLOG_LINE`] decoded by `syslog_in` -- six `syslog.*` attributes already on the event
+/// before [`regex_parser`] adds three more captures, pushing past `AttrMap`'s 8-entry inline
+/// capacity (`crates/logit-bench/tests/allocations.rs`'s `regex_parse_one_event`).
+pub fn sshd_event() -> Event {
+    let mut decoder = syslog_decoder();
+    let batch = decoder.decode(logs_only_syslog_datagram(1)).expect("fixture line should decode");
+    batch.events.into_iter().next().expect("fixture line should produce one event")
 }
 
 // -------------------------------------------------------------------------------------------

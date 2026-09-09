@@ -252,18 +252,14 @@ fn default_span_sample_rate() -> f64 {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ComponentKind {
     /// statsd / DogStatsD-style tagged metrics over UDP.
-    StatsdIn {
-        bind: String,
-    },
+    StatsdIn { bind: String },
     /// RFC 3164 / RFC 5424 syslog over UDP. **Not** TCP, despite this doc comment's old claim --
     /// `crates/logit-inputs/src/syslog.rs`'s own module doc has always said UDP-only (nginx's
     /// `syslog:` writer is UDP-only, so a TCP accept loop would buy this listener nothing;
     /// `docs/known-gaps.md`'s "syslog TCP and structured data" entry tracks it as future,
     /// additive work). `syslog_out` (the egress side, `docs/adr/syslog-output.md`) supports
     /// both UDP and TCP -- that asymmetry is deliberate, not a sign this needs fixing to match.
-    SyslogIn {
-        bind: String,
-    },
+    SyslogIn { bind: String },
     /// OpenTelemetry Protocol (logs, metrics, and/or traces).
     OtlpIn {
         bind: String,
@@ -314,9 +310,7 @@ pub enum ComponentKind {
         tail: TailOptions,
     },
     /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
-    LogitIn {
-        bind: String,
-    },
+    LogitIn { bind: String },
     /// `logit` talking about itself: drains every component's buffered self-telemetry points on
     /// `interval` and emits them as ordinary events into the graph, same as any other listener.
     /// Named for the source, not the signal it emits today -- free to grow logs and spans later
@@ -336,8 +330,10 @@ pub enum ComponentKind {
         /// node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans
         /// off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full
         /// traces rather than a representative sample would set this explicitly. Named
-        /// `span_sample_rate`, not `sample_rate` -- there is already a `ComponentKind::Sample`
-        /// transform, and `internal` may grow other sampling knobs later. See
+        /// `span_sample_rate`, not `sample_rate` -- `internal` may grow other sampling knobs
+        /// later, and the name should keep meaning "which knob" even though the per-event
+        /// `sample` transform this once also disambiguated against was retired
+        /// (`docs/adr/routing-by-condition-is-lua.md`). See
         /// `docs/adr/internal-span-emission-and-deterministic-sampling.md`.
         #[serde(default = "default_span_sample_rate")]
         span_sample_rate: f64,
@@ -430,13 +426,9 @@ pub enum ComponentKind {
     /// `aggregate`'s `SeriesKey` includes the whole of `event.attributes`, so pruning first is
     /// what keeps series cardinality and per-window memory bounded. An empty `fields` list is
     /// legal and means "drop every attribute."
-    Keep {
-        fields: Vec<String>,
-    },
+    Keep { fields: Vec<String> },
     /// Drops the named attributes, keeping the rest.
-    Remove {
-        fields: Vec<String>,
-    },
+    Remove { fields: Vec<String> },
     /// Stamps constant values onto every event's attributes and/or the batch's resource --
     /// the operator-declared counterpart to a wire-carried identity
     /// (`docs/adr/operator-declared-resource-attributes.md`). Overwrites on key collision in
@@ -529,45 +521,67 @@ pub enum ComponentKind {
     /// may not name all three signals (that keeps everything, a no-op that forwards every event
     /// untouched) -- both are rejected as config mistakes. See
     /// `docs/adr/signal-filtering-components.md`.
-    KeepSignals {
-        signals: Vec<Signal>,
-    },
+    KeepSignals { signals: Vec<Signal> },
     /// Clears the listed signals' payloads on every event, keeping the rest -- a denylist, the
     /// mirror of `keep_signals`. Drops an event left with no payload at all. `signals` may not be
     /// empty (that drops nothing, a no-op that forwards every event untouched) and may not name
     /// all three signals (that drops everything, dropping every event) -- both are rejected as
     /// config mistakes. See `docs/adr/signal-filtering-components.md`.
-    DropSignals {
-        signals: Vec<Signal>,
+    DropSignals { signals: Vec<Signal> },
+    /// Parses a log record's message as logfmt (`level=info msg="hello world" dur=3ms`), merging
+    /// the resulting key/values into the event's attributes. Additive and pass-through-on-failure,
+    /// exactly like `json`. See `docs/adr/logfmt-and-kv-parsing.md`.
+    Logfmt {
+        /// Treat a token with no `=` as a boolean-true flag (`cached` -> `cached: true`), the
+        /// Heroku logfmt convention. **Off by default**: a bareword promotes an arbitrary input
+        /// token into attribute-key position, and every attribute key is interned into a
+        /// process-global table that never shrinks -- so a timestamp-prefixed line
+        /// (`2026/09/07 12:00:00 level=info ...`) would leak two never-repeating interner entries
+        /// per line. Turn it on only for a source that genuinely emits flags.
+        #[serde(default)]
+        bare_keys: bool,
     },
-    // The rest of the built-in native transforms -- not implemented yet (`logit-transforms`),
-    // carried over as unimplemented `ComponentKind` variants so config referencing one gets a
-    // clear "not implemented yet" at validation time rather than a deserialization error.
-    Logfmt,
-    Kv,
+    /// Parses a log record's message as literal `key<kv_sep>value` pairs separated by `pair_sep`
+    /// (`a=1&b=2`, `a: 1, b: 2`) -- no quoting and no escapes, unlike `logfmt`. Both separators are
+    /// required: defaulting them to `" "`/`"="` would make a bare `kv` silently mis-parse quoted
+    /// logfmt, and `logfmt` is the right component for that shape anyway.
+    Kv {
+        /// Separator between one pair and the next. Whitespace around each key and value is
+        /// always trimmed, so `", "` and `","` behave the same on `a=1, b=2`.
+        pair_sep: String,
+        /// Separator between a key and its value, within one pair. The **first** occurrence in a
+        /// segment splits it, so `a=b=c` yields `a` -> `b=c`.
+        kv_sep: String,
+        /// See `Logfmt::bare_keys` -- identical rule, identical default.
+        #[serde(default)]
+        bare_keys: bool,
+    },
+    /// Matches a pattern against a log message (or, with `field:`, a named attribute), turning
+    /// every *named* capture group -- `(?P<name>...)` or `(?<name>...)` -- into an attribute of
+    /// that name; an unnamed group is grouping/alternation only and contributes nothing. See
+    /// `docs/adr/regex-transform.md`. Compiled at graph-validation time, so an invalid pattern (or
+    /// one with no named capture group) is a `logit validate` error, not a run-time surprise.
     Regex {
+        /// The pattern. Every named capture group becomes an attribute; first match only -- a
+        /// second match would just overwrite the first's attributes under this flat-`AttrMap`
+        /// model. A non-matching line, or one with no `field` attribute, passes through
+        /// unchanged, with no diagnostic -- only `logit.transform.matched{,.skipped}` counters
+        /// (`docs/adr/scale-transform.md`'s "silent skip is documented behavior" precedent).
         pattern: String,
+        /// The attribute to match against, instead of the log message. Absent (the default) reads
+        /// `log.message`, like `json`. `demo/logit.yaml`'s postgres tier is the case this exists
+        /// for: the SQL statement arrives inside a Postgres jsonlog record, so `json` has already
+        /// lifted it to `attributes.message` by the time a pattern can be run over it.
+        #[serde(default)]
+        field: Option<String>,
     },
-    Rename {
-        from: String,
-        to: String,
-    },
-    Filter {
-        r#where: String,
-    },
-    Sample {
-        rate: f64,
-    },
-    Throttle {
-        limit: u64,
-        #[serde(with = "humantime_serde_duration")]
-        #[schemars(with = "String")]
-        window: Duration,
-    },
-    Dedup {
-        key: String,
-    },
-
+    // `filter`/`rename`/`sample`/`throttle`/`dedup` used to live here too -- retired, not merely
+    // unimplemented, by `docs/adr/routing-by-condition-is-lua.md`: each is already expressible as
+    // a `lua` component (`demo/logit.yaml`'s `nginx_stdout` is the worked filter example), and the
+    // ADR records why building a second, native way to say the same thing wasn't worth it yet.
+    // Referencing one of those five kinds is now a deserialization error naming the valid kinds,
+    // not a graph-validation "not implemented" -- see the ADR's Consequences for why that trade
+    // was accepted.
     /// `rename`d explicitly: `rename_all = "snake_case"` alone would tag this `influx_db_out`
     /// (a word break at the embedded capital `Db`), not `influxdb_out` as published in
     /// `docs/design/pipeline-graph.md` and every example config.
@@ -617,9 +631,7 @@ pub enum ComponentKind {
         tls: TlsClientConfig,
     },
     /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
-    LogitOut {
-        endpoint: String,
-    },
+    LogitOut { endpoint: String },
     /// A general-purpose, human-facing debug sink: dumps every event's details as a readable text
     /// block to stdout (default), stderr, or a file -- the dev loop for seeing a whole pipeline's
     /// output without standing up a real backend like InfluxDB.
@@ -1588,6 +1600,18 @@ mod tests {
             ComponentKind::Json { skip_to_brace } => assert!(skip_to_brace),
             other => panic!("expected Json, got {other:?}"),
         }
+    }
+
+    /// `docs/adr/routing-by-condition-is-lua.md`: `filter`/`rename`/`sample`/`throttle`/`dedup`
+    /// were retired, not merely left unimplemented -- a config referencing one is now a
+    /// deserialization error (naming the valid kinds) rather than `graph::resolve`'s "not
+    /// implemented yet" (`crates/logit-pipeline/src/graph.rs`'s `unimplemented_kind_is_rejected`
+    /// covers a still-unimplemented-but-declared kind; this is the different, now-gone case).
+    #[test]
+    fn a_retired_kind_is_a_deserialization_error_not_an_unimplemented_kind() {
+        let err = serde_json::from_str::<Component>(r#"{"type": "filter", "sources": ["in"]}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown variant"), "got: {err}");
     }
 
     #[test]

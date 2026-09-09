@@ -317,7 +317,7 @@
               "type": "string"
             },
             "span_sample_rate": {
-              "description": "Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id` the same way at every node -- a kept trace is kept at every hop, never partially. Below `1.0` by default: span volume is a different shape than metric volume (one span per node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full traces rather than a representative sample would set this explicitly. Named `span_sample_rate`, not `sample_rate` -- there is already a `ComponentKind::Sample` transform, and `internal` may grow other sampling knobs later. See `docs/adr/internal-span-emission-and-deterministic-sampling.md`.",
+              "description": "Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id` the same way at every node -- a kept trace is kept at every hop, never partially. Below `1.0` by default: span volume is a different shape than metric volume (one span per node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full traces rather than a representative sample would set this explicitly. Named `span_sample_rate`, not `sample_rate` -- `internal` may grow other sampling knobs later, and the name should keep meaning \"which knob\" even though the per-event `sample` transform this once also disambiguated against was retired (`docs/adr/routing-by-condition-is-lua.md`). See `docs/adr/internal-span-emission-and-deterministic-sampling.md`.",
               "default": 0.1,
               "type": "number",
               "format": "double"
@@ -729,11 +729,17 @@
           }
         },
         {
+          "description": "Parses a log record's message as logfmt (`level=info msg=\"hello world\" dur=3ms`), merging the resulting key/values into the event's attributes. Additive and pass-through-on-failure, exactly like `json`. See `docs/adr/logfmt-and-kv-parsing.md`.",
           "type": "object",
           "required": [
             "type"
           ],
           "properties": {
+            "bare_keys": {
+              "description": "Treat a token with no `=` as a boolean-true flag (`cached` -> `cached: true`), the Heroku logfmt convention. **Off by default**: a bareword promotes an arbitrary input token into attribute-key position, and every attribute key is interned into a process-global table that never shrinks -- so a timestamp-prefixed line (`2026/09/07 12:00:00 level=info ...`) would leak two never-repeating interner entries per line. Turn it on only for a source that genuinely emits flags.",
+              "default": false,
+              "type": "boolean"
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -743,11 +749,27 @@
           }
         },
         {
+          "description": "Parses a log record's message as literal `key<kv_sep>value` pairs separated by `pair_sep` (`a=1&b=2`, `a: 1, b: 2`) -- no quoting and no escapes, unlike `logfmt`. Both separators are required: defaulting them to `\" \"`/`\"=\"` would make a bare `kv` silently mis-parse quoted logfmt, and `logfmt` is the right component for that shape anyway.",
           "type": "object",
           "required": [
+            "kv_sep",
+            "pair_sep",
             "type"
           ],
           "properties": {
+            "bare_keys": {
+              "description": "See `Logfmt::bare_keys` -- identical rule, identical default.",
+              "default": false,
+              "type": "boolean"
+            },
+            "kv_sep": {
+              "description": "Separator between a key and its value, within one pair. The **first** occurrence in a segment splits it, so `a=b=c` yields `a` -> `b=c`.",
+              "type": "string"
+            },
+            "pair_sep": {
+              "description": "Separator between one pair and the next. Whitespace around each key and value is always trimmed, so `\", \"` and `\",\"` behave the same on `a=1, b=2`.",
+              "type": "string"
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -757,120 +779,29 @@
           }
         },
         {
+          "description": "Matches a pattern against a log message (or, with `field:`, a named attribute), turning every *named* capture group -- `(?P<name>...)` or `(?<name>...)` -- into an attribute of that name; an unnamed group is grouping/alternation only and contributes nothing. See `docs/adr/regex-transform.md`. Compiled at graph-validation time, so an invalid pattern (or one with no named capture group) is a `logit validate` error, not a run-time surprise.",
           "type": "object",
           "required": [
             "pattern",
             "type"
           ],
           "properties": {
+            "field": {
+              "description": "The attribute to match against, instead of the log message. Absent (the default) reads `log.message`, like `json`. `demo/logit.yaml`'s postgres tier is the case this exists for: the SQL statement arrives inside a Postgres jsonlog record, so `json` has already lifted it to `attributes.message` by the time a pattern can be run over it.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "pattern": {
+              "description": "The pattern. Every named capture group becomes an attribute; first match only -- a second match would just overwrite the first's attributes under this flat-`AttrMap` model. A non-matching line, or one with no `field` attribute, passes through unchanged, with no diagnostic -- only `logit.transform.matched{,.skipped}` counters (`docs/adr/scale-transform.md`'s \"silent skip is documented behavior\" precedent).",
               "type": "string"
             },
             "type": {
               "type": "string",
               "enum": [
                 "regex"
-              ]
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "from",
-            "to",
-            "type"
-          ],
-          "properties": {
-            "from": {
-              "type": "string"
-            },
-            "to": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "rename"
-              ]
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "type",
-            "where"
-          ],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "filter"
-              ]
-            },
-            "where": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "rate",
-            "type"
-          ],
-          "properties": {
-            "rate": {
-              "type": "number",
-              "format": "double"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "sample"
-              ]
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "limit",
-            "type",
-            "window"
-          ],
-          "properties": {
-            "limit": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0.0
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "throttle"
-              ]
-            },
-            "window": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "key",
-            "type"
-          ],
-          "properties": {
-            "key": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "dedup"
               ]
             }
           }

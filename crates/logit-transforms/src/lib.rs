@@ -3,15 +3,17 @@
 //! `logit_pipeline::Transform`, letting the node runtime run it as an ordinary tokio task (no
 //! dedicated OS thread, unlike a Lua component -- `docs/design/pipeline-graph.md`'s "Node kinds"
 //! section). `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`,
-//! `scale`, `has_signal`, `keep_signals`, and `drop_signals` are implemented so far; more
-//! (`logfmt`, `kv`, `regex`, `rename`, `filter`, `sample`, `throttle`, `dedup`) are expected to
-//! land here too.
+//! `scale`, `has_signal`, `keep_signals`, `drop_signals`, `logfmt`, `kv`, and `regex` are
+//! implemented (`rename`/`filter`/`sample`/`throttle`/`dedup` were retired rather than landing --
+//! `docs/adr/routing-by-condition-is-lua.md`).
 
 mod aggregate;
 mod csv;
 mod json;
 mod keep;
 mod kv_metrics;
+mod logfmt;
+mod regex;
 mod scale;
 mod set;
 mod signals;
@@ -24,6 +26,8 @@ pub use csv::CsvParser;
 pub use json::JsonParser;
 pub use keep::{Keep, Remove};
 pub use kv_metrics::{KvMetrics, MetricSpec};
+pub use logfmt::{Kv, Logfmt};
+pub use regex::RegexParser;
 pub use scale::Scale;
 pub use set::Set;
 pub use signals::{DropSignals, HasSignal, KeepSignals, MatchMode, SignalSet};
@@ -124,6 +128,108 @@ mod chained_pipeline_test {
 
         // aggregate: every metric here is mergeable, so it's fully absorbed -- the log half
         // (still present) is forwarded on its own as the remainder.
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let passed = agg.process(&resource, event).expect("the log half should be forwarded");
+        assert!(passed.metrics.is_empty(), "every metric should have been absorbed");
+        assert_eq!(passed.log.as_ref().unwrap().message, Value::str(raw));
+
+        let flushed = agg.flush(1_000_000_000);
+        assert_eq!(flushed.len(), 1, "one resource group");
+        let (_, events) = &flushed[0];
+        assert_eq!(events.len(), 3, "three distinct series -- nothing else");
+
+        for (series_event, _links) in events {
+            let tags: Vec<&str> = series_event.attributes.iter().map(|(k, _)| resolve(k)).collect();
+            assert_eq!(
+                tags,
+                vec!["status"],
+                "every series' tags must be exactly what keep named, no more and no less"
+            );
+            assert_eq!(series_event.metrics.len(), 1);
+
+            let record = &series_event.metrics[0];
+            match resolve(record.name) {
+                "nginx.requests" => {
+                    assert!(matches!(record.kind, MetricKind::Counter(v) if v == 1.0));
+                }
+                "nginx.bytes_sent" => {
+                    assert!(matches!(record.kind, MetricKind::Counter(v) if v == 512.0));
+                }
+                "nginx.request_time" => match &record.kind {
+                    MetricKind::Distribution(sketch) => {
+                        assert_eq!(sketch.count(), 1);
+                        let q = sketch.quantile(0.5).expect("single-sample sketch has a median");
+                        assert!((q - 12.0).abs() < 0.1, "got {q}, scale should have run first");
+                        assert_eq!(record.unit.map(resolve), Some("ms"));
+                    }
+                    other => panic!("expected Distribution, got {other:?}"),
+                },
+                other => panic!("unexpected series name: {other}"),
+            }
+        }
+    }
+
+    /// The `logfmt` mirror of [`json_scale_kv_metrics_keep_aggregate_chain_produces_correctly_tagged_metrics`]:
+    /// same chain, fed a logfmt-shaped line instead of JSON, proving `logfmt`'s always-`Value::Str`
+    /// output (`request_time="0.012"`, never a number) still flows correctly through `scale` ->
+    /// `Value::F64(12.0)` -> `kv_metrics`'s `numeric` coercion, exactly as `crate::numeric`'s own
+    /// doc comment promises.
+    #[test]
+    fn logfmt_scale_kv_metrics_keep_aggregate_chain_produces_correctly_tagged_metrics() {
+        let resource = Arc::new(Resource::default());
+
+        let raw = "status=200 body_bytes_sent=512 request_time=0.012 client_ip=10.0.0.1 \
+                    user_agent=curl/8.0";
+        let event = Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str(raw),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
+        );
+
+        // logfmt: the raw body becomes attributes, always as Value::Str.
+        let mut logfmt = Logfmt::new(false);
+        let event = logfmt.process(&resource, event).expect("logfmt always forwards");
+        assert_eq!(event.attributes.len(), 5, "every logfmt field should have landed");
+        assert_eq!(event.attributes.get("status"), Some(&Value::str("200")), "never coerced");
+
+        // scale: request_time converts from seconds to milliseconds before kv_metrics ever
+        // reads it -- `numeric` parses logfmt's Value::Str("0.012") just fine.
+        let mut scale = Scale::new(vec![("request_time".to_string(), 1000.0)]);
+        let event = scale.process(&resource, event).expect("scale always forwards");
+        assert_eq!(event.attributes.get("request_time"), Some(&Value::F64(12.0)));
+
+        // kv_metrics: two counters (one no-field, one field-backed) and a distribution.
+        let mut kv = KvMetrics::new(
+            vec![
+                MetricSpec { name: "nginx.requests".to_string(), field: None, unit: None },
+                MetricSpec {
+                    name: "nginx.bytes_sent".to_string(),
+                    field: Some("body_bytes_sent".to_string()),
+                    unit: None,
+                },
+            ],
+            vec![],
+            vec![MetricSpec {
+                name: "nginx.request_time".to_string(),
+                field: Some("request_time".to_string()),
+                unit: Some("ms".to_string()),
+            }],
+        );
+        let event = kv.process(&resource, event).expect("kv_metrics always forwards");
+        assert_eq!(event.metrics.len(), 3, "two counters and one distribution should be derived");
+
+        // keep: only `status` is allowed to survive as a tag.
+        let mut keep = Keep::new(vec!["status".to_string()]);
+        let event = keep.process(&resource, event).expect("keep always forwards");
+        let kept: Vec<&str> = event.attributes.iter().map(|(k, _)| resolve(k)).collect();
+        assert_eq!(kept, vec!["status"], "only the kept attribute should survive");
+
+        // aggregate: every metric here is mergeable, so it's fully absorbed.
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let passed = agg.process(&resource, event).expect("the log half should be forwarded");
         assert!(passed.metrics.is_empty(), "every metric should have been absorbed");

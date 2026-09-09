@@ -393,6 +393,152 @@ fn csv_parse_wide_row_event() {
     expect_allocs("csv: parse + merge 1 wide row (16 columns)", stats, 1);
 }
 
+/// Three named captures onto a bare event whose `AttrMap` starts empty -- well inside its 8-entry
+/// inline capacity even after the captures land, so nothing spills to the heap.
+/// `docs/adr/regex-transform.md`'s zero-allocation claim: `captures_read` fills a struct-held
+/// `CaptureLocations` rather than allocating a fresh `Captures`, and every capture is
+/// `haystack.slice(start..end)` -- a `Bytes` refcount bump, never a `String`.
+#[test]
+fn regex_capture_into_an_inline_map() {
+    let mut re = fixtures::regex_parser();
+    let resource = fixtures::resource();
+    drop(re.process(&resource, fixtures::sshd_message_event()));
+
+    let event = fixtures::sshd_message_event();
+    let (event, stats) = measure(|| re.process(&resource, event).expect("regex forwards"));
+    assert_eq!(event.attributes.len(), 3, "ssh_user, client_address, client_port");
+    expect_allocs("regex: capture into an inline map", stats, 0);
+}
+
+/// The sshd shape: `syslog_in` has already put six `syslog.*` attributes on the event, so
+/// `regex`'s three captures push the map from 6 to 9 entries -- past `AttrMap`'s 8-entry inline
+/// capacity, spilling to the heap once.
+#[test]
+fn regex_parse_one_event() {
+    let mut re = fixtures::regex_parser();
+    let resource = fixtures::resource();
+    drop(re.process(&resource, fixtures::sshd_event()));
+
+    let event = fixtures::sshd_event();
+    let (event, stats) = measure(|| re.process(&resource, event).expect("regex forwards"));
+    assert_eq!(event.attributes.len(), 9, "6 syslog.* attributes plus 3 captures");
+    expect_allocs("regex: parse 1 event (sshd shape)", stats, 1);
+}
+
+/// A non-matching line: no capture is written, so nothing beyond the transform's own bookkeeping
+/// happens -- confirms the no-match path is exactly as cheap as the design predicts.
+#[test]
+fn regex_no_match_one_event() {
+    let mut re = fixtures::regex_parser();
+    let resource = fixtures::resource();
+    drop(re.process(&resource, fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let attrs_before = event.attributes.len();
+    let (event, stats) = measure(|| re.process(&resource, event).expect("regex forwards"));
+    assert_eq!(event.attributes.len(), attrs_before, "no match, no attribute added");
+    expect_allocs("regex: no match, 1 event", stats, 0);
+}
+
+/// `logfmt`'s zero-copy claim, stated as an allocation count: [`fixtures::LOGFMT_LINE`]'s 9 fields
+/// are all unquoted or escape-free-quoted, so every value is a `raw.slice(..)` -- a `Bytes`
+/// refcount bump, not a copy -- and every key is warm in the interner after the first call. What's
+/// left is `event.attributes` itself spilling its inline capacity once the merge pushes the count
+/// past `AttrMap`'s 8-entry inline `SmallVec`.
+#[test]
+fn logfmt_parse_one_event() {
+    let mut logfmt = fixtures::logfmt_parser();
+    let resource = fixtures::resource();
+    drop(logfmt.process(&resource, fixtures::logfmt_event()));
+
+    let event = fixtures::logfmt_event();
+    let (event, stats) = measure(|| logfmt.process(&resource, event).expect("logfmt forwards"));
+    assert_eq!(event.attributes.len(), 9, "every logfmt field should have landed");
+    expect_allocs("logfmt: parse + merge 1 event", stats, 1);
+}
+
+/// [`fixtures::LOGFMT_ESCAPED_LINE`]'s `query` value contains an escaped quote, so it's the one
+/// value in this line `logfmt.rs`'s `unescape` can't slice -- a real `String` allocation, on
+/// top of whatever `event.attributes`' own merge costs.
+#[test]
+fn logfmt_parse_escaped_value_event() {
+    let mut logfmt = fixtures::logfmt_parser();
+    let resource = fixtures::resource();
+    drop(logfmt.process(&resource, fixtures::logfmt_escaped_event()));
+
+    let event = fixtures::logfmt_escaped_event();
+    let (event, stats) = measure(|| logfmt.process(&resource, event).expect("logfmt forwards"));
+    assert_eq!(event.attributes.len(), 3, "every logfmt field should have landed");
+    expect_allocs("logfmt: parse + merge 1 escaped-value event", stats, 1);
+}
+
+/// `kv`'s mirror of [`logfmt_parse_one_event`]: [`fixtures::KV_LINE`]'s three values are all
+/// `raw.slice(..)`s, no quoting or escaping ever in play for this kind.
+#[test]
+fn kv_parse_one_event() {
+    let mut kv = fixtures::kv_parser();
+    let resource = fixtures::resource();
+    drop(kv.process(&resource, fixtures::kv_event()));
+
+    let event = fixtures::kv_event();
+    let (event, stats) = measure(|| kv.process(&resource, event).expect("kv forwards"));
+    assert_eq!(event.attributes.len(), 3, "every kv field should have landed");
+    expect_allocs("kv: parse + merge 1 event", stats, 0);
+}
+
+/// The zero-copy claim for `logfmt`, stated structurally rather than as an allocation count: an
+/// unquoted value and a quoted-without-escapes value both point *into* the original message
+/// buffer, while the one value with an escaped quote does not (it went through `unescape`, the
+/// only allocating path in this module). If either of the first two regresses to a copy, or the
+/// third stops copying, this is the test that catches it.
+#[test]
+fn logfmt_values_share_the_message_allocation() {
+    let mut logfmt = fixtures::logfmt_parser();
+    let resource = fixtures::resource();
+
+    let message = bytes::Bytes::from_static(fixtures::LOGFMT_LINE.as_bytes());
+    let event = logit_core::Event::log(
+        0,
+        logit_core::AttrMap::new(),
+        logit_core::LogRecord {
+            message: Value::Str(message.clone()),
+            severity: None,
+            body_format: logit_core::BodyFormat::Raw,
+            trace: None,
+        },
+    );
+    let event = logfmt.process(&resource, event).expect("logfmt forwards");
+
+    let Some(Value::Str(status)) = event.attributes.get("status") else {
+        panic!("status should be a Str")
+    };
+    assert!(points_into(&message, status), "an unquoted value should slice the message");
+
+    let Some(Value::Str(msg)) = event.attributes.get("msg") else { panic!("msg should be a Str") };
+    assert!(points_into(&message, msg), "a quoted, escape-free value should slice the message");
+
+    let mut escaped = fixtures::logfmt_parser();
+    let escaped_message = bytes::Bytes::from_static(fixtures::LOGFMT_ESCAPED_LINE.as_bytes());
+    let escaped_event = logit_core::Event::log(
+        0,
+        logit_core::AttrMap::new(),
+        logit_core::LogRecord {
+            message: Value::Str(escaped_message.clone()),
+            severity: None,
+            body_format: logit_core::BodyFormat::Raw,
+            trace: None,
+        },
+    );
+    let escaped_event = escaped.process(&resource, escaped_event).expect("logfmt forwards");
+    let Some(Value::Str(query)) = escaped_event.attributes.get("query") else {
+        panic!("query should be a Str")
+    };
+    assert!(
+        !points_into(&escaped_message, query),
+        "an escaped value must not point into the message -- it was unescaped into a fresh String"
+    );
+}
+
 /// Four metrics attached: one `MetricList` spill (past its single inline slot) and one `bins` Vec
 /// for each of the two single-sample `DDSketch` distributions. That is the cost of describing two
 /// `f64`s -- see `docs/design/memory.md` on `MetricKind::Distribution`.
