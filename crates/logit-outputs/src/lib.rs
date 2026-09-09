@@ -10,5 +10,6 @@ pub mod influxdb;
 pub mod otlp;
 pub mod stdio;
 pub mod syslog;
+mod tls;
 
 pub use logit_pipeline::Output;
