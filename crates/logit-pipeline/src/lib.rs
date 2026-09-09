@@ -9,6 +9,7 @@
 //! knowing about any concrete input/output/transform kind.
 
 pub mod accumulator;
+pub mod disk_queue;
 pub mod fanout;
 pub mod graph;
 pub mod input;
