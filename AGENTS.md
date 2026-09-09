@@ -67,10 +67,14 @@ the demo. The native `logit`-to-`logit` wire format is also real now, not just d
 `logit_proto::native` (`crates/logit-proto/src/frame.rs` + `src/native/`) is a tested
 `Encoder`/`Decoder` -- dictionary-first, hand-rolled, framed by a 24-byte header with CRC-32C and
 optional lz4 -- decided by a four-arm bake-off against `rkyv`, `postcard`, and OTLP itself
-([ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md)). No component uses
-it yet: `ComponentKind::LogitIn`/`LogitOut` remain unimplemented in `graph.rs`'s `is_implemented`,
-pending the connection/handshake layer `docs/design/wire-protocol.md` still describes as future
-work. Config is a flat graph of named components (ADR `component-graph-configuration`,
+([ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md)). The connection
+layer is real now too: `logit_in`/`logit_out` (`crates/logit-inputs/src/logit.rs`/`crates/
+logit-outputs/src/logit.rs`) are implemented, tested `ComponentKind`s -- one TCP (optionally TLS)
+connection, a `Hello`/`HelloAck` version/codec/compression handshake, one native frame per batch
+acknowledged before the next is sent
+([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md)). Not
+yet built: credit-based flow control beyond one frame in flight, and QUIC (`docs/known-gaps.md`).
+Config is a flat graph of named components (ADR `component-graph-configuration`,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively

@@ -661,16 +661,23 @@ datagram. `datagram_copy_is_one_right_sized_allocation` guards the current behav
 
 ### The native wire format (`logit_proto::native`)
 
-Not part of the nginx reference pipeline above — no `ComponentKind` consumes this codec yet
-([ADR `native-wire-format-encoding`](../adr/native-wire-format-encoding.md), `docs/known-gaps.md`)
-— so it gets its own small table rather than a row in §2's chain. One event
-(`fixtures::nginx_batch(1)`), `crates/logit-bench/tests/allocations.rs`'s
-`native_encode_one_event`/`native_decode_one_event`:
+Not part of the nginx reference pipeline above — it's a separate hop, not a stage inside one
+pipeline process — so it gets its own small table rather than a row in §2's chain. Two
+`ComponentKind`s consume this codec now, `logit_out`/`logit_in`
+(`docs/plans/native-transport.md`), each doing slightly less work than the raw
+`NativeEncoder`/`NativeDecoder` pair below: `logit_out` skips `NativeEncoder`'s bundling and calls
+`encode_batch`/`write_frame_with_flags` directly so it can frame with whatever compression this
+connection actually negotiated; `logit_in` has no caller-held scratch buffer to `out.extend` into
+the way `NativeDecoder::decode_into` does, since `Fanout::send` takes the `EventBatch`
+`decode_batch` already returns. One event (`fixtures::nginx_batch(1)`),
+`crates/logit-bench/tests/allocations.rs`:
 
 | Stage | allocs | Notes |
 |---|---:|---|
 | `NativeEncoder::encode`, 1 event | **23** | dictionary build + the per-field TLV scratch buffers `native::record::write_field` allocates for each of `Event`'s up-to-five fields (`docs/adr/native-wire-format-encoding.md`'s own Decision section notes this as a known, unoptimized cost of the field-level skip-unknown framing) |
+| `logit_out`: encode + frame, 1 event | **23** | `encode_batch` + `write_frame_with_flags` directly — same cost as `NativeEncoder::encode` above, since it's the same two steps; pinned separately so a future change to just this sink's path is caught here |
 | `NativeDecoder::decode_into`, 1 event | **8** | dictionary re-intern + `AttrMap`/`Event` construction; no intermediate object graph, unlike the bake-off's `rkyv`/`postcard` arms, which run through a `WireBatch` mirror first (`docs/adr/native-wire-format-encoding.md`'s finding 4) |
+| `logit_in`: read + decode, 1 event | **7** | `read_frame_with_header` + `decode_batch` directly — one allocation cheaper than `NativeDecoder::decode_into` above: no caller-held `Vec<Event>` to `out.extend` into, since `decode_batch`'s own freshly allocated `Vec` is what `Fanout::send` takes as-is |
 
 The full bake-off comparison against `otlp`, `rkyv`, and `postcard` — across two shapes and three
 batch sizes, both timing and encoded bytes — lives in

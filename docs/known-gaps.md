@@ -6,21 +6,6 @@ a `todo!()`/doc-comment pointer at its actual location too, or is cheap enough t
 here. Not a roadmap — see [OVERVIEW.md](OVERVIEW.md) for planned scope; this is specifically things
 already built that have a known, accepted rough edge.
 
-- **The published schema still advertises component kinds the binary can't run.** `schema/
-  logit.schema.json` is generated directly from `ComponentKind` (ADR `config-yaml-jsonschema`), and
-  `crates/logit-config/src/lib.rs` carries unimplemented variants forward deliberately — a config
-  referencing one gets a clear "not implemented yet" from `logit validate`/`logit run` rather than
-  a deserialization error — but the schema has no way to mark a variant "declared, not runnable."
-  A schema-aware editor autocompletes `logfmt:`/`kv:`/`regex:`/`csv:`, or `logit_in:`/`logit_out:`,
-  and the binary then rejects the resulting config. Narrowed by
-  [ADR `routing-by-condition-is-lua`](adr/routing-by-condition-is-lua.md), which removed the five
-  variants (`filter`/`rename`/`sample`/`throttle`/`dedup`) that were unimplemented for no real
-  reason — each is already expressible as a `lua` component — but not closed: `logfmt`, `kv`,
-  `csv`, and `regex` remain declared-and-unimplemented (real future work, tracked as ordinary
-  scope, not a gap of this kind), and `logit_in`/`logit_out` stay published until the native wire
-  protocol exists (the **Native wire protocol** entry below). There is no fix short of implementing
-  each kind or removing it from the enum — the schema can't be hand-annotated independently of
-  `ComponentKind` without reopening the drift ADR `config-yaml-jsonschema` exists to prevent.
 - **Predicate-shaped work (routing by condition, sampling, throttling, dedup) costs a Lua VM, an OS
   thread, and roughly 9× the per-event allocations of a native transform, because `logit` has no
   native predicate language and there's currently no native component for any of those verbs at
@@ -44,15 +29,39 @@ already built that have a known, accepted rough edge.
   through unaggregated rather than fake-merging it
   ([ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)); `logit-outputs::influxdb` errors on it
   rather than writing a wrong encoding.
-- **Native wire protocol: the format is done, the transport isn't.** `crates/logit-proto/src/frame.rs`
-  (framing/compression/CRC) and `crates/logit-proto/src/native/` (the dictionary-first payload
-  codec, `NativeEncoder`/`NativeDecoder`) are real, tested, `Encoder`/`Decoder` implementations —
-  the `rkyv`-vs-hand-rolled encoding choice is decided
-  ([ADR `native-wire-format-encoding`](adr/native-wire-format-encoding.md)). What's still open: no
-  connection/handshake state machine, no credit-based flow control, and `ComponentKind::LogitIn`/
-  `LogitOut` remain unimplemented in `crates/logit-pipeline/src/graph.rs`'s `is_implemented` — a
-  `logit run` config naming either is still rejected. The format existing is what unblocks the two
-  entries directly below.
+- **Native wire protocol: the format and the transport are both done; credit-based flow control,
+  QUIC, and an OTLP passthrough codec aren't.** `crates/logit-proto/src/frame.rs`/`src/native/`
+  (the codec, [ADR `native-wire-format-encoding`](adr/native-wire-format-encoding.md)) and
+  `logit_in`/`logit_out` (the connection layer, [ADR
+  `native-transport-handshake-and-ack`](adr/native-transport-handshake-and-ack.md)) are real,
+  tested, running `ComponentKind`s now. What's left, genuinely open:
+  - **Credit-based flow control (`window` > 1)** — `Hello`/`HelloAck` already negotiate and record
+    a `window`, but the sender only ever has one frame outstanding; several in-flight frames
+    acknowledged out of order needs `logit-pipeline`'s `SinkQueue` to track more than one
+    outstanding batch, a real queue-shape change, not designed yet.
+  - **QUIC** — TCP only today; a plausible later transport upgrade, not attempted.
+  - **An OTLP passthrough codec** — whether the native protocol should carry OTLP-encoded payloads
+    unmodified (a relaying node forwarding OTLP without re-encoding into native) is still an open
+    question, `docs/design/wire-protocol.md`'s own "Open question" section.
+  - **`cargo-fuzz` targets over the decoders** — `crates/logit-proto/tests/robustness.rs`'s seeded
+    mutation suite (truncation, bit flips, inflated lengths, over-depth nesting) covers the same
+    ground a corpus-driven fuzzer would, but needs nightly Rust to build at all
+    (`docs/adr/containerized-development.md`'s stable-only toolchain), so real fuzz targets are
+    deferred, not built.
+  - **`logit_in`'s shutdown grace is fixed at 5s, not operator-tunable** — graph validation's rule
+    17 rejects a `receive:` block on `logit_in` (it isn't a datagram or tail listener), so it
+    always gets `ReceiveConfig::default().shutdown_grace` with no config-level way to change it,
+    even though `LogitInput` (unlike `internal`) genuinely uses that grace to close idle
+    connections cleanly on shutdown. A real gap if a deployment ever needs a different number, not
+    yet a `receive:`-shaped knob.
+  - **`otlp_in` can hold the graph open past shutdown.** Every connection `OtlpInput::run` spawns
+    holds its own `Fanout` clone but the input never overrides `Input::run_until_shutdown` the way
+    `logit_in` now does (`crates/logit-inputs/src/logit.rs`'s own module doc comment) — an idle
+    keep-alive HTTP/gRPC connection at shutdown time can leave its `Fanout` clone open
+    indefinitely, which the cancel-by-drop shutdown mechanism ([ADR
+    `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md)) depends on
+    every listener eventually releasing. Not fixed here — `logit_in`'s design is the pattern to
+    follow when this is addressed.
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`), and
   every sink now sits behind a bounded, byte-aware `SinkQueue`
@@ -73,16 +82,22 @@ already built that have a known, accepted rough edge.
     `logit_proto::native`'s frames are already designed to be independently decodable and
     file-appendable, so a disk-backed `Buffer<T>` over them is real, unblocked follow-up work, not
     designed yet.
-  - **No end-to-end acknowledgement** — delivery is confirmed only as far as the immediate
-    destination accepting the write; nothing tracks whether the data survives past that point. The
-    receive-side loss this used to also name (a UDP listener losing datagrams before anything
-    reaches a buffer) narrowed with ADR `decoupled-listener-io`: a listener now counts every datagram it drops itself
-    (`logit.component.datagrams.dropped`); what remains uncounted is the kernel's own drop, before
-    `logit` ever sees the datagram — see the new kernel-drop-visibility entry below.
-  - **No out-of-order/credit-based acknowledgement** — `SinkQueue` is deliberately in-order and
-    single-in-flight (one queue, one writer, `peek`-then-`commit`-the-head only). Several in-flight
-    batches acknowledged out of order is real future scope for the native wire protocol's
-    credit-based flow control, not built or designed yet.
+  - **No end-to-end acknowledgement — one hop further than before, still not the whole path.**
+    `logit_out`'s `send` only returns success once `logit_in`'s own `Fanout::send` has accepted
+    the batch into every one of *its* downstream inboxes ([ADR
+    `native-transport-handshake-and-ack`](adr/native-transport-handshake-and-ack.md)'s "Ack
+    point" decision) — a real acknowledgement, not just "the write succeeded" the way every other
+    sink here still means it. But that's still only as far as the *next* hop: if `logit_in`
+    forwards on to a further sink (another `logit_out`, an `influxdb_out`, ...), nothing tracks
+    whether the data survives *that* delivery, and a non-`logit_out` sink's own `send` succeeding
+    is still only "the immediate destination accepted the write," never more. The receive-side loss
+    this entry used to also name (a UDP listener losing datagrams before anything reaches a
+    buffer) narrowed with ADR `decoupled-listener-io`: a listener now counts every datagram it
+    drops itself (`logit.component.datagrams.dropped`); what remains uncounted is the kernel's own
+    drop, before `logit` ever sees the datagram — see the kernel-drop-visibility entry below.
+  - **No out-of-order/credit-based acknowledgement** — see the native wire protocol entry above's
+    "Credit-based flow control" bullet; `SinkQueue` is deliberately in-order and single-in-flight
+    (one queue, one writer, `peek`-then-`commit`-the-head only) until that lands.
 - **No visibility into the kernel's own UDP receive-buffer drops.** A listener's `ReceiveQueue`
   ([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md), directly above) counts every datagram *it* drops,
   but a datagram the kernel discards before `recv_from` ever returns it is invisible to `logit`
