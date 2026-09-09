@@ -137,6 +137,10 @@ impl SyslogInput {
 
 #[async_trait::async_trait]
 impl Input for SyslogInput {
+    async fn bind(&mut self) -> anyhow::Result<()> {
+        self.inner.bind().await
+    }
+
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         self.inner.run(sink).await
     }

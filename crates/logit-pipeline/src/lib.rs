@@ -14,6 +14,7 @@ pub mod graph;
 pub mod input;
 pub mod output;
 pub mod queue;
+pub mod readiness;
 pub mod runtime;
 pub mod transform;
 
@@ -25,8 +26,9 @@ pub use queue::{
     BoundedQueue, OverflowPolicy, QueueConfig, QueueMetrics, Queued, SinkQueue, SinkQueueConfig,
     SINK_QUEUE_METRICS,
 };
+pub use readiness::{NodeState, Phase, PipelineState, Readiness};
 pub use runtime::{
     process_batch, run, run_with_shutdown, run_with_telemetry, send_batch, unwrap_batch, NodeSpec,
-    RetryConfig, WriteLoopConfig,
+    RetryConfig, RunError, WriteLoopConfig,
 };
 pub use transform::{FlushOutput, FlushedEvent, Transform};

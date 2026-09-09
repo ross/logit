@@ -89,6 +89,11 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     diag: Diagnostics,
     telemetry: Telemetry,
     watched_dirs: HashSet<PathBuf>,
+    /// Set by [`Tailer::bind`], taken back out by [`Tailer::run_until_shutdown`]
+    /// (`docs/plans/operator-surface.md`, workstream B). `Option`, not a plain field: `Watcher`
+    /// has no meaningful "not yet opened" value, and taking it back out restores the exact local
+    /// variable this loop had before `bind` existed -- see that method's own comment.
+    watcher: Option<super::watch::Watcher>,
 }
 
 impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
@@ -104,6 +109,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             watched_dirs: HashSet::new(),
+            watcher: None,
         }
     }
 
@@ -125,11 +131,24 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         &self.config
     }
 
-    pub async fn run_until_shutdown(
-        &mut self,
-        sink: Fanout,
-        mut shutdown: watch::Receiver<bool>,
-    ) -> anyhow::Result<()> {
+    /// Test-only: how many files this `Tailer` is currently tracking -- lets a test confirm
+    /// [`Tailer::bind`]'s initial scan actually discovered something, without going through a
+    /// full `run_until_shutdown` + `Fanout` round trip just to prove that.
+    #[cfg(test)]
+    pub(crate) fn tracked_len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Loads the checkpoint (if configured), opens the platform watcher, and performs the
+    /// initial directory scan -- everything [`Tailer::run_until_shutdown`] used to do inline
+    /// before this method existed, moved here so `crate::runtime::run_with_telemetry`'s bind
+    /// pre-pass (`docs/plans/operator-surface.md`, workstream B) can do it *before* any task is
+    /// spawned. Idempotent: a second call is a no-op, per [`logit_pipeline::Input::bind`]'s
+    /// contract -- `self.watcher` already being `Some` is how it knows.
+    pub async fn bind(&mut self) -> anyhow::Result<()> {
+        if self.watcher.is_some() {
+            return Ok(());
+        }
         if let Some(checkpoint_path) = self.config.checkpoint_path.clone() {
             let (store, resume) = CheckpointStore::load(checkpoint_path, &mut self.diag);
             self.checkpoint = Some(store);
@@ -144,6 +163,24 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             }
         };
         self.scan(true, &mut watcher).await;
+        self.watcher = Some(watcher);
+        Ok(())
+    }
+
+    pub async fn run_until_shutdown(
+        &mut self,
+        sink: Fanout,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        // `bind` normally already ran, in `run_with_telemetry`'s pre-pass, before this task was
+        // even spawned; a caller driving a `Tailer` directly (this module's own tests,
+        // `spawn_tailer`) gets it here instead -- `Input::bind`'s documented lazy fallback.
+        self.bind().await?;
+        // Back into a local, exactly the shape this loop had before `bind` existed: `watcher` is
+        // borrowed `&mut` by both this `select!` and by `scan`/`reconcile_watches` below, while
+        // `self` is separately borrowed mutably by those same calls -- `take()` keeps every one
+        // of those borrows a plain, direct-field access rather than reaching through `self`.
+        let mut watcher = self.watcher.take().expect("bind() leaves a watcher behind");
 
         let mut next_poll = tokio::time::Instant::now() + self.config.poll_interval;
         let has_flush_interval = !self.config.batching.flush_interval.is_zero();
@@ -785,6 +822,73 @@ mod tests {
                 }
             })
         })
+    }
+
+    // -- workstream B: `Tailer::bind` (docs/plans/operator-surface.md) --
+
+    /// `bind()` performs the initial directory scan on its own, before `run_until_shutdown` is
+    /// ever called -- the same discovery `run_until_shutdown`'s prologue used to do inline.
+    #[tokio::test]
+    async fn bind_discovers_matching_files_before_run() {
+        let dir = scratch_dir("bind-scans-first");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"line one\n").unwrap();
+
+        let mut tailer = Tailer::new(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        assert_eq!(tailer.tracked_len(), 0, "nothing tracked before bind()");
+        tailer.bind().await.expect("bind should succeed");
+        assert_eq!(tailer.tracked_len(), 1, "bind()'s initial scan should have found app.log");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A second `bind()` call is a no-op, per [`logit_pipeline::Input::bind`]'s idempotency
+    /// contract -- it must not re-scan (which could otherwise double-open an already-tracked
+    /// file).
+    #[tokio::test]
+    async fn a_second_bind_is_a_no_op() {
+        let dir = scratch_dir("bind-idempotent");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"line one\n").unwrap();
+
+        let mut tailer = Tailer::new(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        tailer.bind().await.expect("first bind should succeed");
+        tailer.bind().await.expect("second bind should be a harmless no-op");
+        assert_eq!(tailer.tracked_len(), 1, "still exactly one tracked file, not re-scanned");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `run_until_shutdown` still binds on its own when the caller never called `bind()` first --
+    /// [`logit_pipeline::Input::bind`]'s documented lazy fallback, and the reason no existing
+    /// direct-`run_until_shutdown` test in this module needed to change for this workstream.
+    #[tokio::test]
+    async fn run_until_shutdown_binds_when_the_caller_did_not() {
+        let dir = scratch_dir("run-binds-itself");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"line one\n").unwrap();
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let tailer = Tailer::new(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+        let events = expect_events(&mut rx, 1).await;
+        assert_eq!(messages(&events), vec!["line one"]);
+
+        shutdown(shutdown_tx, handle).await;
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

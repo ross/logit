@@ -28,7 +28,10 @@ use logit_outputs::otlp::{
 use logit_outputs::stdio::StreamOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
-use logit_pipeline::{InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
+use logit_pipeline::{
+    InputRuntimeConfig, NodeSpec, Readiness, RetryConfig, RunError, SinkQueueConfig,
+    WriteLoopConfig,
+};
 use logit_proto::frame::Compression as NativeCompression;
 use logit_transforms::{
     Aggregator, CsvParser, DropSignals as DropSignalsTransform, HasSignal as HasSignalTransform,
@@ -53,10 +56,10 @@ use std::sync::Arc;
 /// than lost. A second signal before that drain finishes exits immediately (exit code 130): a
 /// wedged drain must stay killable by the same signal that started it, which matters once an
 /// unattended restart policy is the thing waiting on this process to actually exit.
-pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
+pub async fn run_pipelines(path: PathBuf) -> Result<(), RunError> {
     // An unset `!env` variable (a missing token, most likely) fails here, before anything starts
     // listening.
-    let config = config::load(&path)?;
+    let config = config::load(&path).map_err(RunError::Startup)?;
 
     // `docs/plans/operator-surface.md`'s stable lifecycle event names, for log-based alerting.
     // Logged before `prepare` (which can still reject the config -- an empty graph, an unknown
@@ -72,7 +75,7 @@ pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
     );
 
     let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let (graph, specs, telemetry) = prepare(config, base_dir)?;
+    let (graph, specs, telemetry) = prepare(config, base_dir).map_err(RunError::Startup)?;
 
     // Independent listener from the one `run_with_shutdown` races internally (below) -- multiple
     // concurrent listeners on the same signal kind are supported and all get notified, so this
@@ -84,12 +87,22 @@ pub async fn run_pipelines(path: PathBuf) -> anyhow::Result<()> {
         std::process::exit(130);
     });
 
-    let result =
-        logit_pipeline::run_with_telemetry(graph, specs, telemetry, shutdown_signal()).await;
+    // A `Readiness::disabled()` placeholder until workstream C's `admin:` block wires up the real
+    // channel and hands its receiver to the admin server.
+    let result = logit_pipeline::run_with_telemetry(
+        graph,
+        specs,
+        telemetry,
+        Readiness::disabled(),
+        shutdown_signal(),
+    )
+    .await;
     kill_switch.abort();
     match &result {
         Ok(()) => tracing::info!(target: "logit", code = 0, "exiting"),
-        Err(err) => tracing::error!(target: "logit", code = 1, reason = %err, "exiting"),
+        Err(err) => {
+            tracing::error!(target: "logit", code = err.exit_code(), reason = %err, "exiting")
+        }
     }
     result
 }
@@ -169,7 +182,15 @@ async fn shutdown_signal() {
 #[cfg(test)]
 async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
     let (graph, specs, telemetry) = prepare(config, base_dir)?;
-    logit_pipeline::run_with_telemetry(graph, specs, telemetry, std::future::pending()).await
+    logit_pipeline::run_with_telemetry(
+        graph,
+        specs,
+        telemetry,
+        Readiness::disabled(),
+        std::future::pending(),
+    )
+    .await
+    .map_err(RunError::into_inner)
 }
 
 /// The same checks `logit run` needs before spawning anything, exposed for `logit validate` to
