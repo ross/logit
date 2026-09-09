@@ -28,7 +28,10 @@ use logit_outputs::otlp::{
 use logit_outputs::stdio::StreamOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
-use logit_pipeline::{InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
+use logit_pipeline::{
+    DiskQueueConfig, InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, SinkStoreConfig,
+    WriteLoopConfig,
+};
 use logit_proto::frame::Compression as NativeCompression;
 use logit_transforms::{
     Aggregator, CsvParser, DropSignals as DropSignalsTransform, HasSignal as HasSignalTransform,
@@ -358,7 +361,7 @@ fn build_spec(
                     .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                     .with_telemetry(telemetry.clone()),
             ),
-            queue_config(&component.buffer),
+            queue_config(&component.buffer, base_dir),
             write_config(&component.buffer),
         ),
         OtlpOut { endpoint, protocol, headers, paths, compression, tls } => {
@@ -371,7 +374,7 @@ fn build_spec(
                 .with_tls(&to_tls_client_settings(tls), base_dir)?;
             NodeSpec::Output(
                 Box::new(output),
-                queue_config(&component.buffer),
+                queue_config(&component.buffer, base_dir),
                 write_config(&component.buffer),
             )
         }
@@ -392,7 +395,7 @@ fn build_spec(
             let output = output.with_format(to_stream_encoder(*format, *compression));
             NodeSpec::Output(
                 Box::new(output.with_telemetry(telemetry.clone())),
-                queue_config(&component.buffer),
+                queue_config(&component.buffer, base_dir),
                 write_config(&component.buffer),
             )
         }
@@ -404,7 +407,7 @@ fn build_spec(
                 .with_telemetry(telemetry.clone());
             NodeSpec::Output(
                 Box::new(output),
-                queue_config(&component.buffer),
+                queue_config(&component.buffer, base_dir),
                 write_config(&component.buffer),
             )
         }
@@ -443,7 +446,7 @@ fn build_spec(
                 .with_telemetry(telemetry.clone());
             NodeSpec::Output(
                 Box::new(output),
-                queue_config(&component.buffer),
+                queue_config(&component.buffer, base_dir),
                 write_config(&component.buffer),
             )
         }
@@ -453,16 +456,28 @@ fn build_spec(
     Ok((spec, telemetry))
 }
 
-/// Builds a sink's `SinkQueueConfig` from its `BufferConfig` (`docs/adr/buffered-sink-delivery.md`,
-/// workstream F) -- the sole place `logit_config::OverflowPolicy` is converted to
-/// `logit_pipeline::OverflowPolicy`, since neither config nor pipeline crate can see both types
-/// without violating the dependency direction (`logit-pipeline` depends on `logit-config`, never
-/// the reverse; `docs/design/pipeline-graph.md`'s crate layout).
-fn queue_config(buffer: &BufferConfig) -> SinkQueueConfig {
-    SinkQueueConfig {
-        max_batches: buffer.max_batches,
-        max_bytes: buffer.max_bytes,
-        overflow: overflow_policy(buffer.overflow),
+/// Builds a sink's `SinkStoreConfig` from its `BufferConfig` (`docs/adr/buffered-sink-delivery.md`
+/// / `docs/adr/disk-backed-sink-buffer.md`) -- the sole place `logit_config::OverflowPolicy` is
+/// converted to `logit_pipeline::OverflowPolicy`, since neither config nor pipeline crate can see
+/// both types without violating the dependency direction (`logit-pipeline` depends on
+/// `logit-config`, never the reverse; `docs/design/pipeline-graph.md`'s crate layout).
+/// `buffer.disk` present selects `SinkStoreConfig::Disk`; `path` is resolved against `base_dir`
+/// exactly like `StdioTarget::Path`/`FileOut::path` above.
+fn queue_config(buffer: &BufferConfig, base_dir: &Path) -> SinkStoreConfig {
+    match &buffer.disk {
+        None => SinkStoreConfig::Memory(SinkQueueConfig {
+            max_batches: buffer.max_batches,
+            max_bytes: buffer.max_bytes,
+            overflow: overflow_policy(buffer.overflow),
+        }),
+        Some(disk) => SinkStoreConfig::Disk(DiskQueueConfig {
+            dir: base_dir.join(&disk.path),
+            max_bytes: disk.max_bytes,
+            segment_bytes: disk.segment_bytes,
+            overflow: overflow_policy(buffer.overflow),
+            compression: to_native_compression(disk.compression),
+            checkpoint_interval: disk.checkpoint_interval,
+        }),
     }
 }
 
@@ -1252,6 +1267,7 @@ mod tests {
                 retry_budget: Duration::from_secs(120),
                 retry_max_delay: Duration::from_secs(20),
                 shutdown_grace: Duration::from_secs(10),
+                disk: None,
             },
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
@@ -1263,10 +1279,13 @@ mod tests {
                 token: "test-token".to_string(),
             },
         };
-        let NodeSpec::Output(_, queue_config, write_config) =
+        let NodeSpec::Output(_, store_config, write_config) =
             build_spec("out", &component, Path::new(""), None).unwrap().0
         else {
             panic!("expected NodeSpec::Output");
+        };
+        let SinkStoreConfig::Memory(queue_config) = store_config else {
+            panic!("expected SinkStoreConfig::Memory, buffer.disk was None");
         };
         assert_eq!(queue_config.max_batches, 4096);
         assert_eq!(queue_config.max_bytes, 128 * 1024 * 1024);
@@ -1283,6 +1302,45 @@ mod tests {
             write_config.delivery_override,
             Some(logit_pipeline::DeliveryPosture::AtLeastOnce)
         );
+    }
+
+    #[test]
+    fn build_spec_wires_a_disk_buffer_into_a_sinkstoreconfig_disk_with_the_path_resolved_against_base_dir(
+    ) {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig {
+                disk: Some(logit_config::DiskBufferConfig {
+                    path: "spool".to_string(),
+                    max_bytes: 2 * 1024 * 1024 * 1024,
+                    segment_bytes: 128 * 1024 * 1024,
+                    compression: logit_config::Compression::Lz4,
+                    checkpoint_interval: Duration::from_secs(5),
+                }),
+                ..logit_config::BufferConfig::default()
+            },
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::InfluxDbOut {
+                url: "http://localhost:8086".to_string(),
+                org: "org".to_string(),
+                bucket: "bucket".to_string(),
+                token: "test-token".to_string(),
+            },
+        };
+        let NodeSpec::Output(_, store_config, _) =
+            build_spec("out", &component, Path::new("/etc/logit"), None).unwrap().0
+        else {
+            panic!("expected NodeSpec::Output");
+        };
+        let SinkStoreConfig::Disk(disk_config) = store_config else {
+            panic!("expected SinkStoreConfig::Disk, buffer.disk was Some");
+        };
+        assert_eq!(disk_config.dir, Path::new("/etc/logit/spool"));
+        assert_eq!(disk_config.max_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(disk_config.segment_bytes, 128 * 1024 * 1024);
+        assert_eq!(disk_config.compression, NativeCompression::Lz4);
+        assert_eq!(disk_config.checkpoint_interval, Duration::from_secs(5));
     }
 
     #[test]

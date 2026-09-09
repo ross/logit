@@ -1156,6 +1156,14 @@ pub struct BufferConfig {
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub shutdown_grace: Duration,
+    /// Disk-backed durable buffering, opt-in (`docs/adr/disk-backed-sink-buffer.md`). `None` (the
+    /// default) is today's in-memory `SinkQueue`, unchanged. `Some(_)` replaces it -- not sizes
+    /// beside it -- with a disk spool at `DiskBufferConfig::path`; graph validation
+    /// (`crates/logit-pipeline/src/graph.rs` rule 34) rejects `max_batches`/`max_bytes` at
+    /// anything but their defaults alongside it, since disk replaces the in-memory bound rather
+    /// than sharing it.
+    #[serde(default)]
+    pub disk: Option<DiskBufferConfig>,
 }
 
 impl Default for BufferConfig {
@@ -1168,8 +1176,59 @@ impl Default for BufferConfig {
             retry_budget: Duration::from_secs(60),
             retry_max_delay: Duration::from_secs(10),
             shutdown_grace: Duration::from_secs(5),
+            disk: None,
         }
     }
+}
+
+/// Disk-backed durable buffering for one sink's delivery queue -- opt-in via `buffer.disk:`
+/// (`docs/adr/disk-backed-sink-buffer.md`). Its mere presence turns disk backing on for that
+/// sink, mirroring [`TlsServerConfig`]'s "presence is the on-switch" precedent: `path` has no
+/// sensible default, so (like `TlsServerConfig::cert_file`/`key_file`) it stays a plain required
+/// field -- this struct deliberately carries no container-level `#[serde(default)]`, only
+/// per-field defaults on everything else, so an omitted `path` is a clear deserialize error
+/// rather than a silently empty one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DiskBufferConfig {
+    /// The spool directory, resolved against the config file's own directory like every other
+    /// path in this schema (`crates/logit-cli/src/pipeline.rs`). Two sinks may not share one
+    /// (graph rule 34).
+    pub path: String,
+    /// Bound on the sum of on-disk segment sizes -- replaces `BufferConfig::max_bytes`'s role,
+    /// not sized alongside it.
+    #[serde(default = "default_disk_max_bytes")]
+    #[serde(with = "human_bytes")]
+    #[schemars(with = "String")]
+    pub max_bytes: u64,
+    /// A soft rotation trigger, not a hard cap: the active segment rotates once it already
+    /// exceeds this, so a single record larger than it still lands whole in a fresh segment.
+    #[serde(default = "default_segment_bytes")]
+    #[serde(with = "human_bytes")]
+    #[schemars(with = "String")]
+    pub segment_bytes: u64,
+    /// `logit_proto::native`'s per-frame compression, mirrored here for the same
+    /// crate-layout reason [`Compression`] itself exists.
+    #[serde(default)]
+    pub compression: Compression,
+    /// How often the read cursor is persisted during ordinary operation (also forced on segment
+    /// rotation and at shutdown, regardless of this interval).
+    #[serde(default = "default_disk_checkpoint_interval")]
+    #[serde(with = "humantime_serde_duration")]
+    #[schemars(with = "String")]
+    pub checkpoint_interval: Duration,
+}
+
+fn default_disk_max_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
+fn default_segment_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_disk_checkpoint_interval() -> Duration {
+    Duration::from_secs(1)
 }
 
 /// What a sink's `SinkQueue` does once both its bounds (`max_batches`/`max_bytes`) are full.
@@ -2346,6 +2405,61 @@ mod tests {
         assert_eq!(component.buffer.retry_budget, Duration::from_secs(120));
         assert_eq!(component.buffer.retry_max_delay, Duration::from_secs(20));
         assert_eq!(component.buffer.shutdown_grace, Duration::from_secs(10));
+        assert_eq!(component.buffer.disk, None);
+    }
+
+    #[test]
+    fn a_fully_specified_disk_block_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086",
+                "org": "org", "bucket": "bucket", "token": "TOKEN",
+                "buffer": {"disk": {"path": "spool", "max_bytes": "2GiB",
+                           "segment_bytes": "128MiB", "compression": "lz4",
+                           "checkpoint_interval": "5s"}}}"#,
+        )
+        .unwrap();
+        let disk = component.buffer.disk.expect("disk block should be present");
+        assert_eq!(disk.path, "spool");
+        assert_eq!(disk.max_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(disk.segment_bytes, 128 * 1024 * 1024);
+        assert_eq!(disk.compression, Compression::Lz4);
+        assert_eq!(disk.checkpoint_interval, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_disk_block_with_only_path_defaults_every_other_field() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086",
+                "org": "org", "bucket": "bucket", "token": "TOKEN",
+                "buffer": {"disk": {"path": "spool"}}}"#,
+        )
+        .unwrap();
+        let disk = component.buffer.disk.expect("disk block should be present");
+        assert_eq!(disk.path, "spool");
+        assert_eq!(disk.max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(disk.segment_bytes, 64 * 1024 * 1024);
+        assert_eq!(disk.compression, Compression::None);
+        assert_eq!(disk.checkpoint_interval, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_disk_block_missing_path_is_rejected() {
+        let result: Result<Component, _> = serde_json::from_str(
+            r#"{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086",
+                "org": "org", "bucket": "bucket", "token": "TOKEN",
+                "buffer": {"disk": {}}}"#,
+        );
+        assert!(result.is_err(), "a disk block with no path should be rejected");
+    }
+
+    #[test]
+    fn an_unknown_field_under_disk_is_rejected() {
+        let result: Result<Component, _> = serde_json::from_str(
+            r#"{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086",
+                "org": "org", "bucket": "bucket", "token": "TOKEN",
+                "buffer": {"disk": {"path": "spool", "bogus_field": 1}}}"#,
+        );
+        assert!(result.is_err(), "an unknown disk field should be rejected");
     }
 
     #[test]
