@@ -30,9 +30,10 @@ use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
 use logit_transforms::{
     Aggregator, DropSignals as DropSignalsTransform, HasSignal as HasSignalTransform, JsonParser,
-    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, KvMetrics as KvMetricsTransform,
-    MatchMode as TransformMatchMode, RegexParser, Remove as RemoveTransform,
-    Scale as ScaleTransform, Set as SetTransform, SignalSet, SpanLift,
+    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, Kv as KvTransform,
+    KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
+    RegexParser, Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform,
+    SignalSet, SpanLift,
     TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
@@ -281,6 +282,16 @@ fn build_spec(
         Json { skip_to_brace } => NodeSpec::Transform(Box::new(
             JsonParser::new(*skip_to_brace)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
+        )),
+        Logfmt { bare_keys } => NodeSpec::Transform(Box::new(
+            LogfmtTransform::new(*bare_keys)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
+        )),
+        Kv { pair_sep, kv_sep, bare_keys } => NodeSpec::Transform(Box::new(
+            KvTransform::new(pair_sep.clone(), kv_sep.clone(), *bare_keys)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
         )),
         KvMetrics { counters, gauges, distributions } => NodeSpec::Transform(Box::new(
             KvMetricsTransform::new(
@@ -1211,6 +1222,40 @@ mod tests {
             write_config.delivery_override,
             Some(logit_pipeline::DeliveryPosture::AtLeastOnce)
         );
+    }
+
+    #[test]
+    fn build_spec_builds_a_logfmt_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Logfmt { bare_keys: false },
+        };
+        assert!(matches!(
+            build_spec("parse", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_kv_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Kv {
+                pair_sep: "&".to_string(),
+                kv_sep: "=".to_string(),
+                bare_keys: false,
+            },
+        };
+        assert!(matches!(
+            build_spec("parse", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
     }
 
     #[test]

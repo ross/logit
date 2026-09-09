@@ -23,8 +23,10 @@ opt-in `span:` block, turning an access log line into a real `SpanRecord` on the
 [ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md)), `scale` (multiplying
 named numeric attributes by a constant factor,
 [ADR `scale-transform`](docs/adr/scale-transform.md)), `has_signal`, `keep_signals`,
-`drop_signals`, and `regex` (named capture groups into attributes, replacing a `lua` component in
-`demo/logit.yaml`'s postgres tier, [ADR `regex-transform`](docs/adr/regex-transform.md))
+`drop_signals`, `logfmt`, and `kv` (the de-facto `key=value` parsers,
+[ADR `logfmt-and-kv-parsing`](docs/adr/logfmt-and-kv-parsing.md)), and `regex` (named capture
+groups into attributes, replacing a `lua` component in `demo/logit.yaml`'s postgres tier,
+[ADR `regex-transform`](docs/adr/regex-transform.md))
 (`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises the syslog/InfluxDB
 side together against a real nginx (`examples/nginx/`), and

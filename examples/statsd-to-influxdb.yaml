@@ -4,11 +4,12 @@
 #
 # Config is a flat graph of components (docs/design/pipeline-graph.md,
 # docs/adr/component-graph-configuration.md): each names its own `sources`, rather than
-# sitting in a fixed inputs/transforms/outputs pipeline. `aggregate` is the only implemented
-# built-in transform so far (docs/adr/aggregation-window-semantics.md) -- `logit run` rejects
-# a config referencing any other unimplemented kind with a clear error. `token: !env
-# INFLUXDB_TOKEN` below pulls the token from the environment rather than inlining a secret in the
-# file (docs/adr/env-yaml-tag.md) -- any field on any component can use `!env` the same way.
+# sitting in a fixed inputs/transforms/outputs pipeline. `aggregate` (docs/adr/
+# aggregation-window-semantics.md) is one of several implemented built-in transforms today --
+# `logit run` rejects a config referencing a still-unimplemented kind (docs/known-gaps.md) with a
+# clear error. `token: !env INFLUXDB_TOKEN` below pulls the token from the environment rather than
+# inlining a secret in the file (docs/adr/env-yaml-tag.md) -- any field on any component can use
+# `!env` the same way.
 components:
   statsd_in:
     type: statsd_in
