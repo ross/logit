@@ -874,6 +874,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "logit-config",
  "logit-core",
  "logit-inputs",

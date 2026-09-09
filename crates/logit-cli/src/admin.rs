@@ -14,6 +14,7 @@ use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use logit_pipeline::readiness::{NodeState, Phase, PipelineState};
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -29,38 +30,54 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 /// the 16 connection slots forever. Generous for a same-host probe.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Serves `/readyz`/`/healthz` off `readiness` on an already-bound `listener`, until `shutdown`
-/// flips. Takes a bound listener, not a `bind` address, so the caller
+/// How long the accept loop pauses after an `accept()` failure that is not one client's own
+/// accident -- fd exhaustion (`EMFILE`/`ENFILE`) is the realistic case, and it neither clears
+/// instantly nor persists forever. Long enough that a sustained one cannot spin a core; short
+/// enough that a probe arriving just after it clears is not noticeably delayed.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Serves `/readyz`/`/healthz` off `readiness` on an already-bound `listener`, for as long as the
+/// process lives. Takes a bound listener, not a `bind` address, so the caller
 /// (`logit-cli::pipeline::run_pipelines`) can bind *synchronously* and map a failure there to
 /// `RunError::Startup` before spawning anything else -- mirroring `Input::bind`'s own pre-pass,
 /// rather than duplicating a second bind-then-serve wrapper nothing else calls. Spawned alongside
-/// the existing kill-switch task, and aborted the same way once the pipeline itself returns.
-pub async fn serve_on(
-    listener: TcpListener,
-    readiness: watch::Receiver<PipelineState>,
-    mut shutdown: watch::Receiver<bool>,
-) -> anyhow::Result<()> {
+/// the existing kill-switch task, and aborted the same way once the pipeline itself returns --
+/// deliberately the *only* teardown. A shutdown signal must **not** close this port: the drain it
+/// starts is precisely the window `/readyz` exists to answer `503 draining` in
+/// (`docs/plans/operator-surface.md`), and a closed port during that window is
+/// indistinguishable, to any orchestrator, from a process that crashed.
+///
+/// Returns nothing, rather than `anyhow::Result<()>`: no failure here has anywhere to go. A
+/// failed `accept()` is logged and retried (below), and the caller only ever `abort()`s this
+/// task -- never joins it -- so an `Err` return would vanish unread instead of being reported.
+pub async fn serve_on(listener: TcpListener, readiness: watch::Receiver<PipelineState>) {
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
-        // Every arm below produces a plain value with no `.await` inside it -- deliberately: an
-        // arm that awaits something *after* `shutdown.wait_for(..)` has already been offered as a
-        // sibling branch makes the whole `select!` hold a `tokio::sync::watch::Ref` (a lock
-        // guard, not `Send`) live across that further await, which `tokio::spawn`'s `Send` bound
-        // then rejects at compile time -- the same hazard
-        // `crates/logit-inputs/src/tail/driver.rs`'s own `run_until_shutdown` documents. Doing the
-        // actual async work (acquiring a permit, spawning) below, after `select!` has already
-        // resolved, sidesteps it entirely.
-        enum Next {
-            Accepted(tokio::net::TcpStream),
-            Shutdown,
-        }
-        let next = tokio::select! {
-            accepted = listener.accept() => Next::Accepted(accepted?.0),
-            _ = shutdown.wait_for(|&due| due) => Next::Shutdown,
-        };
-        let stream = match next {
-            Next::Accepted(stream) => stream,
-            Next::Shutdown => return Ok(()),
+        let stream = match listener.accept().await {
+            Ok((stream, _peer)) => stream,
+            Err(err) => {
+                // One failed `accept()` must never end this loop. This task's `JoinHandle` is
+                // only ever aborted, never awaited, so returning here would take the admin
+                // endpoint down permanently and *silently* -- turning a healthy process into an
+                // endless restart loop under any orchestrator polling `/readyz`, with no
+                // diagnostic trail at all. `ConnectionAborted`/`ConnectionReset`/`Interrupted`
+                // are one client's own accident (it hung up between SYN and accept; a signal
+                // interrupted the syscall) and cost nothing to retry immediately. Anything else
+                // -- `EMFILE`/`ENFILE` under fd pressure being the realistic case -- is a
+                // process-wide condition that clears on its own timescale, so it gets a short
+                // pause first; without one, a sustained fd exhaustion spins this loop hot
+                // against a listener that stays readable and keeps failing.
+                tracing::warn!(target: "logit", error = %err, "admin: accept failed");
+                if !matches!(
+                    err.kind(),
+                    ErrorKind::ConnectionAborted
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::Interrupted
+                ) {
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                }
+                continue;
+            }
         };
 
         // Acquired *after* accept, same reasoning as `otlp_in`'s own accept loop: the kernel's
@@ -83,17 +100,21 @@ async fn handle(
     req: http::Request<hyper::body::Incoming>,
     readiness: watch::Receiver<PipelineState>,
 ) -> Result<http::Response<Full<Bytes>>, std::convert::Infallible> {
-    let head_only = match *req.method() {
-        Method::GET => false,
-        Method::HEAD => true,
-        _ => return Ok(text_response(StatusCode::NOT_FOUND, "not found", false)),
-    };
+    // `HEAD` routes exactly like `GET`, and the full body is built either way: hyper's own HTTP/1
+    // server suppresses a HEAD response's body bytes on the wire while still deriving
+    // `content-length` from the body it was handed -- which is precisely RFC 9110 §9.3.2's "the
+    // same header fields that would have been sent to a GET". Handing it an empty body instead
+    // suppresses the header entirely, so `HEAD /readyz` and `GET /readyz` disagree about a length
+    // the client is entitled to trust.
+    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+        return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
+    }
     let json = req.uri().query().is_some_and(|q| q.split('&').any(|kv| kv == "format=json"));
 
     Ok(match req.uri().path() {
-        "/readyz" => readyz_response(&readiness.borrow(), json, head_only),
-        "/healthz" => healthz_response(json, head_only),
-        _ => text_response(StatusCode::NOT_FOUND, "not found", head_only),
+        "/readyz" => readyz_response(&readiness.borrow(), json),
+        "/healthz" => healthz_response(json),
+        _ => text_response(StatusCode::NOT_FOUND, "not found"),
     })
 }
 
@@ -109,26 +130,22 @@ fn readyz_wire(phase: Phase) -> (StatusCode, &'static str) {
     }
 }
 
-fn readyz_response(
-    snapshot: &PipelineState,
-    json: bool,
-    head_only: bool,
-) -> http::Response<Full<Bytes>> {
+fn readyz_response(snapshot: &PipelineState, json: bool) -> http::Response<Full<Bytes>> {
     let (status, word) = readyz_wire(snapshot.phase);
     if json {
-        json_response(status, snapshot_json(word, snapshot), head_only)
+        json_response(status, snapshot_json(word, snapshot))
     } else {
-        text_response(status, word, head_only)
+        text_response(status, word)
     }
 }
 
 /// Always `200 ok`: this only proves the admin task itself can answer (the tokio runtime is
 /// alive), deliberately not the pipeline's own state -- that's `/readyz`'s job.
-fn healthz_response(json: bool, head_only: bool) -> http::Response<Full<Bytes>> {
+fn healthz_response(json: bool) -> http::Response<Full<Bytes>> {
     if json {
-        json_response(StatusCode::OK, serde_json::json!({"status": "ok"}), head_only)
+        json_response(StatusCode::OK, serde_json::json!({"status": "ok"}))
     } else {
-        text_response(StatusCode::OK, "ok", head_only)
+        text_response(StatusCode::OK, "ok")
     }
 }
 
@@ -154,26 +171,19 @@ fn node_state_wire(state: NodeState) -> String {
     state.as_str().to_string()
 }
 
-fn text_response(status: StatusCode, body: &str, head_only: bool) -> http::Response<Full<Bytes>> {
-    let bytes = if head_only { Bytes::new() } else { Bytes::copy_from_slice(body.as_bytes()) };
+fn text_response(status: StatusCode, body: &str) -> http::Response<Full<Bytes>> {
     http::Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
-        .body(Full::new(bytes))
+        .body(Full::new(Bytes::copy_from_slice(body.as_bytes())))
         .expect("a well-formed response always builds")
 }
 
-fn json_response(
-    status: StatusCode,
-    body: serde_json::Value,
-    head_only: bool,
-) -> http::Response<Full<Bytes>> {
-    let text = body.to_string();
-    let bytes = if head_only { Bytes::new() } else { Bytes::copy_from_slice(text.as_bytes()) };
+fn json_response(status: StatusCode, body: serde_json::Value) -> http::Response<Full<Bytes>> {
     http::Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(Full::new(bytes))
+        .body(Full::new(Bytes::from(body.to_string())))
         .expect("a well-formed response always builds")
 }
 
@@ -203,13 +213,6 @@ mod tests {
         assert_eq!(value["status"], "ok");
         assert_eq!(value["components"]["a"], "running");
         assert!(value["since"].as_str().unwrap().ends_with('Z'), "since should be RFC3339 UTC");
-    }
-
-    #[test]
-    fn text_response_with_head_only_has_an_empty_body_but_the_same_status() {
-        let full = text_response(StatusCode::OK, "ok", false);
-        let head = text_response(StatusCode::OK, "ok", true);
-        assert_eq!(full.status(), head.status());
     }
 
     // `serve_on`/`handle`'s routing and permit logic, driven end to end over real TCP sockets --
@@ -245,8 +248,7 @@ mod tests {
     struct Server {
         addr: String,
         readiness: Readiness,
-        _shutdown_tx: watch::Sender<bool>,
-        handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+        handle: tokio::task::JoinHandle<()>,
     }
 
     async fn spawn_server() -> Server {
@@ -258,9 +260,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let (readiness, rx) = Readiness::channel();
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let handle = tokio::spawn(serve_on(listener, rx, shutdown_rx));
-        Server { addr, readiness, _shutdown_tx: shutdown_tx, handle }
+        let handle = tokio::spawn(serve_on(listener, rx));
+        Server { addr, readiness, handle }
     }
 
     #[tokio::test]
@@ -323,14 +324,33 @@ mod tests {
         server.handle.abort();
     }
 
+    /// RFC 9110 §9.3.2: a `HEAD` response carries the header fields a `GET` would have sent --
+    /// `content-length` included, naming the length of the body the `GET` *would* have returned
+    /// -- while sending no body bytes at all. hyper's own HTTP/1 encoder does the suppression
+    /// (`can_have_body(HEAD, ..)` forces a zero-length encoder) off the *real* body it is handed,
+    /// which is why `handle` builds the full body for `HEAD` and lets hyper drop it.
     #[tokio::test]
-    async fn head_mirrors_get_with_an_empty_body() {
+    async fn head_mirrors_gets_headers_and_sends_no_body() {
         let server = spawn_server().await;
         server.readiness.begin(&[]);
         server.readiness.ready();
-        let (code, _head, body) = request_raw(&server.addr, "HEAD", "/readyz").await;
-        assert_eq!(code, 200);
-        assert_eq!(body, "", "HEAD must return no body");
+
+        let (get_code, get_head, get_body) = request_raw(&server.addr, "GET", "/readyz").await;
+        let (head_code, head_head, head_body) = request_raw(&server.addr, "HEAD", "/readyz").await;
+
+        assert_eq!(get_body, "ok");
+        assert_eq!(head_code, get_code);
+        assert_eq!(head_body, "", "HEAD must return no body");
+
+        fn content_length(head: &str) -> Option<String> {
+            head.lines()
+                .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+                .and_then(|line| line.split_once(':'))
+                .map(|(_, value)| value.trim().to_string())
+        }
+        assert_eq!(content_length(&head_head), content_length(&get_head));
+        assert_eq!(content_length(&head_head).as_deref(), Some("2"), "the length `ok` would be");
+
         server.handle.abort();
     }
 

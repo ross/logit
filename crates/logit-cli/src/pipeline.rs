@@ -93,23 +93,21 @@ pub async fn run_pipelines(path: PathBuf) -> Result<(), RunError> {
     // guarantee `Input::bind`'s own pre-pass gives every ordinary listener. Not set: the
     // `Readiness::disabled()` placeholder every test and every config without an `admin:` block
     // already uses.
-    let (readiness, admin_tasks) = match admin_bind {
+    let (readiness, admin_server) = match admin_bind {
         Some(bind) => {
             let listener = tokio::net::TcpListener::bind(&bind)
                 .await
                 .with_context(|| format!("admin: binding '{bind}'"))
                 .map_err(RunError::Startup)?;
             let (readiness, readiness_rx) = Readiness::channel();
-            // Its own independent shutdown listener, same reasoning as `kill_switch` above --
-            // multiple concurrent `shutdown_signal()` calls are supported and all fire together.
-            let (admin_shutdown_tx, admin_shutdown_rx) = tokio::sync::watch::channel(false);
-            let admin_shutdown_driver = tokio::spawn(async move {
-                shutdown_signal().await;
-                let _ = admin_shutdown_tx.send(true);
-            });
-            let admin_server =
-                tokio::spawn(crate::admin::serve_on(listener, readiness_rx, admin_shutdown_rx));
-            (readiness, Some((admin_server, admin_shutdown_driver)))
+            // Deliberately *not* given a shutdown listener of its own. The drain that a signal
+            // starts is exactly the window `/readyz` has to answer `503 draining` in -- several
+            // seconds of sink flush and listener grace (`buffer.shutdown_grace`,
+            // `receive.shutdown_grace`) during which an orchestrator must be told "stop routing
+            // here, I am still finishing", not handed a refused connection it cannot tell from a
+            // crash. `abort()` below, once `run_with_telemetry` has already returned, is the sole
+            // teardown.
+            (readiness, Some(tokio::spawn(crate::admin::serve_on(listener, readiness_rx))))
         }
         None => (Readiness::disabled(), None),
     };
@@ -118,9 +116,8 @@ pub async fn run_pipelines(path: PathBuf) -> Result<(), RunError> {
         logit_pipeline::run_with_telemetry(graph, specs, telemetry, readiness, shutdown_signal())
             .await;
     kill_switch.abort();
-    if let Some((admin_server, admin_shutdown_driver)) = admin_tasks {
+    if let Some(admin_server) = admin_server {
         admin_server.abort();
-        admin_shutdown_driver.abort();
     }
     match &result {
         Ok(()) => tracing::info!(target: "logit", code = 0, "exiting"),
