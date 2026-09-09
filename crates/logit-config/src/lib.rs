@@ -522,6 +522,34 @@ pub enum ComponentKind {
     DropSignals {
         signals: Vec<Signal>,
     },
+    /// Parses a log record's message as logfmt (`level=info msg="hello world" dur=3ms`), merging
+    /// the resulting key/values into the event's attributes. Additive and pass-through-on-failure,
+    /// exactly like `json`. See `docs/adr/logfmt-and-kv-parsing.md`.
+    Logfmt {
+        /// Treat a token with no `=` as a boolean-true flag (`cached` -> `cached: true`), the
+        /// Heroku logfmt convention. **Off by default**: a bareword promotes an arbitrary input
+        /// token into attribute-key position, and every attribute key is interned into a
+        /// process-global table that never shrinks -- so a timestamp-prefixed line
+        /// (`2026/09/07 12:00:00 level=info ...`) would leak two never-repeating interner entries
+        /// per line. Turn it on only for a source that genuinely emits flags.
+        #[serde(default)]
+        bare_keys: bool,
+    },
+    /// Parses a log record's message as literal `key<kv_sep>value` pairs separated by `pair_sep`
+    /// (`a=1&b=2`, `a: 1, b: 2`) -- no quoting and no escapes, unlike `logfmt`. Both separators are
+    /// required: defaulting them to `" "`/`"="` would make a bare `kv` silently mis-parse quoted
+    /// logfmt, and `logfmt` is the right component for that shape anyway.
+    Kv {
+        /// Separator between one pair and the next. Whitespace around each key and value is
+        /// always trimmed, so `", "` and `","` behave the same on `a=1, b=2`.
+        pair_sep: String,
+        /// Separator between a key and its value, within one pair. The **first** occurrence in a
+        /// segment splits it, so `a=b=c` yields `a` -> `b=c`.
+        kv_sep: String,
+        /// See `Logfmt::bare_keys` -- identical rule, identical default.
+        #[serde(default)]
+        bare_keys: bool,
+    },
     // The rest of the built-in native parsers -- not implemented yet (`logit-transforms`), carried
     // over as unimplemented `ComponentKind` variants so config referencing one gets a clear "not
     // implemented yet" at validation time rather than a deserialization error. `filter`/`rename`/
@@ -531,8 +559,6 @@ pub enum ComponentKind {
     // building a second, native way to say the same thing wasn't worth it yet. Referencing one of
     // those five kinds is now a deserialization error naming the valid kinds, not a graph-
     // validation "not implemented" -- see the ADR's Consequences for why that trade was accepted.
-    Logfmt,
-    Kv,
     Regex {
         pattern: String,
     },

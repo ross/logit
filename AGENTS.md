@@ -22,8 +22,10 @@ opt-in `span:` block, turning an access log line into a real `SpanRecord` on the
 [ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md)/
 [ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md)), `scale` (multiplying
 named numeric attributes by a constant factor,
-[ADR `scale-transform`](docs/adr/scale-transform.md)), `has_signal`, `keep_signals`, and
-`drop_signals` (`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —
+[ADR `scale-transform`](docs/adr/scale-transform.md)), `has_signal`, `keep_signals`,
+`drop_signals`, `logfmt`, and `kv` (the de-facto `key=value` parsers,
+[ADR `logfmt-and-kv-parsing`](docs/adr/logfmt-and-kv-parsing.md))
+(`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises the syslog/InfluxDB
 side together against a real nginx (`examples/nginx/`), and
 [docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside
