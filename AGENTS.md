@@ -16,14 +16,20 @@ something that looks broken — it's likely a documented, deliberate gap, not an
 Lua enrichment stage, InfluxDB 2.x out, via `logit run <config>` (see
 [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml), `script/server`). Since then,
 `syslog_in`, `stdio_out`, `otlp_in`, and `otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`,
-`crates/logit-proto`'s `otlp` codec) and `json`, `kv_metrics`, `keep`, `remove`, `set`,
+`crates/logit-proto`'s `otlp` codec) and `json`, `csv` (delimiter-separated columns into
+attributes from a config-declared, positional schema -- no header-row mode,
+[ADR `csv-positional-columns`](docs/adr/csv-positional-columns.md)), `kv_metrics`, `keep`, `remove`, `set`,
 `trace_context` (giving a `LogRecord` a native application trace/span reference and, with an
 opt-in `span:` block, turning an access log line into a real `SpanRecord` on the same event,
 [ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md)/
 [ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md)), `scale` (multiplying
 named numeric attributes by a constant factor,
-[ADR `scale-transform`](docs/adr/scale-transform.md)), `has_signal`, `keep_signals`, and
-`drop_signals` (`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —
+[ADR `scale-transform`](docs/adr/scale-transform.md)), `has_signal`, `keep_signals`,
+`drop_signals`, `logfmt`, and `kv` (the de-facto `key=value` parsers,
+[ADR `logfmt-and-kv-parsing`](docs/adr/logfmt-and-kv-parsing.md)), and `regex` (named capture
+groups into attributes, replacing a `lua` component in `demo/logit.yaml`'s postgres tier,
+[ADR `regex-transform`](docs/adr/regex-transform.md))
+(`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises the syslog/InfluxDB
 side together against a real nginx (`examples/nginx/`), and
 [docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside
@@ -224,7 +230,7 @@ crates/
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, syslog
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, logfmt, kv, regex
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
 ```

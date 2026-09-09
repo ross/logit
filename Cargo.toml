@@ -104,6 +104,19 @@ webpki-roots = "1"
 # Already present transitively (via `mio`) at this exact version -- a direct, Linux-only dependency
 # on it adds no new crate version to the graph.
 libc = "0.2.189"
+# The `regex` transform's engine (docs/adr/regex-transform.md) --
+# `crates/logit-transforms/src/regex.rs`'s matching, and `crates/logit-pipeline/src/graph.rs`'s
+# validation rule, which compiles the configured pattern at `logit validate` time so an invalid
+# one is a config error, not a run-time surprise. Genuinely new to the shipped graph, unlike
+# `socket2`/`libc`/the rustls stack above: it adds `regex`, `regex-automata`, `regex-syntax`, and
+# `aho-corasick` (`memchr` is already here via `serde_json`). `regex-lite` is in Cargo.lock today
+# only as a dev-dependency of `divan` (logit-bench, which ships in nothing), so picking it would
+# not have been a promotion either -- the ADR records why the full engine's lazy DFA and literal
+# prefilters were worth three extra crates on a per-event hot path. Pure Rust and MIT OR
+# Apache-2.0 throughout, so ADR `containerized-development`'s "no host toolchain needed" holds
+# and deny.toml's allowlist covers it (`aho-corasick`'s `Unlicense OR MIT` resolves through MIT,
+# exactly as the already-present `memchr` does) -- script/audit confirms, not assumes.
+regex = "1"
 
 [profile.release]
 lto = true
