@@ -133,13 +133,23 @@ impl Readiness {
         self.0.borrow().clone()
     }
 
-    /// `phase = Starting`, every id in `ids` set to [`NodeState::Pending`]. Called once, before
-    /// the first bind.
+    /// Every id in `ids` set to [`NodeState::Pending`]. Called once, before the first bind --
+    /// `run_with_telemetry` calls it before it spawns anything that could write here.
+    ///
+    /// It does **not** set `phase`: `phase` is already [`Phase::Starting`] by construction
+    /// ([`PipelineState::default`], which both constructors above start from), so the only thing
+    /// assigning it could ever do is move an *already advanced* phase backwards -- erasing a
+    /// drain (and its `since`) that a concurrent writer had just recorded, and letting
+    /// [`Readiness::ready`] then promote the run to `Ready` as if nothing had happened. Like
+    /// every other method here, the rule lives in this method rather than in its caller's
+    /// ordering (see this module's own doc comment); `since` moves only while the phase is still
+    /// the `Starting` this seeding belongs to.
     pub fn begin(&self, ids: &[String]) {
         self.0.send_modify(|state| {
-            state.phase = Phase::Starting;
             state.components = ids.iter().map(|id| (id.clone(), NodeState::Pending)).collect();
-            state.since = SystemTime::now();
+            if state.phase == Phase::Starting {
+                state.since = SystemTime::now();
+            }
         });
     }
 
@@ -223,6 +233,40 @@ mod tests {
         readiness.failed();
         readiness.draining();
         assert_eq!(readiness.snapshot().phase, Phase::Failed, "draining() must not undo failed");
+    }
+
+    /// `begin` is the one update method that isn't a transition -- it seeds the component list --
+    /// so it must leave `phase` alone rather than resetting it to `Starting`. `run_with_telemetry`
+    /// calls it before it spawns anything that could write here, but the rule lives here, in the
+    /// method, not in that caller's statement order (this module's own doc comment): a caller that
+    /// got the order wrong would otherwise erase a drain, `since` and all, and `ready()` would
+    /// then promote the run to `Ready` as though shutdown had never begun.
+    #[test]
+    fn begin_seeds_components_without_moving_the_phase_backwards() {
+        let (readiness, _rx) = Readiness::channel();
+        readiness.draining();
+        let drained_at = readiness.snapshot().since;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        readiness.begin(&["a".to_string()]);
+        let snapshot = readiness.snapshot();
+        assert_eq!(snapshot.phase, Phase::Draining, "begin() must not undo draining");
+        assert_eq!(snapshot.since, drained_at, "begin() must not move a drain's `since`");
+        assert_eq!(
+            snapshot.components.get("a"),
+            Some(&NodeState::Pending),
+            "begin() must still seed the component list whatever the phase"
+        );
+        readiness.ready();
+        assert_eq!(
+            readiness.snapshot().phase,
+            Phase::Draining,
+            "a phase begin() left alone must still be one ready() refuses to promote"
+        );
+
+        let (readiness, _rx) = Readiness::channel();
+        readiness.failed();
+        readiness.begin(&[]);
+        assert_eq!(readiness.snapshot().phase, Phase::Failed, "begin() must not undo failed");
     }
 
     #[test]
