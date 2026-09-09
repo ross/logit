@@ -455,9 +455,17 @@ Worked examples, one per shipped component:
   runtime.rs`) — its `reason` tag is imprecise for a filter, same as for `keep`/`remove`, but
   fixing that tag is out of scope here. No `Diagnostics` on any of the three — nothing about
   matching or clearing a fixed signal set can fail.
-- `stdio_out` (`crates/logit-outputs/src/stdio.rs`): `logit.output.batch.bytes` — direct parity
-  with `influxdb_out`'s own batch-bytes metric. Also has no `Diagnostics` (a write error
-  propagates as a hard failure today, with no `warn_throttled` call site to bridge).
+- `stdio_out`/`file_out` (`StreamOutput`, `crates/logit-outputs/src/stdio.rs`): both built on the
+  same sink (ADR `rotating-file-output`), so both share `logit.output.batch.bytes` — direct parity
+  with `influxdb_out`'s own batch-bytes metric. A write error still propagates as a hard failure
+  today, with no `warn_throttled` call site to bridge for that — but `file_out`'s rotation adds two
+  keys neither kind needed before: `logit.output.file.rotations` (count, one per successful
+  rotation) and, via `Diagnostics::warn_throttled`, `logit.component.diagnostics
+  {key="rotate_failure"|"retention_failure"}` (`crates/logit-outputs/src/file.rs::FileTarget::
+  rotate` — renaming the active file to `.1` failed and continues writing the current file, or a
+  retained file's own delete/rename in the cascade failed and was skipped, respectively). Neither
+  key can ever fire for a `stdio_out` target or an unrotated `file_out` (`RotatePolicy::never()`),
+  since `should_rotate` never returns `true` under that policy.
 - `lua`/`lua_file` (`crates/logit-script`, `crates/logit-pipeline/src/runtime.rs::run_lua`):
   `logit.script.vm.memory` (the Lua VM's own `used_memory()`, the strongest single signal of a
   leaking stateful script) and `logit.script.events.emitted{outcome}`, both from the Rust side —

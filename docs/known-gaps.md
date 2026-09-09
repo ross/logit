@@ -542,12 +542,37 @@ already built that have a known, accepted rough edge.
   Being a separate, opt-in component (rather than a flag on `syslog_in`) is the point: it keeps the
   listener's contract simple and honest, and makes "we trust our senders' clocks" a visible line in
   the config graph rather than a default nobody remembers choosing.
-- **`stdio_out` has no rotation, no reopen, and no user-controlled format** — a file target is
-  opened once, in append mode, and held for the process's lifetime: an external log rotator that
-  moves the file leaves `logit` writing to the unlinked inode until restart (there is no
-  SIGHUP-reopen). The output format is fixed; a user-supplied `format:` template is designed for
-  (the encoder is built around a `Format` enum) but not implemented. Both are acceptable for a
-  debugging/dev-loop sink, which is what this is for.
+- **`stdio_out` has no reopen and no user-controlled format** — a file target is opened once, in
+  append mode, and held for the process's lifetime: an external log rotator that moves the file
+  leaves `logit` writing to the unlinked inode until restart (there is no SIGHUP-reopen). The
+  output format is fixed; a user-supplied `format:` template is designed for (the encoder is built
+  around a `Format` enum) but not implemented. Both are acceptable for a debugging/dev-loop sink,
+  which is what this is for — `file_out` (ADR `rotating-file-output`) is the sink to reach for when
+  a file target needs to be bounded, sharing `stdio_out`'s implementation but adding a rotation
+  policy.
+- **`file_out` rotates and retains by count, but has no SIGHUP/external-rotator reopen, no
+  compression, no `max_age`, no timestamped rotated-file naming, and its time-based rotation is
+  write-triggered rather than boundary-triggered** (ADR `rotating-file-output`). An external tool
+  rotating a `file_out`-managed file out from under it hits the same unlinked-inode gap `stdio_out`
+  already has — `file_out` only ever rotates a file itself opened, never re-checks whether the path
+  it holds still names the same inode. Rotated files are always named with a numbered suffix
+  (`.1`, `.2`, ...), never a timestamp, and an idle sink under a calendar `interval` rolls on its
+  *next* write after the boundary, not at the boundary itself (the rolled file's *contents* are
+  still exactly the previous period's, only its on-disk appearance is delayed). Retention is a
+  plain `max_files` count; there is no age-based eviction and no built-in compression of rotated
+  files, both left to an external tool. `format:` is inherited from `stdio_out` — the same fixed
+  human-readable render, with the same `Format::Ndjson`-shaped extension point left unbuilt.
+  `FileTarget::open` seeds `RotationState`'s calendar period from an existing file's own mtime (not
+  just `written` from its length), so a restart under an `interval` policy correctly picks up
+  mid-period rather than merging two periods' events into one file or silently never rotating —
+  the residual is an unreadable mtime (a failed `metadata()` call) or a backwards clock jump across
+  the restart, either of which falls back to the pre-seeding behavior (period learned fresh on the
+  first write after open). Rotation is commit-point-first: the active file is renamed to a
+  transient staging path before anything retained is touched, so a rename failure leaves the active
+  file unrotated-and-growing with every retained file completely untouched (not the destructive
+  cascade-before-rename order this replaced), and a `.rotating` staging file orphaned by a process
+  killed between that rename and its promotion is picked up and promoted to `.1` on the very next
+  rotation, never silently lost.
 - **A pathological Host header can truncate the syslog-bound JSON line -- but nginx's own header-size
   limit turns out to make that hard to actually trigger.** The example's lean `access_json_syslog`
   `log_format` (`examples/nginx/nginx.conf`) sizes its fixed fields well under nginx's syslog
@@ -752,7 +777,7 @@ already built that have a known, accepted rough edge.
   *is* the mechanism a `dyn Trait` object uses to return a future of unknown, implementer-varying
   size — not an artifact of `async_trait`'s codegen specifically. A real fix means giving up `dyn
   Output` for this call: either enum dispatch over the small, closed set of concrete `Output`
-  kinds this project ships (`StdioOutput`/`InfluxDbOutput`/...), matched rather than boxed, so
+  kinds this project ships (`StreamOutput`/`InfluxDbOutput`/...), matched rather than boxed, so
   each variant's `async fn` compiles to its own real, unboxed future; or making the runtime
   generic per node over a concrete `Output` type, which loses the config-driven dynamic
   construction (`Box<dyn Output + Send>` built from a running config, `crates/logit-cli/src/pipeline.rs`)

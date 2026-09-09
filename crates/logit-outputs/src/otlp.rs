@@ -67,7 +67,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Which OTLP wire transport this sink speaks. Mirrors `logit_config::OtlpProtocol` -- this crate
 /// doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), so
 /// `logit-cli::pipeline::build_spec` translates one into the other at construction time, the same
-/// way it already turns `StdioTarget` into calls on `StdioOutput`'s own constructors.
+/// way it already turns `StdioTarget` into calls on `StreamOutput`'s own constructors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtlpTransport {
     Http,

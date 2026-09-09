@@ -3617,7 +3617,7 @@ mod tests {
         );
     }
 
-    /// A sink whose `send` always fails with no `Fault` attached at all -- e.g. `StdioOutput`'s
+    /// A sink whose `send` always fails with no `Fault` attached at all -- e.g. `StreamOutput`'s
     /// bare I/O errors. `classify` still defaults this to `Permanent` for retry purposes (never
     /// retry an error the sink didn't recognize), but it must never be mistaken for a positively
     /// identified configuration error that should end the process.

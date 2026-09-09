@@ -5,6 +5,7 @@
 //! (`docs/design/pipeline-graph.md`'s "Crate layout" section) -- see `logit-inputs`'s crate doc
 //! comment for the same reasoning.
 
+pub mod file;
 pub mod influxdb;
 pub mod otlp;
 pub mod stdio;

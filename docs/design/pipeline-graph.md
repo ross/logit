@@ -162,7 +162,7 @@ the tag's literal argument string instead of failing.
 |---|---|---|
 | Listener (`statsd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
-| Sink (`influxdb_out`, `stdio_out`, `otlp_out`, `logit_out`) | ≥1 required | must not be |
+| Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
 considered and rejected (ADR `component-graph-configuration`): a typo'd source reference would silently turn a real sink into
@@ -286,15 +286,21 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     rejected — `poll_interval`/`checkpoint_interval` at `0s` would busy-loop (the same reasoning
     as rule 9's zero `interval`), and `max_line_bytes: 0` would drop every line
     (`docs/adr/file-tailing-and-docker-json-logs.md`).
-29. A `kv` with an empty `pair_sep` or `kv_sep`, with `pair_sep == kv_sep`, or with a `kv_sep`
+29. A `file_out` whose `rotate:` block sets neither `max_bytes` nor `interval` is rejected — that
+    would silently never rotate at all, and `stdio_out` already covers the deliberate never-rotate
+    case, so this is a config error rather than a quiet no-op. `rotate.max_bytes: 0` (every batch
+    would rotate) and `rotate.max_files: 0` (would delete the file it just rotated) are each an
+    impossible bound, the same "0 is impossible, not just small" instinct as rules 9/15/18/28
+    (`docs/adr/rotating-file-output.md`).
+30. A `kv` with an empty `pair_sep` or `kv_sep`, with `pair_sep == kv_sep`, or with a `kv_sep`
     that *contains* `pair_sep`, is rejected — each is a certain no-op or a certain garbage result
     (`docs/adr/logfmt-and-kv-parsing.md`). `logfmt` needs no rule of its own: past `bare_keys`,
     its only field is a `bool`, which can't be malformed.
-30. A `regex` with an empty `field` name, a `pattern` that fails to compile, or a `pattern` that
+31. A `regex` with an empty `field` name, a `pattern` that fails to compile, or a `pattern` that
     declares no named capture group, is rejected — the first is the usual "empty is useless" case,
     the second can only ever be a config mistake, and the third can only ever be a no-op
     (`docs/adr/regex-transform.md`).
-31. A `csv` with an empty `columns` list, an empty column name, or a duplicate column name is
+32. A `csv` with an empty `columns` list, an empty column name, or a duplicate column name is
     rejected (the "can only ever be a no-op" and "a repeated entry silently doubles" rules again,
     the latter applied to columns instead of sources), as is a `delimiter` that is `"` (RFC
     4180's quote character), `\n`/`\r` (already consumed as line framing by every input), or

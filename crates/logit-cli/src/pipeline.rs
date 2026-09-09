@@ -19,12 +19,13 @@ use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_inputs::tail::TailInput;
+use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::otlp::{
     OtlpCompression as OtlpOutCompression, OtlpOutput, OtlpTransport as OtlpOutTransport,
     SignalPaths,
 };
-use logit_outputs::stdio::StdioOutput;
+use logit_outputs::stdio::StreamOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{InputRuntimeConfig, NodeSpec, RetryConfig, SinkQueueConfig, WriteLoopConfig};
@@ -375,8 +376,8 @@ fn build_spec(
         }
         StdioOut { target } => {
             let output = match target {
-                StdioTarget::Stdout => StdioOutput::stdout(),
-                StdioTarget::Stderr => StdioOutput::stderr(),
+                StdioTarget::Stdout => StreamOutput::stdout(),
+                StdioTarget::Stderr => StreamOutput::stderr(),
                 // Resolved against `base_dir` (the config file's own directory), exactly as
                 // `LuaFile { lua_file, .. }` resolves its script path above -- `Path::join`
                 // leaves an already-absolute `path` untouched, so this is correct whether `path`
@@ -385,10 +386,21 @@ fn build_spec(
                 // /etc/logit/config.yaml` run from an unrelated directory silently writes
                 // somewhere other than "next to the config" (what this kind's own doc comment
                 // promises).
-                StdioTarget::Path(path) => StdioOutput::open_path(base_dir.join(path))?,
+                StdioTarget::Path(path) => StreamOutput::open_path(base_dir.join(path))?,
             };
             NodeSpec::Output(
                 Box::new(output.with_telemetry(telemetry.clone())),
+                queue_config(&component.buffer),
+                write_config(&component.buffer),
+            )
+        }
+        FileOut { path, rotate } => {
+            // Resolved against `base_dir`, exactly as `StdioTarget::Path` above.
+            let output = StreamOutput::rotating(base_dir.join(path), to_rotate_policy(rotate))?
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            NodeSpec::Output(
+                Box::new(output),
                 queue_config(&component.buffer),
                 write_config(&component.buffer),
             )
@@ -404,7 +416,7 @@ fn build_spec(
             max_message_bytes,
             connect_timeout,
         } => {
-            // Eager for UDP (a bad local bind is a config error, `StdioOutput::open_path`'s
+            // Eager for UDP (a bad local bind is a config error, `StreamOutput::open_path`'s
             // precedent) -- requires an active tokio runtime, which holds here since `build_spec`
             // only ever runs from inside `logit run`'s `runtime.block_on` (`main.rs`), never from
             // `validate`/`graph`. Lazy for TCP -- see `logit_outputs::syslog::Conn`'s doc comment.
@@ -490,6 +502,24 @@ fn to_otlp_compression(compression: logit_config::OtlpCompression) -> OtlpOutCom
     match compression {
         logit_config::OtlpCompression::None => OtlpOutCompression::None,
         logit_config::OtlpCompression::Gzip => OtlpOutCompression::Gzip,
+    }
+}
+
+/// The sole place `logit_config::RotateConfig` crosses into `logit_outputs::file::RotatePolicy`
+/// -- `logit-outputs` never depends on `logit-config` (`docs/design/pipeline-graph.md`'s crate
+/// layout), the same reason `overflow_policy`/`delivery_posture`/`syslog_format` exist.
+fn to_rotate_policy(cfg: &logit_config::RotateConfig) -> RotatePolicy {
+    RotatePolicy {
+        max_bytes: cfg.max_bytes,
+        interval: cfg.interval.map(to_rotate_interval),
+        max_files: cfg.max_files,
+    }
+}
+
+fn to_rotate_interval(interval: logit_config::RotateInterval) -> OutputRotateInterval {
+    match interval {
+        logit_config::RotateInterval::Hourly => OutputRotateInterval::Hourly,
+        logit_config::RotateInterval::Daily => OutputRotateInterval::Daily,
     }
 }
 
@@ -1356,6 +1386,73 @@ mod tests {
         // reason `logit-pipeline::graph`'s tests have their own `expect_err` helper.
         let path = std::env::temp_dir().join("logit-build-spec-no-such-dir").join("x.log");
         let component = stdio_out_component(StdioTarget::Path(path.display().to_string()));
+        let err = match build_spec("tap", &component, Path::new(""), None) {
+            Ok(_) => panic!("expected build_spec to fail for an unopenable path"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:?}").contains(&path.display().to_string()), "got: {err:?}");
+    }
+
+    fn file_out_component(path: &str, rotate: logit_config::RotateConfig) -> ResolvedComponent {
+        ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::FileOut { path: path.to_string(), rotate },
+        }
+    }
+
+    fn size_rotate_config() -> logit_config::RotateConfig {
+        logit_config::RotateConfig { max_bytes: Some(1024), interval: None, max_files: 5 }
+    }
+
+    #[test]
+    fn build_spec_builds_a_file_out_sink() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("logit-build-spec-file-out-test-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let component = file_out_component(&path.display().to_string(), size_rotate_config());
+        assert!(matches!(
+            build_spec("tap", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A *relative* `path:` must resolve against the config file's own directory (`base_dir`),
+    /// exactly as `StdioTarget::Path` already does -- see
+    /// `build_spec_resolves_a_relative_stdio_target_against_the_config_base_dir` above.
+    #[test]
+    fn build_spec_resolves_a_relative_file_out_path_against_the_config_base_dir() {
+        let base_dir = std::env::temp_dir()
+            .join(format!("logit-build-spec-file-out-base-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&base_dir).expect("base_dir should be creatable");
+        let relative = "relative-events.log";
+        let expected_path = base_dir.join(relative);
+        let _ = std::fs::remove_file(&expected_path);
+
+        let component = file_out_component(relative, size_rotate_config());
+        assert!(matches!(
+            build_spec("tap", &component, &base_dir, None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+        assert!(
+            expected_path.exists(),
+            "expected the relative path to be created inside base_dir ({}), not the process cwd",
+            base_dir.display()
+        );
+
+        std::fs::remove_file(&expected_path).ok();
+        std::fs::remove_dir(&base_dir).ok();
+    }
+
+    #[test]
+    fn build_spec_reports_a_clear_path_naming_error_for_an_unopenable_file_out_target() {
+        let path = std::env::temp_dir().join("logit-build-spec-file-out-no-such-dir").join("x.log");
+        let component = file_out_component(&path.display().to_string(), size_rotate_config());
         let err = match build_spec("tap", &component, Path::new(""), None) {
             Ok(_) => panic!("expected build_spec to fail for an unopenable path"),
             Err(err) => err,
