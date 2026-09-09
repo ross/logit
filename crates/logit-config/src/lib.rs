@@ -309,8 +309,24 @@ pub enum ComponentKind {
         #[serde(flatten)]
         tail: TailOptions,
     },
-    /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
-    LogitIn { bind: String },
+    /// The native logit-to-logit protocol -- one TCP (optionally TLS) listener accepting many
+    /// connections, each speaking `Hello`/`HelloAck`/`Ack`/`Reject`
+    /// (`docs/design/wire-protocol.md`'s connection protocol).
+    LogitIn {
+        bind: String,
+        /// Terminates TLS on this listener when present; plaintext when omitted. No ALPN --
+        /// unlike `otlp_in`, this isn't an HTTP-shaped protocol with anything for a client to
+        /// negotiate down to. See [`TlsServerConfig`].
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        /// Caps the size (post- and pre-decompression alike) of a single frame this listener
+        /// accepts, echoed to every connecting client in `HelloAck.max_frame_bytes`. Defaults to
+        /// 64 MiB (`logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN`); rule 34 rejects a value of
+        /// `0` or over that ceiling.
+        #[serde(default, with = "human_bytes::option")]
+        #[schemars(with = "Option<String>")]
+        max_frame_bytes: Option<u64>,
+    },
     /// `logit` talking about itself: drains every component's buffered self-telemetry points on
     /// `interval` and emits them as ordinary events into the graph, same as any other listener.
     /// Named for the source, not the signal it emits today -- free to grow logs and spans later
@@ -630,8 +646,28 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: TlsClientConfig,
     },
-    /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
-    LogitOut { endpoint: String },
+    /// The native logit-to-logit protocol -- the mirror of [`ComponentKind::LogitIn`]: one TCP
+    /// (optionally TLS) connection, one native frame per batch, one `Ack` before that batch
+    /// counts as delivered.
+    LogitOut {
+        /// `host:port`. Resolved at connect time, never at config-load time -- the same
+        /// `syslog_out` precedent: a `logit_out` pointed at a peer that isn't up yet is not a
+        /// config error.
+        endpoint: String,
+        /// Offered in this sink's `Hello`; the peer may still negotiate it down to `none` if it
+        /// doesn't support `lz4`.
+        #[serde(default)]
+        compression: Compression,
+        /// Turns on TLS for this connection when present -- presence turns it on, unlike
+        /// `otlp_out` (whose `endpoint` has a scheme to select TLS from): a bare `host:port` has
+        /// no scheme to read that signal from. See [`TlsClientConfig`].
+        #[serde(default)]
+        tls: Option<TlsClientConfig>,
+        /// Connect, handshake, and per-batch ack-wait timeout, all sharing this one knob.
+        #[serde(default = "default_logit_out_request_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        request_timeout: Duration,
+    },
     /// A general-purpose, human-facing debug sink: dumps every event's details as a readable text
     /// block to stdout (default), stderr, or a file -- the dev loop for seeing a whole pipeline's
     /// output without standing up a real backend like InfluxDB.
@@ -848,6 +884,12 @@ fn default_max_retained_gauge_series() -> usize {
 /// hand if this ever changes.
 fn default_syslog_connect_timeout() -> Duration {
     Duration::from_secs(5)
+}
+
+/// Mirrors `logit_outputs::logit::DEFAULT_TIMEOUT` -- can't reference it directly, same reason
+/// as [`default_syslog_connect_timeout`].
+fn default_logit_out_request_timeout() -> Duration {
+    Duration::from_secs(10)
 }
 
 fn default_trace_id_field() -> String {
@@ -2104,6 +2146,75 @@ mod tests {
                 assert_eq!(tls.client_ca_file, None);
             }
             other => panic!("expected OtlpIn with tls set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logit_in_defaults_tls_to_none_and_max_frame_bytes_to_none() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "logit_in", "bind": "0.0.0.0:5140"}"#).unwrap();
+        match component.kind {
+            ComponentKind::LogitIn { bind, tls, max_frame_bytes } => {
+                assert_eq!(bind, "0.0.0.0:5140");
+                assert_eq!(tls, None);
+                assert_eq!(max_frame_bytes, None);
+            }
+            other => panic!("expected LogitIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logit_in_with_tls_and_max_frame_bytes_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "logit_in", "bind": "0.0.0.0:5140",
+                "tls": {"cert_file": "server.pem", "key_file": "server.key"},
+                "max_frame_bytes": "32MiB"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::LogitIn { tls: Some(tls), max_frame_bytes, .. } => {
+                assert_eq!(tls.cert_file, "server.pem");
+                assert_eq!(tls.key_file, "server.key");
+                assert_eq!(max_frame_bytes, Some(32 * 1024 * 1024));
+            }
+            other => panic!("expected LogitIn with tls and max_frame_bytes set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logit_out_defaults_compression_tls_and_request_timeout() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "logit_out", "sources": ["in"], "endpoint": "central:5140"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::LogitOut { endpoint, compression, tls, request_timeout } => {
+                assert_eq!(endpoint, "central:5140");
+                assert_eq!(compression, Compression::None);
+                assert_eq!(tls, None);
+                assert_eq!(request_timeout, Duration::from_secs(10));
+            }
+            other => panic!("expected LogitOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logit_out_with_compression_tls_and_request_timeout_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "logit_out", "sources": ["in"], "endpoint": "central:5140",
+                "compression": "lz4",
+                "tls": {"insecure_skip_verify": true},
+                "request_timeout": "30s"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::LogitOut { compression, tls: Some(tls), request_timeout, .. } => {
+                assert_eq!(compression, Compression::Lz4);
+                assert!(tls.insecure_skip_verify);
+                assert_eq!(tls.ca_file, None);
+                assert_eq!(request_timeout, Duration::from_secs(30));
+            }
+            other => panic!("expected LogitOut with tls set, got {other:?}"),
         }
     }
 

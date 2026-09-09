@@ -308,6 +308,14 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 33. `stdio_out`/`file_out`'s `compression:` is rejected whenever set to anything but `none` under
     the default `format: human` — it would silently do nothing, since compression is
     `NativeEncoder`'s own knob (`docs/adr/file-output-native-format.md`).
+34. A `logit_out` `tls:` block: `cert_file`/`key_file` must be set together, and
+    `insecure_skip_verify` together with `ca_file` is contradictory — the same two checks rule 24
+    makes for `otlp_out`'s `tls:` block, minus its third (scheme-based) check: `logit_out`'s
+    `endpoint` is a bare `host:port` with no scheme to read a TLS signal from, so `tls:`'s mere
+    presence is the only signal and always turns TLS on. And a `logit_in` `max_frame_bytes`, when
+    set, must be nonzero and at or under 64 MiB — `logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN`,
+    the ceiling `read_frame`/`read_frame_with_header` themselves enforce regardless of what a
+    listener configures.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that
