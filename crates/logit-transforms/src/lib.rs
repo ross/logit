@@ -3,15 +3,16 @@
 //! `logit_pipeline::Transform`, letting the node runtime run it as an ordinary tokio task (no
 //! dedicated OS thread, unlike a Lua component -- `docs/design/pipeline-graph.md`'s "Node kinds"
 //! section). `aggregate`, `json`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`,
-//! `has_signal`, `keep_signals`, `drop_signals`, `logfmt`, and `kv` are implemented so far; more
-//! (`regex`, `csv`, `rename`, `filter`, `sample`, `throttle`, `dedup`) are expected to land here
-//! too.
+//! `has_signal`, `keep_signals`, `drop_signals`, `logfmt`, `kv`, and `regex` are implemented so
+//! far; `csv` is expected to land here too (`rename`/`filter`/`sample`/`throttle`/`dedup` were
+//! retired rather than landing -- `docs/adr/routing-by-condition-is-lua.md`).
 
 mod aggregate;
 mod json;
 mod keep;
 mod kv_metrics;
 mod logfmt;
+mod regex;
 mod scale;
 mod set;
 mod signals;
@@ -24,6 +25,7 @@ pub use json::JsonParser;
 pub use keep::{Keep, Remove};
 pub use kv_metrics::{KvMetrics, MetricSpec};
 pub use logfmt::{Kv, Logfmt};
+pub use regex::RegexParser;
 pub use scale::Scale;
 pub use set::Set;
 pub use signals::{DropSignals, HasSignal, KeepSignals, MatchMode, SignalSet};

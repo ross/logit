@@ -32,8 +32,8 @@ use logit_transforms::{
     Aggregator, DropSignals as DropSignalsTransform, HasSignal as HasSignalTransform, JsonParser,
     Keep as KeepTransform, KeepSignals as KeepSignalsTransform, Kv as KvTransform,
     KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
-    Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform, SignalSet, SpanLift,
-    TraceContext as TraceContextTransform,
+    RegexParser, Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform,
+    SignalSet, SpanLift, TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -327,6 +327,12 @@ fn build_spec(
         Scale { fields } => NodeSpec::Transform(Box::new(
             ScaleTransform::new(fields.iter().map(|(k, v)| (k.clone(), *v)).collect())
                 .with_telemetry(telemetry.clone()),
+        )),
+        // The `?` here is unreachable in practice: `graph::resolve`'s rule 29 already compiled
+        // this exact pattern successfully, so `RegexParser::new` can only fail on a pattern
+        // validation let through -- which it doesn't.
+        Regex { pattern, field } => NodeSpec::Transform(Box::new(
+            RegexParser::new(pattern, field.as_deref())?.with_telemetry(telemetry.clone()),
         )),
         HasSignal { signals, mode } => NodeSpec::Transform(Box::new(
             HasSignalTransform::new(to_signal_set(signals), to_match_mode(*mode))
@@ -1564,6 +1570,24 @@ mod tests {
             Some(logit_core::Value::F64(v)) => assert!((v - 12.0).abs() < 1e-9, "got {v}"),
             other => panic!("expected a scaled F64, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_spec_builds_a_regex_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Regex {
+                pattern: r"status=(?P<status>\d+)".to_string(),
+                field: None,
+            },
+        };
+        assert!(matches!(
+            build_spec("regex", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
     }
 
     #[test]

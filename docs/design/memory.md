@@ -204,6 +204,9 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `logfmt` parse + merge (go-kit-style, 9 fields) | **1** | hand-rolled scanner, zero-copy by construction -- see `docs/adr/logfmt-and-kv-parsing.md`; the one allocation is `event.attributes` spilling its inline capacity, same shape as `json`'s |
 | `logfmt` parse + merge (1 escaped-quote value) | **1** | + 1 realloc; the escaped value is the only path `unescape` can't slice -- `shrink_to_fit` before the final `Bytes::from` keeps that a `realloc` of the already-paid-for buffer rather than a second `alloc` (see "Fixtures" below); 3 fields fit inline, so nothing else allocates |
 | `kv` parse + merge (`a=1&b=2&c=hello`) | **0** | 3 fields fit inline, no quoting/escaping to ever allocate |
+| `regex` capture into an inline map (3 named groups, empty-attrs event) | **0** | `captures_read` + `haystack.slice` -- zero-copy, no spill |
+| `regex` parse 1 event (sshd shape, 3 captures onto 6 existing `syslog.*` attrs) | **1** | spills past `AttrMap`'s 8-entry inline capacity |
+| `regex` no match, 1 event | **0** | nothing written, nothing allocated |
 | `kv_metrics` derive 4 metrics | **3** | `MetricList` spill + one `bins` Vec per sketch |
 | `keep` filter to 3 attrs | **0** | 3 attributes fit inline |
 | `set` through `process_batch`, attributes only | **1** | `process_batch`'s own `Vec::with_capacity` -- `map_resource` returns `None` immediately, same as `keep` |

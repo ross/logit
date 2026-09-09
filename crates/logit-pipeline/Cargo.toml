@@ -15,6 +15,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 # `test-util` (for `tokio::time::pause`/`#[tokio::test(start_paused = true)]`) only needs to be
