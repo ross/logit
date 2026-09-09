@@ -16,4 +16,5 @@
 //! names the command that reproduces it.
 
 pub mod alloc;
+pub mod bakeoff;
 pub mod fixtures;

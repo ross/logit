@@ -201,6 +201,15 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `statsd_in` decode 1 sampled distribution line (`@0.1`, 10 weighted samples) | **3** | same as unsampled -- `DdSketch::add_weighted` delegates to `add_with_count`, O(1) and zero extra allocations regardless of weight |
 | `json` parse + merge (nginx shape) | **1** | fixed -- see below, was 7 |
 | `json` parse + merge (wide-JSON, 28 keys) | **1** | same fix, confirmed to generalize past a small field count |
+| `logfmt` parse + merge (go-kit-style, 9 fields) | **1** | hand-rolled scanner, zero-copy by construction -- see `docs/adr/logfmt-and-kv-parsing.md`; the one allocation is `event.attributes` spilling its inline capacity, same shape as `json`'s |
+| `logfmt` parse + merge (1 escaped-quote value) | **1** | + 1 realloc; the escaped value is the only path `unescape` can't slice -- `shrink_to_fit` before the final `Bytes::from` keeps that a `realloc` of the already-paid-for buffer rather than a second `alloc` (see "Fixtures" below); 3 fields fit inline, so nothing else allocates |
+| `kv` parse + merge (`a=1&b=2&c=hello`) | **0** | 3 fields fit inline, no quoting/escaping to ever allocate |
+| `regex` capture into an inline map (3 named groups, empty-attrs event) | **0** | `captures_read` + `haystack.slice` -- zero-copy, no spill |
+| `regex` parse 1 event (sshd shape, 3 captures onto 6 existing `syslog.*` attrs) | **1** | spills past `AttrMap`'s 8-entry inline capacity |
+| `regex` no match, 1 event | **0** | nothing written, nothing allocated |
+| `csv` parse + merge (7-column access line, one quoted-but-unescaped field) | **0** | interned columns, `insert_sym`, `Bytes::slice` throughout -- fits `AttrMap`'s inline capacity |
+| `csv` parse + merge (one doubled-quote field) | **1** | `unescape`'s own copy -- the only path in `csv` that allocates (`crates/logit-transforms/src/csv.rs`) |
+| `csv` parse + merge (16-column wide row) | **1** | `AttrMap` inline-capacity spill only -- every field itself is still a zero-copy slice |
 | `kv_metrics` derive 4 metrics | **3** | `MetricList` spill + one `bins` Vec per sketch |
 | `keep` filter to 3 attrs | **0** | 3 attributes fit inline |
 | `set` through `process_batch`, attributes only | **1** | `process_batch`'s own `Vec::with_capacity` -- `map_resource` returns `None` immediately, same as `keep` |
@@ -650,6 +659,26 @@ sink can hold events for seconds, that is a far worse failure mode than one smal
 datagram. `datagram_copy_is_one_right_sized_allocation` guards the current behavior. Don't
 "fix" this.
 
+### The native wire format (`logit_proto::native`)
+
+Not part of the nginx reference pipeline above — no `ComponentKind` consumes this codec yet
+([ADR `native-wire-format-encoding`](../adr/native-wire-format-encoding.md), `docs/known-gaps.md`)
+— so it gets its own small table rather than a row in §2's chain. One event
+(`fixtures::nginx_batch(1)`), `crates/logit-bench/tests/allocations.rs`'s
+`native_encode_one_event`/`native_decode_one_event`:
+
+| Stage | allocs | Notes |
+|---|---:|---|
+| `NativeEncoder::encode`, 1 event | **23** | dictionary build + the per-field TLV scratch buffers `native::record::write_field` allocates for each of `Event`'s up-to-five fields (`docs/adr/native-wire-format-encoding.md`'s own Decision section notes this as a known, unoptimized cost of the field-level skip-unknown framing) |
+| `NativeDecoder::decode_into`, 1 event | **8** | dictionary re-intern + `AttrMap`/`Event` construction; no intermediate object graph, unlike the bake-off's `rkyv`/`postcard` arms, which run through a `WireBatch` mirror first (`docs/adr/native-wire-format-encoding.md`'s finding 4) |
+
+The full bake-off comparison against `otlp`, `rkyv`, and `postcard` — across two shapes and three
+batch sizes, both timing and encoded bytes — lives in
+[ADR `native-wire-format-encoding`](../adr/native-wire-format-encoding.md), not here: those numbers
+came from `script/bench wire_format` (`crates/logit-bench/benches/wire_format.rs`), one-off
+comparison data rather than a per-build assertion, which is exactly the encode/decode split this
+file's own intro draws between the two harnesses.
+
 ## 3. Sharing versus copying
 
 What is shared today:
@@ -1016,6 +1045,36 @@ derived from `examples/nginx/nginx.conf`'s `access_json_syslog` format and confi
 nginx run (the emitted `syslog.facility=23`/`severity=6` match its `<190>` priority exactly). A
 one-off exploration against real software is the right way to *inform* a fixture; the fixture is
 what gets committed.
+
+**A directly-constructed `Event`'s message `Bytes` needs the same "warm the thing being measured"
+discipline as the interner, or the count is an artifact of the fixture, not the code under test.**
+`bytes::Bytes` defers its atomically-refcounted, truly-shared representation until a buffer is
+*first* cloned or sliced — built fresh (`Bytes::from(String)`/`Bytes::copy_from_slice`, both go
+through the same `From<Vec<u8>>`), it starts out a plain, unshared pointer+len+capacity triple, and
+the first `.clone()`/`.slice()` pays a real, `#[cold]` allocation (one `Box<Shared>`, 24 bytes on a
+64-bit target) to promote it. Every existing decoder-sourced fixture (`nginx_syslog_datagram`, ...)
+gets this for free without anyone noticing: the *test* itself holds one base `Bytes` and clones it
+for both the warm-up and the measured call (`decoder.decode(datagram.clone())`, twice, against the
+same `datagram` binding), so the promotion lands on the warm-up clone and the measured one is a
+free atomic bump. `crates/logit-bench/src/fixtures.rs`'s `logfmt_event`/`kv_event`/
+`logfmt_escaped_event` hit this directly, since they build an `Event` (not a raw `Bytes`) and have
+no natural place to hold a shared base across two calls -- each memoizes its message in a
+function-local `static OnceLock<Bytes>`, so every call after the first in a given test process
+returns a `.clone()` of the *same*, by-then-already-promoted buffer, matching every other fixture's
+effective behavior without changing the zero-arg `-> Event` signature. Skipping this makes a
+transform's very first touch of a message look like it costs an allocation it doesn't, every time,
+forever — not a one-off cold-start number worth recording.
+
+**`unescape`'s own allocation count depends on this same `Vec`/`Bytes` conversion rule, the other
+direction.** `Bytes::from(Vec<u8>)` takes the cheap, deferred-promotion path only when
+`vec.len() == vec.capacity()`; otherwise it eagerly allocates the `Shared` control block *inside
+the conversion itself* — a second allocation, immediately, rather than one deferred to the first
+clone. Every escape `unescape` resolves consumes two source bytes and emits one, so a
+`Vec::with_capacity(bytes.len())` sized for the worst case is *always* left with spare capacity
+whenever there was any escape to resolve at all — hitting that eager path unconditionally.
+`unescape` calls `out.shrink_to_fit()` before the final `Bytes::from(out)` specifically to convert
+that second `alloc` into a `realloc` of the buffer it already paid for — see
+`logfmt_parse_escaped_value_event`'s row below.
 
 ## 8. Recommendations
 

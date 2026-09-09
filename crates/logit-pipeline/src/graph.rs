@@ -88,6 +88,28 @@
 //! 28. A `tail_in`/`docker_in` with a `poll_interval`, `checkpoint_interval`, or `max_line_bytes`
 //!     of `0` is rejected -- each would busy-loop, thrash the checkpoint file, or drop every
 //!     line, the same "0 is impossible" reasoning as rule 9.
+//! 29. A `kv` with an empty `pair_sep` or `kv_sep`, with `pair_sep == kv_sep`, or with a `kv_sep`
+//!     that *contains* `pair_sep`, is rejected. An empty separator makes splitting yield a
+//!     boundary between every character; identical separators mean every segment is split away
+//!     from its own separator, so no line could ever produce a pair; and a `kv_sep` containing
+//!     `pair_sep` can never appear intact inside a segment, since the `pair_sep` split runs
+//!     first -- each is a certain no-op or a certain garbage result, catchable at `logit
+//!     validate` time.
+//! 30. A `regex` `pattern` that doesn't compile, or that declares no named capture group, is
+//!     rejected -- and so is an empty `field` name. The pattern is compiled here, not deferred
+//!     to `build_spec`, so an invalid one is a `logit validate` error rather than a run-time
+//!     surprise. The compiled `Regex` is then dropped and rebuilt in `build_spec`, matching how
+//!     every other kind re-derives from its raw `ComponentKind` -- one `Regex::new` at process
+//!     start is not worth inventing a mechanism for. A pattern with no named group could only
+//!     ever be a no-op; an empty `field` name could never match a real attribute. A duplicate
+//!     capture-group name needs no separate check -- the `regex` crate rejects it at compile
+//!     time already.
+//! 31. A `csv` with an empty `columns` list, an empty column name, or a duplicate column name is
+//!     rejected, as is a `delimiter` that is `"` (RFC 4180's quote character), `\n`/`\r`
+//!     (already consumed as line framing by every input), or non-ASCII. The empty-list and
+//!     empty-name clauses are the "can only ever be a no-op" rule again; the duplicate clause is
+//!     the "a repeated entry silently doubles rather than erroring" rule applied to columns
+//!     instead of sources.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -137,6 +159,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | LuaFile { .. }
         | Aggregate { .. }
         | Json { .. }
+        | Csv { .. }
         | KvMetrics { .. }
         | Keep { .. }
         | Remove { .. }
@@ -146,15 +169,9 @@ pub fn role(kind: &ComponentKind) -> Role {
         | HasSignal { .. }
         | KeepSignals { .. }
         | DropSignals { .. }
-        | Logfmt
-        | Kv
-        | Regex { .. }
-        | Csv
-        | Rename { .. }
-        | Filter { .. }
-        | Sample { .. }
-        | Throttle { .. }
-        | Dedup { .. } => Role::Transform,
+        | Logfmt { .. }
+        | Kv { .. }
+        | Regex { .. } => Role::Transform,
         InfluxDbOut { .. }
         | OtlpOut { .. }
         | LogitOut { .. }
@@ -185,6 +202,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         LuaFile { .. } => "lua_file",
         Aggregate { .. } => "aggregate",
         Json { .. } => "json",
+        Csv { .. } => "csv",
         KvMetrics { .. } => "kv_metrics",
         Keep { .. } => "keep",
         Remove { .. } => "remove",
@@ -194,15 +212,9 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         HasSignal { .. } => "has_signal",
         KeepSignals { .. } => "keep_signals",
         DropSignals { .. } => "drop_signals",
-        Logfmt => "logfmt",
-        Kv => "kv",
+        Logfmt { .. } => "logfmt",
+        Kv { .. } => "kv",
         Regex { .. } => "regex",
-        Csv => "csv",
-        Rename { .. } => "rename",
-        Filter { .. } => "filter",
-        Sample { .. } => "sample",
-        Throttle { .. } => "throttle",
-        Dedup { .. } => "dedup",
         InfluxDbOut { .. } => "influxdb_out",
         OtlpOut { .. } => "otlp_out",
         LogitOut { .. } => "logit_out",
@@ -228,6 +240,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::LuaFile { .. }
             | ComponentKind::Aggregate { .. }
             | ComponentKind::Json { .. }
+            | ComponentKind::Csv { .. }
             | ComponentKind::KvMetrics { .. }
             | ComponentKind::Keep { .. }
             | ComponentKind::Remove { .. }
@@ -237,6 +250,9 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::HasSignal { .. }
             | ComponentKind::KeepSignals { .. }
             | ComponentKind::DropSignals { .. }
+            | ComponentKind::Logfmt { .. }
+            | ComponentKind::Kv { .. }
+            | ComponentKind::Regex { .. }
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::OtlpOut { .. }
             | ComponentKind::StdioOut { .. }
@@ -924,6 +940,105 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 30: `kv`'s separators. An empty `pair_sep` or `kv_sep` makes splitting yield a
+    // boundary between every character; `pair_sep == kv_sep` means every segment is split away
+    // from its own separator, so no line could ever produce a pair; and a `kv_sep` that
+    // *contains* `pair_sep` can never appear intact inside a segment, since the `pair_sep` split
+    // always runs first -- each shape is a certain no-op or a certain garbage result, catchable
+    // here rather than surfacing as silently-wrong output at runtime.
+    for (id, component) in &components {
+        if let ComponentKind::Kv { pair_sep, kv_sep, .. } = &component.kind {
+            if pair_sep.is_empty() {
+                anyhow::bail!("component '{id}': a kv 'pair_sep' must not be empty");
+            }
+            if kv_sep.is_empty() {
+                anyhow::bail!("component '{id}': a kv 'kv_sep' must not be empty");
+            }
+            if pair_sep == kv_sep {
+                anyhow::bail!(
+                    "component '{id}': a kv 'pair_sep' and 'kv_sep' must differ -- identical \
+                     separators mean every segment is split away from its own separator, so no \
+                     line could ever produce a pair"
+                );
+            }
+            if kv_sep.contains(pair_sep.as_str()) {
+                anyhow::bail!(
+                    "component '{id}': a kv 'kv_sep' must not contain 'pair_sep' -- it could \
+                     never appear intact inside a segment, since the 'pair_sep' split runs first"
+                );
+            }
+        }
+    }
+
+    // Rule 31: `regex`-specific validation -- an empty `field` name could never match a real
+    // attribute for the same reason rule 19 rejects one on `trace_context`; a pattern that
+    // doesn't compile, or declares no named capture group, can only ever be a no-op (or worse, a
+    // run-time surprise) if left for `build_spec` to discover.
+    for (id, component) in &components {
+        if let ComponentKind::Regex { pattern, field } = &component.kind {
+            if field.as_deref() == Some("") {
+                anyhow::bail!(
+                    "component '{id}': a regex with an empty 'field' name could never match an \
+                     attribute -- omit 'field' to match the log message instead"
+                );
+            }
+            let re = ::regex::Regex::new(pattern).map_err(|err| {
+                anyhow::anyhow!("component '{id}': 'pattern' is not a valid regex: {err}")
+            })?;
+            if !re.capture_names().skip(1).any(|n| n.is_some()) {
+                anyhow::bail!(
+                    "component '{id}': a regex whose 'pattern' declares no named capture group \
+                     can only ever be a no-op -- name the groups you want as attributes, e.g. \
+                     (?P<status>\\d+)"
+                );
+            }
+        }
+    }
+
+    // Rule 32: a `csv`'s `columns`/`delimiter` shape (`docs/adr/csv-positional-columns.md`). An
+    // empty `columns` list can only ever be a no-op, the same reasoning rules 10-12/19/20 already
+    // apply elsewhere; an empty column name could never be a useful attribute name, the same
+    // reasoning as rule 20's empty scale field name; a duplicate column name would let the later
+    // field silently overwrite the earlier one on every event, leaving one configured column
+    // permanently unreachable -- the "a repeated entry silently doubles rather than erroring" rule
+    // applied to columns instead of sources (rule 4). `delimiter` must be a single ASCII
+    // character, and not `"` (RFC 4180's quote character, which this parser reads as field
+    // framing, not data) or `\n`/`\r` (already consumed as line framing by every input).
+    for (id, component) in &components {
+        if let ComponentKind::Csv { columns, delimiter } = &component.kind {
+            if columns.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a csv with no 'columns' configured can only ever be a no-op"
+                );
+            }
+            if columns.iter().any(|c| c.is_empty()) {
+                anyhow::bail!(
+                    "component '{id}': a csv column name must not be empty -- it could never be \
+                     a useful attribute name"
+                );
+            }
+            let mut seen = std::collections::HashSet::with_capacity(columns.len());
+            for column in columns {
+                if !seen.insert(column.as_str()) {
+                    anyhow::bail!(
+                        "component '{id}': 'columns' names '{column}' twice -- the later field \
+                         would silently overwrite the earlier one, leaving one column unreachable"
+                    );
+                }
+            }
+            if !delimiter.is_ascii() {
+                anyhow::bail!("component '{id}': 'delimiter' must be a single ASCII character");
+            }
+            if matches!(delimiter, '"' | '\n' | '\r') {
+                anyhow::bail!(
+                    "component '{id}': 'delimiter' must not be {delimiter:?} -- '\"' is the \
+                     quote character and '\\n'/'\\r' are line framing every input already \
+                     consumes"
+                );
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         let Component { sources, buffer, receive, kind } = component;
@@ -1147,6 +1262,18 @@ mod tests {
         ComponentKind::Json { skip_to_brace: false }
     }
 
+    fn logfmt() -> ComponentKind {
+        ComponentKind::Logfmt { bare_keys: false }
+    }
+
+    fn kv(pair_sep: &str, kv_sep: &str) -> ComponentKind {
+        ComponentKind::Kv {
+            pair_sep: pair_sep.to_string(),
+            kv_sep: kv_sep.to_string(),
+            bare_keys: false,
+        }
+    }
+
     fn metric_spec(name: &str, field: Option<&str>) -> logit_config::MetricSpec {
         logit_config::MetricSpec {
             name: name.to_string(),
@@ -1295,6 +1422,68 @@ mod tests {
         ]))
         .expect("should resolve");
         assert_eq!(graph.components["parse"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_logfmt_component_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("parse", vec!["in"], logfmt()),
+            ("out", vec!["parse"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["parse"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_kv_component_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("parse", vec!["in"], kv("&", "=")),
+            ("out", vec!["parse"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["parse"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn kv_with_an_empty_pair_sep_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("parse", vec!["in"], kv("", "=")),
+            ("out", vec!["parse"], sink()),
+        ]));
+        assert!(err.contains("pair_sep") && err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn kv_with_an_empty_kv_sep_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("parse", vec!["in"], kv("&", "")),
+            ("out", vec!["parse"], sink()),
+        ]));
+        assert!(err.contains("kv_sep") && err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn kv_with_identical_separators_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("parse", vec!["in"], kv("=", "=")),
+            ("out", vec!["parse"], sink()),
+        ]));
+        assert!(err.contains("must differ"), "got: {err}");
+    }
+
+    #[test]
+    fn kv_with_a_kv_sep_containing_pair_sep_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("parse", vec!["in"], kv("=", "==")),
+            ("out", vec!["parse"], sink()),
+        ]));
+        assert!(err.contains("must not contain"), "got: {err}");
     }
 
     #[test]
@@ -2024,6 +2213,221 @@ mod tests {
         ]))
         .expect("should resolve");
         assert_eq!(graph.components["scale"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_regex_with_a_named_capture_resolves() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "regex",
+                vec!["in"],
+                ComponentKind::Regex {
+                    pattern: r"status=(?P<status>\d+)".to_string(),
+                    field: None,
+                },
+            ),
+            ("out", vec!["regex"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["regex"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_regex_with_a_field_naming_an_attribute_resolves() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "regex",
+                vec!["in"],
+                ComponentKind::Regex {
+                    pattern: r"status=(?P<status>\d+)".to_string(),
+                    field: Some("message".to_string()),
+                },
+            ),
+            ("out", vec!["regex"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["regex"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_regex_with_an_invalid_pattern_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "regex",
+                vec!["in"],
+                ComponentKind::Regex { pattern: "(?P<a>".to_string(), field: None },
+            ),
+            ("out", vec!["regex"], sink()),
+        ]));
+        assert!(err.contains("not a valid regex"), "got: {err}");
+    }
+
+    #[test]
+    fn a_regex_with_no_named_capture_groups_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "regex",
+                vec!["in"],
+                ComponentKind::Regex { pattern: r"(\d+)".to_string(), field: None },
+            ),
+            ("out", vec!["regex"], sink()),
+        ]));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_regex_with_a_duplicate_named_capture_group_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "regex",
+                vec!["in"],
+                ComponentKind::Regex { pattern: "(?P<a>x)(?P<a>y)".to_string(), field: None },
+            ),
+            ("out", vec!["regex"], sink()),
+        ]));
+        assert!(err.contains("not a valid regex"), "got: {err}");
+    }
+
+    #[test]
+    fn a_regex_with_an_empty_field_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "regex",
+                vec!["in"],
+                ComponentKind::Regex {
+                    pattern: r"status=(?P<status>\d+)".to_string(),
+                    field: Some(String::new()),
+                },
+            ),
+            ("out", vec!["regex"], sink()),
+        ]));
+        assert!(err.contains("could never match"), "got: {err}");
+    }
+
+    #[test]
+    fn a_csv_with_no_columns_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("csv", vec!["in"], ComponentKind::Csv { columns: vec![], delimiter: ',' }),
+            ("out", vec!["csv"], sink()),
+        ]));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_csv_with_an_empty_column_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "csv",
+                vec!["in"],
+                ComponentKind::Csv {
+                    columns: vec!["a".to_string(), String::new()],
+                    delimiter: ',',
+                },
+            ),
+            ("out", vec!["csv"], sink()),
+        ]));
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn a_csv_with_a_duplicate_column_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "csv",
+                vec!["in"],
+                ComponentKind::Csv {
+                    columns: vec!["a".to_string(), "b".to_string(), "a".to_string()],
+                    delimiter: ',',
+                },
+            ),
+            ("out", vec!["csv"], sink()),
+        ]));
+        assert!(err.contains("twice"), "got: {err}");
+    }
+
+    #[test]
+    fn a_csv_with_a_quote_delimiter_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "csv",
+                vec!["in"],
+                ComponentKind::Csv { columns: vec!["a".to_string()], delimiter: '"' },
+            ),
+            ("out", vec!["csv"], sink()),
+        ]));
+        assert!(err.contains("delimiter"), "got: {err}");
+    }
+
+    #[test]
+    fn a_csv_with_a_newline_delimiter_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "csv",
+                vec!["in"],
+                ComponentKind::Csv { columns: vec!["a".to_string()], delimiter: '\n' },
+            ),
+            ("out", vec!["csv"], sink()),
+        ]));
+        assert!(err.contains("delimiter"), "got: {err}");
+    }
+
+    #[test]
+    fn a_csv_with_a_non_ascii_delimiter_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "csv",
+                vec!["in"],
+                ComponentKind::Csv { columns: vec!["a".to_string()], delimiter: 'é' },
+            ),
+            ("out", vec!["csv"], sink()),
+        ]));
+        assert!(err.contains("ASCII"), "got: {err}");
+    }
+
+    #[test]
+    fn a_csv_with_columns_configured_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "csv",
+                vec!["in"],
+                ComponentKind::Csv {
+                    columns: vec!["remote_addr".to_string(), "status".to_string()],
+                    delimiter: ',',
+                },
+            ),
+            ("out", vec!["csv"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["csv"].role(), Role::Transform);
+        assert_eq!(graph.components["csv"].kind_name(), "csv");
+    }
+
+    #[test]
+    fn a_csv_with_a_tab_delimiter_resolves() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "csv",
+                vec!["in"],
+                ComponentKind::Csv { columns: vec!["a".to_string()], delimiter: '\t' },
+            ),
+            ("out", vec!["csv"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["csv"].role(), Role::Transform);
     }
 
     #[test]

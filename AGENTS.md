@@ -19,14 +19,20 @@ Lua enrichment stage, InfluxDB 2.x out, via `logit run <config>` (see
 `stdio_out`'s own file target is `file_out` with an empty rotation policy,
 [ADR `rotating-file-output`](docs/adr/rotating-file-output.md)), `otlp_in`, and `otlp_out`
 (`crates/logit-inputs`/`crates/logit-outputs`,
-`crates/logit-proto`'s `otlp` codec) and `json`, `kv_metrics`, `keep`, `remove`, `set`,
+`crates/logit-proto`'s `otlp` codec) and `json`, `csv` (delimiter-separated columns into
+attributes from a config-declared, positional schema -- no header-row mode,
+[ADR `csv-positional-columns`](docs/adr/csv-positional-columns.md)), `kv_metrics`, `keep`, `remove`, `set`,
 `trace_context` (giving a `LogRecord` a native application trace/span reference and, with an
 opt-in `span:` block, turning an access log line into a real `SpanRecord` on the same event,
 [ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md)/
 [ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md)), `scale` (multiplying
 named numeric attributes by a constant factor,
-[ADR `scale-transform`](docs/adr/scale-transform.md)), `has_signal`, `keep_signals`, and
-`drop_signals` (`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —
+[ADR `scale-transform`](docs/adr/scale-transform.md)), `has_signal`, `keep_signals`,
+`drop_signals`, `logfmt`, and `kv` (the de-facto `key=value` parsers,
+[ADR `logfmt-and-kv-parsing`](docs/adr/logfmt-and-kv-parsing.md)), and `regex` (named capture
+groups into attributes, replacing a `lua` component in `demo/logit.yaml`'s postgres tier,
+[ADR `regex-transform`](docs/adr/regex-transform.md))
+(`crates/logit-transforms`) have all landed as real, implemented `ComponentKind`s —
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises the syslog/InfluxDB
 side together against a real nginx (`examples/nginx/`), and
 [docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside
@@ -57,7 +63,14 @@ real, implemented `ComponentKind`s; `docker_in` is live in `demo/logit.yaml`'s `
 that tier's container directly instead of receiving a `syslog:` stream, and `tail_in` itself is
 live in the same config's `postgres_in`, tailing Postgres's own rotating jsonlog directory
 (`docs/plans/demo-richer-traces.md`'s workstream C) -- `otlp_in` is the one still unexercised by
-the demo. Config is a flat graph of named components (ADR `component-graph-configuration`,
+the demo. The native `logit`-to-`logit` wire format is also real now, not just designed:
+`logit_proto::native` (`crates/logit-proto/src/frame.rs` + `src/native/`) is a tested
+`Encoder`/`Decoder` -- dictionary-first, hand-rolled, framed by a 24-byte header with CRC-32C and
+optional lz4 -- decided by a four-arm bake-off against `rkyv`, `postcard`, and OTLP itself
+([ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md)). No component uses
+it yet: `ComponentKind::LogitIn`/`LogitOut` remain unimplemented in `graph.rs`'s `is_implemented`,
+pending the connection/handshake layer `docs/design/wire-protocol.md` still describes as future
+work. Config is a flat graph of named components (ADR `component-graph-configuration`,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
 `logit-pipeline::graph`, then run by `logit-pipeline::run`'s node runtime -- `logit-cli::pipeline`
 is now just the kind → implementation registry. Config files are read and parsed exclusively
@@ -182,9 +195,12 @@ not a style preference:
   `logit-core::metric::DdSketch` is a real wrapper with a working `merge` (`crates/logit-transforms`'
   `aggregate` is its first caller); `HyperLogLog` is still a stub pending a real crate — don't fill
   it with a non-mergeable implementation to get `Set` aggregation working faster.
-- **The wire encoding (`rkyv` vs. hand-rolled) is an open, benchmark-gated decision** — see
-  `docs/design/wire-protocol.md`. Don't pick one in passing while implementing something else;
-  benchmark it and record the outcome as an ADR. `crates/logit-bench` is the harness to do it in.
+- **The wire encoding is decided: hand-rolled, shipped as `logit_proto::native`** — a four-arm
+  bake-off (`crates/logit-bench/src/bakeoff/`) settled it against `rkyv`, `postcard`, and OTLP
+  itself; see [ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md) and
+  `docs/design/wire-protocol.md`. Still open: the connection/handshake state machine, credit-based
+  flow control, and a disk-backed `Buffer<T>` — don't design those in passing either; they're real
+  future work, not yet started.
 - **Memory behavior is measured, not assumed** — `docs/design/memory.md` records what every
   pipeline stage allocates and what `Event` costs to move, and both are enforced by tests:
   `crates/logit-core/tests/type_sizes.rs` asserts exact `size_of`s, and
@@ -217,7 +233,7 @@ crates/
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, logfmt, kv, regex
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
 ```

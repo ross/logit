@@ -20,3 +20,5 @@ logit-core.workspace = true
 bytes.workspace = true
 prost.workspace = true
 thiserror.workspace = true
+lz4_flex.workspace = true
+crc32c.workspace = true

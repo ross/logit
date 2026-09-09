@@ -6,6 +6,37 @@ a `todo!()`/doc-comment pointer at its actual location too, or is cheap enough t
 here. Not a roadmap — see [OVERVIEW.md](OVERVIEW.md) for planned scope; this is specifically things
 already built that have a known, accepted rough edge.
 
+- **The published schema still advertises component kinds the binary can't run.** `schema/
+  logit.schema.json` is generated directly from `ComponentKind` (ADR `config-yaml-jsonschema`), and
+  `crates/logit-config/src/lib.rs` carries unimplemented variants forward deliberately — a config
+  referencing one gets a clear "not implemented yet" from `logit validate`/`logit run` rather than
+  a deserialization error — but the schema has no way to mark a variant "declared, not runnable."
+  A schema-aware editor autocompletes `logfmt:`/`kv:`/`regex:`/`csv:`, or `logit_in:`/`logit_out:`,
+  and the binary then rejects the resulting config. Narrowed by
+  [ADR `routing-by-condition-is-lua`](adr/routing-by-condition-is-lua.md), which removed the five
+  variants (`filter`/`rename`/`sample`/`throttle`/`dedup`) that were unimplemented for no real
+  reason — each is already expressible as a `lua` component — but not closed: `logfmt`, `kv`,
+  `csv`, and `regex` remain declared-and-unimplemented (real future work, tracked as ordinary
+  scope, not a gap of this kind), and `logit_in`/`logit_out` stay published until the native wire
+  protocol exists (the **Native wire protocol** entry below). There is no fix short of implementing
+  each kind or removing it from the enum — the schema can't be hand-annotated independently of
+  `ComponentKind` without reopening the drift ADR `config-yaml-jsonschema` exists to prevent.
+- **Predicate-shaped work (routing by condition, sampling, throttling, dedup) costs a Lua VM, an OS
+  thread, and roughly 9× the per-event allocations of a native transform, because `logit` has no
+  native predicate language and there's currently no native component for any of those verbs at
+  all** — a deliberate choice, not an oversight;
+  [ADR `routing-by-condition-is-lua`](adr/routing-by-condition-is-lua.md) has the full account and
+  the measured numbers. Concretely: **9** allocations / **1.07 µs** per event through a `lua`
+  component versus **1** allocation / **360 ns** through a native `Transform`
+  (`docs/design/memory.md`), and one dedicated OS thread plus one LuaJIT VM per `lua` node
+  (`crates/logit-pipeline/src/runtime.rs`'s `run_with_telemetry`) versus an ordinary tokio task.
+  Fine at sidecar/host-agent volume — the delta is noise below roughly tens of thousands of
+  events/sec — and real at central-collector volume, where a multi-branch routing diamond can cost
+  a measurable fraction of a core answering what a native transform would answer for a third of
+  that. The ADR names the explicit revisit trigger: sustained, *measured* central-collector
+  throughput pressure against a real config, not a hunch — and records a substantially-designed
+  native predicate grammar (total-by-construction, so it can't fail at runtime) as where to resume
+  if that trigger fires.
 - **`HyperLogLog` is a stub** (`crates/logit-core/src/metric.rs`) — no methods, just a placeholder
   pending a real crate (`cardinality-estimator` is the candidate). Consequences: statsd's `s` (set)
   metric type is a clear decode error rather than silently losing data
@@ -13,10 +44,15 @@ already built that have a known, accepted rough edge.
   through unaggregated rather than fake-merging it
   ([ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)); `logit-outputs::influxdb` errors on it
   rather than writing a wrong encoding.
-- **Native wire protocol** (`crates/logit-proto/src/frame.rs`) — the frame header type exists; no
-  actual encode/decode, no connection/handshake, no dictionary encoding. The `rkyv`-vs-hand-rolled
-  encoding choice is an explicit open, benchmark-gated decision
-  ([wire-protocol.md](design/wire-protocol.md)).
+- **Native wire protocol: the format is done, the transport isn't.** `crates/logit-proto/src/frame.rs`
+  (framing/compression/CRC) and `crates/logit-proto/src/native/` (the dictionary-first payload
+  codec, `NativeEncoder`/`NativeDecoder`) are real, tested, `Encoder`/`Decoder` implementations —
+  the `rkyv`-vs-hand-rolled encoding choice is decided
+  ([ADR `native-wire-format-encoding`](adr/native-wire-format-encoding.md)). What's still open: no
+  connection/handshake state machine, no credit-based flow control, and `ComponentKind::LogitIn`/
+  `LogitOut` remain unimplemented in `crates/logit-pipeline/src/graph.rs`'s `is_implemented` — a
+  `logit run` config naming either is still rejected. The format existing is what unblocks the two
+  entries directly below.
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`), and
   every sink now sits behind a bounded, byte-aware `SinkQueue`
@@ -31,9 +67,12 @@ already built that have a known, accepted rough edge.
     [ADR `decoupled-listener-io`](adr/decoupled-listener-io.md)) a UDP listener's `ReceiveQueue` are in-memory
     only; a process restart, SIGKILL, or a shutdown grace that expires mid-drain loses whatever
     either was holding. Plausibly config-optional even once it lands, since not every deployment
-    needs cross-restart durability; blocked on the `rkyv`-vs-hand-rolled wire encoding decision
-    ([wire-protocol.md](design/wire-protocol.md)), which this deliberately does not settle in
-    passing.
+    needs cross-restart durability. Was blocked on the wire encoding decision
+    ([wire-protocol.md](design/wire-protocol.md)); that decision is now made
+    ([ADR `native-wire-format-encoding`](adr/native-wire-format-encoding.md)) and
+    `logit_proto::native`'s frames are already designed to be independently decodable and
+    file-appendable, so a disk-backed `Buffer<T>` over them is real, unblocked follow-up work, not
+    designed yet.
   - **No end-to-end acknowledgement** — delivery is confirmed only as far as the immediate
     destination accepting the write; nothing tracks whether the data survives past that point. The
     receive-side loss this used to also name (a UDP listener losing datagrams before anything
@@ -417,6 +456,56 @@ already built that have a known, accepted rough edge.
   UTF-8 validation to the MSG slice alone — a real change, not a one-line fix, and nginx's
   `escape=json` access-log writer never emits invalid UTF-8 in practice, so there's no production
   producer forcing the issue yet.
+
+  **UTF-8 rejection is not the only thing standing between a syslog line and an arbitrary-binary
+  payload.** `SyslogDecoder::decode_into` (`crates/logit-inputs/src/syslog.rs:190-197`) splits a
+  datagram on `\n` *before* any UTF-8 check runs, so a binary payload containing a `0x0A` byte is
+  cut mid-value by the framing regardless of what this entry's fix would do — see the HAProxy CBOR
+  entry below, where this framing gap is what actually blocks the case that motivated writing it
+  down. Fixing UTF-8 validation alone would not be sufficient for a binary payload that isn't
+  newline-safe by construction (nginx's `escape=json` output happens to be; not every binary format
+  is).
+- **HAProxy's native CBOR log output (`%{+cbor}o`/`%{+cbor+bin}o`) was evaluated as a cheaper way to
+  source its access logs and deliberately not pursued** — a considered "not now," not an
+  unexplored idea, recorded here so the investigation doesn't get redone. Three findings, each
+  independently sufficient to defer it:
+  - **The reachable mode is bigger than JSON, not smaller.** HAProxy's default CBOR encoding
+    (`%{+cbor}o`, no `+bin`) is hex-encoded ASCII — a line like `BF69636C69656E745F6970…`, an
+    indefinite-length map rendered as hex text, ~2 bytes on the wire per payload byte. Only
+    `%{+cbor+bin}o` emits raw binary, which is the mode that would actually be more compact than
+    the demo's hand-rolled JSON — but see the next point.
+  - **Binary CBOR cannot reach `logit` over any transport it has today.** Beyond the non-UTF-8
+    rejection above, `syslog_in` splits every datagram on `\n` before any UTF-8 check runs at all
+    (`crates/logit-inputs/src/syslog.rs:190-197`), and `0x0A` occurs freely inside CBOR — it's the
+    encoding of the integer 10, and turns up throughout length headers and float payloads — so a
+    binary payload is chopped mid-value by the framing itself, independent of the UTF-8 question.
+    `tail_in`/`docker_in` are line-framed too, and Docker's json-file driver wraps each line in a
+    JSON string that can't carry arbitrary octets at all. Nothing in the tree offers
+    length-delimited framing, which is the actual prerequisite; a `cbor_in` listener, a unix-socket
+    input, or an opt-out of `syslog_in`'s newline splitting would each qualify.
+  - **HAProxy's log-format item-name grammar rejects a literal `.` in a custom name, and `%{+json}o`
+    and `%{+cbor}o` share that grammar** (already recorded at `demo/haproxy/haproxy.cfg:99-117`,
+    confirmed empirically against `haproxy -c`) — but the two encodings aren't equally stuck by it.
+    JSON has an escape hatch: `demo/haproxy/haproxy.cfg:140` hand-writes the JSON text itself, with
+    per-value `json(ascii)` escaping, to get its dotted `span.*`/`trace.*` keys past the grammar.
+    CBOR has no equivalent, because binary can't be typed into a `log-format` string — `%{+cbor}o`
+    is the only way to emit it, so a CBOR-sourced HAProxy tier is stuck with undotted keys and would
+    need a rename stage the JSON tier doesn't. `SpanLiftConfig`
+    (`crates/logit-config/src/lib.rs:806-828`) has no source-field override for `span.status`,
+    `span.start_us`, or `span.duration_ms`, so `trace_context` can't absorb that rename on its own
+    either. Worth being precise about *whose* limitation this is: CBOR's own text-string keys are
+    arbitrary UTF-8 and handle dots fine — every constraint above belongs to HAProxy's log-format
+    grammar or to `logit`'s current transports, not to CBOR as a format.
+
+  If length-delimited framing ever lands and this is revisited, three design constraints are
+  already known and don't need rediscovering: `Value::as_str` **panics** on an invalid-UTF-8
+  `Value::Str` (`crates/logit-core/src/value.rs:33-41`), so CBOR's only-nominally-UTF-8 text-string
+  type would need validation before becoming one; a hand-rolled decoder needs an explicit recursion
+  depth bound, since `json`'s `serde_json`-based one inherits a limit for free that a hand-rolled
+  CBOR reader would not; and a length header must never size an allocation directly (an attacker can
+  claim a multi-gigabyte array in a handful of bytes). CBOR tag 1 (epoch time), decodable straight
+  into `Value::Timestamp`, is the one thing the format would offer that JSON doesn't — the reason
+  it's worth this entry rather than a closed door.
 - **A syslog event's `timestamp` is receipt time, not the sender's** — every event is stamped with
   the instant its datagram came off the socket (`received_at`, captured by the read half and
   threaded through to `Decoder::decode_into` explicitly since

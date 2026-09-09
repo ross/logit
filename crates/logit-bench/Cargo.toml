@@ -21,6 +21,20 @@ logit-transforms.workspace = true
 logit-script.workspace = true
 logit-proto.workspace = true
 bytes.workspace = true
+serde.workspace = true
+# The native-wire-format bake-off's other two arms (docs/design/wire-protocol.md's "Encoding:
+# decide with a benchmark, not up front", docs/adr/native-wire-format-encoding.md). Both serialize
+# `bakeoff::wire_mirror::WireBatch`, a plain-data mirror of `EventBatch` -- never the shipped
+# `logit_proto::native` codec, which is hand-rolled either way. `logit-bench` ships in nothing (see
+# this crate's own module doc), so these live in `[dependencies]` rather than `[dev-dependencies]`
+# purely so both `tests/` and `benches/` can reach the same mirror types without duplicating them.
+# `default-features = false`: postcard's two default features (`heapless`, `heapless-cas`) exist
+# for no_std/embedded use (a fixed-capacity buffer instead of `Vec`), which this bake-off arm
+# doesn't need -- `to_allocvec`/`from_bytes` only need `alloc`. Turning them off also drops
+# `heapless`'s own dependency on `atomic-polyfill`, an unmaintained crate `script/audit`
+# (`cargo-deny`) flags (RUSTSEC-2023-0089) -- avoided entirely rather than suppressed.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+rkyv = "0.8"
 
 [dev-dependencies]
 divan = "0.1"
@@ -30,4 +44,8 @@ anyhow.workspace = true
 
 [[bench]]
 name = "pipeline"
+harness = false
+
+[[bench]]
+name = "wire_format"
 harness = false

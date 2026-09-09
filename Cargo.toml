@@ -34,6 +34,15 @@ bytes = "1"
 # OTLP codec only (crates/logit-proto/src/otlp) -- messages generated once, offline, and committed
 # (docs/adr/committed-pregenerated-otlp-protobuf.md); no `prost-build`/`protoc` at build time.
 prost = "0.14"
+# The native wire format's compression (docs/design/wire-protocol.md) -- pure Rust, no C toolchain
+# (ADR `containerized-development`). `zstd` is deliberately not a dependency: the real `zstd` crate
+# builds C via `zstd-sys`, and the pure-Rust alternatives aren't yet competitive -- see
+# `docs/adr/native-wire-format-encoding.md`.
+lz4_flex = { version = "0.14", default-features = false, features = ["safe-encode", "safe-decode", "checked-decode"] }
+# CRC-32C (Castagnoli) for the native frame header -- distinct polynomial from the CRC-32/IEEE
+# `crc32fast` already pulls in transitively; hardware-accelerated on x86-64/aarch64 with a pure-Rust
+# software fallback, no C dependency.
+crc32c = "0.6"
 smallvec = { version = "1", features = ["union"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -95,6 +104,19 @@ webpki-roots = "1"
 # Already present transitively (via `mio`) at this exact version -- a direct, Linux-only dependency
 # on it adds no new crate version to the graph.
 libc = "0.2.189"
+# The `regex` transform's engine (docs/adr/regex-transform.md) --
+# `crates/logit-transforms/src/regex.rs`'s matching, and `crates/logit-pipeline/src/graph.rs`'s
+# validation rule, which compiles the configured pattern at `logit validate` time so an invalid
+# one is a config error, not a run-time surprise. Genuinely new to the shipped graph, unlike
+# `socket2`/`libc`/the rustls stack above: it adds `regex`, `regex-automata`, `regex-syntax`, and
+# `aho-corasick` (`memchr` is already here via `serde_json`). `regex-lite` is in Cargo.lock today
+# only as a dev-dependency of `divan` (logit-bench, which ships in nothing), so picking it would
+# not have been a promotion either -- the ADR records why the full engine's lazy DFA and literal
+# prefilters were worth three extra crates on a per-event hot path. Pure Rust and MIT OR
+# Apache-2.0 throughout, so ADR `containerized-development`'s "no host toolchain needed" holds
+# and deny.toml's allowlist covers it (`aho-corasick`'s `Unlicense OR MIT` resolves through MIT,
+# exactly as the already-present `memchr` does) -- script/audit confirms, not assumes.
+regex = "1"
 
 [profile.release]
 lto = true

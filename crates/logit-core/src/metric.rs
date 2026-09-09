@@ -91,6 +91,24 @@ impl DdSketch {
     pub fn count(&self) -> usize {
         self.0.count()
     }
+
+    /// Serializes to DataDog's canonical "java bytes" sketch format -- a compact, cross-language
+    /// binary encoding, not specific to any JVM. This is how a `Distribution` survives a wire or
+    /// disk round trip losslessly: `DDSketch`'s own fields are private with no bin iteration
+    /// (see this struct's own doc comment), so a codec has no way to reconstruct one from parts --
+    /// this blob is the only lossless path in or out. `logit_proto::native`'s wire format uses it
+    /// directly; see `docs/design/wire-protocol.md`.
+    pub fn to_java_bytes(&self) -> Vec<u8> {
+        self.0.to_java_bytes()
+    }
+
+    /// The inverse of [`DdSketch::to_java_bytes`]. Fails only on a genuinely malformed blob (wrong
+    /// magic, truncated, or an encoding this crate's `sketches_ddsketch` version doesn't
+    /// recognize) -- never on a value-range or precision issue, since the format carries the
+    /// sketch's bins directly rather than re-deriving them from samples.
+    pub fn from_java_bytes(bytes: &[u8]) -> Result<Self, sketches_ddsketch::DecodeError> {
+        sketches_ddsketch::DDSketch::from_java_bytes(bytes).map(Self)
+    }
 }
 
 impl Default for DdSketch {
