@@ -115,7 +115,9 @@
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
 //! it is required (by 7) to have a consumer, so the chain can only terminate at a sink.
 
-use logit_config::{BufferConfig, Component, ComponentKind, Config, ReceiveConfig};
+use logit_config::{
+    BufferConfig, Component, ComponentKind, Compression, Config, ReceiveConfig, StreamFormat,
+};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
@@ -917,7 +919,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // `max_files: 0` are each an impossible bound, the same "0 is impossible, not just small"
     // instinct as rule 9/15/18/28.
     for (id, component) in &components {
-        if let ComponentKind::FileOut { path, rotate } = &component.kind {
+        if let ComponentKind::FileOut { path, rotate, .. } = &component.kind {
             if rotate.max_bytes.is_none() && rotate.interval.is_none() {
                 anyhow::bail!(
                     "component '{id}': 'file_out' needs at least one of 'rotate.max_bytes' or \
@@ -1034,6 +1036,25 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     "component '{id}': 'delimiter' must not be {delimiter:?} -- '\"' is the \
                      quote character and '\\n'/'\\r' are line framing every input already \
                      consumes"
+                );
+            }
+        }
+    }
+
+    // Rule 33: `stdio_out`/`file_out`'s `compression:` only means anything under `format:
+    // native` -- under the default `format: human`, a non-`none` value would silently do
+    // nothing, the same reasoning rule 29 already applies to `rotate:`'s own triggers
+    // (`docs/adr/file-output-native-format.md`).
+    for (id, component) in &components {
+        let stream_format = match &component.kind {
+            ComponentKind::StdioOut { format, compression, .. }
+            | ComponentKind::FileOut { format, compression, .. } => Some((*format, *compression)),
+            _ => None,
+        };
+        if let Some((format, compression)) = stream_format {
+            if format != StreamFormat::Native && compression != Compression::None {
+                anyhow::bail!(
+                    "component '{id}': 'compression' only applies under 'format: native'"
                 );
             }
         }
@@ -1292,7 +1313,33 @@ mod tests {
     }
 
     fn file_out(rotate: logit_config::RotateConfig) -> ComponentKind {
-        ComponentKind::FileOut { path: "events.log".to_string(), rotate }
+        ComponentKind::FileOut {
+            path: "events.log".to_string(),
+            rotate,
+            format: StreamFormat::default(),
+            compression: Compression::default(),
+        }
+    }
+
+    fn file_out_with_format(format: StreamFormat, compression: Compression) -> ComponentKind {
+        ComponentKind::FileOut {
+            path: "events.log".to_string(),
+            rotate: logit_config::RotateConfig {
+                max_bytes: Some(1024),
+                interval: None,
+                max_files: 5,
+            },
+            format,
+            compression,
+        }
+    }
+
+    fn stdio_out_with_format(format: StreamFormat, compression: Compression) -> ComponentKind {
+        ComponentKind::StdioOut {
+            target: logit_config::StdioTarget::default(),
+            format,
+            compression,
+        }
     }
 
     /// `Graph` isn't `Debug` (it embeds `ComponentKind`, which isn't either), so
@@ -3087,6 +3134,42 @@ mod tests {
             ),
         ]));
         assert!(err.contains("'rotate.max_files' must be at least 1"), "got: {err}");
+    }
+
+    #[test]
+    fn file_out_with_compression_set_under_the_default_human_format_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], file_out_with_format(StreamFormat::Human, Compression::Lz4)),
+        ]));
+        assert!(err.contains("'compression' only applies under 'format: native'"), "got: {err}");
+    }
+
+    #[test]
+    fn stdio_out_with_compression_set_under_the_default_human_format_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], stdio_out_with_format(StreamFormat::Human, Compression::Lz4)),
+        ]));
+        assert!(err.contains("'compression' only applies under 'format: native'"), "got: {err}");
+    }
+
+    #[test]
+    fn file_out_with_format_native_and_compression_lz4_validates_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], file_out_with_format(StreamFormat::Native, Compression::Lz4)),
+        ]))
+        .expect("format: native with compression: lz4 should validate fine");
+    }
+
+    #[test]
+    fn stdio_out_with_format_native_and_no_compression_validates_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], stdio_out_with_format(StreamFormat::Native, Compression::None)),
+        ]))
+        .expect("format: native with the default compression should validate fine");
     }
 
     #[test]

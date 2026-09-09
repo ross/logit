@@ -934,6 +934,24 @@
             "type"
           ],
           "properties": {
+            "compression": {
+              "description": "Only meaningful under `format: native` -- graph validation rejects a non-`none` value otherwise.",
+              "default": "none",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Compression"
+                }
+              ]
+            },
+            "format": {
+              "description": "Which encoder writes through this sink -- `human` (default) is this same readable text; `native` is `logit_proto::native`'s wire format (`docs/adr/file-output-native-format.md`).",
+              "default": "human",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/StreamFormat"
+                }
+              ]
+            },
             "target": {
               "default": "stdout",
               "allOf": [
@@ -951,13 +969,31 @@
           }
         },
         {
-          "description": "A rotating file sink -- `stdio_out`'s file target grown into an operational destination: size- and/or calendar-interval-triggered rotation, with logrotate-style numbered-suffix retention. Renders the same human-readable text `stdio_out` does (`logit_outputs::stdio:: EventDump`) -- both share one sink implementation, `logit_outputs::stdio::StreamOutput`, differing only in rotation policy. See `docs/adr/rotating-file-output.md`.",
+          "description": "A rotating file sink -- `stdio_out`'s file target grown into an operational destination: size- and/or calendar-interval-triggered rotation, with logrotate-style numbered-suffix retention. Renders the same human-readable text `stdio_out` does by default (`logit_outputs::stdio::EventDump`) -- both share one sink implementation, `logit_outputs::stdio::StreamOutput`, differing only in rotation policy and, now, encoder. See `docs/adr/rotating-file-output.md`/`docs/adr/file-output-native-format.md`.",
           "type": "object",
           "required": [
             "path",
             "type"
           ],
           "properties": {
+            "compression": {
+              "description": "See `StdioOut::compression`.",
+              "default": "none",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Compression"
+                }
+              ]
+            },
+            "format": {
+              "description": "See `StdioOut::format` -- the same choice, same default, same sink implementation.",
+              "default": "human",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/StreamFormat"
+                }
+              ]
+            },
             "path": {
               "description": "Resolved against the config file's own directory when relative, exactly like `stdio_out`'s `StdioTarget::Path`.",
               "type": "string"
@@ -1098,6 +1134,14 @@
           }
         }
       }
+    },
+    "Compression": {
+      "description": "`logit_proto::native`'s compression choice, mirrored here -- `logit-config` must not depend on `logit-proto` (`docs/design/pipeline-graph.md`'s crate layout), the same reason `RotatePolicy`/`RotateInterval` mirror into `logit_outputs::file`; `crates/logit-cli/src/ pipeline.rs` is the sole place this crosses into `logit_proto::frame::Compression`. `Zstd` is deliberately not a variant here: `logit_proto::native` rejects it on both encode and decode (the real `zstd` crate needs a C build via `zstd-sys`, breaking ADR `containerized-development`'s \"no host toolchain\" property), so there is nothing valid for a config to select.",
+      "type": "string",
+      "enum": [
+        "none",
+        "lz4"
+      ]
     },
     "DeliveryPosture": {
       "description": "Whether re-delivering an already-delivered batch is safe for a sink's destination -- see `BufferConfig::delivery`. `logit-config`'s own copy, for the same crate-layout reason as [`OverflowPolicy`]; converted to `logit_pipeline::DeliveryPosture` in `crates/logit-cli/src/pipeline.rs`.",
@@ -1395,6 +1439,14 @@
     },
     "StdioTarget": {
       "type": "string"
+    },
+    "StreamFormat": {
+      "description": "Which encoder a stream sink (`stdio_out`/`file_out`) writes through -- `docs/adr/file-output-native-format.md`. `Human` (the default) is the existing readable text render; `Native` is `logit_proto::native`'s wire format, the same one a future `logit_out` would speak, made available here because every frame it writes is independently decodable -- exactly what a rotated-away file already needs to be.",
+      "type": "string",
+      "enum": [
+        "human",
+        "native"
+      ]
     },
     "SyslogFacility": {
       "description": "The syslog PRI facility, named rather than a bare `0..=23` integer so schemars publishes a real enumeration and a typo is a config error rather than a silently-wrong PRI. Ordered to match the standard facility codes (`kern` is 0); `as_u8` reads the discriminant back out. `local0` defaults, matching `demo/hello/app.py`'s own `PRI = 134` (facility 16), so the demo round-trips its own PRI unchanged even before `syslog.facility` attribute precedence applies.",

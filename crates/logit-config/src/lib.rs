@@ -638,18 +638,34 @@ pub enum ComponentKind {
     StdioOut {
         #[serde(default)]
         target: StdioTarget,
+        /// Which encoder writes through this sink -- `human` (default) is this same readable
+        /// text; `native` is `logit_proto::native`'s wire format
+        /// (`docs/adr/file-output-native-format.md`).
+        #[serde(default)]
+        format: StreamFormat,
+        /// Only meaningful under `format: native` -- graph validation rejects a non-`none` value
+        /// otherwise.
+        #[serde(default)]
+        compression: Compression,
     },
     /// A rotating file sink -- `stdio_out`'s file target grown into an operational destination:
     /// size- and/or calendar-interval-triggered rotation, with logrotate-style numbered-suffix
-    /// retention. Renders the same human-readable text `stdio_out` does (`logit_outputs::stdio::
-    /// EventDump`) -- both share one sink implementation, `logit_outputs::stdio::StreamOutput`,
-    /// differing only in rotation policy. See `docs/adr/rotating-file-output.md`.
+    /// retention. Renders the same human-readable text `stdio_out` does by default
+    /// (`logit_outputs::stdio::EventDump`) -- both share one sink implementation,
+    /// `logit_outputs::stdio::StreamOutput`, differing only in rotation policy and, now, encoder.
+    /// See `docs/adr/rotating-file-output.md`/`docs/adr/file-output-native-format.md`.
     FileOut {
         /// Resolved against the config file's own directory when relative, exactly like
         /// `stdio_out`'s `StdioTarget::Path`.
         path: String,
         #[serde(default)]
         rotate: RotateConfig,
+        /// See `StdioOut::format` -- the same choice, same default, same sink implementation.
+        #[serde(default)]
+        format: StreamFormat,
+        /// See `StdioOut::compression`.
+        #[serde(default)]
+        compression: Compression,
     },
     /// RFC 3164 / RFC 5424 syslog egress over UDP or TCP -- the mirror of `SyslogIn`, and a real
     /// relay: header fields round-trip from an event's `syslog.*` attributes when present,
@@ -1078,6 +1094,35 @@ fn default_max_files() -> u32 {
 pub enum RotateInterval {
     Hourly,
     Daily,
+}
+
+/// Which encoder a stream sink (`stdio_out`/`file_out`) writes through --
+/// `docs/adr/file-output-native-format.md`. `Human` (the default) is the existing readable text
+/// render; `Native` is `logit_proto::native`'s wire format, the same one a future `logit_out`
+/// would speak, made available here because every frame it writes is independently decodable --
+/// exactly what a rotated-away file already needs to be.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamFormat {
+    #[default]
+    Human,
+    Native,
+}
+
+/// `logit_proto::native`'s compression choice, mirrored here -- `logit-config` must not depend on
+/// `logit-proto` (`docs/design/pipeline-graph.md`'s crate layout), the same reason
+/// `RotatePolicy`/`RotateInterval` mirror into `logit_outputs::file`; `crates/logit-cli/src/
+/// pipeline.rs` is the sole place this crosses into `logit_proto::frame::Compression`. `Zstd` is
+/// deliberately not a variant here: `logit_proto::native` rejects it on both encode and decode
+/// (the real `zstd` crate needs a C build via `zstd-sys`, breaking ADR
+/// `containerized-development`'s "no host toolchain" property), so there is nothing valid for a
+/// config to select.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Compression {
+    #[default]
+    None,
+    Lz4,
 }
 
 /// Per-sink delivery buffer (`docs/adr/buffered-sink-delivery.md`). Meaningful only on a
@@ -2107,7 +2152,11 @@ mod tests {
         let component: Component =
             serde_json::from_str(r#"{"type": "stdio_out", "sources": ["in"]}"#).unwrap();
         match component.kind {
-            ComponentKind::StdioOut { target } => assert_eq!(target, StdioTarget::Stdout),
+            ComponentKind::StdioOut { target, format, compression } => {
+                assert_eq!(target, StdioTarget::Stdout);
+                assert_eq!(format, StreamFormat::Human);
+                assert_eq!(compression, Compression::None);
+            }
             other => panic!("expected StdioOut, got {other:?}"),
         }
     }
@@ -2137,9 +2186,11 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::FileOut { path, rotate } => {
+            ComponentKind::FileOut { path, rotate, format, compression } => {
                 assert_eq!(path, "/var/log/logit/events.log");
                 assert_eq!(rotate, RotateConfig::default());
+                assert_eq!(format, StreamFormat::Human);
+                assert_eq!(compression, Compression::None);
             }
             other => panic!("expected FileOut, got {other:?}"),
         }
@@ -2184,6 +2235,71 @@ mod tests {
         {
             let interval: RotateInterval = serde_json::from_str(&format!(r#""{raw}""#)).unwrap();
             assert_eq!(interval, expected);
+        }
+    }
+
+    #[test]
+    fn stream_format_defaults_to_human() {
+        assert_eq!(StreamFormat::default(), StreamFormat::Human);
+    }
+
+    #[test]
+    fn each_stream_format_variant_deserializes() {
+        for (raw, expected) in [("human", StreamFormat::Human), ("native", StreamFormat::Native)] {
+            let format: StreamFormat = serde_json::from_str(&format!(r#""{raw}""#)).unwrap();
+            assert_eq!(format, expected);
+        }
+    }
+
+    #[test]
+    fn compression_defaults_to_none() {
+        assert_eq!(Compression::default(), Compression::None);
+    }
+
+    #[test]
+    fn each_compression_variant_deserializes() {
+        for (raw, expected) in [("none", Compression::None), ("lz4", Compression::Lz4)] {
+            let compression: Compression = serde_json::from_str(&format!(r#""{raw}""#)).unwrap();
+            assert_eq!(compression, expected);
+        }
+    }
+
+    #[test]
+    fn a_zstd_compression_value_is_a_clear_deserialize_error() {
+        // `zstd` is deliberately not a `Compression` variant -- `logit_proto::native` rejects it
+        // on both encode and decode, so there is nothing valid for a config to select.
+        let result: Result<Compression, _> = serde_json::from_str(r#""zstd""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn stdio_out_with_format_native_and_compression_lz4_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "stdio_out", "sources": ["in"], "format": "native", "compression": "lz4"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::StdioOut { format, compression, .. } => {
+                assert_eq!(format, StreamFormat::Native);
+                assert_eq!(compression, Compression::Lz4);
+            }
+            other => panic!("expected StdioOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_out_with_format_native_and_compression_lz4_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "file_out", "sources": ["in"], "path": "events.log",
+                "rotate": {"max_bytes": "1MiB"}, "format": "native", "compression": "lz4"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::FileOut { format, compression, .. } => {
+                assert_eq!(format, StreamFormat::Native);
+                assert_eq!(compression, Compression::Lz4);
+            }
+            other => panic!("expected FileOut, got {other:?}"),
         }
     }
 

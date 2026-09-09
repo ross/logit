@@ -542,14 +542,15 @@ already built that have a known, accepted rough edge.
   Being a separate, opt-in component (rather than a flag on `syslog_in`) is the point: it keeps the
   listener's contract simple and honest, and makes "we trust our senders' clocks" a visible line in
   the config graph rather than a default nobody remembers choosing.
-- **`stdio_out` has no reopen and no user-controlled format** — a file target is opened once, in
-  append mode, and held for the process's lifetime: an external log rotator that moves the file
-  leaves `logit` writing to the unlinked inode until restart (there is no SIGHUP-reopen). The
-  output format is fixed; a user-supplied `format:` template is designed for (the encoder is built
-  around a `Format` enum) but not implemented. Both are acceptable for a debugging/dev-loop sink,
-  which is what this is for — `file_out` (ADR `rotating-file-output`) is the sink to reach for when
-  a file target needs to be bounded, sharing `stdio_out`'s implementation but adding a rotation
-  policy.
+- **`stdio_out` has no reopen** — a file target is opened once, in append mode, and held for the
+  process's lifetime: an external log rotator that moves the file leaves `logit` writing to the
+  unlinked inode until restart (there is no SIGHUP-reopen). Acceptable for a debugging/dev-loop
+  sink, which is what this is for — `file_out` (ADR `rotating-file-output`) is the sink to reach
+  for when a file target needs to be bounded, sharing `stdio_out`'s implementation but adding a
+  rotation policy. The output format is no longer fixed (`format: human | native`,
+  ADR `file-output-native-format`) — a user-supplied `format:` *template* over the human-readable
+  render specifically is still designed for (the encoder is built around a `Format` enum with room
+  for it) but not implemented.
 - **`file_out` rotates and retains by count, but has no SIGHUP/external-rotator reopen, no
   compression, no `max_age`, no timestamped rotated-file naming, and its time-based rotation is
   write-triggered rather than boundary-triggered** (ADR `rotating-file-output`). An external tool
@@ -559,9 +560,15 @@ already built that have a known, accepted rough edge.
   (`.1`, `.2`, ...), never a timestamp, and an idle sink under a calendar `interval` rolls on its
   *next* write after the boundary, not at the boundary itself (the rolled file's *contents* are
   still exactly the previous period's, only its on-disk appearance is delayed). Retention is a
-  plain `max_files` count; there is no age-based eviction and no built-in compression of rotated
-  files, both left to an external tool. `format:` is inherited from `stdio_out` — the same fixed
-  human-readable render, with the same `Format::Ndjson`-shaped extension point left unbuilt.
+  plain `max_files` count; there is no age-based eviction, and rotated-file compression is
+  `format: native`'s `compression: lz4` or nothing — `format: human`'s text render has no
+  compression option of its own, and there is no built-in compression of already-rotated files
+  after the fact, both left to an external tool. `format:` (`human`, the same human-readable
+  render, or `native`, `logit_proto::native`'s wire format, ADR `file-output-native-format`) is
+  shared with `stdio_out`; a `format:` *template* over `human` specifically remains the one
+  unbuilt extension point (`Format::Ndjson` is named only as an aspiration, not code). Reading a
+  `file_out`-written `format: native` file back — a decoder-side reader/verifier, or wiring
+  `NativeDecoder` into `tail_in` — is real, unblocked follow-up work, not designed yet.
   `FileTarget::open` seeds `RotationState`'s calendar period from an existing file's own mtime (not
   just `written` from its length), so a restart under an `interval` policy correctly picks up
   mid-period rather than merging two periods' events into one file or silently never rotating —

@@ -19,10 +19,12 @@
 //! the thin [`StreamOutput`] that owns the open target and writes/flushes it. Every format test
 //! below runs against the encoder alone. `EventDump` also implements `logit_proto::Encoder`
 //! (`&EventBatch` -> `Bytes`) -- the same seam `InfluxLineEncoder` is already on -- which is what
-//! lets `StreamOutput` be generic over its encoder rather than hardcoding this one: a future
-//! binary/NDJSON encoder plugs into the same sink with no change to the destination half.
+//! lets `StreamOutput` be generic over its encoder rather than hardcoding this one. [`StreamEncoder`]
+//! is that seam realized: `format: native` (`docs/adr/file-output-native-format.md`) selects
+//! `logit_proto::native::NativeEncoder` instead, with no change to `Target`/`FileTarget` at all --
+//! the destination half never knew or cared what shape the bytes it writes came from.
 //!
-//! The encoder is deliberately built around a [`Format`] enum with a single variant today
+//! The text encoder is deliberately built around a [`Format`] enum with a single variant today
 //! (`Format::Human`), and the per-value/per-metric rendering (`render_value`/`render_metric`) is
 //! kept as free functions rather than inlined into one big match -- a future user-supplied
 //! `format:` template string (or an NDJSON variant) is explicitly designed *for* here (a new
@@ -47,6 +49,8 @@ use logit_core::{
     AttrMap, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Severity,
     SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus, Telemetry, Value,
 };
+use logit_proto::frame::Compression as NativeCompression;
+use logit_proto::native::NativeEncoder;
 use logit_proto::{CodecError, Encoder};
 use std::cmp::Ordering;
 // `std::fmt::Write`, for `write!` into a `String` -- formatting straight into the output buffer
@@ -122,6 +126,41 @@ impl EventDump {
 impl Encoder for EventDump {
     fn encode(&mut self, batch: &EventBatch) -> Result<Bytes, CodecError> {
         Ok(Bytes::from(self.render(batch).into_bytes()))
+    }
+}
+
+/// Which encoder [`StreamOutput`] writes through -- `Human` is [`EventDump`]'s existing text
+/// render, `Native` is `logit_proto::native::NativeEncoder` (`docs/adr/file-output-native-format.md`).
+/// An enum, not `Box<dyn Encoder>`: both implementors are `Copy` with no state that persists
+/// across calls (`NativeEncoder`'s own "dictionary-first" framing is rebuilt fresh inside every
+/// `encode()`, not carried on the encoder -- the whole point being that every frame it writes is
+/// independently decodable, which is exactly what lets `file_out` rotate mid-stream without
+/// stranding a reader), so delegation costs nothing a trait object wouldn't also cost. This keeps
+/// `StreamOutput<StreamEncoder>` the one concrete type `build_spec` ever constructs -- the same
+/// shape `syslog_out`'s `Conn` and `otlp_out`'s `OtlpTransport` already use for a runtime choice
+/// between a small, closed set of implementations.
+#[derive(Debug, Clone, Copy)]
+pub enum StreamEncoder {
+    Human(EventDump),
+    Native(NativeEncoder),
+}
+
+impl StreamEncoder {
+    pub fn human() -> Self {
+        StreamEncoder::Human(EventDump::default())
+    }
+
+    pub fn native(compression: NativeCompression) -> Self {
+        StreamEncoder::Native(NativeEncoder::new(compression))
+    }
+}
+
+impl Encoder for StreamEncoder {
+    fn encode(&mut self, batch: &EventBatch) -> Result<Bytes, CodecError> {
+        match self {
+            StreamEncoder::Human(e) => e.encode(batch),
+            StreamEncoder::Native(e) => e.encode(batch),
+        }
     }
 }
 
@@ -553,11 +592,11 @@ pub struct StreamOutput<E> {
     diagnostics: Diagnostics,
 }
 
-impl StreamOutput<EventDump> {
+impl StreamOutput<StreamEncoder> {
     pub fn stdout() -> Self {
         Self {
             target: Target::Stdout(io::stdout()),
-            encoder: EventDump::default(),
+            encoder: StreamEncoder::human(),
             telemetry: Telemetry::default(),
             diagnostics: Diagnostics::default(),
         }
@@ -566,7 +605,7 @@ impl StreamOutput<EventDump> {
     pub fn stderr() -> Self {
         Self {
             target: Target::Stderr(io::stderr()),
-            encoder: EventDump::default(),
+            encoder: StreamEncoder::human(),
             telemetry: Telemetry::default(),
             diagnostics: Diagnostics::default(),
         }
@@ -589,10 +628,21 @@ impl StreamOutput<EventDump> {
         let file = FileTarget::open(path, policy)?;
         Ok(Self {
             target: Target::File(file),
-            encoder: EventDump::default(),
+            encoder: StreamEncoder::human(),
             telemetry: Telemetry::default(),
             diagnostics: Diagnostics::default(),
         })
+    }
+
+    /// Selects which encoder writes through this sink, overriding the `human()` default every
+    /// constructor above starts with -- `build_spec` calls this for `format: native`
+    /// (`docs/adr/file-output-native-format.md`). Kept off the generic `impl<E>` block below since
+    /// `StreamEncoder` is the only encoder `build_spec` ever chooses between at config time; a
+    /// direct `StreamOutput<EventDump>`/`StreamOutput<NativeEncoder>` built by a test still swaps
+    /// encoders the ordinary way, by constructing a fresh value.
+    pub fn with_format(mut self, encoder: StreamEncoder) -> Self {
+        self.encoder = encoder;
+        self
     }
 }
 
@@ -614,17 +664,18 @@ impl<E> StreamOutput<E> {
 #[async_trait::async_trait]
 impl<E: Encoder + Send> Output for StreamOutput<E> {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        // `EventDump::encode` never actually returns `Err` (see its own doc comment), but a
-        // future non-`EventDump` encoder might, so this is handled for real rather than
-        // `.expect()`-ed away.
-        let bytes = self.encoder.encode(batch).context("encoding batch")?;
-        if bytes.is_empty() {
-            // An empty batch (`batch.events` is empty). Every *non-empty* batch `EventDump`
-            // encodes always produces at least a timestamp line per event -- see
-            // `render_event_block` -- so this can only happen here, never because a real event
-            // encoded to nothing.
+        // Checked on `batch.events` directly, before encoding at all -- not on the encoded
+        // `Bytes` afterward. The two used to coincide by accident: `EventDump` renders an empty
+        // batch to `""`, so checking the output was equivalent to checking the input. That stopped
+        // being true once a second encoder existed -- `NativeEncoder::encode` always produces a
+        // real, non-empty frame (a header plus a dictionary and resource, even for zero events),
+        // so an output-side check would never fire under `format: native` and every empty batch
+        // would still write a small real frame to disk. Checking the input instead is correct for
+        // any encoder, and also means never asking one to do work for nothing.
+        if batch.events.is_empty() {
             return Ok(());
         }
+        let bytes = self.encoder.encode(batch).context("encoding batch")?;
 
         // Rotation is decided *before* the write, never mid-batch -- a batch is always written
         // whole into whichever file it lands in, never split across a rotation boundary. See
@@ -1327,5 +1378,112 @@ mod tests {
         assert!(rotations.is_none(), "a failed rotation must never be counted, got: {rotations:?}");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // StreamEncoder -- delegation, and a real round-trip through the native decoder.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn stream_encoder_human_delegates_to_event_dump() {
+        let mut encoder = StreamEncoder::human();
+        let bytes = encoder
+            .encode(&batch_with(vec![metric_event(0, "x", MetricKind::Counter(1.0))]))
+            .expect("should encode");
+        let text = String::from_utf8(bytes.to_vec()).expect("human output is always valid utf-8");
+        assert!(text.contains("x counter=1"), "got: {text}");
+    }
+
+    /// Not just "it doesn't panic" -- decodes the frame with the real
+    /// `logit_proto::frame::read_frame` + `logit_proto::native::decode_batch` pair (the same one a
+    /// standalone reader would use, per that crate's own tests), confirming `StreamEncoder::Native`
+    /// really is `NativeEncoder` and not some other byte shape.
+    #[test]
+    fn stream_encoder_native_round_trips_through_the_real_native_decoder() {
+        let mut encoder = StreamEncoder::native(NativeCompression::None);
+        let mut bytes = encoder
+            .encode(&batch_with(vec![metric_event(0, "x", MetricKind::Counter(1.0))]))
+            .expect("native encode should succeed");
+
+        let (codec_id, mut payload) =
+            logit_proto::frame::read_frame(&mut bytes).expect("frame should read");
+        assert_eq!(codec_id, logit_proto::native::CODEC_NATIVE_V1);
+        let decoded =
+            logit_proto::native::decode_batch(&mut payload).expect("payload should decode");
+        assert_eq!(decoded.events.len(), 1);
+        match &decoded.events[0].metrics[0].kind {
+            MetricKind::Counter(v) => assert_eq!(*v, 1.0),
+            other => panic!("expected Counter, got {other:?}"),
+        }
+    }
+
+    /// The regression this fix exists for: before it, `send`'s short-circuit checked the *encoded*
+    /// bytes, which happened to be empty only for `EventDump`. `NativeEncoder::encode` always
+    /// produces a real, non-empty frame (header + dictionary + resource) even for zero events, so
+    /// under the old check an empty batch would still have written a small real frame to disk.
+    #[tokio::test]
+    async fn send_on_an_empty_batch_writes_nothing_under_native_format_either() {
+        let dir = std::env::temp_dir();
+        let path =
+            dir.join(format!("logit-stdio-out-test-native-empty-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut output = StreamOutput::open_path(&path)
+            .expect("path should open")
+            .with_format(StreamEncoder::native(NativeCompression::None));
+        output.send(&batch_with(vec![])).await.expect("send should succeed");
+
+        let contents = std::fs::read(&path).unwrap_or_default();
+        assert!(contents.is_empty(), "an empty batch under format: native should write nothing");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The concrete proof of this design's core claim (`docs/adr/file-output-native-format.md`):
+    /// `file_out`'s rotate-to-independent-files model and native's self-contained-frame model
+    /// were built for exactly this pairing. Rotates once under `format: native`, then decodes
+    /// **both** the just-rotated `.1` and the fresh active file independently -- neither needs the
+    /// other to be readable.
+    #[tokio::test]
+    async fn rotating_under_native_format_leaves_both_files_independently_decodable() {
+        let dir = std::env::temp_dir();
+        let path =
+            dir.join(format!("logit-stdio-out-test-native-rotate-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let rotated =
+            dir.join(format!("logit-stdio-out-test-native-rotate-{}.log.1", std::process::id()));
+        let _ = std::fs::remove_file(&rotated);
+
+        let policy = RotatePolicy { max_bytes: Some(1), interval: None, max_files: 5 };
+        let mut output = StreamOutput::rotating(&path, policy)
+            .expect("path should open")
+            .with_format(StreamEncoder::native(NativeCompression::None));
+
+        output
+            .send(&batch_with(vec![metric_event(0, "first", MetricKind::Counter(1.0))]))
+            .await
+            .expect("send should succeed");
+        output
+            .send(&batch_with(vec![metric_event(0, "second", MetricKind::Counter(2.0))]))
+            .await
+            .expect("send should succeed");
+        assert!(rotated.exists(), "the first batch should have been rotated out to .1");
+
+        for (file_path, expected_name) in [(&rotated, "first"), (&path, "second")] {
+            let mut bytes = Bytes::from(std::fs::read(file_path).unwrap());
+            let (codec_id, mut payload) =
+                logit_proto::frame::read_frame(&mut bytes).expect("frame should read");
+            assert_eq!(codec_id, logit_proto::native::CODEC_NATIVE_V1);
+            let decoded =
+                logit_proto::native::decode_batch(&mut payload).expect("payload should decode");
+            assert_eq!(
+                logit_core::interner::resolve(decoded.events[0].metrics[0].name),
+                expected_name,
+                "got the wrong events out of {}",
+                file_path.display()
+            );
+        }
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&rotated).ok();
     }
 }
