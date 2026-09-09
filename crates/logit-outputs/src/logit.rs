@@ -14,10 +14,19 @@
 //! **Lazy connect.** `LogitOutput::new` never touches the network -- a `logit_out` pointed at a
 //! peer that isn't up yet is not a config error, the same `syslog_out`/`Conn::Tcp` precedent.
 //!
-//! **Fault classification.** Connect/handshake failure (including a version/codec `Reject`
-//! before any data frame is sent) -> `Clean`; `Reject` on the connection at any point -> that
-//! `Reject`'s own severity (`REJECT_FRAME_TOO_LARGE`/`VERSION_MISMATCH`/`NO_COMMON_CODEC` ->
-//! `Permanent`, since retrying the identical `Hello` would fail identically); any I/O failure
+//! **Fault classification.** Connect/handshake I/O failure -> `Clean`. A `Reject`'s own severity
+//! is decided by [`reject_is_permanent`], not by *where* it arrives: only
+//! `REJECT_VERSION_MISMATCH`/`REJECT_NO_COMMON_CODEC`/`REJECT_FRAME_TOO_LARGE` name a condition
+//! that retrying the identical `Hello`/frame would hit identically, so those alone are
+//! `Permanent`. Every other code -- `REJECT_INTERNAL` (the peer is at its connection cap) and
+//! `REJECT_GOING_AWAY` (the peer is shutting down), plus any code a newer peer adds -- is
+//! transient, and a reconnect is exactly the right response: at the handshake site (nothing of
+//! this batch has been written yet) that's `Clean`; after a data frame has left, it's
+//! `Ambiguous`, not `Clean`, since the batch may or may not have already landed. That
+//! post-send `Ambiguous` case is genuinely reachable, not just theoretical: `logit_in`'s
+//! `serve_connection` races its per-frame `select!` against shutdown only on the *header* read,
+//! so it can take the shutdown arm with a header already readable -- `GOING_AWAY` arrives in
+//! place of the `Ack` for a batch that may or may not have been forwarded. Any other I/O failure
 //! once at least one byte of a data frame has left -> `Ambiguous`; an ack timeout or a
 //! mismatched `Ack.seq` -> `Ambiguous` (the batch may have landed; this connection's state is no
 //! longer trustworthy either way, so it's dropped and the next `send` reconnects).
@@ -191,12 +200,16 @@ impl LogitOutput {
         let ack = match response {
             control::ControlMessage::HelloAck(ack) => ack,
             control::ControlMessage::Reject(reject) => {
+                // Nothing of this batch has been written yet, so a transient reject is `Clean`,
+                // not `Ambiguous` -- see this module's own "Fault classification" doc.
+                let fault =
+                    if reject_is_permanent(reject.code) { Fault::Permanent } else { Fault::Clean };
                 return Err(anyhow::anyhow!(
                     "logit_in rejected this connection (code {}): {}",
                     reject.code,
                     reject.message
                 ))
-                .context(Fault::Permanent);
+                .context(fault);
             }
             other => {
                 return Err(anyhow::anyhow!("expected HelloAck or Reject, got {other:?}"))
@@ -237,6 +250,21 @@ fn fault_tag(fault: Fault) -> &'static str {
         Fault::Ambiguous => "ambiguous",
         Fault::Permanent => "permanent",
     }
+}
+
+/// Whether a `Reject`'s code names a condition that retrying the identical `Hello`/frame would
+/// hit identically -- the only codes that justify `Fault::Permanent`. Every other code
+/// (`REJECT_INTERNAL`, `REJECT_GOING_AWAY`, and any code a newer peer adds -- `Reject.code` is a
+/// u16 code space specifically so a reason can be added without a version bump, see
+/// `logit_proto::native::control`'s own doc comment) names a transient condition: the peer is at
+/// its connection cap or shutting down, and a reconnect is exactly the right response.
+fn reject_is_permanent(code: u16) -> bool {
+    matches!(
+        code,
+        control::REJECT_VERSION_MISMATCH
+            | control::REJECT_NO_COMMON_CODEC
+            | control::REJECT_FRAME_TOO_LARGE
+    )
 }
 
 /// The host part of a bare `host:port` endpoint -- `rsplit_once` so a bracketed IPv6 literal's
@@ -357,17 +385,21 @@ impl Output for LogitOutput {
         let ack = match ack_result {
             Ok(Ok(control::ControlMessage::Ack(ack))) => ack,
             Ok(Ok(control::ControlMessage::Reject(reject))) => {
-                self.telemetry.count(
-                    "logit.output.requests",
-                    1.0,
-                    &[("class", fault_tag(Fault::Permanent))],
-                );
+                // A frame has already left on this connection, so a transient reject is
+                // `Ambiguous` (the batch may or may not have landed), not `Clean` -- see this
+                // module's own "Fault classification" doc.
+                let fault = if reject_is_permanent(reject.code) {
+                    Fault::Permanent
+                } else {
+                    Fault::Ambiguous
+                };
+                self.telemetry.count("logit.output.requests", 1.0, &[("class", fault_tag(fault))]);
                 return Err(anyhow::anyhow!(
                     "logit_in rejected this connection (code {}): {}",
                     reject.code,
                     reject.message
                 ))
-                .context(Fault::Permanent);
+                .context(fault);
             }
             Ok(Ok(other)) => {
                 self.telemetry.count(
@@ -465,10 +497,13 @@ impl ControlEncode for control::Reject {
     }
 }
 
-/// Reads one whole control frame off `stream` and decodes it -- no `max_frame_bytes` bound here
-/// (unlike `logit_inputs::logit`'s server-side reader): a control message is always tiny, and
-/// this sink trusts the peer it just successfully TLS/protocol-handshaked with for the length of
-/// one connection.
+/// Reads one whole control frame off `stream` and decodes it. Bounded against
+/// [`frame::MAX_SANE_UNCOMPRESSED_LEN`] (this sink's own `Hello` already advertises exactly this
+/// as its `max_frame_bytes`) *before* either declared length is used to size an allocation --
+/// this matters even though a control message is always tiny in practice, because the first call
+/// (reading `HelloAck`) happens *before* the protocol handshake this sink would otherwise be
+/// trusting has actually completed: there is no trusted peer yet at that point, only a peer that
+/// completed a TCP (and, if configured, TLS) connect.
 async fn read_control<S: AsyncRead + Unpin>(
     stream: &mut S,
 ) -> anyhow::Result<control::ControlMessage> {
@@ -477,6 +512,17 @@ async fn read_control<S: AsyncRead + Unpin>(
     let mut header_bytes = Bytes::copy_from_slice(&header_buf);
     let header = frame::FrameHeader::read(&mut header_bytes)
         .map_err(|e| anyhow::Error::new(e).context("reading a control frame header"))?;
+    if header.uncompressed_len > frame::MAX_SANE_UNCOMPRESSED_LEN
+        || header.compressed_len > frame::MAX_SANE_UNCOMPRESSED_LEN
+    {
+        anyhow::bail!(
+            "control frame declares {}/{} (uncompressed/compressed) bytes, over the {}-byte \
+             sanity cap",
+            header.uncompressed_len,
+            header.compressed_len,
+            frame::MAX_SANE_UNCOMPRESSED_LEN
+        );
+    }
     let mut body = vec![0u8; header.compressed_len as usize];
     stream.read_exact(&mut body).await?;
     let mut full = BytesMut::with_capacity(frame::HEADER_LEN + body.len());
@@ -652,6 +698,26 @@ mod tests {
                 // never resolve (successfully or with an error) on its own.
                 std::future::pending::<()>().await;
             }
+            FakePeerBehavior::AckThenReject { code } => {
+                let ack = control::HelloAck {
+                    version: control::PROTOCOL_VERSION,
+                    codec: native::CODEC_NATIVE_V1,
+                    compression: 0,
+                    max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
+                    window: 1,
+                };
+                write_control(&mut stream, &ack).await.unwrap();
+                // Read (and discard) exactly one data frame, then reject instead of acking it --
+                // exercises the post-send `Reject` arm rather than the handshake one.
+                let mut header = [0u8; frame::HEADER_LEN];
+                stream.read_exact(&mut header).await.unwrap();
+                let mut header_bytes = Bytes::copy_from_slice(&header);
+                let h = frame::FrameHeader::read(&mut header_bytes).unwrap();
+                let mut body = vec![0u8; h.compressed_len as usize];
+                stream.read_exact(&mut body).await.unwrap();
+                let reject = control::Reject { code, message: "rejected after send".to_string() };
+                write_control(&mut stream, &reject).await.unwrap();
+            }
         }
     }
 
@@ -659,6 +725,7 @@ mod tests {
         Reject(control::Reject),
         AckThenClose { ack_compression: u8 },
         AckThenHang { ack_compression: u8 },
+        AckThenReject { code: u16 },
     }
 
     #[tokio::test]
@@ -670,6 +737,68 @@ mod tests {
                 code: control::REJECT_VERSION_MISMATCH,
                 message: "nope".to_string(),
             })
+        }));
+
+        let mut output = LogitOutput::new(addr);
+        let err = output.send(&sample_batch()).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Permanent);
+        assert!(is_explicitly_permanent(&err));
+    }
+
+    #[tokio::test]
+    async fn reject_internal_at_the_handshake_is_clean_not_permanent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(fake_peer(listener, |_hello| {
+            FakePeerBehavior::Reject(control::Reject {
+                code: control::REJECT_INTERNAL,
+                message: "connection limit reached, retry later".to_string(),
+            })
+        }));
+
+        let mut output = LogitOutput::new(addr);
+        let err = output.send(&sample_batch()).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Clean);
+        assert!(!is_explicitly_permanent(&err));
+    }
+
+    #[tokio::test]
+    async fn reject_going_away_at_the_handshake_is_clean_not_permanent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(fake_peer(listener, |_hello| {
+            FakePeerBehavior::Reject(control::Reject {
+                code: control::REJECT_GOING_AWAY,
+                message: "listener shutting down".to_string(),
+            })
+        }));
+
+        let mut output = LogitOutput::new(addr);
+        let err = output.send(&sample_batch()).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Clean);
+        assert!(!is_explicitly_permanent(&err));
+    }
+
+    #[tokio::test]
+    async fn a_reject_internal_after_the_frame_was_sent_is_ambiguous() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(fake_peer(listener, |_hello| FakePeerBehavior::AckThenReject {
+            code: control::REJECT_INTERNAL,
+        }));
+
+        let mut output = LogitOutput::new(addr);
+        let err = output.send(&sample_batch()).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Ambiguous);
+        assert!(!is_explicitly_permanent(&err));
+    }
+
+    #[tokio::test]
+    async fn a_reject_frame_too_large_after_the_frame_was_sent_is_still_permanent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(fake_peer(listener, |_hello| FakePeerBehavior::AckThenReject {
+            code: control::REJECT_FRAME_TOO_LARGE,
         }));
 
         let mut output = LogitOutput::new(addr);
@@ -777,5 +906,36 @@ mod tests {
         output.stream.as_mut().unwrap().peer_max_frame_bytes = frame::MAX_SANE_UNCOMPRESSED_LEN;
         output.send(&sample_batch()).await.expect("a normal batch should still send fine");
         recv_batch(&mut rx).await;
+    }
+
+    // ---- read_control's own allocation bound -------------------------------------------------
+
+    #[tokio::test]
+    async fn read_control_rejects_a_control_header_declaring_more_than_the_sanity_cap() {
+        // Hand-build a 24-byte frame header (no body follows) declaring a `compressed_len` of
+        // `u32::MAX` -- if `read_control` sized its allocation from this before checking it, this
+        // would attempt a ~4 GiB `vec![0u8; ...]`.
+        let mut header = BytesMut::new();
+        header.extend_from_slice(&frame::MAGIC);
+        header.extend_from_slice(&frame::VERSION.to_le_bytes());
+        header.extend_from_slice(&frame::FLAG_CONTROL.to_le_bytes());
+        header.extend_from_slice(&[0u8]); // codec -- meaningless on a control frame
+        header.extend_from_slice(&[Compression::None as u8]);
+        header.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        header.extend_from_slice(&16u32.to_le_bytes()); // uncompressed_len: small, unremarkable
+        header.extend_from_slice(&u32::MAX.to_le_bytes()); // compressed_len: hostile
+        header.extend_from_slice(&0u32.to_le_bytes()); // crc32c -- never reached
+        assert_eq!(header.len(), frame::HEADER_LEN, "test header must match the real wire shape");
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            let _ = client.write_all(&header).await;
+        });
+
+        let err = read_control(&mut server).await.unwrap_err();
+        assert!(
+            err.to_string().contains("sanity cap"),
+            "expected an error mentioning the sanity cap, got: {err}"
+        );
     }
 }

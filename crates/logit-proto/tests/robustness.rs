@@ -7,9 +7,12 @@
 //! thousand seeded bit flips; a length-bearing field inflated to a value far past what the input
 //! actually holds; and (for `decode_batch`, the one decoder whose payload is recursive)
 //! `Value::Array`/`Value::Map` nested past the decode-side depth cap. In every case: the decoder
-//! must return `Err`, never panic, and never allocate as if it trusted an attacker-declared length
-//! before bounding it (checked directly via a peak-allocation counter on the crafted-huge-count
-//! cases, where the property actually bites).
+//! must never panic, and never allocate as if it trusted an attacker-declared length before
+//! bounding it (checked directly via a peak-allocation counter on the crafted-huge-count cases,
+//! where the property actually bites). **Not every decoder here holds the same truncation
+//! contract, though** -- see [`assert_every_truncation_never_panics`] vs.
+//! [`assert_every_truncation_fails_cleanly`]'s own doc comments for which decoders hold which,
+//! and why.
 //!
 //! No RNG crate exists anywhere in this workspace (`docs/plans/native-transport.md`'s own
 //! research confirmed it) and none is added here -- [`Lcg`] below is a hand-rolled, seeded,
@@ -121,15 +124,43 @@ impl Lcg {
 
 // -- generic mutation sweeps, parameterized over one decoder at a time ------------------------
 
-/// Truncates `valid` to every length from 0 to `valid.len() - 1` and asserts the decoder neither
-/// panics nor succeeds -- a prefix of a valid encoding is never itself a complete, valid encoding
-/// for any of these formats (every one of them ends with real content, never optional padding).
-fn assert_every_truncation_fails_cleanly(valid: &[u8], decode: impl Fn(&mut Bytes) -> bool) {
+/// Truncates `valid` to every length from 0 to `valid.len() - 1` and asserts the decoder never
+/// panics -- the weaker of the two truncation contracts in this file, for decoders that genuinely
+/// don't guarantee more. `decode` returns whether the decode *failed* (every call site passes
+/// `.is_err()`), but that return value is deliberately not asserted on here.
+///
+/// The control messages (`Hello`/`HelloAck`/`Ack`/`Reject`/`ControlMessage`) use this weaker
+/// helper on purpose, not by oversight: their TLV fields are all-optional with silent
+/// zero/empty defaults by design (this module's own doc comment on
+/// `logit_proto::native::control`, `read_field`'s `Ok(None)` on an exhausted body, and the
+/// `hello_with_empty_lists_round_trips` unit test all pin this down), so a short truncation of a
+/// valid message routinely decodes `Ok` with some fields defaulted -- that is the protocol
+/// working as designed, not a bug this suite should flag. It also isn't a production hole:
+/// `logit_in::handshake` version-checks a zeroed `Hello` and rejects it explicitly.
+fn assert_every_truncation_never_panics(valid: &[u8], decode: impl Fn(&mut Bytes) -> bool) {
     for len in 0..valid.len() {
         let mut truncated = Bytes::copy_from_slice(&valid[..len]);
         let panicked =
             std::panic::catch_unwind(AssertUnwindSafe(|| decode(&mut truncated))).is_err();
         assert!(!panicked, "decoding a {len}-byte truncation of a valid input panicked");
+    }
+}
+
+/// [`assert_every_truncation_never_panics`], plus the stronger property [`frame::read_frame`] and
+/// [`native::decode_batch`] actually hold: no proper prefix of a valid encoding is itself a valid
+/// encoding, because every one of them ends in length-checked content rather than optional
+/// trailing fields the way the control messages do (see
+/// [`assert_every_truncation_never_panics`]'s own doc comment for that contrast). `decode` returns
+/// whether the decode *failed* (every call site passes `.is_err()`) -- call sites here assert on
+/// that, not just on panic-freedom.
+fn assert_every_truncation_fails_cleanly(valid: &[u8], decode: impl Fn(&mut Bytes) -> bool) {
+    for len in 0..valid.len() {
+        let mut truncated = Bytes::copy_from_slice(&valid[..len]);
+        let failed = match std::panic::catch_unwind(AssertUnwindSafe(|| decode(&mut truncated))) {
+            Ok(failed) => failed,
+            Err(_) => panic!("decoding a {len}-byte truncation of a valid input panicked"),
+        };
+        assert!(failed, "a {len}-byte truncation of a valid input decoded successfully");
     }
 }
 
@@ -349,7 +380,7 @@ fn native_decoder_decode_into_never_panics_on_a_truncated_framed_batch() {
 #[test]
 fn hello_survives_every_single_byte_truncation() {
     let encoded = sample_hello().encode();
-    assert_every_truncation_fails_cleanly(&encoded, |bytes| Hello::decode(bytes).is_err());
+    assert_every_truncation_never_panics(&encoded, |bytes| Hello::decode(bytes).is_err());
 }
 
 #[test]
@@ -361,7 +392,7 @@ fn hello_survives_seeded_bit_flips() {
 #[test]
 fn hello_ack_survives_every_single_byte_truncation() {
     let encoded = sample_hello_ack().encode();
-    assert_every_truncation_fails_cleanly(&encoded, |bytes| HelloAck::decode(bytes).is_err());
+    assert_every_truncation_never_panics(&encoded, |bytes| HelloAck::decode(bytes).is_err());
 }
 
 #[test]
@@ -373,7 +404,7 @@ fn hello_ack_survives_seeded_bit_flips() {
 #[test]
 fn ack_survives_every_single_byte_truncation() {
     let encoded = sample_ack().encode();
-    assert_every_truncation_fails_cleanly(&encoded, |bytes| Ack::decode(bytes).is_err());
+    assert_every_truncation_never_panics(&encoded, |bytes| Ack::decode(bytes).is_err());
 }
 
 #[test]
@@ -385,7 +416,7 @@ fn ack_survives_seeded_bit_flips() {
 #[test]
 fn reject_survives_every_single_byte_truncation() {
     let encoded = sample_reject().encode();
-    assert_every_truncation_fails_cleanly(&encoded, |bytes| Reject::decode(bytes).is_err());
+    assert_every_truncation_never_panics(&encoded, |bytes| Reject::decode(bytes).is_err());
 }
 
 #[test]
@@ -416,7 +447,7 @@ fn control_message_dispatch_survives_every_single_byte_truncation_of_every_messa
         sample_ack().encode(),
         sample_reject().encode(),
     ] {
-        assert_every_truncation_fails_cleanly(&encoded, |bytes| {
+        assert_every_truncation_never_panics(&encoded, |bytes| {
             control::ControlMessage::decode(bytes).is_err()
         });
     }

@@ -455,7 +455,12 @@ comfortably under `retry_budget` -- a `request_timeout` close to or above the re
 room for at most one attempt before the budget itself expires, which defeats retry's purpose.
 `request_timeout` also bounds `logit_in`'s own 5s handshake grace on the far end only loosely: a
 `logit_out` configured with a shorter `request_timeout` than its peer's handshake patience just
-means *this* side gives up first, not that the connection is unsafe.
+means *this* side gives up first, not that the connection is unsafe. A peer that gets
+`Reject{code: REJECT_INTERNAL}` from a `logit_in` at its connection cap classifies it `clean` (or
+`ambiguous`, if a frame had already been sent on that connection) and retries -- not `permanent` --
+so a `logit_out` backing off against a temporarily-full `logit_in` recovers on its own once the
+peer has capacity again, with no operator intervention needed. The same holds for
+`Reject{code: REJECT_GOING_AWAY}` during the peer's own shutdown.
 
 **What to watch.** `logit_out`: `logit.output.requests{class}` (`ok`/`clean`/`ambiguous`/
 `permanent`, one per `send` attempt), `logit.output.reconnects` (should stay near zero in steady

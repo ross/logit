@@ -23,7 +23,23 @@
 //! a non-blocking `try_acquire_owned`: at capacity, a connecting client gets a clean `Reject` and
 //! the connection closes immediately rather than hanging with a handshake that never starts.
 //! `logit`-to-`logit` peers are expected to retry/back off on their own, the same assumption the
-//! connection protocol's ack-driven backpressure already leans on.
+//! connection protocol's ack-driven backpressure already leans on. **The reject goes out after
+//! the TLS wrap, when TLS is configured, not onto the raw `TcpStream`** -- a TLS-configured
+//! `logit_out` past the cap is waiting for a ServerHello, not framed bytes, so
+//! [`reject_or_serve`] does the (now timeout-bounded, see "Pre-`Hello` timeout" below) TLS accept
+//! first for *every* connection and only then decides reject-or-serve. The cost: a connection
+//! rejected for being past the cap now spends one TLS handshake instead of one write -- bounded
+//! per-connection by the same pre-`Hello` timeout, but not bounded in count, since by definition
+//! there is no permit to hold while it happens. Judged acceptable: the alternative (closing with
+//! no `Reject` at all when TLS is on) reintroduces exactly the opaque failure a clean `Reject` is
+//! for.
+//!
+//! **Pre-`Hello` timeout.** [`LogitInput::handshake_timeout`] (field, defaulted to 5s) now bounds
+//! the *whole* pre-`Hello` budget on both the TLS and plaintext paths: the TLS accept itself
+//! (wrapped in `tokio::time::timeout` in the accept loop) and, after it, the `Hello` read inside
+//! [`handshake`]. Before this, only the `Hello` read was bounded -- an unbounded TLS accept let a
+//! client that opened a connection and sent nothing pin a connection-limit permit forever, which
+//! at 1024 connections could turn every subsequent legitimate peer into an immediate `Reject`.
 
 use crate::Input;
 use bytes::{Bytes, BytesMut};
@@ -41,9 +57,11 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
-/// How long a connection has to send `Hello` after connecting before this listener gives up on
-/// it -- generous enough for a loaded peer under TLS, tight enough that a connection opened and
-/// then abandoned (a port scan, a misconfigured health check) doesn't sit open forever.
+/// Default for [`LogitInput::handshake_timeout`] -- how long a connection has, in total, to
+/// finish its TLS accept (if configured) and send `Hello` before this listener gives up on it --
+/// generous enough for a loaded peer under TLS, tight enough that a connection opened and then
+/// abandoned (a port scan, a misconfigured health check, or a TLS client that never sends its
+/// ClientHello) doesn't pin a connection-limit permit forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// See this module's own doc comment's "Connection limit" section for why this listener rejects
@@ -61,6 +79,8 @@ pub struct LogitInput {
     tls: Option<Arc<rustls::ServerConfig>>,
     max_frame_bytes: u32,
     max_connections: usize,
+    /// See this module's own doc comment's "Pre-`Hello` timeout" section.
+    handshake_timeout: Duration,
 }
 
 impl LogitInput {
@@ -72,6 +92,7 @@ impl LogitInput {
             tls: None,
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             max_connections: MAX_CONCURRENT_CONNECTIONS,
+            handshake_timeout: HANDSHAKE_TIMEOUT,
         }
     }
 
@@ -114,6 +135,15 @@ impl LogitInput {
         self.max_connections = max_connections;
         self
     }
+
+    /// Test-only override of [`HANDSHAKE_TIMEOUT`] -- shortens the pre-`Hello` budget so a test
+    /// can observe it actually firing (releasing a permit, timing out a silent TLS accept)
+    /// without a multi-second sleep.
+    #[cfg(test)]
+    fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
+        self.handshake_timeout = handshake_timeout;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -135,34 +165,26 @@ impl Input for LogitInput {
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
         let live_connections = Arc::new(AtomicI64::new(0));
         let max_frame_bytes = self.max_frame_bytes;
+        let handshake_timeout = self.handshake_timeout;
 
         loop {
-            let (mut stream, _peer) = tokio::select! {
+            let (stream, _peer) = tokio::select! {
                 accepted = listener.accept() => accepted?,
                 _ = shutdown.wait_for(|&due| due) => return Ok(()),
             };
 
-            let permit = match connection_limit.clone().try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    self.telemetry.count(
-                        "logit.input.connections.rejected",
-                        1.0,
-                        &[("reason", "limit")],
-                    );
-                    let mut diag = self.diag.clone();
-                    tokio::spawn(async move {
-                        let reject = control::Reject {
-                            code: control::REJECT_INTERNAL,
-                            message: "connection limit reached, retry later".to_string(),
-                        };
-                        if let Err(err) = write_control(&mut stream, &reject).await {
-                            diag.warn_throttled("connection_limit_reject_failed", err);
-                        }
-                    });
-                    continue;
-                }
-            };
+            // Non-blocking: `None` here means "past the cap," handled inside `reject_or_serve`
+            // rather than in this loop -- see this module's own "Connection limit" doc section
+            // for why the reject has to happen *after* the (now timeout-bounded) TLS wrap below,
+            // not onto this raw `stream`.
+            let permit = connection_limit.clone().try_acquire_owned().ok();
+            if permit.is_none() {
+                self.telemetry.count(
+                    "logit.input.connections.rejected",
+                    1.0,
+                    &[("reason", "limit")],
+                );
+            }
 
             let sink = sink.clone();
             let mut diag = self.diag.clone();
@@ -172,55 +194,108 @@ impl Input for LogitInput {
             let live_connections = live_connections.clone();
 
             tokio::spawn(async move {
-                let _permit = permit; // held for the connection's lifetime; released on drop
-                live_connections.fetch_add(1, Ordering::Relaxed);
-                telemetry.gauge(
-                    "logit.input.connections",
-                    live_connections.load(Ordering::Relaxed) as f64,
-                    &[],
-                );
-
                 let result = match tls_acceptor {
-                    Some(acceptor) => match acceptor.accept(stream).await {
-                        Ok(tls_stream) => {
-                            serve_connection(
-                                tls_stream,
-                                sink,
-                                telemetry.clone(),
-                                max_frame_bytes,
-                                conn_shutdown,
-                            )
-                            .await
+                    Some(acceptor) => {
+                        match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await
+                        {
+                            Ok(Ok(tls_stream)) => {
+                                reject_or_serve(
+                                    tls_stream,
+                                    permit,
+                                    sink,
+                                    telemetry.clone(),
+                                    max_frame_bytes,
+                                    handshake_timeout,
+                                    conn_shutdown,
+                                    live_connections,
+                                )
+                                .await
+                            }
+                            Ok(Err(err)) => Err(anyhow::anyhow!("TLS handshake failed: {err}")),
+                            Err(_elapsed) => Err(anyhow::anyhow!(
+                                "TLS handshake did not complete within {handshake_timeout:?}"
+                            )),
                         }
-                        Err(err) => Err(anyhow::anyhow!("TLS handshake failed: {err}")),
-                    },
+                    }
                     None => {
-                        serve_connection(
+                        reject_or_serve(
                             stream,
+                            permit,
                             sink,
                             telemetry.clone(),
                             max_frame_bytes,
+                            handshake_timeout,
                             conn_shutdown,
+                            live_connections,
                         )
                         .await
                     }
                 };
                 // One connection's I/O error (a client disconnecting mid-frame, a malformed
-                // preamble) shouldn't be fatal to the listener or its sibling connections --
-                // only `TcpListener::accept` failing in the accept loop above is.
+                // preamble, a TLS accept that failed or timed out) shouldn't be fatal to the
+                // listener or its sibling connections -- only `TcpListener::accept` failing in
+                // the accept loop above is. This is also where the old, dedicated
+                // `connection_limit_reject_failed` diagnostic used to live -- subsumed here since
+                // a reject that fails to write is now just another connection-level I/O error.
                 if let Err(err) = result {
                     diag.warn_throttled("connection_error", err);
                 }
-
-                live_connections.fetch_sub(1, Ordering::Relaxed);
-                telemetry.gauge(
-                    "logit.input.connections",
-                    live_connections.load(Ordering::Relaxed) as f64,
-                    &[],
-                );
             });
         }
     }
+}
+
+/// A connection that arrived past this listener's cap gets the same clean, decodable
+/// `Reject{INTERNAL}` whether or not TLS is configured -- which means the reject has to be
+/// written *after* the TLS wrap, not onto a raw `TcpStream` where a TLS client is waiting for a
+/// ServerHello. `permit` is `None` exactly when the connection arrived past the cap (this
+/// module's own "Connection limit" doc section); the `logit.input.connections` gauge only ever
+/// counts a connection that actually holds one, incremented/decremented around the `Some` arm
+/// here rather than in the accept loop.
+#[allow(clippy::too_many_arguments)] // one small helper is clearer here than a params struct for 8 mostly-unrelated threaded-through values
+async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    mut stream: S,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    sink: Fanout,
+    telemetry: Telemetry,
+    max_frame_bytes: u32,
+    handshake_timeout: Duration,
+    shutdown: watch::Receiver<bool>,
+    live_connections: Arc<AtomicI64>,
+) -> anyhow::Result<()> {
+    let Some(_permit) = permit else {
+        let reject = control::Reject {
+            code: control::REJECT_INTERNAL,
+            message: "connection limit reached, retry later".to_string(),
+        };
+        return write_control(&mut stream, &reject).await;
+    };
+
+    live_connections.fetch_add(1, Ordering::Relaxed);
+    telemetry.gauge(
+        "logit.input.connections",
+        live_connections.load(Ordering::Relaxed) as f64,
+        &[],
+    );
+
+    let result = serve_connection(
+        stream,
+        sink,
+        telemetry.clone(),
+        max_frame_bytes,
+        handshake_timeout,
+        shutdown,
+    )
+    .await;
+
+    live_connections.fetch_sub(1, Ordering::Relaxed);
+    telemetry.gauge(
+        "logit.input.connections",
+        live_connections.load(Ordering::Relaxed) as f64,
+        &[],
+    );
+
+    result
 }
 
 /// What the handshake negotiated for one connection.
@@ -246,9 +321,10 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     sink: Fanout,
     telemetry: Telemetry,
     max_frame_bytes: u32,
+    handshake_timeout: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let negotiated = match handshake(&mut stream, max_frame_bytes).await {
+    let negotiated = match handshake(&mut stream, max_frame_bytes, handshake_timeout).await {
         Ok(n) => n,
         Err(err) => {
             telemetry.count("logit.proto.errors", 1.0, &[("reason", "handshake")]);
@@ -355,14 +431,18 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     }
 }
 
-/// Reads and negotiates the connection handshake: expects `Hello` within [`HANDSHAKE_TIMEOUT`],
-/// replies `HelloAck` (codec/compression = the intersection with what this listener offers) or
-/// `Reject` and returns an error either way a client can't proceed.
+/// Reads and negotiates the connection handshake: expects `Hello` within `handshake_timeout`
+/// (this is the *remainder* of the connection's pre-`Hello` budget -- the accept loop's TLS
+/// accept, when TLS is configured, is bounded by the same knob and already-spent before this
+/// runs; see this module's own "Pre-`Hello` timeout" doc section), replies `HelloAck` (codec/
+/// compression = the intersection with what this listener offers) or `Reject` and returns an
+/// error either way a client can't proceed.
 async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     max_frame_bytes: u32,
+    handshake_timeout: Duration,
 ) -> anyhow::Result<Negotiated> {
-    let read = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+    let read = tokio::time::timeout(handshake_timeout, async {
         let Some(header_buf) = read_header(stream).await? else {
             anyhow::bail!("connection closed before sending Hello");
         };
@@ -477,8 +557,8 @@ impl FrameReadError {
 /// `stream`, then reads the body and hands the whole thing to
 /// [`frame::read_frame_with_header`] (reusing its CRC/decompression/length-consistency checks
 /// wholesale rather than reimplementing them). Shared by the handshake (no `shutdown` to race --
-/// it's already time-bounded by [`HANDSHAKE_TIMEOUT`]) and `serve_connection`'s main loop (which
-/// only races `shutdown` against the header read that precedes this).
+/// it's already time-bounded by [`handshake`]'s own `handshake_timeout`) and `serve_connection`'s
+/// main loop (which only races `shutdown` against the header read that precedes this).
 async fn read_frame_body<S: AsyncRead + Unpin>(
     stream: &mut S,
     header_buf: [u8; frame::HEADER_LEN],
@@ -566,6 +646,8 @@ mod tests {
     };
     use logit_proto::native::NativeEncoder;
     use logit_proto::Encoder;
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::CertificateDer;
     use std::sync::Arc;
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
@@ -916,5 +998,152 @@ mod tests {
             .expect("should observe a close within 2s")
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    // ---- TLS: pre-`Hello` timeout (F3) and cap-reject-over-TLS (F5) --------------------------
+
+    fn testdata_dir() -> std::path::PathBuf {
+        // `logit-inputs` lives at `crates/logit-inputs`; the fixtures live at the repo root's
+        // `testdata/tls` (`testdata/tls/README.md`) -- two levels up from `CARGO_MANIFEST_DIR`,
+        // the same path `crate::otlp`'s own TLS tests use.
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
+    }
+
+    fn test_tls_settings() -> TlsServerSettings {
+        TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: None,
+        }
+    }
+
+    /// A `tokio-rustls` client trusting `testdata/tls/ca.pem`, presenting no client certificate --
+    /// mirrors `crate::otlp`'s own test-module `tls_connector` (no mTLS case needed here).
+    async fn tls_connector() -> tokio_rustls::TlsConnector {
+        let dir = testdata_dir();
+        let mut roots = rustls::RootCertStore::empty();
+        let ca: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(dir.join("ca.pem"))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        roots.add_parsable_certificates(ca);
+        let cfg = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg))
+    }
+
+    /// [`read_control_response`]'s generic twin -- that one is pinned to a plaintext `TcpStream`
+    /// so plaintext tests read naturally; the TLS tests below need the same read logic over a
+    /// `tokio_rustls::client::TlsStream`, which `read_header`/`read_frame_body` already support
+    /// (both generic over `AsyncRead + Unpin`).
+    async fn read_control_response_over<S: AsyncRead + Unpin>(
+        stream: &mut S,
+    ) -> control::ControlMessage {
+        let header_buf =
+            read_header(stream).await.unwrap().expect("expected a frame, got a clean close");
+        let (header, mut payload) =
+            read_frame_body(stream, header_buf, frame::MAX_SANE_UNCOMPRESSED_LEN)
+                .await
+                .map_err(FrameReadError::into_inner)
+                .unwrap();
+        assert_eq!(
+            header.flags & frame::FLAG_CONTROL,
+            frame::FLAG_CONTROL,
+            "expected a control frame"
+        );
+        control::ControlMessage::decode(&mut payload).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_tls_client_that_sends_nothing_releases_its_permit_after_the_handshake_timeout() {
+        let (addr, input) = bound_input().await;
+        let input = input
+            .with_tls(&test_tls_settings(), &testdata_dir())
+            .unwrap()
+            .with_max_connections(1)
+            .with_handshake_timeout(Duration::from_millis(200));
+        let (sink, _rx) = fanout_into_channel(16);
+        let mut input = input;
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // First connection: raw TCP, sends nothing (not even a TLS ClientHello) -- takes the
+        // listener's one permit, then the TLS accept step it's stuck in must time out and
+        // release it. Held past that -- not dropped -- so nothing but the timeout could free the
+        // permit.
+        let _silent = connect(&addr).await;
+
+        // Comfortably longer than the 200ms handshake_timeout, short enough to keep the test
+        // fast.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // Second connection: a real TLS client. If the first connection's permit was never
+        // released, this would get `Reject{INTERNAL}` (or hang against the accept loop's own
+        // cap); a `HelloAck` proves the permit came back.
+        let connector = tls_connector().await;
+        let stream = connect(&addr).await;
+        let server_name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls_stream =
+            tokio::time::timeout(Duration::from_secs(2), connector.connect(server_name, stream))
+                .await
+                .expect("TLS handshake should complete once the permit is free")
+                .unwrap();
+
+        let hello = control::Hello {
+            version: control::PROTOCOL_VERSION,
+            codecs: vec![native::CODEC_NATIVE_V1],
+            compressions: vec![0],
+            max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
+            window: 1,
+        };
+        write_control(&mut tls_stream, &hello).await.unwrap();
+        match read_control_response_over(&mut tls_stream).await {
+            control::ControlMessage::HelloAck(ack) => {
+                assert_eq!(ack.codec, native::CODEC_NATIVE_V1);
+            }
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tls_listener_at_its_connection_cap_rejects_over_tls_not_in_the_clear() {
+        let (addr, input) = bound_input().await;
+        let input =
+            input.with_tls(&test_tls_settings(), &testdata_dir()).unwrap().with_max_connections(1);
+        let (sink, _rx) = fanout_into_channel(16);
+        let mut input = input;
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // First connection: raw TCP, holds the one permit for the (default, 5s) handshake
+        // timeout -- plenty of time for the rest of this test.
+        let _first = connect(&addr).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Second connection: past the cap, but completes a *real* TLS handshake first -- the
+        // point of this test is that the Reject arrives decodable over that TLS stream, not as
+        // framed bytes where a client mid-handshake would otherwise see garbage.
+        let connector = tls_connector().await;
+        let stream = connect(&addr).await;
+        let server_name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls_stream = tokio::time::timeout(
+            Duration::from_secs(2),
+            connector.connect(server_name, stream),
+        )
+        .await
+        .expect("the TLS handshake itself must succeed even though the connection is over the cap")
+        .unwrap();
+
+        match read_control_response_over(&mut tls_stream).await {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_INTERNAL);
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
     }
 }

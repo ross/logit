@@ -62,6 +62,13 @@ already built that have a known, accepted rough edge.
     `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md)) depends on
     every listener eventually releasing. Not fixed here — `logit_in`'s design is the pattern to
     follow when this is addressed.
+  - **`otlp_in`'s TLS accept has no timeout.** `crate::otlp::run`'s `acceptor.accept(stream).await`
+    is unbounded, same gap `logit_in` had until this was fixed there: a client that completes TCP
+    connect and then sends nothing pins a connection-limit permit forever. `logit_in`'s pattern
+    (`LogitInput::handshake_timeout`, wrapping the TLS accept itself in
+    `tokio::time::timeout` in its accept loop, not just the post-TLS `Hello`/request read) is the
+    one to follow here too. Not fixed for `otlp_in` in the same change — out of scope for the
+    finding that fixed it for `logit_in`.
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`), and
   every sink now sits behind a bounded, byte-aware `SinkQueue`

@@ -61,7 +61,23 @@ immediate `Reject` and the connection closes, rather than `otlp_in`'s shape (a b
 `acquire_owned`, where the connection is accepted at the kernel level and then left with a
 handshake that silently never starts). `logit`-to-`logit` peers are expected to retry on their own,
 the same assumption the ack-driven backpressure above already leans on — an explicit "try later"
-is more useful to that peer than a hung connection.
+is more useful to that peer than a hung connection. That `Reject` is written after the TLS wrap
+when TLS is configured, not onto the raw `TcpStream` — a TLS-configured `logit_out` past the cap is
+waiting for a ServerHello, not framed bytes, so writing the reject in the clear would look like a
+protocol violation rather than a clean, decodable refusal. The cost is one TLS handshake per
+rejected connection instead of one write, bounded per-connection by the same handshake timeout the
+`Hello` read itself uses but not bounded in count (there is no permit to hold while it happens).
+
+**`Reject.code` classification: only three codes are permanent.** `REJECT_VERSION_MISMATCH`,
+`REJECT_NO_COMMON_CODEC`, and `REJECT_FRAME_TOO_LARGE` name a condition that retrying the identical
+`Hello`/frame would hit identically, so `logit_out` classifies those `Fault::Permanent`. Every
+other code — `REJECT_INTERNAL` (the peer is at its connection cap) and `REJECT_GOING_AWAY` (the
+peer is shutting down), plus any code a future peer adds — is transient: `logit_out` classifies
+those `Fault::Clean` at the handshake (nothing written yet) and `Fault::Ambiguous` once a data
+frame has already left (the batch may or may not have landed). The `Ambiguous` case is genuinely
+reachable, not just theoretical: `serve_connection`'s per-frame `select!` only races shutdown
+against the frame *header* read, so it can take the shutdown arm with a header already readable —
+`GOING_AWAY` arrives in place of the `Ack` for a batch that may or may not have been forwarded.
 
 **Shutdown: `logit_in` overrides `Input::run_until_shutdown`.** Every spawned connection task holds
 its own `Fanout` clone (the cancel-by-drop shutdown mechanism [ADR
