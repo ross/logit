@@ -1,6 +1,7 @@
 # The demo pipeline (demo/README.md, docs/plans/demo-tracing-stack.md, docs/plans/demo-stack.md,
 # docs/plans/otlp-end-to-end.md, docs/plans/otlp-logs-and-resource-identity.md,
-# docs/plans/access-log-spans.md, docs/plans/file-tailing.md, docs/plans/demo-richer-traces.md).
+# docs/plans/access-log-spans.md, docs/plans/file-tailing.md, docs/plans/demo-richer-traces.md,
+# docs/plans/operator-surface.md).
 # Exercises syslog in, tail_in, docker_in, set + json + lua + trace_context + scale + kv_metrics +
 # keep_signals + keep + aggregate, InfluxDB out, OTLP/HTTP out, OTLP/gRPC out, plus `internal`
 # observing the pipeline itself (ADR `internal-telemetry-as-pipeline-events`, ADR
@@ -100,6 +101,18 @@
 #   demo-worker --syslog/UDP:5143--> worker_in -> worker_identity (set) -> worker_json (json)
 #             -> worker_trace (trace_context, no `span:` -- the worker's own Celery/psycopg spans
 #             are already real) -> stdout / logs_only -> loki_out
+#
+#   logit's own self-diagnostics (warn and above, `internal`'s default `logs:` threshold) ride
+#   the same `self` -> logs_only -> loki_out leg as every other tier's log events, alongside
+#   `self`'s own points/spans (docs/plans/operator-surface.md, workstream D) -- they are ordinary
+#   `LogRecord`-carrying events, nothing loki_out needs to know is different.
+#
+# `admin: { bind: 0.0.0.0:9600 }` below serves `/readyz`/`/healthz`
+# (docs/deploying.md's "Probes and exit codes") -- what demo/compose.yaml's own `logit` healthcheck
+# probes via `logit ready`.
+admin:
+  bind: 0.0.0.0:9600
+
 components:
   haproxy_in:
     type: syslog_in
@@ -296,10 +309,13 @@ components:
   # this `keep_signals: [logs]` gate in front of it -- `keep_signals` clears the payload slots it
   # isn't given (ADR `signal-filtering-components`), so every log that does reach `loki_out`
   # arrives with its log payload intact, just without the span-only events that would otherwise
-  # trip Loki's `send`.
+  # trip Loki's `send`. `self` (below) joins the same gate for the identical reason: it emits
+  # points, spans, *and* (docs/plans/operator-surface.md, workstream D) logs, all through this one
+  # component -- `keep_signals: [logs]` is what lets `logit`'s own self-diagnostics reach Loki
+  # without also sending `loki_out` a metric point or a span it would reject.
   logs_only:
     type: keep_signals
-    sources: [haproxy_trace, nginx_trace, app_trace, worker_trace, postgres_trace]
+    sources: [haproxy_trace, nginx_trace, app_trace, worker_trace, postgres_trace, self]
     signals: [logs]
 
   # Logs to Loki, direct over OTLP -- no relay service in between (docs/plans/

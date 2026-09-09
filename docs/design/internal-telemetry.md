@@ -238,10 +238,56 @@ argument for spans: `Event::timestamp` *is* the span's start (`SpanRecord`'s own
 stamping it with the drain time would make every span drift later than reality by however long it
 sat in the buffer.
 
+## Logs
+
+The producer ADR `internal-telemetry-as-pipeline-events` predicted: "a future `tracing` subscriber
+could itself feed `Diagnostics`/`Telemetry`, same as any other producer." `TelemetryLayer`
+(`crates/logit-core/src/telemetry.rs`) is that subscriber — a `tracing_subscriber::Layer`
+capturing every `logit`-targeted event at or above a threshold into the same per-component buffer
+points and spans already drain from. See ADR `tracing-for-self-logging` for why `tracing` itself
+was adopted; this section is only the capture-into-the-buffer half.
+
+### The emit API
+
+There is no direct emit API for logs the way `Telemetry::span`/`.count`/`.gauge` are one — a log
+event is never recorded by a component calling a method on its own `Telemetry` handle. It's
+captured centrally, off whatever `tracing::warn!`/`Diagnostics::warn` already emits, by
+`TelemetryLayer::on_event`, which reads the event's `component`/`key` fields and its rendered
+message, then calls the same `Registry::push_log(component_id, log)` a component-level method
+would have:
+
+```rust
+let layer = TelemetryLayer::new();               // starts inactive: every event a no-op
+layer.activate(registry, Severity::Warn, "self"); // "self" = the internal component's own id
+```
+
+Starts inactive deliberately: `logit-cli::main` installs the layer inside the global `tracing`
+subscriber *before* the config is even loaded (there is no stable API to add a layer to an
+already-installed subscriber), and `activate`s it once the config's own `internal` component (if
+any) and its `logs:` threshold are known, slightly later. A config with no `internal` component,
+or `logs: off`, never activates it — the same zero-cost-when-unconfigured shape
+`Telemetry::default` already has for points and spans.
+
+Two fallbacks decide where an event lands: one carrying a `component` field goes to that
+component's own buffer, under its own `key` field if present or the placeholder `"log"` if not
+(`Diagnostics::warn` never sets one); one with no `component` field at all — a runtime lifecycle
+event like `ready` or `shutdown signal received` — goes to the `internal` component's own buffer,
+under the stable key `"process"`.
+
+### The bound: a plain `Vec`, capped like spans
+
+`ComponentBuffer` holds captured logs in an unkeyed `Vec<PendingLog>`, capped at
+`MAX_LOGS_PER_COMPONENT` (256) — the same volume-bound, drop-and-count shape spans use
+(`logit.internal.logs.dropped{reason="buffer_full"}`), for the same reason: nothing else bounds
+how many can accumulate except drain interval × how chatty a component's own diagnostics are.
+Drained `Event::timestamp` is capture time, not the drain time — the same rule spans follow, for
+the same reason (a log line drifting later than reality by however long it sat in the buffer
+would be actively misleading).
+
 ## `internal`: the drain
 
 ```rust
-ComponentKind::Internal { interval: Duration }
+ComponentKind::Internal { interval: Duration, span_sample_rate: f64, logs: InternalLogs }
 ```
 
 A listener (`Role::Listener` — no `sources`, needs ≥1 consumer), like `statsd_in`. `interval`
@@ -263,10 +309,14 @@ divide evenly, a real window ends up straddling two drains in a way that isn't r
 run. The same rule DogStatsD documents for its own aggregation-interval-vs.-Agent-flush-interval
 relationship, for the same reason.
 
-`internal`'s own points (`logit.internal.points.emitted`, `logit.internal.drain.duration`) are
-recorded via its own `Telemetry` handle, registered in the same `Registry` it drains — they ride
-along in the *next* drain, one tick behind, since a drain can't include a count of itself. Every
-mature statsd client's own self-telemetry (packets sent/dropped) works the same way.
+`internal`'s own points (`logit.internal.points.emitted`, `logit.internal.spans.emitted`,
+`logit.internal.logs.emitted`, `logit.internal.drain.duration`) are recorded via its own
+`Telemetry` handle, registered in the same `Registry` it drains — they ride along in the *next*
+drain, one tick behind, since a drain can't include a count of itself. Every mature statsd
+client's own self-telemetry (packets sent/dropped) works the same way. `logs.emitted` is counted
+separately from `points.emitted` for the same reason `spans.emitted` already is: a log event
+carries neither `metrics` nor `span`, so it would otherwise be miscounted as a point
+(`crates/logit-inputs/src/internal.rs::tick`'s fold checks `event.log.is_some()` first).
 
 ## Naming
 
@@ -558,7 +608,10 @@ clear error surfaces the mistake instead of a silent no-op.
 - **Not a time-series aggregation engine.** The buffer coalesces to bound volume between drains;
   any real windowed aggregation is `aggregate`, attached downstream like any other consumer.
 - **Not a scrape endpoint.** There is no pull path and no plan for one — see ADR `internal-telemetry-as-pipeline-events`'s
-  alternatives for why.
-- **Not the `tracing` migration.** `Diagnostics`'s stderr output and this telemetry layer are both
-  still separate from the deferred `tracing` migration `docs/known-gaps.md` names; that migration,
-  when it lands, is a plausible future *producer* into this same buffer, not a replacement for it.
+  alternatives for why. The readiness/liveness endpoint (`docs/deploying.md`'s "Probes and exit
+  codes", ADR `admin-readiness-endpoint`) is not this either: it carries no metrics, and answers
+  "can this process do its job right now," not "what are its numbers."
+- **The `tracing` migration has landed, as a producer, not a replacement.** `Diagnostics` emits
+  through `tracing` (ADR `tracing-for-self-logging`), and `TelemetryLayer` (this doc's "Logs"
+  section) is exactly the future producer ADR `internal-telemetry-as-pipeline-events` predicted —
+  it feeds this same buffer, alongside points and spans, rather than replacing either.
