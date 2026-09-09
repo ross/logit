@@ -36,8 +36,15 @@ fn marker_of(batch: &EventBatch) -> usize {
 /// Sends every batch in `batches` once, then hangs forever -- the test drops this whole future
 /// (via a timeout) rather than ever letting it finish, simulating `SIGKILL`: no shutdown signal,
 /// no chance for anything downstream to flush or checkpoint on its own initiative.
+///
+/// `gap`: how long to sleep between each `sink.send(...)` call -- `Duration::ZERO` sends the
+/// whole burst as fast as possible (this file's original scenario); a nonzero gap gives delivery
+/// time to keep pace with ingest, which is what parks the reader at the end of the active segment
+/// before each rotation -- the F1 scenario `a_disk_backed_sink_keeps_delivering_across_a_rotation_once_the_reader_has_caught_up`
+/// below needs.
 struct BurstThenHangInput {
     batches: Vec<EventBatch>,
+    gap: Duration,
 }
 
 #[async_trait::async_trait]
@@ -45,6 +52,9 @@ impl Input for BurstThenHangInput {
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         for batch in self.batches.drain(..) {
             sink.send(batch).await;
+            if self.gap > Duration::ZERO {
+                tokio::time::sleep(self.gap).await;
+            }
         }
         std::future::pending::<()>().await;
         unreachable!("pending() never resolves")
@@ -165,7 +175,7 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
         specs.insert(
             "in".to_string(),
             NodeSpec::Input(
-                Box::new(BurstThenHangInput { batches }),
+                Box::new(BurstThenHangInput { batches, gap: Duration::ZERO }),
                 InputRuntimeConfig::default(),
             ),
         );
@@ -220,7 +230,7 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
         specs.insert(
             "in".to_string(),
             NodeSpec::Input(
-                Box::new(BurstThenHangInput { batches: vec![] }),
+                Box::new(BurstThenHangInput { batches: vec![], gap: Duration::ZERO }),
                 InputRuntimeConfig::default(),
             ),
         );
@@ -285,6 +295,92 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
     let mut sorted = run2_successes.clone();
     sorted.sort_unstable();
     assert_eq!(run2_successes, sorted, "run 2's deliveries must be in FIFO order");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// End-to-end proof of F1: a reader that catches up to the writer *while* its segment is still
+/// active must not stall forever once that segment later rotates away. `gap` between each
+/// `sink.send` gives delivery time to keep pace with ingest, which is exactly what parks the
+/// reader at `read_offset == len` of the still-active segment before the next rotation --
+/// reproducing the bug scenario at the integration level, not just the unit level
+/// (`disk_queue.rs`'s own `the_cursor_rolls_forward_when_a_segment_the_reader_caught_up_to_later_rotates_away`).
+#[tokio::test]
+async fn a_disk_backed_sink_keeps_delivering_across_a_rotation_once_the_reader_has_caught_up() {
+    let dir = std::env::temp_dir().join(format!(
+        "logit-durable-buffer-rotation-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let spool_dir = dir.join("spool");
+
+    const TOTAL: usize = 12;
+    let gap = Duration::from_millis(20);
+
+    // A couple of small records per segment -- small enough that this handful of batches forces
+    // several real rotations.
+    let (graph, mut disk_config) = graph_and_topology(spool_dir.clone());
+    disk_config.segment_bytes = 256;
+
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let output = RecordingOutput {
+        attempts: Arc::clone(&attempts),
+        attempt_count: Arc::new(AtomicU64::new(0)),
+        succeed_first_n_attempts: u64::MAX, // always succeeds
+    };
+
+    let batches: Vec<EventBatch> = (0..TOTAL).map(batch).collect();
+
+    let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+    specs.insert(
+        "in".to_string(),
+        NodeSpec::Input(
+            Box::new(BurstThenHangInput { batches, gap }),
+            InputRuntimeConfig::default(),
+        ),
+    );
+    specs.insert(
+        "out".to_string(),
+        NodeSpec::Output(
+            Box::new(output),
+            SinkStoreConfig::Disk(disk_config),
+            WriteLoopConfig::default(),
+        ),
+    );
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let run = tokio::spawn(logit_pipeline::run_with_shutdown(graph, specs, async move {
+        let mut rx = shutdown_rx;
+        let _ = rx.wait_for(|&fired| fired).await;
+    }));
+
+    // Poll for every batch to have been delivered rather than sleeping a fixed guess -- pre-fix,
+    // this would never reach TOTAL and the loop would run out the deadline instead.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if attempts.lock().unwrap().len() >= TOTAL || tokio::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let _ = shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run should finish once shutdown fires")
+        .expect("the task should not panic")
+        .expect("run should complete without error");
+
+    let delivered: Vec<usize> =
+        attempts.lock().unwrap().iter().map(|(marker, _)| *marker).collect();
+    assert_eq!(
+        delivered,
+        (0..TOTAL).collect::<Vec<_>>(),
+        "all {TOTAL} markers should have been delivered, in order, exactly once -- pre-fix, the \
+         reader would park forever on `not_empty` the first time it caught up mid-active-segment \
+         and that segment later rotated away"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

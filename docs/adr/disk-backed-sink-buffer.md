@@ -67,18 +67,33 @@ fully crossed it.
 **Bound and overflow.** `disk.max_bytes` (default 1 GiB) over the sum of on-disk segment sizes.
 `buffer.overflow` keeps its meaning: `block` (default) awaits room; `drop_oldest` advances the
 read cursor past whole head records (counted `batches.dropped{reason="overflow_oldest"}`, the
-same reason the in-memory queue uses) and never evicts a record a concurrent `peek` has reserved;
-`drop_newest` rejects the push outright. A write that fails outright — the filesystem genuinely
-out of space, a permissions error, the device gone — never leaves the batch silently counted as
-queued: it is dropped and counted (`reason="disk_full"` when the OS reports `ENOSPC` specifically,
-`reason="disk_io_error"` otherwise), under every overflow policy, since none of them can free real
-disk space. `write_in_flight` still gets set so the next push repairs any partial bytes the failed
-attempt left behind, exactly as a cancelled push does.
+same reason the in-memory queue uses) and still never evicts a record a concurrent `peek` has
+reserved — but a push arriving while the head *is* reserved is now dropped
+(`reason="overflow_newest"`) rather than accepted over-bound, because a file-backed FIFO cannot
+evict "behind" the reserved head the way the in-memory buffer's `InMemoryBuffer` can leave a hole
+mid-buffer; there is nowhere else in a segment file to evict from. `drop_newest` rejects the push
+outright. A write that fails outright — the filesystem genuinely out of space, a permissions
+error, the device gone — never leaves the batch silently counted as queued: it is dropped and
+counted (`reason="disk_full"` when the OS reports `ENOSPC` specifically, `reason="disk_io_error"`
+otherwise), under every overflow policy, since none of them can free real disk space.
+`write_in_flight` still gets set so the next push repairs any partial bytes the failed attempt
+left behind, exactly as a cancelled push does.
 
-**Durability.** `fdatasync` (`tokio::fs::File::sync_data`) on segment rotation, on the cursor
-file, and at shutdown — not per push. Power loss can lose the tail of the active segment; process
-death cannot lose anything already `write`n, since the kernel page cache survives the process.
-Per-push fsync is a possible later `disk.sync: every_push` knob, not built here.
+**Read cursor rollover.** The read cursor can roll onto (and delete) a fully-consumed segment
+from three places, not just `commit`/`evict_oldest`: also from `peek`, before it decides there's
+nothing left to read, and from `drop_oldest`'s eviction check, before it decides there's nothing
+left to evict. This is what lets a reader that catches up to the writer *while* its segment is
+still active (`read_offset == len`, but that segment hasn't rotated away yet) later notice, once a
+subsequent `push` does rotate it away, that there's now somewhere new to read — see
+`disk_queue.rs::DiskQueue::roll_read_cursor`'s own doc comment for the failure mode this closes.
+
+**Durability.** Every push does `write_all` then `flush` — `tokio::fs::File` buffers writes
+internally, so `write_all` alone returning `Ok` does not guarantee the bytes reached the kernel
+page cache; `flush` is what actually hands them over. `fdatasync` (`tokio::fs::File::sync_data`)
+is still only on segment rotation, on the cursor file, and at shutdown — not per push. Process
+death cannot lose a batch a `push` call has already returned from, since the bytes are in the page
+cache by then. A genuine power loss can still lose the tail of the active segment. Per-push
+`fsync` is a possible later `disk.sync: every_push` knob, not built here.
 
 **Recovery.** Only the highest-numbered (active) segment can ever be torn — every other segment
 was already complete and closed before a new one became active, since there is exactly one
@@ -90,11 +105,16 @@ warns a caller must. A missing, corrupt, or stale cursor (referencing a segment 
 exists) falls back to the oldest surviving segment at offset `0`, diagnosed under a `cursor_error`
 key, never fatal — the same posture `checkpoint.rs::CheckpointStore::load` already takes. Records
 found between the resume point and the end of all segments at open count
-`logit.component.buffer.disk.replayed`.
+`logit.component.buffer.disk.replayed`. `logit_proto::frame`'s `compressed_len` header field
+carries its own sanity cap (`MAX_SANE_COMPRESSED_LEN`, mirroring `uncompressed_len`'s), which is
+what keeps a corrupted length field from reading as a clean end-of-file (`Truncated`) instead of
+corruption (`Malformed`) — the former would stop this walk short instead of resyncing past it,
+silently discarding everything after it.
 
-**Push cost.** Push = encode (`native::encode_batch` + `frame::write_frame`) + one `write_all` to
-the active segment. This breaks the `buffered-sink-delivery` ADR's zero-clone `Arc<EventBatch>`
-property for disk-backed sinks *by design* — durability is what the operator opted into. An
+**Push cost.** Push = encode (`native::encode_batch` + `frame::write_frame`) + one `write_all`
+followed by a `flush` to the active segment (see "Durability" above). This breaks the
+`buffered-sink-delivery` ADR's zero-clone `Arc<EventBatch>` property for disk-backed sinks *by
+design* — durability is what the operator opted into. An
 encoded frame over `logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN` is dropped and counted
 (`batches.dropped{reason="frame_too_large"}`) rather than written unreadably — `frame.rs`'s own
 doc comment on that constant names exactly this case as "worth an encode-side assertion once the
@@ -116,7 +136,14 @@ identically regardless of variant. Enum dispatch, no `dyn`, no generic over `run
 **nothing** and counts nothing as `reason="shutdown"`; the shutdown grace only bounds how long
 `write_loop` keeps *delivering*. The abandoned-inbox sweep in `run_output` still applies (those
 batches never reached the spool) — with `disk:` on, it appends them to the spool instead of
-counting them dropped.
+counting them dropped. `run_output` closes the store right before that sweep runs (not after, as
+it used to) — otherwise the sweep's `store.push` could await `not_full` forever under `overflow:
+block` against a full spool, since nothing would be left running to notify it.
+`DiskQueue::push`'s existing closed-queue escape hatch (accept over-bound rather than block once
+closed, `crate::queue::BoundedQueue::close`'s in-memory equivalent) is what lets the sweep still
+finish and still drop nothing — a disk-backed sink's queue may briefly exceed `disk.max_bytes` to
+admit shutdown-time stragglers, bounded by the channel's fixed capacity and reclaimed on the next
+`open`, rather than hanging.
 
 **Frame compression.** `disk.compression: none | lz4` (reuses `logit_config::Compression`,
 already added for `stdio_out`/`file_out`'s own `format: native`), default `none` — disk is cheap,
@@ -172,6 +199,15 @@ actual code; each is resolved as follows.
   never needs to survive a restart on its own — it always resumes at the true end of the highest-
   numbered segment, re-derived by validating that one segment at open (see "Recovery" above). A
   second persisted cursor would be one more thing that could drift from reality, for no benefit.
+- **A deferred-skip-cursor design for `drop_oldest` while the head is reserved** — evicting past
+  the reserved head lazily, applied at the next `commit` once the reservation clears. Rejected:
+  eviction here only ever frees space at whole-segment granularity (`total_bytes` shrinks only on
+  segment deletion), and the read cursor can't leave the reserved head's own segment while it's
+  reserved, so such a design would walk the entire spool without ever being able to satisfy its
+  own "is there enough room" check. Making it work would require per-record byte accounting,
+  which would change what `buffer.bytes`/`buffer.utilization` mean (currently documented as
+  on-disk bytes) — out of scope for this fix. Rejecting the new push instead (`overflow_newest`)
+  is a straightforward, correctly-bounded fallback.
 
 ## Consequences
 

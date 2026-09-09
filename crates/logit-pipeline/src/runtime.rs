@@ -376,6 +376,23 @@ async fn run_output(
     // `finish_and_flush`.
     drop(drain);
 
+    // F3: close `store` right here, before the abandoned-inbox sweep below ever calls
+    // `store.push`. This makes "nothing will ever push into this store again" a true statement at
+    // exactly this point -- mirroring what `drain_inbox` itself would have done on its own
+    // close-on-exit path (see its own doc comment) had it not been abandoned mid-flight instead.
+    // Without this, the sweep's `store.push(...).await` below could await `not_full` forever under
+    // `overflow: block` against a full disk spool -- nothing left running would ever notify it.
+    // `DiskQueue::push` already has a `self.closed()` check that short-circuits its overflow
+    // policy to accept the push unconditionally (over-bound) rather than blocking once closed --
+    // the identical escape hatch `crate::queue::BoundedQueue::close`'s own doc comment already
+    // documents for the in-memory case ("never panic, never hang"). So the sweep still drops
+    // nothing (preserving `SinkStore::finish`'s documented "a disk-backed sink drops nothing at
+    // shutdown" contract) -- it just may briefly exceed `disk.max_bytes`, bounded by the channel's
+    // fixed capacity and reclaimed on the next `open`. The `Memory` store path is unaffected: its
+    // sweep push is already gated on `matches!(store.as_ref(), SinkStore::Disk(_))` below, and
+    // `SinkStore::finish`'s in-memory drain uses `commit()`, which doesn't consult `closed`.
+    store.close();
+
     // A `drain` abandoned mid-flight (the `write`-finishes-first case above) may leave batches
     // sitting in `inbox`'s own buffer -- accepted by the channel but never `recv()`-ed, since
     // `drain_inbox`'s loop never got back around to pulling them out before this function stopped
@@ -4082,6 +4099,172 @@ mod tests {
              an abandoned in-flight `queue.push()`, is a separate, narrower residual gap this fix \
              does not close, and is deliberately not counted here either.)"
         );
+    }
+
+    fn counter_value_of(batch: &EventBatch) -> f64 {
+        match batch.events[0].metrics.iter().next().map(|m| &m.kind) {
+            Some(MetricKind::Counter(v)) => *v,
+            other => panic!("expected exactly one counter metric, got {other:?}"),
+        }
+    }
+
+    /// F3: the shutdown sweep in `run_output` (the `while let Ok(delivered) = inbox.try_recv() {
+    /// ... store.push(...).await ... }` block right after `drop(drain)`) used to run against a
+    /// store that was never closed. Under `overflow: block` with a full disk spool, `store.push`
+    /// awaits `not_full`, which nothing could ever notify again -- a permanent hang. Modelled
+    /// directly on `a_batch_still_sitting_in_the_inbox_when_write_loop_gives_up_is_counted_not_silently_lost`
+    /// above (the in-memory version of this same shutdown-sweep scenario), but with a one-record
+    /// disk spool standing in for the in-memory queue's `max_batches: 1`.
+    #[tokio::test]
+    async fn a_disk_backed_sinks_shutdown_sweep_does_not_hang_pushing_into_a_full_spool() {
+        let dir = crate::disk_queue::test_support::scratch_dir("shutdown-sweep-full-spool");
+
+        let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
+        let (output, mut handles) = faulty_output(Fault::Clean, u32::MAX, false);
+        let write_config = WriteLoopConfig {
+            retry: RetryConfig {
+                total_budget: Duration::from_secs(3600),
+                base_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(10),
+            },
+            shutdown_grace: Duration::from_millis(100),
+            delivery_override: None,
+        };
+
+        // Every counter-metric batch this test pushes encodes to the same length (`write_f64_kind`
+        // is fixed-width), regardless of its value -- so this one measurement sizes the spool to
+        // admit exactly one record.
+        let sample_batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 0.0)],
+        };
+        let one_record_len = crate::disk_queue::test_support::encoded_record_len(&sample_batch);
+
+        let store_config = SinkStoreConfig::Disk(crate::disk_queue::DiskQueueConfig {
+            dir: dir.clone(),
+            max_bytes: one_record_len,
+            segment_bytes: one_record_len * 10, // no rotation needed for this scenario
+            overflow: OverflowPolicy::Block,
+            compression: logit_proto::frame::Compression::None,
+            checkpoint_interval: Duration::from_secs(3600),
+        });
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
+
+        let run = tokio::spawn(run_output(
+            "out".to_string(),
+            Box::new(output),
+            inbox_rx,
+            telemetry,
+            store_config,
+            write_config,
+            shutdown_rx,
+        ));
+
+        // Batch 1: drains into the spool (filling its one-record capacity), then peeked -- and so
+        // reserved -- by write_loop's endless-failure retry loop.
+        inbox_tx
+            .send(Delivered::Owned(
+                EventBatch {
+                    resource: Arc::new(Resource::default()),
+                    events: vec![counter_event("hits", 1.0)],
+                },
+                TraceContext::new_root(),
+            ))
+            .await
+            .expect("receiver should still be alive");
+        handles.attempted.recv().await.expect("the first attempt should have happened");
+
+        // Batch 2: drain_inbox receives it, then blocks forever inside `queue.push` -- the spool
+        // is full (room for exactly one record) and that one slot is reserved, so under `Block`
+        // there is nothing a concurrent commit could ever free. Same residual gap
+        // the in-memory version of this test already names in its own comment.
+        inbox_tx
+            .send(Delivered::Owned(
+                EventBatch {
+                    resource: Arc::new(Resource::default()),
+                    events: vec![counter_event("hits", 2.0)],
+                },
+                TraceContext::new_root(),
+            ))
+            .await
+            .expect("receiver should still be alive");
+        // Let drain_inbox actually reach and block on that push before sending batch 3.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Batch 3: drain_inbox is already stuck on batch 2's push, so this one can only ever sit
+        // in `inbox`'s own channel buffer, genuinely un-`recv()`-ed -- exactly the case this fix
+        // targets.
+        inbox_tx
+            .send(Delivered::Owned(
+                EventBatch {
+                    resource: Arc::new(Resource::default()),
+                    events: vec![counter_event("hits", 3.0)],
+                },
+                TraceContext::new_root(),
+            ))
+            .await
+            .expect("receiver should still be alive");
+
+        shutdown_tx.send(true).expect("receiver should still be alive");
+        drop(inbox_tx);
+
+        // Pre-fix: this times out -- the abandoned-inbox sweep hangs forever trying to push batch
+        // 3 into a still-open, still-full spool.
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run_output should not hang")
+            .expect("task should not panic")
+            .expect("shutdown-grace expiry should end run_output with Ok, not Err");
+
+        let dropped_for_shutdown: f64 = registry
+            .drain(0)
+            .iter()
+            .filter(|e| e.attributes.get("component").and_then(|v| v.as_str()) == Some("out"))
+            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("shutdown"))
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| logit_core::interner::resolve(m.name) == "logit.component.batches.dropped")
+            .filter_map(|m| match &m.kind {
+                MetricKind::Counter(v) => Some(*v),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(
+            dropped_for_shutdown, 0.0,
+            "a disk-backed sink drops nothing at shutdown -- everything still queued at shutdown \
+             must survive, not be counted dropped"
+        );
+
+        // Reopen a fresh DiskQueue on the same directory: batches 1 and 3 should both still be
+        // present, in FIFO order -- proving the fix stops the sweep from hanging without silently
+        // dropping anything. (Batch 2 was never drained out of the inbox channel at all -- the
+        // same narrower residual gap named above, not something this fix closes, so it is not
+        // expected to be here.)
+        let reopened = crate::disk_queue::DiskQueue::open(
+            crate::disk_queue::DiskQueueConfig {
+                dir: dir.clone(),
+                max_bytes: u64::MAX,
+                segment_bytes: one_record_len * 10,
+                overflow: OverflowPolicy::Block,
+                compression: logit_proto::frame::Compression::None,
+                checkpoint_interval: Duration::from_secs(3600),
+            },
+            logit_core::Telemetry::default(),
+            Diagnostics::new("test"),
+        )
+        .unwrap();
+        let (first, _) = reopened.peek().await.expect("batch 1 should still be present");
+        assert_eq!(counter_value_of(&first), 1.0);
+        reopened.commit().unwrap();
+        let (third, _) = reopened.peek().await.expect("batch 3 should still be present");
+        assert_eq!(counter_value_of(&third), 3.0);
+        reopened.commit().unwrap();
+        reopened.close();
+        assert!(reopened.peek().await.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // -----------------------------------------------------------------------------------------

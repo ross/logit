@@ -604,6 +604,13 @@ impl DiskQueue {
         }
 
         loop {
+            // F1: keep `evictable`'s reads of the cursor state below from ever checking a stale,
+            // already-rotated-away segment -- gated on `DropOldest` specifically so the `Block`
+            // hot path (what `disk_queue_push_one_batch` measures) gains only one enum comparison,
+            // no lock.
+            if matches!(self.overflow, OverflowPolicy::DropOldest) {
+                self.roll_read_cursor();
+            }
             let notified = self.not_full.notified();
             let action = {
                 let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -614,20 +621,36 @@ impl DiskQueue {
                     match self.overflow {
                         OverflowPolicy::Block => Action::Block,
                         OverflowPolicy::DropNewest => Action::DropNewest,
+                        // F6: three-way decision, not two -- a reserved head used to fall through
+                        // to accepting the push over-bound, the same as "genuinely nothing to
+                        // evict" did, which left `disk.max_bytes` unenforced for as long as the
+                        // head stayed peeked (nearly the whole retry budget, once per delivery
+                        // attempt, not once per attempt -- i.e. most of a destination outage, the
+                        // exact scenario this bound exists for).
                         OverflowPolicy::DropOldest => {
                             let seg_len = state
                                 .segments
                                 .iter()
                                 .find(|s| s.seq == state.read_seq)
                                 .map(|s| s.len);
-                            let evictable = state.head_cache.is_none()
-                                && seg_len.map(|l| state.read_offset < l).unwrap_or(false);
-                            if evictable {
+                            if state.head_cache.is_some() {
+                                // The head is reserved (peeked, mid-delivery-attempt): a
+                                // file-backed FIFO has no way to evict "behind" it the way the
+                                // in-memory buffer can leave a hole -- there is nowhere else to
+                                // evict from without evicting the very record a caller is
+                                // currently holding. Reject the new push instead, exactly like
+                                // `DropNewest` -- an accepted, documented limitation, not
+                                // something to also try to fix here.
+                                Action::DropNewest
+                            } else if seg_len.map(|l| state.read_offset < l).unwrap_or(false) {
+                                // Unreserved and something is queued: evict it.
                                 Action::Evict
                             } else {
-                                // Nothing evictable ahead of the reserved (peeked) head, or
-                                // nothing evictable at all -- accept over-bound rather than block
-                                // or loop forever, the same escape hatch
+                                // Genuinely nothing queued at all -- must not become a drop: right
+                                // after evicting the very last queued record the spool can still
+                                // read as "full" (`total_bytes` only shrinks on whole-segment
+                                // deletion), and dropping here would mean dropping every future
+                                // push forever. Accept over-bound instead, the same escape hatch
                                 // `crate::queue::BoundedQueue::push` documents for the
                                 // impossible-to-ever-fit case.
                                 Action::Write
@@ -762,7 +785,16 @@ impl DiskQueue {
             }
         };
 
-        let result = file.write_all(record).await;
+        // F2: `write_all` returning `Ok` only means the bytes reached `tokio::fs::File`'s own
+        // internal buffer, not that they're visible via an independent file descriptor --
+        // `.flush()` is what actually hands them to the kernel page cache. Without this, a batch
+        // reported as durably queued could be lost entirely on an ordinary process crash, not just
+        // in the documented power-loss window. A failed flush takes the exact same repair path a
+        // failed write already does below (`write_in_flight` stays `true`).
+        let mut result = file.write_all(record).await;
+        if result.is_ok() {
+            result = file.flush().await;
+        }
 
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match result {
@@ -792,12 +824,17 @@ impl DiskQueue {
     /// Closes out the current active segment (fsync it and the directory, so its directory entry
     /// and every byte written to it are durable) and starts a new one.
     async fn rotate_segment(&self) {
-        let old_seq = {
+        let (old_seq, file) = {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let old_seq = state.segments.back().expect("always at least one segment").seq;
-            state.write_file = None;
-            old_seq
+            (old_seq, state.write_file.take())
         };
+        // F2: flush outside the lock -- `.await`ing while holding `std::sync::Mutex`'s guard is
+        // `clippy::await_holding_lock` under this repo's `-D warnings`, so the file is taken out
+        // under the lock and flushed only after the guard is dropped.
+        if let Some(mut f) = file {
+            let _ = f.flush().await;
+        }
         let _ = fsync_path(&segment_path(&self.dir, old_seq)).await;
         let new_seq = old_seq + 1;
         let new_path = segment_path(&self.dir, new_seq);
@@ -879,10 +916,19 @@ impl DiskQueue {
                         Ok(b) => b,
                         Err(_) => return None,
                     };
+                    // `record_len` (the third element of this method's return, and of
+                    // `walk_segment`'s `on_record` callback) is a *delta from the read cursor*,
+                    // not the found record's own byte size -- callers (`commit`/`evict_oldest`,
+                    // via `advance_read_cursor`) advance the cursor by exactly this many bytes
+                    // from where it currently sits. `pos` is the offset within `whole` (itself
+                    // already anchored at the cursor's `offset`) where the recovered record
+                    // begins, non-zero exactly when corrupted bytes were skipped before it -- so
+                    // the delta is `pos + len`, not `len` alone; using `len` alone would leave the
+                    // cursor short by `pos` bytes, landing inside the delivered record itself.
                     let mut found = None;
-                    let outcome = walk_segment(&whole, 0, |_, ctx, batch, len| {
+                    let outcome = walk_segment(&whole, 0, |pos, ctx, batch, len| {
                         if found.is_none() {
-                            found = Some((ctx, batch, len));
+                            found = Some((ctx, batch, pos + len));
                         }
                     });
                     self.count_dropped("disk_corrupt", outcome.corrupt_skipped.max(1));
@@ -917,47 +963,97 @@ impl DiskQueue {
         Ok(buf)
     }
 
-    /// Advances the read cursor past one record of `record_len` bytes, in-memory only, rolling
-    /// into the next segment (and deleting the one just fully consumed) if that lands exactly at
-    /// a segment boundary. Force-persists the cursor before deleting a segment -- never the other
-    /// order -- so `cursor.json` can never reference a file that no longer exists. Sync: the only
-    /// I/O is one small blocking JSON write and (occasionally) one blocking file removal.
-    fn advance_read_cursor(&self, record_len: u64) {
+    /// While the segment `read_seq` currently names is fully consumed (`read_offset` at or past
+    /// its length) *and* is no longer the active (`segments.back()`) segment, rolls the cursor
+    /// forward onto the next surviving segment and deletes the one just left behind -- looked up
+    /// by scanning for the next larger `seq`, not `read_seq + 1`, since a gap from a previously
+    /// failed deletion is possible. Loops rather than handling one crossing, so a single call
+    /// correctly resolves an advance that overshoots more than one segment boundary.
+    ///
+    /// This is what F1 fixes: previously this rollover only ever happened inside
+    /// `advance_read_cursor`, evaluated once at the moment of that specific commit/evict. A reader
+    /// that caught up to the writer while its segment was still active (`read_offset == len`,
+    /// `is_active == true`) left nothing to ever re-evaluate `read_seq` later, once a subsequent
+    /// `push` rotated that segment away and made it eligible to roll onto -- `peek` then waited on
+    /// `not_empty` forever against a segment that would never grow again. Calling this from `peek`
+    /// (before it decides there's nothing to read) and from `push`'s `drop_oldest` arm (before it
+    /// decides there's nothing to evict), in addition to `advance_read_cursor`, closes that gap:
+    /// whichever caller next has a chance to notice the rotation, does.
+    ///
+    /// Persists the cursor and resets `last_checkpoint` once for the whole roll (not once per
+    /// segment crossed), then releases the lock before deleting files and notifying `not_full` --
+    /// `to_delete` stays empty (no allocation) in the common case of no crossing at all. Returns
+    /// whether the cursor now points at readable bytes (`read_offset < segments[read_seq].len`),
+    /// so callers with more to do after the roll don't need a second, separate check.
+    fn roll_read_cursor(&self) -> bool {
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        state.head_cache = None;
-        let old_seq = state.read_seq;
-        let mut offset = state.read_offset + record_len;
-        let mut seq = old_seq;
-        let is_active = state.segments.back().map(|s| s.seq) == Some(old_seq);
-        let seg_len = state.segments.iter().find(|s| s.seq == old_seq).map(|s| s.len);
-        let mut to_delete = None;
-        if !is_active && seg_len.map(|l| offset >= l).unwrap_or(false) {
-            to_delete = Some(old_seq);
-            seq += 1;
-            offset = 0;
+        let mut to_delete: Vec<u64> = Vec::new();
+        loop {
+            let seq = state.read_seq;
+            let offset = state.read_offset;
+            let is_active = state.segments.back().map(|s| s.seq) == Some(seq);
+            let Some(len) = state.segments.iter().find(|s| s.seq == seq).map(|s| s.len) else {
+                break;
+            };
+            if is_active || offset < len {
+                break;
+            }
+            let Some(next_seq) = state.segments.iter().map(|s| s.seq).find(|&s| s > seq) else {
+                break;
+            };
+            to_delete.push(seq);
+            state.read_seq = next_seq;
+            state.read_offset = offset - len;
         }
-        state.read_seq = seq;
-        state.read_offset = offset;
 
-        if let Some(deleted_seq) = to_delete {
-            persist_cursor(&self.dir, seq, offset, &mut state.diag);
+        if !to_delete.is_empty() {
+            persist_cursor(&self.dir, state.read_seq, state.read_offset, &mut state.diag);
             state.last_checkpoint = Instant::now();
-            if let Some(pos) = state.segments.iter().position(|s| s.seq == deleted_seq) {
-                if let Some(removed) = state.segments.remove(pos) {
-                    state.total_bytes = state.total_bytes.saturating_sub(removed.len);
+            for &seq in &to_delete {
+                if let Some(pos) = state.segments.iter().position(|s| s.seq == seq) {
+                    if let Some(removed) = state.segments.remove(pos) {
+                        state.total_bytes = state.total_bytes.saturating_sub(removed.len);
+                    }
+                }
+                if let Some((cached_seq, _)) = &state.read_file {
+                    if *cached_seq == seq {
+                        state.read_file = None;
+                    }
                 }
             }
-            if let Some((cached_seq, _)) = &state.read_file {
-                if *cached_seq == deleted_seq {
-                    state.read_file = None;
-                }
+        }
+
+        let seq = state.read_seq;
+        let offset = state.read_offset;
+        let readable =
+            state.segments.iter().find(|s| s.seq == seq).map(|s| offset < s.len).unwrap_or(false);
+        drop(state);
+        // `self.dir` needs no clone here -- `self` (unlike `state`, the `MutexGuard`) is still
+        // borrowed, and the common no-crossing case must not allocate at all (this is on `peek`'s
+        // hot, cached-hit path -- see `disk_queue_peek_cached_costs_nothing`).
+        if !to_delete.is_empty() {
+            for seq in to_delete {
+                let _ = std::fs::remove_file(segment_path(&self.dir, seq));
             }
-            let dir = self.dir.clone();
-            drop(state);
-            let _ = std::fs::remove_file(segment_path(&dir, deleted_seq));
             self.not_full.notify_one();
-        } else if state.last_checkpoint.elapsed() >= self.checkpoint_interval {
-            persist_cursor(&self.dir, seq, offset, &mut state.diag);
+        }
+        readable
+    }
+
+    /// Advances the read cursor past one record of `record_len` bytes, in-memory only, then rolls
+    /// forward across any segment boundaries that advance crossed (`roll_read_cursor`, which also
+    /// deletes any segment fully left behind). Sync: the only I/O `roll_read_cursor` can trigger
+    /// is one small blocking JSON write and (occasionally) blocking file removal(s).
+    fn advance_read_cursor(&self, record_len: u64) {
+        {
+            let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            state.head_cache = None;
+            state.read_offset += record_len;
+        }
+        self.roll_read_cursor();
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if state.last_checkpoint.elapsed() >= self.checkpoint_interval {
+            persist_cursor(&self.dir, state.read_seq, state.read_offset, &mut state.diag);
             state.last_checkpoint = Instant::now();
         }
     }
@@ -967,6 +1063,12 @@ impl DiskQueue {
     /// once closed and empty.
     pub async fn peek(&self) -> Option<(Arc<EventBatch>, TraceContext)> {
         loop {
+            // F1: roll past any segment the reader caught up to *while it was still active* and
+            // which has since rotated away -- without this, a reader that reached exactly
+            // `read_offset == len` of the then-active segment would check only that segment's
+            // (unchanging) length forever, even after a later `push` rotated it out and started a
+            // new one with more to read.
+            self.roll_read_cursor();
             let (cached, seq, offset, has_data) = {
                 let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(cache) = &state.head_cache {
@@ -986,6 +1088,7 @@ impl DiskQueue {
                     return None;
                 }
                 let notified = self.not_empty.notified();
+                self.roll_read_cursor();
                 let still_nothing = {
                     let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                     let seg_len =
@@ -1040,13 +1143,17 @@ impl DiskQueue {
     /// segment, and the directory, and closes files. Drops nothing -- a disk-backed sink's
     /// shutdown grace only bounds how long delivery keeps running, never what's still queued.
     pub async fn finish(&self) {
-        let active_seq = {
+        let (active_seq, file) = {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             persist_cursor(&self.dir, state.read_seq, state.read_offset, &mut state.diag);
-            state.write_file = None;
+            let file = state.write_file.take();
             state.read_file = None;
-            state.segments.back().map(|s| s.seq)
+            (state.segments.back().map(|s| s.seq), file)
         };
+        // F2: flush outside the lock, same reasoning as `rotate_segment`.
+        if let Some(mut f) = file {
+            let _ = f.flush().await;
+        }
         let _ = fsync_path(&self.dir.join(CURSOR_FILE_NAME)).await;
         if let Some(active_seq) = active_seq {
             let _ = fsync_path(&segment_path(&self.dir, active_seq)).await;
@@ -1068,6 +1175,23 @@ pub(crate) mod test_support {
             .join(format!("logit-disk-queue-test-{label}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         dir
+    }
+
+    /// The exact on-disk byte length `DiskQueue::push` would write for `batch` (under
+    /// `Compression::None`; the 24-byte `TraceContext` prefix `push` also writes is fixed-size
+    /// regardless of its contents, so no context is needed here) -- the same computation as this
+    /// module's own inline `tests::raw_record`, exposed here so a test in another module
+    /// (`crate::runtime`'s F3 shutdown-sweep test, which needs to size a spool tightly around
+    /// exactly one record) doesn't have to duplicate it or reach into a private `tests` module.
+    pub(crate) fn encoded_record_len(batch: &logit_core::EventBatch) -> u64 {
+        use super::CONTEXT_LEN;
+        use logit_proto::{frame, native};
+
+        let payload = native::encode_batch(batch);
+        let framed =
+            frame::write_frame(native::CODEC_NATIVE_V1, frame::Compression::None, &payload)
+                .expect("None compression never fails");
+        (CONTEXT_LEN + framed.len()) as u64
     }
 }
 
@@ -1315,28 +1439,47 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Replaces `drop_oldest_never_evicts_a_record_currently_peeked`, which asserted that a second
+    /// push while the head is reserved is admitted over-bound -- that was F6, the bug this test
+    /// now proves is fixed: with the head reserved (peeked, mid-delivery-attempt) there is nowhere
+    /// else in a file-backed FIFO to evict from, so `disk.max_bytes` used to go unenforced for as
+    /// long as the head stayed reserved (nearly a whole destination outage). The reserved-head
+    /// part of the old contract still holds (never evicted; `commit()` still returns it); only the
+    /// second push's outcome changed, from admitted-over-bound to rejected.
     #[tokio::test]
-    async fn drop_oldest_never_evicts_a_record_currently_peeked() {
+    async fn drop_oldest_drops_the_newest_rather_than_growing_past_max_bytes_while_the_head_is_peeked(
+    ) {
         let dir = scratch_dir("drop-oldest-reserved");
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("test", "output", "sink");
         let mut cfg = config(dir.clone());
         cfg.overflow = OverflowPolicy::DropOldest;
         let one = raw_record(&batch("x"), ctx()).len() as u64;
         cfg.max_bytes = one + one / 2;
-        let q = open_with(cfg);
+        let q = DiskQueue::open(cfg, telemetry, Diagnostics::new("test")).unwrap();
 
         q.push((batch("first"), ctx())).await;
         let (peeked, _) = q.peek().await.expect("should peek the only batch");
         assert_eq!(marker_of(&peeked), "first");
 
-        // Nothing else exists to evict ahead of the reserved head, so this push is accepted
-        // over-bound rather than evicting the batch a caller (write_loop, here just this test)
-        // is currently holding.
+        // Nothing else exists to evict ahead of the reserved head, so this push is now rejected
+        // (counted overflow_newest) rather than evicting the batch a caller (write_loop, here
+        // just this test) is currently holding, and rather than growing past max_bytes.
         q.push((batch("second"), ctx())).await;
 
         let (still_first, _) = q.commit().expect("the peeked batch must still be first's");
         assert_eq!(marker_of(&still_first), "first");
-        let (second, _) = q.peek().await.expect("second should still be there too");
-        assert_eq!(marker_of(&second), "second");
+
+        let events = registry.drain(0);
+        let dropped = metric_sum(
+            &events,
+            SINK_QUEUE_METRICS.items_dropped,
+            Some(("reason", "overflow_newest")),
+        );
+        assert_eq!(dropped, 1.0, "the second push should have been rejected and counted");
+
+        q.close();
+        assert!(q.peek().await.is_none(), "second was never admitted at all");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1508,6 +1651,205 @@ mod tests {
         let q = open(dir.clone());
         q.close();
         assert!(q.peek().await.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // F1: the read cursor must roll forward past a segment the reader caught up to *while it was
+    // still active*, once that segment later rotates away.
+    // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_cursor_rolls_forward_when_a_segment_the_reader_caught_up_to_later_rotates_away() {
+        let dir = scratch_dir("roll-forward");
+        let mut cfg = config(dir.clone());
+        // Deterministic sizing: every marker-only batch with a single-character marker encodes to
+        // exactly the same length.
+        let one = raw_record(&batch("x"), ctx()).len() as u64;
+        cfg.segment_bytes = 3 * one;
+        let q = open_with(cfg);
+
+        // `segment_bytes` is a soft trigger checked *before* a write, not a hard cap -- all three
+        // land in segment 0, whose length becomes exactly the trigger.
+        q.push((batch("a"), ctx())).await;
+        q.push((batch("b"), ctx())).await;
+        q.push((batch("c"), ctx())).await;
+        assert_eq!(
+            list_segments(&dir).unwrap(),
+            vec![0],
+            "all three should still fit in segment 0"
+        );
+
+        // Catch the reader up to read_offset == len of the still-active segment 0 -- the exact
+        // state no prior test reached, and the one F1 fixes.
+        for label in ["a", "b", "c"] {
+            let (peeked, _) = q.peek().await.expect("should peek the next batch");
+            assert_eq!(marker_of(&peeked), label);
+            q.commit().unwrap();
+        }
+
+        // Forces rotation to segment 1.
+        q.push((batch("d"), ctx())).await;
+        assert_eq!(list_segments(&dir).unwrap(), vec![0, 1], "the push above should have rotated");
+
+        // Pre-fix: this hangs forever, parked on `not_empty` against a segment whose length will
+        // never change again.
+        let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
+            .await
+            .expect("peek must not hang once the segment it was waiting on has rotated away")
+            .expect("d should be delivered");
+        assert_eq!(marker_of(&peeked), "d");
+        q.commit().unwrap();
+        assert_eq!(
+            list_segments(&dir).unwrap(),
+            vec![1],
+            "segment 0 should have been deleted once the cursor rolled past it"
+        );
+
+        // The queue keeps flowing afterward.
+        q.push((batch("e"), ctx())).await;
+        let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
+            .await
+            .expect("peek must not hang")
+            .expect("e should be delivered");
+        assert_eq!(marker_of(&peeked), "e");
+        q.commit().unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // F2: a pushed record must be flushed to the OS before `push` returns.
+    // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_pushed_record_is_on_disk_before_push_returns() {
+        let dir = scratch_dir("flush-on-push");
+        let q = open(dir.clone());
+        q.push((batch("a"), ctx())).await;
+
+        // An independent, non-tokio path -- proves the bytes are visible via a file descriptor
+        // other than the one `DiskQueue` itself wrote through, which is exactly what `.flush()`
+        // guarantees and a bare `write_all` does not.
+        let on_disk = std::fs::metadata(segment_path(&dir, 0)).unwrap().len();
+        assert_eq!(on_disk, raw_record(&batch("a"), ctx()).len() as u64);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // F4: the live corruption-resync path must advance the cursor past the skipped bytes, not
+    // just past the found record's own length.
+    // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_resync_past_corruption_advances_the_cursor_past_the_skipped_bytes() {
+        let dir = scratch_dir("live-resync-cursor");
+        let path = segment_path(&dir, 0);
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = raw_record(&batch("good"), ctx());
+        let mut corrupted = raw_record(&batch("corrupt"), ctx());
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xFF; // CRC-corrupt, same idiom as `rejects_corrupt_crc`.
+        let next = raw_record(&batch("next"), ctx());
+        let last_record = raw_record(&batch("last"), ctx());
+
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&corrupted);
+        bytes.extend_from_slice(&next);
+        bytes.extend_from_slice(&last_record);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("test", "output", "sink");
+        let q = DiskQueue::open(config(dir.clone()), telemetry, Diagnostics::new("test")).unwrap();
+        // `DiskQueue::open`'s own recovery walk independently audits (and counts) every record
+        // from the persisted cursor to the end of the spool, including this same corrupted one --
+        // a separate, already-covered pass (see `a_crc_corrupted_record_mid_segment_is_skipped_via_resync_and_counted`).
+        // Discard that count here so the drain below reflects only the live path this test targets.
+        registry.drain(0);
+
+        // Consumes the clean first record normally -- not the branch this test targets.
+        let (peeked, _) = q.peek().await.expect("good should be delivered");
+        assert_eq!(marker_of(&peeked), "good");
+        q.commit().unwrap();
+
+        // This peek must take `read_record_at`'s *live* corruption-resync branch specifically.
+        let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
+            .await
+            .expect("peek must not hang")
+            .expect("should resync live past the corrupt record to next");
+        assert_eq!(marker_of(&peeked), "next");
+        q.commit().unwrap();
+
+        // The critical assertion: `last` is reached at all. Pre-fix, after committing `next` the
+        // cursor would land inside `next`'s own bytes (the closure returned only `len`, not
+        // `pos + len`), and this peek would misbehave instead of cleanly delivering `last`.
+        let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
+            .await
+            .expect("peek must not hang")
+            .expect("should deliver last");
+        assert_eq!(marker_of(&peeked), "last");
+        q.commit().unwrap();
+
+        q.close();
+        assert!(q.peek().await.is_none(), "queue should be empty after last");
+
+        let events = registry.drain(0);
+        assert_eq!(
+            metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, Some(("reason", "disk_corrupt"))),
+            1.0,
+            "exactly one live corruption event should have been counted by the live read path"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // F5: a corrupted `compressed_len` must not be mistaken for a clean end-of-file, which would
+    // silently discard (via truncation, at `DiskQueue::open`) everything after it.
+    // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_corrupted_length_field_does_not_silently_discard_the_rest_of_the_segment() {
+        let dir = scratch_dir("corrupted-length-field");
+        let path = segment_path(&dir, 0);
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = raw_record(&batch("good"), ctx());
+        let mut corrupted = raw_record(&batch("corrupt"), ctx());
+        // Overwrite `compressed_len` (frame header bytes 16..20, offset by the 24-byte context
+        // prefix this record format prepends) to an oversized value -- pre-F5, `read_frame` would
+        // report this as `Truncated` (indistinguishable from a genuine clean end-of-file), so
+        // `walk_segment` would stop right here instead of resyncing, and `DiskQueue::open` would
+        // truncate the segment at this point, silently discarding `after` for good.
+        let compressed_len_at = CONTEXT_LEN + 16;
+        corrupted[compressed_len_at..compressed_len_at + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        let after = raw_record(&batch("after"), ctx());
+
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&corrupted);
+        bytes.extend_from_slice(&after);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let q = open(dir.clone());
+
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            on_disk,
+            bytes.len() as u64,
+            "the segment must not have been truncated -- the oversized compressed_len should have \
+             been resynced past, not mistaken for a torn tail"
+        );
+
+        let (peeked, _) = q.peek().await.expect("good should still be delivered");
+        assert_eq!(marker_of(&peeked), "good");
+        q.commit().unwrap();
+
+        let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
+            .await
+            .expect("peek must not hang")
+            .expect("after should still be delivered -- pre-fix this would silently vanish");
+        assert_eq!(marker_of(&peeked), "after");
+        q.commit().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 }

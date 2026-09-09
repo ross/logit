@@ -29,6 +29,17 @@ pub const VERSION: u16 = 1;
 /// spooling something unreadable.
 pub const MAX_SANE_UNCOMPRESSED_LEN: u32 = 64 * 1024 * 1024;
 
+/// The largest `compressed_len` a frame may declare, checked the same way and for the same
+/// reason as `MAX_SANE_UNCOMPRESSED_LEN` above -- but not simply reused as the same value: lz4's
+/// worst case expands rather than shrinks a payload, so a legitimately-written frame whose
+/// payload sits at the uncompressed cap can declare slightly more compressed bytes than that,
+/// and reusing the uncompressed cap directly here would make `write_frame` able to produce a
+/// frame its own `read_frame` then refuses. This is the uncompressed cap plus lz4's own
+/// documented worst-case expansion, wide enough to admit exactly that legitimate case while
+/// still bounding the allocation a corrupted length field can force.
+const MAX_SANE_COMPRESSED_LEN: u32 =
+    MAX_SANE_UNCOMPRESSED_LEN + MAX_SANE_UNCOMPRESSED_LEN / 255 + 16;
+
 /// The fixed header size in bytes: 4 (magic) + 2 (version) + 2 (flags) + 1 (codec) +
 /// 1 (compression) + 2 (reserved) + 4 (uncompressed_len) + 4 (compressed_len) + 4 (crc32c) = 24.
 /// Chosen over the 20 bytes an earlier skeleton comment named so every multi-byte field after
@@ -180,6 +191,12 @@ pub fn read_frame(bytes: &mut Bytes) -> Result<(u8, Bytes), CodecError> {
         return Err(CodecError::Malformed(format!(
             "frame declares {} uncompressed bytes, over the {MAX_SANE_UNCOMPRESSED_LEN} sanity cap",
             header.uncompressed_len
+        )));
+    }
+    if header.compressed_len > MAX_SANE_COMPRESSED_LEN {
+        return Err(CodecError::Malformed(format!(
+            "frame declares {} compressed bytes, over the {MAX_SANE_COMPRESSED_LEN} sanity cap",
+            header.compressed_len
         )));
     }
     if (bytes.len() as u64) < header.compressed_len as u64 {
@@ -414,6 +431,28 @@ mod tests {
         let mut bad = mutated.freeze();
         assert!(
             matches!(read_frame(&mut bad), Err(CodecError::Malformed(msg)) if msg.contains("sanity cap"))
+        );
+    }
+
+    /// F5: `compressed_len` (header bytes 16..20, verified against `FrameHeader::write` above --
+    /// magic 0..4, version 4..6, flags 6..8, codec 8, compression 9, reserved 10..12,
+    /// uncompressed_len 12..16, compressed_len 16..20, crc32c 20..24) previously had no upper
+    /// bound before being used to size a read, unlike `uncompressed_len` a few lines above it.
+    /// This is the proof it's now capped, and that a corrupted length field is correctly
+    /// classified as `Malformed` (corruption -- resync past it) rather than `Truncated`
+    /// (indistinguishable from a genuine short read/clean end-of-file).
+    #[test]
+    fn rejects_a_compressed_len_over_the_sanity_cap() {
+        let framed = write_frame(1, Compression::None, b"small").unwrap();
+        let mut mutated = BytesMut::from(&framed[..]);
+        mutated[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut bad = mutated.freeze();
+        assert!(
+            matches!(read_frame(&mut bad), Err(CodecError::Malformed(msg)) if msg.contains("sanity cap")),
+            "an oversized compressed_len must be Malformed, not Truncated -- a Truncated result \
+             here would be indistinguishable from a genuine clean end-of-file to a caller like \
+             `DiskQueue::read_record_at`'s `walk_segment`, silently discarding every record after \
+             it instead of resyncing"
         );
     }
 }
