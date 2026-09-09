@@ -157,6 +157,23 @@ pub async fn run_with_telemetry(
     readiness: Readiness,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), RunError> {
+    // Sorted, not raw `HashMap` iteration order: a startup failure (an unbindable port, a bad
+    // Lua script) should name the same component every time, not whichever the hash seed reached
+    // first -- the same reproducibility argument `logit-cli::pipeline::prepare` already makes for
+    // build order. `readiness.begin` hands out the complete, ordered component list before
+    // anything is bound, so a probe arriving mid-startup already sees every id.
+    //
+    // Ahead of the shutdown driver's `tokio::spawn` below, not after it: that task's first act
+    // once `shutdown` resolves is `readiness.draining()`, and a caller handing this function an
+    // already-resolved `shutdown` (`std::future::ready(())`, a pre-fired oneshot) can have it run
+    // before this line -- there is no `.await` on this path between the spawn and here to make
+    // the ordering anything but a race. Seeding here makes `begin` provably the first write on
+    // this signal rather than racily the first one, matching its own doc comment ("called once,
+    // before the first bind").
+    let mut ids: Vec<String> = graph.components.keys().cloned().collect();
+    ids.sort();
+    readiness.begin(&ids);
+
     // A `watch` (not a `oneshot`) because every listener needs its own clone of the receiver, and
     // `watch::Receiver` is `Clone` where `oneshot::Receiver` is not. Driven from a spawned task
     // rather than shared directly so this function doesn't need to name `shutdown`'s own type in
@@ -192,15 +209,6 @@ pub async fn run_with_telemetry(
     // expired before `write_loop` drained it (`run_output`'s own comment on the sweep) -- summed
     // across every sink so the `drain complete` event can say whether the drain was clean.
     let shutdown_dropped_batches = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-    // Sorted, not raw `HashMap` iteration order: a startup failure (an unbindable port, a bad
-    // Lua script) should name the same component every time, not whichever the hash seed reached
-    // first -- the same reproducibility argument `logit-cli::pipeline::prepare` already makes for
-    // build order. `readiness.begin` below hands out the complete, ordered component list before
-    // anything is bound, so a probe arriving mid-startup already sees every id.
-    let mut ids: Vec<String> = graph.components.keys().cloned().collect();
-    ids.sort();
-    readiness.begin(&ids);
 
     // Every listener bound *before* any channel exists, let alone any task is spawned
     // (`docs/plans/operator-surface.md`, workstream B) -- so a bind failure fails startup with
