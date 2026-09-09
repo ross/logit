@@ -23,11 +23,11 @@ pub const VERSION: u16 = 1;
 ///
 /// **Deliberately asymmetric with `write_frame`.** This bound guards a decoder reading untrusted
 /// bytes; nothing stops `write_frame` from encoding a payload larger than this and producing a
-/// frame its own `read_frame` would then reject. That's fine today -- nothing in this codebase
-/// produces a batch anywhere near 64 MiB -- but worth an encode-side assertion (or raising this
-/// constant) once the durable-buffer work (`docs/known-gaps.md`) starts producing batches large
-/// enough to make it a real possibility, rather than a theoretical one.
-const MAX_SANE_UNCOMPRESSED_LEN: u32 = 64 * 1024 * 1024;
+/// frame its own `read_frame` would then reject. `pub` so a writer that must never produce a frame
+/// its own reader would refuse -- the durable sink buffer (`docs/known-gaps.md`) -- can check an
+/// encoded frame against this bound itself before ever writing it, dropping the batch instead of
+/// spooling something unreadable.
+pub const MAX_SANE_UNCOMPRESSED_LEN: u32 = 64 * 1024 * 1024;
 
 /// The fixed header size in bytes: 4 (magic) + 2 (version) + 2 (flags) + 1 (codec) +
 /// 1 (compression) + 2 (reserved) + 4 (uncompressed_len) + 4 (compressed_len) + 4 (crc32c) = 24.
@@ -90,13 +90,16 @@ impl FrameHeader {
     /// Reads exactly [`HEADER_LEN`] bytes off the front of `bytes`, advancing it past the header
     /// so the caller's remaining slice is the payload. Rejects a wrong magic or an unrecognized
     /// version outright -- both mean this isn't a frame this reader can make sense of at all,
-    /// as opposed to a within-format decode error.
-    fn read(bytes: &mut Bytes) -> Result<Self, CodecError> {
+    /// as opposed to a within-format decode error. `pub` so a stream or file reader outside this
+    /// module (a durable spool's segment reader, a socket reader) can peel off one header at a
+    /// time without going through the whole-frame `read_frame` -- `docs/design/wire-protocol.md`.
+    ///
+    /// Too few bytes to hold a header is [`CodecError::Truncated`], not [`CodecError::Malformed`]:
+    /// that's exactly "come back with more bytes" for a live stream, or "this is where a torn
+    /// write ends" for a file, neither of which is a claim that the bytes present are wrong.
+    pub fn read(bytes: &mut Bytes) -> Result<Self, CodecError> {
         if bytes.len() < HEADER_LEN {
-            return Err(CodecError::Malformed(format!(
-                "frame shorter than the {HEADER_LEN}-byte header: {} bytes",
-                bytes.len()
-            )));
+            return Err(CodecError::Truncated { needed: HEADER_LEN - bytes.len() });
         }
         let mut magic = [0u8; 4];
         bytes.copy_to_slice(&mut magic);
@@ -180,11 +183,7 @@ pub fn read_frame(bytes: &mut Bytes) -> Result<(u8, Bytes), CodecError> {
         )));
     }
     if (bytes.len() as u64) < header.compressed_len as u64 {
-        return Err(CodecError::Malformed(format!(
-            "frame declares {} compressed bytes but only {} remain",
-            header.compressed_len,
-            bytes.len()
-        )));
+        return Err(CodecError::Truncated { needed: header.compressed_len as usize - bytes.len() });
     }
     let compressed = bytes.split_to(header.compressed_len as usize);
     if crc32c::crc32c(&compressed) != header.crc32c {
@@ -331,6 +330,20 @@ mod tests {
         assert!(
             matches!(read_frame(&mut bad), Err(CodecError::Malformed(msg)) if msg.contains("crc32c"))
         );
+    }
+
+    #[test]
+    fn a_header_truncated_by_one_byte_is_truncated_not_malformed() {
+        let framed = write_frame(1, Compression::None, b"hello").unwrap();
+        let mut short = framed.slice(..HEADER_LEN - 1);
+        assert!(matches!(read_frame(&mut short), Err(CodecError::Truncated { needed: 1 })));
+    }
+
+    #[test]
+    fn a_body_truncated_by_one_byte_is_truncated_not_malformed() {
+        let framed = write_frame(1, Compression::None, b"hello").unwrap();
+        let mut short = framed.slice(..framed.len() - 1);
+        assert!(matches!(read_frame(&mut short), Err(CodecError::Truncated { needed: 1 })));
     }
 
     #[test]
