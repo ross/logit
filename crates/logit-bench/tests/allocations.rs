@@ -1806,3 +1806,32 @@ fn native_decode_one_event() {
     assert_eq!(events.len(), 1);
     expect_allocs("native: decode 1 event", stats, 8);
 }
+
+/// Pins `Dict::read`'s `Vec::with_capacity(count.min(4096))` clamp with a byte-count assertion --
+/// the thing `crates/logit-proto/src/native/dict.rs`'s own unit tests can't do, since a plain
+/// `assert!(matches!(.., Err(_)))` on a rejected count passes identically whether or not the
+/// allocation was actually clamped (see the re-review of ADR `native-wire-format-encoding`'s fix
+/// commit, which flagged exactly this gap). A frame declaring a dictionary count of 1,000,000 with
+/// no entries behind it makes `Dict::read` allocate its `Vec` and then fail on the very first
+/// entry's length read, so the measured region is (almost) entirely that one allocation: clamped,
+/// it's ~4096 `Symbol`s (4 bytes each, `crates/logit-core/tests/type_sizes.rs`) -- under 20 KB;
+/// unclamped, it would be ~3.8 MB. The two orders of magnitude apart is exactly what would fail
+/// loudly if the `.min(4096)` clamp were ever removed.
+#[test]
+fn native_dict_read_clamps_its_capacity_to_a_count_far_larger_than_4096() {
+    use logit_proto::native::dict::Dict;
+    use logit_proto::native::varint::write_uvarint;
+
+    let mut buf = bytes::BytesMut::new();
+    write_uvarint(&mut buf, 1_000_000);
+    let declared = buf.freeze();
+
+    let (result, stats) = measure(|| Dict::read(&mut declared.clone()));
+    assert!(result.is_err(), "a count with nothing behind it should still fail to decode");
+    assert!(
+        stats.bytes < 100_000,
+        "Dict::read allocated {} bytes for a declared count of 1,000,000 -- \
+         the with_capacity(count.min(4096)) clamp appears to be gone (unclamped would be ~3.8 MB)",
+        stats.bytes
+    );
+}

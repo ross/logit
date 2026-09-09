@@ -20,6 +20,13 @@ pub const VERSION: u16 = 1;
 /// name a multi-gigabyte `uncompressed_len` and force the allocation attempt before a single byte
 /// of payload had been looked at. Same reasoning as `crate::native::dict`'s
 /// `MAX_SANE_DICT_ENTRIES` and `crate::native`'s `MAX_SANE_EVENT_COUNT`.
+///
+/// **Deliberately asymmetric with `write_frame`.** This bound guards a decoder reading untrusted
+/// bytes; nothing stops `write_frame` from encoding a payload larger than this and producing a
+/// frame its own `read_frame` would then reject. That's fine today -- nothing in this codebase
+/// produces a batch anywhere near 64 MiB -- but worth an encode-side assertion (or raising this
+/// constant) once the durable-buffer work (`docs/known-gaps.md`) starts producing batches large
+/// enough to make it a real possibility, rather than a theoretical one.
 const MAX_SANE_UNCOMPRESSED_LEN: u32 = 64 * 1024 * 1024;
 
 /// The fixed header size in bytes: 4 (magic) + 2 (version) + 2 (flags) + 1 (codec) +
