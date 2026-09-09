@@ -149,12 +149,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Logfmt
         | Kv
         | Regex { .. }
-        | Csv
-        | Rename { .. }
-        | Filter { .. }
-        | Sample { .. }
-        | Throttle { .. }
-        | Dedup { .. } => Role::Transform,
+        | Csv => Role::Transform,
         InfluxDbOut { .. }
         | OtlpOut { .. }
         | LogitOut { .. }
@@ -197,11 +192,6 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         Kv => "kv",
         Regex { .. } => "regex",
         Csv => "csv",
-        Rename { .. } => "rename",
-        Filter { .. } => "filter",
-        Sample { .. } => "sample",
-        Throttle { .. } => "throttle",
-        Dedup { .. } => "dedup",
         InfluxDbOut { .. } => "influxdb_out",
         OtlpOut { .. } => "otlp_out",
         LogitOut { .. } => "logit_out",

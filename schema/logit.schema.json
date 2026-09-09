@@ -317,7 +317,7 @@
               "type": "string"
             },
             "span_sample_rate": {
-              "description": "Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id` the same way at every node -- a kept trace is kept at every hop, never partially. Below `1.0` by default: span volume is a different shape than metric volume (one span per node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full traces rather than a representative sample would set this explicitly. Named `span_sample_rate`, not `sample_rate` -- there is already a `ComponentKind::Sample` transform, and `internal` may grow other sampling knobs later. See `docs/adr/internal-span-emission-and-deterministic-sampling.md`.",
+              "description": "Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id` the same way at every node -- a kept trace is kept at every hop, never partially. Below `1.0` by default: span volume is a different shape than metric volume (one span per node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full traces rather than a representative sample would set this explicitly. Named `span_sample_rate`, not `sample_rate` -- `internal` may grow other sampling knobs later, and the name should keep meaning \"which knob\" even though the per-event `sample` transform this once also disambiguated against was retired (`docs/adr/routing-by-condition-is-lua.md`). See `docs/adr/internal-span-emission-and-deterministic-sampling.md`.",
               "default": 0.1,
               "type": "number",
               "format": "double"
@@ -754,107 +754,6 @@
               "type": "string",
               "enum": [
                 "csv"
-              ]
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "from",
-            "to",
-            "type"
-          ],
-          "properties": {
-            "from": {
-              "type": "string"
-            },
-            "to": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "rename"
-              ]
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "type",
-            "where"
-          ],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "filter"
-              ]
-            },
-            "where": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "rate",
-            "type"
-          ],
-          "properties": {
-            "rate": {
-              "type": "number",
-              "format": "double"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "sample"
-              ]
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "limit",
-            "type",
-            "window"
-          ],
-          "properties": {
-            "limit": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0.0
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "throttle"
-              ]
-            },
-            "window": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "key",
-            "type"
-          ],
-          "properties": {
-            "key": {
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "dedup"
               ]
             }
           }

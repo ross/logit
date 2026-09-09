@@ -6,6 +6,37 @@ a `todo!()`/doc-comment pointer at its actual location too, or is cheap enough t
 here. Not a roadmap — see [OVERVIEW.md](OVERVIEW.md) for planned scope; this is specifically things
 already built that have a known, accepted rough edge.
 
+- **The published schema still advertises component kinds the binary can't run.** `schema/
+  logit.schema.json` is generated directly from `ComponentKind` (ADR `config-yaml-jsonschema`), and
+  `crates/logit-config/src/lib.rs` carries unimplemented variants forward deliberately — a config
+  referencing one gets a clear "not implemented yet" from `logit validate`/`logit run` rather than
+  a deserialization error — but the schema has no way to mark a variant "declared, not runnable."
+  A schema-aware editor autocompletes `logfmt:`/`kv:`/`regex:`/`csv:`, or `logit_in:`/`logit_out:`,
+  and the binary then rejects the resulting config. Narrowed by
+  [ADR `routing-by-condition-is-lua`](adr/routing-by-condition-is-lua.md), which removed the five
+  variants (`filter`/`rename`/`sample`/`throttle`/`dedup`) that were unimplemented for no real
+  reason — each is already expressible as a `lua` component — but not closed: `logfmt`, `kv`,
+  `csv`, and `regex` remain declared-and-unimplemented (real future work, tracked as ordinary
+  scope, not a gap of this kind), and `logit_in`/`logit_out` stay published until the native wire
+  protocol exists (the **Native wire protocol** entry below). There is no fix short of implementing
+  each kind or removing it from the enum — the schema can't be hand-annotated independently of
+  `ComponentKind` without reopening the drift ADR `config-yaml-jsonschema` exists to prevent.
+- **Predicate-shaped work (routing by condition, sampling, throttling, dedup) costs a Lua VM, an OS
+  thread, and roughly 9× the per-event allocations of a native transform, because `logit` has no
+  native predicate language and there's currently no native component for any of those verbs at
+  all** — a deliberate choice, not an oversight;
+  [ADR `routing-by-condition-is-lua`](adr/routing-by-condition-is-lua.md) has the full account and
+  the measured numbers. Concretely: **9** allocations / **1.07 µs** per event through a `lua`
+  component versus **1** allocation / **360 ns** through a native `Transform`
+  (`docs/design/memory.md`), and one dedicated OS thread plus one LuaJIT VM per `lua` node
+  (`crates/logit-pipeline/src/runtime.rs`'s `run_with_telemetry`) versus an ordinary tokio task.
+  Fine at sidecar/host-agent volume — the delta is noise below roughly tens of thousands of
+  events/sec — and real at central-collector volume, where a multi-branch routing diamond can cost
+  a measurable fraction of a core answering what a native transform would answer for a third of
+  that. The ADR names the explicit revisit trigger: sustained, *measured* central-collector
+  throughput pressure against a real config, not a hunch — and records a substantially-designed
+  native predicate grammar (total-by-construction, so it can't fail at runtime) as where to resume
+  if that trigger fires.
 - **`HyperLogLog` is a stub** (`crates/logit-core/src/metric.rs`) — no methods, just a placeholder
   pending a real crate (`cardinality-estimator` is the candidate). Consequences: statsd's `s` (set)
   metric type is a clear decode error rather than silently losing data
