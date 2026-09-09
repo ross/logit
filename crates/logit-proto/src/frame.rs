@@ -23,11 +23,22 @@ pub const VERSION: u16 = 1;
 ///
 /// **Deliberately asymmetric with `write_frame`.** This bound guards a decoder reading untrusted
 /// bytes; nothing stops `write_frame` from encoding a payload larger than this and producing a
-/// frame its own `read_frame` would then reject. That's fine today -- nothing in this codebase
-/// produces a batch anywhere near 64 MiB -- but worth an encode-side assertion (or raising this
-/// constant) once the durable-buffer work (`docs/known-gaps.md`) starts producing batches large
-/// enough to make it a real possibility, rather than a theoretical one.
-const MAX_SANE_UNCOMPRESSED_LEN: u32 = 64 * 1024 * 1024;
+/// frame its own `read_frame` would then reject. `pub` so a writer that must never produce a frame
+/// its own reader would refuse -- the durable sink buffer (`docs/known-gaps.md`) -- can check an
+/// encoded frame against this bound itself before ever writing it, dropping the batch instead of
+/// spooling something unreadable.
+pub const MAX_SANE_UNCOMPRESSED_LEN: u32 = 64 * 1024 * 1024;
+
+/// The largest `compressed_len` a frame may declare, checked the same way and for the same
+/// reason as `MAX_SANE_UNCOMPRESSED_LEN` above -- but not simply reused as the same value: lz4's
+/// worst case expands rather than shrinks a payload, so a legitimately-written frame whose
+/// payload sits at the uncompressed cap can declare slightly more compressed bytes than that,
+/// and reusing the uncompressed cap directly here would make `write_frame` able to produce a
+/// frame its own `read_frame` then refuses. This is the uncompressed cap plus lz4's own
+/// documented worst-case expansion, wide enough to admit exactly that legitimate case while
+/// still bounding the allocation a corrupted length field can force.
+const MAX_SANE_COMPRESSED_LEN: u32 =
+    MAX_SANE_UNCOMPRESSED_LEN + MAX_SANE_UNCOMPRESSED_LEN / 255 + 16;
 
 /// The fixed header size in bytes: 4 (magic) + 2 (version) + 2 (flags) + 1 (codec) +
 /// 1 (compression) + 2 (reserved) + 4 (uncompressed_len) + 4 (compressed_len) + 4 (crc32c) = 24.
@@ -90,13 +101,16 @@ impl FrameHeader {
     /// Reads exactly [`HEADER_LEN`] bytes off the front of `bytes`, advancing it past the header
     /// so the caller's remaining slice is the payload. Rejects a wrong magic or an unrecognized
     /// version outright -- both mean this isn't a frame this reader can make sense of at all,
-    /// as opposed to a within-format decode error.
-    fn read(bytes: &mut Bytes) -> Result<Self, CodecError> {
+    /// as opposed to a within-format decode error. `pub` so a stream or file reader outside this
+    /// module (a durable spool's segment reader, a socket reader) can peel off one header at a
+    /// time without going through the whole-frame `read_frame` -- `docs/design/wire-protocol.md`.
+    ///
+    /// Too few bytes to hold a header is [`CodecError::Truncated`], not [`CodecError::Malformed`]:
+    /// that's exactly "come back with more bytes" for a live stream, or "this is where a torn
+    /// write ends" for a file, neither of which is a claim that the bytes present are wrong.
+    pub fn read(bytes: &mut Bytes) -> Result<Self, CodecError> {
         if bytes.len() < HEADER_LEN {
-            return Err(CodecError::Malformed(format!(
-                "frame shorter than the {HEADER_LEN}-byte header: {} bytes",
-                bytes.len()
-            )));
+            return Err(CodecError::Truncated { needed: HEADER_LEN - bytes.len() });
         }
         let mut magic = [0u8; 4];
         bytes.copy_to_slice(&mut magic);
@@ -179,12 +193,14 @@ pub fn read_frame(bytes: &mut Bytes) -> Result<(u8, Bytes), CodecError> {
             header.uncompressed_len
         )));
     }
-    if (bytes.len() as u64) < header.compressed_len as u64 {
+    if header.compressed_len > MAX_SANE_COMPRESSED_LEN {
         return Err(CodecError::Malformed(format!(
-            "frame declares {} compressed bytes but only {} remain",
-            header.compressed_len,
-            bytes.len()
+            "frame declares {} compressed bytes, over the {MAX_SANE_COMPRESSED_LEN} sanity cap",
+            header.compressed_len
         )));
+    }
+    if (bytes.len() as u64) < header.compressed_len as u64 {
+        return Err(CodecError::Truncated { needed: header.compressed_len as usize - bytes.len() });
     }
     let compressed = bytes.split_to(header.compressed_len as usize);
     if crc32c::crc32c(&compressed) != header.crc32c {
@@ -334,6 +350,20 @@ mod tests {
     }
 
     #[test]
+    fn a_header_truncated_by_one_byte_is_truncated_not_malformed() {
+        let framed = write_frame(1, Compression::None, b"hello").unwrap();
+        let mut short = framed.slice(..HEADER_LEN - 1);
+        assert!(matches!(read_frame(&mut short), Err(CodecError::Truncated { needed: 1 })));
+    }
+
+    #[test]
+    fn a_body_truncated_by_one_byte_is_truncated_not_malformed() {
+        let framed = write_frame(1, Compression::None, b"hello").unwrap();
+        let mut short = framed.slice(..framed.len() - 1);
+        assert!(matches!(read_frame(&mut short), Err(CodecError::Truncated { needed: 1 })));
+    }
+
+    #[test]
     fn write_frame_rejects_zstd_rather_than_panicking() {
         assert!(matches!(
             write_frame(1, Compression::Zstd, b"payload"),
@@ -401,6 +431,28 @@ mod tests {
         let mut bad = mutated.freeze();
         assert!(
             matches!(read_frame(&mut bad), Err(CodecError::Malformed(msg)) if msg.contains("sanity cap"))
+        );
+    }
+
+    /// F5: `compressed_len` (header bytes 16..20, verified against `FrameHeader::write` above --
+    /// magic 0..4, version 4..6, flags 6..8, codec 8, compression 9, reserved 10..12,
+    /// uncompressed_len 12..16, compressed_len 16..20, crc32c 20..24) previously had no upper
+    /// bound before being used to size a read, unlike `uncompressed_len` a few lines above it.
+    /// This is the proof it's now capped, and that a corrupted length field is correctly
+    /// classified as `Malformed` (corruption -- resync past it) rather than `Truncated`
+    /// (indistinguishable from a genuine short read/clean end-of-file).
+    #[test]
+    fn rejects_a_compressed_len_over_the_sanity_cap() {
+        let framed = write_frame(1, Compression::None, b"small").unwrap();
+        let mut mutated = BytesMut::from(&framed[..]);
+        mutated[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut bad = mutated.freeze();
+        assert!(
+            matches!(read_frame(&mut bad), Err(CodecError::Malformed(msg)) if msg.contains("sanity cap")),
+            "an oversized compressed_len must be Malformed, not Truncated -- a Truncated result \
+             here would be indistinguishable from a genuine clean end-of-file to a caller like \
+             `DiskQueue::read_record_at`'s `walk_segment`, silently discarding every record after \
+             it instead of resyncing"
         );
     }
 }

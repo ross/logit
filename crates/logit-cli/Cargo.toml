@@ -34,3 +34,9 @@ serde_norway.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tikv-jemallocator = { version = "0.6", optional = true }
+
+[dev-dependencies]
+# `crates/logit-cli/tests/durable_buffer_restart.rs` implements `logit_pipeline::Input`/`Output`
+# test doubles directly, the same way `crates/logit-outputs`/`logit-inputs` implement the real
+# ones.
+async-trait.workspace = true

@@ -12,7 +12,7 @@
 //! own doc comment for why), and every sink-side metric name, default, and test is unchanged.
 
 use crate::fanout::TraceContext;
-use logit_core::{EventBatch, Telemetry};
+use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_proto::buffer::{Buffer, InMemoryBuffer, OverflowPolicy as DropPolicy, PushOutcome};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -441,6 +441,110 @@ pub type SinkQueue = BoundedQueue<(Arc<EventBatch>, TraceContext)>;
 impl SinkQueue {
     pub fn new(config: SinkQueueConfig, telemetry: Telemetry) -> Self {
         Self::with_metrics(config.into(), &SINK_QUEUE_METRICS, telemetry)
+    }
+}
+
+/// What a sink's queue actually is, chosen per component by `logit-cli::pipeline::build_spec`
+/// from that component's `buffer:` block -- `Memory` (today's `SinkQueue`, unchanged) or `Disk`
+/// (`crate::disk_queue::DiskQueue`, `docs/adr/disk-backed-sink-buffer.md`). Enum dispatch, not
+/// `dyn Trait`: there are exactly two implementations, both known at compile time, and
+/// `disk_queue::DiskQueue` deliberately does *not* implement `logit_proto::buffer::Buffer<T>` --
+/// that trait is sync/`&mut self`/generic, the wrong seam for a concrete, async, file-backed
+/// queue (see `disk_queue`'s own module doc).
+pub enum SinkStore {
+    Memory(SinkQueue),
+    // `Box`ed: `DiskQueue` is far larger than `SinkQueue` (it owns a `PathBuf`, open file
+    // handles, and a lock file), and `clippy::large_enum_variant` is right that leaving it
+    // unboxed would pad every `SinkStore::Memory` (the common case) out to `DiskQueue`'s size.
+    Disk(Box<crate::disk_queue::DiskQueue>),
+}
+
+/// Mirrors [`SinkStore`] one level up, at the config stage -- `logit-cli::pipeline::queue_config`
+/// builds one of these from a component's `logit_config::BufferConfig`, and `run_output`
+/// (`crate::runtime`) turns it into the live [`SinkStore`] via [`SinkStore::open`].
+pub enum SinkStoreConfig {
+    Memory(SinkQueueConfig),
+    Disk(crate::disk_queue::DiskQueueConfig),
+}
+
+impl SinkStore {
+    /// Builds the store a `SinkStoreConfig` describes. Infallible for `Memory` (`SinkQueue::new`
+    /// never fails); `Disk` opens (or recovers) the spool directory, which can fail -- a bad path,
+    /// a permissions error, another process already holding the lock -- and that failure is a
+    /// startup error for the component, not something `run_output` degrades from.
+    pub fn open(
+        config: SinkStoreConfig,
+        telemetry: Telemetry,
+        diag: Diagnostics,
+    ) -> anyhow::Result<Self> {
+        match config {
+            SinkStoreConfig::Memory(cfg) => Ok(SinkStore::Memory(SinkQueue::new(cfg, telemetry))),
+            SinkStoreConfig::Disk(cfg) => Ok(SinkStore::Disk(Box::new(
+                crate::disk_queue::DiskQueue::open(cfg, telemetry, diag)?,
+            ))),
+        }
+    }
+
+    pub async fn push(&self, item: (Arc<EventBatch>, TraceContext)) {
+        match self {
+            SinkStore::Memory(q) => q.push(item).await,
+            SinkStore::Disk(q) => q.push(item).await,
+        }
+    }
+
+    pub async fn peek(&self) -> Option<(Arc<EventBatch>, TraceContext)> {
+        match self {
+            SinkStore::Memory(q) => q.peek().await,
+            SinkStore::Disk(q) => q.peek().await,
+        }
+    }
+
+    /// Advances past the head, returning it -- mirrors `SinkQueue::commit`/`DiskQueue::commit`
+    /// exactly. `write_loop`/`drain_inbox` never need the value back, but a test driving
+    /// `write_loop` directly does (to confirm what it left behind on a shutdown-grace exit,
+    /// say), so this doesn't discard it the way `SinkStore::finish`'s internal drain loop does.
+    pub fn commit(&self) -> Option<(Arc<EventBatch>, TraceContext)> {
+        match self {
+            SinkStore::Memory(q) => q.commit(),
+            SinkStore::Disk(q) => q.commit(),
+        }
+    }
+
+    pub fn close(&self) {
+        match self {
+            SinkStore::Memory(q) => q.close(),
+            SinkStore::Disk(q) => q.close(),
+        }
+    }
+
+    /// Shutdown-time finalization, called from `crate::runtime::finish_and_flush` once nothing
+    /// can push into this store any more. Returns `(dropped_batches, dropped_events)`.
+    ///
+    /// `Memory` drains whatever the queue still holds by repeatedly committing (exactly
+    /// `finish_and_flush`'s old inline loop) -- an in-memory queue's contents don't survive
+    /// process exit regardless, so this is the last chance to count them as dropped.
+    ///
+    /// `Disk` drops **nothing**: it persists the read cursor, `fsync`s it, the active segment,
+    /// and the directory, and returns `(0, 0)` unconditionally -- whatever's still queued survives
+    /// this process exit and delivers on the next `DiskQueue::open`. The shutdown grace only
+    /// bounds how long `write_loop` keeps attempting delivery, never what a disk-backed sink is
+    /// still holding.
+    pub async fn finish(&self) -> (u64, u64) {
+        match self {
+            SinkStore::Memory(q) => {
+                let mut dropped_batches = 0u64;
+                let mut dropped_events = 0u64;
+                while let Some((batch, _ctx)) = q.commit() {
+                    dropped_batches += 1;
+                    dropped_events += batch.events.len() as u64;
+                }
+                (dropped_batches, dropped_events)
+            }
+            SinkStore::Disk(q) => {
+                q.finish().await;
+                (0, 0)
+            }
+        }
     }
 }
 

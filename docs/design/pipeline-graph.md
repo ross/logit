@@ -308,6 +308,14 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 33. `stdio_out`/`file_out`'s `compression:` is rejected whenever set to anything but `none` under
     the default `format: human` — it would silently do nothing, since compression is
     `NativeEncoder`'s own knob (`docs/adr/file-output-native-format.md`).
+34. A sink's `buffer.disk:` block (`docs/adr/disk-backed-sink-buffer.md`) is rejected alongside a
+    non-default `buffer.max_batches`/`max_bytes` — disk replaces the in-memory bound rather than
+    sizing alongside it, so a set-but-ignored value is a config error, the same reasoning as 33.
+    `buffer.disk.segment_bytes`/`max_bytes` of `0` are each an impossible bound (the "0 is
+    impossible, not just small" instinct of 9/15/18/28/29), and `segment_bytes` may not exceed
+    `max_bytes`. Two sinks may not declare the same literal `buffer.disk.path` (compared as
+    written, not resolved against the config directory — `DiskQueue`'s own exclusive lock catches
+    an aliased path this comparison can't see).
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

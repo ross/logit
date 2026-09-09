@@ -63,16 +63,33 @@ already built that have a known, accepted rough edge.
   longer ends `logit run` by default — it degrades to dropping the offending batch and continuing,
   exiting only after a sustained ~60s window of nothing but configuration-error (`Fault::Permanent`)
   failures. What's left, genuinely open:
-  - **No durable (disk-backed) buffering** — both the sink's `SinkQueue` and (since
-    [ADR `decoupled-listener-io`](adr/decoupled-listener-io.md)) a UDP listener's `ReceiveQueue` are in-memory
-    only; a process restart, SIGKILL, or a shutdown grace that expires mid-drain loses whatever
-    either was holding. Plausibly config-optional even once it lands, since not every deployment
-    needs cross-restart durability. Was blocked on the wire encoding decision
-    ([wire-protocol.md](design/wire-protocol.md)); that decision is now made
-    ([ADR `native-wire-format-encoding`](adr/native-wire-format-encoding.md)) and
-    `logit_proto::native`'s frames are already designed to be independently decodable and
-    file-appendable, so a disk-backed `Buffer<T>` over them is real, unblocked follow-up work, not
-    designed yet.
+  - **No durable (disk-backed) buffering on the receive side.** Closed for the sink side: an opt-in
+    `buffer.disk:` block replaces a sink's in-memory `SinkQueue` with a crash-recoverable spool over
+    `logit_proto::native` frames (`crates/logit-pipeline/src/disk_queue.rs`,
+    [ADR `disk-backed-sink-buffer`](adr/disk-backed-sink-buffer.md)) — a process restart or `SIGKILL`
+    resumes delivery from the last persisted read cursor, replaying at most the batches committed
+    since the last checkpoint. A UDP listener's `ReceiveQueue` (since
+    [ADR `decoupled-listener-io`](adr/decoupled-listener-io.md)) is still in-memory only; a restart
+    or a shutdown grace that expires mid-drain still loses whatever it was holding. The same
+    `logit_proto::native` frames this closed the sink side with are available for the receive side
+    too, but the design (what a listener resumes *from* has no equivalent of a sink's "haven't
+    delivered yet" boundary) isn't started.
+  - **The disk-backed sink spool has a real, accepted power-loss window.** Durability is
+    `fdatasync` on segment rotation, on the cursor file, and at shutdown — not per push (see the
+    ADR's "Durability" section). A power loss (not a process crash) can lose the tail of the active
+    segment's most recent, not-yet-`fsync`ed writes. A `disk.sync: every_push` knob to close that
+    window at a real throughput cost is a plausible follow-up, not built.
+  - **`logit_proto::buffer::Buffer<T>`'s role narrowed to `InMemoryBuffer` alone.** Deliberately
+    written ahead of its caller ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md)), the
+    trait's sync/`&mut self`/generic shape turned out to be the wrong seam once a second, disk-backed
+    implementation actually needed to exist: `DiskQueue` is async and concrete over
+    `(Arc<EventBatch>, TraceContext)`, and implements its own surface directly rather than that
+    trait ([ADR `disk-backed-sink-buffer`](adr/disk-backed-sink-buffer.md)).
+  - **No spool sharing, compaction, or out-of-order replay for the disk-backed sink buffer.** One
+    spool directory per sink, no rewriting of already-written segments to reclaim space early
+    (deletion only happens whole-segment, once the read cursor has fully crossed it), and no
+    encryption at rest. None of these block the at-least-once contract the feature ships with; each
+    is real, narrower future work if a deployment needs it.
   - **No end-to-end acknowledgement** — delivery is confirmed only as far as the immediate
     destination accepting the write; nothing tracks whether the data survives past that point. The
     receive-side loss this used to also name (a UDP listener losing datagrams before anything

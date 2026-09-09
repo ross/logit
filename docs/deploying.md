@@ -82,14 +82,15 @@ summary:
 
 ## Sink delivery buffering
 
-Every sink (`influxdb_out`, `stdio_out`, `file_out`, ...) sits behind a per-component, in-memory
-delivery queue that decouples receiving events from delivering them
+Every sink (`influxdb_out`, `stdio_out`, `file_out`, ...) sits behind a per-component delivery
+queue, in memory by default, that decouples receiving events from delivering them
 ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md)). This is what lets a slow or temporarily-down
 destination be ridden out instead of stalling or killing the whole pipeline. It's tunable per sink
 via a `buffer:` block on that component (`buffer:` is rejected at validation time on anything but a
 sink) — see the commented example in
 [`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml). Every field defaults, so
-an omitted `buffer:` is the values below.
+an omitted `buffer:` is the values below. `buffer.disk:` opts a sink into a crash-recoverable,
+disk-backed queue instead — see [Durable buffering](#durable-buffering) below.
 
 ### Failure semantics: degrade to dropping, don't exit
 
@@ -112,13 +113,16 @@ Unlike the pre-0020 behavior, a sink that can't reach its destination no longer 
 
 ### Sizing: `max_bytes` × number of sinks
 
-`buffer.max_bytes` (64MiB default) bounds *one sink's* queue — a config with several sinks (or
-several `influxdb_out`/`stdio_out` components fed by different branches) multiplies that by however
-many sinks it defines when you're sizing the container's memory limit. `buffer.max_batches` (1024
-default) is the second, independent bound — whichever of the two trips first governs. Size for the
-worst case you actually intend to ride out: `max_bytes` deep enough to hold a real destination
-outage's worth of buffered data, weighed against the memory budget you're willing to commit to a
-sink that's doing nothing but holding data no one can currently accept.
+`buffer.max_bytes` (64MiB default) bounds *one sink's* queue — RAM for the in-memory default, disk
+for `buffer.disk:` — a config with several sinks (or several `influxdb_out`/`stdio_out` components
+fed by different branches) multiplies that by however many sinks it defines when you're sizing the
+container's memory (or disk) limit. `buffer.max_batches` (1024 default) is the second, independent
+bound for an in-memory queue — whichever of the two trips first governs; a disk-backed queue drops
+that bound entirely in favor of `buffer.disk.max_bytes` alone (graph validation rejects setting
+both). Size for the worst case you actually intend to ride out: `max_bytes` deep enough to hold a
+real destination outage's worth of buffered data, weighed against the memory (or disk) budget
+you're willing to commit to a sink that's doing nothing but holding data no one can currently
+accept.
 
 `buffer.overflow` decides what happens once both bounds are full: `block` (the default) applies
 backpressure all the way back to intake rather than losing data silently; `drop_oldest`/
@@ -139,6 +143,51 @@ the config. The two most directly actionable for buffering:
   `shutdown` (the queue still held data when `shutdown_grace` expired). Any sustained nonzero rate
   here is data loss worth alerting on; which `reason` tells you whether the cause is an overflowing
   queue, a failing destination, or a slow drain racing shutdown.
+
+### Durable buffering
+
+An in-memory queue is lost on a process restart, a `SIGKILL`, or a shutdown grace that expires
+mid-drain. A `buffer.disk:` block replaces one sink's queue with a crash-recoverable spool on disk
+([ADR `disk-backed-sink-buffer`](adr/disk-backed-sink-buffer.md)) — a restart resumes delivery from
+the last persisted read cursor, replaying at most the batches committed since the last checkpoint
+(at-least-once, the same trade `tail_in`'s own checkpoint already makes):
+
+```yaml
+buffer:
+  disk:
+    path: spool/influxdb_out   # required, resolved relative to this config file's own directory
+    max_bytes: "1GiB"          # bound on the sum of on-disk segment sizes -- replaces buffer.max_bytes
+    segment_bytes: "64MiB"     # soft rotation trigger, not a hard cap
+    compression: none          # none | lz4
+    checkpoint_interval: 1s    # how often the read cursor is persisted during normal operation
+```
+
+Use it for a sink whose destination has outages long enough, or restarts frequent enough, that an
+in-memory queue's loss window is a real cost — not for every sink by default: it costs a real
+`write` per batch (`logit_proto::native` encode plus one file append) that an in-memory queue never
+pays. `buffer.max_batches`/`buffer.max_bytes` are rejected if left non-default alongside `disk:` —
+disk replaces the in-memory bound, it doesn't size beside it.
+
+**Durability level:** `fdatasync` on segment rotation, on the cursor file, and at shutdown, not per
+push. A process crash (including `SIGKILL`) loses nothing already written; a genuine power loss can
+lose the most recent, not-yet-synced tail of the active segment. Put the spool directory on a
+volume that survives the container — an ephemeral container filesystem defeats the entire point,
+the same as any other durable state (`crates/logit-inputs/src/tail/checkpoint.rs`'s own checkpoint
+file, a database's data directory).
+
+**What to watch**, in addition to the metrics above (`buffer.utilization`/`.bytes` mean the same
+thing, sized against `buffer.disk.max_bytes`; `batches.dropped` gains `frame_too_large`,
+`disk_corrupt`, `disk_full`, and `disk_io_error` as possible `reason`s, and never emits
+`reason="shutdown"` for a disk-backed sink, which drops nothing at shutdown):
+
+- `logit.component.buffer.disk.segments` (gauge) — segment files currently on disk.
+- `logit.component.buffer.disk.replayed` (count) — records found between the resume point and the
+  end of all segments, once at process start. Consistently zero after the first tick following a
+  clean start; a nonzero value on every restart under normal operation means something is
+  preventing the queue from ever fully draining.
+- `logit.component.buffer.disk.truncated` (count) — a torn tail found and truncated at open. Any
+  nonzero value here means the previous process ended mid-write (an ordinary `SIGKILL`, not
+  necessarily a problem) — worth noting, not alerting on by itself.
 
 ## Listener intake
 

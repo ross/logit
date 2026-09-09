@@ -9,6 +9,7 @@
 //! knowing about any concrete input/output/transform kind.
 
 pub mod accumulator;
+pub mod disk_queue;
 pub mod fanout;
 pub mod graph;
 pub mod input;
@@ -18,12 +19,13 @@ pub mod runtime;
 pub mod transform;
 
 pub use accumulator::{BatchAccumulator, FlushReason};
+pub use disk_queue::{DiskQueue, DiskQueueConfig};
 pub use fanout::{Delivered, Fanout, TraceContext};
 pub use input::{Input, InputRuntimeConfig};
 pub use output::{classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fault, Output};
 pub use queue::{
     BoundedQueue, OverflowPolicy, QueueConfig, QueueMetrics, Queued, SinkQueue, SinkQueueConfig,
-    SINK_QUEUE_METRICS,
+    SinkStore, SinkStoreConfig, SINK_QUEUE_METRICS,
 };
 pub use runtime::{
     process_batch, run, run_with_shutdown, run_with_telemetry, send_batch, unwrap_batch, NodeSpec,

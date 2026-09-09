@@ -227,6 +227,8 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `stdio_out` encode 100 events | **102** | ~1/event -- fixed, see below, was 1801; +1 since measured through `Encoder::encode` (`&EventBatch` -> `Bytes`) rather than the inherent `render` (`&EventBatch` -> `String`) directly, ADR `rotating-file-output` -- `Bytes::from(String)`'s own small shared-refcount allocation |
 | `influxdb_out` encode 100 events | **30** | ~0.3/event — see below |
 | receive queue: push then pop, warm | **0** | `BoundedQueue<Datagram>`, ADR `decoupled-listener-io` -- see below |
+| `disk_queue`: push one batch (encode + write) | **25** | `native::encode_batch` + `frame::write_frame` + one `write_all` -- breaks the zero-clone `Arc<EventBatch>` property by design, see `docs/adr/disk-backed-sink-buffer.md` |
+| `disk_queue`: peek, cached (no re-decode) | **0** | `write_loop`'s retry loop calls `peek` once per attempt; only the first (uncached) peek after a push touches disk |
 | accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR `decoupled-listener-io` -- see below |
 | `syslog_out` encode_into 100 events | **100** | ~1/event -- reused struct-held scratch buffers, was 401, see below |
 
@@ -916,8 +918,16 @@ exact-equality discipline: a `MetricKind::Distribution`'s `DDSketch` is approxim
 constant rather than walked bin-by-bin, and `Value`'s numeric/bool/null variants (stored inline, no
 heap component) contribute nothing. It is consumed by the buffered sink-delivery work
 (`docs/plans/buffered-sink-delivery.md`, `docs/adr/buffered-sink-delivery.md`): every
-sink's `SinkQueue` (`crates/logit-pipeline/src/queue.rs`) bounds itself on both batch count and this
-estimate, whichever trips first.
+sink's queue (`crates/logit-pipeline/src/queue.rs`) bounds itself on both batch count and this
+estimate, whichever trips first — **for the in-memory default.** A sink opted into `buffer.disk:`
+(`docs/adr/disk-backed-sink-buffer.md`) bounds on-disk bytes instead
+(`crates/logit-pipeline/src/disk_queue.rs`'s own per-record encoded frame length, summed over every
+segment still on disk), not `estimated_heap_bytes()` — the two are deliberately not the same figure:
+disk usage tracks exactly what was written, while the in-memory estimate is the admission-control
+approximation described above. Either way, "in-flight memory" for that sink's queue is memory *or*
+disk, never both at once, and never more than one bound applies (`buffer.max_batches`/`max_bytes`
+are rejected outright alongside a non-default `buffer.disk`, `crates/logit-pipeline/src/graph.rs`
+rule 34).
 
 **A second consumer of the same byte-aware bounding idea, on the listener side.**
 [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md) generalizes `SinkQueue` into `BoundedQueue<T:
