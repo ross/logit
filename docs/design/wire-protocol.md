@@ -154,10 +154,15 @@ pushed item unchanged. A third overflow behavior, blocking until space frees up,
 not a variant here: a synchronous trait can't block usefully, so that's a concern of an async
 wrapper layered on top of `Buffer`, not of the trait or its implementations.
 
-`InMemoryBuffer<T>` is the one shipping implementation, ships first, and is what `Buffer<T>` is
-currently defined against. A disk-backed implementation (for surviving a restart or a downstream
-outage without data loss) is a real future need but not a v1 blocker — the trait boundary is what's
-cheap to add now and expensive to retrofit onto call sites that assumed an in-memory queue.
+`InMemoryBuffer<T>` is the one shipping implementation of this trait, and turns out to be the only
+one: a disk-backed sink buffer landed (`crates/logit-pipeline/src/disk_queue.rs`, ADR
+`disk-backed-sink-buffer`), but *not* against `Buffer<T>` — that trait's sync/`&mut self`/generic
+shape was the wrong seam for an implementation that has to do real file I/O and is concrete over
+`(Arc<EventBatch>, TraceContext)`, not generic over `T`. `DiskQueue` implements its own async
+surface directly instead. `Buffer<T>`'s role narrows to `InMemoryBuffer<T>` alone; the "cheap to
+add now, expensive to retrofit" bet this trait was built on paid off for the *first* buffer this
+crate needed (`SinkQueue`'s own `BoundedQueue<T: Queued>` wraps it), just not for the disk-backed
+one.
 
 ## Open question
 

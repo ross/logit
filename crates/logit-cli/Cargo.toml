@@ -36,6 +36,10 @@ tokio.workspace = true
 tikv-jemallocator = { version = "0.6", optional = true }
 
 [dev-dependencies]
+# `crates/logit-cli/tests/durable_buffer_restart.rs` implements `logit_pipeline::Input`/`Output`
+# test doubles directly, the same way `crates/logit-outputs`/`logit-inputs` implement the real
+# ones.
+async-trait.workspace = true
 # tests/logit_round_trip.rs's forwarding-chain test decodes a real statsd line with
 # `StatsdDecoder` directly, which takes its input as `bytes::Bytes` -- already a transitive
 # dependency via every crate above, named directly here because the test constructs one itself.

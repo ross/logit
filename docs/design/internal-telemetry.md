@@ -315,18 +315,29 @@ receive/processing side from their own loops, which already see every batch and 
 | `logit.script.vm.memory` | gauge | `run_lua`, once per batch — the strongest signal a stateful script is leaking Lua-side state |
 | `logit.script.events.emitted{outcome="emit"\|"emit_many"}` | count | `run_lua`, per `ProcessOutcome` — distinguishes a 1:1 script from a fan-out one |
 
-**Every sink also gets a `SinkQueue`** (`crates/logit-pipeline/src/queue.rs`,
+**Every sink also gets a `SinkStore`** (`crates/logit-pipeline/src/queue.rs`,
 `docs/adr/buffered-sink-delivery.md`) sitting between its inbox drain and delivery — its own
 uniform layer, same reasoning as `Fanout`'s: instrumenting the one choke point every sink's batches
-pass through gives every sink these for free, no per-sink code:
+pass through gives every sink these for free, no per-sink code. In memory (`SinkQueue`, the
+default) or on disk (`DiskQueue`, opt-in via `buffer.disk:`,
+`docs/adr/disk-backed-sink-buffer.md`) emit the same first four rows with the same meanings —
+`buffer.bytes` is on-disk bytes rather than `estimated_heap_bytes` for a disk-backed sink:
 
 | Name | Kind | Meaning |
 |---|---|---|
 | `logit.component.buffer.batches` | gauge | batches currently queued, sampled on every push/commit |
-| `logit.component.buffer.bytes` | gauge | `EventBatch::estimated_heap_bytes` summed over what's queued |
+| `logit.component.buffer.bytes` | gauge | `EventBatch::estimated_heap_bytes` summed over what's queued (in-memory), or on-disk segment bytes (disk-backed) |
 | `logit.component.buffer.utilization` | gauge | `max(batches ratio, bytes ratio)` against the two configured bounds |
 | `logit.component.buffer.push.blocked.duration` | timing | how long a `Block`-policy push waited for room; only recorded when a push actually had to wait |
-| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`SinkQueue` eviction), `send_failed` (`write_loop`: not retryable, or retryable but the budget ran out), `shutdown` (`write_loop`: shutdown grace expired with the queue still non-empty) |
+| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (queue eviction), `send_failed` (`write_loop`: not retryable, or retryable but the budget ran out), `shutdown` (`write_loop`: shutdown grace expired with an in-memory queue still non-empty — never emitted for a disk-backed sink, which drops nothing at shutdown), `frame_too_large`/`disk_corrupt`/`disk_full`/`disk_io_error` (disk-backed only, see below) |
+
+Disk-backed sinks (`DiskQueue`) additionally emit:
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.component.buffer.disk.segments` | gauge | segment files currently on disk |
+| `logit.component.buffer.disk.replayed` | count | records found between the resume point and the end of all segments, at `DiskQueue::open` |
+| `logit.component.buffer.disk.truncated` | count | a torn tail found and truncated at `DiskQueue::open` |
 
 Two metrics named in this doc's original design were not built in the pass that shipped
 `SinkQueue`: a per-batch `buffer.wait.duration` (push-to-commit latency) and an

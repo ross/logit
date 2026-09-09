@@ -16,6 +16,12 @@ async-trait.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 regex.workspace = true
+# The disk-backed sink buffer's cursor.json (crates/logit-pipeline/src/disk_queue.rs), the same
+# tmp+rename JSON idiom crates/logit-inputs/src/tail/checkpoint.rs already uses for its own
+# same-sized checkpoint file.
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 # `test-util` (for `tokio::time::pause`/`#[tokio::test(start_paused = true)]`) only needs to be

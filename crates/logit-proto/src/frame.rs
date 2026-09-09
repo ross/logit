@@ -30,15 +30,29 @@ pub const FLAG_CONTROL: u16 = 1 << 0;
 ///
 /// **Deliberately asymmetric with `write_frame`.** This bound guards a decoder reading untrusted
 /// bytes; nothing stops `write_frame` from encoding a payload larger than this and producing a
-/// frame its own `read_frame` would then reject. That's fine today -- nothing in this codebase
-/// produces a batch anywhere near 64 MiB -- but worth an encode-side assertion (or raising this
-/// constant) once the durable-buffer work (`docs/known-gaps.md`) starts producing batches large
-/// enough to make it a real possibility, rather than a theoretical one.
+/// frame its own `read_frame` would then reject. Nothing in this codebase produces a batch
+/// anywhere near 64 MiB, so that asymmetry stays theoretical in practice -- but a writer that must
+/// never emit a frame its own reader would refuse doesn't rely on that, it checks explicitly.
 ///
-/// `pub`: `logit_in` (`crates/logit-inputs/src/logit.rs`) checks an incoming frame's declared
-/// lengths against `min(MAX_SANE_UNCOMPRESSED_LEN, peer.max_frame_bytes)` *before* reading the
-/// body off the socket, not just after -- this constant is that shared ceiling.
+/// `pub` because both a reader and a writer outside this module need the same ceiling:
+/// - `logit_in` (`crates/logit-inputs/src/logit.rs`) checks an incoming frame's declared lengths
+///   against `min(MAX_SANE_UNCOMPRESSED_LEN, peer.max_frame_bytes)` *before* reading the body off
+///   the socket, not just after -- this constant is that shared ceiling.
+/// - the durable sink buffer (`crates/logit-pipeline/src/disk_queue.rs`) checks an encoded frame
+///   against this bound itself before ever writing it, dropping the batch instead of spooling
+///   something its own segment reader could not read back.
 pub const MAX_SANE_UNCOMPRESSED_LEN: u32 = 64 * 1024 * 1024;
+
+/// The largest `compressed_len` a frame may declare, checked the same way and for the same
+/// reason as `MAX_SANE_UNCOMPRESSED_LEN` above -- but not simply reused as the same value: lz4's
+/// worst case expands rather than shrinks a payload, so a legitimately-written frame whose
+/// payload sits at the uncompressed cap can declare slightly more compressed bytes than that,
+/// and reusing the uncompressed cap directly here would make `write_frame` able to produce a
+/// frame its own `read_frame` then refuses. This is the uncompressed cap plus lz4's own
+/// documented worst-case expansion, wide enough to admit exactly that legitimate case while
+/// still bounding the allocation a corrupted length field can force.
+const MAX_SANE_COMPRESSED_LEN: u32 =
+    MAX_SANE_UNCOMPRESSED_LEN + MAX_SANE_UNCOMPRESSED_LEN / 255 + 16;
 
 /// The fixed header size in bytes: 4 (magic) + 2 (version) + 2 (flags) + 1 (codec) +
 /// 1 (compression) + 2 (reserved) + 4 (uncompressed_len) + 4 (compressed_len) + 4 (crc32c) = 24.
@@ -103,10 +117,17 @@ impl FrameHeader {
     /// version outright -- both mean this isn't a frame this reader can make sense of at all,
     /// as opposed to a within-format decode error.
     ///
-    /// `pub`: a streaming reader (`logit_in`'s per-connection loop) needs this to parse a header
-    /// it has already `read_exact`'d off a socket, separately from reading the (possibly much
-    /// larger) body -- `read_frame`'s all-at-once shape doesn't fit a socket, which doesn't hand
-    /// over a whole frame's bytes atomically the way a `Bytes` buffer does.
+    /// `pub` so a stream or file reader outside this module can peel off one header at a time
+    /// without going through the whole-frame `read_frame` -- `docs/design/wire-protocol.md`. Two
+    /// callers need exactly that: `logit_in`'s per-connection loop parses a header it has already
+    /// `read_exact`'d off a socket, separately from reading the (possibly much larger) body, since
+    /// `read_frame`'s all-at-once shape doesn't fit a socket that never hands over a whole frame's
+    /// bytes atomically the way a `Bytes` buffer does; and the durable spool's segment reader walks
+    /// a file the same way.
+    ///
+    /// Too few bytes to hold a header is [`CodecError::Truncated`], not [`CodecError::Malformed`]:
+    /// that's exactly "come back with more bytes" for a live stream, or "this is where a torn
+    /// write ends" for a file, neither of which is a claim that the bytes present are wrong.
     pub fn read(bytes: &mut Bytes) -> Result<Self, CodecError> {
         if bytes.len() < HEADER_LEN {
             return Err(CodecError::Truncated { needed: HEADER_LEN - bytes.len() });
@@ -210,6 +231,12 @@ pub fn read_frame_with_header(bytes: &mut Bytes) -> Result<(FrameHeader, Bytes),
         return Err(CodecError::Malformed(format!(
             "frame declares {} uncompressed bytes, over the {MAX_SANE_UNCOMPRESSED_LEN} sanity cap",
             header.uncompressed_len
+        )));
+    }
+    if header.compressed_len > MAX_SANE_COMPRESSED_LEN {
+        return Err(CodecError::Malformed(format!(
+            "frame declares {} compressed bytes, over the {MAX_SANE_COMPRESSED_LEN} sanity cap",
+            header.compressed_len
         )));
     }
     if (bytes.len() as u64) < header.compressed_len as u64 {
@@ -363,6 +390,20 @@ mod tests {
     }
 
     #[test]
+    fn a_header_truncated_by_one_byte_is_truncated_not_malformed() {
+        let framed = write_frame(1, Compression::None, b"hello").unwrap();
+        let mut short = framed.slice(..HEADER_LEN - 1);
+        assert!(matches!(read_frame(&mut short), Err(CodecError::Truncated { needed: 1 })));
+    }
+
+    #[test]
+    fn a_body_truncated_by_one_byte_is_truncated_not_malformed() {
+        let framed = write_frame(1, Compression::None, b"hello").unwrap();
+        let mut short = framed.slice(..framed.len() - 1);
+        assert!(matches!(read_frame(&mut short), Err(CodecError::Truncated { needed: 1 })));
+    }
+
+    #[test]
     fn write_frame_rejects_zstd_rather_than_panicking() {
         assert!(matches!(
             write_frame(1, Compression::Zstd, b"payload"),
@@ -434,20 +475,6 @@ mod tests {
     }
 
     #[test]
-    fn a_header_short_by_one_byte_is_truncated_not_malformed() {
-        let framed = write_frame(1, Compression::None, b"hello").unwrap();
-        let mut short = framed.slice(0..HEADER_LEN - 1);
-        assert!(matches!(read_frame(&mut short), Err(CodecError::Truncated { needed: 1 })));
-    }
-
-    #[test]
-    fn a_body_short_by_one_byte_is_truncated_not_malformed() {
-        let framed = write_frame(1, Compression::None, b"hello").unwrap();
-        let mut short = framed.slice(0..framed.len() - 1);
-        assert!(matches!(read_frame(&mut short), Err(CodecError::Truncated { needed: 1 })));
-    }
-
-    #[test]
     fn flag_control_round_trips_through_the_header() {
         let framed = write_frame_with_flags(1, Compression::None, FLAG_CONTROL, b"hello").unwrap();
         let mut bytes = framed;
@@ -462,5 +489,27 @@ mod tests {
         let mut bytes = framed;
         let (header, _) = read_frame_with_header(&mut bytes).unwrap();
         assert_eq!(header.flags, 0);
+    }
+
+    /// F5: `compressed_len` (header bytes 16..20, verified against `FrameHeader::write` above --
+    /// magic 0..4, version 4..6, flags 6..8, codec 8, compression 9, reserved 10..12,
+    /// uncompressed_len 12..16, compressed_len 16..20, crc32c 20..24) previously had no upper
+    /// bound before being used to size a read, unlike `uncompressed_len` a few lines above it.
+    /// This is the proof it's now capped, and that a corrupted length field is correctly
+    /// classified as `Malformed` (corruption -- resync past it) rather than `Truncated`
+    /// (indistinguishable from a genuine short read/clean end-of-file).
+    #[test]
+    fn rejects_a_compressed_len_over_the_sanity_cap() {
+        let framed = write_frame(1, Compression::None, b"small").unwrap();
+        let mut mutated = BytesMut::from(&framed[..]);
+        mutated[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut bad = mutated.freeze();
+        assert!(
+            matches!(read_frame(&mut bad), Err(CodecError::Malformed(msg)) if msg.contains("sanity cap")),
+            "an oversized compressed_len must be Malformed, not Truncated -- a Truncated result \
+             here would be indistinguishable from a genuine clean end-of-file to a caller like \
+             `DiskQueue::read_record_at`'s `walk_segment`, silently discarding every record after \
+             it instead of resyncing"
+        );
     }
 }

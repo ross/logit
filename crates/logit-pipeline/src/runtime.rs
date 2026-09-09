@@ -10,7 +10,9 @@
 use crate::fanout::{Delivered, TraceContext};
 use crate::graph::Graph;
 use crate::output::{classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fault};
+#[cfg(test)]
 use crate::queue::{SinkQueue, SinkQueueConfig};
+use crate::queue::{SinkStore, SinkStoreConfig};
 use crate::{Fanout, Input, InputRuntimeConfig, Output, Transform};
 use anyhow::Context;
 use logit_core::{Diagnostics, EventBatch, Resource, SpanKind, Telemetry};
@@ -47,15 +49,15 @@ pub enum NodeSpec {
     /// 0013's original behaviour) for a listener with no `receive:` block; a test can pass a
     /// short grace to keep a shutdown test fast.
     Input(Box<dyn Input + Send>, InputRuntimeConfig),
-    /// The sink's own `SinkQueue` bounds/overflow policy (see `queue.rs`) plus its retry
-    /// budget and shutdown grace (see `RetryConfig`/`WriteLoopConfig`). Production call sites
-    /// (`logit-cli::pipeline::build_spec`) build these from the component's own
+    /// The sink's own queue -- in memory or disk-backed (see `queue.rs`'s `SinkStoreConfig`) --
+    /// plus its retry budget and shutdown grace (see `RetryConfig`/`WriteLoopConfig`). Production
+    /// call sites (`logit-cli::pipeline::build_spec`) build these from the component's own
     /// `logit_config::BufferConfig` (`queue_config`/`write_config` there), defaulting to
-    /// `SinkQueueConfig::default()`/`WriteLoopConfig::default()` only when a config omits its
-    /// `buffer:` block; a test can pass whatever config it needs to exercise (e.g. a tiny
-    /// `max_batches` to force overflow behavior deterministically, or a short `total_budget`/
-    /// `shutdown_grace` to keep a retry/shutdown test fast).
-    Output(Box<dyn Output + Send>, SinkQueueConfig, WriteLoopConfig),
+    /// `SinkStoreConfig::Memory(SinkQueueConfig::default())`/`WriteLoopConfig::default()` only
+    /// when a config omits its `buffer:` block; a test can pass whatever config it needs to
+    /// exercise (e.g. a tiny `max_batches` to force overflow behavior deterministically, or a
+    /// short `total_budget`/`shutdown_grace` to keep a retry/shutdown test fast).
+    Output(Box<dyn Output + Send>, SinkStoreConfig, WriteLoopConfig),
     Transform(Box<dyn Transform + Send>),
     /// Built here, not by the caller: `ScriptWorker` is `!Send` (`docs/design/lua-api.md`'s
     /// concurrency section), so it can't be constructed anywhere but the dedicated thread it
@@ -160,13 +162,13 @@ pub async fn run_with_telemetry(
                     input_config.shutdown_grace,
                 ));
             }
-            NodeSpec::Output(output, queue_config, write_config) => {
+            NodeSpec::Output(output, store_config, write_config) => {
                 tasks.spawn(run_output(
                     id,
                     output,
                     inbox,
                     node_telemetry,
-                    queue_config,
+                    store_config,
                     write_config,
                     shutdown_rx.clone(),
                 ));
@@ -298,23 +300,30 @@ async fn run_output(
     mut output: Box<dyn Output + Send>,
     mut inbox: mpsc::Receiver<Delivered>,
     telemetry: Telemetry,
-    queue_config: SinkQueueConfig,
+    store_config: SinkStoreConfig,
     write_config: WriteLoopConfig,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let queue = Arc::new(SinkQueue::new(queue_config, telemetry.clone()));
     let diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
+    // A `Disk` store's `SinkStore::open` does real I/O (opening or recovering a spool directory)
+    // and can fail -- a bad path, a permissions error, another process already holding the lock
+    // (`crate::disk_queue::DiskQueue`'s own doc comment) -- which is a startup error for this
+    // component, exactly like a bad `Output` constructor would be.
+    let store = Arc::new(
+        SinkStore::open(store_config, telemetry.clone(), diag.clone())
+            .with_context(|| format!("component '{id}'"))?,
+    );
 
     // `inbox` is now owned by *this* function, not moved into `drain_inbox` -- `drain_inbox`
     // only ever borrows it (`&mut inbox`). This is what makes the abandoned-inbox accounting
     // below possible: dropping a future that merely borrowed `inbox` releases the borrow without
     // touching the channel itself, so whatever `drain_inbox` never got around to `recv()`-ing
     // stays right where it was, in `inbox`'s own buffer, for this function to still see and count.
-    let mut drain = Box::pin(drain_inbox(&mut inbox, Arc::clone(&queue), telemetry.clone()));
+    let mut drain = Box::pin(drain_inbox(&mut inbox, Arc::clone(&store), telemetry.clone()));
     let mut write = Box::pin(write_loop(
         id.clone(),
         output.as_mut(),
-        Arc::clone(&queue),
+        Arc::clone(&store),
         telemetry.clone(),
         write_config,
         shutdown,
@@ -363,55 +372,86 @@ async fn run_output(
 
     // Only now, with `write` finished (and dropped) and `drain` either already finished or about
     // to be dropped (never polled again once this local variable goes out of scope), can nothing
-    // further be pushed into `queue` -- so this snapshot is genuinely final. See
+    // further be pushed into `store` -- so this snapshot is genuinely final. See
     // `finish_and_flush`.
     drop(drain);
+
+    // F3: close `store` right here, before the abandoned-inbox sweep below ever calls
+    // `store.push`. This makes "nothing will ever push into this store again" a true statement at
+    // exactly this point -- mirroring what `drain_inbox` itself would have done on its own
+    // close-on-exit path (see its own doc comment) had it not been abandoned mid-flight instead.
+    // Without this, the sweep's `store.push(...).await` below could await `not_full` forever under
+    // `overflow: block` against a full disk spool -- nothing left running would ever notify it.
+    // `DiskQueue::push` already has a `self.closed()` check that short-circuits its overflow
+    // policy to accept the push unconditionally (over-bound) rather than blocking once closed --
+    // the identical escape hatch `crate::queue::BoundedQueue::close`'s own doc comment already
+    // documents for the in-memory case ("never panic, never hang"). So the sweep still drops
+    // nothing (preserving `SinkStore::finish`'s documented "a disk-backed sink drops nothing at
+    // shutdown" contract) -- it just may briefly exceed `disk.max_bytes`, bounded by the channel's
+    // fixed capacity and reclaimed on the next `open`. The `Memory` store path is unaffected: its
+    // sweep push is already gated on `matches!(store.as_ref(), SinkStore::Disk(_))` below, and
+    // `SinkStore::finish`'s in-memory drain uses `commit()`, which doesn't consult `closed`.
+    store.close();
 
     // A `drain` abandoned mid-flight (the `write`-finishes-first case above) may leave batches
     // sitting in `inbox`'s own buffer -- accepted by the channel but never `recv()`-ed, since
     // `drain_inbox`'s loop never got back around to pulling them out before this function stopped
-    // polling it. Those batches never reached `queue` at all, so `finish_and_flush` below (which
-    // only ever sees what's *in* `queue`) cannot count them; without this sweep they would vanish
-    // with no `batches.dropped` count and no diagnostic, unlike every other drop path this
-    // workstream instruments. `try_recv` is non-blocking and exits as soon as `inbox` reports
-    // empty (or disconnected, the ordinary case when `drain` already ran `inbox` dry on its own),
-    // so this never waits for a sender that may never come.
+    // polling it. Those batches never reached `store` at all, so `finish_and_flush` below (which
+    // only ever sees what's *in* `store`) cannot count or persist them. A `Disk` store still has
+    // room for them -- they were never delivered, so appending them is exactly what "drops
+    // nothing at shutdown" (`crate::queue::SinkStore::finish`'s own doc comment) requires; a
+    // `Memory` store still counts and diagnoses them, as before, since nothing about them
+    // survives this process exiting either way. `try_recv` is non-blocking and exits as soon as
+    // `inbox` reports empty (or disconnected, the ordinary case when `drain` already ran `inbox`
+    // dry on its own), so this never waits for a sender that may never come.
     let mut abandoned_batches: u64 = 0;
     let mut abandoned_events: u64 = 0;
     while let Ok(delivered) = inbox.try_recv() {
+        let ctx = delivered.context();
         let batch = unwrap_batch_arc(delivered);
         abandoned_batches += 1;
         abandoned_events += batch.events.len() as u64;
+        if matches!(store.as_ref(), SinkStore::Disk(_)) {
+            store.push((batch, ctx)).await;
+        }
     }
     if abandoned_batches > 0 {
-        telemetry.count(
-            "logit.component.batches.dropped",
-            abandoned_batches as f64,
-            &[("reason", "shutdown")],
-        );
-        telemetry.count(
-            "logit.component.events.dropped",
-            abandoned_events as f64,
-            &[("reason", "shutdown")],
-        );
-        diag.warn(format_args!(
-            "{abandoned_batches} batch(es) ({abandoned_events} event(s)) still in this sink's \
-             inbox, never handed to its delivery queue, when this sink stopped"
-        ));
+        if matches!(store.as_ref(), SinkStore::Disk(_)) {
+            diag.warn(format_args!(
+                "{abandoned_batches} batch(es) ({abandoned_events} event(s)) still in this \
+                 sink's inbox when it stopped -- appended to its disk spool instead of being \
+                 dropped"
+            ));
+        } else {
+            telemetry.count(
+                "logit.component.batches.dropped",
+                abandoned_batches as f64,
+                &[("reason", "shutdown")],
+            );
+            telemetry.count(
+                "logit.component.events.dropped",
+                abandoned_events as f64,
+                &[("reason", "shutdown")],
+            );
+            diag.warn(format_args!(
+                "{abandoned_batches} batch(es) ({abandoned_events} event(s)) still in this \
+                 sink's inbox, never handed to its delivery queue, when this sink stopped"
+            ));
+        }
     }
 
-    finish_and_flush(&diag, &queue, &telemetry, output.as_mut()).await;
+    finish_and_flush(&diag, &store, &telemetry, output.as_mut()).await;
 
     write_result
 }
 
-/// Moves every `Delivered` batch off `inbox` into `queue`, as fast as `queue.push` (governed by
+/// Moves every `Delivered` batch off `inbox` into `store`, as fast as `store.push` (governed by
 /// its own bounds/overflow policy) allows -- entirely independent of how long `write_loop`'s
 /// current delivery attempt is taking. `Delivered::Owned` costs one `Arc::new` here (previously
 /// zero on this path -- a real, measured, and accepted cost, see
 /// `crates/logit-bench/tests/allocations.rs` and `docs/design/memory.md`); `Delivered::Shared` is
-/// already an `Arc`, so this is just a move, no clone. Closes `queue` once `inbox` itself closes,
-/// which is what lets `write_loop`'s `queue.peek()` loop discover "closed and empty" and return --
+/// already an `Arc`, so this is just a move, no clone. Closes `store` once `inbox` itself closes,
+/// which is what lets `write_loop`'s `store.peek()` loop discover "closed and empty" and return --
 /// no separate close-detection logic needed on that side.
 ///
 /// Takes `&mut inbox`, not an owned receiver -- `run_output` retains ownership specifically so
@@ -425,20 +465,20 @@ async fn run_output(
 /// see `crates/logit-bench/tests/allocations.rs`.
 pub async fn drain_inbox(
     inbox: &mut mpsc::Receiver<Delivered>,
-    queue: Arc<SinkQueue>,
+    store: Arc<SinkStore>,
     telemetry: Telemetry,
 ) {
     while let Some(delivered) = inbox.recv().await {
-        // Read before `unwrap_batch_arc` consumes `delivered` -- `SinkQueue` now carries this
-        // context alongside the batch (`queue.rs`'s own doc comment) specifically so
-        // `write_loop`'s sink span can be parented on it once `peek` reads it back.
+        // Read before `unwrap_batch_arc` consumes `delivered` -- the store carries this context
+        // alongside the batch (`queue.rs`'s own doc comment) specifically so `write_loop`'s sink
+        // span can be parented on it once `peek` reads it back.
         let ctx = delivered.context();
         let batch = unwrap_batch_arc(delivered);
         telemetry.count("logit.component.batches.received", 1.0, &[]);
         telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
-        queue.push((batch, ctx)).await;
+        store.push((batch, ctx)).await;
     }
-    queue.close();
+    store.close();
 }
 
 /// Shared by [`drain_inbox`] and `run_output`'s abandoned-inbox sweep: `Delivered::Owned` costs
@@ -641,15 +681,15 @@ async fn shutdown_grace_expired(
     tokio::time::sleep_until(deadline.expect("just set above if it was None")).await;
 }
 
-/// Commits (drops) whatever `queue` still holds, counting and logging anything found, then
+/// Finalizes whatever `store` still holds, counting and logging anything actually dropped, then
 /// flushes `output` exactly once -- called from `run_output` only, only after nothing can push
-/// into `queue` any more (`drain_inbox` has either already finished naturally or been dropped).
+/// into `store` any more (`drain_inbox` has either already finished naturally or been dropped).
 ///
 /// **This must not run from inside `write_loop`.** An earlier version did exactly that, on
 /// shutdown-grace expiry: it drained the queue to empty, then `await`ed `output.flush()` -- but
-/// `queue.commit()` wakes any producer blocked on `not_full`, so a concurrent `drain_inbox` could
-/// push a *new* batch into the queue while `flush()` was still pending, land uncounted (this
-/// function had already seen the queue go empty and moved on), and then get silently dropped when
+/// committing wakes any producer blocked on `not_full`, so a concurrent `drain_inbox` could push
+/// a *new* batch into the queue while `flush()` was still pending, land uncounted (this function
+/// had already seen the queue go empty and moved on), and then get silently dropped when
 /// `write_loop` returned and `run_output`'s `select!` cancelled `drain_inbox` -- no delivery, no
 /// `reason="shutdown"` accounting, nothing. Running this only after `run_output` has already
 /// ensured `drain_inbox` can push no more closes that gap: there is no longer any window between
@@ -659,20 +699,19 @@ async fn shutdown_grace_expired(
 /// shutdown: `run_output` calls this unconditionally after `write_loop` returns, whether that was
 /// via the queue draining to closed-and-empty on its own, a fatal error, or shutdown grace
 /// expiring -- `Output::flush`'s own contract ("called once after the last batch") doesn't carve
-/// out an exception for the happy path, so this doesn't either. In the ordinary case the queue is
-/// already empty here, so `dropped_batches` stays `0` and nothing but `flush()` itself happens.
+/// out an exception for the happy path, so this doesn't either.
+///
+/// `store.finish()` (`crate::queue::SinkStore::finish`) sources the counts: for `Memory`, exactly
+/// today's drain-to-empty loop; for `Disk`, always `(0, 0)` -- a disk-backed sink persists and
+/// keeps everything still queued rather than dropping it, so this block below simply never fires
+/// for one.
 async fn finish_and_flush(
     diag: &Diagnostics,
-    queue: &SinkQueue,
+    store: &SinkStore,
     telemetry: &Telemetry,
     output: &mut (dyn Output + Send),
 ) {
-    let mut dropped_batches: u64 = 0;
-    let mut dropped_events: u64 = 0;
-    while let Some((batch, _ctx)) = queue.commit() {
-        dropped_batches += 1;
-        dropped_events += batch.events.len() as u64;
-    }
+    let (dropped_batches, dropped_events) = store.finish().await;
     if dropped_batches > 0 {
         telemetry.count(
             "logit.component.batches.dropped",
@@ -700,8 +739,8 @@ async fn finish_and_flush(
     }
 }
 
-/// Delivers from `queue`'s head, one batch at a time, until `queue.peek()` returns `None` (closed
-/// and empty -- see [`SinkQueue::peek`]) or shutdown grace expires. Per batch: attempt delivery via
+/// Delivers from `store`'s head, one batch at a time, until `store.peek()` returns `None` (closed
+/// and empty) or shutdown grace expires. Per batch: attempt delivery via
 /// [`deliver_with_retry`], per the posture resolved from `write_config.delivery_override` (config,
 /// workstream F) falling back to `output.duplicate_safe()`'s derived default
 /// (`docs/adr/buffered-sink-delivery.md`). On success, commit and reset the permanent-failure
@@ -727,7 +766,7 @@ async fn finish_and_flush(
 async fn write_loop(
     id: String,
     output: &mut (dyn Output + Send),
-    queue: Arc<SinkQueue>,
+    store: Arc<SinkStore>,
     telemetry: Telemetry,
     write_config: WriteLoopConfig,
     mut shutdown: watch::Receiver<bool>,
@@ -754,7 +793,7 @@ async fn write_loop(
             ShutdownExpired,
         }
         let next = tokio::select! {
-            batch = queue.peek() => match batch {
+            batch = store.peek() => match batch {
                 Some((batch, ctx)) => NextBatch::Batch(batch, ctx),
                 None => NextBatch::Closed,
             },
@@ -803,12 +842,12 @@ async fn write_loop(
 
         match outcome {
             Delivery::Delivered => {
-                queue.commit();
+                store.commit();
                 last_success = Some(tokio::time::Instant::now());
                 permanent_streak_since = None;
             }
             Delivery::Dropped { fault, explicit_permanent } => {
-                queue.commit();
+                store.commit();
                 span.error();
                 span.tag("fault", fault_tag(fault));
                 telemetry.count(
@@ -1492,7 +1531,7 @@ mod tests {
             "out".to_string(),
             NodeSpec::Output(
                 Box::new(RecordingOutput { tx: result_tx }),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -1579,7 +1618,7 @@ mod tests {
             "out".to_string(),
             NodeSpec::Output(
                 Box::new(RecordingOutput { tx: result_tx }),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -1746,7 +1785,7 @@ mod tests {
             "sink_a".to_string(),
             NodeSpec::Output(
                 Box::new(RecordingOutput { tx: tx_a }),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -1754,7 +1793,7 @@ mod tests {
             "sink_b".to_string(),
             NodeSpec::Output(
                 Box::new(RecordingOutput { tx: tx_b }),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -1917,7 +1956,7 @@ mod tests {
             "out".to_string(),
             NodeSpec::Output(
                 Box::new(RecordingOutput { tx: result_tx }),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -2261,7 +2300,7 @@ mod tests {
             "out".to_string(),
             NodeSpec::Output(
                 Box::new(RecordingOutput { tx: result_tx }),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -2373,7 +2412,7 @@ mod tests {
             "out".to_string(),
             NodeSpec::Output(
                 Box::new(RecordingOutput { tx: result_tx }),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -2495,7 +2534,7 @@ mod tests {
             "out".to_string(),
             NodeSpec::Output(
                 Box::new(RecordingOutput { tx: result_tx }),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -2603,7 +2642,7 @@ mod tests {
             "out".to_string(),
             NodeSpec::Output(
                 Box::new(RecordingOutput { tx: result_tx }),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -2697,7 +2736,7 @@ mod tests {
             "out".to_string(),
             NodeSpec::Output(
                 Box::new(RecordingOutput { tx: result_tx }),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -2791,7 +2830,7 @@ mod tests {
             "out".to_string(),
             NodeSpec::Output(
                 Box::new(RecordingOutput { tx: result_tx }),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -3000,11 +3039,11 @@ mod tests {
             "out".to_string(),
             NodeSpec::Output(
                 Box::new(SlowOutput { gate: gate.clone(), delivered: delivered_tx }),
-                SinkQueueConfig {
+                SinkStoreConfig::Memory(SinkQueueConfig {
                     max_batches: 100,
                     max_bytes: u64::MAX,
                     overflow: OverflowPolicy::Block,
-                },
+                }),
                 WriteLoopConfig::default(),
             ),
         );
@@ -3100,7 +3139,7 @@ mod tests {
             "out".to_string(),
             NodeSpec::Output(
                 Box::new(FailingOutput),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -3160,7 +3199,7 @@ mod tests {
             "out".to_string(),
             NodeSpec::Output(
                 Box::new(FailingOutput),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -3222,7 +3261,7 @@ mod tests {
             "out".to_string(),
             NodeSpec::Output(
                 Box::new(RecordingOutput { tx: result_tx }),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -3339,11 +3378,14 @@ mod tests {
         retry: RetryConfig,
     ) -> anyhow::Result<()> {
         let telemetry = Telemetry::default();
-        let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
+        let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+            SinkQueueConfig::default(),
+            telemetry.clone(),
+        )));
         for batch in batches {
-            queue.push((batch, TraceContext::default())).await;
+            store.push((batch, TraceContext::default())).await;
         }
-        queue.close();
+        store.close();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let write_config = WriteLoopConfig {
             retry,
@@ -3352,7 +3394,7 @@ mod tests {
         };
         tokio::time::timeout(
             Duration::from_secs(5),
-            write_loop("out".to_string(), &mut output, queue, telemetry, write_config, shutdown_rx),
+            write_loop("out".to_string(), &mut output, store, telemetry, write_config, shutdown_rx),
         )
         .await
         .expect("write_loop should not hang")
@@ -3490,12 +3532,15 @@ mod tests {
     async fn sustained_permanent_failures_end_write_loop_once_the_failure_window_elapses() {
         let (output, mut handles) = faulty_output(Fault::Permanent, u32::MAX, false);
         let telemetry = Telemetry::default();
-        let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
+        let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+            SinkQueueConfig::default(),
+            telemetry.clone(),
+        )));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        queue.push((one_event_batch(1.0), TraceContext::default())).await;
+        store.push((one_event_batch(1.0), TraceContext::default())).await;
 
-        let queue_for_task = Arc::clone(&queue);
+        let store_for_task = Arc::clone(&store);
         // `write_loop` borrows `output` (it no longer owns it -- `run_output` does, normally);
         // `tokio::spawn` needs a `'static` future, so `output` moves into this async block and
         // the `&mut` borrow it passes to `write_loop` lives entirely inside that block's own
@@ -3505,7 +3550,7 @@ mod tests {
             write_loop(
                 "out".to_string(),
                 &mut output,
-                queue_for_task,
+                store_for_task,
                 telemetry,
                 WriteLoopConfig::default(),
                 shutdown_rx,
@@ -3520,8 +3565,8 @@ mod tests {
         // above documents.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW).await;
 
-        queue.push((one_event_batch(2.0), TraceContext::default())).await;
-        queue.close();
+        store.push((one_event_batch(2.0), TraceContext::default())).await;
+        store.close();
 
         let result = tokio::time::timeout(Duration::from_secs(5), handle)
             .await
@@ -3567,7 +3612,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_success_inside_the_window_resets_the_permanent_failure_streak() {
         let telemetry = Telemetry::default();
-        let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
+        let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+            SinkQueueConfig::default(),
+            telemetry.clone(),
+        )));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let (attempted_tx, mut attempted_rx) = mpsc::unbounded_channel();
         let output = ScriptedOutput {
@@ -3577,15 +3625,15 @@ mod tests {
         };
 
         // attempt 1: Permanent -- sets streak_since
-        queue.push((one_event_batch(1.0), TraceContext::default())).await;
+        store.push((one_event_batch(1.0), TraceContext::default())).await;
 
-        let queue_for_task = Arc::clone(&queue);
+        let store_for_task = Arc::clone(&store);
         let handle = tokio::spawn(async move {
             let mut output = output;
             write_loop(
                 "out".to_string(),
                 &mut output,
-                queue_for_task,
+                store_for_task,
                 telemetry,
                 WriteLoopConfig::default(),
                 shutdown_rx,
@@ -3598,13 +3646,13 @@ mod tests {
         // reset the streak before the window is ever checked again.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
         // attempt 2: success -- resets the streak
-        queue.push((one_event_batch(2.0), TraceContext::default())).await;
+        store.push((one_event_batch(2.0), TraceContext::default())).await;
         attempted_rx.recv().await.expect("attempt 2 (succeeding) should have happened");
 
         // attempt 3: Permanent again -- a fresh streak
-        queue.push((one_event_batch(3.0), TraceContext::default())).await;
+        store.push((one_event_batch(3.0), TraceContext::default())).await;
         attempted_rx.recv().await.expect("attempt 3 (failing again) should have happened");
-        queue.close();
+        store.close();
 
         let result = tokio::time::timeout(Duration::from_secs(5), handle)
             .await
@@ -3641,19 +3689,22 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_unclassified_error_never_trips_the_permanent_failure_window() {
         let telemetry = Telemetry::default();
-        let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
+        let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+            SinkQueueConfig::default(),
+            telemetry.clone(),
+        )));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let (attempted_tx, mut attempted_rx) = mpsc::unbounded_channel();
         let output = AlwaysUnclassifiedFailure { attempted: attempted_tx };
 
-        queue.push((one_event_batch(1.0), TraceContext::default())).await;
-        let queue_for_task = Arc::clone(&queue);
+        store.push((one_event_batch(1.0), TraceContext::default())).await;
+        let store_for_task = Arc::clone(&store);
         let handle = tokio::spawn(async move {
             let mut output = output;
             write_loop(
                 "out".to_string(),
                 &mut output,
-                queue_for_task,
+                store_for_task,
                 telemetry,
                 WriteLoopConfig::default(),
                 shutdown_rx,
@@ -3664,9 +3715,9 @@ mod tests {
 
         // Well past the window, with nothing but this unclassified failure the whole time.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
-        queue.push((one_event_batch(2.0), TraceContext::default())).await;
+        store.push((one_event_batch(2.0), TraceContext::default())).await;
         attempted_rx.recv().await.expect("a later attempt should have happened");
-        queue.close();
+        store.close();
 
         let result = tokio::time::timeout(Duration::from_secs(5), handle)
             .await
@@ -3715,7 +3766,10 @@ mod tests {
     async fn a_budget_exhausted_ambiguous_drop_resets_the_permanent_failure_streak_like_success_does(
     ) {
         let telemetry = Telemetry::default();
-        let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
+        let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+            SinkQueueConfig::default(),
+            telemetry.clone(),
+        )));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let (attempted_tx, mut attempted_rx) = mpsc::unbounded_channel();
         let output = FaultByBatchValue { attempted: attempted_tx };
@@ -3731,14 +3785,14 @@ mod tests {
         };
 
         // Permanent -- sets streak_since
-        queue.push((one_event_batch(1.0), TraceContext::default())).await;
-        let queue_for_task = Arc::clone(&queue);
+        store.push((one_event_batch(1.0), TraceContext::default())).await;
+        let store_for_task = Arc::clone(&store);
         let handle = tokio::spawn(async move {
             let mut output = output;
             write_loop(
                 "out".to_string(),
                 &mut output,
-                queue_for_task,
+                store_for_task,
                 telemetry,
                 write_config,
                 shutdown_rx,
@@ -3754,14 +3808,14 @@ mod tests {
         // retry loop has already given up and committed batch 2 before batch 3 is pushed --
         // simpler and less brittle than trying to count exactly how many retries it took.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
-        queue.push((one_event_batch(2.0), TraceContext::default())).await;
+        store.push((one_event_batch(2.0), TraceContext::default())).await;
         attempted_rx.recv().await.expect("batch 2's first attempt should have happened");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Permanent again -- must be a fresh streak
-        queue.push((one_event_batch(3.0), TraceContext::default())).await;
+        store.push((one_event_batch(3.0), TraceContext::default())).await;
         attempted_rx.recv().await.expect("attempt 3 (Permanent) should have happened");
-        queue.close();
+        store.close();
 
         let result = tokio::time::timeout(Duration::from_secs(5), handle)
             .await
@@ -3783,10 +3837,13 @@ mod tests {
         let (mut output, _handles) = faulty_output(Fault::Clean, u32::MAX, false);
 
         let telemetry = Telemetry::default();
-        let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
-        queue.push((one_event_batch(1.0), TraceContext::default())).await;
+        let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+            SinkQueueConfig::default(),
+            telemetry.clone(),
+        )));
+        store.push((one_event_batch(1.0), TraceContext::default())).await;
         // Deliberately left open (not closed) -- shutdown grace must cut delivery off even while
-        // the queue could still receive more, not just once it's known to be exhausted.
+        // the store could still receive more, not just once it's known to be exhausted.
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let write_config = WriteLoopConfig {
@@ -3798,12 +3855,12 @@ mod tests {
             shutdown_grace: Duration::from_millis(500),
             delivery_override: None,
         };
-        let queue_for_task = Arc::clone(&queue);
+        let store_for_task = Arc::clone(&store);
         let handle = tokio::spawn(async move {
             write_loop(
                 "out".to_string(),
                 &mut output,
-                queue_for_task,
+                store_for_task,
                 telemetry,
                 write_config,
                 shutdown_rx,
@@ -3828,7 +3885,7 @@ mod tests {
         // Confirm the batch is still exactly where write_loop left it: untouched, not silently
         // dropped by write_loop itself.
         assert!(
-            queue.commit().is_some(),
+            store.commit().is_some(),
             "write_loop must leave the undelivered batch for run_output to account for, not drop it silently itself"
         );
     }
@@ -3864,7 +3921,7 @@ mod tests {
             Box::new(output),
             inbox_rx,
             Telemetry::default(),
-            SinkQueueConfig::default(),
+            SinkStoreConfig::Memory(SinkQueueConfig::default()),
             write_config,
             shutdown_rx,
         ));
@@ -3946,11 +4003,11 @@ mod tests {
             shutdown_grace: Duration::from_millis(100),
             delivery_override: None,
         };
-        let queue_config = SinkQueueConfig {
+        let store_config = SinkStoreConfig::Memory(SinkQueueConfig {
             max_batches: 1,
             max_bytes: u64::MAX,
             overflow: OverflowPolicy::Block,
-        };
+        });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let registry = Registry::new();
@@ -3961,7 +4018,7 @@ mod tests {
             Box::new(output),
             inbox_rx,
             telemetry,
-            queue_config,
+            store_config,
             write_config,
             shutdown_rx,
         ));
@@ -4042,6 +4099,172 @@ mod tests {
              an abandoned in-flight `queue.push()`, is a separate, narrower residual gap this fix \
              does not close, and is deliberately not counted here either.)"
         );
+    }
+
+    fn counter_value_of(batch: &EventBatch) -> f64 {
+        match batch.events[0].metrics.iter().next().map(|m| &m.kind) {
+            Some(MetricKind::Counter(v)) => *v,
+            other => panic!("expected exactly one counter metric, got {other:?}"),
+        }
+    }
+
+    /// F3: the shutdown sweep in `run_output` (the `while let Ok(delivered) = inbox.try_recv() {
+    /// ... store.push(...).await ... }` block right after `drop(drain)`) used to run against a
+    /// store that was never closed. Under `overflow: block` with a full disk spool, `store.push`
+    /// awaits `not_full`, which nothing could ever notify again -- a permanent hang. Modelled
+    /// directly on `a_batch_still_sitting_in_the_inbox_when_write_loop_gives_up_is_counted_not_silently_lost`
+    /// above (the in-memory version of this same shutdown-sweep scenario), but with a one-record
+    /// disk spool standing in for the in-memory queue's `max_batches: 1`.
+    #[tokio::test]
+    async fn a_disk_backed_sinks_shutdown_sweep_does_not_hang_pushing_into_a_full_spool() {
+        let dir = crate::disk_queue::test_support::scratch_dir("shutdown-sweep-full-spool");
+
+        let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
+        let (output, mut handles) = faulty_output(Fault::Clean, u32::MAX, false);
+        let write_config = WriteLoopConfig {
+            retry: RetryConfig {
+                total_budget: Duration::from_secs(3600),
+                base_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(10),
+            },
+            shutdown_grace: Duration::from_millis(100),
+            delivery_override: None,
+        };
+
+        // Every counter-metric batch this test pushes encodes to the same length (`write_f64_kind`
+        // is fixed-width), regardless of its value -- so this one measurement sizes the spool to
+        // admit exactly one record.
+        let sample_batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            events: vec![counter_event("hits", 0.0)],
+        };
+        let one_record_len = crate::disk_queue::test_support::encoded_record_len(&sample_batch);
+
+        let store_config = SinkStoreConfig::Disk(crate::disk_queue::DiskQueueConfig {
+            dir: dir.clone(),
+            max_bytes: one_record_len,
+            segment_bytes: one_record_len * 10, // no rotation needed for this scenario
+            overflow: OverflowPolicy::Block,
+            compression: logit_proto::frame::Compression::None,
+            checkpoint_interval: Duration::from_secs(3600),
+        });
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
+
+        let run = tokio::spawn(run_output(
+            "out".to_string(),
+            Box::new(output),
+            inbox_rx,
+            telemetry,
+            store_config,
+            write_config,
+            shutdown_rx,
+        ));
+
+        // Batch 1: drains into the spool (filling its one-record capacity), then peeked -- and so
+        // reserved -- by write_loop's endless-failure retry loop.
+        inbox_tx
+            .send(Delivered::Owned(
+                EventBatch {
+                    resource: Arc::new(Resource::default()),
+                    events: vec![counter_event("hits", 1.0)],
+                },
+                TraceContext::new_root(),
+            ))
+            .await
+            .expect("receiver should still be alive");
+        handles.attempted.recv().await.expect("the first attempt should have happened");
+
+        // Batch 2: drain_inbox receives it, then blocks forever inside `queue.push` -- the spool
+        // is full (room for exactly one record) and that one slot is reserved, so under `Block`
+        // there is nothing a concurrent commit could ever free. Same residual gap
+        // the in-memory version of this test already names in its own comment.
+        inbox_tx
+            .send(Delivered::Owned(
+                EventBatch {
+                    resource: Arc::new(Resource::default()),
+                    events: vec![counter_event("hits", 2.0)],
+                },
+                TraceContext::new_root(),
+            ))
+            .await
+            .expect("receiver should still be alive");
+        // Let drain_inbox actually reach and block on that push before sending batch 3.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Batch 3: drain_inbox is already stuck on batch 2's push, so this one can only ever sit
+        // in `inbox`'s own channel buffer, genuinely un-`recv()`-ed -- exactly the case this fix
+        // targets.
+        inbox_tx
+            .send(Delivered::Owned(
+                EventBatch {
+                    resource: Arc::new(Resource::default()),
+                    events: vec![counter_event("hits", 3.0)],
+                },
+                TraceContext::new_root(),
+            ))
+            .await
+            .expect("receiver should still be alive");
+
+        shutdown_tx.send(true).expect("receiver should still be alive");
+        drop(inbox_tx);
+
+        // Pre-fix: this times out -- the abandoned-inbox sweep hangs forever trying to push batch
+        // 3 into a still-open, still-full spool.
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run_output should not hang")
+            .expect("task should not panic")
+            .expect("shutdown-grace expiry should end run_output with Ok, not Err");
+
+        let dropped_for_shutdown: f64 = registry
+            .drain(0)
+            .iter()
+            .filter(|e| e.attributes.get("component").and_then(|v| v.as_str()) == Some("out"))
+            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("shutdown"))
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| logit_core::interner::resolve(m.name) == "logit.component.batches.dropped")
+            .filter_map(|m| match &m.kind {
+                MetricKind::Counter(v) => Some(*v),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(
+            dropped_for_shutdown, 0.0,
+            "a disk-backed sink drops nothing at shutdown -- everything still queued at shutdown \
+             must survive, not be counted dropped"
+        );
+
+        // Reopen a fresh DiskQueue on the same directory: batches 1 and 3 should both still be
+        // present, in FIFO order -- proving the fix stops the sweep from hanging without silently
+        // dropping anything. (Batch 2 was never drained out of the inbox channel at all -- the
+        // same narrower residual gap named above, not something this fix closes, so it is not
+        // expected to be here.)
+        let reopened = crate::disk_queue::DiskQueue::open(
+            crate::disk_queue::DiskQueueConfig {
+                dir: dir.clone(),
+                max_bytes: u64::MAX,
+                segment_bytes: one_record_len * 10,
+                overflow: OverflowPolicy::Block,
+                compression: logit_proto::frame::Compression::None,
+                checkpoint_interval: Duration::from_secs(3600),
+            },
+            logit_core::Telemetry::default(),
+            Diagnostics::new("test"),
+        )
+        .unwrap();
+        let (first, _) = reopened.peek().await.expect("batch 1 should still be present");
+        assert_eq!(counter_value_of(&first), 1.0);
+        reopened.commit().unwrap();
+        let (third, _) = reopened.peek().await.expect("batch 3 should still be present");
+        assert_eq!(counter_value_of(&third), 3.0);
+        reopened.commit().unwrap();
+        reopened.close();
+        assert!(reopened.peek().await.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // -----------------------------------------------------------------------------------------
@@ -4141,7 +4364,7 @@ mod tests {
             "bad".to_string(),
             NodeSpec::Output(
                 Box::new(bad_output),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 WriteLoopConfig::default(),
             ),
         );
@@ -4153,11 +4376,11 @@ mod tests {
             "good".to_string(),
             NodeSpec::Output(
                 Box::new(SlowOutput { gate: gate.clone(), delivered: delivered_tx }),
-                SinkQueueConfig {
+                SinkStoreConfig::Memory(SinkQueueConfig {
                     max_batches: 100,
                     max_bytes: u64::MAX,
                     overflow: OverflowPolicy::Block,
-                },
+                }),
                 // Generous shutdown grace AND retry budget: this test deliberately holds "good"'s
                 // gate shut past bad's own PERMANENT_FAILURE_WINDOW trip (60s+), and every attempt
                 // is now raced against its own retry budget (`deliver_with_retry`'s "impossible to
@@ -4362,7 +4585,7 @@ mod tests {
                     delay: PERMANENT_FAILURE_WINDOW,
                     calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 }),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 generous_grace,
             ),
         );
@@ -4377,7 +4600,7 @@ mod tests {
                     delay: PERMANENT_FAILURE_WINDOW + Duration::from_secs(1),
                     calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 }),
-                SinkQueueConfig::default(),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 generous_grace,
             ),
         );
@@ -4686,15 +4909,18 @@ mod tests {
         let registry = Registry::with_span_sampling(1.0);
         let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
         let (mut output, _handles) = faulty_output(Fault::Permanent, u32::MAX, false);
-        let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
-        queue.push((one_event_batch(1.0), TraceContext::new_root())).await;
-        queue.close();
+        let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+            SinkQueueConfig::default(),
+            telemetry.clone(),
+        )));
+        store.push((one_event_batch(1.0), TraceContext::new_root())).await;
+        store.close();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         write_loop(
             "out".to_string(),
             &mut output,
-            queue,
+            store,
             telemetry.clone(),
             WriteLoopConfig { retry: fast_retry_config(), ..WriteLoopConfig::default() },
             shutdown_rx,
@@ -4718,16 +4944,19 @@ mod tests {
         let registry = Registry::with_span_sampling(1.0);
         let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
         let (mut output, _handles) = faulty_output(Fault::Clean, 0, false);
-        let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
+        let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+            SinkQueueConfig::default(),
+            telemetry.clone(),
+        )));
         let parent = TraceContext::new_root();
-        queue.push((one_event_batch(1.0), parent)).await;
-        queue.close();
+        store.push((one_event_batch(1.0), parent)).await;
+        store.close();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         write_loop(
             "out".to_string(),
             &mut output,
-            queue,
+            store,
             telemetry.clone(),
             WriteLoopConfig::default(),
             shutdown_rx,

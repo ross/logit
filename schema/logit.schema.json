@@ -29,6 +29,18 @@
             }
           ]
         },
+        "disk": {
+          "description": "Disk-backed durable buffering, opt-in (`docs/adr/disk-backed-sink-buffer.md`). `None` (the default) is today's in-memory `SinkQueue`, unchanged. `Some(_)` replaces it -- not sizes beside it -- with a disk spool at `DiskBufferConfig::path`; graph validation (`crates/logit-pipeline/src/graph.rs` rule 35) rejects `max_batches`/`max_bytes` at anything but their defaults alongside it, since disk replaces the in-memory bound rather than sharing it.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DiskBufferConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "max_batches": {
           "default": 1024,
           "type": "integer",
@@ -1142,6 +1154,7 @@
           "description": "Per-sink delivery buffer (`docs/adr/buffered-sink-delivery.md`). Meaningful only on a sink -- graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind. A sibling field of `kind`, not nested inside every sink `ComponentKind` variant, so a future fifth sink kind costs nothing extra here.",
           "default": {
             "delivery": null,
+            "disk": null,
             "max_batches": 1024,
             "max_bytes": "67108864",
             "overflow": "block",
@@ -1197,6 +1210,44 @@
         "at_least_once",
         "at_most_once"
       ]
+    },
+    "DiskBufferConfig": {
+      "description": "Disk-backed durable buffering for one sink's delivery queue -- opt-in via `buffer.disk:` (`docs/adr/disk-backed-sink-buffer.md`). Its mere presence turns disk backing on for that sink, mirroring [`TlsServerConfig`]'s \"presence is the on-switch\" precedent: `path` has no sensible default, so (like `TlsServerConfig::cert_file`/`key_file`) it stays a plain required field -- this struct deliberately carries no container-level `#[serde(default)]`, only per-field defaults on everything else, so an omitted `path` is a clear deserialize error rather than a silently empty one.",
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "checkpoint_interval": {
+          "description": "How often the read cursor is persisted during ordinary operation (also forced on segment rotation and at shutdown, regardless of this interval).",
+          "default": "1s",
+          "type": "string"
+        },
+        "compression": {
+          "description": "`logit_proto::native`'s per-frame compression, mirrored here for the same crate-layout reason [`Compression`] itself exists.",
+          "default": "none",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Compression"
+            }
+          ]
+        },
+        "max_bytes": {
+          "description": "Bound on the sum of on-disk segment sizes -- replaces `BufferConfig::max_bytes`'s role, not sized alongside it.",
+          "default": "1073741824",
+          "type": "string"
+        },
+        "path": {
+          "description": "The spool directory, resolved against the config file's own directory like every other path in this schema (`crates/logit-cli/src/pipeline.rs`). Two sinks may not share one (graph rule 35).",
+          "type": "string"
+        },
+        "segment_bytes": {
+          "description": "A soft rotation trigger, not a hard cap: the active segment rotates once it already exceeds this, so a single record larger than it still lands whole in a fresh segment.",
+          "default": "67108864",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "MatchMode": {
       "description": "`has_signal`'s matching rule. `AnyOf` forwards an event carrying at least one signal named in `signals`, untouched, even if it also carries a signal that isn't named. `Only` additionally requires the event carry nothing outside `signals` -- a mixed event that also has a signal not listed is dropped, not trimmed (`keep_signals` trims; `has_signal` never mutates an event).",
