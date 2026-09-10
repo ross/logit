@@ -496,10 +496,36 @@ already built that have a known, accepted rough edge.
   those same types, not a design decision to redo.
 - **`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
   per-message framing** — `syslog_out` needs one UDP datagram or one octet-counted TCP frame per
-  *message*, which one opaque `Bytes` per *batch* can't express, so it bypasses the trait entirely
-  (`crates/logit-outputs/src/syslog.rs`'s module doc has the full reasoning). Generalizing the
-  trait (an associated framing type, or a sink-driven push interface) is deferred until a second
-  sink needs the same thing, so it isn't designed against a single caller.
+  *message*, and `statsd_out` needs one statsd line per metric packed up to a datagram size cap,
+  neither of which one opaque `Bytes` per *batch* can express, so both bypass the trait entirely
+  (`crates/logit-outputs/src/syslog.rs`/`statsd.rs`'s module docs have the full reasoning). Two
+  sinks now independently need this shape, which is exactly the signal that was being waited for —
+  generalizing the trait (an associated framing type, or a sink-driven push interface) is still
+  deferred, but no longer for lack of a second caller to design against; it's simply not yet been
+  done.
+- **`statsd_out` only encodes `Counter`/`Gauge`/`GaugeDelta` in v1 — every `Distribution`/`Set`/
+  `Histogram`/`Summary` metric is dropped** — `ms`/`h`/`d` on the statsd wire all decode to
+  `MetricKind::Distribution` (`crates/logit-inputs/src/statsd.rs::build_event`), so a
+  `statsd_in -> aggregate -> statsd_out` relay drops every timer metric today: the single most
+  common statsd workload makes it through the input and the aggregator, then dies at this sink,
+  loudly counted (`unsupported_metric_kind`) but dropped. Not implemented because the aggregator's
+  merged `DdSketch` no longer holds the original samples it combined, so "how does a merged sketch
+  become one or more statsd lines" (one line per fixed quantile? synthesized samples at quantile
+  boundaries?) is a real design question deserving its own ADR, not a guess made while landing the
+  sink itself. See `docs/adr/statsd-output.md`.
+- **`statsd_out` has no egress timestamp, no `unit`, and no metric renaming/prefixing** — the
+  classic statsd grammar has no timestamp segment at all (and `statsd_in` would silently ignore
+  one if emitted, so it wouldn't even round-trip through this repo's own input), so every relayed
+  metric is stamped with the receiver's own receipt time, exactly like `syslog_out`'s receipt-time
+  entry above. `MetricRecord::unit` has no statsd wire representation and is dropped the same way.
+  There is also no way to rename or namespace a metric on egress anywhere in the pipeline today
+  (`docs/design/lua-api.md` notes a metric's value/fields are unexposed to Lua) — a sink-side
+  `prefix` field was considered and rejected for `statsd_out` specifically
+  (`docs/adr/statsd-output.md`'s Alternatives) in favor of a future general metric-rename
+  transform, which doesn't exist yet either.
+- **`statsd_out` has no TLS/DTLS** — plaintext UDP/TCP only, same gap as `syslog_out`'s above, and
+  the same `TlsClientConfig`/`TlsServerConfig` pair would be the config-plumbing exercise if it
+  lands.
 - **A non-UTF-8 syslog MSG is a rejected line, not a `Value::Bytes` event** — RFC 5424's `MSG-ANY`
   permits arbitrary octets, and `logit-core::Value` already has a `Bytes` variant for exactly this.
   `syslog_in` isolates UTF-8 validation to one line at a time (so one bad line no longer takes its

@@ -5,10 +5,13 @@
 //! (`docs/design/pipeline-graph.md`'s "Crate layout" section) -- see `logit-inputs`'s crate doc
 //! comment for the same reasoning.
 
+mod attrs;
 pub mod file;
 pub mod influxdb;
 pub mod logit;
+mod msgbuf;
 pub mod otlp;
+pub mod statsd;
 pub mod stdio;
 pub mod syslog;
 mod tls;
