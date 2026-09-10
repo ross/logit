@@ -526,6 +526,16 @@ Worked examples, one per shipped component:
   runtime.rs`) — its `reason` tag is imprecise for a filter, same as for `keep`/`remove`, but
   fixing that tag is out of scope here. No `Diagnostics` on any of the three — nothing about
   matching or clearing a fixed signal set can fail.
+- `has_attributes`/`drop_attributes` (`crates/logit-transforms/src/attributes.rs`): shares
+  `logit.transform.events.filtered` with the signal family above (`0.0` on the forward path
+  registers the series rather than leaving it absent; `1.0` on the drop path). No
+  `.payloads.stripped`-style counter — neither kind mutates a forwarded event. No `Diagnostics`,
+  same reasoning as `has_signal`. Deliberately **no cache-miss counter** for the resource-match
+  cache (`Matcher`, `Set::map_resource`'s `Arc::ptr_eq` idiom applied to a read): unlike `set`'s own
+  miss, which rebuilds an `AttrMap`/`Resource`/`Arc` and so is worth a rate, a miss here costs
+  nothing measurable — it only re-evaluates `AttrMap::get_sym` against the `Arc` already in hand —
+  so a counter would advertise a cost that isn't actually there. See
+  [ADR `attribute-filtering-components`](../adr/attribute-filtering-components.md).
 - `stdio_out`/`file_out` (`StreamOutput`, `crates/logit-outputs/src/stdio.rs`): both built on the
   same sink (ADR `rotating-file-output`), so both share `logit.output.batch.bytes` — direct parity
   with `influxdb_out`'s own batch-bytes metric. A write error still propagates as a hard failure

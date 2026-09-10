@@ -28,6 +28,17 @@ impl AttrMap {
         self.0.binary_search_by_key(&key, |(k, _)| *k).ok().map(|i| &self.0[i].1)
     }
 
+    /// Same as [`AttrMap::get`], but for a caller that already holds an interned [`Symbol`] --
+    /// skips both the `lookup` hash probe and the `resolve` such a caller would otherwise need to
+    /// reconstruct the `&str`. The [`AttrMap::insert_sym`] reasoning applied to the read side:
+    /// a matcher that interns its configured keys once, at construction, then probes those same
+    /// `Symbol`s on every event pays a plain `binary_search_by_key` instead of a hash + resolve
+    /// round trip. The interner-growth guarantee `get` documents is trivially preserved here --
+    /// the `Symbol` already exists, so there is nothing left to intern.
+    pub fn get_sym(&self, key: Symbol) -> Option<&Value> {
+        self.0.binary_search_by_key(&key, |(k, _)| *k).ok().map(|i| &self.0[i].1)
+    }
+
     pub fn insert(&mut self, key: &str, value: impl Into<Value>) {
         let key = intern(key);
         self.insert_sym(key, value);
@@ -122,5 +133,46 @@ mod tests {
         let mut map = map;
         assert_eq!(map.remove(never_interned_elsewhere), None);
         assert_eq!(interner::len(), before, "a missed `remove` must not intern the key");
+    }
+
+    #[test]
+    fn get_sym_present_key_returns_the_value() {
+        let mut map = AttrMap::new();
+        map.insert("host", "web-1");
+        let sym = intern("host");
+        assert_eq!(map.get_sym(sym), Some(&Value::from("web-1")));
+    }
+
+    #[test]
+    fn get_sym_absent_key_returns_none() {
+        let map = AttrMap::new();
+        let sym = intern("attrmap_get_sym_absent_probe");
+        assert_eq!(map.get_sym(sym), None);
+    }
+
+    #[test]
+    fn get_sym_agrees_with_get_for_every_key() {
+        let mut map = AttrMap::new();
+        map.insert("host", "web-1");
+        map.insert("env", "prod");
+        map.insert("retries", 3_i64);
+
+        for key in ["host", "env", "retries", "does-not-exist"] {
+            let sym = intern(key);
+            assert_eq!(map.get_sym(sym), map.get(key), "mismatch for key {key:?}");
+        }
+    }
+
+    /// `get_sym` takes an already-interned `Symbol`, so there is nothing left for it to intern --
+    /// interning the probe key happens explicitly, before the snapshot, so this only pins
+    /// `get_sym` itself against growing the interner.
+    #[test]
+    fn get_sym_never_touches_the_interner() {
+        let map = AttrMap::new();
+        let sym = intern("attrmap_get_sym_no_growth_probe_xyzzy");
+
+        let before = interner::len();
+        assert_eq!(map.get_sym(sym), None);
+        assert_eq!(interner::len(), before, "`get_sym` must not intern anything");
     }
 }

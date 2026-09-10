@@ -1,6 +1,6 @@
 ---
 created: 2026-09-07
-updated: 2026-09-07
+updated: 2026-09-10
 ---
 
 # Routing by condition, sampling, throttling, dedup, and renaming are `lua` components
@@ -161,3 +161,13 @@ assumed), this decision is the one to revisit, and the alternative below is wher
 - `crates/logit-config/src/lib.rs`'s `Internal::span_sample_rate` doc comment, which justified its
   own name partly by pointing at `ComponentKind::Sample` ("there is already a
   `ComponentKind::Sample` transform"), needed rewording since that variant no longer exists.
+- **The revisit trigger named above fired, for one specific case, on 2026-09-10.** Fan-out after
+  `logit_in` (N branches merged into one `logit_out` connection, split back apart on the far side)
+  is exactly the central-collector shape this ADR's cost table is about, multiplied by branch
+  count. The response was not the retired predicate grammar -- `has_attributes`/`drop_attributes`
+  (`docs/adr/attribute-filtering-components.md`) are a bounded key/value equality matcher, not a
+  parser, and their config is deliberately no wider than `set`'s. This ADR's core holding is
+  unchanged and this is not its supersession: `logit` still ships no native predicate language, no
+  `filter`/`where`, no operators, no boolean algebra beyond a plain conjunction. Anything needing an
+  actual operator (`>=`, `contains`, cross-attribute comparison) still means writing `lua`, and the
+  preserved grammar sketch above is still where that design would resume.

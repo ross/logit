@@ -569,6 +569,41 @@ pub enum ComponentKind {
     /// all three signals (that drops everything, dropping every event) -- both are rejected as
     /// config mistakes. See `docs/adr/signal-filtering-components.md`.
     DropSignals { signals: Vec<Signal> },
+    /// Forwards an event whose batch resource and/or own attributes match every configured pair,
+    /// dropping the rest. Config is exactly `set`'s -- `resource:`/`attributes:` maps of the same
+    /// `SetValue` literals -- so this matches on precisely what `set` can stamp
+    /// (`docs/adr/attribute-filtering-components.md`). Never mutates a forwarded event, the same
+    /// posture `has_signal` has toward payloads.
+    ///
+    /// **A map is a conjunction**: every pair listed, in both maps combined, must match -- there
+    /// is no `or`. **A configured key the event/resource doesn't carry never matches** ("absent is
+    /// `false`"); "key present with any value" is not expressible. **Values coerce across numeric
+    /// representations** (`status: 200` matches `Value::I64(200)`, `U64(200)`, `F64(200.0)`, and
+    /// `Str("200")`) but never coerce a `Bool` to or from anything else, and two strings are never
+    /// compared numerically. At least one of `resource`/`attributes` must be non-empty (an empty
+    /// config matches every event, a no-op -- rejected at graph-validation time), every key must
+    /// be non-empty, and every numeric value must be finite (a non-finite value can never compare
+    /// equal to anything, so it could never match).
+    HasAttributes {
+        #[serde(default)]
+        resource: std::collections::BTreeMap<String, SetValue>,
+        #[serde(default)]
+        attributes: std::collections::BTreeMap<String, SetValue>,
+    },
+    /// Drops an event whose batch resource and/or own attributes match every configured pair,
+    /// forwarding the rest -- the exact complement of `has_attributes` **on the same config**,
+    /// taken at the top level, not per pair: this drops an event only when *every* configured pair
+    /// matches, so an event matching some-but-not-all of several configured pairs is forwarded,
+    /// not dropped. Combined with "absent is `false`," an event that never carried a configured
+    /// key at all is forwarded too -- read it as "this event isn't one of the ones told to drop,"
+    /// the else-branch of a `has_attributes` fan-out. Same shape, matching rules, and validation
+    /// as `has_attributes` otherwise; see `docs/adr/attribute-filtering-components.md`.
+    DropAttributes {
+        #[serde(default)]
+        resource: std::collections::BTreeMap<String, SetValue>,
+        #[serde(default)]
+        attributes: std::collections::BTreeMap<String, SetValue>,
+    },
     /// Parses a log record's message as logfmt (`level=info msg="hello world" dur=3ms`), merging
     /// the resulting key/values into the event's attributes. Additive and pass-through-on-failure,
     /// exactly like `json`. See `docs/adr/logfmt-and-kv-parsing.md`.
@@ -2108,6 +2143,51 @@ mod tests {
         match component.kind {
             ComponentKind::DropSignals { signals } => assert_eq!(signals, vec![Signal::Metrics]),
             other => panic!("expected DropSignals, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn has_attributes_component_deserializes_with_both_maps() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "has_attributes", "sources": ["in"],
+                "resource": {"service.name": "nginx"}, "attributes": {"status": 200}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::HasAttributes { resource, attributes } => {
+                assert_eq!(resource.get("service.name"), Some(&SetValue::Str("nginx".to_string())));
+                assert_eq!(attributes.get("status"), Some(&SetValue::I64(200)));
+            }
+            other => panic!("expected HasAttributes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_attributes_component_deserializes_with_only_attributes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "drop_attributes", "sources": ["in"], "attributes": {"stream": "debug"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DropAttributes { resource, attributes } => {
+                assert!(resource.is_empty(), "resource must default to empty");
+                assert_eq!(attributes.get("stream"), Some(&SetValue::Str("debug".to_string())));
+            }
+            other => panic!("expected DropAttributes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn has_attributes_a_whole_number_value_stays_i64() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "has_attributes", "sources": ["in"], "attributes": {"status": 200}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::HasAttributes { attributes, .. } => {
+                assert_eq!(attributes.get("status"), Some(&SetValue::I64(200)), "not F64");
+            }
+            other => panic!("expected HasAttributes, got {other:?}"),
         }
     }
 

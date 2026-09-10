@@ -12,7 +12,7 @@
 
 use ::regex::{CaptureLocations, Regex};
 use bytes::Bytes;
-use logit_core::interner::{intern, resolve};
+use logit_core::interner::intern;
 use logit_core::{Event, Resource, Symbol, Telemetry, Value};
 use logit_pipeline::Transform;
 use std::sync::Arc;
@@ -77,7 +77,7 @@ impl Transform for RegexParser {
                     return Some(event);
                 }
             },
-            Some(field) => match event.attributes.get(resolve(field)) {
+            Some(field) => match event.attributes.get_sym(field) {
                 Some(Value::Str(b) | Value::Bytes(b)) => b.clone(),
                 _ => {
                     self.telemetry.count("logit.transform.matched.skipped", 1.0, &[]);
@@ -113,6 +113,7 @@ impl Transform for RegexParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logit_core::interner::resolve;
     use logit_core::{AttrMap, BodyFormat, LogRecord, MetricKind, MetricRecord, Registry};
     use logit_core::{SpanEvent, SpanKind, SpanRecord, SpanStatus};
 

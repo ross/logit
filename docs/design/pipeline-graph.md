@@ -88,6 +88,12 @@ pub enum ComponentKind {
     KeepSignals { signals: Vec<Signal> },
     // A denylist: clears the listed signals' payloads, keeping the rest.
     DropSignals { signals: Vec<Signal> },
+    // Forwards an event whose resource/attributes match every configured pair -- config is
+    // `Set`'s, field for field; never mutates (docs/adr/attribute-filtering-components.md).
+    HasAttributes { resource: BTreeMap<String, SetValue>, attributes: BTreeMap<String, SetValue> },
+    // Drops an event matching every configured pair -- has_attributes' exact complement on the
+    // identical config, taken at the top level (an event matching some-but-not-all pairs forwards).
+    DropAttributes { resource: BTreeMap<String, SetValue>, attributes: BTreeMap<String, SetValue> },
     // Matches a pattern against a log message (or a named attribute), turning named capture
     // groups into attributes (docs/adr/regex-transform.md).
     Regex { pattern: String, field: Option<String> },
@@ -114,9 +120,9 @@ into one tagged enum creates real collisions — `Otlp { bind }` (a listener) an
 keeps the rule predictable as more protocols gain a second side — `syslog_out` (RFC 3164/5424 over
 UDP or TCP, `docs/adr/syslog-output.md`) is exactly that case, landing well after `SyslogIn`.
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
-`remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `logfmt`,
-`kv`, `regex`, and any future native transform — take no suffix; there's only ever one direction
-for a transform to be.
+`remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`,
+`has_attributes`, `drop_attributes`, `logfmt`, `kv`, `regex`, and any future native transform —
+take no suffix; there's only ever one direction for a transform to be.
 
 **`interval` stays a per-kind optional field, unchanged from today.** `lua`/`lua_file` already carry
 an optional flush interval (`docs/adr/aggregation-window-semantics.md`); `aggregate` requires
@@ -161,7 +167,7 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
@@ -236,9 +242,11 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     listener's `receive.batch_max_events`/`batch_max_bytes` of `0` is rejected the same way (the
     queue-only bounds don't apply to it at all — see rule 17).
 19. (Also since drifted into the code's numbering, see the note on 12 above.) A `set` with both
-    `resource` and `attributes` empty is rejected, and a `trace_context` with an empty `trace_id`
-    field name is rejected — both are the same "can only ever be a no-op" reasoning rules 10-12
-    apply to `kv_metrics`, extended to the two components that landed after this list was written
+    `resource` and `attributes` empty is rejected, as is an empty key in either map (added
+    alongside `has_attributes`/`drop_attributes` below, so `set`'s own validation matches what its
+    config actually allows) — and a `trace_context` with an empty `trace_id` field name is
+    rejected — all the same "can only ever be a no-op" reasoning rules 10-12 apply to `kv_metrics`,
+    extended to the components that landed after this list was written
     (`docs/adr/operator-declared-resource-attributes.md`,
     `docs/adr/log-record-trace-context.md`).
 20. A `scale` with an empty `fields` map is rejected (the same no-op reasoning again), as is an
@@ -324,6 +332,15 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     `max_bytes`. Two sinks may not declare the same literal `buffer.disk.path` (compared as
     written, not resolved against the config directory — `DiskQueue`'s own exclusive lock catches
     an aliased path this comparison can't see).
+36. `has_attributes`/`drop_attributes`: at least one of `resource`/`attributes` must be non-empty,
+    every key must be non-empty, and every value must be a finite number
+    (`docs/adr/attribute-filtering-components.md`). The empty-config black-hole/no-op assignment is
+    *inverted* from rule 21's: `resource:`/`attributes:` is a map of conjunctions, not a list of
+    alternatives, so zero configured pairs is vacuously true — `has_attributes` with nothing
+    configured matches (and so forwards) every event, a no-op, while `drop_attributes`, being its
+    exact complement, matches every event too but that means dropping every one of them, a black
+    hole. The same key appearing in both `resource:` and `attributes:` is deliberately legal — they
+    address different objects.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

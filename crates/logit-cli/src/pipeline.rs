@@ -36,11 +36,13 @@ use logit_pipeline::{
 };
 use logit_proto::frame::Compression as NativeCompression;
 use logit_transforms::{
-    Aggregator, CsvParser, DropSignals as DropSignalsTransform, HasSignal as HasSignalTransform,
-    JsonParser, Keep as KeepTransform, KeepSignals as KeepSignalsTransform, Kv as KvTransform,
-    KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
-    RegexParser, Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform,
-    SignalSet, SpanLift, TraceContext as TraceContextTransform,
+    Aggregator, CsvParser, DropAttributes as DropAttributesTransform,
+    DropSignals as DropSignalsTransform, HasAttributes as HasAttributesTransform,
+    HasSignal as HasSignalTransform, JsonParser, Keep as KeepTransform,
+    KeepSignals as KeepSignalsTransform, Kv as KvTransform, KvMetrics as KvMetricsTransform,
+    Logfmt as LogfmtTransform, MatchMode as TransformMatchMode, RegexParser,
+    Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform, SignalSet, SpanLift,
+    TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -473,6 +475,14 @@ fn build_spec(
         DropSignals { signals } => NodeSpec::Transform(Box::new(
             DropSignalsTransform::new(to_signal_set(signals)).with_telemetry(telemetry.clone()),
         )),
+        HasAttributes { resource, attributes } => NodeSpec::Transform(Box::new(
+            HasAttributesTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
+                .with_telemetry(telemetry.clone()),
+        )),
+        DropAttributes { resource, attributes } => NodeSpec::Transform(Box::new(
+            DropAttributesTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
+                .with_telemetry(telemetry.clone()),
+        )),
 
         InfluxDbOut { url, org, bucket, token } => NodeSpec::Output(
             Box::new(
@@ -897,6 +907,11 @@ fn to_metric_specs(specs: &[logit_config::MetricSpec]) -> Vec<logit_transforms::
 /// layout), same reasoning as [`to_metric_specs`] above. A `BTreeMap` iterates in key order, which
 /// is why `Set`'s own tests don't need to assert an order beyond "whatever `AttrMap`'s sorted
 /// `Symbol` order ends up being" -- the interning happens once, at construction, inside `Set::new`.
+///
+/// Also the conversion for `has_attributes`/`drop_attributes` (`ComponentKind::HasAttributes`/
+/// `DropAttributes`), whose `resource`/`attributes` fields are the identical `SetValue` map shape
+/// -- reused unchanged, not reimplemented, so the two config surfaces cannot drift apart on what a
+/// `SetValue` becomes.
 fn to_set_pairs(
     values: &std::collections::BTreeMap<String, logit_config::SetValue>,
 ) -> Vec<(String, logit_core::Value)> {
@@ -2117,6 +2132,48 @@ mod tests {
         };
         assert!(matches!(
             build_spec("drop_signals", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_has_attributes_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::HasAttributes {
+                resource: std::collections::BTreeMap::new(),
+                attributes: std::collections::BTreeMap::from([(
+                    "stream".to_string(),
+                    logit_config::SetValue::Str("a".to_string()),
+                )]),
+            },
+        };
+        assert!(matches!(
+            build_spec("has_attributes", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_drop_attributes_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::DropAttributes {
+                resource: std::collections::BTreeMap::from([(
+                    "service.name".to_string(),
+                    logit_config::SetValue::Str("nginx".to_string()),
+                )]),
+                attributes: std::collections::BTreeMap::new(),
+            },
+        };
+        assert!(matches!(
+            build_spec("drop_attributes", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
     }
