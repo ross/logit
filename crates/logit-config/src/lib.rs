@@ -309,8 +309,24 @@ pub enum ComponentKind {
         #[serde(flatten)]
         tail: TailOptions,
     },
-    /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
-    LogitIn { bind: String },
+    /// The native logit-to-logit protocol -- one TCP (optionally TLS) listener accepting many
+    /// connections, each speaking `Hello`/`HelloAck`/`Ack`/`Reject`
+    /// (`docs/design/wire-protocol.md`'s connection protocol).
+    LogitIn {
+        bind: String,
+        /// Terminates TLS on this listener when present; plaintext when omitted. No ALPN --
+        /// unlike `otlp_in`, this isn't an HTTP-shaped protocol with anything for a client to
+        /// negotiate down to. See [`TlsServerConfig`].
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        /// Caps the size (post- and pre-decompression alike) of a single frame this listener
+        /// accepts, echoed to every connecting client in `HelloAck.max_frame_bytes`. Defaults to
+        /// 64 MiB (`logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN`); rule 34 rejects a value of
+        /// `0` or over that ceiling.
+        #[serde(default, with = "human_bytes::option")]
+        #[schemars(with = "Option<String>")]
+        max_frame_bytes: Option<u64>,
+    },
     /// `logit` talking about itself: drains every component's buffered self-telemetry points on
     /// `interval` and emits them as ordinary events into the graph, same as any other listener.
     /// Named for the source, not the signal it emits today -- free to grow logs and spans later
@@ -630,8 +646,28 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: TlsClientConfig,
     },
-    /// The native logit-to-logit protocol (`docs/design/wire-protocol.md`).
-    LogitOut { endpoint: String },
+    /// The native logit-to-logit protocol -- the mirror of [`ComponentKind::LogitIn`]: one TCP
+    /// (optionally TLS) connection, one native frame per batch, one `Ack` before that batch
+    /// counts as delivered.
+    LogitOut {
+        /// `host:port`. Resolved at connect time, never at config-load time -- the same
+        /// `syslog_out` precedent: a `logit_out` pointed at a peer that isn't up yet is not a
+        /// config error.
+        endpoint: String,
+        /// Offered in this sink's `Hello`; the peer may still negotiate it down to `none` if it
+        /// doesn't support `lz4`.
+        #[serde(default)]
+        compression: Compression,
+        /// Turns on TLS for this connection when present -- presence turns it on, unlike
+        /// `otlp_out` (whose `endpoint` has a scheme to select TLS from): a bare `host:port` has
+        /// no scheme to read that signal from. See [`TlsClientConfig`].
+        #[serde(default)]
+        tls: Option<TlsClientConfig>,
+        /// Connect, handshake, and per-batch ack-wait timeout, all sharing this one knob.
+        #[serde(default = "default_logit_out_request_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        request_timeout: Duration,
+    },
     /// A general-purpose, human-facing debug sink: dumps every event's details as a readable text
     /// block to stdout (default), stderr, or a file -- the dev loop for seeing a whole pipeline's
     /// output without standing up a real backend like InfluxDB.
@@ -848,6 +884,12 @@ fn default_max_retained_gauge_series() -> usize {
 /// hand if this ever changes.
 fn default_syslog_connect_timeout() -> Duration {
     Duration::from_secs(5)
+}
+
+/// Mirrors `logit_outputs::logit::DEFAULT_TIMEOUT` -- can't reference it directly, same reason
+/// as [`default_syslog_connect_timeout`].
+fn default_logit_out_request_timeout() -> Duration {
+    Duration::from_secs(10)
 }
 
 fn default_trace_id_field() -> String {
@@ -1156,6 +1198,14 @@ pub struct BufferConfig {
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub shutdown_grace: Duration,
+    /// Disk-backed durable buffering, opt-in (`docs/adr/disk-backed-sink-buffer.md`). `None` (the
+    /// default) is today's in-memory `SinkQueue`, unchanged. `Some(_)` replaces it -- not sizes
+    /// beside it -- with a disk spool at `DiskBufferConfig::path`; graph validation
+    /// (`crates/logit-pipeline/src/graph.rs` rule 35) rejects `max_batches`/`max_bytes` at
+    /// anything but their defaults alongside it, since disk replaces the in-memory bound rather
+    /// than sharing it.
+    #[serde(default)]
+    pub disk: Option<DiskBufferConfig>,
 }
 
 impl Default for BufferConfig {
@@ -1168,8 +1218,59 @@ impl Default for BufferConfig {
             retry_budget: Duration::from_secs(60),
             retry_max_delay: Duration::from_secs(10),
             shutdown_grace: Duration::from_secs(5),
+            disk: None,
         }
     }
+}
+
+/// Disk-backed durable buffering for one sink's delivery queue -- opt-in via `buffer.disk:`
+/// (`docs/adr/disk-backed-sink-buffer.md`). Its mere presence turns disk backing on for that
+/// sink, mirroring [`TlsServerConfig`]'s "presence is the on-switch" precedent: `path` has no
+/// sensible default, so (like `TlsServerConfig::cert_file`/`key_file`) it stays a plain required
+/// field -- this struct deliberately carries no container-level `#[serde(default)]`, only
+/// per-field defaults on everything else, so an omitted `path` is a clear deserialize error
+/// rather than a silently empty one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DiskBufferConfig {
+    /// The spool directory, resolved against the config file's own directory like every other
+    /// path in this schema (`crates/logit-cli/src/pipeline.rs`). Two sinks may not share one
+    /// (graph rule 35).
+    pub path: String,
+    /// Bound on the sum of on-disk segment sizes -- replaces `BufferConfig::max_bytes`'s role,
+    /// not sized alongside it.
+    #[serde(default = "default_disk_max_bytes")]
+    #[serde(with = "human_bytes")]
+    #[schemars(with = "String")]
+    pub max_bytes: u64,
+    /// A soft rotation trigger, not a hard cap: the active segment rotates once it already
+    /// exceeds this, so a single record larger than it still lands whole in a fresh segment.
+    #[serde(default = "default_segment_bytes")]
+    #[serde(with = "human_bytes")]
+    #[schemars(with = "String")]
+    pub segment_bytes: u64,
+    /// `logit_proto::native`'s per-frame compression, mirrored here for the same
+    /// crate-layout reason [`Compression`] itself exists.
+    #[serde(default)]
+    pub compression: Compression,
+    /// How often the read cursor is persisted during ordinary operation (also forced on segment
+    /// rotation and at shutdown, regardless of this interval).
+    #[serde(default = "default_disk_checkpoint_interval")]
+    #[serde(with = "humantime_serde_duration")]
+    #[schemars(with = "String")]
+    pub checkpoint_interval: Duration,
+}
+
+fn default_disk_max_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
+fn default_segment_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_disk_checkpoint_interval() -> Duration {
+    Duration::from_secs(1)
 }
 
 /// What a sink's `SinkQueue` does once both its bounds (`max_batches`/`max_bytes`) are full.
@@ -2108,6 +2209,75 @@ mod tests {
     }
 
     #[test]
+    fn logit_in_defaults_tls_to_none_and_max_frame_bytes_to_none() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "logit_in", "bind": "0.0.0.0:5140"}"#).unwrap();
+        match component.kind {
+            ComponentKind::LogitIn { bind, tls, max_frame_bytes } => {
+                assert_eq!(bind, "0.0.0.0:5140");
+                assert_eq!(tls, None);
+                assert_eq!(max_frame_bytes, None);
+            }
+            other => panic!("expected LogitIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logit_in_with_tls_and_max_frame_bytes_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "logit_in", "bind": "0.0.0.0:5140",
+                "tls": {"cert_file": "server.pem", "key_file": "server.key"},
+                "max_frame_bytes": "32MiB"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::LogitIn { tls: Some(tls), max_frame_bytes, .. } => {
+                assert_eq!(tls.cert_file, "server.pem");
+                assert_eq!(tls.key_file, "server.key");
+                assert_eq!(max_frame_bytes, Some(32 * 1024 * 1024));
+            }
+            other => panic!("expected LogitIn with tls and max_frame_bytes set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logit_out_defaults_compression_tls_and_request_timeout() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "logit_out", "sources": ["in"], "endpoint": "central:5140"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::LogitOut { endpoint, compression, tls, request_timeout } => {
+                assert_eq!(endpoint, "central:5140");
+                assert_eq!(compression, Compression::None);
+                assert_eq!(tls, None);
+                assert_eq!(request_timeout, Duration::from_secs(10));
+            }
+            other => panic!("expected LogitOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logit_out_with_compression_tls_and_request_timeout_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "logit_out", "sources": ["in"], "endpoint": "central:5140",
+                "compression": "lz4",
+                "tls": {"insecure_skip_verify": true},
+                "request_timeout": "30s"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::LogitOut { compression, tls: Some(tls), request_timeout, .. } => {
+                assert_eq!(compression, Compression::Lz4);
+                assert!(tls.insecure_skip_verify);
+                assert_eq!(tls.ca_file, None);
+                assert_eq!(request_timeout, Duration::from_secs(30));
+            }
+            other => panic!("expected LogitOut with tls set, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn zero_interval_deserializes_fine_left_for_validation_to_reject() {
         // The codec itself has no opinion on zero -- graph validation (`logit-pipeline`) is where
         // a zero flush interval is actually rejected (it would spin the flush loop).
@@ -2346,6 +2516,61 @@ mod tests {
         assert_eq!(component.buffer.retry_budget, Duration::from_secs(120));
         assert_eq!(component.buffer.retry_max_delay, Duration::from_secs(20));
         assert_eq!(component.buffer.shutdown_grace, Duration::from_secs(10));
+        assert_eq!(component.buffer.disk, None);
+    }
+
+    #[test]
+    fn a_fully_specified_disk_block_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086",
+                "org": "org", "bucket": "bucket", "token": "TOKEN",
+                "buffer": {"disk": {"path": "spool", "max_bytes": "2GiB",
+                           "segment_bytes": "128MiB", "compression": "lz4",
+                           "checkpoint_interval": "5s"}}}"#,
+        )
+        .unwrap();
+        let disk = component.buffer.disk.expect("disk block should be present");
+        assert_eq!(disk.path, "spool");
+        assert_eq!(disk.max_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(disk.segment_bytes, 128 * 1024 * 1024);
+        assert_eq!(disk.compression, Compression::Lz4);
+        assert_eq!(disk.checkpoint_interval, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_disk_block_with_only_path_defaults_every_other_field() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086",
+                "org": "org", "bucket": "bucket", "token": "TOKEN",
+                "buffer": {"disk": {"path": "spool"}}}"#,
+        )
+        .unwrap();
+        let disk = component.buffer.disk.expect("disk block should be present");
+        assert_eq!(disk.path, "spool");
+        assert_eq!(disk.max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(disk.segment_bytes, 64 * 1024 * 1024);
+        assert_eq!(disk.compression, Compression::None);
+        assert_eq!(disk.checkpoint_interval, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_disk_block_missing_path_is_rejected() {
+        let result: Result<Component, _> = serde_json::from_str(
+            r#"{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086",
+                "org": "org", "bucket": "bucket", "token": "TOKEN",
+                "buffer": {"disk": {}}}"#,
+        );
+        assert!(result.is_err(), "a disk block with no path should be rejected");
+    }
+
+    #[test]
+    fn an_unknown_field_under_disk_is_rejected() {
+        let result: Result<Component, _> = serde_json::from_str(
+            r#"{"type": "influxdb_out", "sources": ["in"], "url": "http://localhost:8086",
+                "org": "org", "bucket": "bucket", "token": "TOKEN",
+                "buffer": {"disk": {"path": "spool", "bogus_field": 1}}}"#,
+        );
+        assert!(result.is_err(), "an unknown disk field should be rejected");
     }
 
     #[test]

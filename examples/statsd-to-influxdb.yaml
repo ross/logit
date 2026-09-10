@@ -66,3 +66,11 @@ components:
     #   retry_budget: 60s      # wall-clock ceiling on retrying one batch before it's dropped
     #   retry_max_delay: 10s   # backoff cap between retry attempts
     #   shutdown_grace: 5s     # how long SIGTERM waits for the queue to drain before dropping the rest
+    #   # disk:                        # opt-in durable buffering (docs/adr/disk-backed-sink-buffer.md) --
+    #   #                              # replaces the in-memory queue above, not sized alongside it;
+    #   #                              # max_batches/max_bytes above must stay at their defaults if set
+    #   #   path: spool/influxdb_out   # required, resolved relative to this config file's own directory
+    #   #   max_bytes: "1GiB"          # bound on the sum of on-disk segment sizes
+    #   #   segment_bytes: "64MiB"     # soft rotation trigger, not a hard cap
+    #   #   compression: none          # none | lz4, logit_proto::native's per-frame compression
+    #   #   checkpoint_interval: 1s    # how often the read cursor is persisted during normal operation

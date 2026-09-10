@@ -29,6 +29,18 @@
             }
           ]
         },
+        "disk": {
+          "description": "Disk-backed durable buffering, opt-in (`docs/adr/disk-backed-sink-buffer.md`). `None` (the default) is today's in-memory `SinkQueue`, unchanged. `Some(_)` replaces it -- not sizes beside it -- with a disk spool at `DiskBufferConfig::path`; graph validation (`crates/logit-pipeline/src/graph.rs` rule 35) rejects `max_batches`/`max_bytes` at anything but their defaults alongside it, since disk replaces the in-memory bound rather than sharing it.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DiskBufferConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "max_batches": {
           "default": 1024,
           "type": "integer",
@@ -286,7 +298,7 @@
           }
         },
         {
-          "description": "The native logit-to-logit protocol (`docs/design/wire-protocol.md`).",
+          "description": "The native logit-to-logit protocol -- one TCP (optionally TLS) listener accepting many connections, each speaking `Hello`/`HelloAck`/`Ack`/`Reject` (`docs/design/wire-protocol.md`'s connection protocol).",
           "type": "object",
           "required": [
             "bind",
@@ -295,6 +307,26 @@
           "properties": {
             "bind": {
               "type": "string"
+            },
+            "max_frame_bytes": {
+              "description": "Caps the size (post- and pre-decompression alike) of a single frame this listener accepts, echoed to every connecting client in `HelloAck.max_frame_bytes`. Defaults to 64 MiB (`logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN`); rule 34 rejects a value of `0` or over that ceiling.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tls": {
+              "description": "Terminates TLS on this listener when present; plaintext when omitted. No ALPN -- unlike `otlp_in`, this isn't an HTTP-shaped protocol with anything for a client to negotiate down to. See [`TlsServerConfig`].",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsServerConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "type": {
               "type": "string",
@@ -909,15 +941,42 @@
           }
         },
         {
-          "description": "The native logit-to-logit protocol (`docs/design/wire-protocol.md`).",
+          "description": "The native logit-to-logit protocol -- the mirror of [`ComponentKind::LogitIn`]: one TCP (optionally TLS) connection, one native frame per batch, one `Ack` before that batch counts as delivered.",
           "type": "object",
           "required": [
             "endpoint",
             "type"
           ],
           "properties": {
+            "compression": {
+              "description": "Offered in this sink's `Hello`; the peer may still negotiate it down to `none` if it doesn't support `lz4`.",
+              "default": "none",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Compression"
+                }
+              ]
+            },
             "endpoint": {
+              "description": "`host:port`. Resolved at connect time, never at config-load time -- the same `syslog_out` precedent: a `logit_out` pointed at a peer that isn't up yet is not a config error.",
               "type": "string"
+            },
+            "request_timeout": {
+              "description": "Connect, handshake, and per-batch ack-wait timeout, all sharing this one knob.",
+              "default": "10s",
+              "type": "string"
+            },
+            "tls": {
+              "description": "Turns on TLS for this connection when present -- presence turns it on, unlike `otlp_out` (whose `endpoint` has a scheme to select TLS from): a bare `host:port` has no scheme to read that signal from. See [`TlsClientConfig`].",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "type": {
               "type": "string",
@@ -1095,6 +1154,7 @@
           "description": "Per-sink delivery buffer (`docs/adr/buffered-sink-delivery.md`). Meaningful only on a sink -- graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind. A sibling field of `kind`, not nested inside every sink `ComponentKind` variant, so a future fifth sink kind costs nothing extra here.",
           "default": {
             "delivery": null,
+            "disk": null,
             "max_batches": 1024,
             "max_bytes": "67108864",
             "overflow": "block",
@@ -1150,6 +1210,44 @@
         "at_least_once",
         "at_most_once"
       ]
+    },
+    "DiskBufferConfig": {
+      "description": "Disk-backed durable buffering for one sink's delivery queue -- opt-in via `buffer.disk:` (`docs/adr/disk-backed-sink-buffer.md`). Its mere presence turns disk backing on for that sink, mirroring [`TlsServerConfig`]'s \"presence is the on-switch\" precedent: `path` has no sensible default, so (like `TlsServerConfig::cert_file`/`key_file`) it stays a plain required field -- this struct deliberately carries no container-level `#[serde(default)]`, only per-field defaults on everything else, so an omitted `path` is a clear deserialize error rather than a silently empty one.",
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "checkpoint_interval": {
+          "description": "How often the read cursor is persisted during ordinary operation (also forced on segment rotation and at shutdown, regardless of this interval).",
+          "default": "1s",
+          "type": "string"
+        },
+        "compression": {
+          "description": "`logit_proto::native`'s per-frame compression, mirrored here for the same crate-layout reason [`Compression`] itself exists.",
+          "default": "none",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Compression"
+            }
+          ]
+        },
+        "max_bytes": {
+          "description": "Bound on the sum of on-disk segment sizes -- replaces `BufferConfig::max_bytes`'s role, not sized alongside it.",
+          "default": "1073741824",
+          "type": "string"
+        },
+        "path": {
+          "description": "The spool directory, resolved against the config file's own directory like every other path in this schema (`crates/logit-cli/src/pipeline.rs`). Two sinks may not share one (graph rule 35).",
+          "type": "string"
+        },
+        "segment_bytes": {
+          "description": "A soft rotation trigger, not a hard cap: the active segment rotates once it already exceeds this, so a single record larger than it still lands whole in a fresh segment.",
+          "default": "67108864",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "MatchMode": {
       "description": "`has_signal`'s matching rule. `AnyOf` forwards an event carrying at least one signal named in `signals`, untouched, even if it also carries a signal that isn't named. `Only` additionally requires the event carry nothing outside `signals` -- a mixed event that also has a signal not listed is dropped, not trimmed (`keep_signals` trims; `has_signal` never mutates an event).",
