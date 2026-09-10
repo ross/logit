@@ -80,6 +80,107 @@ summary:
   below for the full failure and sizing story, including the one case that still exits the process
   (a sustained, purely-configuration-error failure).
 
+## Probes and exit codes
+
+`logit` distinguishes three outcomes on exit, and (when `admin:` is configured) answers a
+readiness/liveness probe live — see [ADR `admin-readiness-endpoint`](adr/admin-readiness-endpoint.md) for the design.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Clean shutdown — a signal arrived, every listener drained, every sink flushed. |
+| `1` | A startup failure — a bad config, a port already in use, a bad `lua_file`, a bad `--log-level`. Nothing was ever running. |
+| `2` | A runtime failure after the process reported ready — a sustained, purely-configuration-error sink failure (see [Sink delivery buffering](#sink-delivery-buffering) below), a listener's accept loop dying. |
+| `130` | A second SIGTERM/SIGINT arrived before a graceful drain finished. |
+
+Enable the probe endpoint with a top-level `admin:` block:
+
+```yaml
+admin:
+  bind: 0.0.0.0:9600
+```
+
+`GET /readyz` returns `200 ok` once every listener is bound and every node task is running, `503
+starting` before that, `503 draining` after a shutdown signal, and `503 degraded` if any node has
+exited with an error while the process is still draining. `GET /healthz` returns `200 ok`
+whenever the admin task itself can still answer, regardless of the pipeline's own state. Add
+`?format=json` to `/readyz` for `{status, since, components: {id: "pending"|"bound"|
+"running"|"finished"|"failed"}}` instead of the bare status word; `/healthz?format=json` returns
+just `{status}`, since it has nothing else to report. No TLS, no auth — this is a
+loopback/pod-local endpoint by design, not one meant to cross a real network boundary.
+
+A Kubernetes deployment maps naturally onto the two routes:
+
+```yaml
+readinessProbe:
+  httpGet: { path: /readyz, port: 9600 }
+  periodSeconds: 5
+livenessProbe:
+  httpGet: { path: /healthz, port: 9600 }
+  periodSeconds: 10
+```
+
+`logit ready [--admin http://127.0.0.1:9600]` is the probe helper `Dockerfile`'s `HEALTHCHECK`
+uses — the shipped image is `bookworm-slim` with no `curl`, so this is what a container-level
+health check runs instead:
+
+```dockerfile
+HEALTHCHECK --interval=10s --timeout=2s --start-period=5s CMD ["logit", "ready"]
+```
+
+It exits 0 and prints the status word on `200`; anything else exits 1, printing the status word
+the server returned or — with nothing listening at all, e.g. `admin:` was never configured — the
+connection error instead.
+
+### What to watch
+
+- `/readyz` flipping to `503 degraded` and staying there means a node has actually failed, not
+  merely that a sink is retrying — see [Sink delivery buffering](#sink-delivery-buffering)'s own
+  failure semantics for what does and doesn't trip that.
+- An orchestrator that never sees `/readyz` return `200` within its own startup timeout has a
+  listener that can't bind (check the `starting`/`bound`/`ready` lifecycle log lines below) or a
+  Lua script that fails to load.
+
+## Self-logging
+
+`logit run` emits leveled, structured self-diagnostics through `tracing`
+([ADR `tracing-for-self-logging`](adr/tracing-for-self-logging.md)) — `schema`/`validate`/`graph` stay print-only, since they
+run once and exit.
+
+```sh
+logit run /config.yaml --log-level info --log-format text   # the defaults
+logit run /config.yaml --log-level debug                    # or LOGIT_LOG=debug
+logit run /config.yaml --log-format json                    # one JSON object per line
+```
+
+`--log-level`/`LOGIT_LOG` takes `tracing`'s `EnvFilter` syntax — a bare level (`info`, `debug`) or
+a per-module override (`logit_pipeline=trace,info`). `--log-format json` emits one JSON object
+per line with `timestamp`, `level`, `target`, `component`, `key`, and `message` fields, for a log
+collector to parse directly rather than scraping text.
+
+Every *component-scoped* self-diagnostic carries a `component` field naming which component
+reported it, and (for a throttled diagnostic, or a component-owned lifecycle message like
+`bound`/`recovered`) a `key` naming *why*. The process-level lifecycle events below (`starting`,
+`ready`, `shutdown signal received`, `drain complete`, `exiting`) carry neither — they are about
+the process, not any one component. Lifecycle events are stable, `&'static str` names — safe to
+alert on directly:
+
+| Event | Level | When |
+|---|---|---|
+| `starting` | info | Config loaded, before graph resolution — named even if the config goes on to fail. |
+| `bound` | info | One socket listener's socket opened, during the pre-bind pass (`syslog_in`/`statsd_in`/`otlp_in`; `tail_in`/`docker_in` emit none). |
+| `ready` | info | Every socket bound, every node task running, nothing has failed. |
+| `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
+| `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped mid-drain. |
+| `degraded` | warn | A sink's first dropped batch (its retry budget exhausted) since it was last healthy. |
+| `recovered` | info | A sink's first successful delivery after `degraded`. |
+| `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
+
+`internal`'s own `logs:` setting (`warn` by default, `error`, or `off`) routes every `warn`-or-above
+self-diagnostic into the pipeline as an ordinary log event, alongside its existing points and
+spans — see [`docs/design/internal-telemetry.md`](design/internal-telemetry.md)'s "Logs" section. A sink already attached to
+`internal` (or a downstream `keep`/`aggregate`/`lua`) carries `logit`'s own self-logs the same way
+it carries any other signal, with no separate log-shipping setup.
+
 ## Sink delivery buffering
 
 Every sink (`influxdb_out`, `stdio_out`, `file_out`, ...) sits behind a per-component delivery
@@ -595,9 +696,21 @@ Start `logit` and confirm it's actually listening *before* pointing nginx's `acc
 directive at it. UDP is fire-and-forget: a line nginx sends before `logit`'s listener is bound is
 gone, with no error anywhere — not in nginx, not in `logit`.
 
-`logit run` prints nothing on a clean, successful start — no output at all is itself the
-confirmation that startup didn't hit an error. To confirm the listener is actually bound and
-accepting, send it a manual line and watch for the corresponding `stdio_out` block:
+The honest answer used to be "there's no way to know a UDP listener is actually bound short of a
+manual probe" — that gap is what [Probes and exit codes](#probes-and-exit-codes) above closes.
+With `admin: { bind: ... }` set, wait for `/readyz` to return `200` (or run `logit ready`) before
+starting nginx; `/readyz` only reports `ready` once every listener, `syslog_in` included, has
+actually bound its socket:
+
+```sh
+until logit ready --admin http://<logit-host>:9600; do sleep 0.5; done
+```
+
+Without `admin:` configured, the `bound`/`ready` lifecycle log lines (default `--log-level info`,
+[Self-logging](#self-logging) above) are the fallback — `bound` names each socket listener's
+address as it opens (`syslog_in` included), and `ready` fires once every listener is bound. A
+manual smoke test still works if neither is wired up: send a line and watch for the corresponding
+`stdio_out` block:
 
 ```sh
 logger -n <logit-host> -P 5140 -d -t smoke '{}'

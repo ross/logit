@@ -12,6 +12,18 @@
 # `internal` emits whatever accumulated since the last drain, `aggregate` turns that into actual
 # 60-second windows, using the exact same merge semantics
 # (docs/adr/aggregation-window-semantics.md) as any other metric passing through it.
+#
+# `stat_in` and `logs_only`/`logs_out` below are the workstream D demonstration
+# (docs/plans/operator-surface.md, docs/design/internal-telemetry.md's "Logs" section): `self`'s
+# default `logs: warn` threshold captures every `warn`-and-above self-diagnostic -- including
+# `stat_in`'s own throttled `bad_line` warning -- into the same drain as `self`'s points and
+# spans. Send it a malformed line and watch `logs_out`:
+#
+#   printf 'not a valid statsd line' | nc -u -w0 localhost 8125
+#
+# A `bad_line` log event should reach `logs_out` on `self`'s next tick (within `interval`
+# below), attributed to `component: stat_in` -- `Diagnostics::warn_throttled` reports the 1st,
+# 2nd, 4th, ... occurrence, so send it a few times if the first doesn't show up.
 components:
   self:
     type: internal
@@ -29,3 +41,27 @@ components:
     org: logit
     bucket: internal
     token: !env INFLUXDB_TOKEN
+
+  # A real listener whose own throttled diagnostics (a malformed line, chief among them) are
+  # exactly what `self` captures as log events -- see the header comment above for how to trigger
+  # one by hand. `stdout` below is just proof the listener's ordinary decode path also works;
+  # nothing about it is specific to this example.
+  stat_in:
+    type: statsd_in
+    bind: 0.0.0.0:8125
+
+  stdout:
+    type: stdio_out
+    sources: [stat_in]
+
+  # Isolates `self`'s log-carrying events from its points and spans -- `keep_signals` clears the
+  # payload slots it isn't given (ADR `signal-filtering-components`), so `logs_out` below never
+  # sees a metric point or a span, only `LogRecord`-carrying events.
+  logs_only:
+    type: keep_signals
+    sources: [self]
+    signals: [logs]
+
+  logs_out:
+    type: stdio_out
+    sources: [logs_only]

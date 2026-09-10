@@ -11,6 +11,8 @@ New ADR checklist: copy `TEMPLATE.md` to `docs/adr/<slug>.md`, fill in `created`
 
 | ADR | Created | Updated |
 |---|---|---|
+| [`tracing` for self-logging, with `Diagnostics` as its producer](tracing-for-self-logging.md) | 2026-09-09 | 2026-09-09 |
+| [A top-level `admin:` block, not a component, for readiness/liveness](admin-readiness-endpoint.md) | 2026-09-09 | 2026-09-09 |
 | [Native transport: handshake, implicit sequencing, and per-batch acknowledgement](native-transport-handshake-and-ack.md) | 2026-09-09 | 2026-09-09 |
 | [Disk-backed durable buffering for a sink's delivery queue](disk-backed-sink-buffer.md) | 2026-09-09 | 2026-09-09 |
 | [`stdio_out`/`file_out` gain a `native` wire-format option](file-output-native-format.md) | 2026-09-09 | 2026-09-09 |

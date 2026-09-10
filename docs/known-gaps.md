@@ -225,19 +225,19 @@ already built that have a known, accepted rough edge.
   `logit.component.diagnostics{key="sample_rate_clamped"}` by `Diagnostics` for free — no separate
   counter), never silent. A sample rate on `g` (gauge) or `s` (set) stays ignored — extrapolating
   an absolute or a cardinality-estimator value is meaningless, unlike a count.
-- **`eprintln!` instead of a real diagnostics facility** — every component's diagnostic now goes
-  through `logit_core::diag::Diagnostics` ([ADR `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md)),
-  which closes the two concrete hazards this entry used to name: every message is prefixed with its
-  component's id (statsd input, InfluxDB output and its encoder, the aggregator's kind-conflict
-  reports, and the `json` transform's parse-failure reports all identify which running instance
-  spoke), and a message that can fire once per event under normal operation (a malformed line, a
-  parse failure) is throttled by occurrence count rather than printed unbounded. What's still
-  missing is the real thing: severity levels, structured fields, filtering — a full `tracing`
-  migration, deliberately kept as separate, later work rather than folded into this narrower fix.
-  `Diagnostics` now also mirrors every `warn_throttled` occurrence (not just the throttled subset
-  that reaches stderr) into a `logit.component.diagnostics{key}` counter when telemetry is live
-  ([internal-telemetry.md](design/internal-telemetry.md)) — a partial, additive answer to "where do
-  these actually go," not a substitute for the `tracing` migration itself.
+- ~~**`eprintln!` instead of a real diagnostics facility** — every component's diagnostic now goes
+  through `logit_core::diag::Diagnostics`, which closes the two concrete hazards this entry used to
+  name: every message is prefixed with its component's id, and a message that can fire once per
+  event under normal operation is throttled by occurrence count rather than printed unbounded.
+  What's still missing is the real thing: severity levels, structured fields, filtering — a full
+  `tracing` migration, deliberately kept as separate, later work rather than folded into this
+  narrower fix.~~ **Closed** ([ADR `tracing-for-self-logging`](adr/tracing-for-self-logging.md)):
+  `Diagnostics::warn`/`warn_throttled` emit through `tracing::warn!`, carrying `component` and
+  `key` as structured fields; new `info`/`error` cover unthrottled lifecycle messages. `logit run`
+  gains `--log-level`/`LOGIT_LOG` and `--log-format text|json`. `grep -rn 'eprintln!'
+  crates/*/src` now names only `logit-cli/src/main.rs` — `Command::Run`'s exit-error printer,
+  `Command::Graph`'s validation warning, and `Command::Ready`'s probe failure — a CLI's own
+  stderr on its own error paths, not a running service's self-log.
 - **Closed for SIGTERM/SIGINT** ([ADR `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md)) — a
   signal handler now closes every listener's inbox normally
   (`logit_pipeline::run_with_shutdown`, `crates/logit-pipeline/src/runtime.rs`), triggering the
@@ -754,9 +754,15 @@ already built that have a known, accepted rough edge.
        later whether `logit` itself should compute a service graph as a component, rather than
        depending on external `metrics_generator` infrastructure to do it — unexplored, no decision
        made.
-  - **Internal logs** — routing `Diagnostics`' stderr output into the graph as `LogRecord` events
+  - ~~**Internal logs** — routing `Diagnostics`' stderr output into the graph as `LogRecord` events
     is the natural next layer, and what the still-deferred `tracing` migration (above) should build
-    on rather than duplicate.
+    on rather than duplicate.~~ **Closed** (`docs/plans/operator-surface.md`, workstream D):
+    `logit_core::telemetry::TelemetryLayer` — a `tracing_subscriber::Layer` — captures every
+    `logit`-targeted `tracing` event at or above `internal.logs`'s threshold (`warn` by default,
+    `error`, or `off`) into the same per-component buffer points and spans already drain from,
+    emitted as ordinary `LogRecord`-carrying `Event`s alongside them. See
+    `docs/design/internal-telemetry.md`'s "Logs" section for the emit path and the bound
+    (`MAX_LOGS_PER_COMPONENT`, 256, dropped and counted past the cap like spans).
   - **`host_metrics`** — facts about the machine itself (CPU, disks, NICs) are a different kind of
     source than `internal`: read from the OS rather than from `logit`'s own counters, need their
     own config, and can fail in ways an in-process atomic read never does. A separate component
@@ -1019,3 +1025,42 @@ already built that have a known, accepted rough edge.
   notice. A missing or unparseable file already degrades gracefully (a `container.id`-only
   resource, diagnosed `metadata_error`); a *silently reshaped* file that still parses but means
   something different is the residual risk this doesn't catch.
+- **The admin endpoint has no TLS and no auth** (`docs/plans/operator-surface.md`, ADR
+  `admin-readiness-endpoint`) — `/readyz`/`/healthz` are loopback/pod-local by design, not meant to
+  cross a real network boundary; anyone who can reach `admin.bind` can read the pipeline's
+  lifecycle phase and every component's coarse state. Deliberate, not deferred: adding either would
+  protect against a threat model this endpoint doesn't have, for a caller that's already inside
+  the process's own network namespace.
+- **Readiness is per-process, not per-sink.** A single sink stuck retrying (`degraded`, in the
+  self-logging sense) does not flip `/readyz` to unready — that's what a sink's own `buffer:`
+  block (retry budget, queue depth) exists to absorb. `/readyz`'s `degraded` phase is reserved for
+  a node that has actually exited with an error, not one that's merely behind. A richer per-sink
+  probe is additive to `PipelineState.components` (already keyed by component id) should a real
+  need for it show up — not built now because nothing has asked for it yet.
+- **A Lua node's post-startup failure is invisible to `/readyz`.** A Lua component runs on a raw
+  `std::thread`, not inside the `JoinSet` `run_with_telemetry` otherwise watches every task
+  through — its `NodeState` reaches `Running` once it reports ready and stays there for the rest
+  of the run, even if the thread later panics or its script errors out unrecoverably. True before
+  workstream B (`docs/plans/operator-surface.md`) and unchanged by it; the readiness side simply
+  can't see what the join loop never sees either. A bad `lua_file`/`Lua` script that fails to
+  *load* is still caught (the startup handshake `run_with_telemetry`'s spawn loop already does) —
+  this gap is specifically about a failure *after* that handshake succeeds.
+- **No config hot reload on SIGHUP.** A config change means a restart; SIGHUP gets no special
+  handling today. Explicitly out of scope for `docs/plans/operator-surface.md` — it needs its own
+  design (diffing the old and new resolved `Graph`, deciding which components can be reused versus
+  torn down and rebuilt), not a small addition to the readiness/exit-code work.
+- **No `logit stats` command reading a live `Registry` out-of-process.** Every current way to see
+  `internal`'s telemetry is *through* the pipeline (a sink attached downstream) — there's no
+  separate out-of-band read path the way `/readyz`/`/healthz` are for lifecycle state. Considered
+  and set aside alongside the admin endpoint (`docs/plans/operator-surface.md`): building a second
+  read path before an operator has actually asked for one would be speculative, the same reasoning
+  ADR `internal-telemetry-as-pipeline-events` already gives for not building a `Registry` addressable
+  outside the pipeline.
+- **Internal-log sampling is the existing per-key occurrence throttle, nothing finer.**
+  `Diagnostics::warn_throttled`'s powers-of-two throttle is what bounds a chatty diagnostic's
+  volume before it ever reaches `tracing`; `TelemetryLayer` itself applies no further sampling or
+  rate limiting once an event is emitted. A component that logs at `warn`/`error` outside that
+  throttle (a lifecycle event, an unthrottled `Diagnostics::error`) has no rate limit at all beyond
+  `MAX_LOGS_PER_COMPONENT`'s bound-and-drop. Not built now — nothing shipped needs it, and the
+  throttle already covers the actual hot path (a malformed line, a parse failure) this would
+  otherwise protect.

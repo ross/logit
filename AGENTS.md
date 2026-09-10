@@ -128,6 +128,18 @@ real Tempo, exactly the way `log_out` proves `syslog_out` against a real Loki. `
 loop run decoupled through a `ReceiveQueue`, the listener-side mirror of `SinkQueue`'s sink-side
 decoupling, so a stalled downstream no longer stops the socket being read; see
 [ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) and the `receive:` config block it introduces.
+`logit` now has an operator surface: leveled, structured self-logging through `tracing`
+(`--log-level`/`LOGIT_LOG`, `--log-format text|json`,
+[ADR `tracing-for-self-logging`](docs/adr/tracing-for-self-logging.md)); a top-level `admin:` block serving `/readyz`/
+`/healthz` and the `logit ready` probe helper `Dockerfile`'s `HEALTHCHECK` uses
+([ADR `admin-readiness-endpoint`](docs/adr/admin-readiness-endpoint.md)); `Input::bind`, opening every listener's socket in a
+pre-pass *before* any task is spawned, so a bind failure fails startup with nothing else running;
+and exit codes that separate a startup failure (`1`) from a runtime one after the process reported
+ready (`2`). `internal`'s own `logs:` setting (`warn` by default, `error`, or `off`) captures
+`logit`'s own `warn`-and-above self-diagnostics into the pipeline as ordinary log events through
+`logit_core::telemetry::TelemetryLayer`, alongside its existing points and spans -- see
+`internal-telemetry.md`'s "Logs" section. `docs/deploying.md`'s "Probes and exit codes" and
+"Self-logging" sections are the operator-facing account of all of it.
 
 ## Environment
 

@@ -213,6 +213,16 @@ services:
     security_opt: ["label=disable"]
     environment:
       INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-logit-demo-token}
+    # `logit ready` (`docs/deploying.md`'s "Probes and exit codes", ADR `admin-readiness-endpoint`)
+    # against demo/logit.yaml's own `admin: { bind: 0.0.0.0:9600 }` -- the same probe
+    # `Dockerfile`'s own `HEALTHCHECK` runs, just declared explicitly here so this stack's
+    # `depends_on: service_healthy` entries below have something real to wait on.
+    healthcheck:
+      test: ["CMD", "logit", "ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
     networks:
       demo:
         aliases: [logit]
@@ -304,10 +314,12 @@ services:
       # Every `manage.py` invocation loads `demoproj/settings.py`'s `LOGGING` regardless of which
       # command runs, and `SysLogHandler.__init__` resolves its `address` host synchronously at
       # handler-configuration time -- so `migrate` needs `logit`'s network alias to exist before it
-      # runs, even though it never actually logs anything. `service_started`, the same limit `app`
-      # itself accepts below for the identical reason (UDP is fire-and-forget either way).
+      # runs, even though it never actually logs anything. `service_healthy`, not just
+      # `service_started`, now that `logit`'s own healthcheck (`docs/deploying.md`'s "Probes and
+      # exit codes") gives Compose something real to wait on -- previously the honest limit was
+      # "started," since there was no way to know a listener was actually bound.
       logit:
-        condition: service_started
+        condition: service_healthy
     entrypoint: ["python", "manage.py"]
     command: ["migrate", "--noinput"]
     environment:
@@ -334,11 +346,12 @@ services:
         condition: service_completed_successfully
       arch-svg:
         condition: service_completed_successfully
-      # UDP is fire-and-forget, so `logit` not being bound yet just loses lines silently rather
-      # than failing -- `service_started` is the honest limit, there's no way to know a UDP
-      # listener is actually bound short of a manual probe (docs/deploying.md's "ordering rule").
+      # `service_healthy`: `logit`'s own healthcheck (`docs/deploying.md`'s "Probes and exit
+      # codes") now answers "is the UDP listener actually bound" for real, closing the gap
+      # `docs/deploying.md`'s "ordering rule" used to name -- UDP is still fire-and-forget once
+      # `app` is running, this only bounds when it's allowed to start sending.
       logit:
-        condition: service_started
+        condition: service_healthy
       # The OTLP/HTTP leg below is TCP and does get retried by the exporter's own SDK-level retry
       # (a `BatchSpanProcessor` export failure just gets dropped and retried on the next batch, no
       # crash), so `service_started` is no less honest a limit for `tempo` either -- same reasoning
@@ -400,8 +413,10 @@ services:
         condition: service_healthy
       app-migrate:
         condition: service_completed_successfully
+      # `service_healthy`, now that `logit` has a real healthcheck to wait on
+      # (`docs/deploying.md`'s "Probes and exit codes").
       logit:
-        condition: service_started
+        condition: service_healthy
       tempo:
         condition: service_started
     entrypoint: ["celery", "-A", "demoproj.celery", "worker"]
@@ -450,8 +465,10 @@ services:
     depends_on:
       nginx:
         condition: service_started
+      # `service_healthy`, now that `logit` has a real healthcheck to wait on
+      # (`docs/deploying.md`'s "Probes and exit codes").
       logit:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:z,ro
     ports:
