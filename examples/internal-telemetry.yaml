@@ -16,12 +16,12 @@
 # `stat_in` and `logs_only`/`logs_out` below are the workstream D demonstration
 # (docs/plans/operator-surface.md, docs/design/internal-telemetry.md's "Logs" section): `self`'s
 # default `logs: warn` threshold captures every `warn`-and-above self-diagnostic -- including
-# `stat_in`'s own throttled `bad_datagram` warning -- into the same drain as `self`'s points and
+# `stat_in`'s own throttled `bad_line` warning -- into the same drain as `self`'s points and
 # spans. Send it a malformed line and watch `logs_out`:
 #
 #   printf 'not a valid statsd line' | nc -u -w0 localhost 8125
 #
-# A `bad_datagram` log event should reach `logs_out` on `self`'s next tick (within `interval`
+# A `bad_line` log event should reach `logs_out` on `self`'s next tick (within `interval`
 # below), attributed to `component: stat_in` -- `Diagnostics::warn_throttled` reports the 1st,
 # 2nd, 4th, ... occurrence, so send it a few times if the first doesn't show up.
 components:
@@ -42,7 +42,7 @@ components:
     bucket: internal
     token: !env INFLUXDB_TOKEN
 
-  # A real listener whose own throttled diagnostics (a malformed datagram, chief among them) are
+  # A real listener whose own throttled diagnostics (a malformed line, chief among them) are
   # exactly what `self` captures as log events -- see the header comment above for how to trigger
   # one by hand. `stdout` below is just proof the listener's ordinary decode path also works;
   # nothing about it is specific to this example.

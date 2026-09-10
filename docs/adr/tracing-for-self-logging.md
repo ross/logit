@@ -69,10 +69,12 @@ lifecycle events extend it to *what phase the process is in*.
 
 ## Consequences
 
-- Every existing `Diagnostics` call site (30+ across `logit-inputs`/`logit-pipeline`) gets
+- Every existing `Diagnostics` call site (30+ across `logit-inputs`, `logit-outputs`,
+  `logit-transforms`, and `logit-pipeline`) gets
   leveled, filterable, structured output for free, with no call-site changes.
-- `grep -rn 'eprintln!' crates/*/src` names only `logit-cli/src/main.rs`'s `Command::Graph`
-  warning — a CLI's own stderr on a one-shot command, not a running service's self-log.
+- `grep -rn 'eprintln!' crates/*/src` names only `logit-cli/src/main.rs`: `Command::Run`'s
+  exit-error printer, `Command::Graph`'s validation warning, and `Command::Ready`'s probe failure
+  — a CLI's own stderr on its own error paths, not a running service's self-log.
 - Workstream D's `TelemetryLayer` (see `docs/design/internal-telemetry.md`'s "Logs" section) is
   the producer ADR `internal-telemetry-as-pipeline-events` predicted: a `tracing_subscriber::Layer`
   feeding `Registry` the same way any other component's `Telemetry` handle does.

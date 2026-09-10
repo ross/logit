@@ -186,7 +186,7 @@ already built that have a known, accepted rough edge.
   `logit.component.diagnostics{key="sample_rate_clamped"}` by `Diagnostics` for free — no separate
   counter), never silent. A sample rate on `g` (gauge) or `s` (set) stays ignored — extrapolating
   an absolute or a cardinality-estimator value is meaningless, unlike a count.
-~~**`eprintln!` instead of a real diagnostics facility** — every component's diagnostic now goes
+- ~~**`eprintln!` instead of a real diagnostics facility** — every component's diagnostic now goes
   through `logit_core::diag::Diagnostics`, which closes the two concrete hazards this entry used to
   name: every message is prefixed with its component's id, and a message that can fire once per
   event under normal operation is throttled by occurrence count rather than printed unbounded.
@@ -196,8 +196,9 @@ already built that have a known, accepted rough edge.
   `Diagnostics::warn`/`warn_throttled` emit through `tracing::warn!`, carrying `component` and
   `key` as structured fields; new `info`/`error` cover unthrottled lifecycle messages. `logit run`
   gains `--log-level`/`LOGIT_LOG` and `--log-format text|json`. `grep -rn 'eprintln!'
-  crates/*/src` now names only `logit-cli/src/main.rs`'s `Command::Graph` warning — a one-shot
-  CLI command's own stderr, not a running service's self-log.
+  crates/*/src` now names only `logit-cli/src/main.rs` — `Command::Run`'s exit-error printer,
+  `Command::Graph`'s validation warning, and `Command::Ready`'s probe failure — a CLI's own
+  stderr on its own error paths, not a running service's self-log.
 - **Closed for SIGTERM/SIGINT** ([ADR `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md)) — a
   signal handler now closes every listener's inbox normally
   (`logit_pipeline::run_with_shutdown`, `crates/logit-pipeline/src/runtime.rs`), triggering the
@@ -714,7 +715,7 @@ already built that have a known, accepted rough edge.
        later whether `logit` itself should compute a service graph as a component, rather than
        depending on external `metrics_generator` infrastructure to do it — unexplored, no decision
        made.
-  ~~**Internal logs** — routing `Diagnostics`' stderr output into the graph as `LogRecord` events
+  - ~~**Internal logs** — routing `Diagnostics`' stderr output into the graph as `LogRecord` events
     is the natural next layer, and what the still-deferred `tracing` migration (above) should build
     on rather than duplicate.~~ **Closed** (`docs/plans/operator-surface.md`, workstream D):
     `logit_core::telemetry::TelemetryLayer` — a `tracing_subscriber::Layer` — captures every

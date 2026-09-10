@@ -103,8 +103,9 @@ admin:
 starting` before that, `503 draining` after a shutdown signal, and `503 degraded` if any node has
 exited with an error while the process is still draining. `GET /healthz` returns `200 ok`
 whenever the admin task itself can still answer, regardless of the pipeline's own state. Add
-`?format=json` to either route for `{status, since, components: {id: "pending"|"bound"|
-"running"|"finished"|"failed"}}` instead of the bare status word. No TLS, no auth — this is a
+`?format=json` to `/readyz` for `{status, since, components: {id: "pending"|"bound"|
+"running"|"finished"|"failed"}}` instead of the bare status word; `/healthz?format=json` returns
+just `{status}`, since it has nothing else to report. No TLS, no auth — this is a
 loopback/pod-local endpoint by design, not one meant to cross a real network boundary.
 
 A Kubernetes deployment maps naturally onto the two routes:
@@ -126,8 +127,9 @@ health check runs instead:
 HEALTHCHECK --interval=10s --timeout=2s --start-period=5s CMD ["logit", "ready"]
 ```
 
-It exits 0 and prints the status word on `200`, exits 1 and prints it otherwise (including "no
-admin server reachable" if `admin:` was never configured).
+It exits 0 and prints the status word on `200`; anything else exits 1, printing the status word
+the server returned or — with nothing listening at all, e.g. `admin:` was never configured — the
+connection error instead.
 
 ### What to watch
 
@@ -155,20 +157,23 @@ a per-module override (`logit_pipeline=trace,info`). `--log-format json` emits o
 per line with `timestamp`, `level`, `target`, `component`, `key`, and `message` fields, for a log
 collector to parse directly rather than scraping text.
 
-Every self-diagnostic carries a `component` field naming which component reported it, and (for a
-throttled or lifecycle diagnostic) a `key` naming *why*. Lifecycle events are stable, `&'static
-str` names — safe to alert on directly:
+Every *component-scoped* self-diagnostic carries a `component` field naming which component
+reported it, and (for a throttled diagnostic, or a component-owned lifecycle message like
+`bound`/`recovered`) a `key` naming *why*. The process-level lifecycle events below (`starting`,
+`ready`, `shutdown signal received`, `drain complete`, `exiting`) carry neither — they are about
+the process, not any one component. Lifecycle events are stable, `&'static str` names — safe to
+alert on directly:
 
 | Event | Level | When |
 |---|---|---|
 | `starting` | info | Config loaded, before graph resolution — named even if the config goes on to fail. |
-| `bound` | info | One listener's socket/file opened, during the pre-bind pass. |
+| `bound` | info | One socket listener's socket opened, during the pre-bind pass (`syslog_in`/`statsd_in`/`otlp_in`; `tail_in`/`docker_in` emit none). |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped mid-drain. |
-| `degraded` | warn | A sink's first failed delivery after a prior success. |
+| `degraded` | warn | A sink's first dropped batch (its retry budget exhausted) since it was last healthy. |
 | `recovered` | info | A sink's first successful delivery after `degraded`. |
-| `exiting` | info/error | The process is about to exit — `error` at exit code `2`. |
+| `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
 
 `internal`'s own `logs:` setting (`warn` by default, `error`, or `off`) routes every `warn`-or-above
 self-diagnostic into the pipeline as an ordinary log event, alongside its existing points and
@@ -573,9 +578,10 @@ until logit ready --admin http://<logit-host>:9600; do sleep 0.5; done
 ```
 
 Without `admin:` configured, the `bound`/`ready` lifecycle log lines (default `--log-level info`,
-[Self-logging](#self-logging) above) are the fallback — `bound` names each listener's address as
-it opens, and `ready` fires once all of them have. A manual smoke test still works if neither is
-wired up: send a line and watch for the corresponding `stdio_out` block:
+[Self-logging](#self-logging) above) are the fallback — `bound` names each socket listener's
+address as it opens (`syslog_in` included), and `ready` fires once every listener is bound. A
+manual smoke test still works if neither is wired up: send a line and watch for the corresponding
+`stdio_out` block:
 
 ```sh
 logger -n <logit-host> -P 5140 -d -t smoke '{}'

@@ -32,11 +32,11 @@ once every listener is bound and every node task is running; `503 starting` befo
 draining` after a shutdown signal; `503 degraded` if any node has exited with an error while the
 process is still draining). `GET /healthz` reports only whether the admin task itself can still
 answer — `200 ok` whenever the tokio runtime is alive, regardless of the pipeline's own state.
-`?format=json` returns `{status, since, components}` on either route for a caller that wants the
-detail; `HEAD` mirrors `GET`. No `/metrics`, no config dump — see this ADR's own "Alternatives"
+`?format=json` returns `{status, since, components}` on `/readyz` for a caller that wants the
+detail (`/healthz?format=json` returns just `{status}`); `HEAD` mirrors `GET`. No `/metrics`, no config dump — see this ADR's own "Alternatives"
 below and `docs/design/internal-telemetry.md`'s "What this is not".
 
-**HTTP/1.1 only, no TLS, no auth.** This is a loopback/pod-local endpoint: a orchestrator's kubelet
+**HTTP/1.1 only, no TLS, no auth.** This is a loopback/pod-local endpoint: an orchestrator's kubelet
 or Docker's own health-check daemon speaks to it inside the same network namespace or the same
 pod, never across a real network boundary. Adding TLS or auth would protect against a threat model
 this endpoint doesn't have and complicate exactly the deployment shapes it exists to serve — see
