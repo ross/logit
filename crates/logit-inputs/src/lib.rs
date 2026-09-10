@@ -8,10 +8,12 @@
 
 pub mod docker;
 pub mod internal;
+pub mod logit;
 pub mod otlp;
 pub mod statsd;
 pub mod syslog;
 pub mod tail;
+mod tls;
 pub mod udp;
 
 pub use logit_pipeline::Input;

@@ -23,6 +23,7 @@
 //!   of change and is not attempted losslessly by an old reader -- see [`value`]'s and
 //!   [`record`]'s own doc comments for exactly what each degrades to.
 
+pub mod control;
 pub mod dict;
 pub mod record;
 pub mod value;
