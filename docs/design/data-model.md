@@ -239,6 +239,13 @@ either bloat every event or fight the ownership model:
   into.
 - **Buffering/retry state** belongs to the output layer's buffer trait
   ([docs/design/wire-protocol.md](wire-protocol.md)), not to events sitting in a queue somewhere.
+- **Batch provenance** (which component created a batch, which one most recently handled it) is
+  pipeline-graph identity, not data — it travels alongside `EventBatch` on the graph edge
+  (`logit_pipeline::fanout::Delivered`), never inside it, so a transform has no way to forge or
+  silently drop it. See [pipeline-graph.md](pipeline-graph.md)'s "Provenance propagation" and
+  [ADR `batch-provenance-on-delivered`](../adr/batch-provenance-on-delivered.md). A script that
+  wants it in the data copies it into an attribute explicitly; `logit` never stamps it there on its
+  own.
 
 ## Codecs
 

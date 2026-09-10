@@ -223,6 +223,46 @@ doesn't aggregate them on the script's behalf the way
 `aggregate` transform. `resource`, below, has the same default staleness at a flush tick, but --
 unlike `trace` -- a script can override it explicitly.
 
+## Reading provenance
+
+A `provenance` global gives `process()` read-only access to which component created the incoming
+batch, which component most recently handled it, and this worker's own component id
+(`docs/design/pipeline-graph.md`'s "Provenance propagation",
+[ADR `batch-provenance-on-delivered`](../adr/batch-provenance-on-delivered.md)):
+
+```lua
+function process(event)
+  if provenance.origin == "nginx_in" then
+    event.attributes["source.origin"] = provenance.origin
+  end
+  return event
+end
+```
+
+| Field | Meaning |
+|---|---|
+| `provenance.origin` | The component that created this batch (normally a listener); `nil` only if unset |
+| `provenance.previous` | The component this batch was received from -- the node feeding *this* one |
+| `provenance.component` | This worker's own component id |
+
+Unlike `trace` and `resource`, **`provenance` is genuinely read-only, enforced, not by
+convention.** `provenance.origin = "x"` raises `provenance.origin is read-only` rather than
+silently succeeding and being clobbered on the next batch -- the same "read-only, name it or say
+no field" split `event.has_log`/`event.log`'s fields already use, so a write to an unknown field
+(`provenance.bogus = 1`) raises `provenance has no field 'bogus'` instead, and a caller can tell
+"this isn't for you to write" from "you mistyped this."
+
+`provenance.origin`/`.previous` are set once per incoming batch, before any of its events reach
+`process()` -- the same timing `trace` uses. `provenance.component` is fixed for this worker's
+whole lifetime, set once when the pipeline starts. **Stale during `flush()`**, the same way `trace`
+is: `provenance.origin`/`.previous` keep whatever the most recently processed batch set, since a
+flush-driven emission has no single incoming batch to attribute itself to (see "Reading trace
+context" above for the full reasoning, and `docs/known-gaps.md`).
+
+`provenance` carries no application meaning on its own -- a script that wants it in the outgoing
+data copies it into an attribute explicitly (`event.attributes["source.origin"] =
+provenance.origin`, as above); `logit` never stamps it there itself.
+
 ## Reading and writing `resource`
 
 A `resource` global gives `process()` (and `flush()`) read *and write* access to the incoming

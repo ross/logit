@@ -7,7 +7,7 @@
 //! doesn't actually need dependency ordering: a `Fanout` is just cloned `Sender`s into inboxes
 //! that already exist by construction, regardless of which node gets spawned first.
 
-use crate::fanout::{Delivered, TraceContext};
+use crate::fanout::{BatchContext, Delivered, TraceContext};
 use crate::graph::Graph;
 use crate::output::{classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fault};
 #[cfg(test)]
@@ -249,6 +249,7 @@ pub async fn run_with_telemetry(
         let component = graph.components.get(&id).expect("id came from this graph");
         let node_telemetry = telemetry.remove(&id).unwrap_or_default();
         let fanout = Fanout::new(component.consumers.iter().map(|c| senders[c].clone()).collect())
+            .with_component(&id)
             .with_telemetry(node_telemetry.clone());
         let inbox = inboxes.remove(&id).expect("an inbox was created for every id above");
         let spec = specs
@@ -578,7 +579,7 @@ async fn run_output(
     let mut abandoned_batches: u64 = 0;
     let mut abandoned_events: u64 = 0;
     while let Ok(delivered) = inbox.try_recv() {
-        let ctx = delivered.context();
+        let ctx = delivered.batch_context();
         let batch = unwrap_batch_arc(delivered);
         abandoned_batches += 1;
         abandoned_events += batch.events.len() as u64;
@@ -644,8 +645,9 @@ pub async fn drain_inbox(
     while let Some(delivered) = inbox.recv().await {
         // Read before `unwrap_batch_arc` consumes `delivered` -- the store carries this context
         // alongside the batch (`queue.rs`'s own doc comment) specifically so `write_loop`'s sink
-        // span can be parented on it once `peek` reads it back.
-        let ctx = delivered.context();
+        // span can be parented on it once `peek` reads it back, and so `Output::observe_batch`
+        // has the provenance that arrived with this batch to hand a sink like `logit_out`.
+        let ctx = delivered.batch_context();
         let batch = unwrap_batch_arc(delivered);
         telemetry.count("logit.component.batches.received", 1.0, &[]);
         telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
@@ -658,9 +660,10 @@ pub async fn drain_inbox(
 /// one `Arc::new` (previously zero on this path -- see `drain_inbox`'s own doc comment);
 /// `Delivered::Shared` is already an `Arc`, so this is just a move.
 ///
-/// Discards `delivered`'s `TraceContext` -- the sink/output path doesn't propagate trace context
-/// yet (`Output::send` still takes `&EventBatch`, not `&Delivered`; see `unwrap_batch`'s own doc
-/// comment and `docs/design/pipeline-graph.md`'s "Trace context propagation" section).
+/// Discards `delivered`'s `BatchContext` -- callers that need it (`drain_inbox`, the abandoned-
+/// inbox sweep above) read it via `Delivered::batch_context` first, since `Output::send` itself
+/// still takes `&EventBatch`, not `&Delivered` (see `unwrap_batch`'s own doc comment and
+/// `docs/design/pipeline-graph.md`'s "Trace context propagation" section).
 fn unwrap_batch_arc(delivered: Delivered) -> Arc<EventBatch> {
     match delivered {
         Delivered::Owned(batch, _ctx) => Arc::new(batch),
@@ -967,7 +970,7 @@ async fn write_loop(
         // actually driven to completion. Reducing each `select!` to a plain enum keeps every
         // `output` access outside the macro, in the `match` below, where there's no ambiguity.
         enum NextBatch {
-            Batch(Arc<EventBatch>, TraceContext),
+            Batch(Arc<EventBatch>, BatchContext),
             Closed,
             ShutdownExpired,
         }
@@ -988,19 +991,26 @@ async fn write_loop(
 
         // The sink span: the only span that can carry `SpanStatus::Error` and a fault tag,
         // which is the whole point of instrumenting a sink
-        // (`docs/adr/internal-span-emission-and-deterministic-sampling.md`). `ctx.child()` is
+        // (`docs/adr/internal-span-emission-and-deterministic-sampling.md`). `ctx.trace.child()` is
         // minted, used as this span's identity, and then discarded -- `run_output` emits nothing
         // further downstream for anything to inherit it (`Output::send` takes `&EventBatch`, not
         // `&Delivered`), so there is no propagation left to do with it beyond this one span.
-        let span_ctx = ctx.child();
+        let span_ctx = ctx.trace.child();
         let mut span = telemetry.span(
             "deliver",
             SpanKind::Client,
             span_ctx.trace_id,
             span_ctx.span_id,
-            Some(ctx.span_id),
+            Some(ctx.trace.span_id),
         );
         span.events(batch.events.len() as u64);
+
+        // Gives the sink this batch's `BatchContext` before each delivery attempt (including
+        // retries, since `batch`/`ctx` here are the same values across the whole
+        // `deliver_with_retry` call below) -- `logit_out` is the one implementer today, threading
+        // provenance across the wire (`docs/adr/batch-provenance-on-delivered.md`). Default
+        // no-op for every other sink.
+        output.observe_batch(ctx);
 
         enum DeliverStep {
             Outcome(Delivery),
@@ -1164,26 +1174,30 @@ async fn run_transform(
         // survives `process_batch`, however many events it started from) traces back to this one
         // incoming batch, so it's the unambiguous parent (`TraceContext`'s own doc comment,
         // `crates/logit-pipeline/src/fanout.rs`). `run_flush` below has no such single parent and
-        // deliberately doesn't do this.
-        let parent = batch.context();
+        // deliberately doesn't do this. `parent.provenance` is what this batch arrived carrying --
+        // propagated through unchanged to `ctx` below, for `Fanout::stamp` to rewrite `previous`
+        // onto while leaving `origin` alone.
+        let parent = batch.batch_context();
         // Lets a flush-bearing transform (only `Aggregator` today) record this batch as a
         // contributor to whatever it's about to absorb from it -- the flush-side linking
         // `TraceContext`'s doc comment and `docs/known-gaps.md`'s internal-spans entry describe.
-        // A no-op for every other transform.
-        transform.observe_batch_context(parent);
+        // A no-op for every other transform. `observe_provenance` is the same idea for
+        // `Provenance` -- a no-op for every transform today.
+        transform.observe_batch_context(parent.trace);
+        transform.observe_provenance(parent.provenance);
         // Minted here, not inside `Fanout::send_with_context`, because this node records its own
         // span around `process_batch` *and* the send
         // (`docs/adr/internal-span-emission-and-deterministic-sampling.md`'s per-node-kind
         // table): the span's `span_id` and the outgoing
         // `Delivered`'s `span_id` have to be the same id, which only holds if this is the one and
         // only place a context is minted for this emission.
-        let ctx = parent.child();
+        let ctx = BatchContext { trace: parent.trace.child(), provenance: parent.provenance };
         let mut span = telemetry.span(
             "process",
             SpanKind::Internal,
-            ctx.trace_id,
-            ctx.span_id,
-            Some(parent.span_id),
+            ctx.trace.trace_id,
+            ctx.trace.span_id,
+            Some(parent.trace.span_id),
         );
         let batch = unwrap_batch(batch);
         if let Some(out) = process_batch(&mut *transform, batch, &telemetry) {
@@ -1257,8 +1271,16 @@ pub fn process_batch(
 /// `Transform::flush` returns per event (`Aggregator`'s bounded `ContributingContexts`) are unioned
 /// onto this one flush span, bounded by `MAX_LINKS_PER_SPAN` same as any other span's links.
 async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, telemetry: &Telemetry) {
-    let ctx = TraceContext::new_root();
-    let mut span = telemetry.span("flush", SpanKind::Internal, ctx.trace_id, ctx.span_id, None);
+    // Empty provenance in, same as the trace context's fresh root: a flush is a genuinely new
+    // artifact (merged sketches/counters that were never any one input event), so there is no
+    // single incoming batch's `origin`/`previous` to inherit any more than there's a single
+    // incoming `TraceContext` to inherit. `Fanout::stamp` (`fanout.rs`) fills in *both*
+    // `origin` and `previous` as this flushing component's own id -- exactly the same rule a
+    // listener's first send gets, and for the same reason: nothing upstream to attribute this
+    // emission to. See `docs/adr/batch-provenance-on-delivered.md`.
+    let ctx: BatchContext = TraceContext::new_root().into();
+    let mut span =
+        telemetry.span("flush", SpanKind::Internal, ctx.trace.trace_id, ctx.trace.span_id, None);
 
     let timer = telemetry.timer("logit.component.flush.duration");
     let flushed = transform.flush(now_unix_nanos());
@@ -1305,7 +1327,9 @@ fn run_lua(
     telemetry: Telemetry,
     runtime: tokio::runtime::Handle,
 ) {
-    let worker = match ScriptWorker::new(&script).and_then(|w| w.with_telemetry(telemetry.clone()))
+    let worker = match ScriptWorker::new(&script)
+        .and_then(|w| w.with_telemetry(telemetry.clone()))
+        .map(|w| w.with_component(&id))
     {
         Ok(worker) => worker,
         Err(err) => {
@@ -1342,8 +1366,17 @@ fn run_lua(
                      worker: &ScriptWorker,
                      resource: &mut Arc<Resource>,
                      fanout: &Fanout| {
-        let ctx = TraceContext::new_root();
-        let mut span = telemetry.span("flush", SpanKind::Internal, ctx.trace_id, ctx.span_id, None);
+        // Empty provenance in, same reasoning as `run_flush`'s own doc comment: a Lua `flush()`
+        // is a fresh emission with no single incoming batch to inherit `origin`/`previous` from,
+        // so `Fanout::stamp` fills in both as this component's own id.
+        let ctx: BatchContext = TraceContext::new_root().into();
+        let mut span = telemetry.span(
+            "flush",
+            SpanKind::Internal,
+            ctx.trace.trace_id,
+            ctx.trace.span_id,
+            None,
+        );
 
         let timer = telemetry.timer("logit.component.flush.duration");
         let result = worker.flush();
@@ -1416,30 +1449,36 @@ fn run_lua(
         // Read before `unwrap_batch` consumes `batch` -- same reasoning as `run_transform`'s
         // non-flush path (`crates/logit-pipeline/src/fanout.rs`'s `TraceContext` doc comment):
         // this call's entire emission traces back to this one incoming batch. `flush_now` above
-        // has no such single parent and deliberately doesn't do this.
-        let parent = batch.context();
+        // has no such single parent and deliberately doesn't do this. `parent.provenance` is
+        // propagated through to `ctx` unchanged, same as `run_transform`'s non-flush path.
+        let parent = batch.batch_context();
         // Same reasoning as `run_transform`'s non-flush path: this node records its own span
         // around `worker.process()` *and* the blocking send, so the context has to be minted once,
         // here, rather than letting `Fanout::send_blocking_with_context` mint an unrelated one
         // later -- the span's `span_id` and the outgoing `Delivered`'s `span_id` must match.
-        let ctx = parent.child();
+        let ctx = BatchContext { trace: parent.trace.child(), provenance: parent.provenance };
         let mut span = telemetry.span(
             "process",
             SpanKind::Internal,
-            ctx.trace_id,
-            ctx.span_id,
-            Some(parent.span_id),
+            ctx.trace.trace_id,
+            ctx.trace.span_id,
+            Some(parent.trace.span_id),
         );
         // Lets the script's own `process()` read `trace.trace_id`/`trace.span_id`
         // (`crates/logit-script/src/trace.rs`) -- essentially infallible in practice (the
         // registry-held table is independent of whatever a script does to the `trace` global),
         // logged rather than treated as fatal on the off chance it isn't.
-        if let Err(err) = worker.set_trace_context(parent.trace_id, parent.span_id) {
+        if let Err(err) = worker.set_trace_context(parent.trace.trace_id, parent.trace.span_id) {
             diag.warn_throttled(
                 "trace_context_error",
                 format_args!("setting trace context failed: {err}"),
             );
         }
+        // Lets the script's own `process()` read `provenance.origin`/`.previous`
+        // (`crates/logit-script/src/provenance.rs`) -- a plain `Rc<RefCell<..>>` mutation, like
+        // `set_resource` just below, so unlike `set_trace_context` there's no `&Lua` call
+        // involved and so nothing that can fail.
+        worker.set_provenance(parent.provenance);
         let batch = unwrap_batch(batch);
         // Lets the script's own `process()`/`flush()` read (and write) `resource`
         // (`crates/logit-script/src/resource.rs`) -- called on every batch, including one whose
@@ -3606,7 +3645,7 @@ mod tests {
             telemetry.clone(),
         )));
         for batch in batches {
-            store.push((batch, TraceContext::default())).await;
+            store.push((batch, TraceContext::default().into())).await;
         }
         store.close();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -3761,7 +3800,7 @@ mod tests {
         )));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        store.push((one_event_batch(1.0), TraceContext::default())).await;
+        store.push((one_event_batch(1.0), TraceContext::default().into())).await;
 
         let store_for_task = Arc::clone(&store);
         // `write_loop` borrows `output` (it no longer owns it -- `run_output` does, normally);
@@ -3788,7 +3827,7 @@ mod tests {
         // above documents.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW).await;
 
-        store.push((one_event_batch(2.0), TraceContext::default())).await;
+        store.push((one_event_batch(2.0), TraceContext::default().into())).await;
         store.close();
 
         let result = tokio::time::timeout(Duration::from_secs(5), handle)
@@ -3848,7 +3887,7 @@ mod tests {
         };
 
         // attempt 1: Permanent -- sets streak_since
-        store.push((one_event_batch(1.0), TraceContext::default())).await;
+        store.push((one_event_batch(1.0), TraceContext::default().into())).await;
 
         let store_for_task = Arc::clone(&store);
         let handle = tokio::spawn(async move {
@@ -3869,11 +3908,11 @@ mod tests {
         // reset the streak before the window is ever checked again.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
         // attempt 2: success -- resets the streak
-        store.push((one_event_batch(2.0), TraceContext::default())).await;
+        store.push((one_event_batch(2.0), TraceContext::default().into())).await;
         attempted_rx.recv().await.expect("attempt 2 (succeeding) should have happened");
 
         // attempt 3: Permanent again -- a fresh streak
-        store.push((one_event_batch(3.0), TraceContext::default())).await;
+        store.push((one_event_batch(3.0), TraceContext::default().into())).await;
         attempted_rx.recv().await.expect("attempt 3 (failing again) should have happened");
         store.close();
 
@@ -3920,7 +3959,7 @@ mod tests {
         let (attempted_tx, mut attempted_rx) = mpsc::unbounded_channel();
         let output = AlwaysUnclassifiedFailure { attempted: attempted_tx };
 
-        store.push((one_event_batch(1.0), TraceContext::default())).await;
+        store.push((one_event_batch(1.0), TraceContext::default().into())).await;
         let store_for_task = Arc::clone(&store);
         let handle = tokio::spawn(async move {
             let mut output = output;
@@ -3938,7 +3977,7 @@ mod tests {
 
         // Well past the window, with nothing but this unclassified failure the whole time.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
-        store.push((one_event_batch(2.0), TraceContext::default())).await;
+        store.push((one_event_batch(2.0), TraceContext::default().into())).await;
         attempted_rx.recv().await.expect("a later attempt should have happened");
         store.close();
 
@@ -4008,7 +4047,7 @@ mod tests {
         };
 
         // Permanent -- sets streak_since
-        store.push((one_event_batch(1.0), TraceContext::default())).await;
+        store.push((one_event_batch(1.0), TraceContext::default().into())).await;
         let store_for_task = Arc::clone(&store);
         let handle = tokio::spawn(async move {
             let mut output = output;
@@ -4031,12 +4070,12 @@ mod tests {
         // retry loop has already given up and committed batch 2 before batch 3 is pushed --
         // simpler and less brittle than trying to count exactly how many retries it took.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
-        store.push((one_event_batch(2.0), TraceContext::default())).await;
+        store.push((one_event_batch(2.0), TraceContext::default().into())).await;
         attempted_rx.recv().await.expect("batch 2's first attempt should have happened");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Permanent again -- must be a fresh streak
-        store.push((one_event_batch(3.0), TraceContext::default())).await;
+        store.push((one_event_batch(3.0), TraceContext::default().into())).await;
         attempted_rx.recv().await.expect("attempt 3 (Permanent) should have happened");
         store.close();
 
@@ -4064,7 +4103,7 @@ mod tests {
             SinkQueueConfig::default(),
             telemetry.clone(),
         )));
-        store.push((one_event_batch(1.0), TraceContext::default())).await;
+        store.push((one_event_batch(1.0), TraceContext::default().into())).await;
         // Deliberately left open (not closed) -- shutdown grace must cut delivery off even while
         // the store could still receive more, not just once it's known to be exhausted.
 
@@ -4158,7 +4197,7 @@ mod tests {
                     resource: Arc::new(Resource::default()),
                     events: vec![counter_event("hits", 1.0)],
                 },
-                TraceContext::new_root(),
+                TraceContext::new_root().into(),
             ))
             .await
             .expect("receiver should still be alive");
@@ -4176,7 +4215,7 @@ mod tests {
                     resource: Arc::new(Resource::default()),
                     events: vec![counter_event("hits", 2.0)],
                 },
-                TraceContext::new_root(),
+                TraceContext::new_root().into(),
             ))
             .await
             .expect("receiver should still be alive");
@@ -4256,7 +4295,7 @@ mod tests {
                     resource: Arc::new(Resource::default()),
                     events: vec![counter_event("hits", 1.0)],
                 },
-                TraceContext::new_root(),
+                TraceContext::new_root().into(),
             ))
             .await
             .expect("receiver should still be alive");
@@ -4271,7 +4310,7 @@ mod tests {
                     resource: Arc::new(Resource::default()),
                     events: vec![counter_event("hits", 2.0)],
                 },
-                TraceContext::new_root(),
+                TraceContext::new_root().into(),
             ))
             .await
             .expect("receiver should still be alive");
@@ -4289,7 +4328,7 @@ mod tests {
                     resource: Arc::new(Resource::default()),
                     events: vec![counter_event("hits", 3.0)],
                 },
-                TraceContext::new_root(),
+                TraceContext::new_root().into(),
             ))
             .await
             .expect("receiver should still be alive");
@@ -4363,7 +4402,10 @@ mod tests {
             resource: Arc::new(Resource::default()),
             events: vec![counter_event("hits", 0.0)],
         };
-        let one_record_len = crate::disk_queue::test_support::encoded_record_len(&sample_batch);
+        let one_record_len = crate::disk_queue::test_support::encoded_record_len(
+            &sample_batch,
+            logit_core::Provenance::default(),
+        );
 
         let store_config = SinkStoreConfig::Disk(crate::disk_queue::DiskQueueConfig {
             dir: dir.clone(),
@@ -4397,7 +4439,7 @@ mod tests {
                     resource: Arc::new(Resource::default()),
                     events: vec![counter_event("hits", 1.0)],
                 },
-                TraceContext::new_root(),
+                TraceContext::new_root().into(),
             ))
             .await
             .expect("receiver should still be alive");
@@ -4413,7 +4455,7 @@ mod tests {
                     resource: Arc::new(Resource::default()),
                     events: vec![counter_event("hits", 2.0)],
                 },
-                TraceContext::new_root(),
+                TraceContext::new_root().into(),
             ))
             .await
             .expect("receiver should still be alive");
@@ -4429,7 +4471,7 @@ mod tests {
                     resource: Arc::new(Resource::default()),
                     events: vec![counter_event("hits", 3.0)],
                 },
-                TraceContext::new_root(),
+                TraceContext::new_root().into(),
             ))
             .await
             .expect("receiver should still be alive");
@@ -5206,7 +5248,7 @@ mod tests {
             resource: Arc::new(Resource::default()),
             events: vec![counter_event("hits", 1.0)],
         };
-        in_tx.send(Delivered::Owned(batch, parent)).await.expect("inbox should accept");
+        in_tx.send(Delivered::Owned(batch, parent.into())).await.expect("inbox should accept");
         drop(in_tx); // close the inbox so run_transform returns once it's drained
 
         run_transform(transform, in_rx, fanout, Telemetry::default())
@@ -5247,8 +5289,8 @@ mod tests {
             resource: Arc::new(Resource::default()),
             events: vec![counter_event("hits", 1.0)],
         };
-        in_tx.send(Delivered::Owned(batch(), ctx_a)).await.expect("inbox should accept");
-        in_tx.send(Delivered::Owned(batch(), ctx_b)).await.expect("inbox should accept");
+        in_tx.send(Delivered::Owned(batch(), ctx_a.into())).await.expect("inbox should accept");
+        in_tx.send(Delivered::Owned(batch(), ctx_b.into())).await.expect("inbox should accept");
         drop(in_tx); // close the inbox -- triggers the close-time flush that emits both, absorbed
 
         run_transform(transform, in_rx, fanout, Telemetry::default())
@@ -5290,7 +5332,7 @@ mod tests {
             resource: Arc::new(Resource::default()),
             events: vec![counter_event("hits", 1.0)],
         };
-        in_tx.send(Delivered::Owned(batch, parent)).await.expect("inbox should accept");
+        in_tx.send(Delivered::Owned(batch, parent.into())).await.expect("inbox should accept");
         drop(in_tx);
 
         run_transform(transform, in_rx, fanout, telemetry)
@@ -5328,7 +5370,7 @@ mod tests {
             resource: Arc::new(Resource::default()),
             events: vec![counter_event("hits", 1.0)],
         };
-        in_tx.send(Delivered::Owned(batch, parent)).await.expect("inbox should accept");
+        in_tx.send(Delivered::Owned(batch, parent.into())).await.expect("inbox should accept");
         drop(in_tx);
 
         run_transform(transform, in_rx, fanout, telemetry)
@@ -5361,7 +5403,7 @@ mod tests {
             resource: Arc::new(Resource::default()),
             events: vec![counter_event("hits", 1.0)],
         };
-        in_tx.send(Delivered::Owned(batch, parent)).await.expect("inbox should accept");
+        in_tx.send(Delivered::Owned(batch, parent.into())).await.expect("inbox should accept");
         drop(in_tx);
 
         run_transform(transform, in_rx, fanout, telemetry)
@@ -5455,7 +5497,7 @@ mod tests {
             SinkQueueConfig::default(),
             telemetry.clone(),
         )));
-        store.push((one_event_batch(1.0), TraceContext::new_root())).await;
+        store.push((one_event_batch(1.0), TraceContext::new_root().into())).await;
         store.close();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -5491,7 +5533,7 @@ mod tests {
             telemetry.clone(),
         )));
         let parent = TraceContext::new_root();
-        store.push((one_event_batch(1.0), parent)).await;
+        store.push((one_event_batch(1.0), parent.into())).await;
         store.close();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 

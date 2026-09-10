@@ -18,8 +18,8 @@
 #![cfg(target_pointer_width = "64")]
 
 use logit_core::{
-    AttrMap, Event, LogRecord, MetricKind, MetricList, MetricRecord, Resource, SpanRecord, Symbol,
-    TraceRef, Value,
+    AttrMap, Event, LogRecord, MetricKind, MetricList, MetricRecord, Provenance, Resource,
+    SpanRecord, Symbol, TraceRef, Value,
 };
 use std::mem::{size_of, size_of_val};
 
@@ -29,6 +29,15 @@ use std::mem::{size_of, size_of_val};
 fn symbol_is_a_niche_optimized_u32() {
     assert_eq!(size_of::<Symbol>(), 4);
     assert_eq!(size_of::<Option<Symbol>>(), 4, "Spur's NonZero niche should absorb the None case");
+}
+
+/// `Provenance` (`origin`/`previous`, both `Option<Symbol>`) -- the batch-level graph identity
+/// carried alongside `logit-pipeline`'s `TraceContext` on every `Delivered`
+/// (`docs/adr/batch-provenance-on-delivered.md`). Both fields niche-optimize per
+/// `symbol_is_a_niche_optimized_u32` above, so this is two 4-byte fields with no padding.
+#[test]
+fn provenance_is_two_niche_optimized_option_symbols() {
+    assert_eq!(size_of::<Provenance>(), 8);
 }
 
 /// `Value`'s size is set by its largest variant, `Bytes` (4 words: ptr, len, data, vtable), plus a

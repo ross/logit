@@ -25,8 +25,8 @@ use logit_outputs::stdio::{EventDump, Format};
 use logit_outputs::syslog::{Format as SyslogFormat, MessageBuf, SyslogEncoder};
 use logit_pipeline::runtime::drain_inbox;
 use logit_pipeline::{
-    process_batch, send_batch, unwrap_batch, Delivered, Fanout, SinkQueue, SinkQueueConfig,
-    SinkStore, TraceContext, Transform,
+    process_batch, send_batch, unwrap_batch, BatchContext, Delivered, Fanout, SinkQueue,
+    SinkQueueConfig, SinkStore, Transform,
 };
 use logit_proto::{Decoder, Encoder};
 use logit_script::{ProcessOutcome, ScriptWorker};
@@ -937,14 +937,14 @@ fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
     // `Arc::new` this test means to isolate.
     let warm = fixtures::nginx_batch(1);
     rt.block_on(async {
-        tx.send(Delivered::Owned(warm, TraceContext::default()))
+        tx.send(Delivered::Owned(warm, BatchContext::default()))
             .await
             .expect("send should succeed");
         let warmed = match rx.recv().await.expect("should receive") {
             Delivered::Owned(batch, _ctx) => Arc::new(batch),
             Delivered::Shared(shared, _ctx) => shared,
         };
-        store.push((warmed, TraceContext::default())).await;
+        store.push((warmed, BatchContext::default())).await;
         store.commit();
     });
 
@@ -953,7 +953,7 @@ fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
     let telemetry_for_measure = telemetry.clone();
     let ((), stats) = measure(|| {
         rt.block_on(async move {
-            tx.send(Delivered::Owned(batch, TraceContext::default()))
+            tx.send(Delivered::Owned(batch, BatchContext::default()))
                 .await
                 .expect("send should succeed");
             drop(tx); // closes the inbox, so `drain_inbox` returns after this one batch
@@ -1012,7 +1012,8 @@ fn disk_queue_config(dir: std::path::PathBuf) -> logit_pipeline::DiskQueueConfig
     }
 }
 
-/// `DiskQueue::push` = `native::encode_batch` + `frame::write_frame` + one `write_all` to the
+/// `DiskQueue::push` = `native::encode_batch_v2` (`encode_batch` plus a provenance trailer,
+/// `docs/adr/batch-provenance-on-delivered.md`) + `frame::write_frame` + one `write_all` to the
 /// active segment -- the cost the disk-backed buffer's ADR names as breaking
 /// `buffered-sink-delivery`'s zero-clone `Arc<EventBatch>` property *by design*. Warmed first
 /// (one full push+commit round trip) so the queue's own one-time setup (the lock file, the first
@@ -1030,15 +1031,19 @@ fn disk_queue_push_one_batch() {
     .unwrap();
 
     let warm = fixtures::nginx_batch(1);
-    rt.block_on(queue.push((Arc::new(warm), TraceContext::default())));
+    rt.block_on(queue.push((Arc::new(warm), BatchContext::default())));
     rt.block_on(queue.peek());
     queue.commit();
 
     let batch = Arc::new(fixtures::nginx_batch(1));
     let ((), stats) =
-        measure(|| rt.block_on(queue.push((Arc::clone(&batch), TraceContext::default()))));
+        measure(|| rt.block_on(queue.push((Arc::clone(&batch), BatchContext::default()))));
 
-    expect_allocs("disk_queue: push one batch (encode + write)", stats, 25);
+    // 25 -> 27: `encode_batch_v2` builds v1's payload as its own `Bytes` (one allocation) then
+    // copies it into a fresh, larger `BytesMut` alongside the (here empty) provenance trailer
+    // (one more) rather than extending the original buffer in place -- see
+    // `docs/adr/batch-provenance-on-delivered.md`.
+    expect_allocs("disk_queue: push one batch (encode + write)", stats, 27);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1057,7 +1062,7 @@ fn disk_queue_peek_cached_costs_nothing() {
     .unwrap();
 
     let batch = Arc::new(fixtures::nginx_batch(1));
-    rt.block_on(queue.push((batch, TraceContext::default())));
+    rt.block_on(queue.push((batch, BatchContext::default())));
     rt.block_on(queue.peek()); // warm: the first peek per push does the real disk read + decode
 
     let ((), stats) = measure(|| {
@@ -1584,7 +1589,7 @@ fn process_batch_first_call_after_a_drain() {
 #[test]
 fn unwrap_batch_owned() {
     let batch = fixtures::nginx_batch(1);
-    let (out, stats) = measure(|| unwrap_batch(Delivered::Owned(batch, TraceContext::default())));
+    let (out, stats) = measure(|| unwrap_batch(Delivered::Owned(batch, BatchContext::default())));
     assert_eq!(out.events.len(), 1);
     expect_allocs("runtime: unwrap_batch, Delivered::Owned", stats, 0);
 }
@@ -1597,7 +1602,7 @@ fn unwrap_batch_owned() {
 fn unwrap_batch_shared_sole_reference() {
     let batch = fixtures::nginx_batch(1);
     let shared = Arc::new(batch);
-    let (out, stats) = measure(|| unwrap_batch(Delivered::Shared(shared, TraceContext::default())));
+    let (out, stats) = measure(|| unwrap_batch(Delivered::Shared(shared, BatchContext::default())));
     assert_eq!(out.events.len(), 1);
     expect_allocs("runtime: unwrap_batch, Delivered::Shared, sole reference", stats, 0);
 }
@@ -1613,12 +1618,12 @@ fn unwrap_batch_shared_sole_reference() {
 fn unwrap_batch_shared_contended() {
     let warm_shared = Arc::new(fixtures::nginx_batch(1));
     let warm_sibling = warm_shared.clone(); // held across the call below, forcing the fallback
-    drop(unwrap_batch(Delivered::Shared(warm_shared, TraceContext::default())));
+    drop(unwrap_batch(Delivered::Shared(warm_shared, BatchContext::default())));
     drop(warm_sibling);
 
     let shared = Arc::new(fixtures::nginx_batch(1));
     let _sibling = shared.clone(); // kept alive across the measured call, forcing the fallback
-    let (out, stats) = measure(|| unwrap_batch(Delivered::Shared(shared, TraceContext::default())));
+    let (out, stats) = measure(|| unwrap_batch(Delivered::Shared(shared, BatchContext::default())));
     assert_eq!(out.events.len(), 1);
     expect_allocs(
         "runtime: unwrap_batch, Delivered::Shared, contended (falls back to clone)",
@@ -1669,12 +1674,12 @@ fn send_batch_through_a_failing_output_disabled_telemetry() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
     let mut output = FailingOutput;
     let telemetry = Telemetry::default();
-    let warm = Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default());
+    let warm = Delivered::Owned(fixtures::nginx_batch(1), BatchContext::default());
     rt.block_on(async {
         drop(send_batch("out", &mut output, &warm, &telemetry).await);
     });
 
-    let delivered = Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default());
+    let delivered = Delivered::Owned(fixtures::nginx_batch(1), BatchContext::default());
     let (result, stats) = measure(|| {
         rt.block_on(async { send_batch("out", &mut output, &delivered, &telemetry).await })
     });
@@ -1696,7 +1701,7 @@ fn send_batch_through_a_failing_output_telemetry_live() {
     let mut failing = FailingOutput;
     let registry = Registry::new();
     let telemetry = registry.telemetry_for("out", "stdio_out", "sink");
-    let warm = Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default());
+    let warm = Delivered::Owned(fixtures::nginx_batch(1), BatchContext::default());
     rt.block_on(async {
         // A real success first, so batches.received/events.received/send.duration are already
         // resident -- only `errors` is new when the measured call below fails.
@@ -1705,7 +1710,7 @@ fn send_batch_through_a_failing_output_telemetry_live() {
             .expect("noop output never errors");
     });
 
-    let delivered = Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default());
+    let delivered = Delivered::Owned(fixtures::nginx_batch(1), BatchContext::default());
     let (result, stats) = measure(|| {
         rt.block_on(async { send_batch("out", &mut failing, &delivered, &telemetry).await })
     });
@@ -1730,13 +1735,13 @@ fn send_batch_failing_first_call_after_a_drain() {
     let mut output = FailingOutput;
     let registry = Registry::new();
     let telemetry = registry.telemetry_for("out", "stdio_out", "sink");
-    let warm = Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default());
+    let warm = Delivered::Owned(fixtures::nginx_batch(1), BatchContext::default());
     rt.block_on(async {
         drop(send_batch("out", &mut output, &warm, &telemetry).await);
     });
     registry.drain(0); // what `internal`'s tick does: empties the ComponentBuffer's map
 
-    let delivered = Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default());
+    let delivered = Delivered::Owned(fixtures::nginx_batch(1), BatchContext::default());
     let (result, stats) = measure(|| {
         rt.block_on(async { send_batch("out", &mut output, &delivered, &telemetry).await })
     });
@@ -1764,12 +1769,12 @@ fn send_batch_through_a_noop_output_disabled_telemetry() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
     let mut output = NoopOutput;
     let telemetry = Telemetry::default();
-    let warm = Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default());
+    let warm = Delivered::Owned(fixtures::nginx_batch(1), BatchContext::default());
     rt.block_on(async {
         send_batch("out", &mut output, &warm, &telemetry).await.expect("noop output never errors")
     });
 
-    let delivered = Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default());
+    let delivered = Delivered::Owned(fixtures::nginx_batch(1), BatchContext::default());
     let (_, stats) = measure(|| {
         rt.block_on(async {
             send_batch("out", &mut output, &delivered, &telemetry)
@@ -1796,12 +1801,12 @@ fn send_batch_through_a_noop_output_telemetry_live() {
     let mut output = NoopOutput;
     let registry = Registry::new();
     let telemetry = registry.telemetry_for("out", "stdio_out", "sink");
-    let warm = Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default());
+    let warm = Delivered::Owned(fixtures::nginx_batch(1), BatchContext::default());
     rt.block_on(async {
         send_batch("out", &mut output, &warm, &telemetry).await.expect("noop output never errors")
     });
 
-    let delivered = Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default());
+    let delivered = Delivered::Owned(fixtures::nginx_batch(1), BatchContext::default());
     let (_, stats) = measure(|| {
         rt.block_on(async {
             send_batch("out", &mut output, &delivered, &telemetry)
@@ -1830,13 +1835,13 @@ fn send_batch_first_call_after_a_drain() {
     let mut output = NoopOutput;
     let registry = Registry::new();
     let telemetry = registry.telemetry_for("out", "stdio_out", "sink");
-    let warm = Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default());
+    let warm = Delivered::Owned(fixtures::nginx_batch(1), BatchContext::default());
     rt.block_on(async {
         send_batch("out", &mut output, &warm, &telemetry).await.expect("noop output never errors")
     });
     registry.drain(0); // what `internal`'s tick does: empties the ComponentBuffer's map
 
-    let delivered = Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default());
+    let delivered = Delivered::Owned(fixtures::nginx_batch(1), BatchContext::default());
     let (_, stats) = measure(|| {
         rt.block_on(async {
             send_batch("out", &mut output, &delivered, &telemetry)

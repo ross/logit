@@ -15,6 +15,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
 
+mod provenance;
 mod proxy;
 mod resource;
 mod telemetry;
@@ -89,6 +90,9 @@ pub struct ScriptWorker {
     /// doc for why this is a plain `Rc`, not a `RegistryKey` like `trace_table`: `set_resource`/
     /// `take_resource` need to hand a real `Arc<Resource>` back out without a `&Lua` in hand.
     resource_state: Rc<RefCell<resource::ResourceState>>,
+    /// Shared with the installed `provenance` global's userdata -- same reasoning as
+    /// `resource_state`. See `crate::provenance`'s module doc.
+    provenance_state: Rc<RefCell<provenance::ProvenanceState>>,
     _not_send_sync: PhantomData<*const ()>,
 }
 
@@ -135,6 +139,8 @@ impl ScriptWorker {
         // Same "before `.exec()`" reasoning as `trace_table` above, and the same unconditional
         // (not opt-in) installation -- see `crate::resource`'s module doc.
         let resource_state = resource::install(&lua)?;
+        // Same "before `.exec()`" reasoning again -- see `crate::provenance`'s module doc.
+        let provenance_state = provenance::install(&lua)?;
         lua.load(source).exec()?;
         let process_fn = match lua.globals().get::<_, LuaValue>("process")? {
             LuaValue::Function(f) => f,
@@ -152,7 +158,15 @@ impl ScriptWorker {
         // does via `MissingProcess`.
         let flush_fn: Option<mlua::Function> = lua.globals().get("flush")?;
         let flush = flush_fn.map(|f| lua.create_registry_value(f)).transpose()?;
-        Ok(Self { lua, process, flush, trace_table, resource_state, _not_send_sync: PhantomData })
+        Ok(Self {
+            lua,
+            process,
+            flush,
+            trace_table,
+            resource_state,
+            provenance_state,
+            _not_send_sync: PhantomData,
+        })
     }
 
     /// Overwrites the `trace` global's `trace_id`/`span_id` (hex-encoded) so this worker's next
@@ -184,6 +198,17 @@ impl ScriptWorker {
         resource::take(&self.resource_state)
     }
 
+    /// Overwrites the read-only `provenance` global's `origin`/`previous` fields so this worker's
+    /// next `process()` call reads the given batch's provenance. Called once per incoming batch,
+    /// before its events reach `process` (`crates/logit-pipeline/src/runtime.rs`'s `run_lua`) --
+    /// not called at all around a `flush()` call, which keeps whatever was last set, the same
+    /// staleness `set_trace_context`/`set_resource` already have (`docs/known-gaps.md`). A plain
+    /// `Rc<RefCell<..>>` mutation, like `set_resource`, so unlike `set_trace_context` there's no
+    /// `&Lua` call involved and nothing that can fail.
+    pub fn set_provenance(&self, provenance: logit_core::Provenance) {
+        provenance::set(&self.provenance_state, provenance)
+    }
+
     /// Installs a `telemetry` global so `process()`/`flush()` can emit their own metrics -- a
     /// builder rather than a `new()` parameter, mirroring `with_diagnostics`/`with_timeout`/
     /// `with_retry` everywhere else in this framework, specifically so this doesn't touch any of
@@ -196,6 +221,21 @@ impl ScriptWorker {
     pub fn with_telemetry(self, telemetry: Telemetry) -> Result<Self, ScriptError> {
         telemetry::install(&self.lua, telemetry)?;
         Ok(self)
+    }
+
+    /// Sets `provenance.component` to this worker's own component id, for the rest of its
+    /// lifetime -- a builder, not a `new()` parameter, for the same "don't touch every existing
+    /// call site" reason as `with_telemetry` above. Safe to call any time after `new` returns,
+    /// including after a script's top-level code already ran: `provenance` is `UserData`, so a
+    /// top-level alias (`local p = provenance`) captured a *reference* to the same underlying
+    /// state this mutates, not a snapshot -- unlike `trace_table`/`resource_state`, nothing here
+    /// depends on *when* between `new` and the first `process()` call this runs, only that
+    /// `provenance` already exists as a global by the time any alias of it could be taken (which
+    /// `new` already guarantees, installing it before `.exec()`). See `crate::provenance`'s
+    /// module doc.
+    pub fn with_component(self, id: &str) -> Self {
+        provenance::set_component(&self.provenance_state, id);
+        self
     }
 
     /// Bytes currently in use by this worker's Lua VM -- the strongest single signal a stateful

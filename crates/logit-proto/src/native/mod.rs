@@ -32,17 +32,36 @@ pub mod varint;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use logit_core::{Event, EventBatch, Resource};
+use logit_core::interner::intern;
+use logit_core::{Event, EventBatch, Provenance, Resource};
 
 use crate::frame::{read_frame, write_frame, Compression};
 use crate::native::dict::{Dict, DictBuilder};
-use crate::native::varint::{read_uvarint, write_uvarint};
+use crate::native::varint::{read_u8, read_uvarint, write_uvarint};
 use crate::{CodecError, Decoder, Encoder};
 
 /// The `codec` byte [`crate::frame::FrameHeader`] carries for this payload format -- what lets a
 /// reader reject a frame that says "native" but whose codec byte says otherwise, or (eventually)
 /// dispatch among several codecs sharing the same frame header.
 pub const CODEC_NATIVE_V1: u8 = 1;
+
+/// [`encode_batch`]'s payload, plus a mandatory length-prefixed [`Provenance`] trailer -- see
+/// [`encode_batch_v2`]/[`decode_batch_v2`] and `docs/adr/batch-provenance-on-delivered.md`. Not an
+/// in-place change to v1: `crates/logit-proto/tests/robustness.rs`'s
+/// `assert_every_truncation_fails_cleanly` pins the invariant that no proper prefix of a valid
+/// encoding is itself valid, which an *optional* trailer on the existing format would silently
+/// break (a payload truncated exactly at the trailer boundary would decode as "no provenance,"
+/// a valid-looking result, not an error). `Hello.codecs`/`HelloAck.codec`
+/// (`crate::native::control`) negotiate which of the two a `logit_out`/`logit_in` pair actually
+/// uses; either side offering only v1 still talks, with provenance simply absent.
+pub const CODEC_NATIVE_V2: u8 = 2;
+
+const TRAILER_TAG_ORIGIN: u8 = 1;
+const TRAILER_TAG_PREVIOUS: u8 = 2;
+
+/// A trailer field's value is bounded to catch a corrupt/hostile length before it's used to slice
+/// `bytes` -- a component id is config-sized text, never remotely close to this.
+const MAX_SANE_TRAILER_FIELD_BYTES: usize = 4096;
 
 /// Encodes one [`EventBatch`] into the dictionary-first payload `docs/design/wire-protocol.md`
 /// describes: the dictionary section, then the resource's attributes, then a length-prefixed list
@@ -102,6 +121,92 @@ pub fn decode_batch(bytes: &mut Bytes) -> Result<EventBatch, CodecError> {
         events.push(record::read_event(&mut body, &dict)?);
     }
     Ok(EventBatch { resource, events })
+}
+
+/// [`encode_batch`], plus a mandatory length-prefixed [`Provenance`] trailer -- see
+/// [`CODEC_NATIVE_V2`]'s own doc comment for why this is a separate codec rather than a change to
+/// v1. Calls [`encode_batch`] as a subroutine and appends to its output; v1's own encoding is
+/// untouched by this addition.
+///
+/// The trailer is its own small TLV section (same `tag(u8) + len(uvarint) + payload` shape as
+/// `crate::native::control`), holding each present field's string *inline*, not dictionary-
+/// indexed: `origin`/`previous` are at most two scalar strings written once per batch, so there's
+/// no repetition within one payload for a dictionary to pay off on -- unlike attribute/metric
+/// keys, which repeat once per event (`docs/design/wire-protocol.md`'s "dictionary-first
+/// batches"). A `None` field costs nothing (no tag entry at all); the trailer's own length prefix
+/// is what stays mandatory, always at least one byte, even when both fields are absent.
+pub fn encode_batch_v2(batch: &EventBatch, provenance: Provenance) -> Bytes {
+    let v1 = encode_batch(batch);
+
+    let mut trailer = BytesMut::new();
+    if let Some(origin) = provenance.origin_str() {
+        write_trailer_field(&mut trailer, TRAILER_TAG_ORIGIN, origin);
+    }
+    if let Some(previous) = provenance.previous_str() {
+        write_trailer_field(&mut trailer, TRAILER_TAG_PREVIOUS, previous);
+    }
+
+    let mut out = BytesMut::with_capacity(v1.len() + 5 + trailer.len());
+    out.extend_from_slice(&v1);
+    write_uvarint(&mut out, trailer.len() as u64);
+    out.extend_from_slice(&trailer);
+    out.freeze()
+}
+
+fn write_trailer_field(out: &mut BytesMut, tag: u8, s: &str) {
+    out.extend_from_slice(&[tag]);
+    write_uvarint(out, s.len() as u64);
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// The inverse of [`encode_batch_v2`]. Decodes the v1-shaped prefix via [`decode_batch`] itself
+/// (inheriting its truncation/bit-flip robustness unchanged, `crates/logit-proto/tests/
+/// robustness.rs`), then reads the mandatory trailer -- so a plain v1 payload (no trailer at all)
+/// fails here rather than silently decoding as "no provenance": once [`decode_batch`] consumes
+/// every byte a v1 encoding has, the trailer-length `read_uvarint` below finds nothing left and
+/// errors, exactly the "no proper prefix of a valid encoding is itself valid" property this
+/// module holds for v1.
+pub fn decode_batch_v2(bytes: &mut Bytes) -> Result<(EventBatch, Provenance), CodecError> {
+    let batch = decode_batch(bytes)?;
+
+    let trailer_len = read_uvarint(bytes)? as usize;
+    if bytes.len() < trailer_len {
+        return Err(CodecError::Malformed(format!(
+            "provenance trailer declares {trailer_len} bytes but only {} remain",
+            bytes.len()
+        )));
+    }
+    let mut trailer = bytes.split_to(trailer_len);
+
+    let mut provenance = Provenance::default();
+    while !trailer.is_empty() {
+        let tag = read_u8(&mut trailer)?;
+        let len = read_uvarint(&mut trailer)? as usize;
+        if len > MAX_SANE_TRAILER_FIELD_BYTES {
+            return Err(CodecError::Malformed(format!(
+                "provenance trailer field {tag} declares {len} bytes, over the \
+                 {MAX_SANE_TRAILER_FIELD_BYTES} sanity cap"
+            )));
+        }
+        if trailer.len() < len {
+            return Err(CodecError::Malformed(format!(
+                "provenance trailer field {tag} declares {len} bytes but only {} remain",
+                trailer.len()
+            )));
+        }
+        let field = trailer.split_to(len);
+        match tag {
+            TRAILER_TAG_ORIGIN => provenance.origin = Some(intern(trailer_str(&field)?)),
+            TRAILER_TAG_PREVIOUS => provenance.previous = Some(intern(trailer_str(&field)?)),
+            _unknown => { /* forward compatibility -- a future field is skipped, not rejected */ }
+        }
+    }
+    Ok((batch, provenance))
+}
+
+fn trailer_str(bytes: &[u8]) -> Result<&str, CodecError> {
+    std::str::from_utf8(bytes)
+        .map_err(|e| CodecError::Malformed(format!("provenance trailer field not utf-8: {e}")))
 }
 
 /// Encodes an [`EventBatch`] to a complete, framed byte string -- [`encode_batch`]'s payload
@@ -310,5 +415,90 @@ mod tests {
         let decoded_b = decode_batch(&mut payload_b).unwrap();
         assert_eq!(decoded_b.events.len(), 1);
         assert!(cursor.is_empty(), "both frames should be fully consumed");
+    }
+
+    fn sample_provenance() -> Provenance {
+        Provenance {
+            origin: Some(logit_core::interner::intern("mod_test_nginx_in")),
+            previous: Some(logit_core::interner::intern("mod_test_enrich")),
+        }
+    }
+
+    #[test]
+    fn encode_decode_batch_v2_round_trips_provenance() {
+        let batch = sample_batch();
+        let provenance = sample_provenance();
+        let mut payload = encode_batch_v2(&batch, provenance);
+        let (decoded, decoded_provenance) = decode_batch_v2(&mut payload).unwrap();
+
+        assert_eq!(decoded.events.len(), batch.events.len());
+        assert_eq!(decoded_provenance, provenance);
+        assert!(payload.is_empty(), "decode_batch_v2 should consume the whole payload");
+    }
+
+    #[test]
+    fn encode_decode_batch_v2_round_trips_both_fields_absent() {
+        let batch = sample_batch();
+        let mut payload = encode_batch_v2(&batch, Provenance::default());
+        let (_decoded, provenance) = decode_batch_v2(&mut payload).unwrap();
+        assert_eq!(provenance, Provenance::default());
+    }
+
+    /// An absent field costs no dictionary entry and no tag byte at all -- the trailer for two
+    /// absent fields is exactly the one-byte `trailer_len = 0` varint.
+    #[test]
+    fn an_absent_provenance_field_costs_one_byte_total() {
+        let batch = sample_batch();
+        let without = encode_batch(&batch);
+        let with_empty_provenance = encode_batch_v2(&batch, Provenance::default());
+        assert_eq!(with_empty_provenance.len(), without.len() + 1);
+    }
+
+    /// The core invariant this module holds for v1 (`crates/logit-proto/tests/robustness.rs`'s
+    /// `assert_every_truncation_fails_cleanly`) must also hold for v2's trailer: no proper prefix
+    /// of a valid v2 encoding decodes successfully. This is what the mandatory length-prefixed
+    /// trailer buys over an optional one.
+    #[test]
+    fn decode_batch_v2_rejects_every_proper_prefix_of_a_valid_encoding() {
+        let valid = encode_batch_v2(&sample_batch(), sample_provenance());
+        for len in 0..valid.len() {
+            let mut truncated = valid.slice(0..len);
+            assert!(
+                decode_batch_v2(&mut truncated).is_err(),
+                "a {len}-byte truncation of a valid v2 payload decoded successfully"
+            );
+        }
+    }
+
+    /// A plain v1 payload has no trailer at all -- fed to `decode_batch_v2`, `decode_batch` inside
+    /// it consumes every byte, and the trailer-length read then finds nothing left. This must fail
+    /// rather than silently decode as "no provenance": v1 and v2 are distinct codecs, not one a
+    /// superset of the other, and `logit_in`'s codec dispatch (not this function) is what decides
+    /// which to call.
+    #[test]
+    fn decode_batch_v2_rejects_a_plain_v1_payload() {
+        let mut v1_payload = encode_batch(&sample_batch());
+        assert!(decode_batch_v2(&mut v1_payload).is_err());
+    }
+
+    /// An unrecognized trailer tag is skipped, not rejected -- the same forward-compatibility
+    /// contract `record::read_event`'s field loop holds for a future `Event` field.
+    #[test]
+    fn decode_batch_v2_skips_an_unrecognized_trailer_tag() {
+        let batch = sample_batch();
+        let v1 = encode_batch(&batch);
+
+        let mut trailer = BytesMut::new();
+        write_trailer_field(&mut trailer, TRAILER_TAG_ORIGIN, "mod_test_skip_origin");
+        write_trailer_field(&mut trailer, 99, "a future field this reader doesn't know");
+
+        let mut out = BytesMut::new();
+        out.extend_from_slice(&v1);
+        write_uvarint(&mut out, trailer.len() as u64);
+        out.extend_from_slice(&trailer);
+        let mut payload = out.freeze();
+
+        let (_decoded, provenance) = decode_batch_v2(&mut payload).unwrap();
+        assert_eq!(provenance.origin_str(), Some("mod_test_skip_origin"));
     }
 }

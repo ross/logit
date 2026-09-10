@@ -8,7 +8,7 @@
 //! Aggregator` needs no reshaping of its existing methods.
 
 use crate::fanout::TraceContext;
-use logit_core::{Event, Resource, SpanLink};
+use logit_core::{Event, Provenance, Resource, SpanLink};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +37,18 @@ pub trait Transform: Send {
     /// would cost every implementer for the one that actually needs it.
     fn observe_batch_context(&mut self, ctx: TraceContext) {
         let _ = ctx;
+    }
+
+    /// Called once per incoming batch, alongside `observe_batch_context` -- gives a transform a
+    /// chance to see which component the batch's provenance names (`origin`/`previous`,
+    /// `docs/adr/batch-provenance-on-delivered.md`) before any of that batch's events reach
+    /// `process`. A separate hook rather than widening `observe_batch_context`'s own parameter:
+    /// `Aggregator` exposes `observe_batch_context` as an inherent method its own tests call
+    /// directly with a bare `TraceContext`, and no transform today has a use for provenance, so a
+    /// second default no-op costs nothing rather than forcing an unrelated signature change.
+    /// Default no-op, same reasoning as `observe_batch_context`'s own doc comment.
+    fn observe_provenance(&mut self, provenance: Provenance) {
+        let _ = provenance;
     }
 
     /// Called once per incoming batch, after `observe_batch_context` and before any of that

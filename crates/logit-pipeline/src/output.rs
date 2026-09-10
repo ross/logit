@@ -3,6 +3,7 @@
 //! generic writer (`crate::runtime::write_loop`) needs to decide whether a failed `send` is worth
 //! retrying. See `docs/adr/buffered-sink-delivery.md`.
 
+use crate::fanout::BatchContext;
 use logit_core::EventBatch;
 
 /// A sink component: takes batches and delivers them somewhere. Buffering between the pipeline
@@ -30,6 +31,20 @@ use logit_core::EventBatch;
 #[async_trait::async_trait]
 pub trait Output {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()>;
+
+    /// Called once per batch, immediately before each delivery attempt in `write_loop`
+    /// (`crates/logit-pipeline/src/runtime.rs`) -- including retries, so a sink that saves the
+    /// value off for `send` to use sees the same one on every attempt at one batch. Default
+    /// no-op: most sinks have no use for a batch's `BatchContext` (trace id/span id, and which
+    /// component created/last handled it, `docs/adr/batch-provenance-on-delivered.md`).
+    /// `logit_out` is the one implementer today, threading provenance across the wire. A separate
+    /// hook rather than widening `Output::send`'s own signature: `send` is implemented by every
+    /// sink and takes `&EventBatch` specifically so a read-only fan-out consumer never needs an
+    /// `Arc::try_unwrap`/clone (`docs/adr/arc-eventbatch-copy-on-write.md`) -- widening it would
+    /// cost every implementer for the one that actually needs this.
+    fn observe_batch(&mut self, ctx: BatchContext) {
+        let _ = ctx;
+    }
 
     /// Called once after the last batch has been delivered or dropped and no more will follow.
     /// Default no-op -- most sinks (e.g. `InfluxDbOutput`, which writes synchronously with nothing

@@ -278,7 +278,7 @@ mod runtime {
     use super::*;
     use logit_core::{EventBatch, Telemetry};
     use logit_pipeline::{
-        process_batch, send_batch, unwrap_batch, Delivered, Fanout, TraceContext,
+        process_batch, send_batch, unwrap_batch, BatchContext, Delivered, Fanout,
     };
 
     /// `run_transform`'s per-batch body (`logit_pipeline::process_batch`), with no channel or
@@ -352,7 +352,7 @@ mod runtime {
         let mut output = NoopOutput;
         let telemetry = Telemetry::default();
         bencher
-            .with_inputs(|| Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default()))
+            .with_inputs(|| Delivered::Owned(fixtures::nginx_batch(1), BatchContext::default()))
             .bench_local_values(|delivered| {
                 rt.block_on(async {
                     send_batch("out", &mut output, &delivered, &telemetry)
@@ -381,7 +381,7 @@ mod runtime {
         let mut output = FailingOutput;
         let telemetry = Telemetry::default();
         bencher
-            .with_inputs(|| Delivered::Owned(fixtures::nginx_batch(1), TraceContext::default()))
+            .with_inputs(|| Delivered::Owned(fixtures::nginx_batch(1), BatchContext::default()))
             .bench_local_values(|delivered| {
                 rt.block_on(async {
                     drop(send_batch("out", &mut output, &delivered, &telemetry).await)

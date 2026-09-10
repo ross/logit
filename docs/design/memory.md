@@ -230,7 +230,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `stdio_out` encode 100 events | **102** | ~1/event -- fixed, see below, was 1801; +1 since measured through `Encoder::encode` (`&EventBatch` -> `Bytes`) rather than the inherent `render` (`&EventBatch` -> `String`) directly, ADR `rotating-file-output` -- `Bytes::from(String)`'s own small shared-refcount allocation |
 | `influxdb_out` encode 100 events | **30** | ~0.3/event — see below |
 | receive queue: push then pop, warm | **0** | `BoundedQueue<Datagram>`, ADR `decoupled-listener-io` -- see below |
-| `disk_queue`: push one batch (encode + write) | **25** | `native::encode_batch` + `frame::write_frame` + one `write_all` -- breaks the zero-clone `Arc<EventBatch>` property by design, see `docs/adr/disk-backed-sink-buffer.md` |
+| `disk_queue`: push one batch (encode + write) | **27** | `native::encode_batch_v2` + `frame::write_frame` + one `write_all` -- breaks the zero-clone `Arc<EventBatch>` property by design, see `docs/adr/disk-backed-sink-buffer.md`; 25 -> 27 once `encode_batch_v2` (the provenance trailer, `docs/adr/batch-provenance-on-delivered.md`) replaced `encode_batch` here -- it builds v1's payload as its own `Bytes`, then copies it into a fresh `BytesMut` alongside the trailer rather than extending in place |
 | `disk_queue`: peek, cached (no re-decode) | **0** | `write_loop`'s retry loop calls `peek` once per attempt; only the first (uncached) peek after a push touches disk |
 | accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR `decoupled-listener-io` -- see below |
 | `syslog_out` encode_into 100 events | **100** | ~1/event -- reused struct-held scratch buffers, was 401, see below |
@@ -572,7 +572,15 @@ built the piece this section's "what's left unmeasured" line named -- a real `Te
 `SpanGuard`, a bounded per-component span buffer, and `ComponentBuffer::drain`'s span-emitting pass
 -- and the deliberately deterministic-on-`trace_id` sampler (`trace_is_sampled`) is *why* it changed
 nothing here: no `sampled` bit needed propagating, so `TraceContext`/`Delivered` gained nothing
-beyond what this section already measured. `size_of::<Delivered>()` stays exactly 56.
+beyond what this section already measured. `size_of::<Delivered>()` stayed exactly 56 through that
+change.
+
+**It grew again, later, to 64: `Delivered`'s second element became `BatchContext` (`TraceContext`
+plus an 8-byte `Provenance` -- which component created a batch, which one most recently handled it,
+`docs/adr/batch-provenance-on-delivered.md`), not `TraceContext` alone.** Same reasoning as above --
+two `Option<Symbol>`s, no allocation, `Copy` -- so this is a channel-capacity-times-8-bytes cost
+(`CHANNEL_CAPACITY * 8` per inbox, noise against `Event`'s 800), not a new allocation-count entry
+anywhere in this section's table.
 
 `SpanGuard`'s own "disabled/unsampled holds no state" shape (mirroring `Timer`'s) is what's *meant*
 to make the unsampled path free the same way a disabled `Telemetry` handle already is -- but stated

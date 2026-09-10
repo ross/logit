@@ -8,10 +8,10 @@
 //! Generalized from a `SinkQueue` that hardcoded `Arc<EventBatch>` -- the [`Queued`] trait and
 //! [`QueueMetrics`] are what let one implementation serve both a sink's delivery queue and a UDP
 //! listener's receive queue with no behavior change on the sink side: `SinkQueue` is now a type
-//! alias (over `(Arc<EventBatch>, TraceContext)`, not bare `Arc<EventBatch>` -- see that alias's
+//! alias (over `(Arc<EventBatch>, BatchContext)`, not bare `Arc<EventBatch>` -- see that alias's
 //! own doc comment for why), and every sink-side metric name, default, and test is unchanged.
 
-use crate::fanout::TraceContext;
+use crate::fanout::BatchContext;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_proto::buffer::{Buffer, InMemoryBuffer, OverflowPolicy as DropPolicy, PushOutcome};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,15 +40,16 @@ impl Queued for Arc<EventBatch> {
     }
 }
 
-/// [`SinkQueue`]'s actual item type: a batch alongside the [`TraceContext`] it arrived with.
-/// `TraceContext` is `Copy`, 24 bytes, so this rides inline in the existing `(item, weight)` slot
+/// [`SinkQueue`]'s actual item type: a batch alongside the [`BatchContext`] it arrived with.
+/// `BatchContext` is `Copy`, 32 bytes, so this rides inline in the existing `(item, weight)` slot
 /// `InMemoryBuffer` already stores -- no new allocation, and weight/units are unaffected, since
 /// both are computed from the batch alone. See
-/// `docs/adr/internal-span-emission-and-deterministic-sampling.md` for why this exists:
-/// `write_loop`'s sink span (the only span that
-/// can carry `SpanStatus::Error` and a retry count) needs the context that arrived with this
-/// batch, and `drain_inbox`/`peek` were the last place it was still being discarded.
-impl Queued for (Arc<EventBatch>, TraceContext) {
+/// `docs/adr/internal-span-emission-and-deterministic-sampling.md` for why the trace half of this
+/// exists (`write_loop`'s sink span needs the context that arrived with this batch, and
+/// `drain_inbox`/`peek` were the last place it was still being discarded) and
+/// `docs/adr/batch-provenance-on-delivered.md` for the provenance half (`logit_out`'s
+/// `Output::observe_batch` reads it from here too).
+impl Queued for (Arc<EventBatch>, BatchContext) {
     fn weight(&self) -> u64 {
         self.0.weight()
     }
@@ -302,7 +303,7 @@ impl<T: Queued> BoundedQueue<T> {
 
     /// Removes and returns the head (a no-op returning `None` on an empty queue), notifies any
     /// blocked `push` that room may now be available, and refreshes the depth/utilization
-    /// gauges. For [`SinkQueue`], this returns the `TraceContext` the head was pushed with
+    /// gauges. For [`SinkQueue`], this returns the `BatchContext` the head was pushed with
     /// alongside its batch -- nothing downstream of a commit (counting a delivered/dropped batch)
     /// needs it; a caller that does should have already read it from the matching
     /// [`BoundedQueue::peek`] first.
@@ -408,7 +409,7 @@ impl<T: Queued + Clone> BoundedQueue<T> {
     /// The head, without removing it -- a clone the caller can act on and only remove (via
     /// [`BoundedQueue::commit`]) once that action succeeds. Requires `T: Clone` (a cheap
     /// refcount bump for `Arc<EventBatch>`, or for [`SinkQueue`]'s `(Arc<EventBatch>,
-    /// TraceContext)`, a refcount bump plus a `Copy`); a consumer with no such retry contract
+    /// BatchContext)`, a refcount bump plus a `Copy`); a consumer with no such retry contract
     /// should use [`BoundedQueue::pop`] instead, which needs no `Clone` bound and is
     /// cancellation-safe. Awaits `not_empty` while the queue is empty and open; returns `None`
     /// once the queue is both closed and empty, checked together under one lock acquisition so a
@@ -432,11 +433,13 @@ impl<T: Queued + Clone> BoundedQueue<T> {
     }
 }
 
-/// A sink's delivery queue: `Arc<EventBatch>` paired with the [`TraceContext`] it arrived with,
-/// not bare `Arc<EventBatch>` -- `write_loop`'s sink span needs the context that produced each
-/// batch, and `peek`/`commit` are the only place it can still be read back
-/// (`docs/adr/internal-span-emission-and-deterministic-sampling.md`).
-pub type SinkQueue = BoundedQueue<(Arc<EventBatch>, TraceContext)>;
+/// A sink's delivery queue: `Arc<EventBatch>` paired with the [`BatchContext`] it arrived with,
+/// not bare `Arc<EventBatch>` -- `write_loop`'s sink span needs the trace context that produced
+/// each batch (`docs/adr/internal-span-emission-and-deterministic-sampling.md`), and `logit_out`'s
+/// `Output::observe_batch` needs the provenance that arrived with it
+/// (`docs/adr/batch-provenance-on-delivered.md`); `peek`/`commit` are the only place either can
+/// still be read back.
+pub type SinkQueue = BoundedQueue<(Arc<EventBatch>, BatchContext)>;
 
 impl SinkQueue {
     pub fn new(config: SinkQueueConfig, telemetry: Telemetry) -> Self {
@@ -485,14 +488,14 @@ impl SinkStore {
         }
     }
 
-    pub async fn push(&self, item: (Arc<EventBatch>, TraceContext)) {
+    pub async fn push(&self, item: (Arc<EventBatch>, BatchContext)) {
         match self {
             SinkStore::Memory(q) => q.push(item).await,
             SinkStore::Disk(q) => q.push(item).await,
         }
     }
 
-    pub async fn peek(&self) -> Option<(Arc<EventBatch>, TraceContext)> {
+    pub async fn peek(&self) -> Option<(Arc<EventBatch>, BatchContext)> {
         match self {
             SinkStore::Memory(q) => q.peek().await,
             SinkStore::Disk(q) => q.peek().await,
@@ -503,7 +506,7 @@ impl SinkStore {
     /// exactly. `write_loop`/`drain_inbox` never need the value back, but a test driving
     /// `write_loop` directly does (to confirm what it left behind on a shutdown-grace exit,
     /// say), so this doesn't discard it the way `SinkStore::finish`'s internal drain loop does.
-    pub fn commit(&self) -> Option<(Arc<EventBatch>, TraceContext)> {
+    pub fn commit(&self) -> Option<(Arc<EventBatch>, BatchContext)> {
         match self {
             SinkStore::Memory(q) => q.commit(),
             SinkStore::Disk(q) => q.commit(),
@@ -551,6 +554,7 @@ impl SinkStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fanout::TraceContext;
     use logit_core::{AttrMap, Event, Resource, Value};
     use std::time::Duration;
 
@@ -577,26 +581,33 @@ mod tests {
     }
 
     /// Every test in this module pushes under a placeholder context -- none of them exercise
-    /// `TraceContext` propagation itself (`fanout.rs`/`runtime.rs`'s tests do that); this queue
+    /// `BatchContext` propagation itself (`fanout.rs`/`runtime.rs`'s tests do that); this queue
     /// only needs to carry whatever it was given back out again unchanged, which
     /// `push_then_peek_then_commit_round_trips_one_batch` below proves directly with a real,
     /// non-default one.
-    fn ctx() -> TraceContext {
-        TraceContext::default()
+    fn ctx() -> BatchContext {
+        BatchContext::default()
     }
 
     #[tokio::test]
     async fn push_then_peek_then_commit_round_trips_one_batch() {
         let q = queue(10, u64::MAX, OverflowPolicy::Block);
         let sent = tiny_batch();
-        let sent_ctx = TraceContext::new_root();
+        let sent_ctx = BatchContext {
+            trace: TraceContext::new_root(),
+            provenance: logit_core::Provenance {
+                origin: Some(logit_core::interner::intern("nginx_in")),
+                previous: Some(logit_core::interner::intern("logit_out")),
+            },
+        };
         q.push((Arc::clone(&sent), sent_ctx)).await;
 
         let (peeked, peeked_ctx) = q.peek().await.expect("should peek the pushed batch");
         assert!(Arc::ptr_eq(&peeked, &sent));
         assert_eq!(
             peeked_ctx, sent_ctx,
-            "the context pushed with a batch should come back unchanged"
+            "the context (trace and provenance alike) pushed with a batch should come back \
+             unchanged"
         );
 
         let (committed, _) = q.commit().expect("should commit the pushed batch");
