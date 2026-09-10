@@ -94,6 +94,13 @@ pub enum ComponentKind {
     // Drops an event matching every configured pair -- has_attributes' exact complement on the
     // identical config, taken at the top level (an event matching some-but-not-all pairs forwards).
     DropAttributes { resource: BTreeMap<String, SetValue>, attributes: BTreeMap<String, SetValue> },
+    // Forwards an event whose batch's origin/previous match every configured field -- each field
+    // is a list of alternatives (OR'd within the field), the two fields AND together; never
+    // mutates (docs/adr/provenance-filtering-components.md).
+    HasProvenance { origin: Vec<String>, previous: Vec<String> },
+    // Drops an event whose batch's origin/previous match every configured field -- has_provenance's
+    // exact complement on the identical config, taken at the top level.
+    DropProvenance { origin: Vec<String>, previous: Vec<String> },
     // Matches a pattern against a log message (or a named attribute), turning named capture
     // groups into attributes (docs/adr/regex-transform.md).
     Regex { pattern: String, field: Option<String> },
@@ -121,8 +128,9 @@ keeps the rule predictable as more protocols gain a second side — `syslog_out`
 UDP or TCP, `docs/adr/syslog-output.md`) is exactly that case, landing well after `SyslogIn`.
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
 `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`,
-`has_attributes`, `drop_attributes`, `logfmt`, `kv`, `regex`, and any future native transform —
-take no suffix; there's only ever one direction for a transform to be.
+`has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`,
+and any future native transform — take no suffix; there's only ever one direction for a transform
+to be.
 
 **`interval` stays a per-kind optional field, unchanged from today.** `lua`/`lua_file` already carry
 an optional flush interval (`docs/adr/aggregation-window-semantics.md`); `aggregate` requires
@@ -167,7 +175,7 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
@@ -341,6 +349,18 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     exact complement, matches every event too but that means dropping every one of them, a black
     hole. The same key appearing in both `resource:` and `attributes:` is deliberately legal — they
     address different objects.
+37. `has_provenance`/`drop_provenance`: at least one of `origin`/`previous` must be non-empty, no
+    entry in either list may be empty, and no list may contain a duplicate entry
+    (`docs/adr/provenance-filtering-components.md`). The empty-config black-hole/no-op assignment
+    lines up with rule 36's, not rule 21's, despite each field's own contents being a list of
+    alternatives (`signals:`'s own shape): an empty `origin:`/`previous:` means "this field isn't
+    part of the match" (vacuously true), not "match against zero alternatives" (vacuously false) —
+    it's the *field*, not the list, that decides which orientation applies. So both fields empty
+    means `has_provenance` matches every batch, a no-op, and `drop_provenance`, its exact
+    complement, drops every one of them, a black hole. Deliberately *not* validated: that a
+    configured id names a component present in this graph — `origin`/`previous` are exactly as
+    likely to name a component in a different process's graph, relayed unchanged across
+    `logit_out`/`logit_in`.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

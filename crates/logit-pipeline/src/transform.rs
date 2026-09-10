@@ -44,9 +44,13 @@ pub trait Transform: Send {
     /// `docs/adr/batch-provenance-on-delivered.md`) before any of that batch's events reach
     /// `process`. A separate hook rather than widening `observe_batch_context`'s own parameter:
     /// `Aggregator` exposes `observe_batch_context` as an inherent method its own tests call
-    /// directly with a bare `TraceContext`, and no transform today has a use for provenance, so a
-    /// second default no-op costs nothing rather than forcing an unrelated signature change.
-    /// Default no-op, same reasoning as `observe_batch_context`'s own doc comment.
+    /// directly with a bare `TraceContext`, and a second default no-op costs nothing rather than
+    /// forcing an unrelated signature change on every other implementer.
+    /// `crates/logit-transforms/src/provenance.rs`'s `HasProvenance`/`DropProvenance` are the
+    /// first real implementers, caching `provenance` on `self` exactly as `Aggregator` caches
+    /// `TraceContext` -- `process` reads the cached value rather than taking it as a parameter,
+    /// for the same per-batch-not-per-event reasoning `observe_batch_context`'s own doc comment
+    /// gives. Default no-op, same reasoning as `observe_batch_context`'s own doc comment.
     fn observe_provenance(&mut self, provenance: Provenance) {
         let _ = provenance;
     }

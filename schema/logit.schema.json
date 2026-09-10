@@ -854,6 +854,64 @@
           }
         },
         {
+          "description": "Forwards an event whose batch's `origin`/`previous` match a configured allowlist -- `origin`/`previous` are which component created the batch and which one most recently handled it (`docs/adr/batch-provenance-on-delivered.md`), not event data. Never mutates a forwarded event, the same posture `has_attributes`/`has_signal` have.\n\n**Each field is a list of alternatives, OR'd within the field; the two fields AND together when both are configured.** An empty list means \"not checked\" for that field -- a configured field the batch doesn't carry a matching value for never matches (\"absent is `false`\"). At least one of `origin`/`previous` must be non-empty (an empty config matches every batch, a no-op -- rejected at graph-validation time), and no entry may be an empty string. See `docs/adr/provenance-filtering-components.md`.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "origin": {
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "previous": {
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "has_provenance"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Drops an event whose batch's `origin`/`previous` match a configured list, forwarding the rest -- the exact complement of `has_provenance` **on the same config**, taken at the top level, not per field: this drops an event only when the whole configured match succeeds, so a batch matching only one of two configured fields is forwarded, not dropped. Combined with \"absent is `false`,\" a batch that never carried a configured value at all is forwarded too -- read it as \"this batch isn't one of the ones told to drop.\" Same shape, matching rules, and validation as `has_provenance` otherwise; see `docs/adr/provenance-filtering-components.md`.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "origin": {
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "previous": {
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "drop_provenance"
+              ]
+            }
+          }
+        },
+        {
           "description": "Parses a log record's message as logfmt (`level=info msg=\"hello world\" dur=3ms`), merging the resulting key/values into the event's attributes. Additive and pass-through-on-failure, exactly like `json`. See `docs/adr/logfmt-and-kv-parsing.md`.",
           "type": "object",
           "required": [

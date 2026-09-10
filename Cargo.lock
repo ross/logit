@@ -1012,7 +1012,10 @@ dependencies = [
 name = "logit-transforms"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "bytes",
+ "logit-config",
  "logit-core",
  "logit-pipeline",
  "regex",
@@ -1020,6 +1023,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

@@ -174,6 +174,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | DropSignals { .. }
         | HasAttributes { .. }
         | DropAttributes { .. }
+        | HasProvenance { .. }
+        | DropProvenance { .. }
         | Logfmt { .. }
         | Kv { .. }
         | Regex { .. } => Role::Transform,
@@ -219,6 +221,8 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         DropSignals { .. } => "drop_signals",
         HasAttributes { .. } => "has_attributes",
         DropAttributes { .. } => "drop_attributes",
+        HasProvenance { .. } => "has_provenance",
+        DropProvenance { .. } => "drop_provenance",
         Logfmt { .. } => "logfmt",
         Kv { .. } => "kv",
         Regex { .. } => "regex",
@@ -259,6 +263,8 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::DropSignals { .. }
             | ComponentKind::HasAttributes { .. }
             | ComponentKind::DropAttributes { .. }
+            | ComponentKind::HasProvenance { .. }
+            | ComponentKind::DropProvenance { .. }
             | ComponentKind::Logfmt { .. }
             | ComponentKind::Kv { .. }
             | ComponentKind::Regex { .. }
@@ -1244,6 +1250,66 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 37: `has_provenance`/`drop_provenance`-specific validation
+    // (`docs/adr/provenance-filtering-components.md`). Same "can only ever be a no-op" instinct
+    // as rule 36, and the empty-config black-hole/no-op assignment lines up with rule 36's, not
+    // rule 21's -- despite each field's *contents* being a list of alternatives, the same shape
+    // `signals:` has. The difference is what "empty" means at the *field*, not the list: an empty
+    // `origin:`/`previous:` means "this field isn't part of the match" (vacuously true, so it
+    // never narrows what matches), exactly like `has_attributes`' empty `resource:`/`attributes:`
+    // map -- not "match against zero alternatives" (vacuously false), which is what makes
+    // `has_signal`'s family the inverted case. Two independently-omittable AND'd fields, each an
+    // OR internally, is `has_attributes`' top-level shape with `has_signal`'s per-field shape
+    // nested inside it -- and it's the *top* level that decides this assignment. So: both fields
+    // empty means `has_provenance` matches every batch (a no-op, forwarding everything untouched)
+    // and `drop_provenance`, its exact complement, therefore drops every one of them (a black
+    // hole). An empty string entry could never name a real component id (rule 12/19/20/36's
+    // reasoning); a duplicate entry within one list is almost certainly a copy-paste typo, the
+    // same instinct rule 4 already applies to a repeated `sources` entry.
+    for (id, component) in &components {
+        let (kind_name, origin, previous) = match &component.kind {
+            ComponentKind::HasProvenance { origin, previous } => {
+                ("has_provenance", origin, previous)
+            }
+            ComponentKind::DropProvenance { origin, previous } => {
+                ("drop_provenance", origin, previous)
+            }
+            _ => continue,
+        };
+
+        if origin.is_empty() && previous.is_empty() {
+            if kind_name == "has_provenance" {
+                anyhow::bail!(
+                    "component '{id}': a has_provenance with neither 'origin' nor 'previous' \
+                     configured matches every batch -- a no-op that forwards every event \
+                     untouched"
+                );
+            } else {
+                anyhow::bail!(
+                    "component '{id}': a drop_provenance with neither 'origin' nor 'previous' \
+                     configured matches every batch -- and so can only ever drop every event"
+                );
+            }
+        }
+
+        for (field_name, list) in [("origin", origin), ("previous", previous)] {
+            if list.iter().any(|entry| entry.is_empty()) {
+                anyhow::bail!(
+                    "component '{id}': a {kind_name} '{field_name}' entry must not be empty -- \
+                     it could never name a real component id"
+                );
+            }
+            let mut seen = std::collections::HashSet::with_capacity(list.len());
+            if let Some(dup) = list.iter().find(|entry| !seen.insert(entry.as_str())) {
+                anyhow::bail!(
+                    "component '{id}': a {kind_name} '{field_name}' entry ('{dup}') is repeated \
+                     -- almost certainly a copy-paste mistake, since a repeated alternative \
+                     changes nothing about what matches"
+                );
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         let Component { sources, buffer, receive, kind } = component;
@@ -2030,6 +2096,92 @@ mod tests {
             "a drop_attributes with nothing configured is the black-hole shape (drops every \
              event), not the no-op shape -- got: {err}"
         );
+    }
+
+    #[test]
+    fn a_has_provenance_with_neither_field_configured_is_rejected_as_a_no_op() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasProvenance { origin: vec![], previous: vec![] },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(
+            err.contains("no-op") && err.contains("forwards every event untouched"),
+            "a has_provenance with nothing configured is the no-op shape (matches every batch), \
+             not the black-hole shape -- got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_drop_provenance_with_neither_field_configured_is_rejected_as_a_black_hole() {
+        // The inverse of the has_provenance case above: nothing configured matches every batch
+        // too, but for drop_provenance that means dropping every one of them.
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::DropProvenance { origin: vec![], previous: vec![] },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(
+            err.contains("drop every event"),
+            "a drop_provenance with nothing configured is the black-hole shape (drops every \
+             event), not the no-op shape -- got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_has_provenance_with_an_empty_origin_entry_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasProvenance { origin: vec!["".to_string()], previous: vec![] },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("entry must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn a_drop_provenance_with_a_duplicate_previous_entry_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::DropProvenance {
+                    origin: vec![],
+                    previous: vec!["parse_json".to_string(), "parse_json".to_string()],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("is repeated"), "got: {err}");
+    }
+
+    #[test]
+    fn a_has_provenance_with_only_an_origin_list_resolves_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasProvenance {
+                    origin: vec!["nginx_in".to_string(), "syslog_in".to_string()],
+                    previous: vec![],
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]))
+        .unwrap();
     }
 
     #[test]

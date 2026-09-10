@@ -37,7 +37,8 @@ use logit_pipeline::{
 use logit_proto::frame::Compression as NativeCompression;
 use logit_transforms::{
     Aggregator, CsvParser, DropAttributes as DropAttributesTransform,
-    DropSignals as DropSignalsTransform, HasAttributes as HasAttributesTransform,
+    DropProvenance as DropProvenanceTransform, DropSignals as DropSignalsTransform,
+    HasAttributes as HasAttributesTransform, HasProvenance as HasProvenanceTransform,
     HasSignal as HasSignalTransform, JsonParser, Keep as KeepTransform,
     KeepSignals as KeepSignalsTransform, Kv as KvTransform, KvMetrics as KvMetricsTransform,
     Logfmt as LogfmtTransform, MatchMode as TransformMatchMode, RegexParser,
@@ -481,6 +482,18 @@ fn build_spec(
         )),
         DropAttributes { resource, attributes } => NodeSpec::Transform(Box::new(
             DropAttributesTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
+                .with_telemetry(telemetry.clone()),
+        )),
+        // No conversion helper needed here, unlike `to_set_pairs`/`to_signal_set`:
+        // `ComponentKind::HasProvenance`'s fields are already the plain `Vec<String>`
+        // `HasProvenanceTransform::new` takes -- interning happens inside the transform itself
+        // (`crate::provenance::Matcher::new`), not at the config boundary.
+        HasProvenance { origin, previous } => NodeSpec::Transform(Box::new(
+            HasProvenanceTransform::new(origin.clone(), previous.clone())
+                .with_telemetry(telemetry.clone()),
+        )),
+        DropProvenance { origin, previous } => NodeSpec::Transform(Box::new(
+            DropProvenanceTransform::new(origin.clone(), previous.clone())
                 .with_telemetry(telemetry.clone()),
         )),
 
@@ -2174,6 +2187,42 @@ mod tests {
         };
         assert!(matches!(
             build_spec("drop_attributes", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_has_provenance_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::HasProvenance {
+                origin: vec!["nginx_in".to_string()],
+                previous: vec![],
+            },
+        };
+        assert!(matches!(
+            build_spec("has_provenance", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_drop_provenance_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::DropProvenance {
+                origin: vec![],
+                previous: vec!["logit_in".to_string()],
+            },
+        };
+        assert!(matches!(
+            build_spec("drop_provenance", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
     }
