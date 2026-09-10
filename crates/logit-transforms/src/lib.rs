@@ -4,8 +4,9 @@
 //! dedicated OS thread, unlike a Lua component -- `docs/design/pipeline-graph.md`'s "Node kinds"
 //! section). `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`,
 //! `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`,
-//! `logfmt`, `kv`, and `regex` are implemented (`rename`/`filter`/`sample`/`throttle`/`dedup` were
-//! retired rather than landing -- `docs/adr/routing-by-condition-is-lua.md`).
+//! `has_provenance`, `drop_provenance`, `logfmt`, `kv`, and `regex` are implemented
+//! (`rename`/`filter`/`sample`/`throttle`/`dedup` were retired rather than landing --
+//! `docs/adr/routing-by-condition-is-lua.md`).
 
 mod aggregate;
 mod attributes;
@@ -14,6 +15,7 @@ mod json;
 mod keep;
 mod kv_metrics;
 mod logfmt;
+mod provenance;
 mod regex;
 mod scale;
 mod set;
@@ -29,6 +31,7 @@ pub use json::JsonParser;
 pub use keep::{Keep, Remove};
 pub use kv_metrics::{KvMetrics, MetricSpec};
 pub use logfmt::{Kv, Logfmt};
+pub use provenance::{DropProvenance, HasProvenance};
 pub use regex::RegexParser;
 pub use scale::Scale;
 pub use set::Set;

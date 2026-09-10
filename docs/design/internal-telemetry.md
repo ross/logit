@@ -536,6 +536,11 @@ Worked examples, one per shipped component:
   nothing measurable — it only re-evaluates `AttrMap::get_sym` against the `Arc` already in hand —
   so a counter would advertise a cost that isn't actually there. See
   [ADR `attribute-filtering-components`](../adr/attribute-filtering-components.md).
+- `has_provenance`/`drop_provenance` (`crates/logit-transforms/src/provenance.rs`): shares
+  `logit.transform.events.filtered` with the two families above (same `0.0`-on-forward/`1.0`-on-drop
+  convention). No `.payloads.stripped`-style counter — neither kind mutates a forwarded event. No
+  `Diagnostics`, same reasoning as `has_attributes`/`has_signal`. See
+  [ADR `provenance-filtering-components`](../adr/provenance-filtering-components.md).
 - `stdio_out`/`file_out` (`StreamOutput`, `crates/logit-outputs/src/stdio.rs`): both built on the
   same sink (ADR `rotating-file-output`), so both share `logit.output.batch.bytes` — direct parity
   with `influxdb_out`'s own batch-bytes metric. A write error still propagates as a hard failure

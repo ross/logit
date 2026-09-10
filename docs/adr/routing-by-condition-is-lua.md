@@ -171,3 +171,10 @@ assumed), this decision is the one to revisit, and the alternative below is wher
   `filter`/`where`, no operators, no boolean algebra beyond a plain conjunction. Anything needing an
   actual operator (`>=`, `contains`, cross-attribute comparison) still means writing `lua`, and the
   preserved grammar sketch above is still where that design would resume.
+- **The same trigger fired a second time, also on 2026-09-10, for batch provenance.**
+  `has_provenance`/`drop_provenance` (`docs/adr/provenance-filtering-components.md`) filter on a
+  batch's `origin`/`previous` -- component ids drawn from a graph's own `components:` map, a
+  narrower, already-closed set than the attribute values `has_attributes` had to defend matching
+  against. Same posture as above: no operators, no boolean algebra beyond the AND-across-fields/
+  OR-within-a-field this pair adds (itself `has_attributes`' and `has_signal`'s shapes composed,
+  not a new primitive), and this ADR's core holding is still unchanged.

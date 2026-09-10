@@ -1182,7 +1182,8 @@ async fn run_transform(
         // contributor to whatever it's about to absorb from it -- the flush-side linking
         // `TraceContext`'s doc comment and `docs/known-gaps.md`'s internal-spans entry describe.
         // A no-op for every other transform. `observe_provenance` is the same idea for
-        // `Provenance` -- a no-op for every transform today.
+        // `Provenance` -- `has_provenance`/`drop_provenance` cache it here and read it back in
+        // `process`; a no-op for every other transform.
         transform.observe_batch_context(parent.trace);
         transform.observe_provenance(parent.provenance);
         // Minted here, not inside `Fanout::send_with_context`, because this node records its own
