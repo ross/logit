@@ -21,6 +21,12 @@ Once it's up, **start at http://localhost:8080** — a small page that links to 
 get-started instructions and shows this stack's own pipeline, rendered live. That's `haproxy`,
 the demo's front door now; requests flow `haproxy` → `nginx` → `app` (a real Django app).
 
+**This is a demo, not a production example** — it exists to show a large portion of `logit`'s
+functionality in a way that's quick to spin up, with several shortcuts (anonymous Grafana admin,
+hardcoded secrets, root privileges for one tier, and more) that don't belong in a real deployment.
+The landing page's "This demo is not a production example" section spells out exactly which ones
+and why.
+
 | Service | URL | What it's for |
 |---|---|---|
 | Front door (haproxy) | http://localhost:8080 | Start here. Mints the request's W3C `traceparent`, then proxies to `nginx`. |
