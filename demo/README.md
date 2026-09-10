@@ -199,24 +199,33 @@ request, nothing is cached.)
 
 ## What isn't exercised yet
 
-**`otlp_in`** (`crates/logit-inputs/src/otlp.rs`) still ships implemented and tested with nothing
-in this stack sending *to* it — `app`'s spans go straight to Tempo instead, by design (see
-"What's actually flowing" above), so this isn't an oversight to close so much as a deliberate
-choice about where `logit` belongs in the pipeline. If you want to see `otlp_in` exercised with
-real traffic, point `app`'s `OTEL_EXPORTER_OTLP_ENDPOINT` (`demo/compose.yaml`) at `http://logit:4318`
-instead of `http://tempo:4318`, and re-add a `tempo_out` source for it in `demo/logit.yaml` — that
-was this demo's shape until this rework; it's a small, well-understood change to reverse.
+**`otlp_in`** (`crates/logit-inputs/src/otlp.rs`) used to ship implemented and tested with nothing
+in this stack sending *to* it — `browser_in` (`demo/logit.yaml`) closes that: a real `otlp_in`
+listener, reachable through `haproxy`'s own `/v1/*` route (`demo/haproxy/haproxy.cfg`) rather than
+published directly, since a browser (or `curl`) reaching it same-origin is the whole point. Unlike
+every syslog/docker/tail-sourced input elsewhere in this stack, no `set` stage stamps a resource in
+front of it — a real OTel SDK sets its own `Resource`. `app`'s own spans still go straight to
+Tempo instead of through `browser_in` (see "What's actually flowing" above) — that remains a
+deliberate choice, not something this closes. Nothing in this stack's own traffic sends to
+`browser_in` yet, though (see "What's left client-side" below); it's verified instead with a
+manual OTLP/JSON POST to `/v1/traces`.
 
 `tail_in` (plain file tailing, the driver `docker_in` builds on) used to ship tested but
 unexercised here too — `postgres_in` (`demo/logit.yaml`, `docs/plans/demo-richer-traces.md`)
 closes that: a `paths:` glob over Postgres's own rotating jsonlog directory, checkpointed on the
 same `logit_state` volume `nginx_in` already uses.
 
-What's left client-side: browser-side tracing is sketched, not built, in
+## What's left client-side
+
+Browser-side tracing is sketched, not built, in
 [docs/plans/demo-tracing-stack.md](../docs/plans/demo-tracing-stack.md)'s workstream C
-([docs/plans/browser-tracing.md](../docs/plans/browser-tracing.md)) — same-origin OTLP export
-through `haproxy` needs no `logit` change, but a real OTel browser SDK needs `otlp_in` to accept
-OTLP/JSON, which it doesn't today ([docs/known-gaps.md](../docs/known-gaps.md)).
+([docs/plans/browser-tracing.md](../docs/plans/browser-tracing.md)) — the server side is done now
+(previous section, above): `haproxy` already routes same-origin `/v1/*` traffic to `browser_in`,
+and `otlp_in` already accepts OTLP/JSON as well as protobuf
+([ADR `otlp-json-decoding`](../docs/adr/otlp-json-decoding.md)), closing the gap
+[docs/known-gaps.md](../docs/known-gaps.md) used to name here. What remains is purely a real OTel
+browser SDK on the landing page actually sending spans there — no further `logit` or `haproxy`
+change needed first.
 
 ## Stopping
 
