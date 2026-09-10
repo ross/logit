@@ -19,7 +19,7 @@
 
 use logit_bench::alloc::{measure, CountingAlloc, Stats};
 use logit_bench::fixtures;
-use logit_core::{EventBatch, Registry, Telemetry, TraceRef, Value};
+use logit_core::{AttrMap, EventBatch, Registry, Resource, Telemetry, TraceRef, Value};
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::stdio::{EventDump, Format};
 use logit_outputs::syslog::{Format as SyslogFormat, MessageBuf, SyslogEncoder};
@@ -1371,6 +1371,112 @@ fn set_resource_map_resource_cache_miss() {
     let (mapped, stats) = measure(|| set.map_resource(&resource));
     assert!(mapped.is_some());
     expect_allocs("transform: set.map_resource, cache miss (distinct input Arc)", stats, 1);
+}
+
+/// `resource:` attribute for [`has_attributes_resource`]/[`fixtures::has_attributes_resource`]'s
+/// config -- built directly, not via `fixtures::resource()`, because that fixture is always empty
+/// and this needs `service.name` present to match.
+fn resource_with_service_name() -> Arc<Resource> {
+    let mut attrs = AttrMap::new();
+    attrs.insert("service.name", Value::str("nginx"));
+    Arc::new(Resource { attributes: attrs })
+}
+
+/// `has_attributes` matching on a single event attribute -- free, same reasoning as
+/// [`keep_one_event`]: nothing here touches the heap. `Matcher::matches`'s `AttrMap::get_sym`
+/// probe is a `binary_search_by_key` over a `SmallVec`, and `value_matches`' numeric coercion
+/// (config `status: 200` against `nginx_event`'s JSON-sourced `status`) parses on the stack.
+#[test]
+fn has_attributes_one_event() {
+    let mut has = fixtures::has_attributes();
+    let resource = fixtures::resource();
+    drop(has.process(&resource, fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let (event, stats) = measure(|| has.process(&resource, event));
+    assert!(event.is_some(), "the fixture's status should match");
+    expect_allocs("has_attributes: match 1 attribute", stats, 0);
+}
+
+/// [`has_attributes_one_event`]'s exact complement -- also free, same config, an event that
+/// matches is dropped rather than forwarded, but nothing about deciding that allocates either.
+#[test]
+fn drop_attributes_one_event() {
+    let mut drop_attrs = fixtures::drop_attributes();
+    let resource = fixtures::resource();
+    let _ = drop_attrs.process(&resource, fixtures::nginx_event());
+
+    let event = fixtures::nginx_event();
+    let (event, stats) = measure(|| drop_attrs.process(&resource, event));
+    assert!(event.is_none(), "the fixture's status should match, so this drops");
+    expect_allocs("drop_attributes: match 1 attribute (dropped)", stats, 0);
+}
+
+/// The resource-match cache's hit path (`crates/logit-transforms/src/attributes.rs`'s `Matcher`,
+/// `Set::map_resource`'s `ptr_eq` idiom applied to a read): a second call with the same input
+/// `Arc<Resource>` must cost nothing, in contrast to a miss (below).
+#[test]
+fn has_attributes_resource_match_cache_hit() {
+    let mut has = fixtures::has_attributes_resource();
+    let resource = resource_with_service_name();
+    drop(has.process(&resource, fixtures::nginx_event())); // warm the cache
+
+    let event = fixtures::nginx_event();
+    let (event, stats) = measure(|| has.process(&resource, event));
+    assert!(event.is_some());
+    expect_allocs("has_attributes: resource match, cache hit (same input Arc)", stats, 0);
+}
+
+/// The cache-miss cost `has_attributes_resource_match_cache_hit` contrasts with -- and, unlike
+/// `Set::map_resource`'s miss (which rebuilds an `AttrMap`/`Resource`/`Arc` and costs 1), this
+/// stays **0**: a miss here only re-evaluates `resource.attributes.get_sym` against the *existing*
+/// `Arc` a caller already holds, never builds a new one. This is what makes the always-missing
+/// `logit_in` fan-out topology (`docs/adr/attribute-filtering-components.md`) safe -- the cache
+/// exists to help the sidecar case, but costs nothing extra when it can't.
+#[test]
+fn has_attributes_resource_match_cache_miss() {
+    let mut has = fixtures::has_attributes_resource();
+    drop(has.process(&resource_with_service_name(), fixtures::nginx_event())); // warm, distinct Arc
+
+    let resource = resource_with_service_name();
+    let event = fixtures::nginx_event();
+    let (event, stats) = measure(|| has.process(&resource, event));
+    assert!(event.is_some());
+    expect_allocs("has_attributes: resource match, cache miss (distinct input Arc)", stats, 0);
+}
+
+/// `has_attributes` through `process_batch` -- **1**, identical to `keep`/`set`'s own
+/// `process_batch` tests: `process_batch`'s own `Vec::with_capacity(batch.events.len())` is the
+/// whole cost, whether the batch's one event is forwarded (here) or dropped (below).
+#[test]
+fn process_batch_through_has_attributes() {
+    let mut has = fixtures::has_attributes();
+    let telemetry = Telemetry::default();
+    let warm = fixtures::nginx_batch(1);
+    drop(process_batch(&mut has, warm, &telemetry));
+
+    let batch = fixtures::nginx_batch(1);
+    let (out, stats) = measure(|| process_batch(&mut has, batch, &telemetry));
+    let out = out.expect("the fixture's status should match, so this forwards");
+    assert_eq!(out.events.len(), 1);
+    expect_allocs("runtime: process_batch through has_attributes", stats, 1);
+}
+
+/// The other outcome: every event in the batch dropped. Still **1** -- `process_batch` builds its
+/// output `Vec` before any event is processed, so a batch that ends up fully filtered out still
+/// pays for (and immediately drops) a `Vec` it never pushes into, the same fact
+/// `process_batch_fully_absorbed` (below) pins for `aggregate`.
+#[test]
+fn process_batch_through_has_attributes_dropping_every_event() {
+    let mut drop_attrs = fixtures::drop_attributes();
+    let telemetry = Telemetry::default();
+    let warm = fixtures::nginx_batch(1);
+    drop(process_batch(&mut drop_attrs, warm, &telemetry));
+
+    let batch = fixtures::nginx_batch(1);
+    let (out, stats) = measure(|| process_batch(&mut drop_attrs, batch, &telemetry));
+    assert!(out.is_none(), "the fixture's status should match, so every event is dropped");
+    expect_allocs("runtime: process_batch through drop_attributes, dropping every event", stats, 1);
 }
 
 /// The other outcome `process_batch` can produce: every event absorbed, nothing forwarded.

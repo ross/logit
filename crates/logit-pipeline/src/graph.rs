@@ -172,6 +172,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | HasSignal { .. }
         | KeepSignals { .. }
         | DropSignals { .. }
+        | HasAttributes { .. }
+        | DropAttributes { .. }
         | Logfmt { .. }
         | Kv { .. }
         | Regex { .. } => Role::Transform,
@@ -215,6 +217,8 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         HasSignal { .. } => "has_signal",
         KeepSignals { .. } => "keep_signals",
         DropSignals { .. } => "drop_signals",
+        HasAttributes { .. } => "has_attributes",
+        DropAttributes { .. } => "drop_attributes",
         Logfmt { .. } => "logfmt",
         Kv { .. } => "kv",
         Regex { .. } => "regex",
@@ -253,6 +257,8 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::HasSignal { .. }
             | ComponentKind::KeepSignals { .. }
             | ComponentKind::DropSignals { .. }
+            | ComponentKind::HasAttributes { .. }
+            | ComponentKind::DropAttributes { .. }
             | ComponentKind::Logfmt { .. }
             | ComponentKind::Kv { .. }
             | ComponentKind::Regex { .. }
@@ -456,13 +462,22 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 12: `set`-specific validation -- neither map configured can only ever be a no-op,
-    // exactly the `kv_metrics` rule above, for the same reason.
+    // exactly the `kv_metrics` rule above, for the same reason. An empty key in either map could
+    // never name a real attribute -- rule 19/20's reasoning, applied here too so `has_attributes`/
+    // `drop_attributes` (rule 36) can claim their own empty-key rejection actually bounds what
+    // `set` can stamp: `has_attributes`' config is `set`'s config, and this keeps that true.
     for (id, component) in &components {
         if let ComponentKind::Set { resource, attributes } = &component.kind {
             if resource.is_empty() && attributes.is_empty() {
                 anyhow::bail!(
                     "component '{id}': a set with neither 'resource' nor 'attributes' \
                      configured can only ever be a no-op"
+                );
+            }
+            if resource.keys().chain(attributes.keys()).any(|key| key.is_empty()) {
+                anyhow::bail!(
+                    "component '{id}': a set key must not be empty -- it could never name a \
+                     real attribute"
                 );
             }
         }
@@ -1163,6 +1178,69 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 pair[1].1,
                 pair[0].0
             );
+        }
+    }
+
+    // Rule 36: `has_attributes`/`drop_attributes`-specific validation
+    // (`docs/adr/attribute-filtering-components.md`). Neither map configured is rejected on both
+    // kinds, the same "can only ever be a no-op" instinct as rule 12 -- but note the black-hole/
+    // no-op assignment is *inverted* from rule 21: there the allowlist (`keep_signals`) is the
+    // black hole and the denylist the no-op, because `signals:` is a list of alternatives.
+    // `resource:`/`attributes:` is a map of conjunctions instead, so a conjunction over zero pairs
+    // is vacuously true -- `has_attributes` with nothing configured matches *every* event (a
+    // no-op, forwarding everything untouched) and `drop_attributes` with nothing configured is
+    // therefore its exact complement, matching every event too, but that means dropping every one
+    // of them (a black hole). An empty key could never name a real attribute (rule 12/19/20's
+    // reasoning). A non-finite value can never compare equal to anything under
+    // `crate::attributes`' coercing matcher, so an entry holding one could never match -- the same
+    // "would only ever produce a value `numeric` then rejects" reasoning rule 20 applies to
+    // `scale`'s factors. The same key appearing in both `resource:` and `attributes:` is
+    // deliberately *not* rejected -- they address different objects (the batch vs. the event), so
+    // that config is meaningful, not a mistake.
+    for (id, component) in &components {
+        let (kind_name, resource, attributes) = match &component.kind {
+            ComponentKind::HasAttributes { resource, attributes } => {
+                ("has_attributes", resource, attributes)
+            }
+            ComponentKind::DropAttributes { resource, attributes } => {
+                ("drop_attributes", resource, attributes)
+            }
+            _ => continue,
+        };
+
+        if resource.is_empty() && attributes.is_empty() {
+            if kind_name == "has_attributes" {
+                anyhow::bail!(
+                    "component '{id}': a has_attributes with neither 'resource' nor \
+                     'attributes' configured matches every event -- a no-op that forwards \
+                     every event untouched"
+                );
+            } else {
+                anyhow::bail!(
+                    "component '{id}': a drop_attributes with neither 'resource' nor \
+                     'attributes' configured matches every event -- and so can only ever drop \
+                     every one of them"
+                );
+            }
+        }
+
+        for (map_name, map) in [("resource", resource), ("attributes", attributes)] {
+            if map.keys().any(|key| key.is_empty()) {
+                anyhow::bail!(
+                    "component '{id}': a {kind_name} '{map_name}' key must not be empty -- it \
+                     could never name a real attribute"
+                );
+            }
+            if map
+                .values()
+                .any(|value| matches!(value, logit_config::SetValue::F64(f) if !f.is_finite()))
+            {
+                anyhow::bail!(
+                    "component '{id}': every {kind_name} '{map_name}' value must be a finite \
+                     number -- a non-finite value never compares equal to anything, so that \
+                     entry could never match"
+                );
+            }
         }
     }
 
@@ -1890,6 +1968,175 @@ mod tests {
         .expect("should resolve");
     }
 
+    #[test]
+    fn a_set_with_an_empty_key_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "tag",
+                vec!["in"],
+                ComponentKind::Set {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "".to_string(),
+                        logit_config::SetValue::Str("x".to_string()),
+                    )]),
+                },
+            ),
+            ("out", vec!["tag"], sink()),
+        ]));
+        assert!(err.contains("key must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn a_has_attributes_with_neither_map_configured_is_rejected_as_a_no_op() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(
+            err.contains("no-op") && err.contains("forwards every event untouched"),
+            "a has_attributes with nothing configured is the no-op shape (matches every event), \
+             not the black-hole shape -- got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_drop_attributes_with_neither_map_configured_is_rejected_as_a_black_hole() {
+        // The inverse of the has_attributes case above: nothing configured matches every event
+        // too, but for drop_attributes that means dropping every one of them.
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::DropAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(
+            err.contains("drop every one of them"),
+            "a drop_attributes with nothing configured is the black-hole shape (drops every \
+             event), not the no-op shape -- got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_has_attributes_with_an_empty_key_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "".to_string(),
+                        logit_config::SetValue::Str("x".to_string()),
+                    )]),
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("key must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn a_drop_attributes_with_a_non_finite_value_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::DropAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "ratio".to_string(),
+                        logit_config::SetValue::F64(f64::NAN),
+                    )]),
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]));
+        assert!(err.contains("must be a finite number"), "got: {err}");
+    }
+
+    #[test]
+    fn a_has_attributes_with_only_a_resource_map_resolves_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::from([(
+                        "service.name".to_string(),
+                        logit_config::SetValue::Str("nginx".to_string()),
+                    )]),
+                    attributes: std::collections::BTreeMap::new(),
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]))
+        .expect("should resolve");
+    }
+
+    #[test]
+    fn a_has_attributes_with_only_an_attributes_map_resolves_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "stream".to_string(),
+                        logit_config::SetValue::Str("a".to_string()),
+                    )]),
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]))
+        .expect("should resolve");
+    }
+
+    #[test]
+    fn the_same_key_in_both_maps_resolves_fine() {
+        // resource: and attributes: address different objects, so a shared key name is
+        // meaningful configuration, not a mistake -- deliberately not rejected.
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "filter",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::from([(
+                        "stream".to_string(),
+                        logit_config::SetValue::Str("a".to_string()),
+                    )]),
+                    attributes: std::collections::BTreeMap::from([(
+                        "stream".to_string(),
+                        logit_config::SetValue::Str("a".to_string()),
+                    )]),
+                },
+            ),
+            ("out", vec!["filter"], sink()),
+        ]))
+        .expect("should resolve");
+    }
+
     fn otlp_out_with_headers(headers: Vec<(&str, &str)>) -> ComponentKind {
         ComponentKind::OtlpOut {
             endpoint: "http://localhost:4318".to_string(),
@@ -2605,6 +2852,41 @@ mod tests {
         assert_eq!(kind_name(&graph.components["has_signal"].kind), "has_signal");
         assert_eq!(kind_name(&graph.components["keep_signals"].kind), "keep_signals");
         assert_eq!(kind_name(&graph.components["drop_signals"].kind), "drop_signals");
+    }
+
+    #[test]
+    fn the_attribute_components_resolve_as_transforms_with_the_right_kind_names() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "has_attributes",
+                vec!["in"],
+                ComponentKind::HasAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "stream".to_string(),
+                        logit_config::SetValue::Str("a".to_string()),
+                    )]),
+                },
+            ),
+            (
+                "drop_attributes",
+                vec!["has_attributes"],
+                ComponentKind::DropAttributes {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "debug".to_string(),
+                        logit_config::SetValue::Bool(true),
+                    )]),
+                },
+            ),
+            ("out", vec!["drop_attributes"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["has_attributes"].role(), Role::Transform);
+        assert_eq!(graph.components["drop_attributes"].role(), Role::Transform);
+        assert_eq!(kind_name(&graph.components["has_attributes"].kind), "has_attributes");
+        assert_eq!(kind_name(&graph.components["drop_attributes"].kind), "drop_attributes");
     }
 
     #[test]

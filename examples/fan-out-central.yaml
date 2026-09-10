@@ -1,0 +1,76 @@
+# One connection, N streams -- the central half. See examples/fan-out-edge.yaml for the full
+# picture, how to run both together, and the `logit_in` field reference this file doesn't repeat.
+#
+# Topology (this file):
+#
+#                            /--> host_stream (has_attributes) --> windowed --> metrics_out
+#   [the wire] --> central_in --> app_stream  (has_attributes) --------------> app_out
+#                            \--> not_host (drop_attributes) --> untagged (drop_attributes) --> untagged_out
+#
+# `stdio_out` stands in for a real sink purely so this example is runnable with no external
+# service, the same posture examples/forwarder-central.yaml takes.
+components:
+  central_in:
+    type: logit_in
+    bind: 0.0.0.0:5150
+
+  # Fan-out is unconditional -- every consumer of `central_in` sees every batch
+  # (docs/design/pipeline-graph.md's runtime model). Each branch below takes only its own stream
+  # back out of that shared flow. A `has_attributes` map is a conjunction: every pair listed here,
+  # and every pair under `resource:`, must match, or the event is dropped. An attribute the event
+  # doesn't carry at all never matches (docs/adr/attribute-filtering-components.md).
+  host_stream:
+    type: has_attributes
+    sources: [central_in]
+    attributes:
+      stream: host
+    # resource:                     # matches what a `set` with a `resource:` block stamped;
+    #   service.name: host-agent    #   evaluated once per batch, not once per event
+
+  app_stream:
+    type: has_attributes
+    sources: [central_in]
+    attributes:
+      stream: app
+
+  # The else-branch: everything the two branches above didn't claim. `drop_attributes` is the exact
+  # complement of `has_attributes` on the same config -- it drops an event only when *every*
+  # configured pair matches, so with one pair it means "everything that isn't stream=host."
+  #
+  # Note the chain: two single-pair components, not one component listing two pairs. Chaining two
+  # complements is the complement of their *union* ("neither host nor app"); one component listing
+  # both pairs at once would instead mean "drop only what matches both simultaneously" -- never
+  # true here, since one event can't carry two different `stream` values.
+  not_host:
+    type: drop_attributes
+    sources: [central_in]
+    attributes:
+      stream: host
+
+  untagged:
+    type: drop_attributes
+    sources: [not_host]
+    attributes:
+      stream: app
+
+  # The 60s aggregation window happens here, once, centrally -- the edge forwards everything
+  # unaggregated (docs/adr/aggregation-window-semantics.md), same as examples/forwarder-central.yaml.
+  windowed:
+    type: aggregate
+    sources: [host_stream]
+    interval: 60s
+
+  metrics_out:
+    type: stdio_out
+    sources: [windowed]
+    target: stdout
+
+  app_out:
+    type: stdio_out
+    sources: [app_stream]
+    target: stdout
+
+  untagged_out:
+    type: stdio_out
+    sources: [untagged]
+    target: stderr
