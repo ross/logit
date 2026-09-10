@@ -34,6 +34,10 @@ serde_norway.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tikv-jemallocator = { version = "0.6", optional = true }
+# `init_logging` builds the subscriber; `--log-level`/`LOGIT_LOG` and `--log-format` pick its
+# filter and formatter (docs/plans/operator-surface.md).
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 # `crates/logit-cli/tests/durable_buffer_restart.rs` implements `logit_pipeline::Input`/`Output`

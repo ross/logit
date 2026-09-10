@@ -16,6 +16,10 @@ async-trait.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 regex.workspace = true
+# `run_lua`'s remaining `eprintln!`s go through `Diagnostics`, and its own lifecycle events
+# (`ready`, `shutdown signal received`, `drain complete`, `degraded`/`recovered`) go straight
+# through `tracing` (docs/plans/operator-surface.md).
+tracing.workspace = true
 # The disk-backed sink buffer's cursor.json (crates/logit-pipeline/src/disk_queue.rs), the same
 # tmp+rename JSON idiom crates/logit-inputs/src/tail/checkpoint.rs already uses for its own
 # same-sized checkpoint file.
