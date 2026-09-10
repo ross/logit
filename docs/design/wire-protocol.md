@@ -81,16 +81,45 @@ transport at all.
 
 ## Connection protocol
 
-- **Transport:** TCP first; QUIC is a plausible later upgrade (head-of-line-blocking avoidance
-  matters less here than getting the format and node-to-node story right first).
-- **TLS:** via `rustls`, not OpenSSL — keeps the "no host toolchain needed" property
-  ([ADR `containerized-development`](../adr/containerized-development.md)) intact, since `rustls` has no system OpenSSL
-  dependency to link against.
-- **Handshake:** negotiates protocol version, supported codecs, and supported compression before any
-  batch is sent, so a version mismatch fails fast and legibly instead of corrupting a stream.
-- **Flow control:** credit-based — the receiver advertises how many in-flight batches/bytes it will
-  accept, the sender respects it. Combined with per-batch ACKs, this is what makes at-least-once
-  delivery semantics addable later (retransmit unacked batches) without redesigning the transport.
+**Shipped**, as `logit_out`/`logit_in` (`crates/logit-outputs/src/logit.rs` /
+`crates/logit-inputs/src/logit.rs`) — see [ADR
+`native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md) for the full
+decision record; this section is the as-built summary.
+
+- **Transport:** TCP, optionally TLS via `rustls` (not OpenSSL — keeps the "no host toolchain
+  needed" property, [ADR `containerized-development`](../adr/containerized-development.md), intact
+  since `rustls` has no system OpenSSL dependency to link against). QUIC remains a plausible later
+  upgrade, not attempted here.
+- **Control frames.** A control message (handshake or ack) is an ordinary frame with
+  [`FLAG_CONTROL`](../../crates/logit-proto/src/frame.rs) set in the header's `flags` — `codec`/
+  `compression` are meaningless on one. The payload is hand-rolled TLV over `native::varint`
+  (`crates/logit-proto/src/native/control.rs`), the same `tag(u8) + len(uvarint) + payload` shape
+  and skip-unknown forward compatibility as a native-v1 `Event`'s own fields:
+
+  | Message | Fields | Sent by |
+  |---|---|---|
+  | `Hello` | `version`, `codecs`, `compressions`, `max_frame_bytes`, `window` | the connecting side, first |
+  | `HelloAck` | `version`, `codec`, `compression`, `max_frame_bytes`, `window` | the listener, once, in reply to a valid `Hello` |
+  | `Ack` | `seq` | the listener, once per data frame forwarded |
+  | `Reject` | `code`, `message` | either side, closing the connection |
+
+- **Handshake.** The connecting side sends `Hello`; the listener replies `HelloAck` (codec and
+  compression negotiated down to the intersection of what both sides offer, its own
+  `max_frame_bytes`, its own `window`) or `Reject` — a version mismatch or no shared codec is a
+  clean, legible refusal, not a corrupted stream.
+- **Sequence numbers are implicit**, not a field on the data frame: TCP is ordered, so the Nth data
+  frame on a connection is always seq N, and `Ack.seq` is the cumulative count the receiver has
+  forwarded so far. This keeps the native-v1 payload itself untouched by the transport layer.
+- **Acknowledgement point:** after the batch is in every downstream inbox (`Fanout::send` returning
+  on the listener side), not merely after it decodes. A stalled downstream delays the ack, which
+  stalls the sender's next attempt — that *is* this protocol's backpressure, and it's what removes
+  the need for a receive-side queue on `logit_in` the way a UDP listener has one.
+- **Flow control: negotiated, not yet exercised.** `Hello`/`HelloAck` both carry `window`, but the
+  sender only ever has one frame outstanding today (`docs/plans/native-transport.md`'s "In-flight"
+  decision) — `LogitOutput`'s `SinkQueue` `peek`/`commit` is the retransmit state for that one
+  frame. Credit-based flow control (several outstanding, cumulative acks against them) is real,
+  designed-for future work — negotiating `window` now is what lets it land later without a
+  wire-format version bump — tracked in `docs/known-gaps.md`, not built yet.
 
 ## Buffering
 
@@ -125,10 +154,15 @@ pushed item unchanged. A third overflow behavior, blocking until space frees up,
 not a variant here: a synchronous trait can't block usefully, so that's a concern of an async
 wrapper layered on top of `Buffer`, not of the trait or its implementations.
 
-`InMemoryBuffer<T>` is the one shipping implementation, ships first, and is what `Buffer<T>` is
-currently defined against. A disk-backed implementation (for surviving a restart or a downstream
-outage without data loss) is a real future need but not a v1 blocker — the trait boundary is what's
-cheap to add now and expensive to retrofit onto call sites that assumed an in-memory queue.
+`InMemoryBuffer<T>` is the one shipping implementation of this trait, and turns out to be the only
+one: a disk-backed sink buffer landed (`crates/logit-pipeline/src/disk_queue.rs`, ADR
+`disk-backed-sink-buffer`), but *not* against `Buffer<T>` — that trait's sync/`&mut self`/generic
+shape was the wrong seam for an implementation that has to do real file I/O and is concrete over
+`(Arc<EventBatch>, TraceContext)`, not generic over `T`. `DiskQueue` implements its own async
+surface directly instead. `Buffer<T>`'s role narrows to `InMemoryBuffer<T>` alone; the "cheap to
+add now, expensive to retrofit" bet this trait was built on paid off for the *first* buffer this
+crate needed (`SinkQueue`'s own `BoundedQueue<T: Queued>` wraps it), just not for the disk-backed
+one.
 
 ## Open question
 

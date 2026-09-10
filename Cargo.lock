@@ -868,6 +868,8 @@ name = "logit-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "bytes",
  "clap",
  "logit-config",
  "logit-core",
@@ -964,11 +966,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "logit-config",
  "logit-core",
  "logit-proto",
  "logit-script",
  "regex",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

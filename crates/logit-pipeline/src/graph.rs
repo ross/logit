@@ -118,6 +118,7 @@
 use logit_config::{
     BufferConfig, Component, ComponentKind, Compression, Config, ReceiveConfig, StreamFormat,
 };
+use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
@@ -260,6 +261,8 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::StdioOut { .. }
             | ComponentKind::FileOut { .. }
             | ComponentKind::SyslogOut { .. }
+            | ComponentKind::LogitIn { .. }
+            | ComponentKind::LogitOut { .. }
     )
 }
 
@@ -1060,6 +1063,109 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 34: `logit_out`'s `tls:` block must be internally consistent -- `cert_file`/`key_file`
+    // together, `insecure_skip_verify` and `ca_file` contradictory -- mirroring rule 24's first
+    // two checks. No scheme-based check the way rule 24's third one has: `logit_out`'s `endpoint`
+    // is a bare `host:port` (the `syslog_out` shape), so `tls:`'s mere presence is the only signal
+    // available, and it always turns TLS on -- there's no "wrong scheme" case to catch. And
+    // `logit_in`'s `max_frame_bytes`, when set, must be a real, sane bound: `0` could never accept
+    // a single frame (the same "0 is impossible, not just small" instinct as rules 9/15/18/28),
+    // and anything over `logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN` (64 MiB) exceeds what
+    // `read_frame`/`read_frame_with_header` themselves ever accept regardless of what a listener
+    // configures.
+    for (id, component) in &components {
+        if let ComponentKind::LogitOut { tls: Some(tls), .. } = &component.kind {
+            if tls.cert_file.is_some() != tls.key_file.is_some() {
+                anyhow::bail!(
+                    "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
+                     mutual TLS, or both omitted -- one alone can't be used"
+                );
+            }
+            if tls.insecure_skip_verify && tls.ca_file.is_some() {
+                anyhow::bail!(
+                    "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both \
+                     be set -- 'insecure_skip_verify' trusts any certificate, which makes a \
+                     specific trusted CA meaningless"
+                );
+            }
+        }
+        if let ComponentKind::LogitIn { max_frame_bytes: Some(max_frame_bytes), .. } =
+            &component.kind
+        {
+            if *max_frame_bytes == 0 {
+                anyhow::bail!(
+                    "component '{id}': 'max_frame_bytes' of 0 is impossible, not just small"
+                );
+            }
+            if *max_frame_bytes > MAX_SANE_UNCOMPRESSED_LEN as u64 {
+                anyhow::bail!(
+                    "component '{id}': 'max_frame_bytes' ({max_frame_bytes}) is over the \
+                     {MAX_SANE_UNCOMPRESSED_LEN}-byte ceiling the native frame format itself \
+                     enforces"
+                );
+            }
+        }
+    }
+
+    // Rule 35: `buffer.disk:`'s shape (`docs/adr/disk-backed-sink-buffer.md`). Disk *replaces*
+    // memory for that sink, not a tier sized alongside it, so `max_batches`/`max_bytes` staying
+    // at their defaults while `disk:` is set would silently ignore whichever one an operator
+    // actually meant to tune -- the same "a knob that would silently do nothing is a config
+    // error" reasoning as rule 33. `segment_bytes`/`max_bytes` of `0` are impossible bounds, the
+    // same instinct as rule 15's `buffer.max_batches: 0`. Two sinks sharing a literal `disk.path`
+    // would corrupt each other's spool; `DiskQueue::open`'s own exclusive lock also catches an
+    // *aliased* path (`./spool` vs `spool`) this literal-string check can't see, since this
+    // function never resolves a path against the config's base directory.
+    // `(path, id)`, not `(id, path)` -- sorted so two entries sharing a path become adjacent
+    // regardless of which component id happens to sort first.
+    let mut disk_paths: Vec<(&str, &str)> = Vec::new();
+    for (id, component) in &components {
+        let Some(disk) = &component.buffer.disk else { continue };
+        if component.buffer.max_batches != BufferConfig::default().max_batches
+            || component.buffer.max_bytes != BufferConfig::default().max_bytes
+        {
+            anyhow::bail!(
+                "component '{id}': 'buffer.max_batches'/'buffer.max_bytes' are ignored once \
+                 'buffer.disk' is set -- disk replaces the in-memory bound rather than sizing \
+                 alongside it; tune 'buffer.disk.max_bytes' instead"
+            );
+        }
+        if disk.segment_bytes == 0 {
+            anyhow::bail!(
+                "component '{id}': 'buffer.disk.segment_bytes' must be at least 1 -- 0 means no \
+                 record could ever be written"
+            );
+        }
+        if disk.max_bytes == 0 {
+            anyhow::bail!(
+                "component '{id}': 'buffer.disk.max_bytes' must be at least 1 -- 0 means no \
+                 record could ever be written"
+            );
+        }
+        if disk.segment_bytes > disk.max_bytes {
+            anyhow::bail!(
+                "component '{id}': 'buffer.disk.segment_bytes' ({}) must not exceed \
+                 'buffer.disk.max_bytes' ({}) -- a single segment could never fit the overall \
+                 bound",
+                disk.segment_bytes,
+                disk.max_bytes
+            );
+        }
+        disk_paths.push((disk.path.as_str(), id.as_str()));
+    }
+    disk_paths.sort_unstable();
+    for pair in disk_paths.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            anyhow::bail!(
+                "components '{}' and '{}' both set 'buffer.disk.path' to '{}' -- two sinks \
+                 sharing one spool directory would corrupt each other's records",
+                pair[0].1,
+                pair[1].1,
+                pair[0].0
+            );
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         let Component { sources, buffer, receive, kind } = component;
@@ -1449,15 +1555,6 @@ mod tests {
     fn listener_with_no_consumers_is_rejected() {
         let err = expect_err(cfg(vec![("in", vec![], listener())]));
         assert!(err.contains("no consumers"), "got: {err}");
-    }
-
-    #[test]
-    fn unimplemented_kind_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], ComponentKind::LogitIn { bind: "127.0.0.1:0".to_string() }),
-            ("out", vec!["in"], sink()),
-        ]));
-        assert!(err.contains("not implemented yet"), "got: {err}");
     }
 
     #[test]
@@ -3170,6 +3267,211 @@ mod tests {
             ("out", vec!["in"], stdio_out_with_format(StreamFormat::Native, Compression::None)),
         ]))
         .expect("format: native with the default compression should validate fine");
+    }
+
+    fn logit_out_with_tls(tls: Option<logit_config::TlsClientConfig>) -> ComponentKind {
+        ComponentKind::LogitOut {
+            endpoint: "central:5140".to_string(),
+            compression: Compression::None,
+            tls,
+            request_timeout: Duration::from_secs(10),
+        }
+    }
+
+    fn logit_in_with_max_frame_bytes(max_frame_bytes: Option<u64>) -> ComponentKind {
+        ComponentKind::LogitIn { bind: "0.0.0.0:5140".to_string(), tls: None, max_frame_bytes }
+    }
+
+    #[test]
+    fn a_logit_out_with_cert_file_but_no_key_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            cert_file: Some("client.pem".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], logit_out_with_tls(Some(tls))),
+        ]));
+        assert!(err.contains("cert_file") && err.contains("key_file"), "got: {err}");
+    }
+
+    #[test]
+    fn a_logit_out_with_insecure_skip_verify_and_ca_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            ca_file: Some("ca.pem".to_string()),
+            insecure_skip_verify: true,
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], logit_out_with_tls(Some(tls))),
+        ]));
+        assert!(err.contains("insecure_skip_verify") && err.contains("ca_file"), "got: {err}");
+    }
+
+    #[test]
+    fn a_logit_out_with_a_consistent_tls_block_validates_fine() {
+        let tls = logit_config::TlsClientConfig {
+            cert_file: Some("client.pem".to_string()),
+            key_file: Some("client.key".to_string()),
+            ..Default::default()
+        };
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], logit_out_with_tls(Some(tls))),
+        ]))
+        .expect("a paired cert_file/key_file should validate fine");
+    }
+
+    #[test]
+    fn a_logit_in_with_max_frame_bytes_zero_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], logit_in_with_max_frame_bytes(Some(0))),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("max_frame_bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn a_logit_in_with_max_frame_bytes_over_the_sanity_cap_is_rejected() {
+        let err = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                logit_in_with_max_frame_bytes(Some(MAX_SANE_UNCOMPRESSED_LEN as u64 + 1)),
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("max_frame_bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn a_logit_in_with_no_max_frame_bytes_or_a_sane_one_validates_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], logit_in_with_max_frame_bytes(None)),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("an omitted max_frame_bytes should validate fine");
+        resolve(cfg(vec![
+            ("in", vec![], logit_in_with_max_frame_bytes(Some(MAX_SANE_UNCOMPRESSED_LEN as u64))),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("max_frame_bytes at exactly the sanity cap should validate fine");
+    }
+
+    #[test]
+    fn kind_name_and_role_are_implemented_for_logit_in_and_logit_out() {
+        let kind_in = logit_in_with_max_frame_bytes(None);
+        assert_eq!(kind_name(&kind_in), "logit_in");
+        assert_eq!(role(&kind_in), Role::Listener);
+        let kind_out = logit_out_with_tls(None);
+        assert_eq!(kind_name(&kind_out), "logit_out");
+        assert_eq!(role(&kind_out), Role::Sink);
+    }
+
+    fn disk_buffer(path: &str) -> BufferConfig {
+        BufferConfig {
+            disk: Some(logit_config::DiskBufferConfig {
+                path: path.to_string(),
+                max_bytes: 1024 * 1024 * 1024,
+                segment_bytes: 64 * 1024 * 1024,
+                compression: Compression::None,
+                checkpoint_interval: std::time::Duration::from_secs(1),
+            }),
+            ..BufferConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_disk_buffer_with_a_non_default_max_batches_is_rejected() {
+        let mut buffer = disk_buffer("spool");
+        buffer.max_batches = 4096;
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], sink(), buffer),
+        ]));
+        assert!(err.contains("are ignored once 'buffer.disk' is set"), "got: {err}");
+    }
+
+    #[test]
+    fn a_disk_buffer_with_a_non_default_max_bytes_is_rejected() {
+        let mut buffer = disk_buffer("spool");
+        buffer.max_bytes = 1;
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], sink(), buffer),
+        ]));
+        assert!(err.contains("are ignored once 'buffer.disk' is set"), "got: {err}");
+    }
+
+    #[test]
+    fn a_disk_buffer_with_zero_segment_bytes_is_rejected() {
+        let mut buffer = disk_buffer("spool");
+        buffer.disk.as_mut().unwrap().segment_bytes = 0;
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], sink(), buffer),
+        ]));
+        assert!(err.contains("'buffer.disk.segment_bytes' must be at least 1"), "got: {err}");
+    }
+
+    #[test]
+    fn a_disk_buffer_with_zero_max_bytes_is_rejected() {
+        let mut buffer = disk_buffer("spool");
+        buffer.disk.as_mut().unwrap().max_bytes = 0;
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], sink(), buffer),
+        ]));
+        assert!(err.contains("'buffer.disk.max_bytes' must be at least 1"), "got: {err}");
+    }
+
+    #[test]
+    fn a_disk_buffer_whose_segment_bytes_exceeds_max_bytes_is_rejected() {
+        let mut buffer = disk_buffer("spool");
+        {
+            let disk = buffer.disk.as_mut().unwrap();
+            disk.max_bytes = 1024;
+            disk.segment_bytes = 2048;
+        }
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], sink(), buffer),
+        ]));
+        assert!(
+            err.contains("'buffer.disk.segment_bytes'") && err.contains("must not exceed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn two_sinks_sharing_a_literal_disk_path_are_rejected() {
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out1", vec!["in"], sink(), disk_buffer("shared")),
+            ("out2", vec!["in"], sink(), disk_buffer("shared")),
+        ]));
+        assert!(err.contains("'out1'") && err.contains("'out2'"), "got: {err}");
+        assert!(err.contains("both set 'buffer.disk.path' to 'shared'"), "got: {err}");
+    }
+
+    #[test]
+    fn two_sinks_with_distinct_disk_paths_validate_fine() {
+        resolve(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out1", vec!["in"], sink(), disk_buffer("one")),
+            ("out2", vec!["in"], sink(), disk_buffer("two")),
+        ]))
+        .expect("distinct disk paths should validate fine");
+    }
+
+    #[test]
+    fn a_disk_buffer_at_every_default_but_path_validates_fine() {
+        resolve(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], sink(), disk_buffer("spool")),
+        ]))
+        .expect("a disk buffer with only path set should validate fine");
     }
 
     #[test]

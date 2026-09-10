@@ -227,6 +227,8 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `stdio_out` encode 100 events | **102** | ~1/event -- fixed, see below, was 1801; +1 since measured through `Encoder::encode` (`&EventBatch` -> `Bytes`) rather than the inherent `render` (`&EventBatch` -> `String`) directly, ADR `rotating-file-output` -- `Bytes::from(String)`'s own small shared-refcount allocation |
 | `influxdb_out` encode 100 events | **30** | ~0.3/event — see below |
 | receive queue: push then pop, warm | **0** | `BoundedQueue<Datagram>`, ADR `decoupled-listener-io` -- see below |
+| `disk_queue`: push one batch (encode + write) | **25** | `native::encode_batch` + `frame::write_frame` + one `write_all` -- breaks the zero-clone `Arc<EventBatch>` property by design, see `docs/adr/disk-backed-sink-buffer.md` |
+| `disk_queue`: peek, cached (no re-decode) | **0** | `write_loop`'s retry loop calls `peek` once per attempt; only the first (uncached) peek after a push touches disk |
 | accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR `decoupled-listener-io` -- see below |
 | `syslog_out` encode_into 100 events | **100** | ~1/event -- reused struct-held scratch buffers, was 401, see below |
 
@@ -661,16 +663,23 @@ datagram. `datagram_copy_is_one_right_sized_allocation` guards the current behav
 
 ### The native wire format (`logit_proto::native`)
 
-Not part of the nginx reference pipeline above — no `ComponentKind` consumes this codec yet
-([ADR `native-wire-format-encoding`](../adr/native-wire-format-encoding.md), `docs/known-gaps.md`)
-— so it gets its own small table rather than a row in §2's chain. One event
-(`fixtures::nginx_batch(1)`), `crates/logit-bench/tests/allocations.rs`'s
-`native_encode_one_event`/`native_decode_one_event`:
+Not part of the nginx reference pipeline above — it's a separate hop, not a stage inside one
+pipeline process — so it gets its own small table rather than a row in §2's chain. Two
+`ComponentKind`s consume this codec now, `logit_out`/`logit_in`
+(`docs/plans/native-transport.md`), each doing slightly less work than the raw
+`NativeEncoder`/`NativeDecoder` pair below: `logit_out` skips `NativeEncoder`'s bundling and calls
+`encode_batch`/`write_frame_with_flags` directly so it can frame with whatever compression this
+connection actually negotiated; `logit_in` has no caller-held scratch buffer to `out.extend` into
+the way `NativeDecoder::decode_into` does, since `Fanout::send` takes the `EventBatch`
+`decode_batch` already returns. One event (`fixtures::nginx_batch(1)`),
+`crates/logit-bench/tests/allocations.rs`:
 
 | Stage | allocs | Notes |
 |---|---:|---|
 | `NativeEncoder::encode`, 1 event | **23** | dictionary build + the per-field TLV scratch buffers `native::record::write_field` allocates for each of `Event`'s up-to-five fields (`docs/adr/native-wire-format-encoding.md`'s own Decision section notes this as a known, unoptimized cost of the field-level skip-unknown framing) |
+| `logit_out`: encode + frame, 1 event | **23** | `encode_batch` + `write_frame_with_flags` directly — same cost as `NativeEncoder::encode` above, since it's the same two steps; pinned separately so a future change to just this sink's path is caught here |
 | `NativeDecoder::decode_into`, 1 event | **8** | dictionary re-intern + `AttrMap`/`Event` construction; no intermediate object graph, unlike the bake-off's `rkyv`/`postcard` arms, which run through a `WireBatch` mirror first (`docs/adr/native-wire-format-encoding.md`'s finding 4) |
+| `logit_in`: read + decode, 1 event | **7** | `read_frame_with_header` + `decode_batch` directly — one allocation cheaper than `NativeDecoder::decode_into` above: no caller-held `Vec<Event>` to `out.extend` into, since `decode_batch`'s own freshly allocated `Vec` is what `Fanout::send` takes as-is |
 
 The full bake-off comparison against `otlp`, `rkyv`, and `postcard` — across two shapes and three
 batch sizes, both timing and encoded bytes — lives in
@@ -916,8 +925,16 @@ exact-equality discipline: a `MetricKind::Distribution`'s `DDSketch` is approxim
 constant rather than walked bin-by-bin, and `Value`'s numeric/bool/null variants (stored inline, no
 heap component) contribute nothing. It is consumed by the buffered sink-delivery work
 (`docs/plans/buffered-sink-delivery.md`, `docs/adr/buffered-sink-delivery.md`): every
-sink's `SinkQueue` (`crates/logit-pipeline/src/queue.rs`) bounds itself on both batch count and this
-estimate, whichever trips first.
+sink's queue (`crates/logit-pipeline/src/queue.rs`) bounds itself on both batch count and this
+estimate, whichever trips first — **for the in-memory default.** A sink opted into `buffer.disk:`
+(`docs/adr/disk-backed-sink-buffer.md`) bounds on-disk bytes instead
+(`crates/logit-pipeline/src/disk_queue.rs`'s own per-record encoded frame length, summed over every
+segment still on disk), not `estimated_heap_bytes()` — the two are deliberately not the same figure:
+disk usage tracks exactly what was written, while the in-memory estimate is the admission-control
+approximation described above. Either way, "in-flight memory" for that sink's queue is memory *or*
+disk, never both at once, and never more than one bound applies (`buffer.max_batches`/`max_bytes`
+are rejected outright alongside a non-default `buffer.disk`, `crates/logit-pipeline/src/graph.rs`
+rule 35).
 
 **A second consumer of the same byte-aware bounding idea, on the listener side.**
 [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md) generalizes `SinkQueue` into `BoundedQueue<T:
