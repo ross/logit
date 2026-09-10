@@ -129,6 +129,10 @@ pub struct UdpListener<D: Decoder + Send> {
     config: UdpListenerConfig,
     diag: Diagnostics,
     telemetry: Telemetry,
+    /// Set by [`Input::bind`], taken back out by [`Input::run_until_shutdown`]
+    /// (`docs/plans/operator-surface.md`, workstream B). `None` after a run, so a second run
+    /// rebinds, same as before this field existed.
+    socket: Option<tokio::net::UdpSocket>,
 }
 
 impl<D: Decoder + Send> UdpListener<D> {
@@ -139,7 +143,14 @@ impl<D: Decoder + Send> UdpListener<D> {
             config,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
+            socket: None,
         }
+    }
+
+    /// The address actually bound, once [`Input::bind`] has run -- lets a test learn the
+    /// OS-assigned port without a bind-drop-rebind race.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.socket.as_ref().and_then(|s| s.local_addr().ok())
     }
 
     /// Sets *this listener's own* diagnostics -- the top-level `bad_datagram` diagnostic
@@ -196,6 +207,22 @@ impl<D: Decoder + Send> UdpListener<D> {
 
 #[async_trait::async_trait]
 impl<D: Decoder + Send> Input for UdpListener<D> {
+    async fn bind(&mut self) -> anyhow::Result<()> {
+        if self.socket.is_some() {
+            return Ok(()); // idempotent, per `Input::bind`'s contract
+        }
+        let socket = bind_socket(
+            &self.bind,
+            self.config.receive_buffer_bytes,
+            &self.telemetry,
+            &mut self.diag,
+        )
+        .await?;
+        self.diag.info("bound", format_args!("listening on {}", self.bind));
+        self.socket = Some(socket);
+        Ok(())
+    }
+
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         // Never exercised in production -- `run_input` always calls `run_until_shutdown`. Present
         // because the trait requires it, mirroring how `logit_pipeline::run` passes
@@ -209,13 +236,8 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
         sink: Fanout,
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let socket = bind_socket(
-            &self.bind,
-            self.config.receive_buffer_bytes,
-            &self.telemetry,
-            &mut self.diag,
-        )
-        .await?;
+        self.bind().await?;
+        let socket = self.socket.take().expect("bind() leaves a socket behind");
         let queue = Arc::new(BoundedQueue::with_metrics(
             self.config.queue_config(),
             &RECEIVE_QUEUE_METRICS,
@@ -684,15 +706,13 @@ mod tests {
             },
         );
 
-        // `run_until_shutdown` binds its own socket internally, so learn the port by racing a
-        // short-lived probe bind on the same address first is not possible port-for-port -- instead
-        // this test drives `read_loop`/`decode_loop` directly (see the other tests in this module)
-        // for anything needing a known bind address. This test instead proves the *shutdown*
-        // contract specifically through `UdpListener::run_until_shutdown` end to end: bind to an
-        // OS-assigned port, discover it isn't observable pre-bind, so drive the whole listener via
-        // `run` in the background and shut it down almost immediately -- since nothing was sent,
-        // this only proves a clean, prompt shutdown with nothing queued. The queued-backlog case is
-        // covered directly against `read_loop`/`decode_loop` below.
+        // `Input::bind`/`UdpListener::local_addr` (docs/plans/operator-surface.md, workstream B)
+        // now make the OS-assigned port observable before `run` -- see
+        // `bind_then_run_delivers_a_real_datagram` below for the test that actually exercises a
+        // real socket round trip. This test still proves the *shutdown* contract specifically
+        // through `UdpListener::run_until_shutdown` end to end: shut down almost immediately, and
+        // since nothing was sent, this only proves a clean, prompt shutdown with nothing queued.
+        // The queued-backlog case is covered directly against `read_loop`/`decode_loop` below.
         let (fanout, mut rx) = recording_fanout(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle =
@@ -705,6 +725,84 @@ mod tests {
             .expect("task should not panic")
             .expect("should shut down without error");
         assert!(rx.try_recv().is_err(), "nothing was ever sent, so nothing should be delivered");
+    }
+
+    // -- workstream B: `Input::bind`/`local_addr` (docs/plans/operator-surface.md) --
+
+    /// The primitive `shutdown_drains_the_queue_...` above says was impossible before this
+    /// workstream: bind first, learn the real address via `local_addr`, *then* send a real
+    /// datagram to it and see it delivered -- with `run_until_shutdown` never having called
+    /// `bind()` itself.
+    #[tokio::test]
+    async fn bind_then_run_delivers_a_real_datagram() {
+        let mut listener =
+            UdpListener::new("127.0.0.1:0", TestDecoder::new(), UdpListenerConfig::default());
+        assert_eq!(listener.local_addr(), None, "no address before bind()");
+
+        listener.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = listener.local_addr().expect("bind() should leave a real address behind");
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(fanout, shutdown_rx).await });
+
+        send_datagram(addr, b"hello").await;
+        let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a datagram sent to the bound address should be delivered")
+            .expect("the channel should not have closed");
+        let batch = unwrap_batch(delivered);
+        assert_eq!(payload(&batch.events[0]), "hello");
+
+        handle.abort();
+    }
+
+    /// A second `bind()` call is a no-op, per [`logit_pipeline::Input::bind`]'s idempotency
+    /// contract -- it must not try to rebind (and fail with "address in use") against the socket
+    /// it already holds.
+    #[tokio::test]
+    async fn a_second_bind_is_a_no_op() {
+        let mut listener =
+            UdpListener::new("127.0.0.1:0", TestDecoder::new(), UdpListenerConfig::default());
+        listener.bind().await.expect("first bind should succeed");
+        let addr = listener.local_addr().expect("bind() should leave a real address behind");
+        listener.bind().await.expect("second bind should be a harmless no-op");
+        assert_eq!(listener.local_addr(), Some(addr), "the address must not change");
+    }
+
+    /// `bind()` surfaces a genuinely unbindable address as an error, same as `run` did before this
+    /// method existed (`bind_socket`'s own error path, unchanged). A privileged low port is the
+    /// usual way to force this, but this test runs as root in CI's containerized environment
+    /// (`docs/adr/containerized-development.md`), where that fails to fail -- occupying a
+    /// specific already-bound ephemeral port instead works regardless of privilege.
+    #[tokio::test]
+    async fn bind_reports_an_unbindable_address() {
+        let held = bind_ephemeral().await;
+        let addr = held.local_addr().unwrap().to_string();
+        let mut listener = UdpListener::new(addr, TestDecoder::new(), UdpListenerConfig::default());
+        assert!(listener.bind().await.is_err(), "binding an already-held address should fail");
+    }
+
+    /// `run_until_shutdown` still binds on its own when the caller never called `bind()` first --
+    /// [`logit_pipeline::Input::bind`]'s documented lazy fallback, and the reason no existing
+    /// direct-`run`/`run_until_shutdown` test in this module needed to change for this workstream.
+    #[tokio::test]
+    async fn run_until_shutdown_binds_when_the_caller_did_not() {
+        let mut listener =
+            UdpListener::new("127.0.0.1:0", TestDecoder::new(), UdpListenerConfig::default());
+        assert_eq!(listener.local_addr(), None);
+        let (fanout, _rx) = recording_fanout(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(fanout, shutdown_rx).await });
+        // Give the spawned task a chance to reach its own internal `self.bind().await?` -- there
+        // is nothing else to synchronize on here since the listener itself was moved into the
+        // task, but this is only proving the task didn't immediately error out, not timing a
+        // real race.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!handle.is_finished(), "run_until_shutdown should have bound and now be listening");
+        handle.abort();
     }
 
     /// The backlog case `shutdown_drains_the_queue_...` above deferred: datagrams already sitting

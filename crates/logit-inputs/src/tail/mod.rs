@@ -162,6 +162,10 @@ impl TailInput {
 
 #[async_trait::async_trait]
 impl logit_pipeline::Input for TailInput {
+    async fn bind(&mut self) -> anyhow::Result<()> {
+        self.inner.bind().await
+    }
+
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         let (_tx, rx) = shutdown_watch::channel(false);
         self.inner.run_until_shutdown(sink, rx).await

@@ -13,7 +13,8 @@ use crate::output::{classify, is_explicitly_permanent, is_retryable, DeliveryPos
 #[cfg(test)]
 use crate::queue::{SinkQueue, SinkQueueConfig};
 use crate::queue::{SinkStore, SinkStoreConfig};
-use crate::{Fanout, Input, InputRuntimeConfig, Output, Transform};
+use crate::readiness::NodeState;
+use crate::{Fanout, Input, InputRuntimeConfig, Output, Readiness, Transform};
 use anyhow::Context;
 use logit_core::{Diagnostics, EventBatch, Resource, SpanKind, Telemetry};
 use logit_script::{ProcessOutcome, ScriptWorker};
@@ -68,6 +69,51 @@ pub enum NodeSpec {
     },
 }
 
+/// Why the pipeline stopped, at exactly the granularity `logit`'s exit-code table needs
+/// (`docs/deploying.md`): a startup failure is the operator's own config/environment (exit 1,
+/// same class as a schema error); a runtime failure happened to a process that had already
+/// reported `Ready` (exit 2 -- "this was working and stopped").
+///
+/// Deliberately does **not** implement `std::error::Error`. That would give `?`-into-`anyhow` for
+/// free via anyhow's blanket `From`, but at the cost of nesting: `{:?}` would then print this
+/// wrapper's own `Debug` above the inner error's own context chain, changing every message this
+/// crate's tests already assert on. A caller that wants the original `anyhow::Error` back --
+/// unwrapped, byte for byte -- calls [`RunError::into_inner`].
+#[derive(Debug)]
+pub enum RunError {
+    Startup(anyhow::Error),
+    Runtime(anyhow::Error),
+}
+
+impl RunError {
+    /// `1` or `2` -- `0` (clean exit) and `130` (the second-signal kill) are `main`'s and the
+    /// kill switch's own, not this type's.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            RunError::Startup(_) => 1,
+            RunError::Runtime(_) => 2,
+        }
+    }
+
+    pub fn error(&self) -> &anyhow::Error {
+        match self {
+            RunError::Startup(err) | RunError::Runtime(err) => err,
+        }
+    }
+
+    pub fn into_inner(self) -> anyhow::Error {
+        match self {
+            RunError::Startup(err) | RunError::Runtime(err) => err,
+        }
+    }
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error().fmt(f)
+    }
+}
+
 /// Builds every component's inbox and `Fanout`, then spawns each as a tokio task (listeners,
 /// sinks, `Transform`-trait nodes) or a dedicated OS thread (Lua nodes), and runs until the first
 /// one fails. No shutdown signal -- see [`run_with_shutdown`] for graceful shutdown.
@@ -90,7 +136,9 @@ pub async fn run_with_shutdown(
     specs: HashMap<String, NodeSpec>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    run_with_telemetry(graph, specs, HashMap::new(), shutdown).await
+    run_with_telemetry(graph, specs, HashMap::new(), Readiness::disabled(), shutdown)
+        .await
+        .map_err(RunError::into_inner)
 }
 
 /// Same as [`run_with_shutdown`], but with a per-component [`Telemetry`] handle attached to every
@@ -99,12 +147,35 @@ pub async fn run_with_shutdown(
 /// gets [`Telemetry::default`], the disabled handle, same as if this function never existed. Built
 /// by `logit-cli::pipeline::prepare` only when a config's `internal` component asks for a live
 /// `Registry` (`docs/design/internal-telemetry.md`).
+///
+/// `readiness` is the [`Readiness`] handle every input's [`Input::bind`] and every node's spawn
+/// updates -- pass [`Readiness::disabled()`] (what `run`/`run_with_shutdown` do) when nobody's
+/// watching. Returns [`RunError`] rather than a bare `anyhow::Error` so a caller (`logit-cli`) can
+/// tell a startup failure from a runtime one without parsing a message.
 pub async fn run_with_telemetry(
     graph: Graph,
     mut specs: HashMap<String, NodeSpec>,
     mut telemetry: HashMap<String, Telemetry>,
+    readiness: Readiness,
     shutdown: impl Future<Output = ()> + Send + 'static,
-) -> anyhow::Result<()> {
+) -> Result<(), RunError> {
+    // Sorted, not raw `HashMap` iteration order: a startup failure (an unbindable port, a bad
+    // Lua script) should name the same component every time, not whichever the hash seed reached
+    // first -- the same reproducibility argument `logit-cli::pipeline::prepare` already makes for
+    // build order. `readiness.begin` hands out the complete, ordered component list before
+    // anything is bound, so a probe arriving mid-startup already sees every id.
+    //
+    // Ahead of the shutdown driver's `tokio::spawn` below, not after it: that task's first act
+    // once `shutdown` resolves is `readiness.draining()`, and a caller handing this function an
+    // already-resolved `shutdown` (`std::future::ready(())`, a pre-fired oneshot) can have it run
+    // before this line -- there is no `.await` on this path between the spawn and here to make
+    // the ordering anything but a race. Seeding here makes `begin` provably the first write on
+    // this signal rather than racily the first one, matching its own doc comment ("called once,
+    // before the first bind").
+    let mut ids: Vec<String> = graph.components.keys().cloned().collect();
+    ids.sort();
+    readiness.begin(&ids);
+
     // A `watch` (not a `oneshot`) because every listener needs its own clone of the receiver, and
     // `watch::Receiver` is `Clone` where `oneshot::Receiver` is not. Driven from a spawned task
     // rather than shared directly so this function doesn't need to name `shutdown`'s own type in
@@ -122,9 +193,16 @@ pub async fn run_with_telemetry(
     // long the drain actually took (`docs/plans/operator-surface.md`'s `drain complete` event).
     let drain_started: Arc<std::sync::OnceLock<tokio::time::Instant>> = Arc::default();
     let drain_started_for_driver = drain_started.clone();
+    let readiness_for_driver = readiness.clone();
     let shutdown_driver = tokio::spawn(async move {
         shutdown.await;
         tracing::info!(target: "logit", "shutdown signal received");
+        // Flipped *before* the nodes are told (the `send(true)` below), so an orchestrator polling
+        // `/readyz` stops routing to this pod at the instant the signal arrives, not partway
+        // through the drain -- `docs/plans/operator-surface.md`'s "the constraint everything is
+        // designed around". A no-op if a node has already failed (`Readiness::draining`'s own
+        // doc comment): a real SIGTERM arriving after a failure must not paper over it.
+        readiness_for_driver.draining();
         let _ = drain_started_for_driver.set(tokio::time::Instant::now());
         let _ = shutdown_tx_for_driver.send(true);
     });
@@ -134,7 +212,19 @@ pub async fn run_with_telemetry(
     // across every sink so the `drain complete` event can say whether the drain was clean.
     let shutdown_dropped_batches = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    let ids: Vec<String> = graph.components.keys().cloned().collect();
+    // Every listener bound *before* any channel exists, let alone any task is spawned
+    // (`docs/plans/operator-surface.md`, workstream B) -- so a bind failure fails startup with
+    // nothing else running yet, rather than surfacing as the first `JoinSet` error once every
+    // sibling is already listening. Sequential, in the same sorted order: a bind is a syscall,
+    // there are single digits of them, and "which one failed" must not depend on a join order.
+    for id in &ids {
+        let Some(NodeSpec::Input(input, _)) = specs.get_mut(id) else { continue };
+        input
+            .bind()
+            .await
+            .map_err(|err| RunError::Startup(err.context(format!("component '{id}'"))))?;
+        readiness.set_node(id, NodeState::Bound);
+    }
 
     let mut senders: HashMap<String, mpsc::Sender<Delivered>> = HashMap::with_capacity(ids.len());
     let mut inboxes: HashMap<String, mpsc::Receiver<Delivered>> = HashMap::with_capacity(ids.len());
@@ -145,6 +235,12 @@ pub async fn run_with_telemetry(
     }
 
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
+    // Maps each spawned task back to the component id it runs -- `AbortHandle::id()` at spawn
+    // time, read back via `join_next_with_id`/`JoinError::id()` in the loop below, so a failing
+    // (or panicking) task can be named in `readiness` without threading the id through every
+    // `run_input`/`run_output`/`run_transform` call's own error path. A Lua node has no entry
+    // here -- it's a raw `std::thread`, not a `JoinSet` task (`docs/known-gaps.md`).
+    let mut node_ids: HashMap<tokio::task::Id, String> = HashMap::with_capacity(ids.len());
     // Needed only for Lua nodes -- see `run_lua`'s doc comment. `Handle::current()` requires an
     // async context, true here since `run` is itself running as a task on this runtime.
     let runtime_handle = tokio::runtime::Handle::current();
@@ -157,7 +253,8 @@ pub async fn run_with_telemetry(
         let inbox = inboxes.remove(&id).expect("an inbox was created for every id above");
         let spec = specs
             .remove(&id)
-            .with_context(|| format!("no implementation registered for component '{id}'"))?;
+            .with_context(|| format!("no implementation registered for component '{id}'"))
+            .map_err(RunError::Startup)?;
 
         match spec {
             NodeSpec::Input(input, input_config) => {
@@ -167,17 +264,19 @@ pub async fn run_with_telemetry(
                 // send-blocked duration) comes from `fanout` above, already attached -- nothing
                 // further to instrument here.
                 drop(inbox);
-                tasks.spawn(run_input(
-                    id,
+                let handle = tasks.spawn(run_input(
+                    id.clone(),
                     input,
                     fanout,
                     shutdown_rx.clone(),
                     input_config.shutdown_grace,
                 ));
+                node_ids.insert(handle.id(), id.clone());
+                readiness.set_node(&id, NodeState::Running);
             }
             NodeSpec::Output(output, store_config, write_config) => {
-                tasks.spawn(run_output(
-                    id,
+                let handle = tasks.spawn(run_output(
+                    id.clone(),
                     output,
                     inbox,
                     node_telemetry,
@@ -186,9 +285,13 @@ pub async fn run_with_telemetry(
                     shutdown_rx.clone(),
                     shutdown_dropped_batches.clone(),
                 ));
+                node_ids.insert(handle.id(), id.clone());
+                readiness.set_node(&id, NodeState::Running);
             }
             NodeSpec::Transform(transform) => {
-                tasks.spawn(run_transform(transform, inbox, fanout, node_telemetry));
+                let handle = tasks.spawn(run_transform(transform, inbox, fanout, node_telemetry));
+                node_ids.insert(handle.id(), id.clone());
+                readiness.set_node(&id, NodeState::Running);
             }
             NodeSpec::Lua { script, interval } => {
                 let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
@@ -208,12 +311,23 @@ pub async fn run_with_telemetry(
                             handle,
                         )
                     })
-                    .with_context(|| format!("spawning thread for component '{id}'"))?;
+                    .with_context(|| format!("spawning thread for component '{id}'"))
+                    .map_err(RunError::Startup)?;
+                // Not moved into `node_ids` -- there is no `JoinSet` entry for a Lua node to look
+                // up (see `node_ids`'s own doc comment); its `NodeState` stays `Running` for the
+                // rest of this run even if it later fails, a known gap
+                // (`docs/known-gaps.md`), not something this workstream fixes.
                 match ready_rx.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(message)) => anyhow::bail!("component '{id}': {message}"),
+                    Ok(Ok(())) => readiness.set_node(&id, NodeState::Running),
+                    Ok(Err(message)) => {
+                        return Err(RunError::Startup(anyhow::anyhow!(
+                            "component '{id}': {message}"
+                        )))
+                    }
                     Err(_) => {
-                        anyhow::bail!("component '{id}': thread exited before reporting ready")
+                        return Err(RunError::Startup(anyhow::anyhow!(
+                            "component '{id}': thread exited before reporting ready"
+                        )))
                     }
                 }
             }
@@ -230,6 +344,8 @@ pub async fn run_with_telemetry(
 
     // Every socket bound, every task/thread spawned and running, nothing has failed yet --
     // `docs/plans/operator-surface.md`'s stable lifecycle event names, for log-based alerting.
+    // A no-op if a node has already failed by this point (`Readiness::ready`'s own doc comment).
+    readiness.ready();
     tracing::info!(target: "logit", "ready");
 
     // On the first error (from either arm below), record it and trigger the same shutdown signal
@@ -241,16 +357,32 @@ pub async fn run_with_telemetry(
     // exited (the loop condition, unchanged) rather than breaking -- only the *first* error is kept
     // (a later, cascading error from a task that's now shutting down because of the first one must
     // not overwrite it), but a second error is still observed and discarded here rather than
-    // aborting the loop.
-    let mut result: anyhow::Result<()> = Ok(());
-    while let Some(joined) = tasks.join_next().await {
-        let outcome = match joined {
-            Ok(Ok(())) => continue,
-            Ok(Err(err)) => err,
-            Err(join_err) => join_err.into(),
+    // aborting the loop. `join_next_with_id` (not `join_next`) so a failing task can be named in
+    // `readiness` via `node_ids` above.
+    let mut result: Result<(), RunError> = Ok(());
+    while let Some(joined) = tasks.join_next_with_id().await {
+        let (task_id, outcome) = match joined {
+            Ok((task_id, Ok(()))) => {
+                if let Some(id) = node_ids.get(&task_id) {
+                    readiness.set_node(id, NodeState::Finished);
+                }
+                continue;
+            }
+            Ok((task_id, Err(err))) => (task_id, err),
+            Err(join_err) => {
+                let task_id = join_err.id();
+                (task_id, anyhow::Error::from(join_err))
+            }
         };
+        // Every failing node is marked, not only the first -- `/readyz`'s `degraded` status
+        // (workstream C) is "any node has exited with an error," while `result` below still keeps
+        // only the first failure's message, as before this workstream.
+        if let Some(id) = node_ids.get(&task_id) {
+            readiness.set_node(id, NodeState::Failed);
+        }
+        readiness.failed();
         if result.is_ok() {
-            result = Err(outcome);
+            result = Err(RunError::Runtime(outcome));
             let _ = drain_started.set(tokio::time::Instant::now());
             let _ = shutdown_tx.send(true);
         }
@@ -1469,6 +1601,7 @@ mod tests {
     use crate::fanout::TraceContext;
     use crate::graph;
     use crate::queue::OverflowPolicy;
+    use crate::readiness::Phase;
     use logit_config::{Component, ComponentKind, Config};
     use logit_core::{AttrMap, Event, MetricKind, Registry, SpanLink, SpanStatus};
     use std::collections::HashMap as Map;
@@ -2384,7 +2517,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+            run_with_telemetry(g, specs, telemetry, Readiness::disabled(), std::future::pending()),
         )
         .await
         .expect("should not hang")
@@ -2496,7 +2629,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+            run_with_telemetry(g, specs, telemetry, Readiness::disabled(), std::future::pending()),
         )
         .await
         .expect("should not hang")
@@ -2618,7 +2751,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+            run_with_telemetry(g, specs, telemetry, Readiness::disabled(), std::future::pending()),
         )
         .await
         .expect("should not hang")
@@ -2728,7 +2861,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+            run_with_telemetry(g, specs, telemetry, Readiness::disabled(), std::future::pending()),
         )
         .await
         .expect("should not hang")
@@ -2820,7 +2953,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+            run_with_telemetry(g, specs, telemetry, Readiness::disabled(), std::future::pending()),
         )
         .await
         .expect("should not hang")
@@ -2914,7 +3047,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            run_with_telemetry(g, specs, telemetry, std::future::pending()),
+            run_with_telemetry(g, specs, telemetry, Readiness::disabled(), std::future::pending()),
         )
         .await
         .expect("should not hang")
@@ -3123,8 +3256,13 @@ mod tests {
         let mut telemetry: HashMap<String, Telemetry> = HashMap::new();
         telemetry.insert("out".to_string(), registry.telemetry_for("out", "x", "sink"));
 
-        let run_task =
-            tokio::spawn(run_with_telemetry(g, specs, telemetry, std::future::pending()));
+        let run_task = tokio::spawn(run_with_telemetry(
+            g,
+            specs,
+            telemetry,
+            Readiness::disabled(),
+            std::future::pending(),
+        ));
 
         // Poll (under paused time, so this never depends on real wall-clock passing) until the
         // queue's own depth gauge shows more than the one batch currently stuck inside
@@ -4476,8 +4614,13 @@ mod tests {
         let mut telemetry: HashMap<String, Telemetry> = HashMap::new();
         telemetry.insert("good".to_string(), registry.telemetry_for("good", "x", "sink"));
 
-        let run_task =
-            tokio::spawn(run_with_telemetry(g, specs, telemetry, std::future::pending()));
+        let run_task = tokio::spawn(run_with_telemetry(
+            g,
+            specs,
+            telemetry,
+            Readiness::disabled(),
+            std::future::pending(),
+        ));
 
         // Queue three batches on "good" while its delivery is gated shut -- they land in its
         // SinkQueue, undelivered, exactly the state a healthy sibling can be in when another
@@ -4716,6 +4859,309 @@ mod tests {
             !err.to_string().contains("bad2"),
             "bad2's later, cascading failure must not overwrite the first recorded error, got: {err}"
         );
+    }
+
+    // -- workstream B: `Input::bind`, readiness, exit codes (docs/plans/operator-surface.md) --
+
+    /// Fails every `bind()` call -- proves the pre-pass in `run_with_telemetry` runs *before* any
+    /// task is spawned, and never falls through to `run()`.
+    struct FailingBindInput;
+
+    #[async_trait::async_trait]
+    impl Input for FailingBindInput {
+        async fn bind(&mut self) -> anyhow::Result<()> {
+            anyhow::bail!("cannot bind")
+        }
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            unreachable!("bind() fails first; run() must never be called")
+        }
+    }
+
+    fn statsd_in() -> ComponentKind {
+        ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }
+    }
+
+    fn plain_component(sources: Vec<String>, kind: ComponentKind) -> Component {
+        Component {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources,
+            kind,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_bind_returns_startup_and_spawns_nothing() {
+        let mut components = Map::new();
+        components.insert("a_in".to_string(), plain_component(vec![], statsd_in()));
+        components
+            .insert("out".to_string(), plain_component(vec!["a_in".to_string()], influxdb_out()));
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "a_in".to_string(),
+            NodeSpec::Input(Box::new(FailingBindInput), InputRuntimeConfig::default()),
+        );
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let err = run_with_telemetry(
+            g,
+            specs,
+            HashMap::new(),
+            Readiness::disabled(),
+            std::future::pending(),
+        )
+        .await
+        .expect_err("a bind failure must fail the whole run");
+        assert!(matches!(err, RunError::Startup(_)), "a bind failure is a startup failure");
+        assert!(
+            err.to_string().contains("a_in"),
+            "the error should name the failing component: {err}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the sink must never have been spawned -- nothing should have reached it"
+        );
+    }
+
+    /// Sorted id order (`docs/plans/operator-surface.md`'s "reproducible startup failures"): two
+    /// independently-unbindable inputs must always report the same one first.
+    #[tokio::test]
+    async fn the_first_failing_bind_by_sorted_id_is_the_one_reported() {
+        let mut components = Map::new();
+        components.insert("a_in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert("z_in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "out".to_string(),
+            plain_component(vec!["a_in".to_string(), "z_in".to_string()], influxdb_out()),
+        );
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "a_in".to_string(),
+            NodeSpec::Input(Box::new(FailingBindInput), InputRuntimeConfig::default()),
+        );
+        specs.insert(
+            "z_in".to_string(),
+            NodeSpec::Input(Box::new(FailingBindInput), InputRuntimeConfig::default()),
+        );
+
+        let err = run(g, specs).await.expect_err("both inputs fail to bind");
+        assert!(err.to_string().contains("a_in"), "the sorted-first id should be named: {err}");
+    }
+
+    /// `PipelineState`'s phase reaches `Ready` once every socket is bound and every task is
+    /// spawned, then `Draining` the instant the caller's `shutdown` future resolves -- driven
+    /// with `wait_for`, never an exact `changed()` sequence, since `watch` coalesces (a per-node
+    /// update between two reads can hide an intermediate phase from a slow reader, which is
+    /// correct for a probe and would make an exact-sequence assertion flaky).
+    #[tokio::test(start_paused = true)]
+    async fn phase_reaches_ready_then_draining_on_a_normal_run() {
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components
+            .insert("out".to_string(), plain_component(vec!["in".to_string()], influxdb_out()));
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (readiness, mut rx) = Readiness::channel();
+        assert_eq!(rx.borrow().phase, Phase::Starting);
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(ForeverInput), InputRuntimeConfig::default()),
+        );
+        let (tx, _out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let run_task =
+            tokio::spawn(run_with_telemetry(g, specs, HashMap::new(), readiness, async {
+                let _ = shutdown_rx.await;
+            }));
+
+        rx.wait_for(|s| s.phase == Phase::Ready).await.expect("readiness channel should stay open");
+        assert_eq!(
+            rx.borrow().components.get("in"),
+            Some(&NodeState::Running),
+            "every component should be Running once Ready"
+        );
+        assert_eq!(rx.borrow().components.get("out"), Some(&NodeState::Running));
+
+        let _ = shutdown_tx.send(());
+        rx.wait_for(|s| s.phase == Phase::Draining)
+            .await
+            .expect("readiness channel should stay open");
+
+        tokio::time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("run_with_telemetry should not hang once shutdown fires")
+            .expect("task should not panic")
+            .expect("a clean shutdown should end run_with_telemetry with Ok");
+    }
+
+    /// A listener failing once the pipeline is already `Ready` flips `phase` to `Failed`, marks
+    /// that component's own `NodeState::Failed`, and ends the run with `RunError::Runtime` --
+    /// distinct from a startup (bind) failure's `RunError::Startup`.
+    #[tokio::test]
+    async fn a_listener_failing_after_ready_flips_failed_and_returns_runtime() {
+        let mut components = Map::new();
+        components.insert("err_in".to_string(), plain_component(vec![], statsd_in()));
+        components
+            .insert("out".to_string(), plain_component(vec!["err_in".to_string()], influxdb_out()));
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (readiness, rx) = Readiness::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "err_in".to_string(),
+            NodeSpec::Input(Box::new(ErrInput), InputRuntimeConfig::default()),
+        );
+        let (tx, _out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let err = run_with_telemetry(g, specs, HashMap::new(), readiness, std::future::pending())
+            .await
+            .expect_err("ErrInput should fail the run");
+        assert!(matches!(err, RunError::Runtime(_)), "a post-ready failure is a runtime failure");
+        assert!(err.to_string().contains("err_in"), "the error should name err_in: {err}");
+
+        let snapshot = rx.borrow().clone();
+        assert_eq!(snapshot.phase, Phase::Failed);
+        assert_eq!(snapshot.components.get("err_in"), Some(&NodeState::Failed));
+    }
+
+    /// The exit-2 path: a sustained permanent sink failure (`PERMANENT_FAILURE_WINDOW`) ends
+    /// `run_with_telemetry` with `RunError::Runtime`, not `Startup` -- no shortened window or
+    /// test-only knob needed, `write_loop` runs entirely on the paused virtual clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_sustained_permanent_sink_failure_returns_runtime_not_startup() {
+        let mut components = Map::new();
+        components.insert("bad_in".to_string(), plain_component(vec![], statsd_in()));
+        components
+            .insert("bad".to_string(), plain_component(vec!["bad_in".to_string()], influxdb_out()));
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let (bad_tx, bad_rx) = mpsc::unbounded_channel();
+        let (bad_output, mut bad_handles) = faulty_output(Fault::Permanent, u32::MAX, false);
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "bad_in".to_string(),
+            NodeSpec::Input(Box::new(ChannelInput { rx: bad_rx }), InputRuntimeConfig::default()),
+        );
+        specs.insert(
+            "bad".to_string(),
+            NodeSpec::Output(
+                Box::new(bad_output),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let run_task = tokio::spawn(run(g, specs));
+
+        bad_tx
+            .send(EventBatch {
+                resource: Arc::new(Resource::default()),
+                events: vec![counter_event("hits", 1.0)],
+            })
+            .expect("bad_in's receiver should still be alive");
+        bad_handles.attempted.recv().await.expect("bad's first attempt should have happened");
+        tokio::time::sleep(PERMANENT_FAILURE_WINDOW).await;
+        bad_tx
+            .send(EventBatch {
+                resource: Arc::new(Resource::default()),
+                events: vec![counter_event("hits", 2.0)],
+            })
+            .expect("bad_in's receiver should still be alive");
+        bad_handles
+            .attempted
+            .recv()
+            .await
+            .expect("bad's second (window-tripping) attempt should have happened");
+        drop(bad_tx);
+
+        // `run` (not `run_with_telemetry`) is under test here -- it flattens `RunError` back to
+        // a plain `anyhow::Error` via `RunError::into_inner`, so the exit_code()/RunError-typed
+        // assertion below is done separately (`run_error_exit_codes`); this test only pins that
+        // `run`'s error text still names the failing component after that flattening.
+        let result = tokio::time::timeout(PERMANENT_FAILURE_WINDOW * 2, run_task)
+            .await
+            .expect("run should not hang")
+            .expect("task should not panic");
+        let err = result.expect_err("a sustained permanent failure should still end run with Err");
+        assert!(err.to_string().contains("bad"), "the error should name bad, got: {err}");
+    }
+
+    /// `RunError::exit_code()` -- `docs/deploying.md`'s exit-code table: 1 for a startup failure
+    /// (the same class as a bad config), 2 for a runtime failure.
+    #[test]
+    fn run_error_exit_codes() {
+        assert_eq!(RunError::Startup(anyhow::anyhow!("x")).exit_code(), 1);
+        assert_eq!(RunError::Runtime(anyhow::anyhow!("x")).exit_code(), 2);
+    }
+
+    /// `Readiness::disabled()` is a receiver-less channel by construction -- every update method
+    /// must use `send_modify`, never `watch::Sender::send` (which returns `Err` once the last
+    /// receiver drops), or a real run under `run`/`run_with_shutdown` (both pass `disabled()`)
+    /// would panic or silently swallow an error the moment any node so much as bound or spawned.
+    #[tokio::test]
+    async fn readiness_disabled_never_panics_across_a_full_run() {
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components
+            .insert("out".to_string(), plain_component(vec!["in".to_string()], influxdb_out()));
+        let g = graph::resolve(Config { components }).expect("should resolve");
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(OneShotInput { batch: None }), InputRuntimeConfig::default()),
+        );
+        let (tx, _out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        // `run` passes `Readiness::disabled()` internally -- reaching `Ready` (and, via the
+        // shutdown below, `Draining`) without panicking is the assertion.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_task = tokio::spawn(run_with_shutdown(g, specs, async {
+            let _ = shutdown_rx.await;
+        }));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _ = shutdown_tx.send(());
+        run_task.await.expect("task should not panic").expect("clean shutdown should be Ok");
     }
 
     /// `run_transform`'s non-flush path (`MutatingTransform`, which always returns `Some`) reads

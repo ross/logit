@@ -12,6 +12,27 @@ use tokio::sync::watch;
 /// (`docs/design/pipeline-graph.md`'s arity table) -- `sink` here is everything downstream of it.
 #[async_trait::async_trait]
 pub trait Input {
+    /// Opens this listener's sockets/files. Called by `crate::runtime::run_with_telemetry` for
+    /// **every** input, in sorted id order, *before* any node task is spawned
+    /// (docs/plans/operator-surface.md, workstream B) -- so a port that can't be bound fails
+    /// startup with nothing else running yet, rather than surfacing as the first `JoinSet` error
+    /// once every sibling is already listening.
+    ///
+    /// The default is a no-op: an input with nothing to open (`logit_inputs::internal`) needs no
+    /// override and behaves exactly as it did before this method existed.
+    ///
+    /// Two obligations on an override:
+    /// - **Idempotent.** A second call must be harmless (return `Ok(())` without re-opening).
+    /// - **`run`/`run_until_shutdown` must still work if nobody called this first.** They call
+    ///   `bind` themselves when whatever it produces is absent -- a caller outside the node
+    ///   runtime (a direct unit test, `logit-inputs`' own) still gets "one call and it works,"
+    ///   unchanged.
+    ///
+    /// `run` may assume the socket/file this opens already exists.
+    async fn bind(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()>;
 
     /// Runs until `shutdown` flips, with the opportunity to drain buffered work first

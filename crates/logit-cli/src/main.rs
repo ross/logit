@@ -123,7 +123,19 @@ fn main() -> anyhow::Result<()> {
                 .enable_all()
                 .build()
                 .context("building the tokio runtime")?;
-            runtime.block_on(pipeline::run_pipelines(path))
+            match runtime.block_on(pipeline::run_pipelines(path)) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    // `err.exit_code()` -- 1 for a startup failure (same class as a bad config),
+                    // 2 for a runtime failure (the process was ready and then stopped) --
+                    // `docs/deploying.md`'s exit-code table. Reproduces `anyhow`'s own `Error:
+                    // {:?}` formatting by hand (the same override `Command::Graph` above already
+                    // uses `std::process::exit` for) since `main`'s own `Result` would otherwise
+                    // map every error to exit 1.
+                    eprintln!("Error: {:?}", err.error());
+                    std::process::exit(err.exit_code());
+                }
+            }
         }
         Command::Graph { path } => {
             // Every `!env` reference must resolve here too, same as `run`/`validate` -- no

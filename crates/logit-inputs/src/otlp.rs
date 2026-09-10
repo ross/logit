@@ -117,6 +117,10 @@ pub struct OtlpInput {
     diag: Diagnostics,
     telemetry: Telemetry,
     tls: Option<Arc<rustls::ServerConfig>>,
+    /// Set by [`Input::bind`], taken back out by [`Input::run`] -- `docs/plans/operator-surface.md`,
+    /// workstream B. `None` after a run, so a second run rebinds, same as before this field
+    /// existed.
+    listener: Option<TcpListener>,
 }
 
 impl OtlpInput {
@@ -127,7 +131,14 @@ impl OtlpInput {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             tls: None,
+            listener: None,
         }
+    }
+
+    /// The address actually bound, once [`Input::bind`] has run -- lets a caller (a test, or a
+    /// future admin-server precedent) learn the OS-assigned port without a bind-drop-rebind race.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.listener.as_ref().and_then(|l| l.local_addr().ok())
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
@@ -159,8 +170,19 @@ impl OtlpInput {
 
 #[async_trait::async_trait]
 impl Input for OtlpInput {
-    async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
+    async fn bind(&mut self) -> anyhow::Result<()> {
+        if self.listener.is_some() {
+            return Ok(()); // idempotent, per `Input::bind`'s contract
+        }
         let listener = TcpListener::bind(&self.bind).await?;
+        self.diag.info("bound", format_args!("listening on {}", self.bind));
+        self.listener = Some(listener);
+        Ok(())
+    }
+
+    async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
+        self.bind().await?;
+        let listener = self.listener.take().expect("bind() leaves a listener behind");
         // Bounds this input's worst-case memory the same way `MAX_REQUEST_BYTES` bounds one
         // request's -- see [`MAX_CONCURRENT_CONNECTIONS`]'s own doc comment for the reasoning and
         // the resulting worst case.
@@ -599,6 +621,36 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         (addr.to_string(), OtlpInput::new(addr.to_string(), transport))
+    }
+
+    /// `Input::bind` (docs/plans/operator-surface.md, workstream B) makes the port live *before*
+    /// `run`'s accept loop starts, and `local_addr` makes the OS-assigned port observable --
+    /// retiring the bind-drop-rebind idiom `bound_input` above still uses for every other test in
+    /// this module (kept there since it predates `bind`, but no longer the only way).
+    #[tokio::test]
+    async fn bind_makes_the_port_live_before_run_and_local_addr_reports_it() {
+        let mut input = OtlpInput::new("127.0.0.1:0", OtlpTransport::Http);
+        assert_eq!(input.local_addr(), None, "no address before bind()");
+
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("bind() should leave a real address behind");
+
+        // Connects successfully with `run` never having been spawned -- the listening socket is
+        // already live purely from `bind()`.
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("the port should already be accepting connections after bind() alone");
+    }
+
+    /// A second `bind()` call is a no-op, per [`logit_pipeline::Input::bind`]'s idempotency
+    /// contract.
+    #[tokio::test]
+    async fn a_second_bind_is_a_no_op() {
+        let mut input = OtlpInput::new("127.0.0.1:0", OtlpTransport::Http);
+        input.bind().await.expect("first bind should succeed");
+        let addr = input.local_addr().expect("bind() should leave a real address behind");
+        input.bind().await.expect("second bind should be a harmless no-op");
+        assert_eq!(input.local_addr(), Some(addr), "the address must not change");
     }
 
     fn fanout_into_channel() -> (Fanout, mpsc::Receiver<logit_pipeline::Delivered>) {

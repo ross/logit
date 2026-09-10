@@ -76,15 +76,15 @@ async fn round_trip(
     mut output: OtlpOutput,
     batch: &EventBatch,
 ) -> Vec<EventBatch> {
+    // `Input::bind` (docs/plans/operator-surface.md, workstream B) opens the listener before
+    // `run`'s accept loop starts -- the readiness primitive this test used to fake with a 50 ms
+    // sleep now does the real thing: `output.send` below can't race the bind at all.
+    input.bind().await.expect("binding the otlp listener");
     let (tx, mut rx) = mpsc::channel(16);
     let sink = Fanout::new(vec![tx]);
     tokio::spawn(async move {
         let _ = input.run(sink).await;
     });
-    // No readiness signal from `Input::run` (it never returns until the listener errors) -- a
-    // short sleep before the first request is the same idiom `crates/logit-inputs/src/otlp.rs`'s
-    // own tests use to let the `TcpListener::bind` inside `run` actually happen first.
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     output.send(batch).await.expect("send should succeed against a live otlp_in");
 
