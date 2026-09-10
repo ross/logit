@@ -34,17 +34,16 @@ webpki-roots.workspace = true
 # `InfluxDbOutput::send` no longer retries on its own (that moved to `logit-pipeline`'s generic
 # writer, `docs/adr/buffered-sink-delivery.md`) and so no longer needs `tokio::time` itself.
 tokio.workspace = true
+# `logit_out` (`logit.rs`) dials a raw TCP(+TLS) connection itself, unlike `otlp_out`'s
+# HTTP-framed transports -- promoted from a dev-dependency (it used to back only otlp.rs's canned
+# TLS test servers) to a real one, same version already in Cargo.lock.
+tokio-rustls.workspace = true
 
 [dev-dependencies]
 # Only for the end-to-end regression test that a Lua enrichment stage doesn't silently change an
 # attribute's InfluxDB tag-inclusion behavior -- see
 # bytes_attribute_stays_excluded_from_tags_after_a_lua_enrichment_stage below.
 logit-script.workspace = true
-# Only for `syslog.rs`'s relay test, which decodes a real line with `SyslogDecoder` rather than
-# hand-building an event, so the attribute names/types it asserts against can't drift from what
-# `syslog_in` actually produces.
+# `syslog.rs`'s relay test (decodes with a real `SyslogDecoder`) and `logit.rs`'s round-trip
+# tests (drive a real `LogitInput` rather than hand-rolling the wire protocol on both ends).
 logit-inputs.workspace = true
-# otlp.rs's canned TLS test servers -- wraps the existing canned plaintext HTTP/gRPC servers in a
-# `tokio_rustls::TlsAcceptor` so otlp_out's TLS client code has something real to test against
-# with no external service.
-tokio-rustls.workspace = true

@@ -15,12 +15,14 @@ use logit_config::{BufferConfig, Config, StdioTarget};
 use logit_core::{Diagnostics, Registry, Telemetry};
 use logit_inputs::docker::{ContainerFilter, DockerInput};
 use logit_inputs::internal::InternalInput;
+use logit_inputs::logit::LogitInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_inputs::tail::TailInput;
 use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::influxdb::InfluxDbOutput;
+use logit_outputs::logit::LogitOutput;
 use logit_outputs::otlp::{
     OtlpCompression as OtlpOutCompression, OtlpOutput, OtlpTransport as OtlpOutTransport,
     SignalPaths,
@@ -29,8 +31,8 @@ use logit_outputs::stdio::StreamOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{
-    InputRuntimeConfig, NodeSpec, Readiness, RetryConfig, RunError, SinkQueueConfig,
-    WriteLoopConfig,
+    DiskQueueConfig, InputRuntimeConfig, NodeSpec, Readiness, RetryConfig, RunError,
+    SinkQueueConfig, SinkStoreConfig, WriteLoopConfig,
 };
 use logit_proto::frame::Compression as NativeCompression;
 use logit_transforms::{
@@ -280,6 +282,18 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
+        LogitIn { bind, tls, max_frame_bytes } => {
+            let mut input = LogitInput::new(bind.clone())
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
+            }
+            if let Some(max_frame_bytes) = max_frame_bytes {
+                input = input.with_max_frame_bytes(*max_frame_bytes as u32);
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
         TailIn { paths, tail } => {
             let paths = paths.iter().map(|p| base_dir.join(p)).collect();
             NodeSpec::Input(
@@ -418,7 +432,7 @@ fn build_spec(
                     .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                     .with_telemetry(telemetry.clone()),
             ),
-            queue_config(&component.buffer),
+            queue_config(&component.buffer, base_dir),
             write_config(&component.buffer),
         ),
         OtlpOut { endpoint, protocol, headers, paths, compression, tls } => {
@@ -431,7 +445,25 @@ fn build_spec(
                 .with_tls(&to_tls_client_settings(tls), base_dir)?;
             NodeSpec::Output(
                 Box::new(output),
-                queue_config(&component.buffer),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
+        LogitOut { endpoint, compression, tls, request_timeout } => {
+            let mut output = LogitOutput::new(endpoint.clone())
+                .with_compression(to_native_compression(*compression))
+                .with_timeout(*request_timeout)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            if let Some(tls) = tls {
+                // `logit_outputs::logit::TlsClientSettings` and `logit_outputs::otlp::
+                // TlsClientSettings` are the same type (`logit_outputs::tls::TlsClientSettings`,
+                // re-exported at both paths) -- `to_tls_client_settings` already builds it.
+                output = output.with_tls(&to_tls_client_settings(tls), base_dir)?;
+            }
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
                 write_config(&component.buffer),
             )
         }
@@ -452,7 +484,7 @@ fn build_spec(
             let output = output.with_format(to_stream_encoder(*format, *compression));
             NodeSpec::Output(
                 Box::new(output.with_telemetry(telemetry.clone())),
-                queue_config(&component.buffer),
+                queue_config(&component.buffer, base_dir),
                 write_config(&component.buffer),
             )
         }
@@ -464,7 +496,7 @@ fn build_spec(
                 .with_telemetry(telemetry.clone());
             NodeSpec::Output(
                 Box::new(output),
-                queue_config(&component.buffer),
+                queue_config(&component.buffer, base_dir),
                 write_config(&component.buffer),
             )
         }
@@ -503,26 +535,36 @@ fn build_spec(
                 .with_telemetry(telemetry.clone());
             NodeSpec::Output(
                 Box::new(output),
-                queue_config(&component.buffer),
+                queue_config(&component.buffer, base_dir),
                 write_config(&component.buffer),
             )
         }
-
-        other => unreachable!("graph::resolve already rejected any unimplemented kind: {other:?}"),
     };
     Ok((spec, telemetry))
 }
 
-/// Builds a sink's `SinkQueueConfig` from its `BufferConfig` (`docs/adr/buffered-sink-delivery.md`,
-/// workstream F) -- the sole place `logit_config::OverflowPolicy` is converted to
-/// `logit_pipeline::OverflowPolicy`, since neither config nor pipeline crate can see both types
-/// without violating the dependency direction (`logit-pipeline` depends on `logit-config`, never
-/// the reverse; `docs/design/pipeline-graph.md`'s crate layout).
-fn queue_config(buffer: &BufferConfig) -> SinkQueueConfig {
-    SinkQueueConfig {
-        max_batches: buffer.max_batches,
-        max_bytes: buffer.max_bytes,
-        overflow: overflow_policy(buffer.overflow),
+/// Builds a sink's `SinkStoreConfig` from its `BufferConfig` (`docs/adr/buffered-sink-delivery.md`
+/// / `docs/adr/disk-backed-sink-buffer.md`) -- the sole place `logit_config::OverflowPolicy` is
+/// converted to `logit_pipeline::OverflowPolicy`, since neither config nor pipeline crate can see
+/// both types without violating the dependency direction (`logit-pipeline` depends on
+/// `logit-config`, never the reverse; `docs/design/pipeline-graph.md`'s crate layout).
+/// `buffer.disk` present selects `SinkStoreConfig::Disk`; `path` is resolved against `base_dir`
+/// exactly like `StdioTarget::Path`/`FileOut::path` above.
+fn queue_config(buffer: &BufferConfig, base_dir: &Path) -> SinkStoreConfig {
+    match &buffer.disk {
+        None => SinkStoreConfig::Memory(SinkQueueConfig {
+            max_batches: buffer.max_batches,
+            max_bytes: buffer.max_bytes,
+            overflow: overflow_policy(buffer.overflow),
+        }),
+        Some(disk) => SinkStoreConfig::Disk(DiskQueueConfig {
+            dir: base_dir.join(&disk.path),
+            max_bytes: disk.max_bytes,
+            segment_bytes: disk.segment_bytes,
+            overflow: overflow_policy(buffer.overflow),
+            compression: to_native_compression(disk.compression),
+            checkpoint_interval: disk.checkpoint_interval,
+        }),
     }
 }
 
@@ -639,19 +681,24 @@ fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::U
 /// 17 already guarantees a non-datagram-, non-tail-listener's `receive` is `ReceiveConfig::
 /// default()` by the time a resolved `Graph` reaches `build_spec`, so `internal` always gets
 /// `shutdown_grace: ReceiveConfig::default().shutdown_grace` here (5s today, not
-/// `Duration::ZERO`) regardless of what any `receive:` block would otherwise say. That's
-/// harmless, not just unused, only because `InternalInput` never overrides `Input::
+/// `Duration::ZERO`) regardless of what any `receive:` block would otherwise say. For `internal`
+/// that's harmless, not just unused, only because `InternalInput` never overrides `Input::
 /// run_until_shutdown`: the default impl's own `select!` always resolves at t=shutdown against a
 /// non-overriding input, so `run_input`'s grace backstop -- built from this value -- never gets a
 /// chance to matter. If `internal` ever gains a cooperative drain of its own, this stops being a
 /// harmless default and needs its own `receive.shutdown_grace`-shaped knob rather than inheriting
 /// whatever `ReceiveConfig::default` happens to say.
 ///
-/// `tail_in`/`docker_in` are the first listeners where this value is genuinely load-bearing
-/// rather than incidentally harmless: `TailInput` (`crates/logit-inputs/src/tail/driver.rs`)
-/// does override `run_until_shutdown` to flush every tracked file's accumulator and write a
-/// final checkpoint, and that drain must fit inside `shutdown_grace` or `run_input`'s backstop
-/// cancels it by drop, losing whatever it hadn't flushed yet.
+/// `tail_in`/`docker_in` and, now, `logit_in` are the listeners where this value is genuinely
+/// load-bearing rather than incidentally harmless: `TailInput` (`crates/logit-inputs/src/tail/
+/// driver.rs`) overrides `run_until_shutdown` to flush every tracked file's accumulator and
+/// write a final checkpoint, and `LogitInput` (`crates/logit-inputs/src/logit.rs`) overrides it
+/// to close every idle connection with `Reject{GOING_AWAY}` -- either drain must fit inside
+/// `shutdown_grace` or `run_input`'s backstop cancels it by drop, losing whatever it hadn't
+/// flushed/closed yet. `logit_in` falls under rule 17's non-datagram, non-tail bucket, so unlike
+/// `tail_in`/`docker_in` it always gets the fixed 5s default here -- there is no
+/// `receive:`-shaped knob to override it with (`docs/known-gaps.md` tracks this as the one
+/// currently un-tunable case).
 fn input_runtime_config(receive: &logit_config::ReceiveConfig) -> InputRuntimeConfig {
     InputRuntimeConfig { shutdown_grace: receive.shutdown_grace }
 }
@@ -1298,6 +1345,91 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn build_spec_builds_a_logit_input() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::LogitIn {
+                bind: "127.0.0.1:0".to_string(),
+                tls: None,
+                max_frame_bytes: None,
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    #[test]
+    fn build_spec_wires_tls_and_max_frame_bytes_into_a_logit_input() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::LogitIn {
+                bind: "127.0.0.1:0".to_string(),
+                tls: Some(logit_config::TlsServerConfig {
+                    cert_file: "server.pem".to_string(),
+                    key_file: "server.key".to_string(),
+                    client_ca_file: None,
+                }),
+                max_frame_bytes: Some(32 * 1024 * 1024),
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_logit_sink() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::LogitOut {
+                endpoint: "central:5140".to_string(),
+                compression: logit_config::Compression::Lz4,
+                tls: None,
+                request_timeout: Duration::from_secs(10),
+            },
+        };
+        assert!(matches!(
+            build_spec("out", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    #[test]
+    fn build_spec_wires_a_tls_client_config_into_a_logit_sink() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::LogitOut {
+                endpoint: "central:5140".to_string(),
+                compression: logit_config::Compression::None,
+                tls: Some(logit_config::TlsClientConfig {
+                    ca_file: Some("ca.pem".to_string()),
+                    ..Default::default()
+                }),
+                request_timeout: Duration::from_secs(10),
+            },
+        };
+        assert!(matches!(
+            build_spec("out", &component, &testdata_tls_dir(), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
     /// The wiring this workstream adds: a non-default `buffer:` on the component actually reaches
     /// the built `NodeSpec::Output`'s `SinkQueueConfig`/`WriteLoopConfig`, not just
     /// `SinkQueueConfig::default()`/`WriteLoopConfig::default()` as before.
@@ -1312,6 +1444,7 @@ mod tests {
                 retry_budget: Duration::from_secs(120),
                 retry_max_delay: Duration::from_secs(20),
                 shutdown_grace: Duration::from_secs(10),
+                disk: None,
             },
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
@@ -1323,10 +1456,13 @@ mod tests {
                 token: "test-token".to_string(),
             },
         };
-        let NodeSpec::Output(_, queue_config, write_config) =
+        let NodeSpec::Output(_, store_config, write_config) =
             build_spec("out", &component, Path::new(""), None).unwrap().0
         else {
             panic!("expected NodeSpec::Output");
+        };
+        let SinkStoreConfig::Memory(queue_config) = store_config else {
+            panic!("expected SinkStoreConfig::Memory, buffer.disk was None");
         };
         assert_eq!(queue_config.max_batches, 4096);
         assert_eq!(queue_config.max_bytes, 128 * 1024 * 1024);
@@ -1343,6 +1479,45 @@ mod tests {
             write_config.delivery_override,
             Some(logit_pipeline::DeliveryPosture::AtLeastOnce)
         );
+    }
+
+    #[test]
+    fn build_spec_wires_a_disk_buffer_into_a_sinkstoreconfig_disk_with_the_path_resolved_against_base_dir(
+    ) {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig {
+                disk: Some(logit_config::DiskBufferConfig {
+                    path: "spool".to_string(),
+                    max_bytes: 2 * 1024 * 1024 * 1024,
+                    segment_bytes: 128 * 1024 * 1024,
+                    compression: logit_config::Compression::Lz4,
+                    checkpoint_interval: Duration::from_secs(5),
+                }),
+                ..logit_config::BufferConfig::default()
+            },
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::InfluxDbOut {
+                url: "http://localhost:8086".to_string(),
+                org: "org".to_string(),
+                bucket: "bucket".to_string(),
+                token: "test-token".to_string(),
+            },
+        };
+        let NodeSpec::Output(_, store_config, _) =
+            build_spec("out", &component, Path::new("/etc/logit"), None).unwrap().0
+        else {
+            panic!("expected NodeSpec::Output");
+        };
+        let SinkStoreConfig::Disk(disk_config) = store_config else {
+            panic!("expected SinkStoreConfig::Disk, buffer.disk was Some");
+        };
+        assert_eq!(disk_config.dir, Path::new("/etc/logit/spool"));
+        assert_eq!(disk_config.max_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(disk_config.segment_bytes, 128 * 1024 * 1024);
+        assert_eq!(disk_config.compression, NativeCompression::Lz4);
+        assert_eq!(disk_config.checkpoint_interval, Duration::from_secs(5));
     }
 
     #[test]

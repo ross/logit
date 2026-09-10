@@ -69,7 +69,11 @@ use logit_core::{Diagnostics, Telemetry};
 use logit_pipeline::Fanout;
 use logit_proto::otlp::OtlpDecoder;
 use logit_proto::{Signal, SignalDecoder};
+// Only the test module's own `tls_connector` (a canned TLS client) still reads PEM files
+// directly -- server-side TLS config building moved to `crate::tls` (workstream B).
+#[cfg(test)]
 use rustls_pki_types::pem::PemObject;
+#[cfg(test)]
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::path::Path;
 use std::pin::Pin;
@@ -100,16 +104,12 @@ pub enum OtlpTransport {
     Grpc,
 }
 
-/// Mirrors `logit_config::TlsServerConfig` -- this crate doesn't depend on `logit-config`
-/// (`docs/design/pipeline-graph.md`'s crate layout), the same reason [`OtlpTransport`] exists as
-/// a local copy rather than a re-export. See that type's own doc comment for what each field
-/// means; `logit-cli::pipeline::build_spec` converts one into the other at construction time.
-#[derive(Debug, Clone)]
-pub struct TlsServerSettings {
-    pub cert_file: String,
-    pub key_file: String,
-    pub client_ca_file: Option<String>,
-}
+/// `crate::tls::TlsServerSettings`, re-exported at this path -- `logit_in` (`crates/logit-inputs/
+/// src/logit.rs`) shares the same type and TLS-config builder now (`docs/plans/
+/// native-transport.md` workstream B); kept reachable as `otlp::TlsServerSettings` so
+/// `logit-cli::pipeline::build_spec`'s existing `logit_inputs::otlp::TlsServerSettings` path needs
+/// no change.
+pub use crate::tls::TlsServerSettings;
 
 pub struct OtlpInput {
     bind: String,
@@ -159,7 +159,11 @@ impl OtlpInput {
         settings: &TlsServerSettings,
         base_dir: &Path,
     ) -> anyhow::Result<Self> {
-        self.tls = Some(Arc::new(build_rustls_server_config(settings, base_dir, self.transport)?));
+        let alpn: &[&[u8]] = match self.transport {
+            OtlpTransport::Http => &[b"h2", b"http/1.1"],
+            OtlpTransport::Grpc => &[b"h2"],
+        };
+        self.tls = Some(Arc::new(crate::tls::build_server_config(settings, base_dir, alpn)?));
         Ok(self)
     }
 }
@@ -268,70 +272,6 @@ where
                 .map_err(|e| e.to_string())
         }
     }
-}
-
-/// Builds a `rustls::ServerConfig` from [`TlsServerSettings`] -- ALPN advertises `h2` (and
-/// `http/1.1` under `protocol: http`, which `hyper_util::server::conn::auto` needs to offer a
-/// non-h2c client something to negotiate down to) so a TLS client's own ALPN negotiation picks the
-/// same protocol `auto::Builder`/`http2::Builder` would otherwise have to sniff from plaintext
-/// bytes. Every path is resolved against `base_dir`, same as `OtlpOutput::with_tls`'s client-side
-/// counterpart (`crates/logit-outputs/src/otlp.rs`).
-fn build_rustls_server_config(
-    settings: &TlsServerSettings,
-    base_dir: &Path,
-    transport: OtlpTransport,
-) -> anyhow::Result<rustls::ServerConfig> {
-    let cert_path = base_dir.join(&settings.cert_file);
-    let key_path = base_dir.join(&settings.key_file);
-    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&cert_path)
-        .map_err(|e| {
-            anyhow::anyhow!("otlp_in: reading tls.cert_file {}: {e}", cert_path.display())
-        })?
-        .collect::<Result<_, _>>()
-        .map_err(|e| {
-            anyhow::anyhow!("otlp_in: parsing tls.cert_file {}: {e}", cert_path.display())
-        })?;
-    let key = PrivateKeyDer::from_pem_file(&key_path).map_err(|e| {
-        anyhow::anyhow!("otlp_in: reading tls.key_file {}: {e}", key_path.display())
-    })?;
-
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("the ring crypto provider always supports TLS 1.2/1.3");
-
-    let mut cfg = match &settings.client_ca_file {
-        Some(client_ca_file) => {
-            let ca_path = base_dir.join(client_ca_file);
-            let ca_certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&ca_path)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "otlp_in: reading tls.client_ca_file {}: {e}",
-                        ca_path.display()
-                    )
-                })?
-                .collect::<Result<_, _>>()
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "otlp_in: parsing tls.client_ca_file {}: {e}",
-                        ca_path.display()
-                    )
-                })?;
-            let mut roots = rustls::RootCertStore::empty();
-            roots.add_parsable_certificates(ca_certs);
-            let verifier =
-                rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("otlp_in: building client-cert verifier: {e}"))?;
-            builder.with_client_cert_verifier(verifier).with_single_cert(chain, key)?
-        }
-        None => builder.with_no_client_auth().with_single_cert(chain, key)?,
-    };
-    cfg.alpn_protocols = match transport {
-        OtlpTransport::Http => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-        OtlpTransport::Grpc => vec![b"h2".to_vec()],
-    };
-    Ok(cfg)
 }
 
 async fn handle_http(
