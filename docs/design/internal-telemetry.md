@@ -365,18 +365,29 @@ receive/processing side from their own loops, which already see every batch and 
 | `logit.script.vm.memory` | gauge | `run_lua`, once per batch — the strongest signal a stateful script is leaking Lua-side state |
 | `logit.script.events.emitted{outcome="emit"\|"emit_many"}` | count | `run_lua`, per `ProcessOutcome` — distinguishes a 1:1 script from a fan-out one |
 
-**Every sink also gets a `SinkQueue`** (`crates/logit-pipeline/src/queue.rs`,
+**Every sink also gets a `SinkStore`** (`crates/logit-pipeline/src/queue.rs`,
 `docs/adr/buffered-sink-delivery.md`) sitting between its inbox drain and delivery — its own
 uniform layer, same reasoning as `Fanout`'s: instrumenting the one choke point every sink's batches
-pass through gives every sink these for free, no per-sink code:
+pass through gives every sink these for free, no per-sink code. In memory (`SinkQueue`, the
+default) or on disk (`DiskQueue`, opt-in via `buffer.disk:`,
+`docs/adr/disk-backed-sink-buffer.md`) emit the same first four rows with the same meanings —
+`buffer.bytes` is on-disk bytes rather than `estimated_heap_bytes` for a disk-backed sink:
 
 | Name | Kind | Meaning |
 |---|---|---|
 | `logit.component.buffer.batches` | gauge | batches currently queued, sampled on every push/commit |
-| `logit.component.buffer.bytes` | gauge | `EventBatch::estimated_heap_bytes` summed over what's queued |
+| `logit.component.buffer.bytes` | gauge | `EventBatch::estimated_heap_bytes` summed over what's queued (in-memory), or on-disk segment bytes (disk-backed) |
 | `logit.component.buffer.utilization` | gauge | `max(batches ratio, bytes ratio)` against the two configured bounds |
 | `logit.component.buffer.push.blocked.duration` | timing | how long a `Block`-policy push waited for room; only recorded when a push actually had to wait |
-| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`SinkQueue` eviction), `send_failed` (`write_loop`: not retryable, or retryable but the budget ran out), `shutdown` (`write_loop`: shutdown grace expired with the queue still non-empty) |
+| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (queue eviction), `send_failed` (`write_loop`: not retryable, or retryable but the budget ran out), `shutdown` (`write_loop`: shutdown grace expired with an in-memory queue still non-empty — never emitted for a disk-backed sink, which drops nothing at shutdown), `frame_too_large`/`disk_corrupt`/`disk_full`/`disk_io_error` (disk-backed only, see below) |
+
+Disk-backed sinks (`DiskQueue`) additionally emit:
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.component.buffer.disk.segments` | gauge | segment files currently on disk |
+| `logit.component.buffer.disk.replayed` | count | records found between the resume point and the end of all segments, at `DiskQueue::open` |
+| `logit.component.buffer.disk.truncated` | count | a torn tail found and truncated at `DiskQueue::open` |
 
 Two metrics named in this doc's original design were not built in the pass that shipped
 `SinkQueue`: a per-batch `buffer.wait.duration` (push-to-commit latency) and an
@@ -455,6 +466,16 @@ Worked examples, one per shipped component:
   only, `metadata_error` (`config.v2.json` missing or unparseable — degrades to a `container.id`-
   only resource rather than refusing to tail) and `bad_time` (the envelope's own `time` field
   didn't parse — falls back to read time).
+- `logit_in` (`crates/logit-inputs/src/logit.rs`, [ADR
+  `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md)):
+  `logit.proto.frames{direction="in",codec,compression}` and `logit.proto.frame.bytes` — per-frame
+  detail the same way `statsd_in`'s per-datagram pair is, at the transport's own unit.
+  `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated"|"too_large"|"codec"|"handshake"}`
+  (count) — every way a frame or a handshake can be rejected, each its own reason so a version
+  mismatch doesn't hide behind a generic "bad frame" tag. `logit.input.connections` (gauge, sampled
+  on every connect/disconnect) and `logit.input.connections.rejected{reason="limit"}` (count — the
+  1024-connection cap actually binding, unlike `otlp_in`'s blocking-backpressure shape, which has
+  nothing to count here since it never rejects outright).
 - `aggregate` (`crates/logit-transforms/src/aggregate.rs`): `logit.transform.series.active` and
   `logit.transform.resource.groups`, sampled at the top of `flush` before it touches its own state
   — the peak-of-window series count, which is the visible signal for the cardinality blow-up
@@ -541,6 +562,17 @@ Worked examples, one per shipped component:
   truncated` and `logit.output.messages.dropped{reason="oversize_header"|"oversize_datagram"}`
   (per-message size handling, `docs/adr/syslog-output.md`'s "Sizing" section). Retry stays a
   Layer 2 metric here too, for the same reason as `influxdb_out`.
+- `logit_out` (`crates/logit-outputs/src/logit.rs`, [ADR
+  `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md)):
+  `logit.proto.frames{direction="out",codec,compression}` and `logit.proto.frame.bytes` — the
+  send-side mirror of `logit_in`'s pair. `logit.output.ack.duration` (timer, one per attempt) —
+  finer-grained than the generic `logit.component.send.duration` Layer 2 already times, since it
+  isolates the ack wait specifically from the connect/handshake/write that can precede it on a
+  cold connection. `logit.output.reconnects` (count) — incremented on every connect *after* the
+  first; a climbing count in steady state means the peer or the network, not this sink, is
+  unstable. `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` — the `Fault`
+  taxonomy itself as request-outcome classes, the same shape `influxdb_out`'s HTTP-status classes
+  and `syslog_out`'s `ok`/`error` pair are, just with this sink's own vocabulary.
 
 ## Metrics from Lua scripts
 

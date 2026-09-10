@@ -26,7 +26,7 @@ use logit_outputs::syslog::{Format as SyslogFormat, MessageBuf, SyslogEncoder};
 use logit_pipeline::runtime::drain_inbox;
 use logit_pipeline::{
     process_batch, send_batch, unwrap_batch, Delivered, Fanout, SinkQueue, SinkQueueConfig,
-    TraceContext, Transform,
+    SinkStore, TraceContext, Transform,
 };
 use logit_proto::{Decoder, Encoder};
 use logit_script::{ProcessOutcome, ScriptWorker};
@@ -927,7 +927,8 @@ fn fanout_send_two_output_consumers_costs_only_the_arc() {
 fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
     let telemetry = logit_core::Telemetry::default();
-    let queue = Arc::new(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone()));
+    let store =
+        Arc::new(SinkStore::Memory(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone())));
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
     // Warm: one full push+commit round trip through the exact same `SinkQueue`, so its `VecDeque`
@@ -943,12 +944,12 @@ fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
             Delivered::Owned(batch, _ctx) => Arc::new(batch),
             Delivered::Shared(shared, _ctx) => shared,
         };
-        queue.push((warmed, TraceContext::default())).await;
-        queue.commit();
+        store.push((warmed, TraceContext::default())).await;
+        store.commit();
     });
 
     let batch = fixtures::nginx_batch(1);
-    let queue_for_measure = Arc::clone(&queue);
+    let store_for_measure = Arc::clone(&store);
     let telemetry_for_measure = telemetry.clone();
     let ((), stats) = measure(|| {
         rt.block_on(async move {
@@ -956,11 +957,95 @@ fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
                 .await
                 .expect("send should succeed");
             drop(tx); // closes the inbox, so `drain_inbox` returns after this one batch
-            drain_inbox(&mut rx, queue_for_measure, telemetry_for_measure).await;
+            drain_inbox(&mut rx, store_for_measure, telemetry_for_measure).await;
         })
     });
 
     expect_allocs("drain_inbox: single-consumer Delivered::Owned batch (the Arc::new)", stats, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Disk-backed sink buffer (docs/adr/disk-backed-sink-buffer.md)
+// ---------------------------------------------------------------------------------------------
+
+/// A scratch spool directory, cleaned up by the OS's own tmp reaper rather than at the end of
+/// each test -- matches `crates/logit-pipeline/src/disk_queue.rs`'s own `test_support::scratch_dir`
+/// (no `tempfile` dependency, ADR `file-tailing-and-docker-json-logs`).
+fn disk_scratch_dir(label: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir()
+        .join(format!("logit-bench-disk-queue-{label}-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
+fn disk_queue_config(dir: std::path::PathBuf) -> logit_pipeline::DiskQueueConfig {
+    logit_pipeline::DiskQueueConfig {
+        dir,
+        max_bytes: 64 * 1024 * 1024,
+        segment_bytes: 64 * 1024 * 1024,
+        overflow: logit_pipeline::OverflowPolicy::Block,
+        compression: logit_proto::frame::Compression::None,
+        checkpoint_interval: std::time::Duration::from_secs(3600),
+    }
+}
+
+/// `DiskQueue::push` = `native::encode_batch` + `frame::write_frame` + one `write_all` to the
+/// active segment -- the cost the disk-backed buffer's ADR names as breaking
+/// `buffered-sink-delivery`'s zero-clone `Arc<EventBatch>` property *by design*. Warmed first
+/// (one full push+commit round trip) so the queue's own one-time setup (the lock file, the first
+/// segment's `tokio::fs::File` open) doesn't fold into the measured push.
+#[test]
+fn disk_queue_push_one_batch() {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let dir = disk_scratch_dir("push");
+    let telemetry = Telemetry::default();
+    let queue = logit_pipeline::DiskQueue::open(
+        disk_queue_config(dir.clone()),
+        telemetry,
+        logit_core::Diagnostics::new("bench"),
+    )
+    .unwrap();
+
+    let warm = fixtures::nginx_batch(1);
+    rt.block_on(queue.push((Arc::new(warm), TraceContext::default())));
+    rt.block_on(queue.peek());
+    queue.commit();
+
+    let batch = Arc::new(fixtures::nginx_batch(1));
+    let ((), stats) =
+        measure(|| rt.block_on(queue.push((Arc::clone(&batch), TraceContext::default()))));
+
+    expect_allocs("disk_queue: push one batch (encode + write)", stats, 25);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A repeated `peek` before `commit` is cached -- `write_loop`'s retry loop calls `peek` once per
+/// delivery attempt, so a batch retried several times must not re-decode from disk each time.
+#[test]
+fn disk_queue_peek_cached_costs_nothing() {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let dir = disk_scratch_dir("peek-cached");
+    let telemetry = Telemetry::default();
+    let queue = logit_pipeline::DiskQueue::open(
+        disk_queue_config(dir.clone()),
+        telemetry,
+        logit_core::Diagnostics::new("bench"),
+    )
+    .unwrap();
+
+    let batch = Arc::new(fixtures::nginx_batch(1));
+    rt.block_on(queue.push((batch, TraceContext::default())));
+    rt.block_on(queue.peek()); // warm: the first peek per push does the real disk read + decode
+
+    let ((), stats) = measure(|| {
+        rt.block_on(queue.peek());
+    });
+
+    expect_allocs("disk_queue: peek, cached (no re-decode)", stats, 0);
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// The actually-common shape (the nginx reference config's `tap` (`stdio_out`)/`trimmed`
@@ -2012,6 +2097,64 @@ fn native_decode_one_event() {
         measure(|| decoder.decode_into(framed.clone(), 0, &mut events).expect("should decode"));
     assert_eq!(events.len(), 1);
     expect_allocs("native: decode 1 event", stats, 8);
+}
+
+/// `logit_out::send`'s own encode+frame step, exercised through the exact primitives it calls
+/// (`native::encode_batch` then `frame::write_frame_with_flags`) rather than through
+/// `NativeEncoder` -- `docs/plans/native-transport.md` workstream F. Same cost as
+/// [`native_encode_one_event`] today (both paths do the same two steps), but pinned separately so
+/// a future change to just one of the two sinks' code paths is caught here.
+#[test]
+fn logit_out_encode_and_frame_one_batch() {
+    let batch = fixtures::nginx_batch(1);
+    let warm_payload = logit_proto::native::encode_batch(&batch);
+    drop(logit_proto::frame::write_frame_with_flags(
+        logit_proto::native::CODEC_NATIVE_V1,
+        logit_proto::frame::Compression::None,
+        0,
+        &warm_payload,
+    ));
+
+    let (framed, stats) = measure(|| {
+        let payload = logit_proto::native::encode_batch(&batch);
+        logit_proto::frame::write_frame_with_flags(
+            logit_proto::native::CODEC_NATIVE_V1,
+            logit_proto::frame::Compression::None,
+            0,
+            &payload,
+        )
+        .expect("should frame")
+    });
+    assert!(!framed.is_empty());
+    expect_allocs("logit_out: encode + frame 1 batch", stats, 23);
+}
+
+/// `logit_in`'s own read+decode step, exercised through the exact primitives its per-connection
+/// loop calls once a whole frame's bytes are already in memory (`frame::read_frame_with_header`
+/// then `native::decode_batch`) -- `docs/plans/native-transport.md` workstream F. One allocation
+/// cheaper than [`native_decode_one_event`]: `NativeDecoder::decode_into` additionally
+/// `out.extend(batch.events)`s into a caller-held `Vec`, but `logit_in` has no such buffer to
+/// extend -- `decode_batch` already returns an owned `EventBatch` with its own freshly allocated
+/// `Vec<Event>` directly, which `Fanout::send` takes as-is (see `crates/logit-inputs/src/
+/// logit.rs`'s own module doc comment for why there is no scratch buffer to warm here).
+#[test]
+fn logit_in_read_and_decode_one_batch() {
+    let batch = fixtures::nginx_batch(1);
+    let mut encoder = logit_proto::native::NativeEncoder::default();
+    let framed = encoder.encode(&batch).expect("should encode");
+
+    let mut warm = framed.clone();
+    let (_, mut warm_payload) = logit_proto::frame::read_frame_with_header(&mut warm).unwrap();
+    drop(logit_proto::native::decode_batch(&mut warm_payload));
+
+    let (event_count, stats) = measure(|| {
+        let mut bytes = framed.clone();
+        let (_, mut payload) =
+            logit_proto::frame::read_frame_with_header(&mut bytes).expect("should read frame");
+        logit_proto::native::decode_batch(&mut payload).expect("should decode").events.len()
+    });
+    assert_eq!(event_count, 1);
+    expect_allocs("logit_in: read + decode 1 batch", stats, 7);
 }
 
 /// Pins `Dict::read`'s `Vec::with_capacity(count.min(4096))` clamp with a byte-count assertion --

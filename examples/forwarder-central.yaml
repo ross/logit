@@ -1,0 +1,34 @@
+# The other half of the native-transport forwarding pair -- see examples/forwarder-edge.yaml for
+# the full picture, how to run both together, and the `logit_out`/`logit_in` field reference this
+# file doesn't repeat.
+#
+# Topology (this file):
+#
+#   [the wire] --> central_in (logit_in) --> windowed (aggregate) --> central_out (stdio_out)
+#
+# `windowed` is where the 60s aggregation window actually happens -- the edge process forwards
+# everything unaggregated (docs/adr/aggregation-window-semantics.md's merge semantics apply once,
+# here, not once per edge and again centrally). `stdio_out` stands in for a real sink
+# (`influxdb_out`, another `otlp_out`/`logit_out` hop, ...) purely so this example is runnable with
+# no external service.
+components:
+  central_in:
+    type: logit_in
+    bind: 0.0.0.0:5140
+    # tls:                        # presence turns TLS on; no ALPN, unlike otlp_in
+    #   cert_file: server.pem
+    #   key_file: server.key
+    #   client_ca_file: null       # set for mutual TLS -- every connecting client must then
+    #                                present a certificate chaining to this CA
+    # max_frame_bytes: 64MiB       # caps one frame's size (post- and pre-decompression alike),
+    #                                echoed to every connecting client in HelloAck.max_frame_bytes
+
+  windowed:
+    type: aggregate
+    sources: [central_in]
+    interval: 60s
+
+  central_out:
+    type: stdio_out
+    sources: [windowed]
+    target: stdout

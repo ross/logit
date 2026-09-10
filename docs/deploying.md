@@ -183,14 +183,15 @@ it carries any other signal, with no separate log-shipping setup.
 
 ## Sink delivery buffering
 
-Every sink (`influxdb_out`, `stdio_out`, `file_out`, ...) sits behind a per-component, in-memory
-delivery queue that decouples receiving events from delivering them
+Every sink (`influxdb_out`, `stdio_out`, `file_out`, ...) sits behind a per-component delivery
+queue, in memory by default, that decouples receiving events from delivering them
 ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md)). This is what lets a slow or temporarily-down
 destination be ridden out instead of stalling or killing the whole pipeline. It's tunable per sink
 via a `buffer:` block on that component (`buffer:` is rejected at validation time on anything but a
 sink) — see the commented example in
 [`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml). Every field defaults, so
-an omitted `buffer:` is the values below.
+an omitted `buffer:` is the values below. `buffer.disk:` opts a sink into a crash-recoverable,
+disk-backed queue instead — see [Durable buffering](#durable-buffering) below.
 
 ### Failure semantics: degrade to dropping, don't exit
 
@@ -213,13 +214,16 @@ Unlike the pre-0020 behavior, a sink that can't reach its destination no longer 
 
 ### Sizing: `max_bytes` × number of sinks
 
-`buffer.max_bytes` (64MiB default) bounds *one sink's* queue — a config with several sinks (or
-several `influxdb_out`/`stdio_out` components fed by different branches) multiplies that by however
-many sinks it defines when you're sizing the container's memory limit. `buffer.max_batches` (1024
-default) is the second, independent bound — whichever of the two trips first governs. Size for the
-worst case you actually intend to ride out: `max_bytes` deep enough to hold a real destination
-outage's worth of buffered data, weighed against the memory budget you're willing to commit to a
-sink that's doing nothing but holding data no one can currently accept.
+`buffer.max_bytes` (64MiB default) bounds *one sink's* queue — RAM for the in-memory default, disk
+for `buffer.disk:` — a config with several sinks (or several `influxdb_out`/`stdio_out` components
+fed by different branches) multiplies that by however many sinks it defines when you're sizing the
+container's memory (or disk) limit. `buffer.max_batches` (1024 default) is the second, independent
+bound for an in-memory queue — whichever of the two trips first governs; a disk-backed queue drops
+that bound entirely in favor of `buffer.disk.max_bytes` alone (graph validation rejects setting
+both). Size for the worst case you actually intend to ride out: `max_bytes` deep enough to hold a
+real destination outage's worth of buffered data, weighed against the memory (or disk) budget
+you're willing to commit to a sink that's doing nothing but holding data no one can currently
+accept.
 
 `buffer.overflow` decides what happens once both bounds are full: `block` (the default) applies
 backpressure all the way back to intake rather than losing data silently; `drop_oldest`/
@@ -240,6 +244,51 @@ the config. The two most directly actionable for buffering:
   `shutdown` (the queue still held data when `shutdown_grace` expired). Any sustained nonzero rate
   here is data loss worth alerting on; which `reason` tells you whether the cause is an overflowing
   queue, a failing destination, or a slow drain racing shutdown.
+
+### Durable buffering
+
+An in-memory queue is lost on a process restart, a `SIGKILL`, or a shutdown grace that expires
+mid-drain. A `buffer.disk:` block replaces one sink's queue with a crash-recoverable spool on disk
+([ADR `disk-backed-sink-buffer`](adr/disk-backed-sink-buffer.md)) — a restart resumes delivery from
+the last persisted read cursor, replaying at most the batches committed since the last checkpoint
+(at-least-once, the same trade `tail_in`'s own checkpoint already makes):
+
+```yaml
+buffer:
+  disk:
+    path: spool/influxdb_out   # required, resolved relative to this config file's own directory
+    max_bytes: "1GiB"          # bound on the sum of on-disk segment sizes -- replaces buffer.max_bytes
+    segment_bytes: "64MiB"     # soft rotation trigger, not a hard cap
+    compression: none          # none | lz4
+    checkpoint_interval: 1s    # how often the read cursor is persisted during normal operation
+```
+
+Use it for a sink whose destination has outages long enough, or restarts frequent enough, that an
+in-memory queue's loss window is a real cost — not for every sink by default: it costs a real
+`write` per batch (`logit_proto::native` encode plus one file append) that an in-memory queue never
+pays. `buffer.max_batches`/`buffer.max_bytes` are rejected if left non-default alongside `disk:` —
+disk replaces the in-memory bound, it doesn't size beside it.
+
+**Durability level:** `fdatasync` on segment rotation, on the cursor file, and at shutdown, not per
+push. A process crash (including `SIGKILL`) loses nothing already written; a genuine power loss can
+lose the most recent, not-yet-synced tail of the active segment. Put the spool directory on a
+volume that survives the container — an ephemeral container filesystem defeats the entire point,
+the same as any other durable state (`crates/logit-inputs/src/tail/checkpoint.rs`'s own checkpoint
+file, a database's data directory).
+
+**What to watch**, in addition to the metrics above (`buffer.utilization`/`.bytes` mean the same
+thing, sized against `buffer.disk.max_bytes`; `batches.dropped` gains `frame_too_large`,
+`disk_corrupt`, `disk_full`, and `disk_io_error` as possible `reason`s, and never emits
+`reason="shutdown"` for a disk-backed sink, which drops nothing at shutdown):
+
+- `logit.component.buffer.disk.segments` (gauge) — segment files currently on disk.
+- `logit.component.buffer.disk.replayed` (count) — records found between the resume point and the
+  end of all segments, once at process start. Consistently zero after the first tick following a
+  clean start; a nonzero value on every restart under normal operation means something is
+  preventing the queue from ever fully draining.
+- `logit.component.buffer.disk.truncated` (count) — a torn tail found and truncated at open. Any
+  nonzero value here means the previous process ended mid-write (an ordinary `SIGKILL`, not
+  necessarily a problem) — worth noting, not alerting on by itself.
 
 ## Listener intake
 
@@ -501,6 +550,86 @@ listener-side `logit.component.diagnostics` counters as any other transport fail
 -specific to watch beyond that. `docs/known-gaps.md` tracks two open items: certificates are read
 once at startup (a renewed cert needs a restart, not a live reload), and `otlp_out` has no
 `server_name` override for an endpoint reached by IP or through a proxy.
+
+## Forwarding between `logit` nodes
+
+`logit_out`/`logit_in` are the native `logit`-to-`logit` transport
+([ADR `native-transport-handshake-and-ack`](adr/native-transport-handshake-and-ack.md)) -- the
+"split collection from processing across nodes" shape [`docs/OVERVIEW.md`](OVERVIEW.md) names as
+the whole point of the native wire format existing. A sidecar/edge process collects and forwards
+unaggregated; a central process receives, aggregates, and delivers. See
+[`examples/forwarder-edge.yaml`](../examples/forwarder-edge.yaml)/
+[`examples/forwarder-central.yaml`](../examples/forwarder-central.yaml) for a complete, runnable
+pair.
+
+```yaml
+# edge
+components:
+  central_out:
+    type: logit_out
+    sources: [edge_in]
+    endpoint: central.internal:5140
+```
+
+```yaml
+# central
+components:
+  central_in:
+    type: logit_in
+    bind: 0.0.0.0:5140
+```
+
+**TLS.** `logit_out`'s `endpoint` is a bare `host:port` with no scheme to read a TLS signal from
+(unlike `otlp_out`'s URL-shaped endpoint) -- a `tls:` block's mere presence turns TLS on, the same
+convention `otlp_in` already uses server-side:
+
+```yaml
+# edge
+    tls:
+      ca_file: /etc/logit/tls/ca.pem
+```
+
+```yaml
+# central
+    tls:
+      cert_file: /etc/logit/tls/server.pem
+      key_file: /etc/logit/tls/server.key
+      client_ca_file: /etc/logit/tls/ca.pem   # omit for server-auth-only TLS
+```
+
+**Sizing `request_timeout` against `buffer.retry_budget`.** `logit_out.request_timeout` (default
+10s) bounds one attempt -- connect, handshake, and the ack wait, all sharing that one knob, the
+same shape `otlp_out`'s own timeout has. `buffer.retry_budget` (default 60s, see "Sink delivery
+buffering" above) is the *outer* bound across every retried attempt. Keep `request_timeout`
+comfortably under `retry_budget` -- a `request_timeout` close to or above the retry budget leaves
+room for at most one attempt before the budget itself expires, which defeats retry's purpose.
+`request_timeout` also bounds `logit_in`'s own handshake grace on the far end only loosely: a
+`logit_out` configured with a shorter `request_timeout` than its peer's handshake patience just
+means *this* side gives up first, not that the connection is unsafe. That far-end grace is 5s per
+pre-`Hello` phase, applied independently to the TLS accept and to the `Hello` read that follows
+it -- so a TLS peer that connects and then goes silent is dropped after at most 10s, not 5s.
+A peer that gets `Reject{code: REJECT_INTERNAL}` from a `logit_in` at its connection cap never
+classifies it `permanent`: at the handshake (nothing of the batch written yet) it's `clean` and
+the batch is retried within `retry_budget`; once a frame has already left on that connection it's
+`ambiguous`, which under `logit_out`'s default `at_most_once` posture is *not* retried -- that
+batch is dropped and counted, and only the connection itself recovers. Either way the sink
+reconnects on its own once the peer has capacity again, with no operator intervention needed; set
+`buffer.delivery: at_least_once` on the `logit_out` component if you would rather risk a duplicate
+than lose that batch. The same holds for `Reject{code: REJECT_GOING_AWAY}` during the peer's own
+shutdown.
+
+**What to watch.** `logit_out`: `logit.output.requests{class}` (`ok`/`clean`/`ambiguous`/
+`permanent`, one per `send` attempt), `logit.output.reconnects` (should stay near zero in steady
+state -- a climbing count means the peer or the network is unstable), `logit.output.ack.duration`.
+`logit_in`: `logit.input.connections` (a gauge; should match the number of `logit_out` peers
+actually connected), `logit.input.connections.rejected{reason="limit"}` (nonzero means the 1024
+-connection cap is actually binding -- raise it or shed load upstream), `logit.proto.errors{reason}`
+(`magic`/`version`/`crc`/`truncated`/`too_large`/`codec`/`handshake` -- any of these on a healthy
+link points at a version-mismatched or misbehaving peer, not routine loss). Both sides:
+`logit.proto.frames{direction,codec,compression}` and `logit.proto.frame.bytes` for throughput.
+`docs/known-gaps.md` tracks what's still open: no credit-based flow control (this plan's sender
+never has more than one frame outstanding), and `logit_in`'s shutdown grace is fixed at 5s with no
+`receive:`-shaped knob to change it.
 
 ## The nginx-side recipe
 

@@ -52,3 +52,11 @@ http-body-util.workspace = true
 # graceful path and therefore no drain to probe). Already a workspace dependency via
 # `logit-inputs`, so this adds no new crate to the graph.
 libc.workspace = true
+# `crates/logit-cli/tests/durable_buffer_restart.rs` implements `logit_pipeline::Input`/`Output`
+# test doubles directly, the same way `crates/logit-outputs`/`logit-inputs` implement the real
+# ones.
+async-trait.workspace = true
+# tests/logit_round_trip.rs's forwarding-chain test decodes a real statsd line with
+# `StatsdDecoder` directly, which takes its input as `bytes::Bytes` -- already a transitive
+# dependency via every crate above, named directly here because the test constructs one itself.
+bytes.workspace = true
