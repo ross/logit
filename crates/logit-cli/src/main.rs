@@ -30,7 +30,10 @@ struct Cli {
     #[arg(long, env = "LOGIT_LOG", default_value = "info", global = true)]
     log_level: String,
     /// `text` is one line per event, human-formatted; `json` is one JSON object per line
-    /// (`timestamp`, `level`, `target`, `component`, `key`, `message`) -- for a log collector.
+    /// (`timestamp`, `level`, `target`, `component`, `key`, `message`, every one of them
+    /// top-level -- `flatten_event`, and `target` left displayed, so a collector reads the
+    /// fields named here rather than unwrapping a nested `fields` object) -- for a log
+    /// collector. Both formats write to stderr; see `init_logging`.
     #[arg(long, value_enum, default_value = "text", global = true)]
     log_format: LogFormat,
 }
@@ -70,30 +73,65 @@ enum Command {
 /// regardless of whether the config itself would also fail, and `pipeline::run_pipelines`'s own
 /// `starting` log always fires, even for a config that goes on to fail resolution.
 ///
+/// Everything the subscriber renders goes to stderr, never stdout: `stdio_out` defaults to
+/// `target: stdout` (`StdioTarget::Stdout`), so stdout belongs to the pipeline's own event
+/// stream -- `logit run c.yaml > events.log` has to stay parseable, and lifecycle lines
+/// interleaved into it would corrupt exactly the output an operator is capturing.
+///
 /// `telemetry_layer` (`docs/plans/operator-surface.md`, workstream D) is stacked in unconditionally
 /// -- it starts inactive (every event a no-op) and stays that way until
 /// `pipeline::run_pipelines` calls `TelemetryLayer::activate` once the config's own `internal`
 /// component (if any) is known, which happens strictly *after* this call: there is no stable API
 /// to add a layer to an already-`.init()`-ed subscriber, so the layer has to already be here,
 /// even inactive.
+///
+/// `--log-level`/`LOGIT_LOG` filters *only* the stderr `fmt` layer, via a per-layer
+/// `.with_filter(...)` rather than a subscriber-wide `.with(filter)`: a global filter
+/// short-circuits every layer beneath it (and `tracing-core` caches that verdict per callsite
+/// forever), which would make `--log-level error` silently override the config's own
+/// `internal.logs` threshold. `telemetry_layer` carries `logit_core::TelemetryLayer::capture_filter`
+/// of its own instead.
 fn init_logging(
     level: &str,
     format: LogFormat,
     telemetry_layer: logit_core::TelemetryLayer,
 ) -> anyhow::Result<()> {
+    use tracing_subscriber::layer::Layer;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_new(level)
         .with_context(|| format!("--log-level/LOGIT_LOG: '{level}' is not a valid directive"))?;
-    let registry = tracing_subscriber::registry().with(filter).with(telemetry_layer);
+    // `with_filter` on each layer, never a bare `.with(filter)` on the registry: a plain
+    // `.with(EnvFilter)` is a *global* filter -- `Layered::enabled`/`register_callsite`
+    // short-circuit the whole stack, and a `never` verdict is cached at the callsite by
+    // `tracing-core` for the life of the process -- so `--log-level error` (or `LOGIT_LOG=off`)
+    // would kill every `warn` before `TelemetryLayer::on_event` ever ran, silently downgrading
+    // `internal: { logs: warn }` to `error` upstream of anywhere the drop could even be counted.
+    // Scoped per layer, the two are independent knobs: `--log-level` is stderr verbosity,
+    // `internal.logs` is what the pipeline captures (`TelemetryLayer::capture_filter`).
+    let registry = tracing_subscriber::registry()
+        .with(telemetry_layer.with_filter(logit_core::TelemetryLayer::capture_filter()));
     match format {
         LogFormat::Text => {
-            registry.with(tracing_subscriber::fmt::layer().with_target(false)).init();
+            let layer = tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(std::io::stderr)
+                .with_filter(filter);
+            registry.with(layer).init();
         }
         LogFormat::Json => {
-            registry.with(tracing_subscriber::fmt::layer().with_target(false).json()).init();
+            // `target` stays displayed here (unlike the text arm): every `logit` event sets it
+            // explicitly to `"logit"`, and it's one of the six fields `--log-format`'s doc
+            // comment promises a collector. `flatten_event` lifts `message`/`component`/`key`
+            // out of the nested `fields` object the JSON formatter otherwise wraps them in.
+            let layer = tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_writer(std::io::stderr)
+                .with_filter(filter);
+            registry.with(layer).init();
         }
     }
     Ok(())

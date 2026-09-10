@@ -46,3 +46,9 @@ hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+
+[dev-dependencies]
+# `admin_ready.rs`'s drain test needs a real SIGTERM (`Child::kill` sends SIGKILL, which has no
+# graceful path and therefore no drain to probe). Already a workspace dependency via
+# `logit-inputs`, so this adds no new crate to the graph.
+libc.workspace = true
