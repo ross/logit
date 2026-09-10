@@ -15,7 +15,9 @@ docker compose up --build
 
 The first run builds `logit`'s production image from source (vendored LuaJIT, no dependency-layer
 caching by design — see `../Dockerfile`'s comment) — expect several minutes before anything
-appears. Every run after that reuses the built image.
+appears. Every run after that reuses the built image. `app`'s own image now has a client-side build
+step too (`app/Dockerfile`'s `bundle` stage, `docs/adr/browser-tracing-sdk.md`) — the first build
+needs npm registry access alongside PyPI/crates.io/apt, unlike every other image in this stack.
 
 Once it's up, **start at http://localhost:8080** — a small page that links to Grafana with
 get-started instructions and shows this stack's own pipeline, rendered live. That's `haproxy`,
@@ -206,26 +208,30 @@ published directly, since a browser (or `curl`) reaching it same-origin is the w
 every syslog/docker/tail-sourced input elsewhere in this stack, no `set` stage stamps a resource in
 front of it — a real OTel SDK sets its own `Resource`. `app`'s own spans still go straight to
 Tempo instead of through `browser_in` (see "What's actually flowing" above) — that remains a
-deliberate choice, not something this closes. Nothing in this stack's own traffic sends to
-`browser_in` yet, though (see "What's left client-side" below); it's verified instead with a
-manual OTLP/JSON POST to `/v1/traces`.
+deliberate choice, not something this closes. `browser_in` is exercised by real traffic now too
+(next section) — every landing-page load sends it a real `documentLoad` batch, not just the manual
+OTLP/JSON POST it was first verified with.
 
 `tail_in` (plain file tailing, the driver `docker_in` builds on) used to ship tested but
 unexercised here too — `postgres_in` (`demo/logit.yaml`, `docs/plans/demo-richer-traces.md`)
 closes that: a `paths:` glob over Postgres's own rotating jsonlog directory, checkpointed on the
 same `logit_state` volume `nginx_in` already uses.
 
-## What's left client-side
+## Browser-side tracing
 
-Browser-side tracing is sketched, not built, in
-[docs/plans/demo-tracing-stack.md](../docs/plans/demo-tracing-stack.md)'s workstream C
-([docs/plans/browser-tracing.md](../docs/plans/browser-tracing.md)) — the server side is done now
-(previous section, above): `haproxy` already routes same-origin `/v1/*` traffic to `browser_in`,
-and `otlp_in` already accepts OTLP/JSON as well as protobuf
-([ADR `otlp-json-decoding`](../docs/adr/otlp-json-decoding.md)), closing the gap
-[docs/known-gaps.md](../docs/known-gaps.md) used to name here. What remains is purely a real OTel
-browser SDK on the landing page actually sending spans there — no further `logit` or `haproxy`
-change needed first.
+The real `@opentelemetry/sdk-trace-web` SDK now runs on the landing page itself
+(`app/browser/telemetry.js`, bundled by a new `esbuild` stage in `app/Dockerfile` — this demo's
+first client-side build step, see the "Quick start" note above), closing out
+[docs/plans/browser-tracing.md](../docs/plans/browser-tracing.md)'s workstream C
+([ADR `browser-tracing-sdk`](../docs/adr/browser-tracing-sdk.md) has the implementation decisions,
+including two places the real SDK's behaviour didn't match this doc's original, spec-derived
+expectations). A page load produces a `documentLoad` span, parented (confirmed empirically — not
+linked, see the ADR) to the request's own server span via a `<meta name="traceparent">` tag
+(`pages/context_processors.py`), plus a `resourceFetch` span per sub-resource, each *linked* to the
+real `haproxy_trace`/`nginx_trace`-minted span that served it via HAProxy's `Server-Timing` header.
+The "Call /work via fetch()" button on the page exercises `instrumentation-fetch`'s context
+propagation the same way: that fetch span becomes a real parent of `app`'s own Django request span
+for the call it triggers.
 
 ## Stopping
 
