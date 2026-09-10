@@ -50,7 +50,9 @@ unit/integration tests but no longer exercised by the demo, which moved its log 
 `otlp_out` straight to Loki ([docs/plans/otlp-logs-and-resource-identity.md](docs/plans/otlp-logs-and-resource-identity.md)'s
 workstream B) — the demo isn't meant to stay exhaustive over every component as more land.
 `otlp_in`/`otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`, OTLP for logs,
-metrics, and traces, both OTLP/HTTP and a hand-rolled OTLP/gRPC transport,
+metrics, and traces, both OTLP/HTTP and a hand-rolled OTLP/gRPC transport --
+`otlp_in`'s HTTP side accepts OTLP/JSON as well as protobuf
+([ADR `otlp-json-decoding`](docs/adr/otlp-json-decoding.md)) --
 [ADR `committed-pregenerated-otlp-protobuf`](docs/adr/committed-pregenerated-otlp-protobuf.md)/
 [ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md)) are real, implemented `ComponentKind`s —
 `otlp_out` is live in `demo/logit.yaml`'s both `log_out` (HTTP, straight to Loki) and `trace_out`
