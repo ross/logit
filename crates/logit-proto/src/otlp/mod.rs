@@ -18,7 +18,10 @@
 //! generating or depending on the collector service messages (see `proto/README.md`). PR3's
 //! `otlp_in`/`otlp_out` parse `partial_success` themselves from the same bytes, on the response
 //! side, without needing generated types for it either -- that shape is small enough to build by
-//! hand there.
+//! hand there. The same equivalence holds for OTLP/JSON, and for a cleaner reason: since
+//! [`json`]'s dialect layer keys off field *names* rather than protobuf tag numbers, and both
+//! message shapes present the identical top-level key (`resourceSpans`/`resourceLogs`/
+//! `resourceMetrics`), one parser reads either without needing to know which it received.
 //!
 //! **Nesting**, shared by every signal (detail in [`common`]): one `EventBatch` encodes as one
 //! `Resource*` entry (the batch's single `Arc<Resource>`) with one `Scope*` stamped
@@ -31,6 +34,7 @@
 //! returns nothing for a signal with no events to carry, rather than sending an empty request.
 
 pub mod common;
+pub mod json;
 pub mod logs;
 pub mod metrics;
 pub mod traces;
@@ -237,6 +241,39 @@ impl SignalDecoder for OtlpDecoder {
     }
 }
 
+impl OtlpDecoder {
+    /// The OTLP/JSON mirror of [`SignalDecoder::decode_signal`] -- not a trait method (see
+    /// [`crate::SignalDecoder`]'s doc comment for why), but otherwise identical in shape: parse
+    /// `bytes` into the same generated `prost` structs the protobuf path decodes into (via
+    /// [`json`]'s hand-written dialect layer, [ADR `otlp-json-decoding`](../../../../docs/adr/otlp-json-decoding.md)),
+    /// then feed them through the exact same `decode_resource_*` functions above, so every
+    /// semantic rule and every test that covers them applies regardless of wire encoding.
+    pub fn decode_signal_json(
+        &mut self,
+        signal: Signal,
+        bytes: Bytes,
+    ) -> Result<Vec<EventBatch>, CodecError> {
+        match signal {
+            Signal::Logs => {
+                let data = json::logs_data(&bytes)?;
+                Ok(data.resource_logs.into_iter().map(decode_resource_logs).collect())
+            }
+            Signal::Traces => {
+                let data = json::traces_data(&bytes)?;
+                data.resource_spans.into_iter().map(decode_resource_spans).collect()
+            }
+            Signal::Metrics => {
+                let data = json::metrics_data(&bytes)?;
+                Ok(data
+                    .resource_metrics
+                    .into_iter()
+                    .map(|rm| self.decode_resource_metrics(rm))
+                    .collect())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +456,67 @@ mod tests {
         assert_eq!(
             batch.events[0].attributes.get("otel.scope.name").and_then(|v| v.as_str()),
             Some("logit")
+        );
+    }
+
+    /// The strongest claim this codec can make about its two wire encodings, and OTLP/JSON's own
+    /// claim about itself: a hand-written OTLP/JSON literal describing the exact same span as
+    /// [`OTLP_TRACE_REQUEST`] above must decode to the identical [`EventBatch`], through the
+    /// completely separate [`json`] parsing path -- not merely "produces similar-looking output",
+    /// full structural equality.
+    const OTLP_TRACE_REQUEST_JSON: &[u8] = br#"{
+        "resourceSpans": [{
+            "scopeSpans": [{
+                "scope": {"name": "logit", "version": "0.1.0"},
+                "spans": [{
+                    "traceId": "01010101010101010101010101010101",
+                    "spanId": "0202020202020202",
+                    "name": "fixture_span",
+                    "startTimeUnixNano": "1",
+                    "endTimeUnixNano": "2",
+                    "attributes": [{"key": "fk1", "value": {"boolValue": true}}],
+                    "events": [{"timeUnixNano": "1", "name": "checkpoint",
+                                "attributes": [{"key": "ek", "value": {"stringValue": "ev"}}]}],
+                    "links": [{"traceId": "03030303030303030303030303030303",
+                               "spanId": "0404040404040404",
+                               "attributes": [{"key": "lk", "value": {"stringValue": "link"}}]}],
+                    "status": {"code": "STATUS_CODE_OK"}
+                }]
+            }]
+        }]
+    }"#;
+
+    #[test]
+    fn protobuf_and_json_encodings_of_the_same_span_decode_to_the_same_event_batch() {
+        let mut proto_decoder = OtlpDecoder::new();
+        let proto_batches = proto_decoder
+            .decode_signal(Signal::Traces, Bytes::from_static(OTLP_TRACE_REQUEST))
+            .expect("the protobuf fixture must decode");
+
+        let mut json_decoder = OtlpDecoder::new();
+        let json_batches = json_decoder
+            .decode_signal_json(Signal::Traces, Bytes::from_static(OTLP_TRACE_REQUEST_JSON))
+            .expect("the JSON fixture must decode");
+
+        assert_eq!(proto_batches.len(), 1);
+        assert_eq!(json_batches.len(), 1);
+        let (proto_span, json_span) = (
+            proto_batches[0].events[0].span.as_ref().unwrap(),
+            json_batches[0].events[0].span.as_ref().unwrap(),
+        );
+        assert_eq!(proto_span.trace_id, json_span.trace_id);
+        assert_eq!(proto_span.span_id, json_span.span_id);
+        assert_eq!(proto_span.name, json_span.name);
+        assert_eq!(proto_span.status, json_span.status);
+        assert_eq!(proto_span.events.len(), json_span.events.len());
+        assert_eq!(proto_span.links[0].trace_id, json_span.links[0].trace_id);
+        assert_eq!(
+            proto_batches[0].events[0].attributes.get("fk1"),
+            json_batches[0].events[0].attributes.get("fk1"),
+        );
+        assert_eq!(
+            proto_batches[0].events[0].attributes.get("otel.scope.name"),
+            json_batches[0].events[0].attributes.get("otel.scope.name"),
         );
     }
 }

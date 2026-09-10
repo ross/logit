@@ -56,6 +56,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 # Already present transitively (via tokio/hyper) at this exact version -- pinning it as a direct
 # dependency doesn't add a new entry to the dependency tree.
 socket2 = "0.6.5"
+# OTLP/JSON decoding only (crates/logit-proto/src/otlp/json) -- `AnyValue.bytesValue` is the one
+# field proto3 JSON base64-encodes; everything else in that dialect is hand-parsed (see
+# ADR `otlp-json-decoding`). Already present transitively (via reqwest/rustls) at this exact
+# version -- pinning it as a direct dependency adds no new crate version to the graph.
+base64 = "0.22.1"
 clap = { version = "4", features = ["derive", "env"] }
 serde_norway = "0.9"
 sketches-ddsketch = "0.4"

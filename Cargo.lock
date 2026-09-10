@@ -990,11 +990,13 @@ dependencies = [
 name = "logit-proto"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "crc32c",
  "logit-core",
  "lz4_flex",
  "prost",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
