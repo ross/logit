@@ -7,11 +7,11 @@
 //! the sink under test needs to fail on command, which no real `ComponentKind` can express.
 
 use logit_config::{BufferConfig, Component, ComponentKind, Config, ReceiveConfig};
-use logit_core::{AttrMap, Event, EventBatch, Resource, Value};
+use logit_core::{AttrMap, Event, EventBatch, MetricKind, Registry, Resource, Telemetry, Value};
 use logit_pipeline::graph;
 use logit_pipeline::{
     DiskQueueConfig, Fanout, Input, InputRuntimeConfig, NodeSpec, Output, OverflowPolicy,
-    SinkStoreConfig, WriteLoopConfig,
+    Readiness, SinkStoreConfig, WriteLoopConfig, SINK_QUEUE_METRICS,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,9 +33,9 @@ fn marker_of(batch: &EventBatch) -> usize {
     batch.events[0].attributes.get("marker").and_then(Value::as_str).unwrap().parse().unwrap()
 }
 
-/// Sends every batch in `batches` once, then hangs forever -- the test drops this whole future
-/// (via a timeout) rather than ever letting it finish, simulating `SIGKILL`: no shutdown signal,
-/// no chance for anything downstream to flush or checkpoint on its own initiative.
+/// Sends every batch in `batches` once, then hangs forever -- the test aborts the whole `run`
+/// task rather than ever letting it finish, simulating `SIGKILL`: no shutdown signal, no chance
+/// for anything downstream to flush or checkpoint on its own initiative.
 ///
 /// `gap`: how long to sleep between each `sink.send(...)` call -- `Duration::ZERO` sends the
 /// whole burst as fast as possible (this file's original scenario); a nonzero gap gives delivery
@@ -106,6 +106,17 @@ impl Output for RecordingOutput {
         // requires the posture that actually retries/redelivers rather than giving up.
         true
     }
+}
+
+/// The most recent `Gauge` point named `name` in one drain's worth of telemetry events -- a gauge
+/// is last-write-wins within a drain (`Telemetry::gauge`), so each drain carries at most one.
+fn latest_gauge(events: &[Event], name: &str) -> Option<f64> {
+    events.iter().rev().find_map(|e| {
+        e.metrics.iter().rev().find_map(|m| match &m.kind {
+            MetricKind::Gauge(v) if logit_core::interner::resolve(m.name) == name => Some(*v),
+            _ => None,
+        })
+    })
 }
 
 fn graph_and_topology(disk_dir: std::path::PathBuf) -> (graph::Graph, DiskQueueConfig) {
@@ -196,13 +207,69 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
             ),
         );
 
-        // No shutdown signal at all -- the timeout elapsing drops this future outright, taking
-        // every task (and the `DiskQueue` inside them) down with it mid-flight. This is the
-        // closest in-process analogue of `SIGKILL`: nothing gets a chance to run `finish()`.
-        let result =
-            tokio::time::timeout(Duration::from_millis(500), logit_pipeline::run(graph, specs))
-                .await;
-        assert!(result.is_err(), "run should still be going (in should be hanging) when killed");
+        // No shutdown signal at all -- aborting this task drops the whole `run` future outright,
+        // taking every node task (and the `DiskQueue` inside them) down with it mid-flight. This
+        // is the closest in-process analogue of `SIGKILL`: nothing gets a chance to run
+        // `finish()`.
+        //
+        // *When* to kill is decided by observation, not a clock. A batch is only durable once
+        // `DiskQueue::push` has written it; anything still in the input's loop or the sink's
+        // inbox at the kill is lost by design, so this test's premise ("every batch was pushed
+        // before the crash") has to be established, not assumed. A fixed 500ms wait used to be
+        // that assumption, and on a loaded CI disk (each of run 1's ~3 segment rotations
+        // `fsync`s twice) 40 pushes did not always fit -- the batches that had not reached the
+        // spool yet were then reported as "never delivered". The sink's own
+        // `logit.component.buffer.batches` gauge (`SINK_QUEUE_METRICS.depth`: pushed minus
+        // committed) reading exactly `TOTAL - SUCCEED_FIRST_RUN` is the precise statement that
+        // all 40 are on disk and the first 10 are committed.
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = HashMap::from([(
+            "out".to_string(),
+            registry.telemetry_for("out", "influxdb_out", "sink"),
+        )]);
+        let run = tokio::spawn(logit_pipeline::run_with_telemetry(
+            graph,
+            specs,
+            telemetry,
+            Readiness::disabled(),
+            std::future::pending(),
+        ));
+        let expected_depth = (TOTAL as u64 - SUCCEED_FIRST_RUN) as f64;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut depth = None;
+        loop {
+            // `drain` consumes the pending points, and a gauge is last-write-wins per drain, so
+            // the most recent drain that carried one holds the current value.
+            if let Some(v) = latest_gauge(&registry.drain(0), SINK_QUEUE_METRICS.depth) {
+                depth = Some(v);
+            }
+            let jammed = run1_attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(marker, ok)| *marker == SUCCEED_FIRST_RUN as usize && !*ok);
+            if (depth == Some(expected_depth) && jammed) || tokio::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            depth,
+            Some(expected_depth),
+            "all {TOTAL} batches should be spooled ({SUCCEED_FIRST_RUN} of them committed) before \
+             the kill"
+        );
+        assert!(!run.is_finished(), "run should still be going (in should be hanging) when killed");
+        run.abort();
+        // Let the abort actually land before reopening the spool: the aborted task still holds
+        // the `DiskQueue` (and its exclusive lock file) until its future is dropped.
+        let joined = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the aborted run should be torn down promptly");
+        assert!(
+            joined.is_err_and(|err| err.is_cancelled()),
+            "run should have been aborted, not finished on its own"
+        );
     }
     let run1_successes: Vec<usize> = run1_attempts
         .lock()
@@ -253,13 +320,17 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
         }));
         // Poll until the spool is drained rather than sleeping a fixed guess -- `run` itself
         // never returns on its own here (nothing closes `in`'s Fanout), so this drives shutdown
-        // once delivery has caught up.
-        let expected_run2_deliveries = TOTAL - SUCCEED_FIRST_RUN as usize;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // once delivery has caught up. "Drained" is the *last* marker having been delivered,
+        // not a count of deliveries: how many run 2 has to make depends on where run 1's cursor
+        // was last checkpointed (`checkpoint_interval` is time-gated, so all 10 commits may have
+        // landed before the first checkpoint and the whole spool replays -- the at-most-twice
+        // assertion below allows exactly that), and stopping after a fixed count used to cut the
+        // drain short in that case.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
-            if run2_attempts.lock().unwrap().len() >= expected_run2_deliveries
-                || tokio::time::Instant::now() > deadline
-            {
+            let last_delivered =
+                run2_attempts.lock().unwrap().iter().any(|(marker, _)| *marker == TOTAL - 1);
+            if last_delivered || tokio::time::Instant::now() > deadline {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

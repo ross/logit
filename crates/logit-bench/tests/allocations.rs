@@ -981,6 +981,26 @@ fn disk_scratch_dir(label: &str) -> std::path::PathBuf {
     dir
 }
 
+/// The runtime every `disk_queue_*` measurement below runs on. `max_blocking_threads(1)` is
+/// load-bearing for determinism, not a performance choice: `DiskQueue`'s writes and reads go
+/// through `tokio::fs`, i.e. `spawn_blocking`, and the counters in `logit_bench::alloc` are
+/// thread-local -- the blocking worker's own allocations are invisible, which is fine, but
+/// *spawning a new worker thread* allocates on the calling (measuring) thread. tokio only reuses
+/// an existing worker when one is already marked idle at the moment `spawn_blocking` is called,
+/// and the worker that ran the warm-up's last operation has to re-take the pool lock to mark
+/// itself idle after handing back its result. If it is preempted in that window (as happened
+/// twice on CI, with ~1500 test processes starting at once), the measured `push` wins the race,
+/// finds no idle worker, spawns a fresh OS thread, and reports exactly `+4` allocations. Capping
+/// the pool at one thread means the warm-up's first blocking call is the only spawn that can ever
+/// happen: everything after it queues for that worker instead.
+fn disk_queue_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+}
+
 fn disk_queue_config(dir: std::path::PathBuf) -> logit_pipeline::DiskQueueConfig {
     logit_pipeline::DiskQueueConfig {
         dir,
@@ -999,7 +1019,7 @@ fn disk_queue_config(dir: std::path::PathBuf) -> logit_pipeline::DiskQueueConfig
 /// segment's `tokio::fs::File` open) doesn't fold into the measured push.
 #[test]
 fn disk_queue_push_one_batch() {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = disk_queue_runtime();
     let dir = disk_scratch_dir("push");
     let telemetry = Telemetry::default();
     let queue = logit_pipeline::DiskQueue::open(
@@ -1026,7 +1046,7 @@ fn disk_queue_push_one_batch() {
 /// delivery attempt, so a batch retried several times must not re-decode from disk each time.
 #[test]
 fn disk_queue_peek_cached_costs_nothing() {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = disk_queue_runtime();
     let dir = disk_scratch_dir("peek-cached");
     let telemetry = Telemetry::default();
     let queue = logit_pipeline::DiskQueue::open(
