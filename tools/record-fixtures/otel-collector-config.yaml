@@ -1,0 +1,39 @@
+# Collector config for script/record-fixtures's `otlp` producer.
+#
+# Receives real OTLP (gRPC and HTTP, protobuf) from a real SDK-backed sender (`telemetrygen`,
+# the OpenTelemetry project's own load-generation tool -- a real exporter, not a hand-built
+# payload) and re-exports each signal through the `file` exporter's default JSON marshaler.
+#
+# That JSON *is* the fixture -- not a raw byte capture like the syslog producers get from
+# raw_capture.py. This is a deliberate difference, not an inconsistency: pdata's JSON marshaler
+# (which the `file` exporter uses) is the normative implementation of OTLP/JSON -- there's no more
+# "real" OTLP/JSON to capture underneath it, and capturing it this way means the fixture is valid
+# regardless of whether the sender happened to use gRPC or HTTP, protobuf or JSON, on the wire to
+# the Collector. See docs/plans/recorded-interop-fixtures.md, "How captures are recorded".
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  file/traces:
+    path: /output/traces.json
+  file/logs:
+    path: /output/logs.json
+  file/metrics:
+    path: /output/metrics.json
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [file/traces]
+    logs:
+      receivers: [otlp]
+      exporters: [file/logs]
+    metrics:
+      receivers: [otlp]
+      exporters: [file/metrics]
