@@ -3,11 +3,12 @@
 //! `logit_pipeline::Transform`, letting the node runtime run it as an ordinary tokio task (no
 //! dedicated OS thread, unlike a Lua component -- `docs/design/pipeline-graph.md`'s "Node kinds"
 //! section). `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`,
-//! `scale`, `has_signal`, `keep_signals`, `drop_signals`, `logfmt`, `kv`, and `regex` are
-//! implemented (`rename`/`filter`/`sample`/`throttle`/`dedup` were retired rather than landing --
-//! `docs/adr/routing-by-condition-is-lua.md`).
+//! `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`,
+//! `logfmt`, `kv`, and `regex` are implemented (`rename`/`filter`/`sample`/`throttle`/`dedup` were
+//! retired rather than landing -- `docs/adr/routing-by-condition-is-lua.md`).
 
 mod aggregate;
+mod attributes;
 mod csv;
 mod json;
 mod keep;
@@ -22,6 +23,7 @@ mod trace_context;
 use logit_core::Value;
 
 pub use aggregate::Aggregator;
+pub use attributes::{DropAttributes, HasAttributes};
 pub use csv::CsvParser;
 pub use json::JsonParser;
 pub use keep::{Keep, Remove};
@@ -49,6 +51,184 @@ pub(crate) fn numeric(value: &Value) -> Option<f64> {
         _ => return None,
     };
     v.is_finite().then_some(v)
+}
+
+/// Whether an event's (or resource's) `Value` matches an operator-configured one. Coercing,
+/// modelled on [`numeric`] and `logit-script`'s `lua_value_matches`, deliberately *not* on
+/// `aggregate`'s `value_key_eq` -- that one is a *keying* equality (variant-exact, `f64` by bit
+/// pattern), correct for hash-map identity and wrong here: config `status: 200` must match a
+/// `Value::Str("200")` off a logfmt line just as it matches a `Value::I64(200)` off JSON, per
+/// ADR `kv-metrics-semantics`' identity commitment.
+///
+/// **Symmetric** in its arguments -- every arm below is -- so a caller can't get the order wrong.
+/// **Total**: never panics, never allocates, never fails; anything it can't compare is `false`.
+///
+/// Three rules worth stating plainly, because each is a deliberate asymmetry with a precedent
+/// elsewhere in this module rather than an oversight:
+/// - **String-to-string is never coerced numerically.** `Str("01")` and `Str("1")` do not match --
+///   id-shaped tags are routinely numeric-looking, and treating them as numbers would be a
+///   surprise. Coercion only happens *across* a numeric variant and a string.
+/// - **`Bool` never coerces to anything else, including a string.** A `logfmt` line's
+///   `sampled=true` is `Value::Str("true")` (logfmt always emits `Str`), so it will not match a
+///   configured `sampled: true` -- write `sampled: "true"` instead. Both models this function
+///   follows (`numeric`, `lua_value_matches`) refuse bool coercion, and there is no demand for it.
+/// - **A non-finite configured or actual value matches nothing**, inherited from `numeric`'s
+///   `is_finite` filter -- see `docs/adr/attribute-filtering-components.md`, rule 36's finiteness
+///   check exists precisely because of this.
+///
+/// One divergence from `lua_value_matches` worth flagging so nobody "fixes" it later:
+/// `Timestamp` never compares equal to a bare number here, even though the Lua bridge lets an
+/// integer match one -- filtering on an exact nanosecond value is not a tag-shaped use case, and
+/// `numeric` (which this delegates to for the general numeric case) already excludes `Timestamp`.
+pub(crate) fn value_matches(configured: &Value, actual: &Value) -> bool {
+    match (configured, actual) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
+        (Value::Str(a) | Value::Bytes(a), Value::Str(b) | Value::Bytes(b)) => a == b,
+        (Value::I64(a), Value::I64(b)) => a == b,
+        (Value::U64(a), Value::U64(b)) => a == b,
+        (Value::I64(a), Value::U64(b)) | (Value::U64(b), Value::I64(a)) => {
+            *a >= 0 && *a as u64 == *b
+        }
+        (Value::Bool(_), _) | (_, Value::Bool(_)) => false,
+        (Value::Timestamp(_), _) | (_, Value::Timestamp(_)) => false,
+        (Value::I64(_) | Value::U64(_) | Value::F64(_) | Value::Str(_), _)
+            if matches!(actual, Value::I64(_) | Value::U64(_) | Value::F64(_) | Value::Str(_)) =>
+        {
+            matches!((numeric(configured), numeric(actual)), (Some(a), Some(b)) if a == b)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod value_matches_tests {
+    use super::*;
+
+    #[test]
+    fn bool_matches_bool_by_equality() {
+        assert!(value_matches(&Value::Bool(true), &Value::Bool(true)));
+        assert!(!value_matches(&Value::Bool(true), &Value::Bool(false)));
+    }
+
+    #[test]
+    fn a_bool_never_matches_a_string() {
+        assert!(!value_matches(&Value::Bool(true), &Value::str("true")));
+        assert!(!value_matches(&Value::str("true"), &Value::Bool(true)));
+    }
+
+    #[test]
+    fn a_bool_never_matches_a_number() {
+        assert!(!value_matches(&Value::Bool(true), &Value::I64(1)));
+    }
+
+    #[test]
+    fn exact_integer_variants_match_by_equality() {
+        assert!(value_matches(&Value::I64(200), &Value::I64(200)));
+        assert!(value_matches(&Value::U64(200), &Value::U64(200)));
+        assert!(!value_matches(&Value::I64(200), &Value::I64(201)));
+    }
+
+    #[test]
+    fn i64_and_u64_compare_exactly_across_variants() {
+        assert!(value_matches(&Value::I64(200), &Value::U64(200)));
+        assert!(value_matches(&Value::U64(200), &Value::I64(200)));
+        assert!(
+            !value_matches(&Value::I64(-1), &Value::U64(u64::MAX)),
+            "a negative I64 never matches a U64"
+        );
+    }
+
+    #[test]
+    fn numeric_variants_coerce_across_i64_u64_f64_and_str() {
+        let hundred = [Value::I64(200), Value::U64(200), Value::F64(200.0), Value::str("200")];
+        for configured in &hundred {
+            for actual in &hundred {
+                assert!(
+                    value_matches(configured, actual),
+                    "{configured:?} should match {actual:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_numeric_looking_strings_are_not_coerced() {
+        assert!(
+            !value_matches(&Value::str("01"), &Value::str("1")),
+            "id-shaped strings must not be numerically coerced against each other"
+        );
+        assert!(
+            value_matches(&Value::str("01"), &Value::str("01")),
+            "exact byte match still works"
+        );
+    }
+
+    #[test]
+    fn bytes_and_str_compare_alike() {
+        assert!(value_matches(
+            &Value::str("web-1"),
+            &Value::Bytes(bytes::Bytes::from_static(b"web-1"))
+        ));
+        assert!(value_matches(
+            &Value::Bytes(bytes::Bytes::from_static(b"web-1")),
+            &Value::str("web-1")
+        ));
+    }
+
+    #[test]
+    fn timestamp_matches_timestamp_but_never_a_bare_number() {
+        assert!(value_matches(&Value::Timestamp(5), &Value::Timestamp(5)));
+        assert!(!value_matches(&Value::Timestamp(5), &Value::I64(5)));
+        assert!(!value_matches(&Value::I64(5), &Value::Timestamp(5)));
+    }
+
+    #[test]
+    fn a_non_finite_value_matches_nothing() {
+        assert!(!value_matches(&Value::F64(f64::NAN), &Value::F64(f64::NAN)));
+        assert!(!value_matches(&Value::F64(f64::INFINITY), &Value::F64(f64::INFINITY)));
+        assert!(!value_matches(&Value::F64(f64::INFINITY), &Value::I64(1)));
+    }
+
+    #[test]
+    fn null_matches_only_null() {
+        assert!(value_matches(&Value::Null, &Value::Null));
+        assert!(!value_matches(&Value::Null, &Value::str("")));
+    }
+
+    #[test]
+    fn array_and_map_never_match_anything() {
+        let arr = Value::Array(vec![Value::I64(1)]);
+        assert!(!value_matches(&arr, &arr));
+        let map = Value::Map(Box::new(logit_core::AttrMap::new()));
+        assert!(!value_matches(&map, &map));
+    }
+
+    #[test]
+    fn value_matches_is_symmetric() {
+        let values = [
+            Value::Null,
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::I64(200),
+            Value::U64(200),
+            Value::F64(200.0),
+            Value::str("200"),
+            Value::Bytes(bytes::Bytes::from_static(b"200")),
+            Value::Timestamp(200),
+            Value::Array(vec![Value::I64(1)]),
+        ];
+        for a in &values {
+            for b in &values {
+                assert_eq!(
+                    value_matches(a, b),
+                    value_matches(b, a),
+                    "value_matches must be symmetric for {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
 }
 
 /// Integration coverage across module boundaries -- each transform above is unit-tested in its
@@ -415,5 +595,40 @@ mod chained_pipeline_test {
                 other => panic!("unexpected series name: {other}"),
             }
         }
+    }
+
+    /// The headline claim `docs/adr/attribute-filtering-components.md` exists to make: a `set`
+    /// stage stamping a distinguishing tag, and a `has_attributes`/`drop_attributes` stage
+    /// downstream matching on exactly that tag, are inverses -- `has_attributes` forwards what
+    /// `set` stamped and `drop_attributes` forwards everything else, on the identical config.
+    #[test]
+    fn set_then_has_attributes_round_trips_the_stamped_tag() {
+        let resource = Arc::new(Resource::default());
+        let event = Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str("line"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+            },
+        );
+
+        let mut tag_web = Set::new(vec![], vec![("stream".to_string(), Value::str("web"))]);
+        let tagged = tag_web.process(&resource, event).expect("set always forwards");
+
+        let config = vec![("stream".to_string(), Value::str("web"))];
+        let mut has_web = HasAttributes::new(vec![], config.clone());
+        let mut drop_web = DropAttributes::new(vec![], config);
+
+        assert!(
+            has_web.process(&resource, tagged.clone()).is_some(),
+            "has_attributes must forward exactly what set stamped"
+        );
+        assert!(
+            drop_web.process(&resource, tagged).is_none(),
+            "drop_attributes must drop exactly what set stamped"
+        );
     }
 }

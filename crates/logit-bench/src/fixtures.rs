@@ -308,6 +308,31 @@ pub fn set_resource() -> Set {
     Set::new(vec![("service.name".to_string(), Value::str("nginx"))], vec![])
 }
 
+/// A `has_attributes` matching [`nginx_event`]'s `status` attribute -- configured as `I64(200)`
+/// against `NGINX_SYSLOG_LINE`'s JSON-sourced `status` (a `U64`, per `serde_json`'s handling of an
+/// unsigned literal), so this fixture deliberately exercises `value_matches`' cross-variant
+/// coercion rather than an exact-type match (`crates/logit-bench/tests/allocations.rs`'s
+/// `has_attributes_one_event`).
+pub fn has_attributes() -> logit_transforms::HasAttributes {
+    logit_transforms::HasAttributes::new(vec![], vec![("status".to_string(), Value::I64(200))])
+}
+
+/// [`has_attributes`]'s exact complement, same config
+/// (`crates/logit-bench/tests/allocations.rs`'s `drop_attributes_one_event`).
+pub fn drop_attributes() -> logit_transforms::DropAttributes {
+    logit_transforms::DropAttributes::new(vec![], vec![("status".to_string(), Value::I64(200))])
+}
+
+/// A `has_attributes` matching on [`resource`] instead of an event's own attributes -- for
+/// measuring the resource-match cache's hit and miss costs
+/// (`crates/logit-bench/tests/allocations.rs`'s `has_attributes_resource_match_cache_hit`/`_miss`).
+pub fn has_attributes_resource() -> logit_transforms::HasAttributes {
+    logit_transforms::HasAttributes::new(
+        vec![("service.name".to_string(), Value::str("nginx"))],
+        vec![],
+    )
+}
+
 /// A `trace_context` configured to lift `trace_id` only (no `span_id`/`flags`, `keep_source:
 /// false`) -- the common case, for `crates/logit-bench/tests/allocations.rs`'s
 /// `trace_context_lifts_a_valid_trace_id`.

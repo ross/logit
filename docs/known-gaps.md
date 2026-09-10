@@ -8,8 +8,7 @@ already built that have a known, accepted rough edge.
 
 - **Predicate-shaped work (routing by condition, sampling, throttling, dedup) costs a Lua VM, an OS
   thread, and roughly 9× the per-event allocations of a native transform, because `logit` has no
-  native predicate language and there's currently no native component for any of those verbs at
-  all** — a deliberate choice, not an oversight;
+  native predicate language** — a deliberate choice, not an oversight;
   [ADR `routing-by-condition-is-lua`](adr/routing-by-condition-is-lua.md) has the full account and
   the measured numbers. Concretely: **9** allocations / **1.07 µs** per event through a `lua`
   component versus **1** allocation / **360 ns** through a native `Transform`
@@ -21,7 +20,13 @@ already built that have a known, accepted rough edge.
   that. The ADR names the explicit revisit trigger: sustained, *measured* central-collector
   throughput pressure against a real config, not a hunch — and records a substantially-designed
   native predicate grammar (total-by-construction, so it can't fail at runtime) as where to resume
-  if that trigger fires.
+  if that trigger fires. **Narrowed on 2026-09-10:** that trigger fired for the equality-only
+  subcase of routing by condition (splitting a `logit_in` fan-out back apart by an attribute an
+  upstream `set` stamped) — `has_attributes`/`drop_attributes`
+  ([ADR `attribute-filtering-components`](adr/attribute-filtering-components.md)) answer exactly
+  that shape natively. Sampling, throttling, dedup, and anything needing an actual operator
+  (`>=`, `contains`, cross-attribute comparison) remain Lua-only; the gap above still applies to
+  them unchanged.
 - **`HyperLogLog` is a stub** (`crates/logit-core/src/metric.rs`) — no methods, just a placeholder
   pending a real crate (`cardinality-estimator` is the candidate). Consequences: statsd's `s` (set)
   metric type is a clear decode error rather than silently losing data

@@ -1,0 +1,50 @@
+# One connection, N streams -- the edge half. See examples/fan-out-central.yaml for the far side,
+# and examples/forwarder-edge.yaml for the `logit_out` field reference this file doesn't repeat.
+#
+# The problem: an edge process with several logically distinct streams (here, a host's own statsd
+# metrics and an application's syslog lines) forwarding to one central process. One `logit_out` per
+# stream would mean one TCP connection per stream; the graph's N->1 fan-in
+# (docs/design/pipeline-graph.md's "Fan-in is free") lets a single `logit_out` carry all of them
+# instead. Each stream just needs a tag that survives the hop -- `set` stamps one
+# (docs/adr/operator-declared-resource-attributes.md), and the native wire format carries both
+# event attributes and the batch's resource end to end, one frame per batch.
+#
+# Run alongside examples/fan-out-central.yaml (start the central process first, or logit_out will
+# just keep retrying the connection -- lazy connect, not a config error either way):
+#
+#   logit run examples/fan-out-central.yaml &
+#   logit run examples/fan-out-edge.yaml
+#
+# Topology (this file):
+#
+#   statsd (UDP) --> host_in (statsd_in) --> tag_host (set: stream=host) --\
+#                                                                          >--> central_out (logit_out)
+#   syslog (UDP) --> app_in (syslog_in) ----> tag_app  (set: stream=app) --/
+components:
+  host_in:
+    type: statsd_in
+    bind: 0.0.0.0:8125
+
+  tag_host:
+    type: set
+    sources: [host_in]
+    attributes:
+      stream: host
+    # resource:                    # the other half `has_attributes` can match on, in
+    #   service.name: host-agent   #   examples/fan-out-central.yaml -- stamped once per batch
+    #                               #   rather than once per event, unlike `attributes:` above
+
+  app_in:
+    type: syslog_in
+    bind: 0.0.0.0:5514
+
+  tag_app:
+    type: set
+    sources: [app_in]
+    attributes:
+      stream: app
+
+  central_out:
+    type: logit_out
+    sources: [tag_host, tag_app]
+    endpoint: central:5150

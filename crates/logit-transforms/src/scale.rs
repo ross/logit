@@ -7,7 +7,7 @@
 //! keep the `Transform` trait's defaults.
 
 use crate::numeric;
-use logit_core::interner::{intern, resolve};
+use logit_core::interner::intern;
 use logit_core::{Event, Resource, Symbol, Telemetry, Value};
 use logit_pipeline::Transform;
 use std::sync::Arc;
@@ -62,7 +62,7 @@ impl Transform for Scale {
         for f in &self.fields {
             let scaled = event
                 .attributes
-                .get(resolve(f.field))
+                .get_sym(f.field)
                 .and_then(numeric)
                 .map(|v| v * f.factor)
                 .filter(|v| v.is_finite());
@@ -80,6 +80,7 @@ impl Transform for Scale {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logit_core::interner::resolve;
     use logit_core::{AttrMap, BodyFormat, LogRecord, Registry};
 
     fn event_with_attrs(attrs: &[(&str, Value)]) -> Event {
