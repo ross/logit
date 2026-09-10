@@ -12,10 +12,13 @@
 //! (`std::fs::File::try_lock`) for this queue's lifetime -- released automatically on process
 //! exit, including `SIGKILL`, so a restart of the same component reopens its own spool without
 //! any stale-lock cleanup. One **record** per batch: 24 raw bytes (16-byte `trace_id` + 8-byte
-//! `span_id`, [`TraceContext`] inline, no framing of its own) followed by one
-//! `logit_proto::frame` native frame. `frame::resync` still works to recover past a corrupt
-//! record because it scans for `MAGIC`, which always immediately follows a record's 24 context
-//! bytes.
+//! `span_id`, [`TraceContext`] inline, no framing of its own -- unversioned and never widened, see
+//! `CONTEXT_LEN`'s own doc comment) followed by one `logit_proto::frame` native frame, whose own
+//! codec byte (`native::CODEC_NATIVE_V1` or `..._V2`) tells [`parse_record`] whether a
+//! [`logit_core::Provenance`] trailer follows the batch inside that frame -- see
+//! `docs/adr/batch-provenance-on-delivered.md`. `frame::resync` still works to recover past a
+//! corrupt record because it scans for `MAGIC`, which always immediately follows a record's 24
+//! context bytes.
 //!
 //! **The write cursor is never persisted.** Only the read cursor needs to survive a restart --
 //! the write side always resumes at the end of the highest-numbered segment, re-derived by
@@ -41,14 +44,22 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::fanout::TraceContext;
+use crate::fanout::{BatchContext, TraceContext};
 use crate::queue::{OverflowPolicy, SINK_QUEUE_METRICS};
-use logit_core::{Diagnostics, EventBatch, Telemetry};
+use logit_core::{Diagnostics, EventBatch, Provenance, Telemetry};
 use logit_proto::frame::{self, Compression, MAX_SANE_UNCOMPRESSED_LEN};
 use logit_proto::native;
 use logit_proto::CodecError;
 
-/// `[trace_id: 16][span_id: 8]`, ahead of the frame -- see the module doc.
+/// `[trace_id: 16][span_id: 8]`, ahead of the frame -- see the module doc. Unversioned and never
+/// widened: a record carries no version of its own, so a wider fixed prefix would silently
+/// misparse every already-spooled record on upgrade. `Provenance` (added alongside
+/// `TraceContext` on every `BatchContext` this queue now stores) rides inside the frame payload
+/// instead, as `native::CODEC_NATIVE_V2` -- self-describing via the codec byte `parse_record`
+/// already reads, so an old (`CODEC_NATIVE_V1`) record on disk keeps replaying with empty
+/// provenance forever, and a downgraded binary encountering a `CODEC_NATIVE_V2` record resyncs
+/// past it exactly as it would past any other codec it doesn't recognize
+/// (`docs/adr/batch-provenance-on-delivered.md`).
 const CONTEXT_LEN: usize = 24;
 
 const LOCK_FILE_NAME: &str = "lock";
@@ -117,26 +128,36 @@ fn list_segments(dir: &Path) -> io::Result<Vec<u64>> {
     Ok(seqs)
 }
 
-/// Parses one record -- `[24-byte context][native frame]` -- off the front of `buf`. `Truncated`
-/// means `buf` simply doesn't hold a whole record yet (ran out of bytes, benign); every other
-/// error means the bytes present are provably wrong and the caller should resync
+/// Parses one record -- `[24-byte trace context][native frame]` -- off the front of `buf`.
+/// `Truncated` means `buf` simply doesn't hold a whole record yet (ran out of bytes, benign);
+/// every other error means the bytes present are provably wrong and the caller should resync
 /// (`docs/design/wire-protocol.md`).
-fn parse_record(buf: &[u8]) -> Result<(TraceContext, Arc<EventBatch>, usize), CodecError> {
+///
+/// Dispatches on the frame's own codec byte: `CODEC_NATIVE_V1` (every record written before
+/// provenance existed, and still what a v1-only writer produces) decodes via `decode_batch` with
+/// `Provenance::default()`; `CODEC_NATIVE_V2` decodes via `decode_batch_v2`. Any other codec byte
+/// is rejected the same as before -- this queue only ever writes one of these two.
+fn parse_record(buf: &[u8]) -> Result<(BatchContext, Arc<EventBatch>, usize), CodecError> {
     if buf.len() < CONTEXT_LEN {
         return Err(CodecError::Truncated { needed: CONTEXT_LEN - buf.len() });
     }
-    let ctx = decode_context(&buf[..CONTEXT_LEN]);
+    let trace = decode_context(&buf[..CONTEXT_LEN]);
     let mut rest = Bytes::copy_from_slice(&buf[CONTEXT_LEN..]);
     let before = rest.len();
     let (codec, mut payload) = frame::read_frame(&mut rest)?;
-    if codec != native::CODEC_NATIVE_V1 {
-        return Err(CodecError::Malformed(format!(
-            "disk record declares codec {codec}, expected native v1 ({})",
-            native::CODEC_NATIVE_V1
-        )));
-    }
+    let (batch, provenance) = match codec {
+        native::CODEC_NATIVE_V1 => (native::decode_batch(&mut payload)?, Provenance::default()),
+        native::CODEC_NATIVE_V2 => native::decode_batch_v2(&mut payload)?,
+        other => {
+            return Err(CodecError::Malformed(format!(
+                "disk record declares codec {other}, expected native v1 ({}) or v2 ({})",
+                native::CODEC_NATIVE_V1,
+                native::CODEC_NATIVE_V2
+            )))
+        }
+    };
     let consumed_frame = before - rest.len();
-    let batch = native::decode_batch(&mut payload)?;
+    let ctx = BatchContext { trace, provenance };
     Ok((ctx, Arc::new(batch), CONTEXT_LEN + consumed_frame))
 }
 
@@ -162,7 +183,7 @@ struct WalkOutcome {
 fn walk_segment(
     bytes: &[u8],
     start_offset: u64,
-    mut on_record: impl FnMut(u64, TraceContext, Arc<EventBatch>, u64),
+    mut on_record: impl FnMut(u64, BatchContext, Arc<EventBatch>, u64),
 ) -> WalkOutcome {
     let mut pos = start_offset as usize;
     let mut valid_count = 0u64;
@@ -298,7 +319,7 @@ struct Segment {
 
 struct HeadCache {
     batch: Arc<EventBatch>,
-    ctx: TraceContext,
+    ctx: BatchContext,
     record_len: u64,
 }
 
@@ -573,10 +594,10 @@ impl DiskQueue {
     /// (see [`State::write_in_flight`]). This mirrors
     /// `crates/logit-outputs/src/syslog.rs::send_tcp`'s take-before-write shape, adapted for a
     /// single always-appending file rather than a reconnectable stream.
-    pub async fn push(&self, item: (Arc<EventBatch>, TraceContext)) {
+    pub async fn push(&self, item: (Arc<EventBatch>, BatchContext)) {
         let (batch, ctx) = item;
 
-        let payload = native::encode_batch(&batch);
+        let payload = native::encode_batch_v2(&batch, ctx.provenance);
         if payload.len() > MAX_SANE_UNCOMPRESSED_LEN as usize {
             self.count_dropped("frame_too_large", batch.events.len() as u64);
             return;
@@ -584,10 +605,10 @@ impl DiskQueue {
         // `write_frame` only ever fails for `Compression::Zstd`, which nothing on the path from
         // config to here can produce: `logit_config::Compression` (the only place an operator's
         // `disk.compression` is read from) has no `Zstd` variant at all.
-        let framed = frame::write_frame(native::CODEC_NATIVE_V1, self.compression, &payload)
+        let framed = frame::write_frame(native::CODEC_NATIVE_V2, self.compression, &payload)
             .expect("logit_config::Compression excludes Zstd; write_frame only fails for Zstd");
         let mut record = Vec::with_capacity(CONTEXT_LEN + framed.len());
-        record.extend_from_slice(&encode_context(ctx));
+        record.extend_from_slice(&encode_context(ctx.trace));
         record.extend_from_slice(&framed);
         let record_len = record.len() as u64;
         let events = batch.events.len() as u64;
@@ -885,7 +906,7 @@ impl DiskQueue {
         &self,
         seq: u64,
         offset: u64,
-    ) -> Option<(TraceContext, Arc<EventBatch>, u64)> {
+    ) -> Option<(BatchContext, Arc<EventBatch>, u64)> {
         let mut chunk_len = READ_CHUNK_INITIAL;
         loop {
             let buf = match self.read_at(seq, offset, chunk_len).await {
@@ -1061,7 +1082,7 @@ impl DiskQueue {
     /// The head, without removing it -- cached until [`DiskQueue::commit`] so a retry
     /// (`write_loop` calls this once per delivery attempt) costs nothing after the first. `None`
     /// once closed and empty.
-    pub async fn peek(&self) -> Option<(Arc<EventBatch>, TraceContext)> {
+    pub async fn peek(&self) -> Option<(Arc<EventBatch>, BatchContext)> {
         loop {
             // F1: roll past any segment the reader caught up to *while it was still active* and
             // which has since rotated away -- without this, a reader that reached exactly
@@ -1121,7 +1142,7 @@ impl DiskQueue {
     /// Advances the read cursor past the currently-cached head, returning it. A no-op (`None`)
     /// with nothing cached -- mirrors `SinkQueue::commit`'s contract exactly, including staying
     /// synchronous (see the module doc).
-    pub fn commit(&self) -> Option<(Arc<EventBatch>, TraceContext)> {
+    pub fn commit(&self) -> Option<(Arc<EventBatch>, BatchContext)> {
         let (item, record_len) = {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let cache = state.head_cache.take()?;
@@ -1177,19 +1198,23 @@ pub(crate) mod test_support {
         dir
     }
 
-    /// The exact on-disk byte length `DiskQueue::push` would write for `batch` (under
-    /// `Compression::None`; the 24-byte `TraceContext` prefix `push` also writes is fixed-size
-    /// regardless of its contents, so no context is needed here) -- the same computation as this
-    /// module's own inline `tests::raw_record`, exposed here so a test in another module
-    /// (`crate::runtime`'s F3 shutdown-sweep test, which needs to size a spool tightly around
-    /// exactly one record) doesn't have to duplicate it or reach into a private `tests` module.
-    pub(crate) fn encoded_record_len(batch: &logit_core::EventBatch) -> u64 {
+    /// The exact on-disk byte length `DiskQueue::push` would write for `batch` under
+    /// `Compression::None` with `provenance` (the 24-byte `TraceContext` prefix `push` also
+    /// writes is fixed-size regardless of its contents, so only the trace half is irrelevant
+    /// here) -- the same computation `DiskQueue::push` itself does, exposed here so a test in
+    /// another module (`crate::runtime`'s F3 shutdown-sweep test, which needs to size a spool
+    /// tightly around exactly one record) doesn't have to duplicate it or reach into a private
+    /// `tests` module.
+    pub(crate) fn encoded_record_len(
+        batch: &logit_core::EventBatch,
+        provenance: logit_core::Provenance,
+    ) -> u64 {
         use super::CONTEXT_LEN;
         use logit_proto::{frame, native};
 
-        let payload = native::encode_batch(batch);
+        let payload = native::encode_batch_v2(batch, provenance);
         let framed =
-            frame::write_frame(native::CODEC_NATIVE_V1, frame::Compression::None, &payload)
+            frame::write_frame(native::CODEC_NATIVE_V2, frame::Compression::None, &payload)
                 .expect("None compression never fails");
         (CONTEXT_LEN + framed.len()) as u64
     }
@@ -1201,8 +1226,8 @@ mod tests {
     use super::*;
     use logit_core::{AttrMap, Event, Registry, Resource, Value};
 
-    fn ctx() -> TraceContext {
-        TraceContext::new_root()
+    fn ctx() -> BatchContext {
+        BatchContext { trace: TraceContext::new_root(), provenance: Provenance::default() }
     }
 
     fn batch(marker: &str) -> Arc<EventBatch> {
@@ -1261,12 +1286,26 @@ mod tests {
 
     /// Builds the exact on-disk bytes `DiskQueue::push` would write for one record -- reused by
     /// tests that hand-construct or hand-corrupt segment files directly.
-    fn raw_record(batch: &EventBatch, ctx: TraceContext) -> Vec<u8> {
+    fn raw_record(batch: &EventBatch, ctx: BatchContext) -> Vec<u8> {
+        let payload = native::encode_batch_v2(batch, ctx.provenance);
+        let framed = frame::write_frame(native::CODEC_NATIVE_V2, Compression::None, &payload)
+            .expect("None compression never fails");
+        let mut record = Vec::with_capacity(CONTEXT_LEN + framed.len());
+        record.extend_from_slice(&encode_context(ctx.trace));
+        record.extend_from_slice(&framed);
+        record
+    }
+
+    /// The on-disk shape a record written *before* provenance existed still has: `CODEC_NATIVE_V1`
+    /// instead of `CODEC_NATIVE_V2`, no trailer at all. Used only by
+    /// `a_v1_codec_record_spooled_before_this_change_still_replays_with_empty_provenance` below --
+    /// every other test uses [`raw_record`], matching what `DiskQueue::push` writes today.
+    fn raw_record_v1(batch: &EventBatch, trace: TraceContext) -> Vec<u8> {
         let payload = native::encode_batch(batch);
         let framed = frame::write_frame(native::CODEC_NATIVE_V1, Compression::None, &payload)
             .expect("None compression never fails");
         let mut record = Vec::with_capacity(CONTEXT_LEN + framed.len());
-        record.extend_from_slice(&encode_context(ctx));
+        record.extend_from_slice(&encode_context(trace));
         record.extend_from_slice(&framed);
         record
     }
@@ -1294,6 +1333,49 @@ mod tests {
         }
         q.close();
         assert!(q.peek().await.is_none(), "closed and empty should return None");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `push`'s provenance survives a spool round trip, not just its trace context -- the whole
+    /// point of `parse_record` dispatching on the frame's own codec byte to `decode_batch_v2`
+    /// rather than discarding what it decodes.
+    #[tokio::test]
+    async fn provenance_survives_a_spool_round_trip() {
+        let dir = scratch_dir("provenance-round-trip");
+        let q = open(dir.clone());
+        let sent = BatchContext {
+            trace: TraceContext::new_root(),
+            provenance: Provenance {
+                origin: Some(logit_core::interner::intern("disk_queue_test_nginx_in")),
+                previous: Some(logit_core::interner::intern("disk_queue_test_enrich")),
+            },
+        };
+
+        q.push((batch("a"), sent)).await;
+
+        let (_peeked, peeked_ctx) = q.peek().await.expect("should peek the pushed batch");
+        assert_eq!(peeked_ctx, sent, "trace and provenance should both come back unchanged");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A record spooled by a build of `logit` before provenance existed (`CODEC_NATIVE_V1`, no
+    /// trailer) must keep replaying correctly after this change -- `CONTEXT_LEN`/`encode_context`/
+    /// `decode_context` are deliberately never widened (this module's own doc comment), and
+    /// `parse_record` dispatches on the codec byte specifically so an old record on disk isn't
+    /// silently corrupted or resynced-past by a newer binary.
+    #[tokio::test]
+    async fn a_v1_codec_record_spooled_before_this_change_still_replays_with_empty_provenance() {
+        let dir = scratch_dir("v1-record-compat");
+        std::fs::create_dir_all(&dir).unwrap();
+        let trace = TraceContext::new_root();
+        let record = raw_record_v1(&batch("pre-provenance"), trace);
+        std::fs::write(segment_path(&dir, 0), &record).unwrap();
+
+        let q = open(dir.clone());
+        let (peeked, peeked_ctx) = q.peek().await.expect("should find the pre-existing record");
+        assert_eq!(marker_of(&peeked), "pre-provenance");
+        assert_eq!(peeked_ctx.trace, trace);
+        assert_eq!(peeked_ctx.provenance, Provenance::default());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1410,7 +1492,7 @@ mod tests {
         // A trace_id whose bytes happen to contain `MAGIC` -- `frame::resync`'s own doc warns a
         // reader must expect and tolerate exactly this spurious match.
         let mut spurious_ctx = ctx();
-        spurious_ctx.trace_id[4..8].copy_from_slice(&frame::MAGIC);
+        spurious_ctx.trace.trace_id[4..8].copy_from_slice(&frame::MAGIC);
         let record = raw_record(&batch("real"), spurious_ctx);
         std::fs::write(&path, &record).unwrap();
 

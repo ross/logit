@@ -463,6 +463,40 @@ A fan-out (one batch, several downstream branches) gives every branch the *ident
 context — one emission forking into several consumers is still one hop, not several, and (per ADR
 0022) records exactly one span for it, not one per branch.
 
+### Provenance propagation
+
+Alongside `TraceContext`, every `Delivered`'s second element (`BatchContext`) also carries a
+`Provenance { origin: Option<Symbol>, previous: Option<Symbol> }` — which component created a
+batch, and which component the current node received it from — decided in
+[ADR `batch-provenance-on-delivered`](../adr/batch-provenance-on-delivered.md). Readable by every
+component (a native `Transform::observe_provenance`, an `Output::observe_batch`, a Lua script's
+`provenance` global) and writable by none: a component never constructs a `Delivered`, so it has
+no way to forge or drop what it carries.
+
+**One stamping rule, applied uniformly by `Fanout` (the sole writer), covers every node kind with
+no special-casing** — a deliberate contrast with the trace-context table above, which genuinely
+does need one row per node kind:
+
+```
+origin   = origin.or(Some(self.component))   // set once, on this Fanout's first send
+previous = Some(self.component)              // rewritten on every send
+```
+
+- A listener's first send has empty incoming provenance, so it sets *both* fields — the listener
+  is its own origin and previous. `internal` needs no special case: it's a listener by role.
+- Every later hop finds `origin` already set and only rewrites `previous`.
+- A flush emission (`Transform::flush`/Lua's `flush()`) mints a fresh `BatchContext` with empty
+  provenance, the same way it mints a fresh `TraceContext` root — so the flushing component
+  becomes *both* `origin` and `previous`, the honest statement for a batch built from accumulated
+  state rather than a re-emission of anything that passed through unchanged.
+- A real fan-out gives every branch the identical provenance, same as it does for trace context.
+
+`logit_in`'s relay (`Fanout::send_relayed`) uses a different rule, `stamp_relayed`: it back-fills
+(`or`, not overwrite) only whatever the wire didn't carry, so a v2 `logit_out` peer's own
+`origin`/`previous` survive the hop completely untouched — the property the `logit_out -> logit_in`
+special case exists for, letting a split-collection deployment read as one graph. See the ADR for
+the wire-format decision (`CODEC_NATIVE_V2`) this relies on.
+
 ## Backpressure: diamonds are the normal shape now
 
 With a chain of ordinary transform components as the only branching mechanism (ADR

@@ -5,6 +5,7 @@
 
 pub mod diag;
 pub mod interner;
+pub mod provenance;
 pub mod telemetry;
 pub mod time;
 pub mod value;
@@ -21,6 +22,7 @@ pub use diag::Diagnostics;
 pub use event::{Event, EventBatch, MetricList};
 pub use interner::Symbol;
 pub use metric::{DdSketch, HyperLogLog, MetricKind, MetricRecord};
+pub use provenance::Provenance;
 pub use resource::Resource;
 pub use span::{SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus};
 pub use telemetry::{

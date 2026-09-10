@@ -48,7 +48,7 @@
 
 use crate::Input;
 use bytes::{Bytes, BytesMut};
-use logit_core::{Diagnostics, Telemetry};
+use logit_core::{Diagnostics, Provenance, Telemetry};
 use logit_pipeline::Fanout;
 use logit_proto::frame::{self, Compression, FrameHeader};
 use logit_proto::native::{self, control};
@@ -306,6 +306,11 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
 /// What the handshake negotiated for one connection.
 struct Negotiated {
     compression: Compression,
+    /// `CODEC_NATIVE_V2` if the client offered it (so provenance crosses the wire), otherwise
+    /// `CODEC_NATIVE_V1`. `handshake` picks the best codec this listener and the client both
+    /// speak; every data frame on this connection must be framed under exactly this one
+    /// (`serve_connection` checks it per frame).
+    codec: u8,
 }
 
 fn compression_tag(compression: Compression) -> &'static str {
@@ -313,6 +318,15 @@ fn compression_tag(compression: Compression) -> &'static str {
         Compression::None => "none",
         Compression::Lz4 => "lz4",
         Compression::Zstd => "zstd",
+    }
+}
+
+/// Renders a connection's negotiated codec byte for the `logit.proto.frames` metric's `codec`
+/// tag -- mirrors `logit_outputs::logit`'s own `codec_tag`.
+fn codec_tag(codec: u8) -> &'static str {
+    match codec {
+        native::CODEC_NATIVE_V2 => "native_v2",
+        _ => "native_v1",
     }
 }
 
@@ -405,20 +419,36 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
             // message a well-behaved client sends after `Hello` is none at all; close.
             anyhow::bail!("received an unexpected control frame after the handshake");
         }
-        if header.codec != native::CODEC_NATIVE_V1 {
+        if header.codec != negotiated.codec {
             telemetry.count("logit.proto.errors", 1.0, &[("reason", "codec")]);
-            anyhow::bail!("frame codec byte {}, expected native v1", header.codec);
+            anyhow::bail!(
+                "frame codec byte {}, expected the negotiated codec ({})",
+                header.codec,
+                negotiated.codec
+            );
         }
 
-        let batch = native::decode_batch(&mut payload).map_err(|err| {
-            telemetry.count("logit.proto.errors", 1.0, &[("reason", "magic")]);
-            anyhow::Error::new(err).context("decoding a native batch")
-        })?;
+        let (batch, provenance) = if negotiated.codec == native::CODEC_NATIVE_V2 {
+            native::decode_batch_v2(&mut payload).map_err(|err| {
+                telemetry.count("logit.proto.errors", 1.0, &[("reason", "magic")]);
+                anyhow::Error::new(err).context("decoding a native v2 batch")
+            })?
+        } else {
+            let batch = native::decode_batch(&mut payload).map_err(|err| {
+                telemetry.count("logit.proto.errors", 1.0, &[("reason", "magic")]);
+                anyhow::Error::new(err).context("decoding a native batch")
+            })?;
+            (batch, Provenance::default())
+        };
 
         telemetry.count(
             "logit.proto.frames",
             1.0,
-            &[("direction", "in"), ("codec", "native_v1"), ("compression", compression)],
+            &[
+                ("direction", "in"),
+                ("codec", codec_tag(negotiated.codec)),
+                ("compression", compression),
+            ],
         );
         telemetry.count(
             "logit.proto.frame.bytes",
@@ -427,9 +457,12 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         );
 
         // The ack point: written only after the batch is in every downstream inbox
-        // (`Fanout::send` returns once every consumer has accepted it) -- see this module's own
-        // doc comment.
-        sink.send(batch).await;
+        // (`Fanout::send`/`send_relayed` return once every consumer has accepted it) -- see this
+        // module's own doc comment. `send_relayed` (not `send`) backfills only whatever provenance
+        // the wire didn't carry -- a v1 peer, or a v2 peer that genuinely had none -- and passes a
+        // v2 peer's own `origin`/`previous` through untouched, the property `logit_out ->
+        // logit_in` exists for (`docs/adr/batch-provenance-on-delivered.md`).
+        sink.send_relayed(batch, provenance).await;
 
         seq += 1;
         write_control(&mut stream, &control::Ack { seq }).await?;
@@ -483,14 +516,23 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
         );
     }
 
-    if !hello.codecs.contains(&native::CODEC_NATIVE_V1) {
+    // Prefer v2 (carries provenance) whenever the client offers it; fall back to v1 otherwise.
+    // This is what lets an unmodified old `logit_out` (offering only `[1]`) keep talking to this
+    // listener unchanged, and a new `logit_out` (offering `[2, 1]`) get provenance without either
+    // side needing to know about the other's version ahead of time
+    // (`docs/adr/batch-provenance-on-delivered.md`).
+    let codec = if hello.codecs.contains(&native::CODEC_NATIVE_V2) {
+        native::CODEC_NATIVE_V2
+    } else if hello.codecs.contains(&native::CODEC_NATIVE_V1) {
+        native::CODEC_NATIVE_V1
+    } else {
         let reject = control::Reject {
             code: control::REJECT_NO_COMMON_CODEC,
-            message: "this listener only speaks native v1".to_string(),
+            message: "this listener speaks native v1 or v2".to_string(),
         };
         let _ = write_control(stream, &reject).await;
         anyhow::bail!("client offered no codec this listener speaks: {:?}", hello.codecs);
-    }
+    };
 
     // Compression always has a safe fallback (`None`), so there is no reject path for it --
     // unlike codec, where no shared choice means the connection genuinely cannot proceed.
@@ -502,13 +544,13 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
 
     let ack = control::HelloAck {
         version: control::PROTOCOL_VERSION,
-        codec: native::CODEC_NATIVE_V1,
+        codec,
         compression: compression as u8,
         max_frame_bytes,
         window: 1,
     };
     write_control(stream, &ack).await?;
-    Ok(Negotiated { compression })
+    Ok(Negotiated { compression, codec })
 }
 
 /// Reads exactly [`frame::HEADER_LEN`] bytes off `stream`, distinguishing "the peer closed
@@ -671,6 +713,26 @@ mod tests {
         (Fanout::new(vec![tx]), rx)
     }
 
+    /// Like [`fanout_into_channel`], but with a component id attached -- needed for any test that
+    /// checks what `send_relayed` backfills into `origin`/`previous`
+    /// (`docs/adr/batch-provenance-on-delivered.md`).
+    fn fanout_into_channel_with_component(
+        component: &str,
+        capacity: usize,
+    ) -> (Fanout, mpsc::Receiver<logit_pipeline::Delivered>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Fanout::new(vec![tx]).with_component(component), rx)
+    }
+
+    async fn recv_delivered(
+        rx: &mut mpsc::Receiver<logit_pipeline::Delivered>,
+    ) -> logit_pipeline::Delivered {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("should receive within 5s")
+            .expect("channel should still be open")
+    }
+
     async fn recv_batch(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> EventBatch {
         let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -743,6 +805,19 @@ mod tests {
         stream.write_all(&framed).await.unwrap();
     }
 
+    /// Like [`send_data_frame`], but under `CODEC_NATIVE_V2` with a provenance trailer -- what a
+    /// v2-capable `logit_out` actually sends.
+    async fn send_data_frame_v2(
+        stream: &mut TcpStream,
+        batch: &EventBatch,
+        provenance: Provenance,
+        compression: Compression,
+    ) {
+        let payload = native::encode_batch_v2(batch, provenance);
+        let framed = frame::write_frame(native::CODEC_NATIVE_V2, compression, &payload).unwrap();
+        stream.write_all(&framed).await.unwrap();
+    }
+
     async fn read_ack(stream: &mut TcpStream) -> control::Ack {
         match read_control_response(stream).await {
             control::ControlMessage::Ack(ack) => ack,
@@ -767,7 +842,131 @@ mod tests {
         })
     }
 
+    // ---- provenance -------------------------------------------------------------------------
+
+    /// A v2 client's own `origin`/`previous` cross the wire and come out the other side
+    /// untouched -- the property `logit_out -> logit_in` exists for
+    /// (`docs/adr/batch-provenance-on-delivered.md`).
+    #[tokio::test]
+    async fn a_v2_clients_provenance_is_relayed_untouched() {
+        let (addr, input) = bound_input().await;
+        let (sink, mut rx) = fanout_into_channel_with_component("logit_in_test", 16);
+        let mut input = input;
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V2], vec![0]).await;
+        read_control_response(&mut client).await;
+
+        let sent = Provenance {
+            origin: Some(logit_core::interner::intern("remote_listener")),
+            previous: Some(logit_core::interner::intern("remote_enrich")),
+        };
+        send_data_frame_v2(&mut client, &sample_batch(), sent, Compression::None).await;
+        read_ack(&mut client).await;
+
+        let delivered = recv_delivered(&mut rx).await;
+        let provenance = delivered.provenance();
+        assert_eq!(provenance.origin_str(), Some("remote_listener"));
+        assert_eq!(provenance.previous_str(), Some("remote_enrich"));
+    }
+
+    /// A v2 client whose trailer carries no provenance at all (a v2 peer that genuinely had none)
+    /// gets this listener's own id backfilled into both fields, rather than being relayed as
+    /// `nil`/`nil` for no operator-visible reason.
+    #[tokio::test]
+    async fn a_v2_client_with_no_provenance_gets_this_listener_backfilled() {
+        let (addr, input) = bound_input().await;
+        let (sink, mut rx) = fanout_into_channel_with_component("logit_in_test", 16);
+        let mut input = input;
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V2], vec![0]).await;
+        read_control_response(&mut client).await;
+
+        send_data_frame_v2(&mut client, &sample_batch(), Provenance::default(), Compression::None)
+            .await;
+        read_ack(&mut client).await;
+
+        let delivered = recv_delivered(&mut rx).await;
+        let provenance = delivered.provenance();
+        assert_eq!(provenance.origin_str(), Some("logit_in_test"));
+        assert_eq!(provenance.previous_str(), Some("logit_in_test"));
+    }
+
+    /// A v1 client's batch carries no provenance on the wire at all -- this listener backfills
+    /// its own id into both fields, exactly like the empty-v2-trailer case above.
+    #[tokio::test]
+    async fn a_v1_clients_batch_gets_this_listeners_own_provenance() {
+        let (addr, input) = bound_input().await;
+        let (sink, mut rx) = fanout_into_channel_with_component("logit_in_test", 16);
+        let mut input = input;
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        read_control_response(&mut client).await;
+
+        send_data_frame(&mut client, &sample_batch(), Compression::None).await;
+        read_ack(&mut client).await;
+
+        let delivered = recv_delivered(&mut rx).await;
+        let provenance = delivered.provenance();
+        assert_eq!(provenance.origin_str(), Some("logit_in_test"));
+        assert_eq!(provenance.previous_str(), Some("logit_in_test"));
+    }
+
     // ---- handshake ------------------------------------------------------------------------
+
+    /// A client offering both codecs negotiates v2, this listener's preferred choice -- see
+    /// `handshake`'s own doc comment on why v2 is tried first.
+    #[tokio::test]
+    async fn a_client_offering_both_codecs_negotiates_v2() {
+        let (addr, input) = bound_input().await;
+        let (sink, _rx) = fanout_into_channel(16);
+        let mut input = input;
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V2, native::CODEC_NATIVE_V1], vec![0])
+            .await;
+        match read_control_response(&mut client).await {
+            control::ControlMessage::HelloAck(ack) => {
+                assert_eq!(ack.codec, native::CODEC_NATIVE_V2);
+            }
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+    }
+
+    /// An unmodified old `logit_out`, offering only `[1]`, still negotiates and talks
+    /// successfully -- the whole point of preferring v2 without requiring it.
+    #[tokio::test]
+    async fn a_client_offering_only_v1_still_negotiates_and_talks() {
+        let (addr, input) = bound_input().await;
+        let (sink, mut rx) = fanout_into_channel(16);
+        let mut input = input;
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        match read_control_response(&mut client).await {
+            control::ControlMessage::HelloAck(ack) => {
+                assert_eq!(ack.codec, native::CODEC_NATIVE_V1)
+            }
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        send_data_frame(&mut client, &sample_batch(), Compression::None).await;
+        read_ack(&mut client).await;
+        let batch = recv_batch(&mut rx).await;
+        assert_eq!(batch.events.len(), 1);
+    }
 
     #[tokio::test]
     async fn handshake_happy_path_returns_the_negotiated_compression() {

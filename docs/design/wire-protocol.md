@@ -64,6 +64,37 @@ Compression then runs over the dictionary-encoded payload: **lz4** for low-laten
 sidecar-to-local-aggregator case), **zstd** where bandwidth matters more than latency (a
 cross-region hop). Configurable per link.
 
+## `CODEC_NATIVE_V2`: a provenance trailer
+
+A second payload codec, `CODEC_NATIVE_V2`, carries everything v1 does plus a mandatory
+length-prefixed trailer holding the batch's `Provenance` — which component created it, which
+component most recently handled it (`docs/design/pipeline-graph.md`'s "Provenance propagation",
+[ADR `batch-provenance-on-delivered`](../adr/batch-provenance-on-delivered.md)):
+
+```
+payload_v2 := dict | resource attrs | uvarint(event_count) | events...
+            | uvarint(trailer_len) | trailer_bytes[trailer_len]
+trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*   -- tag 1 = origin, tag 2 = previous
+```
+
+v1's own encoding is untouched — `encode_batch`/`decode_batch` stay byte-for-byte what they were.
+`encode_batch_v2`/`decode_batch_v2` call them as subroutines and add the trailer around them. The
+trailer's length prefix is *mandatory*, present (as a single `0x00` byte) even when both fields are
+absent — deliberately, not an optional convenience: an optional trailer on an otherwise-unchanged
+v1 payload would let a payload truncated exactly at the trailer boundary decode as "no provenance"
+instead of failing, silently breaking this format's own truncation-safety invariant (every proper
+prefix of a valid encoding must fail to decode, pinned by
+`crates/logit-proto/tests/robustness.rs`'s `assert_every_truncation_fails_cleanly`). With the
+length mandatory, v2 holds the identical invariant v1 does. Each trailer field's value is inline,
+not dictionary-indexed: `origin`/`previous` are at most two scalar strings written once per batch,
+with no repetition within one payload for a dictionary to amortize.
+
+`Hello.codecs`/`HelloAck.codec` (below) negotiate v2 whenever both sides offer it, falling back to
+v1 with provenance simply absent otherwise — no version bump forced on either side. `DiskQueue`'s
+spooled records (`crates/logit-pipeline/src/disk_queue.rs`) are self-describing the same way: the
+existing per-record codec byte picks v1 or v2 decoding, so an already-spooled v1 record keeps
+replaying correctly after an upgrade.
+
 ## Encoding: decided — hand-rolled
 
 **Settled by [ADR `native-wire-format-encoding`](../adr/native-wire-format-encoding.md), on a four-arm bake-off

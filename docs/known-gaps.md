@@ -296,6 +296,16 @@ already built that have a known, accepted rough edge.
   script that wants better than "stale" can read `trace.trace_id`/`trace.span_id` inside its own
   `process()` and do its own bookkeeping — the values are genuinely there to use, just not
   aggregated by `logit` on the script's behalf.
+- **A Lua component's `flush()` sees stale provenance, for the same reason.**
+  `provenance.origin`/`.previous` (`docs/design/lua-api.md`'s "Reading provenance") reflect
+  whichever batch `process()` most recently saw, not the flushing component itself — the same
+  *n*-to-1 gap as the trace-context entry just above, with one difference: outside a Lua `flush()`,
+  `Fanout` (`crates/logit-pipeline/src/fanout.rs`) resolves this correctly for the batch it actually
+  sends (a flush-driven emission is stamped with the flushing component as both `origin` and
+  `previous`, [ADR `batch-provenance-on-delivered`](adr/batch-provenance-on-delivered.md)) — only
+  the Lua globals a script reads *during* `flush()`, before that stamp is applied, are stale. A
+  script reading `provenance.origin` inside `flush()` to decide what to do sees the last processed
+  batch's value, not what the emitted batch will actually be stamped with.
 - **No native way to stamp `logit`'s own pipeline trace context onto a log's `LogRecord.trace`** —
   a script can already do this by hand (`event.log.trace_id = trace.trace_id`,
   [ADR `log-record-trace-context`](adr/log-record-trace-context.md)), but the `trace_context`

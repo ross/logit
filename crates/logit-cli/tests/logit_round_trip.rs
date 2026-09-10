@@ -88,6 +88,96 @@ fn assert_round_tripped(received: &[EventBatch], batch: &EventBatch) {
     );
 }
 
+/// Like [`round_trip`], but the listener's `Fanout` carries a component id and `output` is
+/// primed with a specific [`logit_core::Provenance`] before sending -- what
+/// [`origin_and_previous_cross_the_wire_untouched_from_a_remote_peer`] needs to observe the
+/// property `docs/adr/batch-provenance-on-delivered.md`'s `logit_out -> logit_in` special case
+/// exists for.
+async fn round_trip_with_provenance(
+    mut input: LogitInput,
+    input_component: &str,
+    mut output: LogitOutput,
+    provenance: logit_core::Provenance,
+    batch: &EventBatch,
+) -> Vec<(EventBatch, logit_core::Provenance)> {
+    let (tx, mut rx) = mpsc::channel(16);
+    let sink = Fanout::new(vec![tx]).with_component(input_component);
+    tokio::spawn(async move {
+        let _ = input.run(sink).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    output.observe_batch(logit_pipeline::BatchContext {
+        trace: logit_pipeline::TraceContext::new_root(),
+        provenance,
+    });
+    output.send(batch).await.expect("send should succeed against a live logit_in");
+
+    let mut received = Vec::new();
+    while let Ok(Some(delivered)) =
+        tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+    {
+        let provenance = delivered.provenance();
+        received.push((logit_pipeline::unwrap_batch(delivered), provenance));
+    }
+    received
+}
+
+/// The end-to-end property the `logit_out -> logit_in` special case exists for: a batch carrying
+/// a remote listener's `origin` and the remote node that fed `logit_out` as `previous` comes out
+/// the other side of the wire with both untouched -- `logit_in` (named `central_logit_in` here)
+/// never overwrites either, so the split-collection deployment reads as one graph
+/// (`docs/adr/batch-provenance-on-delivered.md`).
+#[tokio::test]
+async fn origin_and_previous_cross_the_wire_untouched_from_a_remote_peer() {
+    let addr = ephemeral_addr().await;
+    let input = LogitInput::new(addr.clone());
+    let output = LogitOutput::new(addr);
+
+    let sent_provenance = logit_core::Provenance {
+        origin: Some(logit_core::interner::intern("remote_listener")),
+        previous: Some(logit_core::interner::intern("remote_enrich")),
+    };
+    let batch = sample_batch();
+    let received =
+        round_trip_with_provenance(input, "central_logit_in", output, sent_provenance, &batch)
+            .await;
+
+    assert_eq!(received.len(), 1);
+    let (_batch, provenance) = &received[0];
+    assert_eq!(provenance.origin_str(), Some("remote_listener"));
+    assert_eq!(
+        provenance.previous_str(),
+        Some("remote_enrich"),
+        "previous should name the remote node that fed logit_out, not logit_in itself"
+    );
+}
+
+/// The fallback half of the same special case: a `logit_out`/`logit_in` pair with nothing to
+/// relay (a v1 peer, or a v2 peer that genuinely had none) must not leave `origin`/`previous`
+/// empty -- `logit_in` backfills its own id into both.
+#[tokio::test]
+async fn a_batch_with_no_provenance_gets_logit_ins_own_id_backfilled() {
+    let addr = ephemeral_addr().await;
+    let input = LogitInput::new(addr.clone());
+    let output = LogitOutput::new(addr);
+
+    let batch = sample_batch();
+    let received = round_trip_with_provenance(
+        input,
+        "central_logit_in",
+        output,
+        logit_core::Provenance::default(),
+        &batch,
+    )
+    .await;
+
+    assert_eq!(received.len(), 1);
+    let (_batch, provenance) = &received[0];
+    assert_eq!(provenance.origin_str(), Some("central_logit_in"));
+    assert_eq!(provenance.previous_str(), Some("central_logit_in"));
+}
+
 #[tokio::test]
 async fn logit_output_to_logit_input_round_trips_a_batch_plaintext() {
     let addr = ephemeral_addr().await;

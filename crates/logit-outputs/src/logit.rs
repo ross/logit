@@ -36,8 +36,8 @@
 use crate::Output;
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
-use logit_core::{Diagnostics, EventBatch, Telemetry};
-use logit_pipeline::Fault;
+use logit_core::{Diagnostics, EventBatch, Provenance, Telemetry};
+use logit_pipeline::{BatchContext, Fault};
 use logit_proto::frame::{self, Compression};
 use logit_proto::native::{self, control};
 use rustls_pki_types::ServerName;
@@ -65,6 +65,12 @@ struct Conn {
     /// larger than this is rejected locally (`Fault::Permanent`) rather than sent and rejected by
     /// the peer.
     peer_max_frame_bytes: u32,
+    /// The codec `HelloAck.codec` actually chose -- `CODEC_NATIVE_V2` if the peer offered it (so
+    /// provenance crosses the wire), `CODEC_NATIVE_V1` if it only understood the original format.
+    /// Validated against what this sink itself offered in `Hello.codecs`
+    /// (`connect_and_handshake`'s own doc comment): an ack naming a codec never offered is a
+    /// protocol violation, not silently trusted.
+    codec: u8,
     /// The negotiated compression -- the intersection of what this sink offered and what the
     /// peer's `HelloAck` chose, which may be `None` even if this sink offered `Lz4` (the peer
     /// doesn't support it).
@@ -97,6 +103,12 @@ pub struct LogitOutput {
     /// "reconnect," only every one after it (`logit.output.reconnects`'s own doc comment on
     /// [`LogitOutput::connect_and_handshake`]).
     has_connected_once: bool,
+    /// The provenance of whatever batch `send` is about to be called with -- set by
+    /// `Output::observe_batch` (`write_loop`, `crates/logit-pipeline/src/runtime.rs`) immediately
+    /// before each delivery attempt, read by `send` when it encodes under `CODEC_NATIVE_V2`.
+    /// `Provenance::default()` (nothing sent) on a `CODEC_NATIVE_V1` connection, since v1 has no
+    /// trailer to carry it in. See `docs/adr/batch-provenance-on-delivered.md`.
+    pending_provenance: Provenance,
 }
 
 impl LogitOutput {
@@ -110,6 +122,7 @@ impl LogitOutput {
             telemetry: Telemetry::default(),
             stream: None,
             has_connected_once: false,
+            pending_provenance: Provenance::default(),
         }
     }
 
@@ -184,7 +197,11 @@ impl LogitOutput {
 
         let hello = control::Hello {
             version: control::PROTOCOL_VERSION,
-            codecs: vec![native::CODEC_NATIVE_V1],
+            // v2 first: an old `logit_in` that only recognizes v1 already acks the first entry it
+            // recognizes in `Hello.codecs`, so offering v2 first costs nothing against an
+            // unmodified old listener and gains provenance against a new one -- no separate
+            // negotiation logic needed on this side beyond validating the ack below.
+            codecs: vec![native::CODEC_NATIVE_V2, native::CODEC_NATIVE_V1],
             compressions: vec![Compression::None as u8, self.compression as u8],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window: 1,
@@ -224,7 +241,27 @@ impl LogitOutput {
         }
 
         let compression = compression_from_u8(ack.compression).unwrap_or(Compression::None);
-        Ok(Conn { stream, peer_max_frame_bytes: ack.max_frame_bytes, compression, seq: 0 })
+        // `ack.codec` must name one of the codecs this sink actually offered -- an ack naming
+        // anything else is a protocol violation from the peer, not something to trust silently.
+        // `Fault::Ambiguous`, not `Clean`: nothing about this being a bad ack tells us whether the
+        // peer is in a state worth retrying against identically, but nothing has been sent on this
+        // connection yet either, so treating it as `Clean` would also be defensible -- `Ambiguous`
+        // is the more conservative of the two, and this should never happen against a real
+        // `logit_in` in the first place.
+        if ack.codec != native::CODEC_NATIVE_V1 && ack.codec != native::CODEC_NATIVE_V2 {
+            return Err(anyhow::anyhow!(
+                "logit_in acked codec {}, which was never offered in this sink's Hello",
+                ack.codec
+            ))
+            .context(Fault::Ambiguous);
+        }
+        Ok(Conn {
+            stream,
+            peer_max_frame_bytes: ack.max_frame_bytes,
+            compression,
+            seq: 0,
+            codec: ack.codec,
+        })
     }
 }
 
@@ -233,6 +270,16 @@ fn compression_from_u8(b: u8) -> Option<Compression> {
         0 => Some(Compression::None),
         1 => Some(Compression::Lz4),
         _ => None,
+    }
+}
+
+/// Renders a connection's negotiated codec byte for the `logit.proto.frames` metric's `codec`
+/// tag -- `docs/design/internal-telemetry.md`'s cardinality convention wants a fixed string, not
+/// the raw byte, and the byte space isn't otherwise self-describing.
+fn codec_tag(codec: u8) -> &'static str {
+    match codec {
+        native::CODEC_NATIVE_V2 => "native_v2",
+        _ => "native_v1",
     }
 }
 
@@ -283,15 +330,27 @@ fn host_only(endpoint: &str) -> &str {
 
 #[async_trait::async_trait]
 impl Output for LogitOutput {
+    /// Records `ctx.provenance` for `send` to encode under, once the connection's negotiated
+    /// codec is known to actually support it -- see [`LogitOutput::pending_provenance`]'s own doc
+    /// comment. `write_loop` calls this before every delivery attempt for one batch, retries
+    /// included, so the same value is used across all of them.
+    fn observe_batch(&mut self, ctx: BatchContext) {
+        self.pending_provenance = ctx.provenance;
+    }
+
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let payload = native::encode_batch(batch);
-        if payload.len() as u64 > frame::MAX_SANE_UNCOMPRESSED_LEN as u64 {
+        // Encoded once here, under v1 -- before touching the network at all, so a batch that's
+        // already too large is rejected without ever attempting a connection. v2's payload is
+        // this plus a small trailer, never smaller, so this stays a valid (if slightly
+        // conservative) pre-check regardless of which codec the eventual connection negotiates.
+        let v1_payload = native::encode_batch(batch);
+        if v1_payload.len() as u64 > frame::MAX_SANE_UNCOMPRESSED_LEN as u64 {
             self.diag.warn_throttled(
                 "frame_too_large",
                 format!(
                     "batch encodes to {} bytes, over the {}-byte sanity cap -- dropping it \
                      rather than ever attempting to send it",
-                    payload.len(),
+                    v1_payload.len(),
                     frame::MAX_SANE_UNCOMPRESSED_LEN
                 ),
             );
@@ -301,6 +360,14 @@ impl Output for LogitOutput {
         let mut conn = match self.stream.take() {
             Some(conn) => conn,
             None => self.connect_and_handshake().await?,
+        };
+        // Only re-encoded on a v2 connection -- reuses `v1_payload` otherwise, so a v1 connection
+        // (an old peer, or a fresh one before any v2-capable `logit_in` exists) never pays for a
+        // second encode.
+        let payload = if conn.codec == native::CODEC_NATIVE_V2 {
+            native::encode_batch_v2(batch, self.pending_provenance)
+        } else {
+            v1_payload
         };
 
         let bound = conn.peer_max_frame_bytes.min(frame::MAX_SANE_UNCOMPRESSED_LEN);
@@ -319,9 +386,8 @@ impl Output for LogitOutput {
                 .context(Fault::Permanent);
         }
 
-        let framed =
-            frame::write_frame_with_flags(native::CODEC_NATIVE_V1, conn.compression, 0, &payload)
-                .context(Fault::Permanent)?;
+        let framed = frame::write_frame_with_flags(conn.codec, conn.compression, 0, &payload)
+            .context(Fault::Permanent)?;
 
         // `syslog_out::send_tcp`'s two-property rule: a single `write` first to learn whether
         // anything left at all, `write_all` only for the remainder -- never resend once any byte
@@ -368,7 +434,7 @@ impl Output for LogitOutput {
             1.0,
             &[
                 ("direction", "out"),
-                ("codec", "native_v1"),
+                ("codec", codec_tag(conn.codec)),
                 ("compression", compression_tag(conn.compression)),
             ],
         );
@@ -496,6 +562,15 @@ impl ControlEncode for control::Reject {
         control::Reject::encode(self)
     }
 }
+// `Ack` is likewise only ever written by a peer in production -- exists for the same
+// fake-peer-reuses-`write_control` reason as `HelloAck`/`Reject` above, needed by the tests that
+// hand-roll a peer acking a data frame (the provenance/codec-negotiation tests).
+#[cfg(test)]
+impl ControlEncode for control::Ack {
+    fn encode(&self) -> Bytes {
+        control::Ack::encode(self)
+    }
+}
 
 /// Reads one whole control frame off `stream` and decodes it. Bounded against
 /// [`frame::MAX_SANE_UNCOMPRESSED_LEN`] (this sink's own `Hello` already advertises exactly this
@@ -608,6 +683,143 @@ mod tests {
             .flat_map(|e| e.metrics.into_iter())
             .find(|m| logit_core::interner::resolve(m.name) == "logit.output.reconnects");
         assert!(reconnects.is_none(), "expected no reconnects after two sends on one connection");
+    }
+
+    // ---- provenance / codec negotiation ------------------------------------------------------
+
+    /// Offers both codecs; a peer that acks v2 gets a v2-framed batch carrying whatever
+    /// provenance `Output::observe_batch` was last called with -- the property the whole codec
+    /// split exists for (`docs/adr/batch-provenance-on-delivered.md`).
+    #[tokio::test]
+    async fn a_peer_that_acks_v2_gets_a_v2_frame_with_provenance() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let control::ControlMessage::Hello(hello) = read_control(&mut stream).await.unwrap()
+            else {
+                panic!("expected Hello");
+            };
+            assert!(
+                hello.codecs.contains(&native::CODEC_NATIVE_V2),
+                "this sink should offer v2: {:?}",
+                hello.codecs
+            );
+            let ack = control::HelloAck {
+                version: control::PROTOCOL_VERSION,
+                codec: native::CODEC_NATIVE_V2,
+                compression: 0,
+                max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
+                window: 1,
+            };
+            write_control(&mut stream, &ack).await.unwrap();
+
+            let mut header = [0u8; frame::HEADER_LEN];
+            stream.read_exact(&mut header).await.unwrap();
+            let mut header_bytes = Bytes::copy_from_slice(&header);
+            let h = frame::FrameHeader::read(&mut header_bytes).unwrap();
+            assert_eq!(h.codec, native::CODEC_NATIVE_V2, "should send under the negotiated codec");
+            let mut body = vec![0u8; h.compressed_len as usize];
+            stream.read_exact(&mut body).await.unwrap();
+            let mut payload = Bytes::from(body);
+            let (_batch, provenance) = native::decode_batch_v2(&mut payload).unwrap();
+
+            write_control(&mut stream, &control::Ack { seq: 1 }).await.unwrap();
+            provenance
+        });
+
+        let mut output = LogitOutput::new(addr);
+        output.observe_batch(logit_pipeline::BatchContext {
+            trace: logit_pipeline::TraceContext::new_root(),
+            provenance: logit_core::Provenance {
+                origin: Some(logit_core::interner::intern("logit_out_test_origin")),
+                previous: Some(logit_core::interner::intern("logit_out_test_previous")),
+            },
+        });
+        output.send(&sample_batch()).await.expect("send should succeed");
+
+        let provenance = server.await.expect("server task should not panic");
+        assert_eq!(provenance.origin_str(), Some("logit_out_test_origin"));
+        assert_eq!(provenance.previous_str(), Some("logit_out_test_previous"));
+    }
+
+    /// A peer that only acks v1 gets a plain v1 frame, byte for byte what `encode_batch`
+    /// produces -- no trailer, provenance simply never sent -- proving the negotiation degrades
+    /// cleanly against an old peer rather than assuming v2.
+    #[tokio::test]
+    async fn a_peer_that_only_acks_v1_gets_a_plain_v1_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let control::ControlMessage::Hello(_hello) = read_control(&mut stream).await.unwrap()
+            else {
+                panic!("expected Hello");
+            };
+            let ack = control::HelloAck {
+                version: control::PROTOCOL_VERSION,
+                codec: native::CODEC_NATIVE_V1,
+                compression: 0,
+                max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
+                window: 1,
+            };
+            write_control(&mut stream, &ack).await.unwrap();
+
+            let mut header = [0u8; frame::HEADER_LEN];
+            stream.read_exact(&mut header).await.unwrap();
+            let mut header_bytes = Bytes::copy_from_slice(&header);
+            let h = frame::FrameHeader::read(&mut header_bytes).unwrap();
+            assert_eq!(h.codec, native::CODEC_NATIVE_V1, "should stay on v1 against this peer");
+            let mut body = vec![0u8; h.compressed_len as usize];
+            stream.read_exact(&mut body).await.unwrap();
+            let mut payload = Bytes::from(body);
+            // A v1 payload has no trailer at all -- decoding it as v2 must fail (the same
+            // invariant `native/mod.rs`'s own `decode_batch_v2_rejects_a_plain_v1_payload` pins).
+            assert!(native::decode_batch_v2(&mut payload.clone()).is_err());
+            native::decode_batch(&mut payload).unwrap();
+
+            write_control(&mut stream, &control::Ack { seq: 1 }).await.unwrap();
+        });
+
+        let mut output = LogitOutput::new(addr);
+        output.observe_batch(logit_pipeline::BatchContext {
+            trace: logit_pipeline::TraceContext::new_root(),
+            provenance: logit_core::Provenance {
+                origin: Some(logit_core::interner::intern("logit_out_test_origin")),
+                previous: None,
+            },
+        });
+        output.send(&sample_batch()).await.expect("send should succeed");
+        server.await.expect("server task should not panic");
+    }
+
+    /// An ack naming a codec this sink never offered is a protocol violation from the peer, not
+    /// something to trust -- classified `Ambiguous` since nothing has actually been sent yet on
+    /// this connection either way.
+    #[tokio::test]
+    async fn an_ack_naming_a_codec_never_offered_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let control::ControlMessage::Hello(_hello) = read_control(&mut stream).await.unwrap()
+            else {
+                panic!("expected Hello");
+            };
+            let ack = control::HelloAck {
+                version: control::PROTOCOL_VERSION,
+                codec: 99, // never offered
+                compression: 0,
+                max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
+                window: 1,
+            };
+            write_control(&mut stream, &ack).await.unwrap();
+        });
+
+        let mut output = LogitOutput::new(addr);
+        let err = output.send(&sample_batch()).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Ambiguous);
+        server.await.expect("server task should not panic");
     }
 
     #[tokio::test]

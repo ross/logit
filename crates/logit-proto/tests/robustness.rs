@@ -24,7 +24,7 @@
 //! `docs/plans/native-transport.md` allows.
 
 use bytes::{Bytes, BytesMut};
-use logit_core::{AttrMap, Event, EventBatch, LogRecord, Resource, Severity, Value};
+use logit_core::{AttrMap, Event, EventBatch, LogRecord, Provenance, Resource, Severity, Value};
 use logit_proto::frame::{self, Compression};
 use logit_proto::native::control::{self, Ack, Hello, HelloAck, Reject};
 use logit_proto::native::varint::write_uvarint;
@@ -355,6 +355,39 @@ fn decode_batch_at_exactly_the_depth_cap_still_decodes() {
     let batch = deeply_nested_batch(127);
     let mut payload = native::encode_batch(&batch);
     assert!(native::decode_batch(&mut payload).is_ok());
+}
+
+// -- native::decode_batch_v2 ----------------------------------------------------------------
+
+fn sample_provenance() -> Provenance {
+    Provenance {
+        origin: Some(logit_core::interner::intern("robustness_nginx_in")),
+        previous: Some(logit_core::interner::intern("robustness_enrich")),
+    }
+}
+
+#[test]
+fn decode_batch_v2_survives_every_single_byte_truncation() {
+    let payload = native::encode_batch_v2(&sample_batch(), sample_provenance());
+    assert_every_truncation_fails_cleanly(&payload, |bytes| {
+        native::decode_batch_v2(bytes).is_err()
+    });
+}
+
+#[test]
+fn decode_batch_v2_survives_seeded_bit_flips() {
+    let payload = native::encode_batch_v2(&sample_batch(), sample_provenance());
+    assert_bit_flips_never_panic(&payload, 5000, |bytes| native::decode_batch_v2(bytes).is_ok());
+}
+
+/// A plain v1 payload is a distinct codec, not a subset of v2's -- `decode_batch_v2` must reject
+/// it rather than silently decode it as "no provenance" (`native::mod`'s own inline test covers
+/// the same property; this is the adversarial-suite copy for consistency with every other decoder
+/// here).
+#[test]
+fn decode_batch_v2_rejects_a_plain_v1_payload() {
+    let mut payload = native::encode_batch(&sample_batch());
+    assert!(native::decode_batch_v2(&mut payload).is_err());
 }
 
 #[test]
