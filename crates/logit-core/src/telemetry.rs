@@ -20,8 +20,8 @@
 
 use crate::interner::intern;
 use crate::{
-    AttrMap, DdSketch, Event, MetricKind, MetricRecord, SpanKind, SpanLink, SpanRecord, SpanStatus,
-    Value,
+    AttrMap, BodyFormat, DdSketch, Event, LogRecord, MetricKind, MetricRecord, Severity, SpanKind,
+    SpanLink, SpanRecord, SpanStatus, Value,
 };
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -72,6 +72,13 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
 /// (`ComponentBuffer::drain`'s `logit.internal.spans.dropped{reason="buffer_full"}`), the same
 /// bound-and-count-the-drop shape [`MAX_KEYS_PER_COMPONENT`] uses for points.
 const MAX_SPANS_PER_COMPONENT: usize = 512;
+
+/// Caps the number of logs one component's buffer will hold between drains -- a volume bound,
+/// same reasoning as [`MAX_SPANS_PER_COMPONENT`]: a log never coalesces with another one. Beyond
+/// the cap, a new log is dropped and counted (`ComponentBuffer::drain`'s
+/// `logit.internal.logs.dropped{reason="buffer_full"}`). See `docs/plans/operator-surface.md`,
+/// workstream D.
+const MAX_LOGS_PER_COMPONENT: usize = 256;
 
 /// Caps the number of [`SpanLink`]s one span will carry -- the same reasoning
 /// `logit-transforms::Aggregator`'s own `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES` bound has (a
@@ -356,6 +363,23 @@ struct PendingSpan {
     tags: SmallVec<[Tag; 2]>,
 }
 
+/// One `tracing` event at or above [`TelemetryLayer`]'s threshold, captured into its component's
+/// buffer -- turned into a real `Event` carrying a [`LogRecord`] only at drain time
+/// (`ComponentBuffer::drain`'s log pass), same as a [`PendingSpan`]. See
+/// `docs/plans/operator-surface.md`, workstream D.
+#[derive(Debug)]
+struct PendingLog {
+    /// Unix nanoseconds, read at capture time (`now_unix_nanos()`) -- becomes the drained
+    /// `Event::timestamp`, same as a point or a span's own `start`: this is when the event
+    /// actually happened, not when it happened to drain.
+    ts: i64,
+    level: Severity,
+    /// The `key` field on the `tracing` event that produced this, or a stable placeholder when
+    /// absent -- see [`TelemetryLayer::on_event`]'s own comment on the two fallback cases.
+    key: String,
+    message: String,
+}
+
 /// A guard opened by [`Telemetry::span`], recording one [`SpanRecord`]-carrying `Event` when it
 /// finishes -- mirrors [`Timer`]'s shape exactly, including the "disabled/unsampled holds no
 /// state" trick that makes an unsampled span free: every method below is an immediate return
@@ -477,6 +501,11 @@ pub struct ComponentBuffer {
     spans: Mutex<Vec<PendingSpan>>,
     /// Spans rejected by the [`MAX_SPANS_PER_COMPONENT`] cap since the last drain.
     spans_dropped: AtomicU64,
+    /// Every log captured by [`TelemetryLayer`] for this component since the last drain -- a
+    /// plain `Vec`, same reasoning as `spans`: nothing here coalesces.
+    logs: Mutex<Vec<PendingLog>>,
+    /// Logs rejected by the [`MAX_LOGS_PER_COMPONENT`] cap since the last drain.
+    logs_dropped: AtomicU64,
     /// Copied from [`Registry`] at construction (never changes after) so [`Telemetry::span`]
     /// never needs a second lock beyond whichever one this buffer's own state already takes --
     /// process-wide, set once, per graph validation rule 16 guaranteeing at most one `internal`
@@ -494,6 +523,8 @@ impl ComponentBuffer {
             dropped: AtomicU64::new(0),
             spans: Mutex::new(Vec::new()),
             spans_dropped: AtomicU64::new(0),
+            logs: Mutex::new(Vec::new()),
+            logs_dropped: AtomicU64::new(0),
             span_sample_rate,
         }
     }
@@ -509,6 +540,19 @@ impl ComponentBuffer {
             return;
         }
         spans.push(span);
+    }
+
+    /// Pushes `log`, dropping and counting it (`logit.internal.logs.dropped{reason=
+    /// "buffer_full"}`) past [`MAX_LOGS_PER_COMPONENT`] -- the same bound-and-count-the-drop
+    /// shape [`ComponentBuffer::push_span`] uses.
+    fn push_log(&self, log: PendingLog) {
+        let mut logs = self.logs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if logs.len() >= MAX_LOGS_PER_COMPONENT {
+            drop(logs);
+            self.logs_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        logs.push(log);
     }
 
     /// Turns one finished [`PendingSpan`] into its drained `Event`. `name` is built here, not at
@@ -589,9 +633,19 @@ impl ComponentBuffer {
             std::mem::take(&mut *spans)
         };
         let spans_dropped = self.spans_dropped.swap(0, Ordering::Relaxed);
+        let logs = {
+            let mut logs = self.logs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *logs)
+        };
+        let logs_dropped = self.logs_dropped.swap(0, Ordering::Relaxed);
 
         let mut events = Vec::with_capacity(
-            points.len() + spans.len() + usize::from(dropped > 0) + usize::from(spans_dropped > 0),
+            points.len()
+                + spans.len()
+                + logs.len()
+                + usize::from(dropped > 0)
+                + usize::from(spans_dropped > 0)
+                + usize::from(logs_dropped > 0),
         );
         for (key, pending) in points {
             // `key.tags` never holds a reserved key at all (filtered out in `PointKey::new`, so a
@@ -643,6 +697,33 @@ impl ComponentBuffer {
                 MetricRecord {
                     name: intern("logit.internal.spans.dropped"),
                     kind: MetricKind::Counter(spans_dropped as f64),
+                    unit: None,
+                },
+            ));
+        }
+        for log in logs {
+            let mut attrs = self.base_attrs();
+            attrs.insert("key", log.key.as_str());
+            events.push(Event::log(
+                log.ts,
+                attrs,
+                LogRecord {
+                    message: Value::str(log.message),
+                    severity: Some(log.level),
+                    body_format: BodyFormat::Raw,
+                    trace: None,
+                },
+            ));
+        }
+        if logs_dropped > 0 {
+            let mut attrs = self.base_attrs();
+            attrs.insert("reason", "buffer_full");
+            events.push(Event::metric(
+                now,
+                attrs,
+                MetricRecord {
+                    name: intern("logit.internal.logs.dropped"),
+                    kind: MetricKind::Counter(logs_dropped as f64),
                     unit: None,
                 },
             ));
@@ -704,6 +785,19 @@ impl Registry {
         Telemetry(Some(buf))
     }
 
+    /// Pushes `log` into `component_id`'s own buffer -- [`TelemetryLayer::on_event`]'s only way
+    /// to reach a buffer without exposing [`ComponentBuffer`] itself. A silent no-op if
+    /// `component_id` names no registered buffer (should not happen in practice: every component
+    /// gets a `Telemetry` handle -- and therefore a registered buffer -- at startup, including
+    /// the `internal` component itself, which is where an unattributed event's `component_id`
+    /// always points).
+    fn push_log(&self, component_id: &str, log: PendingLog) {
+        let buffers = self.buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(buf) = buffers.iter().find(|buf| buf.id == component_id) {
+            buf.push_log(log);
+        }
+    }
+
     /// Drains every registered component's buffer, in registration order, into one flat list of
     /// events. Registration order is deterministic (`crates/logit-cli/src/pipeline.rs` builds
     /// components in sorted-id order), so drain output is reproducible across runs, which matters
@@ -714,6 +808,158 @@ impl Registry {
         // lock, and nothing here needs the registry's own lock held that long.
         let buffers = self.buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         buffers.iter().flat_map(|buf| buf.drain(now)).collect()
+    }
+}
+
+/// A `tracing_subscriber::Layer` that captures every event at its activated threshold or above
+/// into the pipeline as an ordinary log event -- turning `logit`'s own self-logging into just
+/// another producer into this same buffer, exactly the shape ADR
+/// `internal-telemetry-as-pipeline-events` names as the future the design was left open for ("a
+/// future `tracing` subscriber could itself feed `Diagnostics`/`Telemetry`, same as any other
+/// producer"). See `docs/plans/operator-surface.md`, workstream D.
+///
+/// Starts **inactive** -- every event is a no-op until [`TelemetryLayer::activate`] is called,
+/// deliberately: `logit-cli::main` installs this layer (inside the global subscriber, via
+/// `.init()`) *before* the config is even loaded, so a bad `--log-level` still fails fast and
+/// `starting` still logs even for a config that fails to resolve, same as before this workstream
+/// -- there is no stable API to add a layer to an already-`.init()`-ed subscriber, so the layer
+/// itself has to exist from the start, with its real target filled in once the config's own
+/// `internal` component (if any) is known, slightly later. A config with no `internal`
+/// component, or `logs: off`, simply never calls `activate`, forever -- the exact same
+/// zero-cost-when-unconfigured shape [`Telemetry::default`] already has.
+#[derive(Clone, Default)]
+pub struct TelemetryLayer(Arc<std::sync::RwLock<Option<ActiveTelemetryLayer>>>);
+
+struct ActiveTelemetryLayer {
+    registry: Arc<Registry>,
+    threshold: Severity,
+    /// The operator-chosen *id* of the config's `internal` component -- `"internal"` is its
+    /// *kind*, not its id (e.g. `self` in `demo/logit.yaml`). Where an event carrying no
+    /// `component` field lands.
+    internal_id: String,
+}
+
+impl TelemetryLayer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fills in the real capture target -- `logit-cli::main`, once the config's `internal`
+    /// component (if any) and its `logs` threshold are known. Every event before this call (and,
+    /// for a config with no `internal` component or `logs: off`, every event for the life of the
+    /// process) is a no-op.
+    pub fn activate(
+        &self,
+        registry: Arc<Registry>,
+        threshold: Severity,
+        internal_id: impl Into<String>,
+    ) {
+        let mut inner = self.0.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *inner =
+            Some(ActiveTelemetryLayer { registry, threshold, internal_id: internal_id.into() });
+    }
+
+    /// The per-layer filter this layer must be installed *with* -- `logit-cli::main::init_logging`
+    /// applies it via `tracing_subscriber::Layer::with_filter`, and scopes the
+    /// `--log-level`/`LOGIT_LOG` `EnvFilter` the same way onto the stderr `fmt` layer, so that
+    /// stderr verbosity and internal-log capture stay two independent knobs.
+    ///
+    /// Installed as a *global* filter instead (`registry().with(env_filter)`), an operator's
+    /// `--log-level error` would return `Interest::never()` for every `warn` callsite -- a verdict
+    /// `tracing-core` caches at that callsite for the life of the process -- and this layer's
+    /// `on_event` would simply never run: `internal: { logs: warn }` would silently become
+    /// `error`, and the drop would happen upstream of the registry, where not even a
+    /// `logit.internal.logs.dropped` counter can see it. `LOGIT_LOG=off` would disable capture
+    /// outright.
+    ///
+    /// `target: "logit"` is exactly what `on_event` already requires (this crate's own
+    /// self-diagnostics, never a dependency's `tracing` instrumentation). `WARN` is a static cap
+    /// rather than the configured threshold because this layer is built before the config is even
+    /// loaded -- sound because `logit_config::InternalLogs` offers only `warn`/`error`/`off`
+    /// (`logit-cli::pipeline::severity_for_logs`), so `WARN` is never stricter than a reachable
+    /// threshold and the real gate stays `on_event`'s own `threshold` check. It is a cap rather
+    /// than *no* filter for a reason: an unfiltered layer reports no `max_level_hint`, which drags
+    /// the process-wide static max level up to `TRACE` and makes every `debug!`/`trace!` callsite
+    /// in every dependency evaluate dynamically -- moving the bug rather than fixing it. If
+    /// `InternalLogs` ever gains a level below `warn`, this cap moves down with it.
+    pub fn capture_filter() -> tracing_subscriber::filter::Targets {
+        tracing_subscriber::filter::Targets::new()
+            .with_target("logit", tracing_subscriber::filter::LevelFilter::WARN)
+    }
+}
+
+fn severity_from_level(level: tracing::Level) -> Severity {
+    match level {
+        tracing::Level::TRACE => Severity::Trace,
+        tracing::Level::DEBUG => Severity::Debug,
+        tracing::Level::INFO => Severity::Info,
+        tracing::Level::WARN => Severity::Warn,
+        tracing::Level::ERROR => Severity::Error,
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for TelemetryLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let inner = self.0.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(inner) = &*inner else { return }; // not yet activated, or never will be
+                                                   // Only this crate's own self-diagnostics, not every dependency's own `tracing`
+                                                   // instrumentation (hyper's, tokio's, ...) -- every call site this layer is meant to
+                                                   // capture (`Diagnostics`, the runtime's lifecycle events) sets this target explicitly.
+        if event.metadata().target() != "logit" {
+            return;
+        }
+        let level = severity_from_level(*event.metadata().level());
+        if level < inner.threshold {
+            return;
+        }
+
+        // `tracing`'s field values arrive through visitor callbacks, not a map -- the same
+        // capturing-`Visit` shape `crates/logit-core/src/diag.rs`'s own tests use, and for the
+        // same reason: a string field's value (`component`, `key`) and the formatted message
+        // both surface via `record_debug` (quoted, since the underlying `fmt::Arguments` is
+        // recorded through `Debug`), hence the `trim_matches('"')` below.
+        struct Visitor {
+            component: Option<String>,
+            key: Option<String>,
+            message: String,
+        }
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.record_str(field, &format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                let value = value.trim_matches('"');
+                match field.name() {
+                    "component" => self.component = Some(value.to_string()),
+                    "key" => self.key = Some(value.to_string()),
+                    "message" => self.message = value.to_string(),
+                    _ => {}
+                }
+            }
+        }
+        let mut visitor = Visitor { component: None, key: None, message: String::new() };
+        event.record(&mut visitor);
+
+        // Two fallbacks, both deliberate: an event with no `component` field (a runtime lifecycle
+        // event -- `ready`, `shutdown signal received`) is attributed to the `internal` component
+        // itself, under the stable key `"process"`; an event *with* a `component` but no `key`
+        // field (`Diagnostics::warn`, which never sets one) still needs some key, so it gets the
+        // generic placeholder `"log"` rather than an empty string.
+        let (target_id, key) = match visitor.component {
+            Some(component) => (component, visitor.key.unwrap_or_else(|| "log".to_string())),
+            None => (inner.internal_id.clone(), "process".to_string()),
+        };
+        inner.registry.push_log(
+            &target_id,
+            PendingLog { ts: now_unix_nanos(), level, key, message: visitor.message },
+        );
     }
 }
 
@@ -1241,5 +1487,155 @@ mod tests {
         let events = registry.drain(0);
         assert!(events.iter().any(|e| !e.metrics.is_empty() && e.span.is_none()), "a metric event");
         assert!(find_span_event(&events).is_some(), "a span event");
+    }
+
+    // -- workstream D: `TelemetryLayer` (docs/plans/operator-surface.md) --
+
+    use tracing_subscriber::layer::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    fn find_log_event(events: &[Event]) -> Option<&Event> {
+        events.iter().find(|e| e.log.is_some())
+    }
+
+    #[test]
+    fn a_warn_event_with_component_lands_in_that_components_buffer_as_a_log() {
+        let registry = Registry::new();
+        registry.telemetry_for("x", "json", "transform");
+        let layer = TelemetryLayer::new();
+        layer.activate(registry.clone(), Severity::Warn, "self");
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "logit", component = "x", key = "bad_frame", "malformed input");
+        });
+
+        let events = registry.drain(0);
+        let event = find_log_event(&events).expect("a log event should be present");
+        assert_eq!(event.attributes.get("component").and_then(|v| v.as_str()), Some("x"));
+        assert_eq!(event.attributes.get("kind").and_then(|v| v.as_str()), Some("json"));
+        assert_eq!(event.attributes.get("role").and_then(|v| v.as_str()), Some("transform"));
+        assert_eq!(event.attributes.get("key").and_then(|v| v.as_str()), Some("bad_frame"));
+        let record = event.log.as_ref().unwrap();
+        assert_eq!(record.severity, Some(Severity::Warn));
+        assert_eq!(record.message.as_str(), Some("malformed input"));
+        assert_eq!(record.body_format, BodyFormat::Raw);
+        assert!(record.trace.is_none());
+    }
+
+    #[test]
+    fn an_info_event_is_not_captured_below_the_warn_threshold() {
+        let registry = Registry::new();
+        registry.telemetry_for("x", "json", "transform");
+        let layer = TelemetryLayer::new();
+        layer.activate(registry.clone(), Severity::Warn, "self");
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "logit", component = "x", "just fyi");
+        });
+
+        let events = registry.drain(0);
+        assert!(
+            find_log_event(&events).is_none(),
+            "an info event should not pass a warn threshold"
+        );
+    }
+
+    #[test]
+    fn an_unattributed_error_lands_under_the_internal_component_with_key_process() {
+        let registry = Registry::new();
+        registry.telemetry_for("self", "internal", "listener");
+        let layer = TelemetryLayer::new();
+        layer.activate(registry.clone(), Severity::Warn, "self");
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(target: "logit", "something went wrong with no component");
+        });
+
+        let events = registry.drain(0);
+        let event = find_log_event(&events).expect("a log event should be present");
+        assert_eq!(event.attributes.get("component").and_then(|v| v.as_str()), Some("self"));
+        assert_eq!(event.attributes.get("key").and_then(|v| v.as_str()), Some("process"));
+        assert_eq!(event.log.as_ref().unwrap().severity, Some(Severity::Error));
+    }
+
+    #[test]
+    fn an_inactive_layer_captures_nothing() {
+        let registry = Registry::new();
+        registry.telemetry_for("x", "json", "transform");
+        // Never activated -- the default state, and what a config with no `internal` component
+        // or `logs: off` leaves it at forever.
+        let layer = TelemetryLayer::new();
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(target: "logit", component = "x", "should go nowhere");
+        });
+
+        let events = registry.drain(0);
+        assert!(find_log_event(&events).is_none(), "an inactive layer must capture nothing");
+    }
+
+    #[test]
+    fn a_strict_env_filter_does_not_suppress_capture() {
+        // The regression this pins: with `--log-level`/`LOGIT_LOG`'s `EnvFilter` installed
+        // globally (`registry().with(filter)`) rather than scoped to the stderr layer,
+        // `EnvFilter::register_callsite` returns `Interest::never()` for a `warn` callsite under
+        // `error` -- a verdict `tracing-core` caches at that callsite for the life of the process
+        // -- so `on_event` never runs at all and `internal: { logs: warn }` silently becomes
+        // `error`. This builds the same shape `logit-cli::main::init_logging` builds: the
+        // `EnvFilter` scoped to the rendering layer, `TelemetryLayer::capture_filter` on this one.
+        let registry = Registry::new();
+        registry.telemetry_for("x", "json", "transform");
+        let layer = TelemetryLayer::new();
+        layer.activate(registry.clone(), Severity::Warn, "self");
+
+        let subscriber = tracing_subscriber::registry()
+            .with(layer.with_filter(TelemetryLayer::capture_filter()))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::sink)
+                    .with_filter(tracing_subscriber::EnvFilter::new("error")),
+            );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "logit", component = "x", key = "bad_frame", "malformed input");
+        });
+
+        let events = registry.drain(0);
+        let event = find_log_event(&events)
+            .expect("a warn must still reach the pipeline under --log-level error");
+        let record = event.log.as_ref().unwrap();
+        assert_eq!(record.severity, Some(Severity::Warn));
+    }
+
+    #[test]
+    fn a_log_beyond_the_per_component_capacity_is_dropped_and_counted_not_grown() {
+        let registry = Registry::new();
+        registry.telemetry_for("noisy", "lua", "transform");
+        for i in 0..MAX_LOGS_PER_COMPONENT + 5 {
+            registry.push_log(
+                "noisy",
+                PendingLog {
+                    ts: i as i64,
+                    level: Severity::Warn,
+                    key: "k".to_string(),
+                    message: "m".to_string(),
+                },
+            );
+        }
+
+        let events = registry.drain(0);
+        let log_count = events.iter().filter(|e| e.log.is_some()).count();
+        assert_eq!(log_count, MAX_LOGS_PER_COMPONENT, "the cap, not one more");
+        let dropped = events
+            .iter()
+            .find(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("buffer_full"))
+            .expect("a buffer_full drop counter event should be present");
+        match &dropped.metrics[0].kind {
+            MetricKind::Counter(v) => assert_eq!(*v, 5.0),
+            other => panic!("expected Counter, got {other:?}"),
+        }
     }
 }

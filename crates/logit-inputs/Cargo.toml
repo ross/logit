@@ -48,3 +48,8 @@ libc.workspace = true
 # dependency -- `logit-inputs` still doesn't depend on `logit-transforms` for the library itself
 # (AGENTS.md's crate layout).
 logit-transforms.workspace = true
+# `internal.rs`'s own tests drive `logit_core::TelemetryLayer` through a real `tracing` event
+# (docs/plans/operator-surface.md, workstream D) -- test-only, `logit-inputs` itself never picks
+# a subscriber.
+tracing.workspace = true
+tracing-subscriber.workspace = true

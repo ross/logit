@@ -937,6 +937,8 @@ dependencies = [
  "socket2",
  "tokio",
  "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
