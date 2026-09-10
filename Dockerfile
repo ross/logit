@@ -30,6 +30,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /work/target/release/logit /usr/local/bin/logit
 
+# Only effective when the target config sets `admin.bind` (docs/plans/operator-surface.md,
+# docs/deploying.md) -- `logit ready` exits 1 with nothing listening otherwise, same as a
+# genuinely unready process would. Exec form, naming the binary explicitly: HEALTHCHECK's exec
+# form does not go through ENTRYPOINT below.
+HEALTHCHECK --interval=10s --timeout=2s --start-period=5s CMD ["logit", "ready"]
+
 USER logit
 ENTRYPOINT ["logit"]
 CMD ["--help"]

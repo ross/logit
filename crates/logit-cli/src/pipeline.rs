@@ -76,6 +76,7 @@ pub async fn run_pipelines(path: PathBuf) -> Result<(), RunError> {
         "starting"
     );
 
+    let admin_bind = config.admin.bind.clone();
     let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let (graph, specs, telemetry) = prepare(config, base_dir).map_err(RunError::Startup)?;
 
@@ -89,17 +90,37 @@ pub async fn run_pipelines(path: PathBuf) -> Result<(), RunError> {
         std::process::exit(130);
     });
 
-    // A `Readiness::disabled()` placeholder until workstream C's `admin:` block wires up the real
-    // channel and hands its receiver to the admin server.
-    let result = logit_pipeline::run_with_telemetry(
-        graph,
-        specs,
-        telemetry,
-        Readiness::disabled(),
-        shutdown_signal(),
-    )
-    .await;
+    // `admin.bind` set: bind its listener *synchronously*, here, before `run_with_telemetry` ever
+    // starts -- a bind failure is `RunError::Startup`, the same "fail before anything else spawns"
+    // guarantee `Input::bind`'s own pre-pass gives every ordinary listener. Not set: the
+    // `Readiness::disabled()` placeholder every test and every config without an `admin:` block
+    // already uses.
+    let (readiness, admin_server) = match admin_bind {
+        Some(bind) => {
+            let listener = tokio::net::TcpListener::bind(&bind)
+                .await
+                .with_context(|| format!("admin: binding '{bind}'"))
+                .map_err(RunError::Startup)?;
+            let (readiness, readiness_rx) = Readiness::channel();
+            // Deliberately *not* given a shutdown listener of its own. The drain that a signal
+            // starts is exactly the window `/readyz` has to answer `503 draining` in -- several
+            // seconds of sink flush and listener grace (`buffer.shutdown_grace`,
+            // `receive.shutdown_grace`) during which an orchestrator must be told "stop routing
+            // here, I am still finishing", not handed a refused connection it cannot tell from a
+            // crash. `abort()` below, once `run_with_telemetry` has already returned, is the sole
+            // teardown.
+            (readiness, Some(tokio::spawn(crate::admin::serve_on(listener, readiness_rx))))
+        }
+        None => (Readiness::disabled(), None),
+    };
+
+    let result =
+        logit_pipeline::run_with_telemetry(graph, specs, telemetry, readiness, shutdown_signal())
+            .await;
     kill_switch.abort();
+    if let Some(admin_server) = admin_server {
+        admin_server.abort();
+    }
     match &result {
         Ok(()) => tracing::info!(target: "logit", code = 0, "exiting"),
         Err(err) => {
@@ -880,7 +901,7 @@ mod tests {
         for (id, component) in components {
             map.insert(id.to_string(), component);
         }
-        Config { components: map }
+        Config { components: map, ..Default::default() }
     }
 
     #[test]

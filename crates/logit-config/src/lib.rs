@@ -18,11 +18,29 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
     #[serde(default)]
     #[schemars(schema_with = "non_empty_components_schema")]
     pub components: HashMap<String, Component>,
+    /// The readiness/liveness HTTP endpoint (`docs/plans/operator-surface.md`,
+    /// `docs/adr/admin-readiness-endpoint.md`) -- off unless `bind` is set. A top-level block, not
+    /// a component: it's process-level (one admin server per `logit run`, not per graph node), and
+    /// a component kind with no `sources` and no consumers would trip graph rule 7's "nothing
+    /// reads what it produces" check.
+    #[serde(default)]
+    pub admin: AdminConfig,
+}
+
+/// See [`Config::admin`]'s own doc comment. Every field defaults, so an omitted `admin:` block
+/// (today's universal case -- no shipped config sets one) is exactly "the admin server is off."
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct AdminConfig {
+    /// `host:port` to serve `/readyz`/`/healthz` on -- `None` (the default) means off. No TLS, by
+    /// design: this is a loopback/pod-local endpoint, not one exposed past the process's own
+    /// network namespace (`docs/deploying.md`).
+    pub bind: Option<String>,
 }
 
 fn non_empty_components_schema(generator: &mut SchemaGenerator) -> Schema {

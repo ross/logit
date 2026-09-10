@@ -38,8 +38,20 @@ tikv-jemallocator = { version = "0.6", optional = true }
 # filter and formatter (docs/plans/operator-surface.md).
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# `admin.rs`'s `/readyz`/`/healthz` server, and `logit ready`'s client -- already direct deps of
+# `logit-inputs`/`logit-outputs` at these exact versions; promoting them here adds no new crate
+# version to the graph (docs/plans/operator-surface.md, workstream C).
+bytes.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
 
 [dev-dependencies]
+# `admin_ready.rs`'s drain test needs a real SIGTERM (`Child::kill` sends SIGKILL, which has no
+# graceful path and therefore no drain to probe). Already a workspace dependency via
+# `logit-inputs`, so this adds no new crate to the graph.
+libc.workspace = true
 # `crates/logit-cli/tests/durable_buffer_restart.rs` implements `logit_pipeline::Input`/`Output`
 # test doubles directly, the same way `crates/logit-outputs`/`logit-inputs` implement the real
 # ones.

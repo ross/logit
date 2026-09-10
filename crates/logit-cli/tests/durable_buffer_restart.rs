@@ -133,7 +133,8 @@ fn graph_and_topology(disk_dir: std::path::PathBuf) -> (graph::Graph, DiskQueueC
             },
         },
     );
-    let graph = graph::resolve(Config { components }).expect("topology should resolve");
+    let graph = graph::resolve(Config { components, ..Default::default() })
+        .expect("topology should resolve");
     let disk_config = DiskQueueConfig {
         dir: disk_dir,
         max_bytes: 64 * 1024 * 1024,

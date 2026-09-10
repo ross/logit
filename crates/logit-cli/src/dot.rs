@@ -66,7 +66,7 @@ mod tests {
                 },
             },
         );
-        let dot = render(&Config { components });
+        let dot = render(&Config { components, ..Default::default() });
         assert!(dot.starts_with("digraph logit {"));
         assert!(dot.contains("\"in\""), "got: {dot}");
         assert!(dot.contains("\"out\""), "got: {dot}");
@@ -93,7 +93,7 @@ mod tests {
                 },
             },
         );
-        let dot = render(&Config { components });
+        let dot = render(&Config { components, ..Default::default() });
         assert!(dot.contains("\"missing\" -> \"out\";"), "got: {dot}");
     }
 }
