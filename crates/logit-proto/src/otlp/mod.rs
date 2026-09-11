@@ -463,7 +463,10 @@ mod tests {
     /// claim about itself: a hand-written OTLP/JSON literal describing the exact same span as
     /// [`OTLP_TRACE_REQUEST`] above must decode to the identical [`EventBatch`], through the
     /// completely separate [`json`] parsing path -- not merely "produces similar-looking output",
-    /// full structural equality.
+    /// full structural equality. `parentSpanId` is deliberately written as `null` here rather than
+    /// omitted: [`OTLP_TRACE_REQUEST`] encodes no `parent_span_id` field at all, so this proves a
+    /// producer that serializes "unset" as an explicit `null` decodes identically to one that omits
+    /// the key entirely, and to the protobuf encoding of the same span.
     const OTLP_TRACE_REQUEST_JSON: &[u8] = br#"{
         "resourceSpans": [{
             "scopeSpans": [{
@@ -471,6 +474,7 @@ mod tests {
                 "spans": [{
                     "traceId": "01010101010101010101010101010101",
                     "spanId": "0202020202020202",
+                    "parentSpanId": null,
                     "name": "fixture_span",
                     "startTimeUnixNano": "1",
                     "endTimeUnixNano": "2",
@@ -506,6 +510,7 @@ mod tests {
         );
         assert_eq!(proto_span.trace_id, json_span.trace_id);
         assert_eq!(proto_span.span_id, json_span.span_id);
+        assert_eq!(proto_span.parent_span_id, json_span.parent_span_id);
         assert_eq!(proto_span.name, json_span.name);
         assert_eq!(proto_span.status, json_span.status);
         assert_eq!(proto_span.events.len(), json_span.events.len());

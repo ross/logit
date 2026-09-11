@@ -140,6 +140,11 @@ fn number_data_point(v: &JsonValue) -> Result<pb::NumberDataPoint, CodecError> {
     })
 }
 
+// A `null` *element* is deliberately still an error, unlike a `null` field (see `super`'s module
+// doc): `bucketCounts`/`explicitBounds` are positional and length-coupled
+// (`bucket_counts.len() == explicit_bounds.len() + 1`, which `../metrics.rs` relies on to
+// reconstruct boundaries), so there is no "this element is absent" reading -- coercing a null to 0
+// would invent a real bucket observation out of a producer bug instead of surfacing it.
 fn u64_array(obj: &JsonMap, camel: &str, snake: &str, field: &str) -> Result<Vec<u64>, CodecError> {
     array_field(obj, camel, snake)?.iter().map(|x| parse_u64(x, field)).collect()
 }
@@ -318,6 +323,54 @@ mod tests {
                 assert!(s.is_monotonic);
             }
             other => panic!("expected Sum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_null_data_point_value_decodes_as_no_value() {
+        for body in [r#""asInt": null"#, r#""asDouble": null"#] {
+            let json = format!(
+                r#"{{"resourceMetrics": [{{"scopeMetrics": [{{"metrics": [{{
+                    "name": "m", "gauge": {{"dataPoints": [{{"timeUnixNano": "1", {body}}}]}}
+                }}]}}]}}]}}"#
+            );
+            let data = metrics_data(json.as_bytes())
+                .unwrap_or_else(|e| panic!("{body} should decode, got {e}"));
+            match &data.resource_metrics[0].scope_metrics[0].metrics[0].data {
+                Some(pb::metric::Data::Gauge(g)) => {
+                    assert_eq!(g.data_points[0].value, None, "{body} should leave value unset");
+                }
+                other => panic!("expected Gauge, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_null_bucket_count_is_rejected_with_a_message_naming_the_element() {
+        let json = br#"{"resourceMetrics": [{"scopeMetrics": [{"metrics": [{
+            "name": "m", "histogram": {"dataPoints": [{
+                "timeUnixNano": "1", "count": "3", "bucketCounts": ["1", null], "explicitBounds": [1.0]
+            }]}
+        }]}]}]}"#;
+        let err = metrics_data(json).unwrap_err().to_string();
+        assert!(err.contains("bucketCounts[]"), "error should name the element, got: {err}");
+        assert!(err.contains("null"), "error should show the offending value, got: {err}");
+    }
+
+    #[test]
+    fn a_null_bucket_counts_array_is_the_empty_list_not_an_error() {
+        let json = br#"{"resourceMetrics": [{"scopeMetrics": [{"metrics": [{
+            "name": "m", "histogram": {"dataPoints": [{
+                "timeUnixNano": "1", "count": "0", "bucketCounts": null, "explicitBounds": null
+            }]}
+        }]}]}]}"#;
+        let data = metrics_data(json).expect("a null bucketCounts field must decode as empty");
+        match &data.resource_metrics[0].scope_metrics[0].metrics[0].data {
+            Some(pb::metric::Data::Histogram(h)) => {
+                assert!(h.data_points[0].bucket_counts.is_empty());
+                assert!(h.data_points[0].explicit_bounds.is_empty());
+            }
+            other => panic!("expected Histogram, got {other:?}"),
         }
     }
 

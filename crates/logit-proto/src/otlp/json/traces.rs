@@ -175,6 +175,48 @@ mod tests {
     }
 
     #[test]
+    fn a_null_parent_span_id_decodes_as_no_parent_the_same_as_an_absent_one() {
+        let null_parent = br#"{"resourceSpans": [{"scopeSpans": [{"spans": [{
+            "traceId": "0102030405060708090a0b0c0d0e0f10",
+            "spanId": "0102030405060708",
+            "parentSpanId": null
+        }]}]}]}"#;
+        let absent_parent = br#"{"resourceSpans": [{"scopeSpans": [{"spans": [{
+            "traceId": "0102030405060708090a0b0c0d0e0f10",
+            "spanId": "0102030405060708"
+        }]}]}]}"#;
+        let with_null =
+            traces_data(null_parent).expect("a null parentSpanId must not fail the batch");
+        assert!(with_null.resource_spans[0].scope_spans[0].spans[0].parent_span_id.is_empty());
+        assert_eq!(with_null, traces_data(absent_parent).unwrap());
+    }
+
+    #[test]
+    fn a_null_trace_id_decodes_the_same_as_an_absent_one_and_is_left_to_downstream_to_reject() {
+        let with_null = br#"{"resourceSpans": [{"scopeSpans": [{"spans": [{
+            "traceId": null, "spanId": null, "name": "op"
+        }]}]}]}"#;
+        let absent = br#"{"resourceSpans": [{"scopeSpans": [{"spans": [{"name": "op"}]}]}]}"#;
+        let a = traces_data(with_null).expect("a null id must not fail this layer");
+        assert!(a.resource_spans[0].scope_spans[0].spans[0].trace_id.is_empty());
+        assert!(a.resource_spans[0].scope_spans[0].spans[0].span_id.is_empty());
+        assert_eq!(a, traces_data(absent).unwrap());
+    }
+
+    #[test]
+    fn a_null_trace_id_or_span_id_on_a_span_link_decodes_as_no_linked_span() {
+        let json = br#"{"resourceSpans": [{"scopeSpans": [{"spans": [{
+            "traceId": "0102030405060708090a0b0c0d0e0f10",
+            "spanId": "0102030405060708",
+            "links": [{"traceId": null, "spanId": null}]
+        }]}]}]}"#;
+        let data = traces_data(json).expect("a null link id must not fail the batch");
+        let link = &data.resource_spans[0].scope_spans[0].spans[0].links[0];
+        assert!(link.trace_id.is_empty());
+        assert!(link.span_id.is_empty());
+    }
+
+    #[test]
     fn snake_case_and_camel_case_agree() {
         let camel = br#"{"resourceSpans": [{"scopeSpans": [{"spans": [{
             "traceId": "0102030405060708090a0b0c0d0e0f10", "spanId": "0102030405060708",

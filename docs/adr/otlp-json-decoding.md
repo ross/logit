@@ -56,7 +56,7 @@ Three shapes were evaluated for producing `EventBatch`es from an OTLP/JSON reque
 `serde_json::Value` tree by hand into the existing `LogsData`/`TracesData`/`MetricsData` prost
 structs, then feeds them through the exact same decode functions the protobuf path uses. The new
 code is purely a dialect-parsing layer — camelCase-or-snake_case keys, hex-vs-base64 bytes,
-string-or-number 64-bit ints, enum name-or-number, "absent means default" — with no signal
+string-or-number 64-bit ints, enum name-or-number, "absent-or-null means default" — with no signal
 semantics of its own.
 
 Exposed as an inherent method, `OtlpDecoder::decode_signal_json`, not a `SignalDecoder` trait

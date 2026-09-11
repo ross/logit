@@ -54,10 +54,7 @@ fn log_record(v: &JsonValue) -> Result<pb::LogRecord, CodecError> {
         Some(x) => hex_bytes(x, 8, "spanId")?,
         None => Vec::new(),
     };
-    let body = match get(obj, "body", "body") {
-        None | Some(JsonValue::Null) => None,
-        Some(v) => Some(any_value(v)?),
-    };
+    let body = get(obj, "body", "body").map(any_value).transpose()?;
     Ok(pb::LogRecord {
         time_unix_nano: u64_field(obj, "timeUnixNano", "time_unix_nano")?,
         observed_time_unix_nano: u64_field(obj, "observedTimeUnixNano", "observed_time_unix_nano")?,
@@ -99,6 +96,17 @@ mod tests {
         assert_eq!(record.body.as_ref().unwrap().value, Some(
             crate::otlp::generated::opentelemetry::proto::common::v1::any_value::Value::StringValue("hi".to_string())
         ));
+    }
+
+    #[test]
+    fn a_null_trace_id_on_a_log_record_decodes_as_not_associated_with_a_trace() {
+        let json = br#"{"resourceLogs": [{"scopeLogs": [{"logRecords": [{
+            "timeUnixNano": "1", "traceId": null, "spanId": null, "body": {"stringValue": "hi"}
+        }]}]}]}"#;
+        let data = logs_data(json).expect("a null traceId must not fail the batch");
+        let record = &data.resource_logs[0].scope_logs[0].log_records[0];
+        assert!(record.trace_id.is_empty());
+        assert!(record.span_id.is_empty());
     }
 
     #[test]

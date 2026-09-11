@@ -8,7 +8,7 @@
 //! wrong length).
 //!
 //! **This module doc is the dialect table**, the same role `../mod.rs`'s module doc plays for wire
-//! types. Four rules, from the [OTLP spec](https://opentelemetry.io/docs/specs/otlp/):
+//! types. Five rules, from the [OTLP spec](https://opentelemetry.io/docs/specs/otlp/):
 //!
 //! - **Field names** are lowerCamelCase (`traceId`, `startTimeUnixNano`). The spec: *"The keys of
 //!   JSON objects are field names converted to lowerCamelCase. Original field names are not
@@ -27,6 +27,13 @@
 //!   Protobuf Encoding; the enum name strings MUST NOT be used"*). [`enum_field`] accepts the
 //!   proto enum name too (e.g. `"SPAN_KIND_SERVER"`) -- again leniency beyond the spec, for the
 //!   same reason snake_case keys are accepted.
+//! - **An explicit `null` is the same as an absent key** -- proto3 JSON's own rule (*"null is accepted
+//!   and treated as the default value"*), implemented once in [`get`] rather than at each field. This
+//!   is what makes `{"parentSpanId": null}` on a root span decode identically to the protobuf encoding
+//!   of that same span, which simply doesn't emit the field: producers in any language where "unset"
+//!   serializes as `null` rather than an omitted key are common, and a whole batch must not 400 over
+//!   one of them. A `null` *element inside an array* is a different thing and is still an error -- see
+//!   `metrics.rs`'s `u64_array`/`f64_array`.
 //!
 //! **`ExportTraceServiceRequest`/`ExportLogsServiceRequest`/`ExportMetricsServiceRequest` decode
 //! the same as `TracesData`/`LogsData`/`MetricsData`.** Both message shapes have exactly one field
@@ -65,9 +72,16 @@ fn malformed(msg: impl Into<String>) -> CodecError {
     CodecError::Malformed(msg.into())
 }
 
-/// The two-name lookup every field accessor goes through -- see the module doc's leniency note.
+/// The two-name lookup every field read in this module goes through -- see the module doc's
+/// leniency note, and its `null` rule: **an explicit `null` is reported as absent here, once**, so
+/// that neither an accessor below nor a hand-written call site has to remember proto3 JSON's "a
+/// `null` means the field's default" rule. Folding it in here rather than at each call site is what
+/// makes the rule unbypassable: a producer that serializes "unset" as `null` rather than omitting
+/// the key (Python's `json.dumps` of a `None`, a Go pointer field, a JS `undefined`-turned-`null`)
+/// gets the same decode as one that omits it, and as the protobuf encoding of the same message,
+/// which simply doesn't emit the field.
 fn get<'a>(obj: &'a JsonMap, camel: &str, snake: &str) -> Option<&'a JsonValue> {
-    obj.get(camel).or_else(|| obj.get(snake))
+    obj.get(camel).or_else(|| obj.get(snake)).filter(|v| !v.is_null())
 }
 
 fn require_object<'a>(v: &'a JsonValue, what: &str) -> Result<&'a JsonMap, CodecError> {
@@ -80,7 +94,7 @@ fn object_field<'a>(
     snake: &str,
 ) -> Result<Option<&'a JsonMap>, CodecError> {
     match get(obj, camel, snake) {
-        None | Some(JsonValue::Null) => Ok(None),
+        None => Ok(None),
         Some(JsonValue::Object(o)) => Ok(Some(o)),
         Some(_) => Err(malformed(format!("{camel} must be a JSON object"))),
     }
@@ -93,7 +107,7 @@ fn array_field<'a>(
     snake: &str,
 ) -> Result<&'a [JsonValue], CodecError> {
     match get(obj, camel, snake) {
-        None | Some(JsonValue::Null) => Ok(&[]),
+        None => Ok(&[]),
         Some(JsonValue::Array(a)) => Ok(a.as_slice()),
         Some(_) => Err(malformed(format!("{camel} must be an array"))),
     }
@@ -101,7 +115,7 @@ fn array_field<'a>(
 
 fn str_field(obj: &JsonMap, camel: &str, snake: &str) -> Result<String, CodecError> {
     match get(obj, camel, snake) {
-        None | Some(JsonValue::Null) => Ok(String::new()),
+        None => Ok(String::new()),
         Some(JsonValue::String(s)) => Ok(s.clone()),
         Some(_) => Err(malformed(format!("{camel} must be a string"))),
     }
@@ -109,7 +123,7 @@ fn str_field(obj: &JsonMap, camel: &str, snake: &str) -> Result<String, CodecErr
 
 fn bool_field(obj: &JsonMap, camel: &str, snake: &str) -> Result<bool, CodecError> {
     match get(obj, camel, snake) {
-        None | Some(JsonValue::Null) => Ok(false),
+        None => Ok(false),
         Some(JsonValue::Bool(b)) => Ok(*b),
         Some(_) => Err(malformed(format!("{camel} must be a boolean"))),
     }
@@ -131,7 +145,7 @@ fn parse_u64(v: &JsonValue, field: &str) -> Result<u64, CodecError> {
 
 fn u64_field(obj: &JsonMap, camel: &str, snake: &str) -> Result<u64, CodecError> {
     match get(obj, camel, snake) {
-        None | Some(JsonValue::Null) => Ok(0),
+        None => Ok(0),
         Some(v) => parse_u64(v, camel),
     }
 }
@@ -155,7 +169,7 @@ fn parse_i64(v: &JsonValue, field: &str) -> Result<i64, CodecError> {
 
 fn i32_field(obj: &JsonMap, camel: &str, snake: &str) -> Result<i32, CodecError> {
     match get(obj, camel, snake) {
-        None | Some(JsonValue::Null) => Ok(0),
+        None => Ok(0),
         Some(v) => {
             let i = parse_i64(v, camel)?;
             i32::try_from(i).map_err(|_| malformed(format!("{camel} must fit in 32 bits, got {i}")))
@@ -186,7 +200,7 @@ fn parse_f64(v: &JsonValue, field: &str) -> Result<f64, CodecError> {
 
 fn f64_field(obj: &JsonMap, camel: &str, snake: &str) -> Result<f64, CodecError> {
     match get(obj, camel, snake) {
-        None | Some(JsonValue::Null) => Ok(0.0),
+        None => Ok(0.0),
         Some(v) => parse_f64(v, camel),
     }
 }
@@ -197,7 +211,7 @@ fn f64_field(obj: &JsonMap, camel: &str, snake: &str) -> Result<f64, CodecError>
 /// `../metrics.rs` gets a value it was never sent.
 fn f64_field_opt(obj: &JsonMap, camel: &str, snake: &str) -> Result<Option<f64>, CodecError> {
     match get(obj, camel, snake) {
-        None | Some(JsonValue::Null) => Ok(None),
+        None => Ok(None),
         Some(v) => Ok(Some(parse_f64(v, camel)?)),
     }
 }
@@ -212,7 +226,7 @@ fn enum_field(
     from_str_name: impl Fn(&str) -> Option<i32>,
 ) -> Result<i32, CodecError> {
     match get(obj, camel, snake) {
-        None | Some(JsonValue::Null) => Ok(0),
+        None => Ok(0),
         Some(JsonValue::Number(n)) => {
             let i = n.as_i64().ok_or_else(|| malformed(format!("{camel} must be an integer")))?;
             i32::try_from(i)
@@ -229,7 +243,8 @@ fn enum_field(
 /// `Link`'s ids, and for a required id like `Span.traceId` the empty `Vec` this produces is
 /// rejected downstream by `../traces.rs`'s `ids::trace_id`/`ids::span_id`, the same generic
 /// wrong-length error the protobuf path already gives). A non-empty string must match
-/// `expected_len` exactly.
+/// `expected_len` exactly. Never actually sees a JSON `null` -- every call site reads its argument
+/// through [`get`], which already reports an explicit `null` as absent.
 fn hex_bytes(v: &JsonValue, expected_len: usize, field: &str) -> Result<Vec<u8>, CodecError> {
     let s = v.as_str().ok_or_else(|| malformed(format!("{field} must be a hex string")))?;
     if s.is_empty() {
@@ -277,10 +292,7 @@ fn base64_bytes(v: &JsonValue, field: &str) -> Result<Vec<u8>, CodecError> {
 fn key_value(v: &JsonValue) -> Result<pb::KeyValue, CodecError> {
     let obj = require_object(v, "a KeyValue")?;
     let key = str_field(obj, "key", "key")?;
-    let value = match get(obj, "value", "value") {
-        None | Some(JsonValue::Null) => None,
-        Some(v) => Some(any_value(v)?),
-    };
+    let value = get(obj, "value", "value").map(any_value).transpose()?;
     Ok(pb::KeyValue { key, value, key_strindex: 0 })
 }
 
@@ -427,6 +439,31 @@ mod tests {
             Some(pb::any_value::Value::ArrayValue(a)) => assert_eq!(a.values.len(), 2),
             other => panic!("expected ArrayValue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_null_any_value_oneof_arm_decodes_as_an_empty_any_value() {
+        for json in [
+            r#"{"stringValue": null}"#,
+            r#"{"boolValue": null}"#,
+            r#"{"intValue": null}"#,
+            r#"{"doubleValue": null}"#,
+            r#"{"arrayValue": null}"#,
+            r#"{"kvlistValue": null}"#,
+            r#"{"bytesValue": null}"#,
+        ] {
+            let v = obj(json);
+            let decoded = any_value(&v).unwrap_or_else(|e| panic!("{json} should decode, got {e}"));
+            assert_eq!(decoded.value, None, "{json} should decode as an empty AnyValue");
+        }
+    }
+
+    #[test]
+    fn a_null_attribute_value_decodes_as_an_empty_any_value() {
+        let v = obj(r#"{"key": "k", "value": null}"#);
+        let kv = key_value(&v).expect("a null attribute value must not fail");
+        assert_eq!(kv.key, "k");
+        assert_eq!(kv.value, None);
     }
 
     #[test]
