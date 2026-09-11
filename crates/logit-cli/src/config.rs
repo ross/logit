@@ -21,10 +21,15 @@ use std::path::Path;
 
 /// Reads, resolves, and deserializes the config file at `path`.
 pub fn load(path: &Path) -> anyhow::Result<Config> {
+    load_with(path, &|name| std::env::var(name).ok())
+}
+
+/// [`load`] with an injectable environment lookup, used by repository-wide config tests without
+/// mutating the test process's environment.
+fn load_with(path: &Path, lookup: &impl Fn(&str) -> Option<String>) -> anyhow::Result<Config> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config file {}", path.display()))?;
-    parse(&raw, &|name| std::env::var(name).ok())
-        .with_context(|| format!("parsing config file {}", path.display()))
+    parse(&raw, lookup).with_context(|| format!("parsing config file {}", path.display()))
 }
 
 /// The rest of [`load`], parameterized over the environment lookup so tests can exercise `!env`
@@ -215,6 +220,30 @@ fn scalar_from_env(raw: String) -> Value {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn every_shipped_config_loads_and_validates() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut configs = vec![root.join("demo/logit.yaml")];
+        configs.extend(
+            std::fs::read_dir(root.join("examples"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
+        );
+        configs.sort();
+
+        assert!(configs.len() > 1, "expected demo and example configs");
+        for path in configs {
+            let config = load_with(&path, &|name| match name {
+                "INFLUXDB_TOKEN" => Some("logit-test-token".to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|err| panic!("{} did not load: {err:#}", path.display()));
+            crate::pipeline::validate_semantics(config)
+                .unwrap_or_else(|err| panic!("{} did not validate: {err:#}", path.display()));
+        }
+    }
 
     /// A `lookup` backed by a plain map, so tests never touch the real process environment.
     fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {

@@ -12,7 +12,7 @@ jobs:
       # Same image family contributors build locally (Dockerfile.dev / ADR `containerized-development`); script/common.sh
       # detects $CI (set by GitHub Actions) and runs commands directly against it instead of
       # trying to `docker compose run` from inside a container.
-      image: docker.io/library/rust:1-bookworm
+      image: docker.io/library/rust:1.98.1-bookworm
     steps:
       - uses: actions/checkout@v4
 
@@ -25,7 +25,7 @@ jobs:
       - name: Install cargo tools
         uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
         with:
-          tool: cargo-nextest,cargo-deny,cargo-audit
+          tool: cargo-nextest@0.9.144,cargo-deny@0.20.2,cargo-audit@0.22.2
           fallback: none
 
       - uses: actions/cache@v4
