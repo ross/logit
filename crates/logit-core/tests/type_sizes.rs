@@ -18,8 +18,8 @@
 #![cfg(target_pointer_width = "64")]
 
 use logit_core::{
-    AttrMap, Event, LogRecord, MetricKind, MetricList, MetricRecord, Provenance, Resource,
-    SpanRecord, Symbol, TraceRef, Value,
+    AttrMap, DdSketch, Event, LogRecord, MetricKind, MetricList, MetricRecord, Provenance,
+    Resource, Samples, Scope, SpanExt, SpanRecord, Symbol, TraceRef, Value, SAMPLES_INLINE,
 };
 use std::mem::{size_of, size_of_val};
 
@@ -75,29 +75,52 @@ fn attr_map_pays_its_inline_capacity_whether_or_not_it_spills() {
     assert_eq!(size_of_val(&spilled), size_of::<AttrMap>());
 }
 
-/// `MetricKind` inlines a whole `sketches_ddsketch::DDSketch` in its `Distribution` variant (two
-/// `Store`s, each a `Vec` plus bookkeeping), which makes every `MetricRecord` pay for a sketch it
-/// almost never holds. Boxing that one variant is the single cheapest size win available; see
-/// `docs/design/memory.md`.
+/// `MetricKind` inlines either a whole `sketches_ddsketch::DDSketch` (`Distribution`) or a
+/// `SmallVec<[f64; SAMPLES_INLINE]>` (`Samples`) -- the two largest variants, deliberately sized to
+/// match. `size_of::<DdSketch>()` is 176 bytes (two `Store`s, each a `Vec` plus bookkeeping, and a
+/// `Config`), and `MetricKind::Distribution(DdSketch)` fits in exactly that many bytes with no
+/// separate discriminant byte: rustc niche-fills the outer enum's tag into spare bit patterns
+/// already present inside `DDSketch`'s own layout. That trick is specific to `DDSketch`'s layout,
+/// not available to `Samples`'s -- a `Samples` variant sized to exactly 176 bytes too would force a
+/// real discriminant on top, growing `MetricKind` to 184 (measured directly while choosing
+/// `SAMPLES_INLINE`, see `metric.rs`'s own doc comment on the constant). `SAMPLES_INLINE = 19`
+/// keeps `Samples` at 168 bytes, leaving exactly enough room for that discriminant to land inside
+/// the existing 176-byte envelope instead of growing it.
 #[test]
-fn metric_kind_is_sized_by_the_inlined_ddsketch() {
+fn metric_kind_is_sized_by_its_two_largest_variants() {
+    assert_eq!(
+        size_of::<DdSketch>(),
+        176,
+        "sketches_ddsketch::DDSketch inlined directly (no Box): two Stores (a Vec plus \
+         bookkeeping each) and a Config"
+    );
+    assert_eq!(
+        size_of::<Samples>(),
+        168,
+        "SmallVec<[f64; SAMPLES_INLINE]> (max(24, SAMPLES_INLINE * 8 + 8) under the union \
+         feature) plus an 8-byte sample_rate: f64"
+    );
     assert_eq!(
         size_of::<MetricKind>(),
         176,
-        "almost entirely the `Distribution` variant's inlined DDSketch: two `Store`s (a Vec plus \
-         bookkeeping each) and a Config. Counter/Gauge need 8 bytes and pay 176."
+        "sized by the larger of its two big variants (Distribution's inlined DDSketch, at 176) \
+         plus room for a real discriminant that Samples's own 168-byte payload leaves inside that \
+         envelope -- every other variant (Sum/Gauge/GaugeDelta/SetMembers/Set/Histogram/\
+         ExponentialHistogram/Summary) is far smaller and pays the same 176 regardless"
     );
     assert_eq!(
         size_of::<MetricRecord>(),
-        184,
-        "MetricKind + a Symbol + a niche-free Option<Symbol>"
+        224,
+        "MetricKind (176) + name: Symbol (4) + unit: Option<Symbol> (4) + description: \
+         Option<Symbol> (4, 4 bytes padding to the next i64-aligned field) + start_timestamp: i64 \
+         (8) + exemplars: Vec<Exemplar> (24)"
     );
     assert_eq!(
         size_of::<MetricList>(),
-        192,
-        "SmallVec<[MetricRecord; 1]>: the inline record, plus 8 bytes of capacity-and-\
+        232,
+        "SmallVec<[MetricRecord; 1]>: the inline record (224), plus 8 bytes of capacity-and-\
          discriminant overhead (smallvec's `union` feature, enabled workspace-wide in \
-         Cargo.toml, saved the other 8)"
+         Cargo.toml)"
     );
 }
 
@@ -115,11 +138,55 @@ fn trace_ref_is_sized_by_its_two_id_arrays_plus_a_span_discriminant() {
     assert_eq!(size_of::<Option<TraceRef>>(), 26, "niche-filled through Option<[u8;8]>'s tag");
 }
 
+/// `SpanExt` is boxed on `SpanRecord` specifically so the overwhelmingly common span (no status
+/// message, no `tracestate`, nothing dropped) doesn't pay for it inline -- confirm both halves of
+/// that trade: the box itself is pointer-sized and niche-free (`None` needs no separate
+/// discriminant), and `SpanExt` on its own is worth boxing at all.
+#[test]
+fn span_ext_is_boxed_to_a_niche_free_pointer() {
+    assert_eq!(
+        size_of::<SpanExt>(),
+        80,
+        "status_message: Option<Bytes> (32) + trace_state: Option<Bytes> (32) + three u32 \
+         dropped counts (12, padded to 16 for Bytes's 8-byte alignment)"
+    );
+    assert_eq!(
+        size_of::<Option<Box<SpanExt>>>(),
+        8,
+        "Box's non-null pointer niche absorbs the None case"
+    );
+}
+
+/// `Scope` -- the batch-level OTLP instrumentation scope (`docs/adr/lossless-transit.md`). Two
+/// `Bytes` (32 each) for `name`/`version`, the `AttrMap` (392), a `u32` `dropped_attributes_count`,
+/// and an `Option<Bytes>` `schema_url` (32, no niche: `Bytes` carries no spare bit pattern to fill
+/// with `None`, so this costs a real discriminant, padded to `Bytes`'s 8-byte alignment).
+#[test]
+fn scope_size() {
+    assert_eq!(size_of::<Scope>(), 496);
+}
+
 #[test]
 fn record_types() {
-    assert_eq!(size_of::<LogRecord>(), 72, "message: Value (40) + Option<TraceRef> (32)");
-    assert_eq!(size_of::<SpanRecord>(), 136);
-    assert_eq!(size_of::<Resource>(), size_of::<AttrMap>());
+    assert_eq!(
+        size_of::<LogRecord>(),
+        88,
+        "message: Value (40) + severity: Option<Severity> (1, niche-free) + body_format: \
+         BodyFormat (1) + trace: Option<TraceRef> (26) + event_name: Option<Symbol> (4) + \
+         observed_timestamp: i64 (8) + dropped_attributes_count: u32 (4), plus alignment padding"
+    );
+    assert_eq!(
+        size_of::<SpanRecord>(),
+        144,
+        "the original 136-byte record plus flags: u32 (4, padded to 8) and ext: \
+         Option<Box<SpanExt>> (8, niche-free per span_ext_is_boxed_to_a_niche_free_pointer)"
+    );
+    assert_eq!(
+        size_of::<Resource>(),
+        432,
+        "AttrMap (392) + dropped_attributes_count: u32 (4, \
+        padded) + schema_url: Option<Bytes> (32, no niche)"
+    );
 
     // Both `Option`s are free: `Severity` and `SpanKind` are small field-less enums, so their
     // spare discriminants absorb the `None` case. Worth asserting rather than assuming -- adding
@@ -131,17 +198,14 @@ fn record_types() {
 /// The number that matters: what one event costs to move between two pipeline nodes, and to deep-
 /// clone for each extra fan-out consumer. `docs/design/memory.md` breaks this down term by term
 /// and lists what could be reclaimed.
-///
-/// Note what this means for the cheap cases: a bare log line with two attributes and a statsd
-/// counter with three tags both cost this same 800 bytes to move, because `AttrMap`'s inline
-/// capacity and `MetricKind`'s inlined sketch are paid unconditionally.
 #[test]
 fn event_size() {
     assert_eq!(
         size_of::<Event>(),
-        800,
-        "776 (post-`union`-feature baseline) + the 24 bytes LogRecord::trace added (48 -> 72, \
-         see record_types) -- see docs/adr/log-record-trace-context.md"
+        864,
+        "800 (pre-lossless-transit-v2 baseline) + the 16 bytes LogRecord grew by (72 -> 88) + \
+         the 8 bytes SpanRecord grew by (136 -> 144), both niche-free through their enclosing \
+         Option -- see docs/adr/metrics-model-v2.md and record_types above"
     );
 
     // The breakdown, asserted so it can't drift out of sync with the total above.
@@ -151,4 +215,12 @@ fn event_size() {
         + size_of::<MetricList>()
         + size_of::<Option<SpanRecord>>();
     assert_eq!(sum, size_of::<Event>(), "Event should have no padding beyond its fields");
+}
+
+/// `SAMPLES_INLINE` is a measured constant, not an arbitrary one -- pin its value directly so a
+/// future change to it (or to `Samples`'s other field) is a deliberate, reviewed edit here, not a
+/// silent drift.
+#[test]
+fn samples_inline_is_the_measured_constant() {
+    assert_eq!(SAMPLES_INLINE, 19);
 }

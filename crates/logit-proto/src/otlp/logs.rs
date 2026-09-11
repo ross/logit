@@ -179,7 +179,21 @@ pub(crate) fn decode_log_record(record: pb::LogRecord, mut attrs: AttrMap) -> Ev
     // flags; the rest is reserved. Lenient by construction -- see the module doc.
     let trace =
         TraceRef::from_bytes(&record.trace_id, &record.span_id, (record.flags & 0xFF) as u8);
-    Event::log(timestamp, attrs, LogRecord { message, severity, body_format, trace })
+    Event::log(
+        timestamp,
+        attrs,
+        LogRecord {
+            message,
+            severity,
+            body_format,
+            trace,
+            // Still dropped, documented, not errors -- see the module doc's closing note. W4
+            // maps these.
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -241,6 +255,9 @@ mod tests {
                     severity: None,
                     body_format: format,
                     trace: None,
+                    event_name: None,
+                    observed_timestamp: 0,
+                    dropped_attributes_count: 0,
                 },
             );
             let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
@@ -264,6 +281,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
@@ -290,6 +310,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
@@ -353,6 +376,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
@@ -369,6 +395,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         encode_log_record(&event, event.log.as_ref().unwrap())
@@ -468,6 +497,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         event.span = Some(SpanRecord {
@@ -480,6 +512,8 @@ mod tests {
             events: Vec::new(),
             links: Vec::new(),
             end_timestamp: 0,
+            flags: 0,
+            ext: None,
         });
         let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
         assert_eq!(encoded.trace_id, [3; 16].to_vec());
@@ -497,6 +531,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: Some(TraceRef { trace_id: [9; 16], span_id: None, flags: 0 }),
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         event.span = Some(SpanRecord {
@@ -509,6 +546,8 @@ mod tests {
             events: Vec::new(),
             links: Vec::new(),
             end_timestamp: 0,
+            flags: 0,
+            ext: None,
         });
         let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
         assert_eq!(

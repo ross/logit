@@ -69,7 +69,13 @@ fn encode_span_event(event: &SpanEvent) -> pb::span::Event {
 fn decode_span_event(event: pb::span::Event) -> SpanEvent {
     let mut attributes = AttrMap::new();
     common::key_values_into_attrs(event.attributes, &mut attributes);
-    SpanEvent { timestamp: event.time_unix_nano as i64, name: Value::str(event.name), attributes }
+    SpanEvent {
+        timestamp: event.time_unix_nano as i64,
+        name: Value::str(event.name),
+        attributes,
+        // W4 maps this; decode fills the default.
+        dropped_attributes_count: 0,
+    }
 }
 
 fn encode_span_link(link: &SpanLink) -> pb::span::Link {
@@ -88,7 +94,15 @@ fn decode_span_link(link: pb::span::Link) -> Result<SpanLink, CodecError> {
     let span_id = ids::span_id(&link.span_id)?;
     let mut attributes = AttrMap::new();
     common::key_values_into_attrs(link.attributes, &mut attributes);
-    Ok(SpanLink { trace_id, span_id, attributes })
+    // `flags`/`trace_state`/`dropped_attributes_count` -- W4 maps these; decode fills defaults.
+    Ok(SpanLink {
+        trace_id,
+        span_id,
+        attributes,
+        flags: 0,
+        trace_state: None,
+        dropped_attributes_count: 0,
+    })
 }
 
 /// `trace_id`/`span_id` length validation, shared by a `Span` and its `Link`s -- OTLP requires
@@ -171,6 +185,10 @@ pub(crate) fn decode_span(span: pb::Span, mut attrs: AttrMap) -> Result<Event, C
         events: span.events.into_iter().map(decode_span_event).collect(),
         links,
         end_timestamp: span.end_time_unix_nano as i64,
+        // `flags`/`ext` (status message aside, which already rides the `otel.status_message`
+        // attribute above) -- W4 maps these; decode fills defaults.
+        flags: 0,
+        ext: None,
     };
     Ok(Event::span(span.start_time_unix_nano as i64, attrs, record))
 }
@@ -196,9 +214,19 @@ mod tests {
                 timestamp: 100,
                 name: Value::str("checkpoint"),
                 attributes: event_attrs,
+                dropped_attributes_count: 0,
             }],
-            links: vec![SpanLink { trace_id: [8; 16], span_id: [10; 8], attributes: link_attrs }],
+            links: vec![SpanLink {
+                trace_id: [8; 16],
+                span_id: [10; 8],
+                attributes: link_attrs,
+                flags: 0,
+                trace_state: None,
+                dropped_attributes_count: 0,
+            }],
             end_timestamp: 200,
+            flags: 0,
+            ext: None,
         };
         let event = Event::span(50, AttrMap::new(), record.clone());
         (event, record)
@@ -251,6 +279,8 @@ mod tests {
             events: Vec::new(),
             links: Vec::new(),
             end_timestamp: 10,
+            flags: 0,
+            ext: None,
         };
         // Decode: an incoming Status.message has nowhere to live but an attribute.
         let mut pb_span = encode_span(&Event::span(0, AttrMap::new(), span.clone()), &span);

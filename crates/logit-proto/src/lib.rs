@@ -69,7 +69,7 @@ pub trait Decoder {
         let received_at = now_nanos();
         let mut events = Vec::new();
         let resource = self.decode_into(bytes, received_at, &mut events)?;
-        Ok(EventBatch { resource, events })
+        Ok(EventBatch { resource, scope: None, events })
     }
 }
 

@@ -182,7 +182,7 @@ fn decode_resource_logs(rl: logs_pb::ResourceLogs) -> EventBatch {
             events.push(logs::decode_log_record(record, base_attrs.clone()));
         }
     }
-    EventBatch { resource: Arc::new(resource), events }
+    EventBatch { resource: Arc::new(resource), scope: None, events }
 }
 
 fn decode_resource_spans(rs: trace_pb::ResourceSpans) -> Result<EventBatch, CodecError> {
@@ -194,7 +194,7 @@ fn decode_resource_spans(rs: trace_pb::ResourceSpans) -> Result<EventBatch, Code
             events.push(traces::decode_span(span, base_attrs.clone())?);
         }
     }
-    Ok(EventBatch { resource: Arc::new(resource), events })
+    Ok(EventBatch { resource: Arc::new(resource), scope: None, events })
 }
 
 impl OtlpDecoder {
@@ -207,7 +207,7 @@ impl OtlpDecoder {
                 events.extend(metrics::decode_metric(metric, &base_attrs, &self.telemetry));
             }
         }
-        EventBatch { resource: Arc::new(resource), events }
+        EventBatch { resource: Arc::new(resource), scope: None, events }
     }
 }
 
@@ -280,7 +280,7 @@ mod tests {
     use logit_core::{AttrMap, Event, LogRecord, MetricKind, MetricRecord, Resource, Value};
 
     fn batch(events: Vec<Event>) -> EventBatch {
-        EventBatch { resource: Arc::new(Resource::default()), events }
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
     }
 
     #[test]
@@ -293,16 +293,15 @@ mod tests {
                 severity: None,
                 body_format: logit_core::BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let metric = Event::metric(
             2,
             AttrMap::new(),
-            MetricRecord {
-                name: logit_core::interner::intern("m"),
-                kind: MetricKind::Counter(1.0),
-                unit: None,
-            },
+            MetricRecord::new(logit_core::interner::intern("m"), MetricKind::counter(1.0)),
         );
         let span = Event::span(
             3,
@@ -317,6 +316,8 @@ mod tests {
                 events: Vec::new(),
                 links: Vec::new(),
                 end_timestamp: 4,
+                flags: 0,
+                ext: None,
             },
         );
 
@@ -356,6 +357,8 @@ mod tests {
                 events: Vec::new(),
                 links: Vec::new(),
                 end_timestamp: 2,
+                flags: 0,
+                ext: None,
             },
         );
         let span_b = Event::span(
@@ -371,15 +374,25 @@ mod tests {
                 events: Vec::new(),
                 links: Vec::new(),
                 end_timestamp: 2,
+                flags: 0,
+                ext: None,
             },
         );
 
         let mut encoder = OtlpEncoder::new();
         let bytes_a = encoder
-            .encode_signals(&EventBatch { resource: Arc::new(resource_a), events: vec![span_a] })
+            .encode_signals(&EventBatch {
+                resource: Arc::new(resource_a),
+                scope: None,
+                events: vec![span_a],
+            })
             .unwrap();
         let bytes_b = encoder
-            .encode_signals(&EventBatch { resource: Arc::new(resource_b), events: vec![span_b] })
+            .encode_signals(&EventBatch {
+                resource: Arc::new(resource_b),
+                scope: None,
+                events: vec![span_b],
+            })
             .unwrap();
 
         // Hand-assemble one TracesData carrying both ResourceSpans, the shape a batching

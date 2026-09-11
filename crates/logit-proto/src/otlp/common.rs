@@ -161,7 +161,7 @@ pub(crate) fn pb_to_resource(
     if let Some(resource) = resource {
         key_values_into_attrs(resource.attributes, &mut attrs);
     }
-    Resource { attributes: attrs }
+    Resource { attributes: attrs, dropped_attributes_count: 0, schema_url: None }
 }
 
 #[cfg(test)]

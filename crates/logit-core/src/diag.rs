@@ -210,8 +210,8 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].attributes.get("key").and_then(|v| v.as_str()), Some("parse_failure"));
         match &events[0].metrics[0].kind {
-            MetricKind::Counter(v) => assert_eq!(*v, 10.0),
-            other => panic!("expected Counter, got {other:?}"),
+            MetricKind::Sum(s) => assert_eq!(s.value, 10.0),
+            other => panic!("expected Sum, got {other:?}"),
         }
     }
 
