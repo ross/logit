@@ -11,6 +11,7 @@ New ADR checklist: copy `TEMPLATE.md` to `docs/adr/<slug>.md`, fill in `created`
 
 | ADR | Created | Updated |
 |---|---|---|
+| [Metrics model v2: `Sum` replaces `Counter`, raw/summarized pairs, boxed span fidelity, batch-level `Scope`](metrics-model-v2.md) | 2026-09-11 | 2026-09-11 |
 | [Lossless like-protocol transit: the internal model is a superset of every supported wire protocol](lossless-transit.md) | 2026-09-10 | 2026-09-10 |
 | [Browser tracing: the real OTel-JS SDK, `addLink` for sub-resources, and living with document-load's parent (not link) behaviour](browser-tracing-sdk.md) | 2026-09-10 | 2026-09-10 |
 | [OTLP/JSON decoding: hand-written against `serde_json::Value`, not generated](otlp-json-decoding.md) | 2026-09-10 | 2026-09-10 |
@@ -38,10 +39,10 @@ New ADR checklist: copy `TEMPLATE.md` to `docs/adr/<slug>.md`, fill in `created`
 | [`otlp_out`/`otlp_in` gzip: client never accepts a compressed response, server bounds decompressed size](otlp-compression-and-decompression-bounds.md) | 2026-09-03 | 2026-09-03 |
 | [Signal filtering is two transform components, not a sink field](signal-filtering-components.md) | 2026-09-03 | 2026-09-03 |
 | [Syslog egress: format, transport, and header-field precedence](syslog-output.md) | 2026-09-02 | 2026-09-02 |
-| [Relative gauge adjustments (`+`/`-` in statsd)](relative-gauge-adjustments.md) | 2026-09-02 | 2026-09-02 |
+| [Relative gauge adjustments (`+`/`-` in statsd)](relative-gauge-adjustments.md) | 2026-09-02 | 2026-09-11 |
 | [Internal span emission, one span per node-visit, and deterministic-on-`trace_id` sampling](internal-span-emission-and-deterministic-sampling.md) | 2026-09-02 | 2026-09-02 |
 | [Hand-rolled unary gRPC over `hyper`, not `tonic`](hand-rolled-grpc-over-hyper.md) | 2026-09-02 | 2026-09-02 |
-| [Decoupled listener I/O](decoupled-listener-io.md) | 2026-09-02 | 2026-09-02 |
+| [Decoupled listener I/O](decoupled-listener-io.md) | 2026-09-02 | 2026-09-11 |
 | [Committed, pre-generated OTLP protobuf types; no `protoc` in any build path](committed-pregenerated-otlp-protobuf.md) | 2026-09-02 | 2026-09-02 |
 | [Buffered, decoupled sink delivery](buffered-sink-delivery.md) | 2026-09-01 | 2026-09-02 |
 | [Propagate real trace context on `Delivered`, for the node kinds with one unambiguous parent](trace-context-propagation-on-delivered.md) | 2026-09-01 | 2026-09-01 |

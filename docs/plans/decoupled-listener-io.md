@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-02
+updated: 2026-09-11
 ---
 
 # Closing plan: decoupled listener I/O
@@ -197,6 +197,9 @@ socket read.
 fn decode_into(&mut self, bytes: Bytes, received_at: i64, out: &mut Vec<Event>)
     -> Result<Arc<Resource>, CodecError>;
 ```
+
+(later widened to return `(Arc<Resource>, Option<Arc<Scope>>)` once `EventBatch` gained a
+batch-level scope, [ADR `metrics-model-v2`](../adr/metrics-model-v2.md))
 
 with a provided default `decode(&mut self, bytes: Bytes) -> Result<EventBatch, CodecError>`
 stamping "now" and calling `decode_into` with a fresh `Vec::new()`. This is what kept the change

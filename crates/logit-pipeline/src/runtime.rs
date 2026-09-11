@@ -16,7 +16,7 @@ use crate::queue::{SinkStore, SinkStoreConfig};
 use crate::readiness::NodeState;
 use crate::{Fanout, Input, InputRuntimeConfig, Output, Readiness, Transform};
 use anyhow::Context;
-use logit_core::{Diagnostics, EventBatch, Resource, SpanKind, Telemetry};
+use logit_core::{Diagnostics, EventBatch, Resource, Scope, SpanKind, Telemetry};
 use logit_script::{ProcessOutcome, ScriptWorker};
 use std::collections::HashMap;
 use std::future::Future;
@@ -1224,7 +1224,10 @@ pub fn process_batch(
 
     // `map_resource` before any event reaches `process`, per `Transform::map_resource`'s doc
     // comment -- `None` (the common case) moves the incoming `Arc` straight through with no
-    // clone; `Some` substitutes it for both `process`'s argument and the outgoing batch.
+    // clone; `Some` substitutes it for both `process`'s argument and the outgoing batch. `scope`
+    // is read out first since it has no analogous `map_scope` hook to consult -- it always rides
+    // straight through onto the outgoing batch unchanged.
+    let scope = batch.scope.clone();
     let resource = transform.map_resource(&batch.resource).unwrap_or(batch.resource);
 
     let process_timer = telemetry.timer("logit.component.process.duration");
@@ -1247,7 +1250,7 @@ pub fn process_batch(
     if out.is_empty() {
         None
     } else {
-        Some(EventBatch { resource, events: out })
+        Some(EventBatch { resource, scope, events: out })
     }
 }
 
@@ -1299,7 +1302,11 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
             span.links(links);
             events.push(event);
         }
-        fanout.send_with_own_context(EventBatch { resource, events }, ctx).await;
+        // `scope: None` -- `Transform::flush` groups only by resource (its per-resource windowing,
+        // `docs/adr/aggregation-window-semantics.md`), with no analogous per-scope key to carry
+        // through; same reasoning as `run_flush`'s own doc comment for why there's no single
+        // incoming batch's identity to inherit here either.
+        fanout.send_with_own_context(EventBatch { resource, scope: None, events }, ctx).await;
     }
     span.events(total_events);
 }
@@ -1350,6 +1357,11 @@ fn run_lua(
 
     let mut next_flush = configured_interval.map(|interval| tokio::time::Instant::now() + interval);
     let mut last_resource = Arc::new(Resource::default());
+    // Mirrors `last_resource`'s "whichever batch was last seen" approximation for `flush_now`'s
+    // benefit -- a Lua `flush()` has no scope-writing hook analogous to `resource`'s
+    // (`crates/logit-script/src/resource.rs`), so this is never overwritten by the script itself,
+    // only ever updated from whatever scope the most recently processed batch carried.
+    let mut last_scope: Option<Arc<Scope>> = None;
 
     // Mints its own root and records this node's `flush` span directly (rather than going
     // through `fanout.send_blocking`, which now only ever mints a root for a genuine listener --
@@ -1366,6 +1378,7 @@ fn run_lua(
     let flush_now = |diag: &mut Diagnostics,
                      worker: &ScriptWorker,
                      resource: &mut Arc<Resource>,
+                     scope: &Option<Arc<Scope>>,
                      fanout: &Fanout| {
         // Empty provenance in, same reasoning as `run_flush`'s own doc comment: a Lua `flush()`
         // is a fresh emission with no single incoming batch to inherit `origin`/`previous` from,
@@ -1402,7 +1415,7 @@ fn run_lua(
                 telemetry.count("logit.component.flush.events", events.len() as f64, &[]);
                 span.events(events.len() as u64);
                 fanout.send_blocking_with_own_context(
-                    EventBatch { resource: resource.clone(), events },
+                    EventBatch { resource: resource.clone(), scope: scope.clone(), events },
                     ctx,
                 );
             }
@@ -1419,7 +1432,7 @@ fn run_lua(
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
-                flush_now(&mut diag, &worker, &mut last_resource, &fanout);
+                flush_now(&mut diag, &worker, &mut last_resource, &last_scope, &fanout);
                 let interval = configured_interval
                     .expect("next_flush is only ever Some for a component with an interval");
                 next_flush = Some(advance_flush_deadline(deadline, now_instant, interval));
@@ -1443,7 +1456,7 @@ fn run_lua(
         };
         let Some(batch) = batch else {
             if next_flush.is_some() {
-                flush_now(&mut diag, &worker, &mut last_resource, &fanout);
+                flush_now(&mut diag, &worker, &mut last_resource, &last_scope, &fanout);
             }
             return;
         };
@@ -1543,9 +1556,13 @@ fn run_lua(
         // `map_resource`-shaped contract `process_batch` (above) gives native transforms.
         let resource = worker.take_resource().unwrap_or(batch.resource);
         last_resource = resource.clone();
+        last_scope = batch.scope.clone();
         if !out.is_empty() {
             span.events(out.len() as u64);
-            fanout.send_blocking_with_own_context(EventBatch { resource, events: out }, ctx);
+            fanout.send_blocking_with_own_context(
+                EventBatch { resource, scope: batch.scope, events: out },
+                ctx,
+            );
         }
     }
 }
@@ -1703,7 +1720,7 @@ mod tests {
         Event::metric(
             0,
             AttrMap::new(),
-            MetricRecord { name: intern(name), kind: MetricKind::Counter(value), unit: None },
+            MetricRecord::new(intern(name), MetricKind::counter(value)),
         )
     }
 
@@ -1752,6 +1769,7 @@ mod tests {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
 
@@ -1849,6 +1867,7 @@ mod tests {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
 
@@ -1888,11 +1907,7 @@ mod tests {
     impl Transform for MutatingTransform {
         fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
             use logit_core::{interner::intern, MetricKind, MetricRecord};
-            event.metrics.push(MetricRecord {
-                name: intern("extra"),
-                kind: MetricKind::Counter(1.0),
-                unit: None,
-            });
+            event.metrics.push(MetricRecord::new(intern("extra"), MetricKind::counter(1.0)));
             Some(event)
         }
     }
@@ -1923,11 +1938,12 @@ mod tests {
     fn process_batch_uses_map_resources_substituted_resource_for_the_outgoing_batch() {
         let mut attrs = AttrMap::new();
         attrs.insert("service.name", "mapped");
-        let replacement = Arc::new(Resource { attributes: attrs });
+        let replacement = Arc::new(Resource { attributes: attrs, ..Default::default() });
         let mut transform = ResourceMappingTransform { replacement: replacement.clone() };
 
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![Event::empty(0, AttrMap::new())],
         };
         let telemetry = Registry::new().telemetry_for("x", "x", "x");
@@ -1947,6 +1963,7 @@ mod tests {
         let resource = Arc::new(Resource::default());
         let batch = EventBatch {
             resource: resource.clone(),
+            scope: None,
             events: vec![Event::empty(0, AttrMap::new())],
         };
         let telemetry = Registry::new().telemetry_for("x", "x", "x");
@@ -2016,6 +2033,7 @@ mod tests {
         let (tx_b, rx_b) = std::sync::mpsc::channel();
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
 
@@ -2181,6 +2199,7 @@ mod tests {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
 
@@ -2328,6 +2347,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
 
@@ -2438,6 +2458,7 @@ mod tests {
         let fanout = Fanout::new(vec![tx]);
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
 
@@ -2464,6 +2485,7 @@ mod tests {
         let fanout = Fanout::new(vec![tx_a, tx_b]);
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
 
@@ -2533,6 +2555,7 @@ mod tests {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
 
@@ -2577,8 +2600,8 @@ mod tests {
                     return None;
                 }
                 e.metrics.iter().find_map(|m| match &m.kind {
-                    MetricKind::Counter(v) if logit_core::interner::resolve(m.name) == name => {
-                        Some(*v)
+                    MetricKind::Sum(s) if logit_core::interner::resolve(m.name) == name => {
+                        Some(s.value)
                     }
                     _ => None,
                 })
@@ -2640,6 +2663,7 @@ mod tests {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
 
@@ -2697,8 +2721,8 @@ mod tests {
                     }
                 }
                 e.metrics.iter().find_map(|m| match &m.kind {
-                    MetricKind::Counter(v) if logit_core::interner::resolve(m.name) == name => {
-                        Some(*v)
+                    MetricKind::Sum(s) if logit_core::interner::resolve(m.name) == name => {
+                        Some(s.value)
                     }
                     _ => None,
                 })
@@ -2769,6 +2793,7 @@ mod tests {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
 
@@ -2872,6 +2897,7 @@ mod tests {
         let (result_tx, _result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0), counter_event("hits", 2.0)],
         };
 
@@ -2973,6 +2999,7 @@ mod tests {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0), counter_event("hits", 2.0)],
         };
 
@@ -3279,6 +3306,7 @@ mod tests {
         let batches: Vec<EventBatch> = (0..5)
             .map(|i| EventBatch {
                 resource: Arc::new(Resource::default()),
+                scope: None,
                 events: vec![counter_event("hits", i as f64)],
             })
             .collect();
@@ -3340,10 +3368,10 @@ mod tests {
                 .expect("every batch should eventually be delivered once the gate opens")
                 .expect("the channel should not have closed");
             match &received.events[0].metrics[0].kind {
-                MetricKind::Counter(v) => {
-                    assert_eq!(*v, i as f64, "batches should still be delivered in order")
+                MetricKind::Sum(s) => {
+                    assert_eq!(s.value, i as f64, "batches should still be delivered in order")
                 }
-                other => panic!("expected Counter, got {other:?}"),
+                other => panic!("expected Sum, got {other:?}"),
             }
         }
 
@@ -3386,6 +3414,7 @@ mod tests {
 
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
@@ -3447,6 +3476,7 @@ mod tests {
 
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
@@ -3510,6 +3540,7 @@ mod tests {
         let batches: Vec<EventBatch> = (0..5)
             .map(|i| EventBatch {
                 resource: Arc::new(Resource::default()),
+                scope: None,
                 events: vec![counter_event("hits", i as f64)],
             })
             .collect();
@@ -3619,6 +3650,7 @@ mod tests {
     fn one_event_batch(value: f64) -> Arc<EventBatch> {
         Arc::new(EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", value)],
         })
     }
@@ -4006,8 +4038,8 @@ mod tests {
         async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
             let _ = self.attempted.send(());
             let value = match &batch.events[0].metrics[0].kind {
-                MetricKind::Counter(v) => *v,
-                other => panic!("expected Counter, got {other:?}"),
+                MetricKind::Sum(s) => s.value,
+                other => panic!("expected Sum, got {other:?}"),
             };
             let fault = if value == 2.0 { Fault::Ambiguous } else { Fault::Permanent };
             Err(anyhow::anyhow!("simulated failure for batch {value}")).context(fault)
@@ -4196,6 +4228,7 @@ mod tests {
             .send(Delivered::Owned(
                 EventBatch {
                     resource: Arc::new(Resource::default()),
+                    scope: None,
                     events: vec![counter_event("hits", 1.0)],
                 },
                 TraceContext::new_root().into(),
@@ -4214,6 +4247,7 @@ mod tests {
             .send(Delivered::Owned(
                 EventBatch {
                     resource: Arc::new(Resource::default()),
+                    scope: None,
                     events: vec![counter_event("hits", 2.0)],
                 },
                 TraceContext::new_root().into(),
@@ -4294,6 +4328,7 @@ mod tests {
             .send(Delivered::Owned(
                 EventBatch {
                     resource: Arc::new(Resource::default()),
+                    scope: None,
                     events: vec![counter_event("hits", 1.0)],
                 },
                 TraceContext::new_root().into(),
@@ -4309,6 +4344,7 @@ mod tests {
             .send(Delivered::Owned(
                 EventBatch {
                     resource: Arc::new(Resource::default()),
+                    scope: None,
                     events: vec![counter_event("hits", 2.0)],
                 },
                 TraceContext::new_root().into(),
@@ -4327,6 +4363,7 @@ mod tests {
             .send(Delivered::Owned(
                 EventBatch {
                     resource: Arc::new(Resource::default()),
+                    scope: None,
                     events: vec![counter_event("hits", 3.0)],
                 },
                 TraceContext::new_root().into(),
@@ -4351,7 +4388,7 @@ mod tests {
             .flat_map(|e| e.metrics.iter())
             .filter(|m| logit_core::interner::resolve(m.name) == "logit.component.batches.dropped")
             .filter_map(|m| match &m.kind {
-                MetricKind::Counter(v) => Some(*v),
+                MetricKind::Sum(s) => Some(s.value),
                 _ => None,
             })
             .sum();
@@ -4368,7 +4405,7 @@ mod tests {
 
     fn counter_value_of(batch: &EventBatch) -> f64 {
         match batch.events[0].metrics.iter().next().map(|m| &m.kind) {
-            Some(MetricKind::Counter(v)) => *v,
+            Some(MetricKind::Sum(s)) => s.value,
             other => panic!("expected exactly one counter metric, got {other:?}"),
         }
     }
@@ -4401,6 +4438,7 @@ mod tests {
         // admit exactly one record.
         let sample_batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 0.0)],
         };
         let one_record_len = crate::disk_queue::test_support::encoded_record_len(
@@ -4438,6 +4476,7 @@ mod tests {
             .send(Delivered::Owned(
                 EventBatch {
                     resource: Arc::new(Resource::default()),
+                    scope: None,
                     events: vec![counter_event("hits", 1.0)],
                 },
                 TraceContext::new_root().into(),
@@ -4454,6 +4493,7 @@ mod tests {
             .send(Delivered::Owned(
                 EventBatch {
                     resource: Arc::new(Resource::default()),
+                    scope: None,
                     events: vec![counter_event("hits", 2.0)],
                 },
                 TraceContext::new_root().into(),
@@ -4470,6 +4510,7 @@ mod tests {
             .send(Delivered::Owned(
                 EventBatch {
                     resource: Arc::new(Resource::default()),
+                    scope: None,
                     events: vec![counter_event("hits", 3.0)],
                 },
                 TraceContext::new_root().into(),
@@ -4496,7 +4537,7 @@ mod tests {
             .flat_map(|e| e.metrics.iter())
             .filter(|m| logit_core::interner::resolve(m.name) == "logit.component.batches.dropped")
             .filter_map(|m| match &m.kind {
-                MetricKind::Counter(v) => Some(*v),
+                MetricKind::Sum(s) => Some(s.value),
                 _ => None,
             })
             .sum();
@@ -4687,6 +4728,7 @@ mod tests {
             good_tx
                 .send(EventBatch {
                     resource: Arc::new(Resource::default()),
+                    scope: None,
                     events: vec![counter_event("hits", i as f64)],
                 })
                 .expect("good_in's receiver should still be alive");
@@ -4711,6 +4753,7 @@ mod tests {
         bad_tx
             .send(EventBatch {
                 resource: Arc::new(Resource::default()),
+                scope: None,
                 events: vec![counter_event("hits", 1.0)],
             })
             .expect("bad_in's receiver should still be alive");
@@ -4719,6 +4762,7 @@ mod tests {
         bad_tx
             .send(EventBatch {
                 resource: Arc::new(Resource::default()),
+                scope: None,
                 events: vec![counter_event("hits", 2.0)],
             })
             .expect("bad_in's receiver should still be alive");
@@ -4745,10 +4789,10 @@ mod tests {
                 .expect("good's already-queued batches should still be delivered, not aborted")
                 .expect("the channel should not have closed");
             match &received.events[0].metrics[0].kind {
-                MetricKind::Counter(v) => {
-                    assert_eq!(*v, i as f64, "batches should still be delivered in order")
+                MetricKind::Sum(s) => {
+                    assert_eq!(s.value, i as f64, "batches should still be delivered in order")
                 }
-                other => panic!("expected Counter, got {other:?}"),
+                other => panic!("expected Sum, got {other:?}"),
             }
         }
 
@@ -4888,6 +4932,7 @@ mod tests {
             for i in 0..2 {
                 tx.send(EventBatch {
                     resource: Arc::new(Resource::default()),
+                    scope: None,
                     events: vec![counter_event("hits", i as f64)],
                 })
                 .expect("receiver should still be alive");
@@ -5152,6 +5197,7 @@ mod tests {
         bad_tx
             .send(EventBatch {
                 resource: Arc::new(Resource::default()),
+                scope: None,
                 events: vec![counter_event("hits", 1.0)],
             })
             .expect("bad_in's receiver should still be alive");
@@ -5160,6 +5206,7 @@ mod tests {
         bad_tx
             .send(EventBatch {
                 resource: Arc::new(Resource::default()),
+                scope: None,
                 events: vec![counter_event("hits", 2.0)],
             })
             .expect("bad_in's receiver should still be alive");
@@ -5247,6 +5294,7 @@ mod tests {
         let parent = TraceContext::new_root();
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
         in_tx.send(Delivered::Owned(batch, parent.into())).await.expect("inbox should accept");
@@ -5288,6 +5336,7 @@ mod tests {
         let ctx_b = TraceContext::new_root();
         let batch = || EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
         in_tx.send(Delivered::Owned(batch(), ctx_a.into())).await.expect("inbox should accept");
@@ -5331,6 +5380,7 @@ mod tests {
         let parent = TraceContext::new_root();
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
         in_tx.send(Delivered::Owned(batch, parent.into())).await.expect("inbox should accept");
@@ -5369,6 +5419,7 @@ mod tests {
         let parent = TraceContext::new_root();
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
         in_tx.send(Delivered::Owned(batch, parent.into())).await.expect("inbox should accept");
@@ -5402,6 +5453,7 @@ mod tests {
         let parent = TraceContext::new_root();
         let batch = EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![counter_event("hits", 1.0)],
         };
         in_tx.send(Delivered::Owned(batch, parent.into())).await.expect("inbox should accept");
@@ -5457,8 +5509,14 @@ mod tests {
         let telemetry = registry.telemetry_for("agg", "aggregate", "transform");
         let (out_tx, out_rx) = mpsc::channel(2);
         let fanout = Fanout::new(vec![out_tx]);
-        let link =
-            SpanLink { trace_id: [7; 16], span_id: [7; 8], attributes: logit_core::AttrMap::new() };
+        let link = SpanLink {
+            trace_id: [7; 16],
+            span_id: [7; 8],
+            attributes: logit_core::AttrMap::new(),
+            flags: 0,
+            trace_state: None,
+            dropped_attributes_count: 0,
+        };
         let mut transform = MultiGroupFlushTransform { links_for_first_group: vec![link.clone()] };
 
         run_flush(&mut transform, &fanout, &telemetry).await;

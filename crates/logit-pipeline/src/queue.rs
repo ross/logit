@@ -568,6 +568,7 @@ mod tests {
         }
         Arc::new(EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![Event::empty(0, attrs)],
         })
     }

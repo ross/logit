@@ -491,6 +491,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         )
     }
@@ -504,6 +507,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         )
     }
@@ -716,6 +722,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let event = logfmt.process(&resource, event).expect("log events pass through");
@@ -856,6 +865,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let event = kv.process(&resource, event).expect("log events pass through");
@@ -875,7 +887,7 @@ mod tests {
         let event = Event::metric(
             0,
             AttrMap::new(),
-            MetricRecord { name: intern_for_test("m"), kind: MetricKind::Counter(1.0), unit: None },
+            MetricRecord::new(intern_for_test("m"), MetricKind::counter(1.0)),
         );
         let event = logfmt.process(&resource, event).expect("metric-only events pass through");
         assert!(event.attributes.is_empty());
@@ -898,6 +910,8 @@ mod tests {
                 events: Vec::<SpanEvent>::new(),
                 links: Vec::new(),
                 end_timestamp: 0,
+                flags: 0,
+                ext: None,
             },
         );
         let event = logfmt.process(&resource, event).expect("span-only events pass through");
@@ -909,15 +923,14 @@ mod tests {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
         let mut event = log_event("a=1");
-        event.metrics.push(MetricRecord {
-            name: intern_for_test("m"),
-            kind: MetricKind::Counter(1.0),
-            unit: None,
-        });
+        event.metrics.push(MetricRecord::new(intern_for_test("m"), MetricKind::counter(1.0)));
         let event = logfmt.process(&resource, event).expect("mixed events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(event.metrics.len(), 1, "the metric should ride through unaffected");
-        assert!(matches!(event.metrics[0].kind, MetricKind::Counter(v) if v == 1.0));
+        assert!(matches!(
+            event.metrics[0].kind,
+            MetricKind::Sum(logit_core::Sum { value, .. }) if value == 1.0
+        ));
     }
 
     #[test]
@@ -934,6 +947,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let event = logfmt.process(&resource, event).expect("log events pass through");
@@ -947,7 +963,7 @@ mod tests {
         let event = Event::metric(
             0,
             AttrMap::new(),
-            MetricRecord { name: intern_for_test("m"), kind: MetricKind::Counter(1.0), unit: None },
+            MetricRecord::new(intern_for_test("m"), MetricKind::counter(1.0)),
         );
         assert!(event.log.is_none());
         let event = logfmt.process(&resource, event).expect("events with no log pass through");
@@ -999,8 +1015,8 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].attributes.get("key").and_then(|v| v.as_str()), Some("parse_failure"));
         match &events[0].metrics[0].kind {
-            MetricKind::Counter(v) => assert_eq!(*v, 1.0),
-            other => panic!("expected Counter, got {other:?}"),
+            MetricKind::Sum(sum) => assert_eq!(sum.value, 1.0),
+            other => panic!("expected Sum, got {other:?}"),
         }
     }
 }

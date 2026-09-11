@@ -1,6 +1,7 @@
 use crate::{AttrMap, Value};
+use bytes::Bytes;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpanRecord {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
@@ -12,6 +13,25 @@ pub struct SpanRecord {
     pub links: Vec<SpanLink>,
     /// Unix nanoseconds. The span's start time is `Event::timestamp`.
     pub end_timestamp: i64,
+    /// OTLP's `Span.flags`, carried verbatim: the low 8 bits are the W3C trace flags (bit 0 =
+    /// `SAMPLED`), the bits above them OTLP's own (`CONTEXT_HAS_IS_REMOTE`/`CONTEXT_IS_REMOTE`).
+    /// `0` means unset.
+    pub flags: u32,
+    /// Boxed: populated only on an error span or one carrying a `trace_state`/dropped counts, so
+    /// the overwhelmingly common span (no status message, no `tracestate`) doesn't pay for these
+    /// fields inline.
+    pub ext: Option<Box<SpanExt>>,
+}
+
+/// The rarely-populated half of a span's OTLP fidelity -- boxed out of [`SpanRecord`] itself, see
+/// its `ext` field's doc comment.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpanExt {
+    pub status_message: Option<Bytes>,
+    pub trace_state: Option<Bytes>,
+    pub dropped_attributes_count: u32,
+    pub dropped_events_count: u32,
+    pub dropped_links_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,16 +50,20 @@ pub enum SpanStatus {
     Error,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpanEvent {
     pub timestamp: i64,
     pub name: Value,
     pub attributes: AttrMap,
+    pub dropped_attributes_count: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpanLink {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
     pub attributes: AttrMap,
+    pub flags: u32,
+    pub trace_state: Option<Bytes>,
+    pub dropped_attributes_count: u32,
 }

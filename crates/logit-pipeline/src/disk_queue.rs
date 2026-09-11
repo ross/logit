@@ -1235,6 +1235,7 @@ mod tests {
         attrs.insert("marker", Value::str(marker));
         Arc::new(EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![Event::empty(0, attrs)],
         })
     }
@@ -1258,7 +1259,8 @@ mod tests {
             .flat_map(|e| e.metrics.iter())
             .filter(|m| m.name == name_sym)
             .map(|m| match &m.kind {
-                logit_core::MetricKind::Counter(v) | logit_core::MetricKind::Gauge(v) => *v,
+                logit_core::MetricKind::Sum(s) => s.value,
+                logit_core::MetricKind::Gauge(v) => *v,
                 _ => 0.0,
             })
             .sum()
@@ -1674,6 +1676,7 @@ mod tests {
         attrs.insert("payload", Value::str("x".repeat(MAX_SANE_UNCOMPRESSED_LEN as usize + 1)));
         let huge = Arc::new(EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![Event::empty(0, attrs)],
         });
         q.push((huge, ctx())).await;

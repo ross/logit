@@ -324,7 +324,7 @@ mod tests {
         Event::metric(
             1_700_000_000_000_000_000,
             AttrMap::new(),
-            MetricRecord { name: intern(name), kind: MetricKind::Counter(value), unit: None },
+            MetricRecord::new(intern(name), MetricKind::counter(value)),
         )
     }
 
@@ -338,6 +338,9 @@ mod tests {
             severity: None,
             body_format: logit_core::BodyFormat::Raw,
             trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
         });
         event
     }

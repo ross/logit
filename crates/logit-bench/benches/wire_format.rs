@@ -50,6 +50,7 @@ impl Shape {
 fn repeat(build: impl Fn() -> Event, count: usize) -> EventBatch {
     EventBatch {
         resource: Arc::new(Resource::default()),
+        scope: None,
         events: (0..count).map(|_| build()).collect(),
     }
 }

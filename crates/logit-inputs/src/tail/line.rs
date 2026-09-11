@@ -210,6 +210,9 @@ impl TailDecoder for LineDecoder {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         ));
         Ok(self.resource.clone())

@@ -23,11 +23,16 @@ pub fn native_encode(batch: &EventBatch) -> Bytes {
     encoder.encode(batch).expect("native encode")
 }
 
+/// Decodes through the [`logit_proto::Decoder`] trait's `decode`/`decode_into`, the same seam
+/// every real `ComponentKind` decodes through -- not `logit_proto::native::decode_batch` directly.
+/// `Decoder::decode_into` now returns `(Arc<Resource>, Option<Arc<Scope>>)`, so `Decoder::decode`'s
+/// default body carries a batch's `scope` through into the `EventBatch` it hands back, exactly
+/// like every other field; this arm no longer has to bypass the trait to keep its round trip
+/// lossless on `scope`. Native is the one arm expected to be exact end to end
+/// (`tests/wire_format_bakeoff.rs`'s fidelity gate).
 pub fn native_decode(bytes: Bytes) -> EventBatch {
     let mut decoder = logit_proto::native::NativeDecoder;
-    let mut events = Vec::new();
-    let resource = decoder.decode_into(bytes, 0, &mut events).expect("native decode");
-    EventBatch { resource, events }
+    decoder.decode(bytes).expect("native decode")
 }
 
 // -- otlp: the interop control arm ---------------------------------------------------------------

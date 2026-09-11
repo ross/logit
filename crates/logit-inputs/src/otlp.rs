@@ -771,6 +771,7 @@ mod tests {
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let batch = logit_core::EventBatch {
             resource: std::sync::Arc::new(logit_core::Resource::default()),
+            scope: None,
             events: vec![logit_core::Event::span(
                 1,
                 logit_core::AttrMap::new(),
@@ -784,6 +785,8 @@ mod tests {
                     events: Vec::new(),
                     links: Vec::new(),
                     end_timestamp: 2,
+                    flags: 0,
+                    ext: None,
                 },
             )],
         };
@@ -1048,6 +1051,7 @@ mod tests {
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let batch = logit_core::EventBatch {
             resource: std::sync::Arc::new(logit_core::Resource::default()),
+            scope: None,
             events: vec![logit_core::Event::span(
                 1,
                 logit_core::AttrMap::new(),
@@ -1061,6 +1065,8 @@ mod tests {
                     events: Vec::new(),
                     links: Vec::new(),
                     end_timestamp: 2,
+                    flags: 0,
+                    ext: None,
                 },
             )],
         };
@@ -1191,6 +1197,7 @@ mod tests {
             resource.attributes.insert("host", host);
             logit_core::EventBatch {
                 resource: std::sync::Arc::new(resource),
+                scope: None,
                 events: vec![logit_core::Event::span(
                     1,
                     logit_core::AttrMap::new(),
@@ -1204,6 +1211,8 @@ mod tests {
                         events: Vec::new(),
                         links: Vec::new(),
                         end_timestamp: 2,
+                        flags: 0,
+                        ext: None,
                     },
                 )],
             }
@@ -1558,14 +1567,14 @@ mod tests {
     fn metric_batch() -> logit_core::EventBatch {
         logit_core::EventBatch {
             resource: std::sync::Arc::new(logit_core::Resource::default()),
+            scope: None,
             events: vec![logit_core::Event::metric(
                 1,
                 logit_core::AttrMap::new(),
-                logit_core::MetricRecord {
-                    name: logit_core::interner::intern("x"),
-                    kind: logit_core::MetricKind::Counter(1.0),
-                    unit: None,
-                },
+                logit_core::MetricRecord::new(
+                    logit_core::interner::intern("x"),
+                    logit_core::MetricKind::counter(1.0),
+                ),
             )],
         }
     }

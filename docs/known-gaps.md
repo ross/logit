@@ -503,7 +503,7 @@ already built that have a known, accepted rough edge.
   generalizing the trait (an associated framing type, or a sink-driven push interface) is still
   deferred, but no longer for lack of a second caller to design against; it's simply not yet been
   done.
-- **`statsd_out` only encodes `Counter`/`Gauge`/`GaugeDelta` in v1 — every `Distribution`/`Set`/
+- **`statsd_out` only encodes `Sum`/`Gauge`/`GaugeDelta` in v1 — every `Distribution`/`Set`/
   `Histogram`/`Summary` metric is dropped** — `ms`/`h`/`d` on the statsd wire all decode to
   `MetricKind::Distribution` (`crates/logit-inputs/src/statsd.rs::build_event`), so a
   `statsd_in -> aggregate -> statsd_out` relay drops every timer metric today: the single most
@@ -893,7 +893,7 @@ already built that have a known, accepted rough edge.
   | encode | `MetricKind::Set` (a `HyperLogLog`) → skipped entirely | `logit.output.metrics.skipped{metric_kind="set"}` | `HyperLogLog` is still a stub with no cardinality to read (this file's own first entry) — matches `crates/logit-outputs/src/influxdb.rs`'s existing precedent for the same kind. |
   | encode | `Value::U64` above `i64::MAX` → OTLP `AnyValue.DoubleValue` | none (numeric, not a metric point) | OTLP's only integer type is signed 64-bit; exact up to `f64`'s 2^53 range, approximate above it. Any `Value::U64` (even in range) also loses the "this was unsigned" fact on decode, coming back as `Value::I64` — `otlp/common.rs`'s module doc has the full case list. |
   | encode | `Value::Timestamp` → OTLP `AnyValue.IntValue` | none | OTLP's `AnyValue` has no timestamp variant at all; decodes back as `Value::I64`, indistinguishable from a value that was always an integer. |
-  | decode | OTLP `ExponentialHistogramDataPoint` wider than 512 derived buckets → skipped | `logit.input.metrics.skipped{metric_kind="exponential_histogram", reason="bucket_cap"}` | The *mapping itself* is exact (an exponential histogram is a fixed-bucket histogram with geometric bounds, not lossy) — this is a volume bound against a peer-chosen `scale`/`offset` producing an unbounded `Vec`, the same "bound and count" shape every buffer in this codebase uses for its own overflow. |
+  | encode | `MetricKind::Samples` (raw statsd `ms`/`h`/`d` observations) → OTLP `Summary` of 5 fixed quantiles (p50/p75/p90/p95/p99), sketched into a temporary `DdSketch` first | `logit.output.metrics.degraded{metric_kind="samples"}` | Same shape as the `Distribution` row above — OTLP has no raw-sample-list metric type either, so `otlp_out` sketches first (`add_weighted` per value, weighted by `(1/sample_rate).round()` clamped to `[1, 1000]`) and takes the same degraded path ([ADR `metrics-model-v2`](adr/metrics-model-v2.md)). |
   | decode | any OTLP data point with `flags & DATA_POINT_FLAGS_NO_RECORDED_VALUE_MASK` → skipped | `logit.input.metrics.skipped{metric_kind, reason="no_recorded_value"}` | Never fails the whole request — OTLP has its own channel for reporting rejected points back (`partial_success`), wired in PR3, not invented here as a second one. |
 
   One residual, narrower gap in the same codec, not yet worth its own table row: `BodyFormat`/a
@@ -983,7 +983,7 @@ already built that have a known, accepted rough edge.
   process.** Discovered running `demo/`'s `tempo_out` against Tempo
   ([docs/plans/otlp-end-to-end.md](plans/otlp-end-to-end.md)), not anticipated by that
   plan. `internal` (`self`, observing `logit`'s own pipeline) doesn't distinguish signals -- every
-  drain carries both spans and this process's own `logit.*` metrics (all `Counter`/`Gauge`/
+  drain carries both spans and this process's own `logit.*` metrics (all `Sum`/`Gauge`/
   `Distribution`, all mergeable). `OtlpOutput::send` (`crates/logit-outputs/src/otlp.rs`) issues
   one request per non-empty signal, sequentially (traces before metrics, per `encode_signals`'
   fixed ordering), and `?`-propagates the first failure without attempting the rest. Tempo is a

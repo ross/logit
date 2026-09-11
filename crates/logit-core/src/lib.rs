@@ -21,10 +21,13 @@ pub use attrs::AttrMap;
 pub use diag::Diagnostics;
 pub use event::{Event, EventBatch, MetricList};
 pub use interner::Symbol;
-pub use metric::{DdSketch, HyperLogLog, MetricKind, MetricRecord};
+pub use metric::{
+    DdSketch, Exemplar, ExpHistogram, Histogram, HyperLogLog, MetricKind, MetricRecord, Samples,
+    Sum, Summary, Temporality, SAMPLES_INLINE,
+};
 pub use provenance::Provenance;
-pub use resource::Resource;
-pub use span::{SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus};
+pub use resource::{Resource, Scope};
+pub use span::{SpanEvent, SpanExt, SpanKind, SpanLink, SpanRecord, SpanStatus};
 pub use telemetry::{
     trace_is_sampled, Registry, SpanGuard, Tag, Telemetry, TelemetryLayer, DEFAULT_SPAN_SAMPLE_RATE,
 };
@@ -51,7 +54,7 @@ pub enum BodyFormat {
     Structured,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogRecord {
     pub message: Value,
     pub severity: Option<Severity>,
@@ -62,4 +65,13 @@ pub struct LogRecord {
     /// explicitly set (`ComponentKind::TraceContext`, `event.log.trace_id` in Lua). See
     /// `docs/adr/log-record-trace-context.md`.
     pub trace: Option<TraceRef>,
+    /// OTLP's `LogRecord.event_name` -- a short, stable identifier for the kind of event this log
+    /// represents (distinct from its free-form `message`). No producer until W4
+    /// (`docs/plans/lossless-transit.md`).
+    pub event_name: Option<Symbol>,
+    /// Unix nanoseconds this log was observed by the collector, as distinct from when it was
+    /// generated (`Event::timestamp`) -- OTLP's `LogRecord.observed_time_unix_nano`. `0` means
+    /// unset.
+    pub observed_timestamp: i64,
+    pub dropped_attributes_count: u32,
 }

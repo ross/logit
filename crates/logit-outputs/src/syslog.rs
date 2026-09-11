@@ -963,7 +963,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     fn batch_with(events: Vec<Event>) -> EventBatch {
-        EventBatch { resource: Arc::new(Resource::default()), events }
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
     }
 
     fn log_event(ts: i64, message: &str, severity: Option<Severity>) -> Event {
@@ -975,6 +975,9 @@ mod tests {
                 severity,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         )
     }
@@ -983,11 +986,7 @@ mod tests {
         Event::metric(
             ts,
             AttrMap::new(),
-            MetricRecord {
-                name: logit_core::interner::intern("m"),
-                kind: MetricKind::Counter(1.0),
-                unit: None,
-            },
+            MetricRecord::new(logit_core::interner::intern("m"), MetricKind::counter(1.0)),
         )
     }
 
@@ -1056,6 +1055,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let mut encoder = SyslogEncoder::new(Format::Rfc3164, 16);
@@ -1084,6 +1086,9 @@ mod tests {
                 severity: Some(Severity::Fatal), // would otherwise map to 2
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let (msgs, _) = encode(vec![event]);
@@ -1129,6 +1134,9 @@ mod tests {
                 severity: Some(Severity::Warn),
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let (msgs, _) = encode(vec![event]);
@@ -1147,6 +1155,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let mut encoder = SyslogEncoder::new(Format::Rfc5424, 16).with_hostname("from-config");
@@ -1221,6 +1232,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let (msgs, _) = encode(vec![event]);
@@ -1239,6 +1253,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let mut encoder = SyslogEncoder::new(Format::Rfc3164, 16);
@@ -1258,6 +1275,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let (msgs, _) = encode(vec![event]);
@@ -1280,6 +1300,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let (msgs, _) = encode(vec![event]);

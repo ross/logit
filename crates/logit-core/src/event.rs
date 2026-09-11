@@ -1,43 +1,48 @@
 use crate::interner::Symbol;
 use crate::{
-    AttrMap, LogRecord, MetricKind, MetricRecord, Resource, SpanEvent, SpanLink, SpanRecord, Value,
+    AttrMap, ExpHistogram, LogRecord, MetricKind, MetricRecord, Resource, Scope, SpanEvent,
+    SpanExt, SpanLink, SpanRecord, Value,
 };
 use smallvec::SmallVec;
 use std::sync::Arc;
 
-/// A batch of events sharing one [`Resource`]. Events always travel in batches -- per-event
-/// channel sends and allocation would dominate the profile at any interesting throughput. See
-/// `docs/design/data-model.md`.
-#[derive(Debug, Clone)]
+/// A batch of events sharing one [`Resource`] and, optionally, one [`Scope`]. Events always travel
+/// in batches -- per-event channel sends and allocation would dominate the profile at any
+/// interesting throughput. See `docs/design/data-model.md`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct EventBatch {
     pub resource: Arc<Resource>,
+    /// The OTLP instrumentation scope this batch's events were reported through, if any -- see
+    /// [`Scope`]'s own doc comment. `Arc`-shared across the batch the same way `resource` is.
+    pub scope: Option<Arc<Scope>>,
     pub events: Vec<Event>,
 }
 
 impl EventBatch {
     /// Approximate heap bytes held by this batch: the `Vec<Event>` backing allocation itself,
     /// attribute keys/values, log bodies, span-owned data, metric records, and the batch's
-    /// resource. Deliberately approximate -- an O(events) walk for admission control (bounding an
-    /// in-memory delivery buffer, see `docs/adr/buffered-sink-delivery.md`), NOT an
+    /// resource and scope. Deliberately approximate -- an O(events) walk for admission control
+    /// (bounding an in-memory delivery buffer, see `docs/adr/buffered-sink-delivery.md`), NOT an
     /// allocator-accounting figure. Exempt from this crate's exact-size/exact-allocation-count
     /// discipline (`tests/type_sizes.rs`, `crates/logit-bench/tests/allocations.rs`) on purpose --
     /// don't add this to either of those.
     ///
     /// What gets counted: the dominant term first -- `events.capacity() * size_of::<Event>()`,
-    /// the batch's own backing storage, which every event pays (800 bytes each, `memory.md` §1)
-    /// *before* any nested heap payload -- a batch of numeric-only metrics with no string
-    /// attributes would otherwise estimate close to zero despite genuinely holding hundreds of
-    /// bytes per event. Then, per event: every attribute key's and value's byte length
-    /// (`value_heap_bytes` below), the log body's `Value` the same way if `event.log` is `Some`,
-    /// every span-owned `Value`/`AttrMap`/nested `Vec` if `event.span` is `Some`
-    /// (`span_heap_bytes` below), and a per-metric-record contribution for `event.metrics`
-    /// (`metric_record_heap_bytes` below). `Null`/`Bool`/`I64`/`U64`/`F64`/`Timestamp` values are
-    /// stored inline in `Value` with no heap component of their own (see `tests/type_sizes.rs`'s
-    /// `value_is_bytes_plus_a_discriminant_word`), so they contribute nothing -- only
-    /// `Bytes`/`Str`/`Array`/`Map` do. The batch's `resource` is counted once, not once per event
-    /// -- it's `Arc`-shared across every event in the batch, not copied per event.
+    /// the batch's own backing storage, which every event pays *before* any nested heap payload --
+    /// a batch of numeric-only metrics with no string attributes would otherwise estimate close to
+    /// zero despite genuinely holding hundreds of bytes per event. Then, per event: every
+    /// attribute key's and value's byte length (`value_heap_bytes` below), the log body's `Value`
+    /// and `event_name` symbol the same way if `event.log` is `Some`, every span-owned
+    /// `Value`/`AttrMap`/nested `Vec` if `event.span` is `Some` (`span_heap_bytes` below), and a
+    /// per-metric-record contribution for `event.metrics` (`metric_record_heap_bytes` below).
+    /// `Null`/`Bool`/`I64`/`U64`/`F64`/`Timestamp` values are stored inline in `Value` with no heap
+    /// component of their own (see `tests/type_sizes.rs`'s `value_is_bytes_plus_a_discriminant_
+    /// word`), so they contribute nothing -- only `Bytes`/`Str`/`Array`/`Map` do. The batch's
+    /// `resource` and `scope` are each counted once, not once per event -- both are `Arc`-shared
+    /// across every event in the batch, not copied per event.
     pub fn estimated_heap_bytes(&self) -> u64 {
         let mut total = self.resource.estimated_heap_bytes()
+            + self.scope.as_ref().map(|s| s.estimated_heap_bytes()).unwrap_or(0)
             + (self.events.capacity() * std::mem::size_of::<Event>()) as u64;
         for event in &self.events {
             total += event.estimated_heap_bytes();
@@ -46,12 +51,13 @@ impl EventBatch {
     }
 }
 
-/// Heap bytes owned by one `SpanRecord` beyond its own inline 136 bytes (`memory.md` §1): its
-/// `name`, plus every `SpanEvent`/`SpanLink`'s own `Vec` backing storage and owned data. Unlike
-/// `Event`'s outer `Vec` (which every batch has regardless of shape), a span's `events`/`links`
-/// are typically empty, so their `capacity() * size_of::<T>()` terms are usually zero in
-/// practice -- included anyway since a span that *does* carry several span-events (a common OTLP
-/// shape) would otherwise be undercounted the same way the outer batch was before this fix.
+/// Heap bytes owned by one `SpanRecord` beyond its own inline size (`memory.md` §1): its `name`,
+/// every `SpanEvent`/`SpanLink`'s own `Vec` backing storage and owned data, and (when present) its
+/// boxed [`SpanExt`]. Unlike `Event`'s outer `Vec` (which every batch has regardless of shape), a
+/// span's `events`/`links` are typically empty, so their `capacity() * size_of::<T>()` terms are
+/// usually zero in practice -- included anyway since a span that *does* carry several span-events
+/// (a common OTLP shape) would otherwise be undercounted the same way the outer batch was before
+/// this fix.
 fn span_heap_bytes(span: &SpanRecord) -> u64 {
     let name = value_heap_bytes(&span.name);
     let events = (span.events.capacity() * std::mem::size_of::<SpanEvent>()) as u64
@@ -61,8 +67,25 @@ fn span_heap_bytes(span: &SpanRecord) -> u64 {
             .map(|e| value_heap_bytes(&e.name) + attr_map_heap_bytes(&e.attributes))
             .sum::<u64>();
     let links = (span.links.capacity() * std::mem::size_of::<SpanLink>()) as u64
-        + span.links.iter().map(|l| attr_map_heap_bytes(&l.attributes)).sum::<u64>();
-    name + events + links
+        + span
+            .links
+            .iter()
+            .map(|l| {
+                attr_map_heap_bytes(&l.attributes)
+                    + l.trace_state.as_ref().map(|s| s.len() as u64).unwrap_or(0)
+            })
+            .sum::<u64>();
+    let ext = span
+        .ext
+        .as_ref()
+        .map(|ext| (std::mem::size_of::<SpanExt>() as u64) + span_ext_bytes_heap_bytes(ext))
+        .unwrap_or(0);
+    name + events + links + ext
+}
+
+fn span_ext_bytes_heap_bytes(ext: &SpanExt) -> u64 {
+    ext.status_message.as_ref().map(|s| s.len() as u64).unwrap_or(0)
+        + ext.trace_state.as_ref().map(|s| s.len() as u64).unwrap_or(0)
 }
 
 /// A rough per-record stand-in for `MetricKind::Distribution`'s inlined `DDSketch`. The sketch
@@ -97,27 +120,54 @@ fn value_heap_bytes(value: &Value) -> u64 {
     }
 }
 
-/// Heap bytes owned by one `MetricRecord`: its name/unit symbols, plus a kind-dependent
-/// contribution. `Counter`/`Gauge`/`GaugeDelta`/`Set` are effectively free (no heap payload of
-/// their own -- `HyperLogLog` is still a stub, see `metric.rs`); `Histogram`/`Summary` count their
-/// actual bucket/quantile `Vec`s exactly, since those are plain `Vec`s and doing so costs nothing
-/// extra; `Distribution` uses [`ESTIMATED_DISTRIBUTION_HEAP_BYTES`] rather than walking the sketch.
+/// Heap bytes owned by one `MetricRecord`: its name/unit/description symbols, its exemplars, plus
+/// a kind-dependent contribution. `Sum`/`Gauge`/`GaugeDelta`/`Set` are effectively free (no heap
+/// payload of their own -- `HyperLogLog` is still a stub, see `metric.rs`); `Samples` counts its
+/// `SmallVec`'s heap allocation only once it has actually spilled past its inline capacity (an
+/// unspilled `Samples` pays nothing extra here, the same way `AttrMap`'s own inline capacity
+/// doesn't count as heap); `SetMembers` counts each member's own byte length;
+/// `Histogram`/`ExponentialHistogram`/`Summary` count their actual bucket/quantile `Vec`s, since
+/// those are plain `Vec`s and doing so costs nothing extra; `Distribution` uses
+/// [`ESTIMATED_DISTRIBUTION_HEAP_BYTES`] rather than walking the sketch.
 fn metric_record_heap_bytes(record: &MetricRecord) -> u64 {
-    let symbols = symbol_heap_bytes(record.name) + record.unit.map(symbol_heap_bytes).unwrap_or(0);
+    let symbols = symbol_heap_bytes(record.name)
+        + record.unit.map(symbol_heap_bytes).unwrap_or(0)
+        + record.description.map(symbol_heap_bytes).unwrap_or(0);
+    let exemplars = if record.exemplars.is_empty() {
+        0
+    } else {
+        (record.exemplars.capacity() * std::mem::size_of::<crate::Exemplar>()) as u64
+            + record
+                .exemplars
+                .iter()
+                .map(|e| attr_map_heap_bytes(&e.filtered_attributes))
+                .sum::<u64>()
+    };
     let kind = match &record.kind {
-        MetricKind::Counter(_)
+        MetricKind::Sum(_)
         | MetricKind::Gauge(_)
         | MetricKind::GaugeDelta(_)
         | MetricKind::Set(_) => 0,
+        MetricKind::Samples(s) => {
+            if s.values.spilled() {
+                (s.values.capacity() * std::mem::size_of::<f64>()) as u64
+            } else {
+                0
+            }
+        }
         MetricKind::Distribution(_) => ESTIMATED_DISTRIBUTION_HEAP_BYTES,
-        MetricKind::Histogram { buckets } => {
-            (buckets.len() * std::mem::size_of::<(f64, u64)>()) as u64
-        }
-        MetricKind::Summary { quantiles } => {
-            (quantiles.len() * std::mem::size_of::<(f64, f64)>()) as u64
-        }
+        MetricKind::SetMembers(members) => members.iter().map(|m| m.len() as u64).sum(),
+        MetricKind::Histogram(h) => (h.buckets.len() * std::mem::size_of::<(f64, u64)>()) as u64,
+        MetricKind::ExponentialHistogram(e) => exp_histogram_heap_bytes(e),
+        MetricKind::Summary(s) => (s.quantiles.len() * std::mem::size_of::<(f64, f64)>()) as u64,
     };
-    symbols + kind
+    symbols + exemplars + kind
+}
+
+fn exp_histogram_heap_bytes(e: &ExpHistogram) -> u64 {
+    let positive = (e.positive.1.capacity() * std::mem::size_of::<u64>()) as u64;
+    let negative = (e.negative.1.capacity() * std::mem::size_of::<u64>()) as u64;
+    positive + negative
 }
 
 /// The metric list on an [`Event`]. Inline capacity 1: the overwhelmingly common shape is a
@@ -131,7 +181,7 @@ pub type MetricList = SmallVec<[MetricRecord; 1]>;
 /// source of several derived metrics; a sink emits whatever it finds. Two logs on one event is
 /// unrepresentable by construction, since `log` is a single `Option`, not a list. See
 /// `docs/adr/multi-payload-events.md` and `docs/design/data-model.md`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Event {
     /// Unix nanoseconds.
     pub timestamp: i64,
@@ -174,16 +224,17 @@ impl Event {
 
     /// This event's own contribution to [`EventBatch::estimated_heap_bytes`] -- everything that
     /// formula counts *per event* (attributes, log body, span-owned data, metric records), minus
-    /// the batch-level terms (the resource, counted once via [`Resource::estimated_heap_bytes`],
-    /// and the `Vec<Event>` backing storage itself). Exposed so a caller accumulating events
-    /// incrementally (`logit_pipeline::BatchAccumulator`) can track a running total in O(1) per
-    /// event as they arrive, rather than re-walking every event held so far on every call --
-    /// summing this over a set of events and adding the batch-level terms once reproduces
-    /// `estimated_heap_bytes` exactly, by construction.
+    /// the batch-level terms (the resource and scope, each counted once via their own
+    /// `estimated_heap_bytes`, and the `Vec<Event>` backing storage itself). Exposed so a caller
+    /// accumulating events incrementally (`logit_pipeline::BatchAccumulator`) can track a running
+    /// total in O(1) per event as they arrive, rather than re-walking every event held so far on
+    /// every call -- summing this over a set of events and adding the batch-level terms once
+    /// reproduces `estimated_heap_bytes` exactly, by construction.
     pub fn estimated_heap_bytes(&self) -> u64 {
         let mut total = attr_map_heap_bytes(&self.attributes);
         if let Some(log) = &self.log {
             total += value_heap_bytes(&log.message);
+            total += log.event_name.map(symbol_heap_bytes).unwrap_or(0);
         }
         if let Some(span) = &self.span {
             total += span_heap_bytes(span);
@@ -201,7 +252,7 @@ mod tests {
     use crate::{BodyFormat, DdSketch};
 
     fn batch(resource: Arc<Resource>, events: Vec<Event>) -> EventBatch {
-        EventBatch { resource, events }
+        EventBatch { resource, scope: None, events }
     }
 
     fn default_batch(events: Vec<Event>) -> EventBatch {
@@ -214,6 +265,34 @@ mod tests {
             attrs.insert(key, value.clone());
         }
         attrs
+    }
+
+    fn log_record(message: &str) -> LogRecord {
+        LogRecord {
+            message: Value::str(message),
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        }
+    }
+
+    fn span_record() -> SpanRecord {
+        SpanRecord {
+            trace_id: [0; 16],
+            span_id: [0; 8],
+            parent_span_id: None,
+            name: Value::str("span name"),
+            kind: crate::SpanKind::Internal,
+            status: crate::SpanStatus::Unset,
+            events: vec![],
+            links: vec![],
+            end_timestamp: 0,
+            flags: 0,
+            ext: None,
+        }
     }
 
     #[test]
@@ -242,13 +321,12 @@ mod tests {
     fn a_purely_numeric_metric_event_is_not_undercounted_to_near_zero() {
         // The exact scenario a review finding named: a numeric-only event (no strings anywhere)
         // used to estimate at only a few bytes (the metric name symbol's length) despite Event
-        // itself costing 800 bytes before any nested allocation -- the dominant term for a
-        // metrics-heavy batch. Must now be at least one Event's worth of backing storage.
-        let record = MetricRecord {
-            name: crate::interner::intern("numeric_only_test_counter"),
-            kind: MetricKind::Counter(1.0),
-            unit: None,
-        };
+        // itself costing several hundred bytes before any nested allocation -- the dominant term
+        // for a metrics-heavy batch. Must now be at least one Event's worth of backing storage.
+        let record = MetricRecord::new(
+            crate::interner::intern("numeric_only_test_counter"),
+            MetricKind::counter(1.0),
+        );
         let bytes =
             default_batch(vec![Event::metric(0, AttrMap::new(), record)]).estimated_heap_bytes();
         let floor = std::mem::size_of::<Event>() as u64;
@@ -261,18 +339,10 @@ mod tests {
             timestamp: 0,
             name: Value::str("a span event name long enough to matter"),
             attributes: attrs_with(&[("k", Value::str("a fairly long attribute value here"))]),
+            dropped_attributes_count: 0,
         };
-        let span = SpanRecord {
-            trace_id: [0; 16],
-            span_id: [0; 8],
-            parent_span_id: None,
-            name: Value::str("span name"),
-            kind: crate::SpanKind::Internal,
-            status: crate::SpanStatus::Unset,
-            events: vec![span_event],
-            links: vec![],
-            end_timestamp: 0,
-        };
+        let mut span = span_record();
+        span.events = vec![span_event];
         let without_span =
             default_batch(vec![Event::empty(0, AttrMap::new())]).estimated_heap_bytes();
         let with_span =
@@ -281,44 +351,53 @@ mod tests {
     }
 
     #[test]
+    fn a_spans_ext_contributes_to_the_estimate() {
+        let mut span = span_record();
+        let without_ext = default_batch(vec![Event::span(0, AttrMap::new(), span.clone())])
+            .estimated_heap_bytes();
+        span.ext = Some(Box::new(SpanExt {
+            status_message: Some(bytes::Bytes::from_static(b"a status message")),
+            trace_state: Some(bytes::Bytes::from_static(b"vendor=value")),
+            dropped_attributes_count: 0,
+            dropped_events_count: 0,
+            dropped_links_count: 0,
+        }));
+        let with_ext =
+            default_batch(vec![Event::span(0, AttrMap::new(), span)]).estimated_heap_bytes();
+        assert!(with_ext > without_ext, "a populated SpanExt must add weight");
+    }
+
+    #[test]
     fn log_only_event_is_nonzero() {
-        let log = LogRecord {
-            message: Value::str("a reasonably long log line for the estimator to see"),
-            severity: None,
-            body_format: BodyFormat::Raw,
-            trace: None,
-        };
+        let log = log_record("a reasonably long log line for the estimator to see");
         let bytes = default_batch(vec![Event::log(0, AttrMap::new(), log)]).estimated_heap_bytes();
         assert!(bytes > 0);
     }
 
     #[test]
     fn metrics_only_event_is_nonzero() {
-        let record = MetricRecord {
-            name: crate::interner::intern("estimated_heap_bytes_test_counter"),
-            kind: MetricKind::Counter(1.0),
-            unit: None,
-        };
+        let record = MetricRecord::new(
+            crate::interner::intern("estimated_heap_bytes_test_counter"),
+            MetricKind::counter(1.0),
+        );
         let bytes =
             default_batch(vec![Event::metric(0, AttrMap::new(), record)]).estimated_heap_bytes();
-        // A `Counter` has no heap payload of its own, but the metric's name symbol still counts.
+        // A `Sum` has no heap payload of its own, but the metric's name symbol still counts.
         assert!(bytes > 0);
     }
 
     #[test]
-    fn distribution_metric_costs_more_than_a_counter_with_the_same_name_length() {
-        let counter = MetricRecord {
-            name: crate::interner::intern("estimated_heap_bytes_test_metric_a"),
-            kind: MetricKind::Counter(1.0),
-            unit: None,
-        };
+    fn distribution_metric_costs_more_than_a_sum_with_the_same_name_length() {
+        let counter = MetricRecord::new(
+            crate::interner::intern("estimated_heap_bytes_test_metric_a"),
+            MetricKind::counter(1.0),
+        );
         let mut sketch = DdSketch::new();
         sketch.add(1.0);
-        let distribution = MetricRecord {
-            name: crate::interner::intern("estimated_heap_bytes_test_metric_b"),
-            kind: MetricKind::Distribution(sketch),
-            unit: None,
-        };
+        let distribution = MetricRecord::new(
+            crate::interner::intern("estimated_heap_bytes_test_metric_b"),
+            MetricKind::Distribution(sketch),
+        );
 
         let counter_bytes =
             default_batch(vec![Event::metric(0, AttrMap::new(), counter)]).estimated_heap_bytes();
@@ -335,12 +414,7 @@ mod tests {
         let mut previous = b.estimated_heap_bytes();
         for i in 0..5 {
             let attrs = attrs_with(&[("i", Value::from(i))]);
-            let log = LogRecord {
-                message: Value::str("padding so each added event is not entirely free"),
-                severity: None,
-                body_format: BodyFormat::Raw,
-                trace: None,
-            };
+            let log = log_record("padding so each added event is not entirely free");
             b.events.push(Event::log(i, attrs, log));
 
             let next = b.estimated_heap_bytes();
@@ -354,6 +428,7 @@ mod tests {
     fn resource_contributes_once_per_batch_not_once_per_event() {
         let resource = Arc::new(Resource {
             attributes: attrs_with(&[("datacenter", Value::str("us-east-1"))]),
+            ..Resource::default()
         });
         let resource_only_bytes = attr_map_heap_bytes(&resource.attributes);
 
@@ -373,5 +448,30 @@ mod tests {
         let event_size = std::mem::size_of::<Event>() as u64;
         assert_eq!(one_event.estimated_heap_bytes(), resource_only_bytes + event_size);
         assert_eq!(two_events.estimated_heap_bytes(), resource_only_bytes + 2 * event_size);
+    }
+
+    #[test]
+    fn scope_contributes_once_per_batch_not_once_per_event() {
+        let scope = Arc::new(Scope {
+            name: bytes::Bytes::from_static(b"nginx-otel-module"),
+            version: bytes::Bytes::from_static(b"1.0.0"),
+            ..Scope::default()
+        });
+        let scope_only_bytes = scope.estimated_heap_bytes();
+        assert!(scope_only_bytes > 0, "fixture should carry a nonzero scope cost");
+
+        let one_event = EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: Some(scope.clone()),
+            events: vec![Event::empty(0, AttrMap::new())],
+        };
+        let two_events = EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: Some(scope.clone()),
+            events: vec![Event::empty(0, AttrMap::new()), Event::empty(0, AttrMap::new())],
+        };
+        let event_size = std::mem::size_of::<Event>() as u64;
+        assert_eq!(one_event.estimated_heap_bytes(), scope_only_bytes + event_size);
+        assert_eq!(two_events.estimated_heap_bytes(), scope_only_bytes + 2 * event_size);
     }
 }

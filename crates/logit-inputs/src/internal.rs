@@ -35,7 +35,7 @@ impl InternalInput {
         Self {
             interval,
             registry,
-            resource: Arc::new(Resource { attributes }),
+            resource: Arc::new(Resource { attributes, ..Default::default() }),
             telemetry: Telemetry::default(),
             diag: Diagnostics::default(),
         }
@@ -120,7 +120,9 @@ impl InternalInput {
             self.telemetry.count("logit.internal.logs.emitted", logs_emitted as f64, &[]);
         }
 
-        sink.send(EventBatch { resource: self.resource.clone(), events }).await;
+        // No scope: this batch is synthesized from `internal`'s own drained telemetry, not
+        // decoded off any wire with an OTLP instrumentation scope to carry.
+        sink.send(EventBatch { resource: self.resource.clone(), scope: None, events }).await;
     }
 }
 
@@ -255,8 +257,8 @@ mod tests {
                     if logit_core::interner::resolve(metric.name) == "logit.internal.points.emitted"
                     {
                         found = true;
-                        if let MetricKind::Counter(v) = metric.kind {
-                            assert!(v >= 1.0);
+                        if let MetricKind::Sum(sum) = metric.kind {
+                            assert!(sum.value >= 1.0);
                         }
                     }
                 }

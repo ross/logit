@@ -26,7 +26,7 @@ use crate::Input;
 use bytes::Bytes;
 use logit_core::{
     interner::intern, AttrMap, DdSketch, Diagnostics, Event, MetricKind, MetricRecord, Resource,
-    Telemetry, Value,
+    Scope, Telemetry, Value,
 };
 use logit_pipeline::Fanout;
 use logit_proto::{CodecError, Decoder};
@@ -139,7 +139,7 @@ impl Decoder for StatsdDecoder {
         bytes: Bytes,
         received_at: i64,
         out: &mut Vec<Event>,
-    ) -> Result<Arc<Resource>, CodecError> {
+    ) -> Result<(Arc<Resource>, Option<Arc<Scope>>), CodecError> {
         let text = std::str::from_utf8(&bytes)
             .map_err(|e| CodecError::Malformed(format!("invalid utf-8: {e}")))?;
         for line in text.split('\n') {
@@ -158,7 +158,8 @@ impl Decoder for StatsdDecoder {
                 }
             }
         }
-        Ok(self.resource.clone())
+        // statsd datagrams carry no OTLP instrumentation-scope concept -- `None`, always.
+        Ok((self.resource.clone(), None))
     }
 }
 
@@ -267,7 +268,7 @@ fn build_event(
     let kind = match type_part {
         "c" => {
             let value = parse_finite_value(raw_value, "counter", line)?;
-            MetricKind::Counter(value / sample_rate)
+            MetricKind::counter(value / sample_rate)
         }
         "g" => {
             // Any leading '+'/'-' means a *relative* adjustment to the gauge's previous value,
@@ -339,11 +340,7 @@ fn build_event(
     // every `Value::Str` in `attributes` is already a slice of the datagram's one shared
     // allocation (see `slice_of`), so cloning the map is a `SmallVec` memcpy plus a refcount
     // bump per tag, not a fresh copy of the tag bytes.
-    Ok(Event::metric(
-        timestamp,
-        attributes.clone(),
-        MetricRecord { name: intern(name), kind, unit: None },
-    ))
+    Ok(Event::metric(timestamp, attributes.clone(), MetricRecord::new(intern(name), kind)))
 }
 
 /// Parses a metric value and rejects it unless finite. `f64::parse` accepts the literal text
@@ -436,13 +433,18 @@ mod tests {
     fn counter() {
         let metric = only_metric(decode("page.views:1|c"));
         assert_eq!(intern("page.views"), metric.name);
-        assert!(matches!(metric.kind, MetricKind::Counter(v) if v == 1.0));
+        assert!(
+            matches!(metric.kind, MetricKind::Sum(logit_core::Sum { value, .. }) if value == 1.0)
+        );
     }
 
     #[test]
     fn counter_with_sample_rate_extrapolates() {
         let metric = only_metric(decode("page.views:2|c|@0.5"));
-        assert!(matches!(metric.kind, MetricKind::Counter(v) if (v - 4.0).abs() < 1e-9));
+        assert!(matches!(
+            metric.kind,
+            MetricKind::Sum(logit_core::Sum { value, .. }) if (value - 4.0).abs() < 1e-9
+        ));
     }
 
     #[test]
@@ -676,8 +678,10 @@ mod tests {
             })
             .expect("sample_rate_clamped diagnostic should have fired");
         match &diagnostics_event.metrics[0].kind {
-            MetricKind::Counter(v) => assert_eq!(*v, 1.0, "clamping should report exactly once"),
-            other => panic!("expected Counter, got {other:?}"),
+            MetricKind::Sum(sum) => {
+                assert_eq!(sum.value, 1.0, "clamping should report exactly once")
+            }
+            other => panic!("expected Sum, got {other:?}"),
         }
     }
 

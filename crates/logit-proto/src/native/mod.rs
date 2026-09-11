@@ -14,14 +14,17 @@
 //! `docs/design/data-model.md`):
 //! - A `Symbol` (`lasso::Spur`) is never written raw -- see [`dict`]'s own doc comment. Every key,
 //!   metric name, and unit crosses the wire as a string in the dictionary, referenced by index.
-//! - Every frame is independently decodable: its own dictionary, its own resource, its own events.
-//!   A file is a plain concatenation of frames -- append, sequential read, `frame::resync` past a
-//!   torn write.
-//! - `Event`'s own fields are the one place this format is forward-compatible without a version
-//!   bump: `record::write_event`/`read_event`'s per-field framing lets an older reader skip a
-//!   field it doesn't recognize. Growing a fixed enum (`Value`, `MetricKind`) is a different kind
-//!   of change and is not attempted losslessly by an old reader -- see [`value`]'s and
-//!   [`record`]'s own doc comments for exactly what each degrades to.
+//! - Every frame is independently decodable: its own dictionary, its own resource, its own scope,
+//!   its own events. A file is a plain concatenation of frames -- append, sequential read,
+//!   `frame::resync` past a torn write.
+//! - Every record type (`Event`, `MetricRecord`, `LogRecord`, `SpanRecord`, `SpanLink`,
+//!   `SpanEvent`, `Exemplar`, `Resource`, `Scope`) is TLV-framed: `record::write_field`/
+//!   `for_each_field`'s per-field framing lets a reader skip a field it doesn't recognize.
+//!   `logit` is pre-release (`docs/adr/lossless-transit.md`), so this is hygiene against a torn
+//!   write, not a version-negotiation mechanism -- growing a fixed enum (`Value`, `MetricKind`) is
+//!   a straight reshape of this module, not something an old reader is expected to tolerate; see
+//!   [`value`]'s and [`record`]'s own doc comments for exactly what an unrecognized tag degrades
+//!   to in each case.
 
 pub mod control;
 pub mod dict;
@@ -64,8 +67,14 @@ const TRAILER_TAG_PREVIOUS: u8 = 2;
 const MAX_SANE_TRAILER_FIELD_BYTES: usize = 4096;
 
 /// Encodes one [`EventBatch`] into the dictionary-first payload `docs/design/wire-protocol.md`
-/// describes: the dictionary section, then the resource's attributes, then a length-prefixed list
-/// of events (each itself [`record::write_event`]'s TLV field stream).
+/// describes: the dictionary section, then a len-prefixed [`Resource`] TLV section, then a
+/// mandatory [`logit_core::Scope`] section (a presence byte, and if present a len-prefixed TLV
+/// body), then a length-prefixed list of events (each itself [`record::write_event`]'s TLV field
+/// stream). The scope section is placed right after the resource, never as an optional *trailing*
+/// section -- an optional trailing section would let a truncated payload decode successfully with
+/// "no scope" instead of failing, breaking `crates/logit-proto/tests/robustness.rs`'s "no proper
+/// prefix of a valid encoding is itself valid" invariant the same way an optional provenance
+/// trailer would have (see [`encode_batch_v2`]'s own doc comment for that same reasoning).
 ///
 /// The dictionary is written *first* on the wire but built *last*, in the sense that
 /// [`DictBuilder`] accumulates symbols as encoding proceeds and its own bytes aren't emitted until
@@ -74,7 +83,19 @@ pub fn encode_batch(batch: &EventBatch) -> Bytes {
     let mut dict = DictBuilder::default();
 
     let mut resource_buf = BytesMut::new();
-    value::write_attr_map(&mut resource_buf, &mut dict, &batch.resource.attributes);
+    record::write_resource(&mut resource_buf, &mut dict, &batch.resource);
+
+    let mut scope_buf = BytesMut::new();
+    match &batch.scope {
+        Some(scope) => {
+            scope_buf.extend_from_slice(&[1]);
+            let mut tmp = BytesMut::new();
+            record::write_scope(&mut tmp, &mut dict, scope);
+            write_uvarint(&mut scope_buf, tmp.len() as u64);
+            scope_buf.extend_from_slice(&tmp);
+        }
+        None => scope_buf.extend_from_slice(&[0]),
+    }
 
     let mut events_buf = BytesMut::new();
     write_uvarint(&mut events_buf, batch.events.len() as u64);
@@ -86,7 +107,9 @@ pub fn encode_batch(batch: &EventBatch) -> Bytes {
 
     let mut out = BytesMut::new();
     dict.write(&mut out);
+    write_uvarint(&mut out, resource_buf.len() as u64);
     out.extend_from_slice(&resource_buf);
+    out.extend_from_slice(&scope_buf);
     out.extend_from_slice(&events_buf);
     out.freeze()
 }
@@ -99,8 +122,34 @@ const MAX_SANE_EVENT_COUNT: usize = 16 * 1024 * 1024;
 /// The inverse of [`encode_batch`].
 pub fn decode_batch(bytes: &mut Bytes) -> Result<EventBatch, CodecError> {
     let dict = Dict::read(bytes)?;
-    let resource_attrs = value::read_attr_map(bytes, &dict)?;
-    let resource = Arc::new(Resource { attributes: resource_attrs });
+
+    let resource_len = read_uvarint(bytes)? as usize;
+    if bytes.len() < resource_len {
+        return Err(CodecError::Malformed(format!(
+            "resource section declares {resource_len} bytes but only {} remain",
+            bytes.len()
+        )));
+    }
+    let mut resource_body = bytes.split_to(resource_len);
+    let resource = Arc::new(record::read_resource(&mut resource_body, &dict)?);
+
+    let scope = match read_u8(bytes)? {
+        0 => None,
+        1 => {
+            let scope_len = read_uvarint(bytes)? as usize;
+            if bytes.len() < scope_len {
+                return Err(CodecError::Malformed(format!(
+                    "scope section declares {scope_len} bytes but only {} remain",
+                    bytes.len()
+                )));
+            }
+            let mut scope_body = bytes.split_to(scope_len);
+            Some(Arc::new(record::read_scope(&mut scope_body, &dict)?))
+        }
+        other => {
+            return Err(CodecError::Malformed(format!("bad scope presence byte {other}")));
+        }
+    };
 
     let event_count = read_uvarint(bytes)? as usize;
     if event_count > MAX_SANE_EVENT_COUNT {
@@ -120,7 +169,7 @@ pub fn decode_batch(bytes: &mut Bytes) -> Result<EventBatch, CodecError> {
         let mut body = bytes.split_to(body_len);
         events.push(record::read_event(&mut body, &dict)?);
     }
-    Ok(EventBatch { resource, events })
+    Ok(EventBatch { resource, scope, events })
 }
 
 /// [`encode_batch`], plus a mandatory length-prefixed [`Provenance`] trailer -- see
@@ -244,7 +293,7 @@ impl Decoder for NativeDecoder {
         bytes: Bytes,
         _received_at: i64,
         out: &mut Vec<Event>,
-    ) -> Result<Arc<Resource>, CodecError> {
+    ) -> Result<(Arc<Resource>, Option<Arc<logit_core::Scope>>), CodecError> {
         let mut bytes = bytes;
         let (codec, mut payload) = read_frame(&mut bytes)?;
         if codec != CODEC_NATIVE_V1 {
@@ -254,7 +303,7 @@ impl Decoder for NativeDecoder {
         }
         let batch = decode_batch(&mut payload)?;
         out.extend(batch.events);
-        Ok(batch.resource)
+        Ok((batch.resource, batch.scope))
     }
 }
 
@@ -269,7 +318,7 @@ mod tests {
     fn sample_batch() -> EventBatch {
         let mut resource_attrs = AttrMap::new();
         resource_attrs.insert("service.name", "orders-api");
-        let resource = Arc::new(Resource { attributes: resource_attrs });
+        let resource = Arc::new(Resource { attributes: resource_attrs, ..Resource::default() });
 
         let mut log_attrs = AttrMap::new();
         log_attrs.insert("host", "web-1");
@@ -281,6 +330,9 @@ mod tests {
                 severity: Some(Severity::Info),
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
 
@@ -290,9 +342,11 @@ mod tests {
             2,
             AttrMap::new(),
             MetricRecord {
-                name: logit_core::interner::intern("mod_test_metric"),
-                kind: MetricKind::Distribution(sketch),
                 unit: Some(logit_core::interner::intern("s")),
+                ..MetricRecord::new(
+                    logit_core::interner::intern("mod_test_metric"),
+                    MetricKind::Distribution(sketch),
+                )
             },
         );
 
@@ -309,10 +363,12 @@ mod tests {
                 events: Vec::new(),
                 links: Vec::new(),
                 end_timestamp: 4,
+                flags: 0,
+                ext: None,
             },
         );
 
-        EventBatch { resource, events: vec![log_event, metric_event, span_event] }
+        EventBatch { resource, scope: None, events: vec![log_event, metric_event, span_event] }
     }
 
     #[test]
@@ -336,9 +392,10 @@ mod tests {
 
         let mut decoder = NativeDecoder;
         let mut events = Vec::new();
-        let resource = decoder.decode_into(framed, 999, &mut events).unwrap();
+        let (resource, scope) = decoder.decode_into(framed, 999, &mut events).unwrap();
 
         assert_eq!(resource.attributes, batch.resource.attributes);
+        assert!(scope.is_none());
         assert_eq!(events.len(), 3);
         // The whole point of this decoder: original timestamps survive, `received_at` (999) never
         // overwrites them.
@@ -355,7 +412,7 @@ mod tests {
 
         let mut decoder = NativeDecoder;
         let mut events = Vec::new();
-        let resource = decoder.decode_into(framed, 0, &mut events).unwrap();
+        let (resource, _scope) = decoder.decode_into(framed, 0, &mut events).unwrap();
         assert_eq!(resource.attributes, batch.resource.attributes);
         assert_eq!(events.len(), 3);
     }
@@ -368,11 +425,57 @@ mod tests {
 
     #[test]
     fn an_empty_batch_round_trips() {
-        let batch = EventBatch { resource: Arc::new(Resource::default()), events: Vec::new() };
+        let batch =
+            EventBatch { resource: Arc::new(Resource::default()), scope: None, events: Vec::new() };
         let payload = encode_batch(&batch);
         let decoded = decode_batch(&mut payload.clone()).unwrap();
         assert!(decoded.events.is_empty());
         assert!(decoded.resource.attributes.is_empty());
+        assert!(decoded.scope.is_none());
+    }
+
+    #[test]
+    fn a_batch_with_a_fully_populated_scope_round_trips() {
+        let mut scope_attrs = AttrMap::new();
+        scope_attrs.insert("k", "v");
+        let scope = std::sync::Arc::new(logit_core::Scope {
+            name: bytes::Bytes::from_static(b"nginx-otel-module"),
+            version: bytes::Bytes::from_static(b"1.0.0"),
+            attributes: scope_attrs,
+            dropped_attributes_count: 2,
+            schema_url: Some(bytes::Bytes::from_static(b"https://example.com/schema")),
+        });
+        let mut batch = sample_batch();
+        batch.scope = Some(scope.clone());
+
+        let payload = encode_batch(&batch);
+        let decoded = decode_batch(&mut payload.clone()).unwrap();
+        assert_eq!(decoded.scope.as_deref(), Some(&*scope));
+    }
+
+    /// The `Decoder`/`Encoder` trait seam, not the free `encode_batch`/`decode_batch` functions
+    /// directly: `NativeDecoder::decode_into` returns `(Arc<Resource>, Option<Arc<Scope>>)`
+    /// specifically so `Decoder::decode`'s default body can carry the scope through into the
+    /// `EventBatch` it builds, rather than hardcoding `scope: None` the way it did before this
+    /// field existed on the trait. `assert_eq!` on the whole batch (not just its scope) is the
+    /// point -- proves nothing else about the round trip regressed either.
+    #[test]
+    fn a_batch_with_a_scope_round_trips_through_the_decoder_trait() {
+        let scope = std::sync::Arc::new(logit_core::Scope {
+            name: bytes::Bytes::from_static(b"trait_test_scope"),
+            version: bytes::Bytes::from_static(b"2.0.0"),
+            ..Default::default()
+        });
+        let mut batch = sample_batch();
+        batch.scope = Some(scope);
+
+        let mut encoder = NativeEncoder::default();
+        let framed = encoder.encode(&batch).unwrap();
+
+        let mut decoder = NativeDecoder;
+        let decoded = decoder.decode(framed).unwrap();
+
+        assert_eq!(decoded, batch);
     }
 
     #[test]

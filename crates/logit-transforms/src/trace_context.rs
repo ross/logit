@@ -396,6 +396,11 @@ impl TraceContext {
                 events: Vec::new(),
                 links: Vec::new(),
                 end_timestamp: end,
+                // Same W3C trace flags this lifted span's own `TraceRef` carries (`flags` above)
+                // -- the minted span represents the same trace/span identity, so its `SAMPLED`
+                // bit should match rather than default to unset.
+                flags: flags as u32,
+                ext: None,
             }),
             timestamp: Some(start),
             minted,
@@ -495,6 +500,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         )
     }
@@ -503,11 +511,10 @@ mod tests {
         Event::metric(
             0,
             AttrMap::new(),
-            logit_core::MetricRecord {
-                name: logit_core::interner::intern("m"),
-                kind: logit_core::MetricKind::Counter(1.0),
-                unit: None,
-            },
+            logit_core::MetricRecord::new(
+                logit_core::interner::intern("m"),
+                logit_core::MetricKind::counter(1.0),
+            ),
         )
     }
 
@@ -567,13 +574,13 @@ mod tests {
     fn find_counter(events: &[Event], name: &str, tag: Option<(&str, &str)>) -> Option<f64> {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
-                logit_core::MetricKind::Counter(v)
+                logit_core::MetricKind::Sum(sum)
                     if logit_core::interner::resolve(m.name) == name
                         && tag.is_none_or(|(k, want)| {
                             e.attributes.get(k).and_then(|v| v.as_str()) == Some(want)
                         }) =>
                 {
-                    Some(*v)
+                    Some(sum.value)
                 }
                 _ => None,
             })

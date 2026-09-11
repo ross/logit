@@ -37,16 +37,15 @@ fn mixed_signal_batch() -> EventBatch {
             severity: None,
             body_format: BodyFormat::Raw,
             trace: Some(TraceRef { trace_id: [5; 16], span_id: Some([9; 8]), flags: 1 }),
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
         },
     );
     let metric = Event::metric(
         2_000,
         AttrMap::new(),
-        MetricRecord {
-            name: logit_core::interner::intern("requests"),
-            kind: MetricKind::Counter(3.0),
-            unit: None,
-        },
+        MetricRecord::new(logit_core::interner::intern("requests"), MetricKind::counter(3.0)),
     );
     let span = Event::span(
         3_000,
@@ -61,11 +60,13 @@ fn mixed_signal_batch() -> EventBatch {
             events: Vec::new(),
             links: Vec::new(),
             end_timestamp: 4_000,
+            flags: 0,
+            ext: None,
         },
     );
     let mut resource = Resource::default();
     resource.attributes.insert("host", "roundtrip-host");
-    EventBatch { resource: Arc::new(resource), events: vec![log, metric, span] }
+    EventBatch { resource: Arc::new(resource), scope: None, events: vec![log, metric, span] }
 }
 
 /// Runs `input` in the background, sends `batch` through `output`, and returns every

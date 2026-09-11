@@ -267,10 +267,10 @@ fn accumulator_absorb_into_a_warm_buffer_costs_nothing() {
     let mut acc = BatchAccumulator::new(1_000, u64::MAX);
     let resource = Arc::new(Resource::default());
     let mut events = vec![Event::empty(0, AttrMap::new())];
-    assert!(acc.absorb(Arc::clone(&resource), &mut events).is_none()); // warm: grows acc's own Vec
+    assert!(acc.absorb(Arc::clone(&resource), None, &mut events).is_none()); // warm: grows acc's own Vec
     events.push(Event::empty(0, AttrMap::new())); // re-fill the (now-empty, still-capacity) buffer
 
-    let (flushed, stats) = measure(|| acc.absorb(Arc::clone(&resource), &mut events));
+    let (flushed, stats) = measure(|| acc.absorb(Arc::clone(&resource), None, &mut events));
     assert!(flushed.is_none());
     expect_allocs("accumulator: absorb into a warm buffer", stats, 0);
 }
@@ -505,6 +505,9 @@ fn logfmt_values_share_the_message_allocation() {
             severity: None,
             body_format: logit_core::BodyFormat::Raw,
             trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
         },
     );
     let event = logfmt.process(&resource, event).expect("logfmt forwards");
@@ -527,6 +530,9 @@ fn logfmt_values_share_the_message_allocation() {
             severity: None,
             body_format: logit_core::BodyFormat::Raw,
             trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
         },
     );
     let escaped_event = escaped.process(&resource, escaped_event).expect("logfmt forwards");
@@ -1043,7 +1049,16 @@ fn disk_queue_push_one_batch() {
     // copies it into a fresh, larger `BytesMut` alongside the (here empty) provenance trailer
     // (one more) rather than extending the original buffer in place -- see
     // `docs/adr/batch-provenance-on-delivered.md`.
-    expect_allocs("disk_queue: push one batch (encode + write)", stats, 27);
+    // 27 -> 36 (W1, metrics-model-v2): `encode_batch`'s per-record TLV reshape
+    // (`crates/logit-proto/src/native/record.rs`) adds two new `write_field` temp-buffer
+    // allocations per `MetricRecord` in `nginx_event`'s four metrics -- one from
+    // `write_record_list` now length-prefixing each list entry so a record with unrecognized
+    // fields can still be skipped (the old positional metrics list read/wrote records
+    // back-to-back with no per-entry length at all), and one from `MetricRecord`'s own `kind`
+    // field now being wrapped in `write_field(MR_KIND, ..)` instead of written straight into the
+    // record's buffer -- plus one more from `LogRecord.message` gaining the same `write_field`
+    // wrapper it didn't have before. 4*2 + 1 = 9.
+    expect_allocs("disk_queue: push one batch (encode + write)", stats, 36);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1326,10 +1341,14 @@ fn trace_context_lifts_a_valid_trace_id() {
         event
     };
     let telemetry = Telemetry::default();
-    let warm = EventBatch { resource: resource.clone(), events: vec![event_with_trace_id.clone()] };
+    let warm = EventBatch {
+        resource: resource.clone(),
+        scope: None,
+        events: vec![event_with_trace_id.clone()],
+    };
     drop(process_batch(&mut trace_context, warm, &telemetry));
 
-    let batch = EventBatch { resource, events: vec![event_with_trace_id] };
+    let batch = EventBatch { resource, scope: None, events: vec![event_with_trace_id] };
     let (out, stats) = measure(|| process_batch(&mut trace_context, batch, &telemetry));
     let out = out.expect("trace_context forwards events, never absorbs");
     assert!(out.events[0].log.as_ref().unwrap().trace.is_some(), "the lift should have succeeded");
@@ -1350,10 +1369,10 @@ fn trace_context_mints_a_span_from_the_convention() {
     let resource = fixtures::resource();
     let traced = fixtures::nginx_traced_event();
     let telemetry = Telemetry::default();
-    let warm = EventBatch { resource: resource.clone(), events: vec![traced.clone()] };
+    let warm = EventBatch { resource: resource.clone(), scope: None, events: vec![traced.clone()] };
     drop(process_batch(&mut trace_context, warm, &telemetry));
 
-    let batch = EventBatch { resource, events: vec![traced] };
+    let batch = EventBatch { resource, scope: None, events: vec![traced] };
     let (out, stats) = measure(|| process_batch(&mut trace_context, batch, &telemetry));
     let out = out.expect("trace_context forwards events, never absorbs");
     let event = &out.events[0];
@@ -1404,7 +1423,7 @@ fn set_resource_map_resource_cache_miss() {
 fn resource_with_service_name() -> Arc<Resource> {
     let mut attrs = AttrMap::new();
     attrs.insert("service.name", Value::str("nginx"));
-    Arc::new(Resource { attributes: attrs })
+    Arc::new(Resource { attributes: attrs, ..Default::default() })
 }
 
 /// `has_attributes` matching on a single event attribute -- free, same reasoning as
@@ -1520,10 +1539,14 @@ fn process_batch_fully_absorbed() {
     let mut agg = fixtures::aggregator();
     let resource = fixtures::resource();
     let telemetry = Telemetry::default();
-    let warm = EventBatch { resource: resource.clone(), events: vec![fixtures::statsd_event()] };
+    let warm = EventBatch {
+        resource: resource.clone(),
+        scope: None,
+        events: vec![fixtures::statsd_event()],
+    };
     drop(process_batch(&mut agg, warm, &telemetry));
 
-    let batch = EventBatch { resource, events: vec![fixtures::statsd_event()] };
+    let batch = EventBatch { resource, scope: None, events: vec![fixtures::statsd_event()] };
     let (out, stats) = measure(|| process_batch(&mut agg, batch, &telemetry));
     assert!(out.is_none(), "a batch with nothing left to forward should not be forwarded");
     expect_allocs("runtime: process_batch, fully absorbed (aggregate)", stats, 1);
@@ -2209,7 +2232,14 @@ fn native_encode_one_event() {
 
     let (framed, stats) = measure(|| encoder.encode(&batch).expect("should encode"));
     assert!(!framed.is_empty());
-    expect_allocs("native: encode 1 event", stats, 23);
+    // 23 -> 32 (W1, metrics-model-v2): the per-record TLV reshape in
+    // `crates/logit-proto/src/native/record.rs` costs 2 new `write_field` temp-buffer
+    // allocations per `MetricRecord` (`write_record_list` now length-prefixes each list entry
+    // individually so an unrecognized field inside one doesn't desync the rest of the list, and
+    // `MetricRecord.kind` is now wrapped in its own `write_field` rather than written straight
+    // into the record's buffer) plus 1 for `LogRecord.message` gaining the same wrapper -- `nginx_
+    // event` carries 4 metrics and 1 log, so 4*2 + 1 = 9.
+    expect_allocs("native: encode 1 event", stats, 32);
 }
 
 /// The decode-side mirror of [`native_encode_one_event`]. `decode_into` appends into a caller-held
@@ -2227,6 +2257,16 @@ fn native_decode_one_event() {
     let (_, stats) =
         measure(|| decoder.decode_into(framed.clone(), 0, &mut events).expect("should decode"));
     assert_eq!(events.len(), 1);
+    // 8 -> 9 -> 8 (W1, metrics-model-v2): the per-record TLV reshape briefly cost a second spill
+    // allocation here -- `read_event`'s `FIELD_METRICS` arm built the metrics list in two steps,
+    // `read_record_list` returning its own freshly allocated `Vec<MetricRecord>` and then
+    // `.into_iter().collect()`-ing that into the event's `MetricList` (`SmallVec<[MetricRecord;
+    // 1]>`), which spills to a second, separate heap buffer since a `SmallVec`'s `FromIterator`
+    // can't reuse a donor `Vec`'s allocation. `read_record_list_into`
+    // (`crates/logit-proto/src/native/record.rs`) removes that: it decodes straight into a
+    // caller-supplied destination (`reserve` once up front, then push per item), so `FIELD_METRICS`
+    // now decodes directly into the event's own `MetricList`, back down to one allocation for the
+    // list -- exactly the old positional format's cost.
     expect_allocs("native: decode 1 event", stats, 8);
 }
 
@@ -2257,7 +2297,9 @@ fn logit_out_encode_and_frame_one_batch() {
         .expect("should frame")
     });
     assert!(!framed.is_empty());
-    expect_allocs("logit_out: encode + frame 1 batch", stats, 23);
+    // 23 -> 32 (W1, metrics-model-v2): same cause as [`native_encode_one_event`] -- this path
+    // calls the same `native::encode_batch`.
+    expect_allocs("logit_out: encode + frame 1 batch", stats, 32);
 }
 
 /// `logit_in`'s own read+decode step, exercised through the exact primitives its per-connection
@@ -2285,6 +2327,10 @@ fn logit_in_read_and_decode_one_batch() {
         logit_proto::native::decode_batch(&mut payload).expect("should decode").events.len()
     });
     assert_eq!(event_count, 1);
+    // 7 -> 8 -> 7 (W1, metrics-model-v2): same cause and same fix as
+    // [`native_decode_one_event`] -- this path calls the same `native::decode_batch`, which now
+    // decodes `FIELD_METRICS` straight into the event's `MetricList` via `read_record_list_into`
+    // instead of collecting through an intermediate `Vec`.
     expect_allocs("logit_in: read + decode 1 batch", stats, 7);
 }
 

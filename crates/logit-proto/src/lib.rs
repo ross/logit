@@ -6,7 +6,7 @@ pub mod frame;
 pub mod native;
 pub mod otlp;
 
-use logit_core::{Event, EventBatch, Resource};
+use logit_core::{Event, EventBatch, Resource, Scope};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,12 +53,20 @@ pub trait Decoder {
     /// receive queue's own latency under backlog, and every emitted event's `timestamp` must be
     /// the former: this is what keeps a syslog/statsd event's `timestamp` meaning *receipt* time
     /// regardless of how far behind decode is running.
+    ///
+    /// Returns the batch's [`Resource`] **and** its [`Scope`], if any -- not just the former. A
+    /// scope, when a wire format carries one at all, is part of what one datagram/frame decodes
+    /// to, the same identity term `resource` already is
+    /// (`docs/adr/lossless-transit.md`); dropping it here would silently lose it even though the
+    /// native codec encodes it end to end. `logit_pipeline::BatchAccumulator::absorb` keys its own
+    /// accumulation on the pair `(resource, scope)`, so a caller decoding into it needs both, not
+    /// just the resource half.
     fn decode_into(
         &mut self,
         bytes: bytes::Bytes,
         received_at: i64,
         out: &mut Vec<Event>,
-    ) -> Result<Arc<Resource>, CodecError>;
+    ) -> Result<(Arc<Resource>, Option<Arc<Scope>>), CodecError>;
 
     /// Convenience wrapper over [`Decoder::decode_into`], stamping every event with the current
     /// time -- for a caller (a test, a benchmark) with no real "receipt" instant of its own to
@@ -68,8 +76,8 @@ pub trait Decoder {
     fn decode(&mut self, bytes: bytes::Bytes) -> Result<EventBatch, CodecError> {
         let received_at = now_nanos();
         let mut events = Vec::new();
-        let resource = self.decode_into(bytes, received_at, &mut events)?;
-        Ok(EventBatch { resource, events })
+        let (resource, scope) = self.decode_into(bytes, received_at, &mut events)?;
+        Ok(EventBatch { resource, scope, events })
     }
 }
 

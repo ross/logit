@@ -14,9 +14,12 @@
 //! using exactly the merges `logit-transforms::Aggregator` already performs on real events (sum
 //! for counts, last-write-wins for gauges, sketch merge for timings). That's what lets a real
 //! `aggregate` component attached downstream extend this to any actual time window *correctly*,
-//! because the merges compose -- see the module doc on why this can't take statsd clients'
-//! "batch raw samples, let the server aggregate" option for timings: `logit`'s `MetricKind` has no
-//! raw-sample representation, only mergeable ones.
+//! because the merges compose -- this module deliberately doesn't take statsd clients'
+//! "batch raw samples, let the server aggregate" option for timings: `MetricKind` does now carry a
+//! raw-sample representation ([`crate::MetricKind::Samples`], with no producer yet -- a later
+//! workstream wires `statsd_in` to it), but self-telemetry's own points are always merged eagerly
+//! here rather than buffered raw, since there is no later `aggregate` stage guaranteed to run over
+//! internal telemetry the way one might over real events.
 
 use crate::interner::intern;
 use crate::{
@@ -157,7 +160,8 @@ pub struct Telemetry(Option<Arc<ComponentBuffer>>);
 
 impl Telemetry {
     /// Adds `n` to a counter, sum-coalesced with any pending point at the same `(name, tags)`
-    /// until the next drain, then emitted as `MetricKind::Counter`.
+    /// until the next drain, then emitted as a monotonic delta `MetricKind::Sum`
+    /// ([`MetricKind::counter`]).
     pub fn count(&self, name: &'static str, n: f64, tags: &[Tag]) {
         let Some(buf) = &self.0 else { return };
         buf.upsert(
@@ -578,6 +582,8 @@ impl ComponentBuffer {
             events: Vec::new(),
             links: span.links,
             end_timestamp: span.end,
+            flags: 0,
+            ext: None,
         };
         Event::span(span.start, attrs, record)
     }
@@ -662,15 +668,11 @@ impl ComponentBuffer {
             attrs.insert("kind", self.kind);
             attrs.insert("role", self.role);
             let kind = match pending {
-                Pending::Count(v) => MetricKind::Counter(v),
+                Pending::Count(v) => MetricKind::counter(v),
                 Pending::Gauge(v) => MetricKind::Gauge(v),
                 Pending::Timing(sketch) => MetricKind::Distribution(sketch),
             };
-            events.push(Event::metric(
-                now,
-                attrs,
-                MetricRecord { name: intern(key.name), kind, unit: None },
-            ));
+            events.push(Event::metric(now, attrs, MetricRecord::new(intern(key.name), kind)));
         }
         if dropped > 0 {
             let mut attrs = self.base_attrs();
@@ -678,11 +680,10 @@ impl ComponentBuffer {
             events.push(Event::metric(
                 now,
                 attrs,
-                MetricRecord {
-                    name: intern("logit.internal.points.dropped"),
-                    kind: MetricKind::Counter(dropped as f64),
-                    unit: None,
-                },
+                MetricRecord::new(
+                    intern("logit.internal.points.dropped"),
+                    MetricKind::counter(dropped as f64),
+                ),
             ));
         }
         for span in spans {
@@ -694,11 +695,10 @@ impl ComponentBuffer {
             events.push(Event::metric(
                 now,
                 attrs,
-                MetricRecord {
-                    name: intern("logit.internal.spans.dropped"),
-                    kind: MetricKind::Counter(spans_dropped as f64),
-                    unit: None,
-                },
+                MetricRecord::new(
+                    intern("logit.internal.spans.dropped"),
+                    MetricKind::counter(spans_dropped as f64),
+                ),
             ));
         }
         for log in logs {
@@ -712,6 +712,9 @@ impl ComponentBuffer {
                     severity: Some(log.level),
                     body_format: BodyFormat::Raw,
                     trace: None,
+                    event_name: None,
+                    observed_timestamp: 0,
+                    dropped_attributes_count: 0,
                 },
             ));
         }
@@ -721,11 +724,10 @@ impl ComponentBuffer {
             events.push(Event::metric(
                 now,
                 attrs,
-                MetricRecord {
-                    name: intern("logit.internal.logs.dropped"),
-                    kind: MetricKind::Counter(logs_dropped as f64),
-                    unit: None,
-                },
+                MetricRecord::new(
+                    intern("logit.internal.logs.dropped"),
+                    MetricKind::counter(logs_dropped as f64),
+                ),
             ));
         }
         events
@@ -1015,8 +1017,8 @@ mod tests {
         let events = registry.drain(0);
         assert_eq!(events.len(), 1);
         match &events[0].metrics[0].kind {
-            MetricKind::Counter(v) => assert_eq!(*v, 3.0),
-            other => panic!("expected Counter, got {other:?}"),
+            MetricKind::Sum(s) => assert_eq!(s.value, 3.0),
+            other => panic!("expected Sum, got {other:?}"),
         }
     }
 
@@ -1071,8 +1073,8 @@ mod tests {
         let events = registry.drain(0);
         assert_eq!(events.len(), 1);
         match &events[0].metrics[0].kind {
-            MetricKind::Counter(v) => assert_eq!(*v, 2.0),
-            other => panic!("expected Counter, got {other:?}"),
+            MetricKind::Sum(s) => assert_eq!(s.value, 2.0),
+            other => panic!("expected Sum, got {other:?}"),
         }
     }
 
@@ -1140,8 +1142,8 @@ mod tests {
             "both calls should coalesce into one point, not fragment into two"
         );
         match &events[0].metrics[0].kind {
-            MetricKind::Counter(v) => assert_eq!(*v, 3.0),
-            other => panic!("expected Counter, got {other:?}"),
+            MetricKind::Sum(s) => assert_eq!(s.value, 3.0),
+            other => panic!("expected Sum, got {other:?}"),
         }
     }
 
@@ -1164,8 +1166,8 @@ mod tests {
             .find(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("cardinality"))
             .expect("a cardinality-drop counter event should be present");
         match &dropped.metrics[0].kind {
-            MetricKind::Counter(v) => assert_eq!(*v, 5.0),
-            other => panic!("expected Counter, got {other:?}"),
+            MetricKind::Sum(s) => assert_eq!(s.value, 5.0),
+            other => panic!("expected Sum, got {other:?}"),
         }
     }
 
@@ -1220,8 +1222,8 @@ mod tests {
         let events = registry.drain(0);
         assert_eq!(events.len(), 1, "both handles should coalesce into one buffer, not race two");
         match &events[0].metrics[0].kind {
-            MetricKind::Counter(v) => assert_eq!(*v, 2.0),
-            other => panic!("expected Counter, got {other:?}"),
+            MetricKind::Sum(s) => assert_eq!(s.value, 2.0),
+            other => panic!("expected Sum, got {other:?}"),
         }
         // The first registration's kind/role wins -- a later call didn't silently overwrite it.
         assert_eq!(events[0].attributes.get("kind").and_then(|v| v.as_str()), Some("statsd_in"));
@@ -1370,8 +1372,8 @@ mod tests {
             .find(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("buffer_full"))
             .expect("a buffer_full drop counter event should be present");
         match &dropped.metrics[0].kind {
-            MetricKind::Counter(v) => assert_eq!(*v, 5.0),
-            other => panic!("expected Counter, got {other:?}"),
+            MetricKind::Sum(s) => assert_eq!(s.value, 5.0),
+            other => panic!("expected Sum, got {other:?}"),
         }
     }
 
@@ -1453,6 +1455,9 @@ mod tests {
                 trace_id: trace_id(seed),
                 span_id: span_id(seed),
                 attributes: AttrMap::new(),
+                flags: 0,
+                trace_state: None,
+                dropped_attributes_count: 0,
             });
         }
         drop(span);
@@ -1467,8 +1472,8 @@ mod tests {
             .filter_map(|e| {
                 e.metrics.iter().find_map(|m| {
                     (crate::interner::resolve(m.name) == "logit.internal.span.links.dropped")
-                        .then_some(match m.kind {
-                            MetricKind::Counter(v) => v,
+                        .then_some(match &m.kind {
+                            MetricKind::Sum(s) => s.value,
                             _ => 0.0,
                         })
                 })
@@ -1634,8 +1639,8 @@ mod tests {
             .find(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("buffer_full"))
             .expect("a buffer_full drop counter event should be present");
         match &dropped.metrics[0].kind {
-            MetricKind::Counter(v) => assert_eq!(*v, 5.0),
-            other => panic!("expected Counter, got {other:?}"),
+            MetricKind::Sum(s) => assert_eq!(s.value, 5.0),
+            other => panic!("expected Sum, got {other:?}"),
         }
     }
 }

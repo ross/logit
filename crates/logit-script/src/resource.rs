@@ -60,7 +60,14 @@ pub(crate) fn set(state: &Rc<RefCell<ResourceState>>, resource: &Arc<Resource>) 
 pub(crate) fn take(state: &Rc<RefCell<ResourceState>>) -> Option<Arc<Resource>> {
     let mut state = state.borrow_mut();
     let modified = state.modified.take()?;
-    let new = Arc::new(Resource { attributes: modified });
+    // `dropped_attributes_count`/`schema_url` are not exposed to Lua (W7) -- carry them over from
+    // `base` explicitly rather than defaulting them, so a script's attribute write doesn't
+    // silently discard what the batch's resource already reported.
+    let new = Arc::new(Resource {
+        attributes: modified,
+        dropped_attributes_count: state.base.dropped_attributes_count,
+        schema_url: state.base.schema_url.clone(),
+    });
     state.base = new.clone();
     Some(new)
 }
@@ -149,7 +156,7 @@ mod tests {
         for (k, v) in pairs {
             attrs.insert(k, *v);
         }
-        Arc::new(Resource { attributes: attrs })
+        Arc::new(Resource { attributes: attrs, ..Default::default() })
     }
 
     #[test]

@@ -101,11 +101,9 @@ impl Transform for KvMetrics {
     fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
         for m in &self.counters {
             if let Some(value) = metric_value(m, &event.attributes) {
-                event.metrics.push(MetricRecord {
-                    name: m.name,
-                    kind: MetricKind::Counter(value),
-                    unit: m.unit,
-                });
+                let mut record = MetricRecord::new(m.name, MetricKind::counter(value));
+                record.unit = m.unit;
+                event.metrics.push(record);
                 self.telemetry.count("logit.transform.derived", 1.0, &[("metric_kind", "counter")]);
             } else {
                 self.telemetry.count(
@@ -117,11 +115,9 @@ impl Transform for KvMetrics {
         }
         for m in &self.gauges {
             if let Some(value) = metric_value(m, &event.attributes) {
-                event.metrics.push(MetricRecord {
-                    name: m.name,
-                    kind: MetricKind::Gauge(value),
-                    unit: m.unit,
-                });
+                let mut record = MetricRecord::new(m.name, MetricKind::Gauge(value));
+                record.unit = m.unit;
+                event.metrics.push(record);
                 self.telemetry.count("logit.transform.derived", 1.0, &[("metric_kind", "gauge")]);
             } else {
                 self.telemetry.count(
@@ -150,11 +146,9 @@ impl Transform for KvMetrics {
             if let Some(value) = event.attributes.get(field).and_then(numeric) {
                 let mut sketch = DdSketch::new();
                 sketch.add(value);
-                event.metrics.push(MetricRecord {
-                    name: m.name,
-                    kind: MetricKind::Distribution(sketch),
-                    unit: m.unit,
-                });
+                let mut record = MetricRecord::new(m.name, MetricKind::Distribution(sketch));
+                record.unit = m.unit;
+                event.metrics.push(record);
                 self.telemetry.count(
                     "logit.transform.derived",
                     1.0,
@@ -215,6 +209,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         )
     }
@@ -229,8 +226,8 @@ mod tests {
 
     fn counter_value(record: &MetricRecord) -> f64 {
         match record.kind {
-            MetricKind::Counter(v) => v,
-            _ => panic!("expected Counter"),
+            MetricKind::Sum(sum) => sum.value,
+            _ => panic!("expected Sum"),
         }
     }
 
@@ -377,11 +374,7 @@ mod tests {
         let mut kv = KvMetrics::new(vec![spec("new_counter", None)], vec![], vec![]);
         let resource = default_resource();
         let mut event = event_with_attrs(&[]);
-        event.metrics.push(MetricRecord {
-            name: intern("existing"),
-            kind: MetricKind::Counter(9.0),
-            unit: None,
-        });
+        event.metrics.push(MetricRecord::new(intern("existing"), MetricKind::counter(9.0)));
         let event = kv.process(&resource, event).expect("always forwards");
         assert_eq!(event.metrics.len(), 2);
         assert_eq!(resolve(event.metrics[0].name), "existing");
@@ -404,6 +397,8 @@ mod tests {
             events: Vec::<SpanEvent>::new(),
             links: Vec::new(),
             end_timestamp: 0,
+            flags: 0,
+            ext: None,
         });
         let original_attrs = event.attributes.clone();
         let original_log = event.log.clone();
@@ -445,7 +440,7 @@ mod tests {
                 return None;
             }
             e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Counter(v) if resolve(m.name) == name => Some(*v),
+                MetricKind::Sum(sum) if resolve(m.name) == name => Some(sum.value),
                 _ => None,
             })
         })

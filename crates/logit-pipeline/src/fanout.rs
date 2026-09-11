@@ -419,18 +419,23 @@ mod tests {
     use logit_core::{AttrMap, MetricKind, Registry, Resource};
 
     /// `Delivered`'s size, pinned exactly, the same reasoning `crates/logit-core/tests/type_sizes.rs`
-    /// applies to `Event`: a `<=` bound would absorb exactly what this exists to catch. 64, not 32
-    /// -- `BatchContext` (32 bytes: `TraceContext`'s 24 plus `Provenance`'s 8, no padding) is now a
-    /// real, permanent field on every variant. `Owned`'s `EventBatch` (32 bytes: an `Arc<Resource>`
-    /// pointer plus a `Vec<Event>`) plus `BatchContext` (32) is the larger variant at 64, and it
-    /// still fits with no separate discriminant byte -- the `Vec`'s non-null pointer gives the
-    /// compiler a niche to fold the tag into for free, the same trick that makes
-    /// `Option<SpanRecord>` cost nothing over `SpanRecord` (`crates/logit-core/tests/type_sizes.rs`).
-    /// `docs/design/memory.md`'s "Costing internal spans" section has the history of the earlier
-    /// 32 -> 56 growth this extends; `docs/adr/batch-provenance-on-delivered.md` records this one.
+    /// applies to `Event`: a `<=` bound would absorb exactly what this exists to catch. 72, not 64
+    /// -- `EventBatch` grew an 8-byte `scope: Option<Arc<Scope>>` field (`docs/plans/
+    /// lossless-transit.md`'s batch-level `Scope`), so `Owned`'s `EventBatch` (`Arc<Resource>` 8 +
+    /// `Option<Arc<Scope>>` 8 + `Vec<Event>` 24 = 40 bytes) plus `BatchContext` (32 bytes:
+    /// `TraceContext`'s 24 plus `Provenance`'s 8, no padding) is now the larger variant at 72. Still
+    /// no separate discriminant byte: the `Vec`'s non-null pointer still gives the compiler a niche
+    /// to fold `Delivered`'s own tag into for free, same trick as before -- confirmed below by
+    /// `Option<Delivered>` staying exactly 72 too, one niche further. `docs/design/memory.md`'s
+    /// "Costing internal spans" section has the history of the earlier 32 -> 56 -> 64 growth this
+    /// extends; `docs/adr/batch-provenance-on-delivered.md` records the 56 -> 64 step, `docs/adr/
+    /// metrics-model-v2.md` this one.
     #[test]
-    fn delivered_is_64_bytes_no_wider_than_its_larger_variant() {
-        assert_eq!(std::mem::size_of::<Delivered>(), 64);
+    fn delivered_is_72_bytes_no_wider_than_its_larger_variant() {
+        assert_eq!(std::mem::size_of::<Delivered>(), 72);
+        // `EventBatch`'s own `Vec<Event>` pointer niche is still available one level up too --
+        // `Option<Delivered>` costs nothing extra over `Delivered` itself.
+        assert_eq!(std::mem::size_of::<Option<Delivered>>(), 72);
     }
 
     /// `Provenance` itself lives in `logit-core` and is pinned there
@@ -482,6 +487,7 @@ mod tests {
     fn batch(n: usize) -> EventBatch {
         EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: (0..n).map(|_| logit_core::Event::empty(0, AttrMap::new())).collect(),
         }
     }
@@ -489,7 +495,9 @@ mod tests {
     fn counter_value(events: &[logit_core::Event], name: &str) -> Option<f64> {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Counter(v) if logit_core::interner::resolve(m.name) == name => Some(*v),
+                MetricKind::Sum(s) if logit_core::interner::resolve(m.name) == name => {
+                    Some(s.value)
+                }
                 _ => None,
             })
         })

@@ -194,7 +194,7 @@ fn assert_bit_flips_never_panic(
 fn sample_batch() -> EventBatch {
     let mut resource_attrs = AttrMap::new();
     resource_attrs.insert("service.name", "robustness-fixture");
-    let resource = Arc::new(Resource { attributes: resource_attrs });
+    let resource = Arc::new(Resource { attributes: resource_attrs, ..Resource::default() });
 
     let mut log_attrs = AttrMap::new();
     log_attrs.insert("host", "robustness-host");
@@ -206,9 +206,12 @@ fn sample_batch() -> EventBatch {
             severity: Some(Severity::Info),
             body_format: logit_core::BodyFormat::Raw,
             trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
         },
     );
-    EventBatch { resource, events: vec![event] }
+    EventBatch { resource, scope: None, events: vec![event] }
 }
 
 fn deeply_nested_batch(depth: usize) -> EventBatch {
@@ -226,9 +229,12 @@ fn deeply_nested_batch(depth: usize) -> EventBatch {
             severity: None,
             body_format: logit_core::BodyFormat::Raw,
             trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
         },
     );
-    EventBatch { resource: Arc::new(Resource::default()), events: vec![event] }
+    EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![event] }
 }
 
 fn sample_hello() -> Hello {

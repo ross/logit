@@ -12,6 +12,7 @@ per-event allocation would dominate the profile at any interesting throughput.
 ```rust
 pub struct EventBatch {
     pub resource: Arc<Resource>,   // host/service/container id -- shared across the whole batch
+    pub scope: Option<Arc<Scope>>, // OTLP instrumentation scope; None for most non-OTLP producers
     pub events: Vec<Event>,
 }
 
@@ -38,9 +39,9 @@ mechanism an operator uses to declare a resource identity `logit`'s own code won
 own (`logit_pipeline::Transform::map_resource`,
 [ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md)).
 
-**`Event` is 800 bytes**, and that size is paid unconditionally — a statsd counter with three tags
+**`Event` is 864 bytes**, and that size is paid unconditionally — a statsd counter with three tags
 costs exactly as much to move as a fully-populated nginx access log, because `AttrMap`'s inline
-capacity and `MetricKind`'s inlined `DDSketch` are reserved whether or not they're used. Since an
+capacity and `MetricKind`'s inlined `DDSketch`/`Samples` are reserved whether or not they're used. Since an
 event is moved by value on every hop between nodes and deep-cloned once per extra fan-out consumer,
 that number is a throughput property. [memory.md](memory.md) breaks it down term by term, measures
 what each pipeline stage allocates, and lists what could be reclaimed;
@@ -156,6 +157,9 @@ pub struct LogRecord {
     pub severity: Option<Severity>,   // normalized syslog-style level
     pub body_format: BodyFormat,      // Raw | Json | Structured -- hints downstream parsers
     pub trace: Option<TraceRef>,      // application trace/span this log was emitted under
+    pub event_name: Option<Symbol>,   // OTLP's LogRecord.event_name -- no producer until W4
+    pub observed_timestamp: i64,      // unix nanos observed by the collector; 0 = unset
+    pub dropped_attributes_count: u32,
 }
 
 pub struct TraceRef {
@@ -166,19 +170,51 @@ pub struct TraceRef {
 
 pub struct MetricRecord {
     pub name: Symbol,
-    pub kind: MetricKind,
     pub unit: Option<Symbol>,
+    pub description: Option<Symbol>,
+    pub start_timestamp: i64,         // 0 = unknown, OTLP's own convention -- avoids Option<i64>
+    pub exemplars: Vec<Exemplar>,     // empty Vec allocates nothing on the common no-exemplars path
+    pub kind: MetricKind,
 }
 
 pub enum MetricKind {
-    Counter(f64),
+    Sum(Sum),                             // replaces Counter; MetricKind::counter(v) for delta+monotonic
     Gauge(f64),
-    GaugeDelta(f64),  // unresolved relative adjustment; resolved into Gauge by `aggregate` only
-    Set(HyperLogLog),
-    Distribution(DdSketch),
-    Histogram { buckets: Vec<(f64, u64)> },   // fixed-bucket, e.g. Prometheus-style input
-    Summary { quantiles: Vec<(f64, f64)> },   // pre-computed quantiles, e.g. some scrape inputs
+    GaugeDelta(f64),   // unresolved relative adjustment; resolved into Gauge by `aggregate` only
+    Samples(Samples),                     // raw observations, e.g. statsd ms/h/d -- no producer until W3
+    Distribution(DdSketch),               // produced only by `aggregate`, merging a run of Samples
+    SetMembers(Vec<bytes::Bytes>),        // raw set members, e.g. statsd s -- no producer until W3
+    Set(HyperLogLog),                     // produced only by `aggregate`; still a stub
+    Histogram(Histogram),                 // fixed, explicit bucket bounds
+    ExponentialHistogram(ExpHistogram),   // OTLP/Prometheus base-2 exponential bucketing, kept
+                                           // distinct so otlp_in -> otlp_out is a fixed point
+    Summary(Summary),                     // pre-computed quantiles
 }
+
+pub struct Sum { pub value: f64, pub temporality: Temporality, pub monotonic: bool }
+
+pub struct Samples { pub values: SmallVec<[f64; SAMPLES_INLINE]>, pub sample_rate: f64 }
+
+pub struct Histogram {
+    pub buckets: Vec<(f64, u64)>, pub temporality: Temporality,
+    pub sum: Option<f64>, pub min: Option<f64>, pub max: Option<f64>,
+}
+
+pub struct ExpHistogram {
+    pub scale: i32, pub zero_count: u64, pub zero_threshold: f64,
+    pub positive: (i32, Vec<u64>), pub negative: (i32, Vec<u64>),   // each (offset, bucket_counts)
+    pub temporality: Temporality, pub count: u64,
+    pub sum: Option<f64>, pub min: Option<f64>, pub max: Option<f64>,
+}
+
+pub struct Summary { pub quantiles: Vec<(f64, f64)>, pub count: u64, pub sum: f64 }
+
+pub struct Exemplar {
+    pub timestamp: i64, pub value: f64, pub trace: Option<TraceRef>,
+    pub filtered_attributes: AttrMap,
+}
+
+pub enum Temporality { Delta, Cumulative }
 
 pub struct SpanRecord {
     pub trace_id: [u8; 16],
@@ -190,6 +226,46 @@ pub struct SpanRecord {
     pub events: Vec<SpanEvent>,
     pub links: Vec<SpanLink>,
     pub end_timestamp: i64,
+    pub flags: u32,                   // W3C trace flags (low 8 bits of OTLP's Span.flags); 0 = unset
+    pub ext: Option<Box<SpanExt>>,    // boxed: only an error span or one with tracestate pays for it
+}
+
+pub struct SpanExt {
+    pub status_message: Option<bytes::Bytes>,
+    pub trace_state: Option<bytes::Bytes>,
+    pub dropped_attributes_count: u32,
+    pub dropped_events_count: u32,
+    pub dropped_links_count: u32,
+}
+
+pub struct SpanEvent {
+    pub timestamp: i64,
+    pub name: Value,
+    pub attributes: AttrMap,
+    pub dropped_attributes_count: u32,
+}
+
+pub struct SpanLink {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub attributes: AttrMap,
+    pub flags: u32,
+    pub trace_state: Option<bytes::Bytes>,
+    pub dropped_attributes_count: u32,
+}
+
+pub struct Scope {
+    pub name: bytes::Bytes,
+    pub version: bytes::Bytes,
+    pub attributes: AttrMap,
+    pub dropped_attributes_count: u32,
+    pub schema_url: Option<bytes::Bytes>,
+}
+
+pub struct Resource {
+    pub attributes: AttrMap,
+    pub dropped_attributes_count: u32,
+    pub schema_url: Option<bytes::Bytes>,
 }
 ```
 
@@ -203,18 +279,23 @@ config or script explicitly set; `logit`'s own code never invents one. See
 
 **Metric kinds are chosen to be mergeable**, because the split-collection topology
 ([overview](../OVERVIEW.md)) means two edge nodes' aggregates may need to combine into one
-downstream, and that has to be correct, not approximate-and-hope. The kinds below are also being
-reshaped under [ADR `lossless-transit`](../adr/lossless-transit.md) — see
-[docs/plans/lossless-transit.md](../plans/lossless-transit.md)'s target model for the fuller shape
-this section will grow into (raw-sample and raw-member representations alongside the sketch/HLL
-ones, temporality and monotonicity on sums, sum/count/min/max on histograms):
+downstream, and that has to be correct, not approximate-and-hope. [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)
+reshaped these kinds to close the gaps [ADR `lossless-transit`](../adr/lossless-transit.md) named —
+raw-sample (`Samples`) and raw-member (`SetMembers`) representations alongside the sketch/HLL ones,
+temporality and monotonicity on `Sum`, sum/count/min/max on `Histogram`/`ExponentialHistogram`/
+`Summary` — per [docs/plans/lossless-transit.md](../plans/lossless-transit.md)'s target model:
 
 - `Distribution` uses **DDSketch** (`sketches-ddsketch`), which merges with a guaranteed relative
   error bound. Plain reservoir sampling or naive percentile-of-percentiles does not merge correctly
   — merging two nodes' p99s is not the p99 of the merged data — so DDSketch is load-bearing for the
-  whole distributed-aggregation story, not a nice-to-have.
-- `Set` uses a **HyperLogLog**, which merges (union) exactly by construction.
-- `Counter`/`Gauge` merge trivially (sum / last-write-wins by timestamp).
+  whole distributed-aggregation story, not a nice-to-have. `Samples` (raw statsd `ms`/`h`/`d`
+  observations) is what `aggregate` sketches into a `Distribution` — no producer until W3.
+- `Set` uses a **HyperLogLog**, which merges (union) exactly by construction. `SetMembers` (raw
+  statsd `s` members) is `Set`'s own raw counterpart, same relationship as `Samples`/`Distribution`
+  — no producer until W3.
+- `Sum`/`Gauge` merge trivially (sum / last-write-wins by timestamp) for the delta-monotonic case
+  `MetricKind::counter` produces; a cumulative or non-monotonic `Sum` has no merge rule defined
+  here and passes through unmerged, the same as `Histogram`/`ExponentialHistogram`/`Summary`.
 - `GaugeDelta` is not mergeable on its own terms — it's statsd/DogStatsD's relative gauge
   adjustment (a leading `+`/`-`), decoded by `statsd_in` but left explicitly **unresolved**: it
   must never reach a sink. Only `aggregate` resolves it, applying it to a `Gauge`'s running value
@@ -222,13 +303,13 @@ ones, temporality and monotonicity on sums, sum/count/min/max on histograms):
   see [ADR `relative-gauge-adjustments`](../adr/relative-gauge-adjustments.md)). This is the one metric kind whose
   aggregation state genuinely needs to survive a flush to be correct — see
   [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment for why that's true for
-  gauges specifically and not for `Counter`.
+  gauges specifically and not for a delta-monotonic `Sum`.
 
 A `Distribution`'s `count()` becomes a **population estimate**, not a count of received
 datagrams, wherever sample-rate extrapolation is in play: `statsd_in`'s `ms`/`h`/`d` decoding
 (`crates/logit-inputs/src/statsd.rs`) inserts `(1.0 / sample_rate).round()` weighted samples per
 line via `DdSketch::add_weighted`, so a sketch fed by `100|ms|@0.1` reports `count() == 10` even
-though only one datagram arrived. This is the same relationship `Counter(value / sample_rate)`
+though only one datagram arrived. This is the same relationship `MetricKind::counter(value / sample_rate)`
 already has for counters, made explicit for distributions too — `count` answers "how many events
 this represents," not "how many datagrams I received."
 

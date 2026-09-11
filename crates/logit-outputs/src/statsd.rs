@@ -127,7 +127,8 @@ use crate::msgbuf::MessageBuf;
 use crate::Output;
 use anyhow::Context;
 use logit_core::{
-    Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
+    Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Temporality,
+    Value,
 };
 use logit_pipeline::Fault;
 use std::time::Duration;
@@ -371,8 +372,12 @@ fn render_metric(
     }
 
     match &metric.kind {
-        MetricKind::Counter(v) => {
-            if !v.is_finite() {
+        // A delta, monotonic `Sum` is what `MetricKind::Counter` used to mean -- encodes exactly
+        // as it did, `name:v|c`. Any other `Sum` (cumulative, or non-monotonic) has no `|c`
+        // meaning statsd can represent and falls through to the unsupported-kind arm below --
+        // real encoding support is W3's (`docs/plans/lossless-transit.md`).
+        MetricKind::Sum(s) if s.temporality == Temporality::Delta && s.monotonic => {
+            if !s.value.is_finite() {
                 stats.dropped_unencodable_value += 1;
                 diag.warn_throttled(
                     "unencodable_value",
@@ -382,10 +387,18 @@ fn render_metric(
             }
             line.push_str(name);
             line.push(':');
-            push_float(line, *v);
+            push_float(line, s.value);
             line.push_str("|c");
             append_tags(line, tag_suffix);
             true
+        }
+        MetricKind::Sum(s) => {
+            let kind_name = if s.temporality == Temporality::Cumulative {
+                "cumulative Sum"
+            } else {
+                "non-monotonic Sum"
+            };
+            dropped_unsupported_kind(stats, diag, name, kind_name)
         }
         MetricKind::Gauge(v) => {
             if !v.is_finite() {
@@ -445,25 +458,41 @@ fn render_metric(
             append_tags(line, tag_suffix);
             true
         }
-        other => {
-            let kind_name = match other {
-                MetricKind::Distribution(_) => "Distribution",
-                MetricKind::Set(_) => "Set",
-                MetricKind::Histogram { .. } => "Histogram",
-                MetricKind::Summary { .. } => "Summary",
-                _ => unreachable!("Counter/Gauge/GaugeDelta handled above"),
-            };
-            stats.dropped_unsupported_kind += 1;
-            diag.warn_throttled(
-                "unsupported_metric_kind",
-                format_args!(
-                    "statsd_out: {kind_name} metrics are not implemented yet (metric {name:?}); \
-                     dropping"
-                ),
-            );
-            false
+        MetricKind::Distribution(_) => dropped_unsupported_kind(stats, diag, name, "Distribution"),
+        MetricKind::Set(_) => dropped_unsupported_kind(stats, diag, name, "Set"),
+        MetricKind::Histogram(_) => dropped_unsupported_kind(stats, diag, name, "Histogram"),
+        MetricKind::Summary(_) => dropped_unsupported_kind(stats, diag, name, "Summary"),
+        // Raw, unsummarized data (statsd's own `ms`/`h`/`d`/`s` shapes, decoded losslessly by
+        // `statsd_in` -- `docs/plans/lossless-transit.md`) -- W3 owns real `|ms`/`|h`/`|d`/`|s`
+        // encoding for these; W1 only has to keep them from panicking.
+        MetricKind::Samples(_) => dropped_unsupported_kind(stats, diag, name, "Samples"),
+        MetricKind::SetMembers(_) => dropped_unsupported_kind(stats, diag, name, "SetMembers"),
+        MetricKind::ExponentialHistogram(_) => {
+            dropped_unsupported_kind(stats, diag, name, "ExponentialHistogram")
         }
     }
+}
+
+/// Shared by every `MetricKind` arm `render_metric` can't encode -- counts the drop and logs a
+/// throttled warning naming exactly which kind was unencodable, then returns `false` the same way
+/// every other early-return drop path in `render_metric` does. Extracted so the match above can
+/// stay one arm per variant (fully exhaustive, no wildcard) without repeating these three lines
+/// per arm -- the exhaustiveness itself is the point: a future `MetricKind` variant is a compile
+/// error here, not a silent `unreachable!` panic at runtime.
+fn dropped_unsupported_kind(
+    stats: &mut EncodeStats,
+    diag: &mut Diagnostics,
+    name: &str,
+    kind_name: &str,
+) -> bool {
+    stats.dropped_unsupported_kind += 1;
+    diag.warn_throttled(
+        "unsupported_metric_kind",
+        format_args!(
+            "statsd_out: {kind_name} metrics are not implemented yet (metric {name:?}); dropping"
+        ),
+    );
+    false
 }
 
 fn write_gauge_line(line: &mut String, name: &str, v: f64, tag_suffix: &str) {
@@ -876,7 +905,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     fn batch_with(events: Vec<Event>) -> EventBatch {
-        EventBatch { resource: Arc::new(Resource::default()), events }
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
     }
 
     fn metric_event(name: &str, kind: MetricKind, attrs: &[(&str, Value)]) -> Event {
@@ -884,7 +913,7 @@ mod tests {
         for (k, v) in attrs {
             attributes.insert(k, v.clone());
         }
-        Event::metric(0, attributes, MetricRecord { name: intern(name), kind, unit: None })
+        Event::metric(0, attributes, MetricRecord::new(intern(name), kind))
     }
 
     fn log_event(ts: i64) -> Event {
@@ -896,6 +925,9 @@ mod tests {
                 severity: None,
                 body_format: logit_core::BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         )
     }
@@ -923,7 +955,7 @@ mod tests {
 
     #[test]
     fn a_counter_encodes_as_name_colon_value_pipe_c() {
-        let (msgs, stats) = encode(vec![metric_event("hits", MetricKind::Counter(3.0), &[])]);
+        let (msgs, stats) = encode(vec![metric_event("hits", MetricKind::counter(3.0), &[])]);
         assert_eq!(stats, EncodeStats::default());
         assert_eq!(msgs, vec!["hits:3|c"]);
     }
@@ -943,20 +975,20 @@ mod tests {
 
     #[test]
     fn no_sample_rate_segment_is_ever_emitted() {
-        let (msgs, _) = encode(vec![metric_event("hits", MetricKind::Counter(3.0), &[])]);
+        let (msgs, _) = encode(vec![metric_event("hits", MetricKind::counter(3.0), &[])]);
         assert!(!msgs[0].contains('@'));
     }
 
     #[test]
     fn no_timestamp_segment_is_ever_emitted() {
-        let (msgs, _) = encode(vec![metric_event("hits", MetricKind::Counter(3.0), &[])]);
+        let (msgs, _) = encode(vec![metric_event("hits", MetricKind::counter(3.0), &[])]);
         assert!(!msgs[0].contains('T'));
     }
 
     #[test]
     fn encoding_the_same_batch_twice_produces_byte_identical_output() {
         let events =
-            vec![metric_event("hits", MetricKind::Counter(3.0), &[("env", "prod".into())])];
+            vec![metric_event("hits", MetricKind::counter(3.0), &[("env", "prod".into())])];
         let (first, _) = encode_with_format(events.clone(), Format::DogStatsd);
         let (second, _) = encode_with_format(events, Format::DogStatsd);
         assert_eq!(first, second);
@@ -968,7 +1000,7 @@ mod tests {
     fn dogstatsd_tags_render_as_one_hash_prefixed_comma_separated_segment() {
         let (msgs, _) = encode(vec![metric_event(
             "hits",
-            MetricKind::Counter(1.0),
+            MetricKind::counter(1.0),
             &[("env", "prod".into()), ("host", "web1".into())],
         )]);
         assert_eq!(msgs[0], "hits:1|c|#env:prod,host:web1");
@@ -978,7 +1010,7 @@ mod tests {
     fn a_bool_true_attribute_encodes_as_a_bare_tag_not_key_colon_true() {
         let (msgs, _) = encode(vec![metric_event(
             "hits",
-            MetricKind::Counter(1.0),
+            MetricKind::counter(1.0),
             &[("urgent", true.into())],
         )]);
         assert_eq!(msgs[0], "hits:1|c|#urgent");
@@ -988,7 +1020,7 @@ mod tests {
     fn a_bool_false_attribute_encodes_as_key_colon_false() {
         let (msgs, _) = encode(vec![metric_event(
             "hits",
-            MetricKind::Counter(1.0),
+            MetricKind::counter(1.0),
             &[("verified", false.into())],
         )]);
         assert_eq!(msgs[0], "hits:1|c|#verified:false");
@@ -997,7 +1029,7 @@ mod tests {
     #[test]
     fn plain_statsd_format_omits_the_tag_segment_entirely() {
         let (msgs, stats) = encode_with_format(
-            vec![metric_event("hits", MetricKind::Counter(1.0), &[("env", "prod".into())])],
+            vec![metric_event("hits", MetricKind::counter(1.0), &[("env", "prod".into())])],
             Format::Statsd,
         );
         assert_eq!(msgs[0], "hits:1|c");
@@ -1010,7 +1042,7 @@ mod tests {
     fn a_colon_in_a_tag_value_survives() {
         let (msgs, _) = encode(vec![metric_event(
             "hits",
-            MetricKind::Counter(1.0),
+            MetricKind::counter(1.0),
             &[("range", "a:b".into())],
         )]);
         assert_eq!(msgs[0], "hits:1|c|#range:a:b");
@@ -1020,18 +1052,15 @@ mod tests {
     fn a_colon_in_a_tag_key_is_replaced() {
         let mut attrs = AttrMap::new();
         attrs.insert("a:b", "x");
-        let event = Event::metric(
-            0,
-            attrs,
-            MetricRecord { name: intern("hits"), kind: MetricKind::Counter(1.0), unit: None },
-        );
+        let event =
+            Event::metric(0, attrs, MetricRecord::new(intern("hits"), MetricKind::counter(1.0)));
         let (msgs, _) = encode(vec![event]);
         assert_eq!(msgs[0], "hits:1|c|#a_b:x");
     }
 
     #[test]
     fn an_embedded_newline_in_a_metric_name_cannot_forge_a_second_metric_line() {
-        let (msgs, _) = encode(vec![metric_event("a\nb", MetricKind::Counter(1.0), &[])]);
+        let (msgs, _) = encode(vec![metric_event("a\nb", MetricKind::counter(1.0), &[])]);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0], "a_b:1|c");
     }
@@ -1041,7 +1070,7 @@ mod tests {
         // Substitution never produces an empty result except from an already-empty input --
         // every forbidden character becomes `_`, not nothing (`:` alone sanitizes to `"_"`, a
         // perfectly good one-character name, not a drop).
-        let (msgs, stats) = encode(vec![metric_event("", MetricKind::Counter(1.0), &[])]);
+        let (msgs, stats) = encode(vec![metric_event("", MetricKind::counter(1.0), &[])]);
         assert!(msgs.is_empty());
         assert_eq!(stats.dropped_empty_name, 1);
     }
@@ -1050,7 +1079,7 @@ mod tests {
 
     #[test]
     fn a_non_finite_counter_value_is_dropped_rather_than_written_as_the_text_nan() {
-        let (msgs, stats) = encode(vec![metric_event("hits", MetricKind::Counter(f64::NAN), &[])]);
+        let (msgs, stats) = encode(vec![metric_event("hits", MetricKind::counter(f64::NAN), &[])]);
         assert!(msgs.is_empty());
         assert_eq!(stats.dropped_unencodable_value, 1);
     }
@@ -1112,22 +1141,86 @@ mod tests {
         let events = vec![
             metric_event("d", MetricKind::Distribution(logit_core::DdSketch::new()), &[]),
             metric_event("s", MetricKind::Set(logit_core::HyperLogLog::default()), &[]),
-            metric_event("h", MetricKind::Histogram { buckets: vec![] }, &[]),
-            metric_event("q", MetricKind::Summary { quantiles: vec![] }, &[]),
+            metric_event(
+                "h",
+                MetricKind::Histogram(logit_core::Histogram {
+                    buckets: vec![],
+                    temporality: Temporality::Cumulative,
+                    sum: None,
+                    min: None,
+                    max: None,
+                }),
+                &[],
+            ),
+            metric_event(
+                "q",
+                MetricKind::Summary(logit_core::Summary { quantiles: vec![], count: 0, sum: 0.0 }),
+                &[],
+            ),
         ];
         let (msgs, stats) = encode(events);
         assert!(msgs.is_empty());
         assert_eq!(stats.dropped_unsupported_kind, 4);
     }
 
+    /// The new-in-v2 variants (`Samples`/`SetMembers`/`ExponentialHistogram`, raw or lossless data
+    /// no producer emits until W3/W4) all fall through to the same unsupported-kind drop path as
+    /// `Distribution`/`Set`/`Histogram`/`Summary` above -- not a panic, and not silently dropped
+    /// uncounted.
+    #[test]
+    fn samples_set_members_and_exponential_histogram_each_drop_with_a_clear_message() {
+        let events = vec![
+            metric_event("s", MetricKind::Samples(logit_core::Samples::new([1.0])), &[]),
+            metric_event("m", MetricKind::SetMembers(vec![bytes::Bytes::from_static(b"a")]), &[]),
+            metric_event(
+                "e",
+                MetricKind::ExponentialHistogram(logit_core::ExpHistogram {
+                    scale: 0,
+                    zero_count: 0,
+                    zero_threshold: 0.0,
+                    positive: (0, vec![]),
+                    negative: (0, vec![]),
+                    temporality: Temporality::Cumulative,
+                    count: 0,
+                    sum: None,
+                    min: None,
+                    max: None,
+                }),
+                &[],
+            ),
+        ];
+        let (msgs, stats) = encode(events);
+        assert!(msgs.is_empty());
+        assert_eq!(stats.dropped_unsupported_kind, 3);
+    }
+
+    /// A cumulative (or non-monotonic) `Sum` has no `|c` statsd can represent and is dropped, same
+    /// as any other unsupported kind -- only a delta, monotonic `Sum` still encodes as `|c`.
+    #[test]
+    fn a_cumulative_sum_is_dropped_and_a_delta_monotonic_sum_still_encodes_as_c() {
+        let (msgs, stats) = encode(vec![
+            metric_event(
+                "cumulative",
+                MetricKind::Sum(logit_core::Sum {
+                    value: 5.0,
+                    temporality: Temporality::Cumulative,
+                    monotonic: true,
+                }),
+                &[],
+            ),
+            metric_event("delta", MetricKind::counter(3.0), &[]),
+        ]);
+        assert_eq!(msgs, vec!["delta:3|c"]);
+        assert_eq!(stats.dropped_unsupported_kind, 1);
+    }
+
     #[test]
     fn a_dropped_distribution_does_not_take_a_healthy_counter_on_the_same_event_with_it() {
-        let mut event = metric_event("ok", MetricKind::Counter(1.0), &[]);
-        event.metrics.push(MetricRecord {
-            name: intern("bad"),
-            kind: MetricKind::Distribution(logit_core::DdSketch::new()),
-            unit: None,
-        });
+        let mut event = metric_event("ok", MetricKind::counter(1.0), &[]);
+        event.metrics.push(MetricRecord::new(
+            intern("bad"),
+            MetricKind::Distribution(logit_core::DdSketch::new()),
+        ));
         let (msgs, stats) = encode(vec![event]);
         assert_eq!(msgs, vec!["ok:1|c"]);
         assert_eq!(stats.dropped_unsupported_kind, 1);
@@ -1140,8 +1233,8 @@ mod tests {
         let (addr, collector) = udp_collector().await;
         let mut output = StatsdOutput::udp(addr.to_string()).unwrap();
         let batch = batch_with(vec![
-            metric_event("a", MetricKind::Counter(1.0), &[]),
-            metric_event("b", MetricKind::Counter(2.0), &[]),
+            metric_event("a", MetricKind::counter(1.0), &[]),
+            metric_event("b", MetricKind::counter(2.0), &[]),
         ]);
         let recv_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
@@ -1160,8 +1253,8 @@ mod tests {
         let mut output = StatsdOutput::udp(addr.to_string()).unwrap();
         output = output.with_max_packet_bytes(10); // "a:1|c" is 5 bytes; two won't fit with a sep
         let batch = batch_with(vec![
-            metric_event("a", MetricKind::Counter(1.0), &[]),
-            metric_event("b", MetricKind::Counter(2.0), &[]),
+            metric_event("a", MetricKind::counter(1.0), &[]),
+            metric_event("b", MetricKind::counter(2.0), &[]),
         ]);
         let recv_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
@@ -1183,7 +1276,7 @@ mod tests {
         let mut encoder = StatsdEncoder::new(Format::DogStatsd);
         let mut out = MessageBuf::default();
         let stats = encoder.encode_into(
-            &batch_with(vec![metric_event("hits", MetricKind::Counter(1.0), &[])]),
+            &batch_with(vec![metric_event("hits", MetricKind::counter(1.0), &[])]),
             3, // "hits:1|c" is longer than this
             &mut out,
         );
@@ -1211,7 +1304,7 @@ mod tests {
     async fn a_udp_datagram_carries_no_trailing_newline() {
         let (addr, collector) = udp_collector().await;
         let mut output = StatsdOutput::udp(addr.to_string()).unwrap();
-        let batch = batch_with(vec![metric_event("a", MetricKind::Counter(1.0), &[])]);
+        let batch = batch_with(vec![metric_event("a", MetricKind::counter(1.0), &[])]);
         let recv_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let (n, _) = collector.recv_from(&mut buf).await.unwrap();
@@ -1228,8 +1321,8 @@ mod tests {
         let (addr, received, _accepts) = tcp_collector().await;
         let mut output = StatsdOutput::tcp(addr.to_string(), Duration::from_secs(2));
         let batch = batch_with(vec![
-            metric_event("a", MetricKind::Counter(1.0), &[]),
-            metric_event("b", MetricKind::Counter(2.0), &[]),
+            metric_event("a", MetricKind::counter(1.0), &[]),
+            metric_event("b", MetricKind::counter(2.0), &[]),
         ]);
         output.send(&batch).await.expect("send should succeed");
         drop(output);
@@ -1279,7 +1372,7 @@ mod tests {
     async fn tcp_sends_one_newline_delimited_frame_per_batch() {
         let (addr, received, accepts) = tcp_collector().await;
         let mut output = StatsdOutput::tcp(addr.to_string(), Duration::from_secs(2));
-        let batch = batch_with(vec![metric_event("a", MetricKind::Counter(1.0), &[])]);
+        let batch = batch_with(vec![metric_event("a", MetricKind::counter(1.0), &[])]);
         output.send(&batch).await.expect("send should succeed");
         drop(output);
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1293,14 +1386,14 @@ mod tests {
         let (addr, received, accepts) = tcp_collector().await;
         let mut output = StatsdOutput::tcp(addr.to_string(), Duration::from_secs(2));
 
-        let batch = batch_with(vec![metric_event("first", MetricKind::Counter(1.0), &[])]);
+        let batch = batch_with(vec![metric_event("first", MetricKind::counter(1.0), &[])]);
         output.send(&batch).await.expect("first send should succeed against a fresh connection");
 
         if let Conn::Tcp { stream: Some(stream), .. } = &mut output.conn {
             stream.shutdown().await.expect("local shutdown should succeed");
         }
 
-        let batch2 = batch_with(vec![metric_event("second", MetricKind::Counter(1.0), &[])]);
+        let batch2 = batch_with(vec![metric_event("second", MetricKind::counter(1.0), &[])]);
         output
             .send(&batch2)
             .await
@@ -1322,7 +1415,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let mut output = StatsdOutput::tcp(addr.to_string(), Duration::from_millis(500));
-        let batch = batch_with(vec![metric_event("a", MetricKind::Counter(1.0), &[])]);
+        let batch = batch_with(vec![metric_event("a", MetricKind::counter(1.0), &[])]);
         let err = output.send(&batch).await.expect_err("connect should fail");
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
     }
@@ -1362,7 +1455,7 @@ mod tests {
                 .flat_map(|e| e.metrics)
                 .filter(|m| logit_core::interner::resolve(m.name) == "logit.output.messages")
                 .map(|m| match m.kind {
-                    MetricKind::Counter(v) => v,
+                    MetricKind::Sum(s) => s.value,
                     _ => panic!("logit.output.messages must be a counter"),
                 })
                 .sum()
@@ -1370,7 +1463,7 @@ mod tests {
         let batch = || {
             batch_with(vec![
                 metric_event("free", MetricKind::Gauge(-5.0), &[]),
-                metric_event("hits", MetricKind::Counter(1.0), &[]),
+                metric_event("hits", MetricKind::counter(1.0), &[]),
             ])
         };
 
@@ -1405,10 +1498,10 @@ mod tests {
     #[test]
     fn a_counter_with_tags_round_trips_through_the_real_statsd_decoder() {
         let (msgs, _) =
-            encode(vec![metric_event("hits", MetricKind::Counter(3.0), &[("env", "prod".into())])]);
+            encode(vec![metric_event("hits", MetricKind::counter(3.0), &[("env", "prod".into())])]);
         let events = decode_one(&msgs[0]);
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0].metrics[0].kind, MetricKind::Counter(v) if v == 3.0));
+        assert!(matches!(events[0].metrics[0].kind, MetricKind::Sum(s) if s.value == 3.0));
         assert_eq!(events[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
     }
 
@@ -1416,7 +1509,7 @@ mod tests {
     fn a_bare_tag_round_trips_as_value_bool_true_through_the_real_statsd_decoder() {
         let (msgs, _) = encode(vec![metric_event(
             "hits",
-            MetricKind::Counter(1.0),
+            MetricKind::counter(1.0),
             &[("urgent", true.into())],
         )]);
         let events = decode_one(&msgs[0]);
@@ -1429,8 +1522,8 @@ mod tests {
         let mut out = MessageBuf::default();
         encoder.encode_into(
             &batch_with(vec![
-                metric_event("a", MetricKind::Counter(1.0), &[]),
-                metric_event("b", MetricKind::Counter(2.0), &[]),
+                metric_event("a", MetricKind::counter(1.0), &[]),
+                metric_event("b", MetricKind::counter(2.0), &[]),
             ]),
             usize::MAX,
             &mut out,
@@ -1479,7 +1572,7 @@ mod tests {
     fn a_tag_value_containing_a_colon_round_trips_with_its_colon_intact() {
         let (msgs, _) = encode(vec![metric_event(
             "hits",
-            MetricKind::Counter(1.0),
+            MetricKind::counter(1.0),
             &[("range", "a:b".into())],
         )]);
         let events = decode_one(&msgs[0]);
@@ -1493,7 +1586,7 @@ mod tests {
         let (msgs, _) = encode(original.clone());
         let relayed = decode_one(&msgs[0]);
         assert_eq!(logit_core::interner::resolve(relayed[0].metrics[0].name), name);
-        assert!(matches!(relayed[0].metrics[0].kind, MetricKind::Counter(v) if v == 3.0));
+        assert!(matches!(relayed[0].metrics[0].kind, MetricKind::Sum(s) if s.value == 3.0));
         assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
         assert_eq!(relayed[0].attributes.get("host").and_then(|v| v.as_str()), Some("web1"));
     }

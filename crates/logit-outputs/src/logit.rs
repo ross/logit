@@ -635,9 +635,12 @@ mod tests {
                 severity: Some(Severity::Info),
                 body_format: logit_core::BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
-        EventBatch { resource: Arc::new(Resource::default()), events: vec![event] }
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![event] }
     }
 
     /// Spins up a real `LogitInput` on an ephemeral port and returns its address plus a

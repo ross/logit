@@ -843,14 +843,11 @@ mod tests {
     fn metric_batch() -> EventBatch {
         EventBatch {
             resource: Arc::new(Resource::default()),
+            scope: None,
             events: vec![Event::metric(
                 1,
                 AttrMap::new(),
-                MetricRecord {
-                    name: logit_core::interner::intern("x"),
-                    kind: MetricKind::Counter(1.0),
-                    unit: None,
-                },
+                MetricRecord::new(logit_core::interner::intern("x"), MetricKind::counter(1.0)),
             )],
         }
     }
@@ -864,16 +861,15 @@ mod tests {
                 severity: None,
                 body_format: logit_core::BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let metric = Event::metric(
             2,
             AttrMap::new(),
-            MetricRecord {
-                name: logit_core::interner::intern("m"),
-                kind: MetricKind::Counter(1.0),
-                unit: None,
-            },
+            MetricRecord::new(logit_core::interner::intern("m"), MetricKind::counter(1.0)),
         );
         let span = Event::span(
             3,
@@ -888,9 +884,15 @@ mod tests {
                 events: Vec::new(),
                 links: Vec::new(),
                 end_timestamp: 4,
+                flags: 0,
+                ext: None,
             },
         );
-        EventBatch { resource: Arc::new(Resource::default()), events: vec![log, metric, span] }
+        EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![log, metric, span],
+        }
     }
 
     // ---- HTTP transport: a bare HTTP/1.1 canned-response peer, `influxdb.rs`'s pattern ----
@@ -1087,11 +1089,11 @@ mod tests {
             .iter()
             .find_map(|e| {
                 e.metrics.iter().find_map(|m| match &m.kind {
-                    MetricKind::Counter(v)
+                    MetricKind::Sum(s)
                         if logit_core::interner::resolve(m.name)
                             == "logit.output.records.rejected" =>
                     {
-                        Some(*v)
+                        Some(s.value)
                     }
                     _ => None,
                 })
@@ -1522,11 +1524,11 @@ mod tests {
             .iter()
             .find_map(|e| {
                 e.metrics.iter().find_map(|m| match &m.kind {
-                    MetricKind::Counter(v)
+                    MetricKind::Sum(s)
                         if logit_core::interner::resolve(m.name)
                             == "logit.output.records.rejected" =>
                     {
-                        Some(*v)
+                        Some(s.value)
                     }
                     _ => None,
                 })

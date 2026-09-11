@@ -96,6 +96,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         )
     }
@@ -204,7 +207,7 @@ mod tests {
     fn scaled_count(events: &[Event], name: &str) -> Option<f64> {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
-                logit_core::MetricKind::Counter(v) if resolve(m.name) == name => Some(*v),
+                logit_core::MetricKind::Sum(sum) if resolve(m.name) == name => Some(sum.value),
                 _ => None,
             })
         })

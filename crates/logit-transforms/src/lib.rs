@@ -268,6 +268,9 @@ mod chained_pipeline_test {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
 
@@ -333,10 +336,14 @@ mod chained_pipeline_test {
             let record = &series_event.metrics[0];
             match resolve(record.name) {
                 "nginx.requests" => {
-                    assert!(matches!(record.kind, MetricKind::Counter(v) if v == 1.0));
+                    assert!(
+                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 1.0)
+                    );
                 }
                 "nginx.bytes_sent" => {
-                    assert!(matches!(record.kind, MetricKind::Counter(v) if v == 512.0));
+                    assert!(
+                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 512.0)
+                    );
                 }
                 "nginx.request_time" => match &record.kind {
                     MetricKind::Distribution(sketch) => {
@@ -371,6 +378,9 @@ mod chained_pipeline_test {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
 
@@ -435,10 +445,14 @@ mod chained_pipeline_test {
             let record = &series_event.metrics[0];
             match resolve(record.name) {
                 "nginx.requests" => {
-                    assert!(matches!(record.kind, MetricKind::Counter(v) if v == 1.0));
+                    assert!(
+                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 1.0)
+                    );
                 }
                 "nginx.bytes_sent" => {
-                    assert!(matches!(record.kind, MetricKind::Counter(v) if v == 512.0));
+                    assert!(
+                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 512.0)
+                    );
                 }
                 "nginx.request_time" => match &record.kind {
                     MetricKind::Distribution(sketch) => {
@@ -471,6 +485,9 @@ mod chained_pipeline_test {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
 
@@ -519,6 +536,9 @@ mod chained_pipeline_test {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
 
@@ -586,7 +606,9 @@ mod chained_pipeline_test {
             let record = &series_event.metrics[0];
             match resolve(record.name) {
                 "nginx.bytes_sent" => {
-                    assert!(matches!(record.kind, MetricKind::Counter(v) if v == 612.0));
+                    assert!(
+                        matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 612.0)
+                    );
                 }
                 "nginx.request_time" => match &record.kind {
                     MetricKind::Distribution(sketch) => {
@@ -615,6 +637,9 @@ mod chained_pipeline_test {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
 

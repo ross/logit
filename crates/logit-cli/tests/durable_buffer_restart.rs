@@ -25,6 +25,7 @@ fn batch(marker: usize) -> EventBatch {
     attrs.insert("marker", Value::str(marker.to_string()));
     EventBatch {
         resource: Arc::new(Resource::default()),
+        scope: None,
         events: vec![Event::empty(marker as i64, attrs)],
     }
 }
