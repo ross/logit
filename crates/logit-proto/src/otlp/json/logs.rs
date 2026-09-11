@@ -64,7 +64,11 @@ fn log_record(v: &JsonValue) -> Result<pb::LogRecord, CodecError> {
         severity_text: str_field(obj, "severityText", "severity_text")?,
         body,
         attributes: key_values(obj, "attributes", "attributes")?,
-        dropped_attributes_count: 0,
+        dropped_attributes_count: u32_field(
+            obj,
+            "droppedAttributesCount",
+            "dropped_attributes_count",
+        )?,
         flags: u32_field(obj, "flags", "flags")?,
         trace_id,
         span_id,

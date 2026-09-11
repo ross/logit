@@ -77,11 +77,15 @@ fn span(v: &JsonValue) -> Result<pb::Span, CodecError> {
         start_time_unix_nano: u64_field(obj, "startTimeUnixNano", "start_time_unix_nano")?,
         end_time_unix_nano: u64_field(obj, "endTimeUnixNano", "end_time_unix_nano")?,
         attributes: key_values(obj, "attributes", "attributes")?,
-        dropped_attributes_count: 0,
+        dropped_attributes_count: u32_field(
+            obj,
+            "droppedAttributesCount",
+            "dropped_attributes_count",
+        )?,
         events,
-        dropped_events_count: 0,
+        dropped_events_count: u32_field(obj, "droppedEventsCount", "dropped_events_count")?,
         links,
-        dropped_links_count: 0,
+        dropped_links_count: u32_field(obj, "droppedLinksCount", "dropped_links_count")?,
         status,
     })
 }
@@ -92,7 +96,11 @@ fn span_event(v: &JsonValue) -> Result<pb::span::Event, CodecError> {
         time_unix_nano: u64_field(obj, "timeUnixNano", "time_unix_nano")?,
         name: str_field(obj, "name", "name")?,
         attributes: key_values(obj, "attributes", "attributes")?,
-        dropped_attributes_count: 0,
+        dropped_attributes_count: u32_field(
+            obj,
+            "droppedAttributesCount",
+            "dropped_attributes_count",
+        )?,
     })
 }
 
@@ -111,7 +119,11 @@ fn span_link(v: &JsonValue) -> Result<pb::span::Link, CodecError> {
         span_id,
         trace_state: str_field(obj, "traceState", "trace_state")?,
         attributes: key_values(obj, "attributes", "attributes")?,
-        dropped_attributes_count: 0,
+        dropped_attributes_count: u32_field(
+            obj,
+            "droppedAttributesCount",
+            "dropped_attributes_count",
+        )?,
         flags: u32_field(obj, "flags", "flags")?,
     })
 }

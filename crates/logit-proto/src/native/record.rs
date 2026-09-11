@@ -586,6 +586,7 @@ const MR_DESCRIPTION: u8 = 3;
 const MR_START_TIMESTAMP: u8 = 4;
 const MR_EXEMPLARS: u8 = 5;
 const MR_KIND: u8 = 6;
+const MR_FLAGS: u8 = 7;
 
 pub fn write_metric_record(out: &mut BytesMut, dict: &mut DictBuilder, record: &MetricRecord) {
     write_symbol_field(out, dict, MR_NAME, record.name);
@@ -605,6 +606,9 @@ pub fn write_metric_record(out: &mut BytesMut, dict: &mut DictBuilder, record: &
             write_record_list(b, &record.exemplars, |b, e| write_exemplar(b, dict, e));
         });
     }
+    if record.flags != 0 {
+        write_scalar_field(out, MR_FLAGS, 4, |b| b.extend_from_slice(&record.flags.to_le_bytes()));
+    }
     write_field(out, MR_KIND, |b| write_metric_kind(b, &record.kind));
 }
 
@@ -614,6 +618,7 @@ pub fn read_metric_record(bytes: &mut Bytes, dict: &Dict) -> Result<MetricRecord
     let mut description = None;
     let mut start_timestamp = 0i64;
     let mut exemplars = Vec::new();
+    let mut flags = 0u32;
     let mut kind = None;
 
     for_each_field(bytes, |tag, field| {
@@ -623,6 +628,7 @@ pub fn read_metric_record(bytes: &mut Bytes, dict: &Dict) -> Result<MetricRecord
             MR_DESCRIPTION => description = Some(read_symbol_field(field, dict)?),
             MR_START_TIMESTAMP => start_timestamp = read_exact_i64(field)?,
             MR_EXEMPLARS => exemplars = read_record_list(field, |b| read_exemplar(b, dict))?,
+            MR_FLAGS => flags = read_exact_u32(field)?,
             MR_KIND => kind = Some(read_metric_kind(field)?),
             _unknown => {}
         }
@@ -633,7 +639,7 @@ pub fn read_metric_record(bytes: &mut Bytes, dict: &Dict) -> Result<MetricRecord
         name.ok_or_else(|| CodecError::Malformed("metric record missing name".to_string()))?;
     let kind =
         kind.ok_or_else(|| CodecError::Malformed("metric record missing kind".to_string()))?;
-    Ok(MetricRecord { name, unit, description, start_timestamp, exemplars, kind })
+    Ok(MetricRecord { name, unit, description, start_timestamp, exemplars, flags, kind })
 }
 
 // -- LogRecord --------------------------------------------------------------------------------
@@ -1311,7 +1317,12 @@ mod tests {
             }),
         ];
         for kind in kinds {
-            let record = MetricRecord::new(name, kind.clone());
+            // Non-zero on every kind here too -- MR_FLAGS is a record-level field, orthogonal to
+            // which MetricKind variant it's attached to.
+            let record = MetricRecord {
+                flags: MetricRecord::FLAG_NO_RECORDED_VALUE,
+                ..MetricRecord::new(name, kind.clone())
+            };
             let out = dict_round_trip_metric(&record);
             match (&kind, &out.kind) {
                 (MetricKind::Distribution(a), MetricKind::Distribution(b)) => {
@@ -1337,6 +1348,7 @@ mod tests {
             unit: Some(unit),
             description: Some(description),
             start_timestamp: 1_700_000_000_000_000_000,
+            flags: MetricRecord::FLAG_NO_RECORDED_VALUE | 0x2,
             exemplars: vec![
                 Exemplar {
                     timestamp: 100,

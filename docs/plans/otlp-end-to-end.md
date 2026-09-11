@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-02
+updated: 2026-09-11
 ---
 
 # Closing plan: OTLP end-to-end — internal spans, an OTLP codec, `otlp_in`/`otlp_out`, and the demo
@@ -221,8 +221,12 @@ claim that the internal model "must be a superset of what OTLP can express" — 
 own model (a mergeable sketch, a cardinality stub) that can't be losslessly re-expressed *as* OTLP,
 the direction ADR `native-wire-format-with-otlp-bridge` didn't anticipate. Decode: `Sum` monotonic + `DELTA` → `Counter`; `Sum`
 monotonic + `CUMULATIVE` → `Gauge` with an `otel.temporality` attribute (summing a running total
-would be wrong); `ExponentialHistogram` → `Histogram{buckets}` with bounds materialized from
-`scale`/`offset` — this direction is **exact, not lossy** — capped at `MAX_DERIVED_BUCKETS = 512`.
+would be wrong; **since retired** — `Sum`/`Histogram`/`ExponentialHistogram` temporality rides a
+real field now, [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)); `ExponentialHistogram` →
+`Histogram{buckets}` with bounds materialized from `scale`/`offset` — this direction is **exact, not
+lossy** — capped at `MAX_DERIVED_BUCKETS = 512` (**also since retired** — `ExponentialHistogram` is
+kept as its own model variant and maps 1:1 now, W4 of
+[`docs/plans/lossless-transit.md`](lossless-transit.md)).
 
 A dedicated `docs/known-gaps.md` entry — "Cross-protocol semantic gaps" — was filed for this, meant
 to grow as more codecs join, rather than staying scattered across doc comments.

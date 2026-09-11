@@ -222,3 +222,16 @@ just enough room inside the existing 176-byte envelope for `MetricKind`'s discri
   `HyperLogLog`), W3 (statsd produces `Samples`/`SetMembers`, `|c:`/`|T`, sample-rate retention on
   timers), W4 (the rest of the OTLP mapping this PR deferred), W7 (expose the new fields through the
   Lua proxy — otherwise the model is lossless but the scripting surface can't see any of it).
+- **2026-09-11: W4 landed the one further model addition this ADR's OTLP work needed —
+  `MetricRecord.flags: u32` (OTLP `DataPointFlags`, bit 0 `FLAG_NO_RECORDED_VALUE`).** A data point
+  flagged `NO_RECORDED_VALUE` now round-trips as a flagged point — its numeric payload decoded
+  exactly as sent, typically the wire's own zero for a well-behaved producer — instead of being
+  silently skipped the way the OTLP codec used to treat it
+  (`crates/logit-proto/src/otlp/metrics.rs`'s module doc). `flags` fills the 4 bytes of padding
+  that already followed this struct's three `Symbol` fields (`name`/`unit`/`description`), so
+  `MetricRecord` stays exactly 224 bytes, asserted in `crates/logit-core/tests/type_sizes.rs`.
+  Native codec: a new `MR_FLAGS` tag (`crates/logit-proto/src/native/record.rs`), written only when
+  non-zero like every other field in this TLV framing. W4 also retired `otel.scope.*` and
+  `otel.status_message` exactly as the bullet above promised: `EventBatch.scope` and
+  `SpanExt.status_message` are real producers on both sides of the OTLP codec now, and neither
+  attribute is stamped or read anywhere in the codec any more.

@@ -9,7 +9,9 @@
 //! tied to no occurrence, so nothing else would ever push them.
 
 use crate::Input;
-use logit_core::{interner, AttrMap, Diagnostics, EventBatch, Registry, Resource, Telemetry};
+use logit_core::{
+    interner, AttrMap, Diagnostics, EventBatch, Registry, Resource, Scope, Telemetry,
+};
 use logit_pipeline::Fanout;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,6 +26,15 @@ pub struct InternalInput {
     /// unlike `syslog_in`/`statsd_in`, whose ingested data belongs to other services and would be
     /// misidentified by the same stamp. See `docs/design/internal-telemetry.md`.
     resource: Arc<Resource>,
+    /// The OTLP instrumentation scope every batch this input sends carries -- `{ name: "logit",
+    /// version: env!("CARGO_PKG_VERSION") }`, built once here and `Arc`-shared across every
+    /// batch the same way `resource` is. `internal` is the one input allowed to stamp this: it's
+    /// the identity an earlier codec revision used to *invent* on decode for any OTLP-sourced
+    /// batch with no wire scope (`crates/logit-proto/src/otlp/common.rs`'s `pb_to_scope`), which
+    /// W4 retired everywhere except here, where it belongs to the one real producer of it --
+    /// `logit`'s own self-telemetry. `docs/design/internal-telemetry.md` relies on this scope
+    /// existing to identify `logit`'s own points/spans/logs downstream.
+    scope: Arc<Scope>,
     telemetry: Telemetry,
     diag: Diagnostics,
 }
@@ -36,6 +47,11 @@ impl InternalInput {
             interval,
             registry,
             resource: Arc::new(Resource { attributes, ..Default::default() }),
+            scope: Arc::new(Scope {
+                name: bytes::Bytes::from_static(b"logit"),
+                version: bytes::Bytes::from_static(env!("CARGO_PKG_VERSION").as_bytes()),
+                ..Default::default()
+            }),
             telemetry: Telemetry::default(),
             diag: Diagnostics::default(),
         }
@@ -120,9 +136,15 @@ impl InternalInput {
             self.telemetry.count("logit.internal.logs.emitted", logs_emitted as f64, &[]);
         }
 
-        // No scope: this batch is synthesized from `internal`'s own drained telemetry, not
-        // decoded off any wire with an OTLP instrumentation scope to carry.
-        sink.send(EventBatch { resource: self.resource.clone(), scope: None, events }).await;
+        // A real Scope, deliberately: this is `logit` observing itself, the one producer
+        // `docs/design/internal-telemetry.md` names as allowed to stamp that identity on purpose
+        // (see `scope`'s own doc comment on this struct).
+        sink.send(EventBatch {
+            resource: self.resource.clone(),
+            scope: Some(self.scope.clone()),
+            events,
+        })
+        .await;
     }
 }
 
@@ -229,6 +251,31 @@ mod tests {
             batch.resource.attributes.get("service.name").and_then(|v| v.as_str()),
             Some("logit")
         );
+    }
+
+    /// The scope identity `otlp_out` used to have `otlp_in`'s decoder *invent* for any
+    /// OTLP-sourced batch with no wire scope -- W4 retired that everywhere except here, where it
+    /// belongs to the one real producer of it (`InternalInput::scope`'s own doc comment).
+    #[tokio::test]
+    async fn every_batch_carries_the_logit_scope() {
+        let registry = Registry::new();
+        let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        component_telemetry.count("logit.input.datagrams", 1.0, &[]);
+
+        let input = InternalInput::new(Duration::from_millis(1), registry);
+        let (tx, mut rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]);
+
+        input.tick(Instant::now(), &fanout).await;
+
+        let delivered = rx.try_recv().expect("should have sent a batch");
+        let batch = match delivered {
+            logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
+            logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
+        };
+        let scope = batch.scope.expect("internal should stamp a Scope on every batch");
+        assert_eq!(&scope.name[..], b"logit");
+        assert_eq!(&scope.version[..], env!("CARGO_PKG_VERSION").as_bytes());
     }
 
     #[tokio::test]

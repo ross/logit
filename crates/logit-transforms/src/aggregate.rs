@@ -236,6 +236,21 @@ impl Aggregator {
         // pushed back at the end, in its original relative order.
         let metrics = std::mem::take(&mut event.metrics);
         for record in metrics {
+            // An OTLP `NO_RECORDED_VALUE`-flagged record has no genuine reading to fold into a
+            // series -- pass it through unmerged, the same shape as the kind-conflict pass-through
+            // below, rather than silently folding its default numeric payload in as though it were
+            // a real sample (`docs/adr/lossless-transit.md`, `crates/logit-core/src/metric.rs`'s
+            // `flags` doc, `docs/known-gaps.md`'s cross-protocol table).
+            if record.is_no_recorded_value() {
+                self.telemetry.count(
+                    "logit.transform.metrics.passed_through",
+                    1.0,
+                    &[("reason", "no_recorded_value")],
+                );
+                event.metrics.push(record);
+                continue;
+            }
+
             // No merge rule defined for these (docs/design/data-model.md) -- leave them on the
             // event rather than absorbing or dropping them. `GaugeDelta` is *not* here -- it has
             // a real resolution below, unlike these (docs/adr/relative-gauge-adjustments.md). A
@@ -464,6 +479,12 @@ impl Aggregator {
                         };
                         let mut record = MetricRecord::new(key.name, MetricKind::Gauge(value));
                         record.unit = key.unit;
+                        // Explicit, not just `MetricRecord::new`'s implicit `0` default: an
+                        // accumulated value is by construction never a `NO_RECORDED_VALUE` point
+                        // (a flagged record short-circuits into `process`'s pass-through instead
+                        // of ever reaching an accumulator) -- see `crates/logit-core/src/
+                        // metric.rs`'s `flags` doc.
+                        record.flags = 0;
                         events.push((Event::metric(now, key.attributes.clone(), record), links));
                         // A retained gauge keeps `value` but resets `at` to `i64::MIN`: LWW is a
                         // within-window tiebreak, and retention must not promote it to a
@@ -483,6 +504,10 @@ impl Aggregator {
                         let kind = state.accumulator.into_kind();
                         let mut record = MetricRecord::new(key.name, kind);
                         record.unit = key.unit;
+                        // See the retained-gauge arm above: an accumulated value is never a
+                        // `NO_RECORDED_VALUE` point, made explicit rather than relying on
+                        // `MetricRecord::new`'s implicit `0` default.
+                        record.flags = 0;
                         events.push((Event::metric(now, key.attributes, record), links));
                     }
                 } else {
@@ -1262,6 +1287,47 @@ mod tests {
         let (_, events) = &flushed[0];
         assert_eq!(events.len(), 1, "two NaN-tagged events should key into the same series");
         assert_eq!(counter_value(kind_of(&events[0])), 2.0);
+    }
+
+    /// A `NO_RECORDED_VALUE`-flagged record has no genuine reading -- `process` must leave it on
+    /// the event unmerged (pass-through, the same shape as a kind conflict) rather than fold its
+    /// default `0.0` in as a real sample, and count it. Fix 3 in PR #123's review
+    /// (`docs/adr/lossless-transit.md`, `docs/known-gaps.md`'s cross-protocol table).
+    #[test]
+    fn a_no_recorded_value_record_is_passed_through_unmerged_and_counted() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_telemetry(telemetry);
+        let resource = default_resource();
+
+        let mut flagged = metric_event("conns", MetricKind::Gauge(0.0), 0);
+        flagged.metrics[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        let passed = agg.process(&resource, flagged);
+        assert!(passed.is_some(), "a flagged record must be forwarded, not absorbed");
+        let passed = passed.unwrap();
+        assert_eq!(passed.metrics.len(), 1);
+        assert_eq!(passed.metrics[0].flags, MetricRecord::FLAG_NO_RECORDED_VALUE);
+
+        // Nothing was absorbed into a series -- a flush produces no event for it.
+        let flushed = flush_events(&mut agg, 100);
+        assert!(flushed.is_empty() || flushed.iter().all(|(_, events)| events.is_empty()));
+
+        let drained = registry.drain(0);
+        let passed_through = drained.iter().find_map(|e| {
+            if e.attributes.get("reason").and_then(|v| v.as_str()) != Some("no_recorded_value") {
+                return None;
+            }
+            e.metrics.iter().find_map(|m| match &m.kind {
+                MetricKind::Sum(sum)
+                    if logit_core::interner::resolve(m.name)
+                        == "logit.transform.metrics.passed_through" =>
+                {
+                    Some(sum.value)
+                }
+                _ => None,
+            })
+        });
+        assert_eq!(passed_through, Some(1.0), "the flagged record should be counted");
     }
 
     #[test]

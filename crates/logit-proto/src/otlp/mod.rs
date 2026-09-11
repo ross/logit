@@ -24,10 +24,21 @@
 //! `resourceMetrics`), one parser reads either without needing to know which it received.
 //!
 //! **Nesting**, shared by every signal (detail in [`common`]): one `EventBatch` encodes as one
-//! `Resource*` entry (the batch's single `Arc<Resource>`) with one `Scope*` stamped
-//! `{ name: "logit", version: env!("CARGO_PKG_VERSION") }`. Decoding walks every `Resource*` entry
-//! in a request into its own `EventBatch` -- **never collapsed into one**, since an `EventBatch`
-//! holds exactly one resource and a request can legitimately carry data from several.
+//! `Resource*` entry (the batch's single `Arc<Resource>`, with its own `dropped_attributes_count`
+//! and `schema_url`) holding exactly one `Scope*` entry built from the batch's single
+//! `Option<Arc<Scope>>` (`common::scope_to_pb`) -- `None` encodes an empty `InstrumentationScope`
+//! (empty name), never a fabricated `{name: "logit", version: ...}` identity the way an earlier
+//! revision of this codec did. Decoding is the mirror at finer grain: every `(Resource*, Scope*)`
+//! pair in a request becomes its own `EventBatch` -- **never collapsed**, whether that's two
+//! `Resource*` entries in one request, or two `Scope*` groups nested under the *same* `Resource*`
+//! entry (a real OTLP shape: one resource, several instrumentation scopes). A batch always holds
+//! exactly one resource and at most one scope, and a request can legitimately carry several of
+//! either. A scope group that decodes to zero events (an empty ScopeLogs/ScopeSpans/ScopeMetrics,
+//! or -- for metrics -- one whose every point is otherwise unrepresentable) produces no batch at
+//! all, rather than an empty one nothing downstream asked for. A wire scope that is entirely
+//! empty decodes to `scope: None`, not `Some(Scope::default())` -- see [`common::pb_to_scope`]'s
+//! own doc comment for why that collapse is required for `otlp_in -> otlp_out` to be a fixed
+//! point on every non-OTLP-sourced batch.
 //!
 //! **An empty batch encodes to no payloads at all** -- an OTLP request with zero `Resource*`
 //! entries is a valid but pointless wire message, so [`SignalEncoder::encode_signals`] simply
@@ -47,7 +58,7 @@ use bytes::Bytes;
 use generated::opentelemetry::proto::logs::v1 as logs_pb;
 use generated::opentelemetry::proto::metrics::v1 as metrics_pb;
 use generated::opentelemetry::proto::trace::v1 as trace_pb;
-use logit_core::{Diagnostics, EventBatch, Telemetry};
+use logit_core::{AttrMap, Diagnostics, Event, EventBatch, Telemetry};
 use prost::Message;
 use std::sync::Arc;
 
@@ -81,7 +92,15 @@ impl OtlpEncoder {
 impl SignalEncoder for OtlpEncoder {
     fn encode_signals(&mut self, batch: &EventBatch) -> Result<Vec<(Signal, Bytes)>, CodecError> {
         let resource = common::resource_to_pb(&batch.resource);
-        let scope = common::logit_scope();
+        let resource_schema_url =
+            batch.resource.schema_url.as_ref().map(common::bytes_to_string).unwrap_or_default();
+        let scope = common::scope_to_pb(batch.scope.as_deref());
+        let scope_schema_url = batch
+            .scope
+            .as_ref()
+            .and_then(|s| s.schema_url.as_ref())
+            .map(common::bytes_to_string)
+            .unwrap_or_default();
 
         let mut log_records = Vec::new();
         let mut spans = Vec::new();
@@ -111,9 +130,9 @@ impl SignalEncoder for OtlpEncoder {
                     scope_logs: vec![logs_pb::ScopeLogs {
                         scope: Some(scope.clone()),
                         log_records,
-                        schema_url: String::new(),
+                        schema_url: scope_schema_url.clone(),
                     }],
-                    schema_url: String::new(),
+                    schema_url: resource_schema_url.clone(),
                 }],
             };
             payloads.push((Signal::Logs, Bytes::from(data.encode_to_vec())));
@@ -125,9 +144,9 @@ impl SignalEncoder for OtlpEncoder {
                     scope_spans: vec![trace_pb::ScopeSpans {
                         scope: Some(scope.clone()),
                         spans,
-                        schema_url: String::new(),
+                        schema_url: scope_schema_url.clone(),
                     }],
-                    schema_url: String::new(),
+                    schema_url: resource_schema_url.clone(),
                 }],
             };
             payloads.push((Signal::Traces, Bytes::from(data.encode_to_vec())));
@@ -139,9 +158,9 @@ impl SignalEncoder for OtlpEncoder {
                     scope_metrics: vec![metrics_pb::ScopeMetrics {
                         scope: Some(scope),
                         metrics: metric_points,
-                        schema_url: String::new(),
+                        schema_url: scope_schema_url,
                     }],
-                    schema_url: String::new(),
+                    schema_url: resource_schema_url,
                 }],
             };
             payloads.push((Signal::Metrics, Bytes::from(data.encode_to_vec())));
@@ -173,41 +192,72 @@ impl OtlpDecoder {
     }
 }
 
-fn decode_resource_logs(rl: logs_pb::ResourceLogs) -> EventBatch {
-    let resource = common::pb_to_resource(rl.resource);
-    let mut events = Vec::new();
-    for scope_logs in rl.scope_logs {
-        let base_attrs = common::scope_attrs(&scope_logs.scope);
-        for record in scope_logs.log_records {
-            events.push(logs::decode_log_record(record, base_attrs.clone()));
-        }
-    }
-    EventBatch { resource: Arc::new(resource), scope: None, events }
+/// One `EventBatch` per `(ResourceX, ScopeX)` pair -- see the module doc's "Nesting" note. A
+/// record's own decoder gets an empty base `AttrMap`: resource attributes never rode as event
+/// attributes even before scope grouping existed, and scope attributes now live on
+/// `EventBatch::scope` rather than being copied onto every event under it.
+fn decode_resource_logs(rl: logs_pb::ResourceLogs) -> Vec<EventBatch> {
+    let resource = Arc::new(common::pb_to_resource(rl.resource, &rl.schema_url));
+    rl.scope_logs
+        .into_iter()
+        .filter_map(|scope_logs| {
+            let events: Vec<Event> = scope_logs
+                .log_records
+                .into_iter()
+                .map(|record| logs::decode_log_record(record, AttrMap::new()))
+                .collect();
+            // A scope group with no records is not a batch -- see this module's own doc.
+            if events.is_empty() {
+                return None;
+            }
+            let scope = common::pb_to_scope(scope_logs.scope, &scope_logs.schema_url).map(Arc::new);
+            Some(EventBatch { resource: resource.clone(), scope, events })
+        })
+        .collect()
 }
 
-fn decode_resource_spans(rs: trace_pb::ResourceSpans) -> Result<EventBatch, CodecError> {
-    let resource = common::pb_to_resource(rs.resource);
-    let mut events = Vec::new();
+fn decode_resource_spans(rs: trace_pb::ResourceSpans) -> Result<Vec<EventBatch>, CodecError> {
+    let resource = Arc::new(common::pb_to_resource(rs.resource, &rs.schema_url));
+    let mut batches = Vec::new();
     for scope_spans in rs.scope_spans {
-        let base_attrs = common::scope_attrs(&scope_spans.scope);
-        for span in scope_spans.spans {
-            events.push(traces::decode_span(span, base_attrs.clone())?);
+        let events: Vec<Event> = scope_spans
+            .spans
+            .into_iter()
+            .map(|span| traces::decode_span(span, AttrMap::new()))
+            .collect::<Result<_, _>>()?;
+        // A scope group with no records is not a batch -- see this module's own doc.
+        if events.is_empty() {
+            continue;
         }
+        let scope = common::pb_to_scope(scope_spans.scope, &scope_spans.schema_url).map(Arc::new);
+        batches.push(EventBatch { resource: resource.clone(), scope, events });
     }
-    Ok(EventBatch { resource: Arc::new(resource), scope: None, events })
+    Ok(batches)
 }
 
 impl OtlpDecoder {
-    fn decode_resource_metrics(&self, rm: metrics_pb::ResourceMetrics) -> EventBatch {
-        let resource = common::pb_to_resource(rm.resource);
-        let mut events = Vec::new();
-        for scope_metrics in rm.scope_metrics {
-            let base_attrs = common::scope_attrs(&scope_metrics.scope);
-            for metric in scope_metrics.metrics {
-                events.extend(metrics::decode_metric(metric, &base_attrs, &self.telemetry));
-            }
-        }
-        EventBatch { resource: Arc::new(resource), scope: None, events }
+    fn decode_resource_metrics(&self, rm: metrics_pb::ResourceMetrics) -> Vec<EventBatch> {
+        let resource = Arc::new(common::pb_to_resource(rm.resource, &rm.schema_url));
+        rm.scope_metrics
+            .into_iter()
+            .filter_map(|scope_metrics| {
+                let events: Vec<Event> = scope_metrics
+                    .metrics
+                    .into_iter()
+                    .flat_map(|metric| {
+                        metrics::decode_metric(metric, &AttrMap::new(), &self.telemetry)
+                    })
+                    .collect();
+                // A scope group that expands to no events (an empty metrics list, or every
+                // metric's data variant unset) is not a batch -- see this module's own doc.
+                if events.is_empty() {
+                    return None;
+                }
+                let scope = common::pb_to_scope(scope_metrics.scope, &scope_metrics.schema_url)
+                    .map(Arc::new);
+                Some(EventBatch { resource: resource.clone(), scope, events })
+            })
+            .collect()
     }
 }
 
@@ -221,12 +271,16 @@ impl SignalDecoder for OtlpDecoder {
             Signal::Logs => {
                 let data = logs_pb::LogsData::decode(bytes)
                     .map_err(|e| CodecError::Malformed(e.to_string()))?;
-                Ok(data.resource_logs.into_iter().map(decode_resource_logs).collect())
+                Ok(data.resource_logs.into_iter().flat_map(decode_resource_logs).collect())
             }
             Signal::Traces => {
                 let data = trace_pb::TracesData::decode(bytes)
                     .map_err(|e| CodecError::Malformed(e.to_string()))?;
-                data.resource_spans.into_iter().map(decode_resource_spans).collect()
+                let mut batches = Vec::new();
+                for rs in data.resource_spans {
+                    batches.extend(decode_resource_spans(rs)?);
+                }
+                Ok(batches)
             }
             Signal::Metrics => {
                 let data = metrics_pb::MetricsData::decode(bytes)
@@ -234,7 +288,7 @@ impl SignalDecoder for OtlpDecoder {
                 Ok(data
                     .resource_metrics
                     .into_iter()
-                    .map(|rm| self.decode_resource_metrics(rm))
+                    .flat_map(|rm| self.decode_resource_metrics(rm))
                     .collect())
             }
         }
@@ -256,18 +310,22 @@ impl OtlpDecoder {
         match signal {
             Signal::Logs => {
                 let data = json::logs_data(&bytes)?;
-                Ok(data.resource_logs.into_iter().map(decode_resource_logs).collect())
+                Ok(data.resource_logs.into_iter().flat_map(decode_resource_logs).collect())
             }
             Signal::Traces => {
                 let data = json::traces_data(&bytes)?;
-                data.resource_spans.into_iter().map(decode_resource_spans).collect()
+                let mut batches = Vec::new();
+                for rs in data.resource_spans {
+                    batches.extend(decode_resource_spans(rs)?);
+                }
+                Ok(batches)
             }
             Signal::Metrics => {
                 let data = json::metrics_data(&bytes)?;
                 Ok(data
                     .resource_metrics
                     .into_iter()
-                    .map(|rm| self.decode_resource_metrics(rm))
+                    .flat_map(|rm| self.decode_resource_metrics(rm))
                     .collect())
             }
         }
@@ -460,16 +518,17 @@ mod tests {
         assert_eq!(span.links[0].trace_id, vec![3u8; 16]);
         assert_eq!(span.status.as_ref().unwrap().code, trace_pb::status::StatusCode::Ok as i32);
 
-        let batch =
+        let batches =
             decode_resource_spans(rs.clone()).expect("decode_resource_spans should succeed");
+        assert_eq!(batches.len(), 1, "one Resource*/Scope* pair must decode to one batch");
+        let batch = &batches[0];
         assert_eq!(batch.events.len(), 1);
         let decoded_span = batch.events[0].span.as_ref().unwrap();
         assert_eq!(decoded_span.trace_id, [1u8; 16]);
         assert_eq!(decoded_span.span_id, [2u8; 8]);
-        assert_eq!(
-            batch.events[0].attributes.get("otel.scope.name").and_then(|v| v.as_str()),
-            Some("logit")
-        );
+        let scope = batch.scope.as_ref().expect("scope must survive onto the batch");
+        assert_eq!(scope.name, bytes::Bytes::from_static(b"logit"));
+        assert_eq!(scope.version, bytes::Bytes::from_static(b"0.1.0"));
     }
 
     /// The strongest claim this codec can make about its two wire encodings, and OTLP/JSON's own
@@ -517,24 +576,179 @@ mod tests {
 
         assert_eq!(proto_batches.len(), 1);
         assert_eq!(json_batches.len(), 1);
-        let (proto_span, json_span) = (
-            proto_batches[0].events[0].span.as_ref().unwrap(),
-            json_batches[0].events[0].span.as_ref().unwrap(),
-        );
-        assert_eq!(proto_span.trace_id, json_span.trace_id);
-        assert_eq!(proto_span.span_id, json_span.span_id);
-        assert_eq!(proto_span.parent_span_id, json_span.parent_span_id);
-        assert_eq!(proto_span.name, json_span.name);
-        assert_eq!(proto_span.status, json_span.status);
-        assert_eq!(proto_span.events.len(), json_span.events.len());
-        assert_eq!(proto_span.links[0].trace_id, json_span.links[0].trace_id);
+        // Full structural equality, now that EventBatch derives PartialEq -- not merely
+        // "produces similar-looking output" (this fn's own doc comment), the whole batch two
+        // completely separate parsing paths produced for the same logical span must be identical.
         assert_eq!(
-            proto_batches[0].events[0].attributes.get("fk1"),
-            json_batches[0].events[0].attributes.get("fk1"),
+            proto_batches[0], json_batches[0],
+            "protobuf and JSON encodings of the same span must decode to the identical EventBatch"
         );
+    }
+
+    #[test]
+    fn a_request_with_two_scopes_under_one_resource_decodes_to_two_batches() {
+        let resource_pb = crate::otlp::generated::opentelemetry::proto::resource::v1::Resource {
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            entity_refs: Vec::new(),
+        };
+        let scope_a = trace_pb::ScopeSpans {
+            scope: Some(
+                crate::otlp::generated::opentelemetry::proto::common::v1::InstrumentationScope {
+                    name: "scope-a".to_string(),
+                    version: String::new(),
+                    attributes: Vec::new(),
+                    dropped_attributes_count: 0,
+                },
+            ),
+            spans: vec![trace_pb::Span {
+                trace_id: vec![1; 16],
+                span_id: vec![1; 8],
+                trace_state: String::new(),
+                parent_span_id: Vec::new(),
+                flags: 0,
+                name: "span-a".to_string(),
+                kind: 0,
+                start_time_unix_nano: 1,
+                end_time_unix_nano: 2,
+                attributes: Vec::new(),
+                dropped_attributes_count: 0,
+                events: Vec::new(),
+                dropped_events_count: 0,
+                links: Vec::new(),
+                dropped_links_count: 0,
+                status: None,
+            }],
+            schema_url: String::new(),
+        };
+        let mut scope_b = scope_a.clone();
+        scope_b.scope.as_mut().unwrap().name = "scope-b".to_string();
+        scope_b.spans[0].trace_id = vec![2; 16];
+        scope_b.spans[0].span_id = vec![2; 8];
+        scope_b.spans[0].name = "span-b".to_string();
+
+        let data = trace_pb::TracesData {
+            resource_spans: vec![trace_pb::ResourceSpans {
+                resource: Some(resource_pb),
+                scope_spans: vec![scope_a, scope_b],
+                schema_url: String::new(),
+            }],
+        };
+
+        let mut decoder = OtlpDecoder::new();
+        let batches = decoder
+            .decode_signal(Signal::Traces, Bytes::from(data.encode_to_vec()))
+            .expect("must decode");
         assert_eq!(
-            proto_batches[0].events[0].attributes.get("otel.scope.name"),
-            json_batches[0].events[0].attributes.get("otel.scope.name"),
+            batches.len(),
+            2,
+            "two scope groups under one resource must decode to two batches"
         );
+        let names: Vec<&[u8]> =
+            batches.iter().map(|b| b.scope.as_ref().unwrap().name.as_ref()).collect();
+        assert!(names.contains(&b"scope-a".as_slice()));
+        assert!(names.contains(&b"scope-b".as_slice()));
+    }
+
+    #[test]
+    fn a_batch_with_some_scope_re_encodes_the_same_scope_and_schema_url() {
+        let mut scope_attributes = AttrMap::new();
+        scope_attributes.insert("k", "v");
+        let scope = logit_core::Scope {
+            name: bytes::Bytes::from_static(b"nginx-otel-module"),
+            version: bytes::Bytes::from_static(b"1.0.0"),
+            attributes: scope_attributes,
+            dropped_attributes_count: 1,
+            schema_url: Some(bytes::Bytes::from_static(b"https://example.com/scope-schema")),
+        };
+        let span_event = Event::span(
+            1,
+            AttrMap::new(),
+            logit_core::SpanRecord {
+                trace_id: [1; 16],
+                span_id: [2; 8],
+                parent_span_id: None,
+                name: Value::str("s"),
+                kind: logit_core::SpanKind::Internal,
+                status: logit_core::SpanStatus::Ok,
+                events: Vec::new(),
+                links: Vec::new(),
+                end_timestamp: 2,
+                flags: 0,
+                ext: None,
+            },
+        );
+        let input_batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: Some(Arc::new(scope.clone())),
+            events: vec![span_event],
+        };
+
+        let mut encoder = OtlpEncoder::new();
+        let payloads = encoder.encode_signals(&input_batch).unwrap();
+        let (_, bytes) = payloads.into_iter().find(|(s, _)| *s == Signal::Traces).unwrap();
+
+        let mut decoder = OtlpDecoder::new();
+        let batches = decoder.decode_signal(Signal::Traces, bytes).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].scope.as_deref(), Some(&scope));
+    }
+
+    #[test]
+    fn a_resource_logs_with_one_empty_scope_group_decodes_to_exactly_one_batch() {
+        let non_empty_log = Event::log(
+            1,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str("hi"),
+                severity: None,
+                body_format: logit_core::BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        let wire_record =
+            logs::encode_log_record(&non_empty_log, non_empty_log.log.as_ref().unwrap());
+
+        let non_empty_scope = logs_pb::ScopeLogs {
+            scope: Some(
+                crate::otlp::generated::opentelemetry::proto::common::v1::InstrumentationScope {
+                    name: "scope-a".to_string(),
+                    version: String::new(),
+                    attributes: Vec::new(),
+                    dropped_attributes_count: 0,
+                },
+            ),
+            log_records: vec![wire_record],
+            schema_url: String::new(),
+        };
+        let empty_scope = logs_pb::ScopeLogs {
+            scope: Some(
+                crate::otlp::generated::opentelemetry::proto::common::v1::InstrumentationScope {
+                    name: "scope-b".to_string(),
+                    version: String::new(),
+                    attributes: Vec::new(),
+                    dropped_attributes_count: 0,
+                },
+            ),
+            log_records: Vec::new(),
+            schema_url: String::new(),
+        };
+        let data = logs_pb::LogsData {
+            resource_logs: vec![logs_pb::ResourceLogs {
+                resource: None,
+                scope_logs: vec![non_empty_scope, empty_scope],
+                schema_url: String::new(),
+            }],
+        };
+
+        let mut decoder = OtlpDecoder::new();
+        let batches = decoder
+            .decode_signal(Signal::Logs, Bytes::from(data.encode_to_vec()))
+            .expect("must decode");
+        assert_eq!(batches.len(), 1, "the empty scope-b group must not produce a batch of its own");
+        assert_eq!(batches[0].scope.as_ref().unwrap().name, bytes::Bytes::from_static(b"scope-a"));
     }
 }

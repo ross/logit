@@ -330,6 +330,19 @@ fn render_optional_sum_min_max(
 fn render_metric(out: &mut String, metric: &MetricRecord) {
     render_key(out, resolve(metric.name));
     out.push(' ');
+    if metric.is_no_recorded_value() {
+        // OTLP `NO_RECORDED_VALUE`: this point has no genuine reading. Unlike `influxdb_out`/
+        // `statsd_out` (which drop and count it), a debug sink never drops -- it renders the flag
+        // itself rather than the kind's otherwise-meaningless default value
+        // (`docs/adr/lossless-transit.md`, `crates/logit-core/src/metric.rs`'s `flags` doc,
+        // `docs/known-gaps.md`'s cross-protocol table).
+        out.push_str("no_recorded_value");
+        if let Some(unit) = metric.unit {
+            out.push_str(" unit=");
+            render_key(out, resolve(unit));
+        }
+        return;
+    }
     match &metric.kind {
         MetricKind::Sum(s) => {
             let _ = write!(
@@ -1183,6 +1196,19 @@ mod tests {
         let out =
             encode(vec![metric_event(0, "unique.users", MetricKind::Set(HyperLogLog::default()))]);
         assert!(out.contains("unique.users set=<unrepresentable>"), "got: {out}");
+    }
+
+    /// A debug sink never drops (unlike `influxdb_out`/`statsd_out`, which skip and count a
+    /// `NO_RECORDED_VALUE`-flagged point) -- it renders the flag itself rather than the kind's
+    /// otherwise-meaningless default value. Fix 3 in PR #123's review
+    /// (`docs/adr/lossless-transit.md`, `docs/known-gaps.md`'s cross-protocol table).
+    #[test]
+    fn a_no_recorded_value_point_renders_the_flag_instead_of_a_value() {
+        let mut event = metric_event(0, "conns", MetricKind::Gauge(0.0));
+        event.metrics[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        let out = encode(vec![event]);
+        assert!(out.contains("conns no_recorded_value"), "got: {out}");
+        assert!(!out.contains("gauge="), "must not also render a value: {out}");
     }
 
     /// `gauge_delta`, not `gauge` -- an unresolved relative adjustment must be visually

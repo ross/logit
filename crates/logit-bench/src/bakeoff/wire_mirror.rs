@@ -242,6 +242,12 @@ pub struct WireMetric {
     pub description: Option<u32>,
     pub start_timestamp: i64,
     pub exemplars: Vec<WireExemplar>,
+    /// `MetricRecord::flags` -- OTLP `DataPointFlags` bitmask (see
+    /// `crates/logit-core/src/metric.rs`'s doc comment). Missing from this mirror until W4;
+    /// dropping it silently would have made this arm lossy on a flagged point, unlike
+    /// native/postcard/rkyv's stated "exact" guarantee (`tests/wire_format_bakeoff.rs`'s module
+    /// doc).
+    pub flags: u32,
     pub kind: WireMetricKind,
 }
 
@@ -587,6 +593,7 @@ fn metric_record_to_wire(dict: &mut DictBuilder, record: &MetricRecord) -> WireM
         description: record.description.map(|d| dict.intern(d)),
         start_timestamp: record.start_timestamp,
         exemplars: record.exemplars.iter().map(|e| exemplar_to_wire(dict, e)).collect(),
+        flags: record.flags,
         kind: metric_kind_to_wire(&record.kind),
     }
 }
@@ -598,6 +605,7 @@ fn wire_to_metric_record(strings: &[Symbol], wire: &WireMetric) -> MetricRecord 
         description: wire.description.map(|i| strings[i as usize]),
         start_timestamp: wire.start_timestamp,
         exemplars: wire.exemplars.iter().map(|e| wire_to_exemplar(strings, e)).collect(),
+        flags: wire.flags,
         kind: wire_to_metric_kind(&wire.kind),
     }
 }

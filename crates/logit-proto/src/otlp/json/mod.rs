@@ -45,12 +45,14 @@
 //! **Unknown keys are silently ignored** -- forward compatibility with a newer OTLP minor version
 //! adding a field must not fail an entire batch.
 //!
-//! **`exemplars` is parsed nowhere in this module and always encodes empty.** `../metrics.rs`'s
-//! `decode_metric` never reads a data point's `exemplars` field (every read there is `Vec::new()`
-//! on the *encode* side only) -- so an exemplar array in the input is dropped before it would ever
-//! be looked at, the same way protobuf's own exemplar bytes would be decoded into a `Vec<Exemplar>`
-//! that `decode_metric` never touches either. Extending this module to preserve exemplars would
-//! need `decode_metric` to grow a reason to read them first.
+//! **`exemplars` is parsed in `metrics.rs`'s `number_data_point`/`histogram_data_point`/
+//! `exponential_histogram_data_point`** -- one `Exemplar` JSON object per element (`timeUnixNano`,
+//! `asDouble`/`asInt`, `spanId`/`traceId` as the same case-insensitive hex `hex_bytes` uses
+//! elsewhere in this module, `filteredAttributes` via the shared `key_value` helper), feeding the
+//! same `../metrics.rs::decode_exemplar` the protobuf path does, so both wire encodings produce
+//! identical `Vec<Exemplar>`s for the same logical data. `summaryDataPoint` has no `exemplars` key
+//! at all in the OTLP spec, so nothing is parsed there -- matching the protobuf message shape,
+//! which has no field for it either.
 
 mod logs;
 mod metrics;
@@ -344,13 +346,17 @@ fn any_value(v: &JsonValue) -> Result<pb::AnyValue, CodecError> {
     Ok(pb::AnyValue { value: None })
 }
 
-/// `resource`'s `dropped_attributes_count`/`entity_refs` are parsed nowhere here -- `../common.rs`'s
-/// `pb_to_resource` (the function every signal's decode path feeds this through) never reads
-/// either field, protobuf or JSON.
+/// `entity_refs` is parsed nowhere here -- `../common.rs`'s `pb_to_resource` (the function every
+/// signal's decode path feeds this through) never reads it, protobuf or JSON (OTLP's own
+/// experimental entity-relationship field, unused by this codec).
 fn resource(obj: &JsonMap) -> Result<respb::Resource, CodecError> {
     Ok(respb::Resource {
         attributes: key_values(obj, "attributes", "attributes")?,
-        dropped_attributes_count: 0,
+        dropped_attributes_count: u32_field(
+            obj,
+            "droppedAttributesCount",
+            "dropped_attributes_count",
+        )?,
         entity_refs: Vec::new(),
     })
 }
@@ -367,7 +373,11 @@ fn instrumentation_scope(
         name: str_field(obj, "name", "name")?,
         version: str_field(obj, "version", "version")?,
         attributes: key_values(obj, "attributes", "attributes")?,
-        dropped_attributes_count: 0,
+        dropped_attributes_count: u32_field(
+            obj,
+            "droppedAttributesCount",
+            "dropped_attributes_count",
+        )?,
     }))
 }
 
