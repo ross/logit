@@ -212,10 +212,10 @@ pub(crate) fn encode_metric(
         MetricKind::Samples(s) => {
             telemetry.count("logit.output.metrics.degraded", 1.0, &[("metric_kind", "samples")]);
             // Sketch first, then take the same degraded path `Distribution` does -- see the
-            // module doc. `1/sample_rate` extrapolates a sampled statsd timing/histogram line the
-            // same way `crates/logit-inputs/src/statsd.rs` does for its own sketch; clamped to
-            // [1, 1000] against a hostile or malformed rate forcing a huge weighted add.
-            let weight = (1.0 / s.sample_rate).round().clamp(1.0, 1000.0) as u64;
+            // module doc. `Samples::weight` extrapolates a sampled statsd timing/histogram line
+            // the same way `crates/logit-inputs/src/statsd.rs` does for its own sketch, bounded
+            // and NaN-safe against a hostile or malformed rate.
+            let weight = s.weight();
             let mut sketch = DdSketch::new();
             for v in &s.values {
                 sketch.add_weighted(*v, weight);
@@ -677,6 +677,28 @@ mod tests {
             .iter()
             .find(|e| e.attributes.get("metric_kind").and_then(|v| v.as_str()) == Some("samples"));
         assert!(degraded.is_some(), "should count logit.output.metrics.degraded{{metric_kind}}");
+    }
+
+    /// A NaN `sample_rate` must not empty the sketch: `Samples::weight` degrades it to `1`, so
+    /// the summary still carries every observation (`count == values.len()`), where a bare
+    /// `clamp`-then-`as u64` would have produced weight `0` and a `count: 0` point.
+    #[test]
+    fn a_samples_metric_with_a_nan_sample_rate_keeps_every_observation() {
+        let mut samples = Samples::new([120.0, 130.0]);
+        samples.sample_rate = f64::NAN;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_out", "otlp_out", "sink");
+        let mut diag = Diagnostics::default();
+        let metric =
+            encode_metric(&event(), &record(MetricKind::Samples(samples)), &telemetry, &mut diag)
+                .unwrap();
+        match metric.data.unwrap() {
+            pb::metric::Data::Summary(s) => {
+                assert_eq!(s.data_points[0].count, 2);
+                assert_eq!(s.data_points[0].quantile_values.len(), 5);
+            }
+            other => panic!("expected Summary, got {other:?}"),
+        }
     }
 
     #[test]

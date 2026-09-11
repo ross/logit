@@ -124,9 +124,32 @@ pub struct Samples {
 }
 
 impl Samples {
+    /// Upper bound on [`Samples::weight`]: a `@0.0001` rate would otherwise turn one observation
+    /// into ten thousand, and the rate is attacker-influenced wire input. Mirrors
+    /// `crates/logit-inputs/src/statsd.rs`'s `MAX_SAMPLE_WEIGHT`, which W3 folds into this one.
+    pub const MAX_WEIGHT: u64 = 1000;
+
     /// `sample_rate` defaults to `1.0` -- unsampled, the common case.
     pub fn new(values: impl IntoIterator<Item = f64>) -> Self {
         Samples { values: SmallVec::from_iter(values), sample_rate: 1.0 }
+    }
+
+    /// How many observations each value in `values` stands for: `round(1 / sample_rate)`,
+    /// clamped to `[1, MAX_WEIGHT]` -- the extrapolation a consumer sketching these applies per
+    /// value (`DdSketch::add_weighted`). A non-finite or non-positive rate (nothing upstream
+    /// validates `sample_rate`; the native decoder reads a bare `f64`) degrades to `1`, i.e.
+    /// unweighted, rather than to `0`: `f64::clamp` propagates NaN and `NaN as u64` is `0`,
+    /// which `add_weighted` treats as a no-op -- every observation would silently vanish.
+    pub fn weight(&self) -> u64 {
+        if !(self.sample_rate.is_finite() && self.sample_rate > 0.0) {
+            return 1;
+        }
+        let weight = (1.0 / self.sample_rate).round();
+        if weight.is_nan() {
+            1
+        } else {
+            (weight as u64).clamp(1, Self::MAX_WEIGHT)
+        }
     }
 }
 
@@ -380,6 +403,22 @@ mod tests {
         let s = Samples::new([1.0, 2.0, 3.0]);
         assert_eq!(s.sample_rate, 1.0);
         assert_eq!(&s.values[..], &[1.0, 2.0, 3.0]);
+    }
+
+    /// The weight must never be `0` -- `add_weighted(v, 0)` is a no-op, so a `0` here would
+    /// silently discard every observation. NaN is the case a plain `clamp` gets wrong.
+    #[test]
+    fn samples_weight_is_never_zero_and_is_clamped() {
+        let with_rate = |rate: f64| Samples { values: SmallVec::new(), sample_rate: rate };
+        assert_eq!(with_rate(1.0).weight(), 1);
+        assert_eq!(with_rate(0.1).weight(), 10);
+        assert_eq!(with_rate(0.0001).weight(), Samples::MAX_WEIGHT);
+        assert_eq!(with_rate(f64::NAN).weight(), 1, "NaN must degrade to unweighted, not 0");
+        assert_eq!(with_rate(f64::INFINITY).weight(), 1);
+        assert_eq!(with_rate(f64::NEG_INFINITY).weight(), 1);
+        assert_eq!(with_rate(0.0).weight(), 1);
+        assert_eq!(with_rate(-0.5).weight(), 1);
+        assert_eq!(with_rate(2.0).weight(), 1, "a rate above 1 rounds to 0 and is floored to 1");
     }
 
     #[test]

@@ -563,7 +563,7 @@ fn render_fields(out: &mut String, kind: &MetricKind) -> Result<bool, CodecError
             // by the inverse of its sample rate, the same extrapolation `aggregate` applies when it
             // builds a real `Distribution` from a run of these -- and render exactly like one.
             let mut sketch = DdSketch::new();
-            let weight = (1.0 / s.sample_rate).round().clamp(1.0, 1000.0) as u64;
+            let weight = s.weight();
             for v in &s.values {
                 sketch.add_weighted(*v, weight);
             }
@@ -834,6 +834,18 @@ mod tests {
             "count should be an unsigned int field: {out}"
         );
         assert!(out.contains("p50="));
+    }
+
+    /// A NaN `sample_rate` must degrade to unweighted samples, not to an empty sketch --
+    /// `Samples::weight` is NaN-safe where a bare `f64::clamp` isn't (`count=0u` here would mean
+    /// both observations silently vanished).
+    #[test]
+    fn samples_with_a_nan_sample_rate_still_render_every_observation() {
+        let mut samples = logit_core::Samples::new([120.0, 130.0]);
+        samples.sample_rate = f64::NAN;
+        let out = encode(vec![metric_event("latency", MetricKind::Samples(samples), &[])]);
+        assert!(out.starts_with("latency count=2u,"), "got: {out}");
+        assert!(out.contains("p50="), "got: {out}");
     }
 
     /// `SetMembers`/`ExponentialHistogram` have no line-protocol encoding yet (cross-protocol

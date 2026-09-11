@@ -379,12 +379,15 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
             let _ = write!(out, "] rate={}", s.sample_rate);
         }
         MetricKind::SetMembers(members) => {
+            // Members are arbitrary wire bytes (the native decoder accepts any blob), so each one
+            // goes through the same quoting/escaping every other string this sink writes does --
+            // see the module doc: an embedded newline would otherwise forge a second output line.
             out.push_str("set_members=[");
             for (i, m) in members.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
-                out.push_str(&String::from_utf8_lossy(m));
+                render_quoted_str(out, &String::from_utf8_lossy(m));
             }
             out.push(']');
         }
@@ -1115,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn set_members_renders_as_lossy_utf8_strings() {
+    fn set_members_render_as_quoted_lossy_utf8_strings() {
         let out = encode(vec![metric_event(
             0,
             "unique_visitors",
@@ -1124,7 +1127,31 @@ mod tests {
                 bytes::Bytes::from_static(b"b"),
             ]),
         )]);
-        assert!(out.contains("set_members=[a,b]"), "got: {out}");
+        assert!(out.contains("set_members=[\"a\",\"b\"]"), "got: {out}");
+    }
+
+    /// A set member is arbitrary wire bytes; the sink's escaping invariant (module doc) applies
+    /// to it exactly as to any attribute value -- a newline must not forge a second `metric`
+    /// line, and a raw ESC must never reach the output.
+    #[test]
+    fn set_members_are_escaped_not_emitted_raw() {
+        let out = encode(vec![metric_event(
+            0,
+            "uniq",
+            MetricKind::SetMembers(vec![bytes::Bytes::from_static(
+                b"a\n  metric  forged sum=9\x1b]0;x\x07",
+            )]),
+        )]);
+        assert!(!out.contains('\x1b'), "a raw ESC byte must never reach the output: {out:?}");
+        assert_eq!(
+            out.lines().filter(|l| l.starts_with("  metric  ")).count(),
+            1,
+            "a member must not forge a second metric line: {out:?}"
+        );
+        assert!(
+            out.contains("set_members=[\"a\\n  metric  forged sum=9\\x1b]0;x\\x07\"]"),
+            "got: {out:?}"
+        );
     }
 
     #[test]
