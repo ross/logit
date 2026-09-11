@@ -23,6 +23,11 @@ gluing two different tools together with a lossy intermediate format. `logit` is
 internal wire protocol designed for it, and OpenTelemetry (OTLP) as the interoperable option at the
 edges.
 
+A stated property of that internal event model: data of the same protocol should transit `logit`
+losslessly — `statsd_in` to `statsd_out`, `otlp_in` to `otlp_out`, `syslog_in` to `syslog_out` are
+each meant to be a transparent relay, with regrouping and summing allowed but no information
+dropped, per [ADR `lossless-transit`](adr/lossless-transit.md).
+
 ## Scope (v1 direction)
 
 - **Ingest:** UDP/TCP listeners for statsd and DogStatsD-style tagged metrics, collectd, syslog
