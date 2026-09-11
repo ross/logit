@@ -924,24 +924,57 @@ already built that have a known, accepted rough edge.
   still correctly fails the *whole* request (`400`/`grpc-status: 3`), which is the one shape
   `otlp_in`'s response *does* reflect today. Threading a real per-call count through would be a
   `SignalDecoder` API change (`crates/logit-proto`), out of scope for the PR that added `otlp_in`
-  itself — a natural next step whenever OTLP input volume makes the gap worth closing.
+  itself — a natural next step whenever OTLP input volume makes the gap worth closing. Now that
+  `otlp_in` speaks two wire encodings (below), closing this means rendering the per-signal reject
+  count as `rejectedSpans`/`rejectedLogRecords`/`rejectedDataPoints` on the JSON path — the JSON key
+  differs per [`Signal`], where the protobuf field shares one tag number across all three
+  `Export*ServiceResponse` messages (`export_response_json`'s doc comment,
+  `crates/logit-inputs/src/otlp.rs`).
   (Compression was the other half of this entry — `otlp_in` now decodes gzip on both transports,
   bounded the same way `otlp_out` bounds it on encode; see
   [ADR `otlp-compression-and-decompression-bounds`](adr/otlp-compression-and-decompression-bounds.md).)
 
-- **`otlp_in` only accepts OTLP/protobuf, not OTLP/JSON.** `crates/logit-inputs/src/otlp.rs`
-  rejects any `Content-Type` other than `application/x-protobuf`/`application/protobuf` with a
-  `415` and an explicit message (line ~194) — a deliberate scope cut for the PR that added
-  `otlp_in`, not an oversight. It's now a real blocker for one concrete consumer:
-  [docs/plans/browser-tracing.md](plans/browser-tracing.md) (workstream C of
-  [demo-tracing-stack.md](plans/demo-tracing-stack.md)) wants a real OpenTelemetry-JS browser SDK
-  exporting spans into the demo, and every browser trace exporter speaks OTLP/JSON —
-  `@opentelemetry/exporter-trace-otlp-proto` is Node-only (protobuf-in-the-browser has been an
-  open upstream request since 2022, `open-telemetry/opentelemetry-js#3118`). Closing this is a
-  bounded, well-specified feature — OTLP/JSON is a documented 1:1 mapping of the same protobuf
-  messages onto JSON, not a new wire format — but it's `logit-proto`/`otlp_in` work, not demo
-  work, which is why `browser-tracing.md` stopped short of it rather than reaching into `logit`
-  to build it in passing.
+- **`otlp_in` only accepted OTLP/protobuf, not OTLP/JSON — closed.** `otlp_in`
+  (`crates/logit-inputs/src/otlp.rs`) now accepts `Content-Type: application/json` alongside
+  protobuf on the HTTP transport, decoding through a hand-written dialect layer
+  (`crates/logit-proto/src/otlp/json/`) onto the same generated types and decode path the protobuf
+  side already used. See [ADR `otlp-json-decoding`](adr/otlp-json-decoding.md) for the design (and
+  for why `pbjson`/generated `serde::Deserialize` impls were rejected — OTLP's hex trace/span ids
+  are exactly where OTLP deviates from proto3 JSON's own bytes-as-base64 rule, which those
+  generators implement faithfully and can't be told to skip for one field type without hand-editing
+  generated code). What's still open, tracked below and in that ADR's Consequences: CORS, the
+  `text/plain` error-body deviation, and the JSON path's real (if still bounded) memory cost
+  relative to protobuf.
+
+- **`otlp_in` has no CORS support — `OPTIONS` 404s, no `Access-Control-Allow-Origin`.** A browser
+  exporter posting cross-origin to `otlp_in` fails at preflight: `handle_http` answers any
+  non-`POST` method, `OPTIONS` included, with a `404`
+  (`crates/logit-inputs/src/otlp.rs`). Same-origin export (a reverse proxy in front of both the
+  page and `otlp_in`, e.g. `demo/haproxy/haproxy.cfg` routing `/v1/traces` to `logit`) sidesteps
+  this entirely and is the supported path today — see `docs/plans/browser-tracing.md`. A real
+  `cors:` config surface (allowed origins, an `OPTIONS` handler, response headers) is unbuilt; it's
+  a config/security surface in its own right (an allowed-origins list, whether a reflexive `*` is
+  ever appropriate) rather than something to fold into the OTLP/JSON decoding work that made it
+  worth naming.
+
+- **`otlp_in` answers every 4xx/5xx with `text/plain`, on both encodings — the spec wants a
+  protobuf-encoded `Status`.** *"The response body for all HTTP 4xx and HTTP 5xx responses MUST be
+  a Protobuf-encoded Status message"* — `text_response` (`crates/logit-inputs/src/otlp.rs`) always
+  builds a plain-text body instead, for both the protobuf and the JSON request path. Pre-existing
+  on the protobuf side since `otlp_in` first shipped, not something OTLP/JSON support introduced;
+  left alone when JSON support landed since building a `google.rpc.Status` encoder is orthogonal to
+  decoding and every real client checked (including `opentelemetry-js`) only reads the HTTP status
+  code on error, never the error body's content-type.
+
+- **An OTLP/JSON request costs more peak memory per byte than a same-sized protobuf one, under the
+  same `MAX_REQUEST_BYTES` cap.** The JSON path parses into a `serde_json::Value` tree
+  (`crates/logit-proto/src/otlp/json/`) before any of it reaches the decoded event model — a
+  `Map`/`Vec`/`String`/`Number` allocation per JSON node — where `prost::Message::decode` builds
+  the target structs directly with no such intermediate tree. `MAX_CONCURRENT_CONNECTIONS`'s doc
+  comment (`crates/logit-inputs/src/otlp.rs`) states the bound this doesn't break (worst case
+  across all connections is still a real, finite multiple of the existing 4 GiB figure, not
+  unbounded) without asserting a measured multiplier — nobody has profiled one yet. Worth doing
+  before OTLP/JSON sees production volume.
 
 - **`otlp_out` aborts an entire batch's `send` on the first signal request that fails -- pointed at
   a signal-partial backend fed by a mixed-signal source, that's not just noise, it can end the

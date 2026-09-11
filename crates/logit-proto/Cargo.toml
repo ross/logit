@@ -22,3 +22,12 @@ prost.workspace = true
 thiserror.workspace = true
 lz4_flex.workspace = true
 crc32c.workspace = true
+# OTLP/JSON decoding (src/otlp/json) -- both already resolve in Cargo.lock at these exact versions
+# via other workspace members (serde_json transitively through several crates, base64 through
+# reqwest/rustls), so neither adds a new crate version to the dependency graph. No `serde` here:
+# the JSON walk is plain functions over `serde_json::Value`, not `Deserialize` derives -- see
+# ADR `otlp-json-decoding` for why (short version: derives can't express OTLP's hex-vs-base64 or
+# string-or-number dialect rules without fighting the derive, and this crate's generated `prost`
+# types are never hand-edited -- ADR `committed-pregenerated-otlp-protobuf`).
+serde_json.workspace = true
+base64.workspace = true

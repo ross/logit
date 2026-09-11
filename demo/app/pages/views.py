@@ -10,7 +10,7 @@ import random
 import time
 
 import requests
-from django.http import HttpResponse, JsonResponse
+from django.http import Http404, HttpResponse, JsonResponse
 from django.shortcuts import render
 
 from pages.models import WorkRecord
@@ -35,6 +35,12 @@ INNER_URL = os.environ.get("INNER_URL", "http://nginx/inner")
 GRAPH_SVG_PATH = os.environ.get("GRAPH_SVG", "/graph/logit.svg")
 ARCH_SVG_PATH = os.environ.get("ARCH_SVG", "/graph/architecture.svg")
 
+# ../Dockerfile's `bundle` stage's only output -- the real @opentelemetry/sdk-trace-web SDK,
+# esbuild-bundled from browser/telemetry.js (docs/plans/browser-tracing.md's Workstream C).
+# `WORKDIR /app` there, so this is relative to this same tier's own root, unlike GRAPH_SVG_PATH/
+# ARCH_SVG_PATH above (a different, shared volume another service writes into).
+BROWSER_BUNDLE_PATH = os.environ.get("BROWSER_BUNDLE_PATH", "browser/telemetry.bundle.js")
+
 
 def _svg_placeholder(label):
     return (
@@ -56,6 +62,27 @@ def _serve_svg(path, placeholder_label):
     except OSError:
         payload = _svg_placeholder(placeholder_label)
     return HttpResponse(payload, content_type="image/svg+xml")
+
+
+def browser_telemetry_js(request):
+    # Deliberately NOT `_serve_svg`'s placeholder-on-`OSError` pattern, despite reading a file the
+    # same "open fresh per request" way: `graph.svg`/`architecture.svg` are written by one-shot
+    # renderer containers that race with this tier's own startup (`_serve_svg`'s own comment) --
+    # a missing file there is a normal, transient "hasn't run yet." This bundle has no such race:
+    # ../Dockerfile's `bundle` stage produces it at image-build time, `COPY --from=bundle` puts it
+    # in the image, and this tier can't even start serving without that COPY having succeeded --
+    # so a missing file here means a broken image, not a timing window. A real 404 says so
+    # honestly; a placeholder script would instead load fine and silently trace nothing, the
+    # worst failure mode for a demo whose entire point is showing tracing working.
+    try:
+        with open(BROWSER_BUNDLE_PATH, "rb") as fh:
+            payload = fh.read()
+    except OSError as exc:
+        raise Http404(f"browser telemetry bundle not found: {exc}") from exc
+    # Not `application/javascript` -- RFC 9239 obsoletes it in favor of `text/javascript`, and
+    # index.html's `<script type="module">` tag doesn't care either way, but a modern MIME type is
+    # free to get right.
+    return HttpResponse(payload, content_type="text/javascript; charset=utf-8")
 
 
 def index(request):

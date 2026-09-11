@@ -39,6 +39,18 @@
 //! enforced on the compressed body -- rather than trusting the input to be well-behaved. See
 //! `docs/adr/otlp-compression-and-decompression-bounds.md`.
 //!
+//! **OTLP/HTTP accepts protobuf or JSON; OTLP/gRPC accepts protobuf only.** `handle_http` picks
+//! the decode path off `Content-Type` (absent/empty means protobuf, preserved for every client
+//! that predates OTLP/JSON support); the success response mirrors whichever encoding the request
+//! used, per spec. gRPC is unaffected -- OTLP/gRPC's framing *is* protobuf by definition, and no
+//! OTel SDK speaks `application/grpc+json`. See
+//! [ADR `otlp-json-decoding`](../../../../docs/adr/otlp-json-decoding.md) for the JSON dialect
+//! itself (hex vs. base64 ids, string-or-number 64-bit fields, and why it's hand-parsed rather
+//! than generated). Every error response, on both encodings, stays `text/plain` -- the spec wants
+//! a protobuf-encoded `Status` message even for a JSON request's error; tracked in
+//! `docs/known-gaps.md` as a pre-existing deviation, not something this input's OTLP/JSON support
+//! introduced.
+//!
 //! **Size and concurrency limits.** `MAX_REQUEST_BYTES` (4 MiB) matches the OTel collector's own
 //! default `max_recv_msg_size`; a request over that is rejected (`413`/`grpc-status: 8`,
 //! `RESOURCE_EXHAUSTED`) before it can grow an unbounded buffer. That bounds one connection's
@@ -93,6 +105,17 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// uses elsewhere in this codebase for "a generous but real bound, not unlimited" -- worst case
 /// `1024 * MAX_REQUEST_BYTES` = 4 GiB in flight, not unbounded. Not (yet) operator-tunable; revisit
 /// as a config field if a real deployment needs a different number.
+///
+/// **That 4 GiB figure is the protobuf path's worst case, not the JSON one's.** An OTLP/JSON
+/// request (`docs/adr/otlp-json-decoding.md`) is parsed into a `serde_json::Value` tree before it
+/// ever reaches the decoded event model -- a `Map`/`Vec`/`String`/`Number` allocation per JSON
+/// node, several times the source bytes for a typically-nested OTLP payload, where the protobuf
+/// path's `prost::Message::decode` builds the target structs directly with none of that
+/// intermediate tree. The *bound* still holds -- one connection's JSON body is still capped at
+/// `MAX_REQUEST_BYTES` before parsing starts, so total worst-case memory across all connections is
+/// still a real, finite multiple of 4 GiB, not unbounded -- it just isn't exactly 4 GiB any more
+/// for an all-JSON worst case. No number is asserted here rather than guessed; tracked in
+/// `docs/known-gaps.md` for whoever needs a measured one.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// Which OTLP wire transport this listener accepts. See `logit_outputs::otlp::OtlpTransport`'s
@@ -285,19 +308,10 @@ async fn handle_http(
     let Some(signal) = route_path(req.uri().path()) else {
         return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
     };
-    if let Some(ct) = req.headers().get("content-type") {
-        let ct = ct.to_str().unwrap_or("");
-        let ct = ct.split(';').next().unwrap_or("").trim();
-        if !ct.is_empty() && ct != "application/x-protobuf" && ct != "application/protobuf" {
-            return Ok(text_response(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                &format!(
-                    "OTLP/JSON is not supported; send protobuf as application/x-protobuf (got \
-                     {ct:?})"
-                ),
-            ));
-        }
-    }
+    let encoding = match request_encoding(req.headers()) {
+        Ok(encoding) => encoding,
+        Err(message) => return Ok(text_response(StatusCode::UNSUPPORTED_MEDIA_TYPE, &message)),
+    };
     // `identity` and `gzip` are the only encodings this input speaks -- rejecting on the header's
     // mere *presence* would 415 a client that explicitly (if redundantly) declares no compression,
     // not just one sending an encoding this input can't decode. Mirrors the gRPC handler's
@@ -342,19 +356,66 @@ async fn handle_http(
     };
 
     let mut decoder = OtlpDecoder::new().with_telemetry(telemetry);
-    match decoder.decode_signal(signal, bytes) {
+    let result = match encoding {
+        RequestEncoding::Protobuf => decoder.decode_signal(signal, bytes),
+        RequestEncoding::Json => decoder.decode_signal_json(signal, bytes),
+    };
+    match result {
         Ok(batches) => {
             for batch in batches {
                 sink.send(batch).await;
             }
+            // Mirrors the request's own encoding -- the spec: "The server MUST use the same
+            // Content-Type in the response as it received in the request." A protobuf request
+            // gets `export_response`'s empty-on-success body; a JSON request gets `{}`, not a
+            // zero-length body -- `opentelemetry-js`'s exporter parses the success body looking
+            // for `partialSuccess`, and `JSON.parse("")` throws.
+            let (content_type, body) = match encoding {
+                RequestEncoding::Protobuf => ("application/x-protobuf", export_response(0, "")),
+                RequestEncoding::Json => ("application/json", export_response_json()),
+            };
             Ok(http::Response::builder()
                 .status(StatusCode::OK)
-                .header("content-type", "application/x-protobuf")
-                .body(Full::new(Bytes::from(export_response(0, ""))))
+                .header("content-type", content_type)
+                .body(Full::new(Bytes::from(body)))
                 .expect("a well-formed response always builds"))
         }
         Err(err) => Ok(text_response(StatusCode::BAD_REQUEST, &err.to_string())),
     }
+}
+
+/// Which OTLP/HTTP wire encoding a request's `Content-Type` declares -- protobuf (this input's
+/// original, and still default, encoding) or JSON (`docs/adr/otlp-json-decoding.md`). `Err`
+/// carries the 415 message for anything else.
+enum RequestEncoding {
+    Protobuf,
+    Json,
+}
+
+/// Absent or empty `Content-Type` means protobuf -- **not new leniency, a preserved compatibility
+/// promise**: every client this input accepted before OTLP/JSON existed sent no `Content-Type` at
+/// all, or an empty one, and none of them meant JSON. Matched via `eq_ignore_ascii_case`: HTTP
+/// media types are case-insensitive (`Content-Type: Application/JSON` is conformant), and the
+/// exact-string match this replaces was a latent bug that would have 415'd it.
+fn request_encoding(headers: &HeaderMap) -> Result<RequestEncoding, String> {
+    let Some(ct) = headers.get("content-type") else {
+        return Ok(RequestEncoding::Protobuf);
+    };
+    let ct = ct.to_str().unwrap_or("");
+    let ct = ct.split(';').next().unwrap_or("").trim();
+    if ct.is_empty()
+        || ct.eq_ignore_ascii_case("application/x-protobuf")
+        || ct.eq_ignore_ascii_case("application/protobuf")
+    {
+        return Ok(RequestEncoding::Protobuf);
+    }
+    if ct.eq_ignore_ascii_case("application/json") {
+        return Ok(RequestEncoding::Json);
+    }
+    Err(format!(
+        "unsupported Content-Type {ct:?} -- this input accepts application/x-protobuf, \
+         application/protobuf, and application/json"
+    ))
 }
 
 async fn handle_grpc(
@@ -609,6 +670,23 @@ fn export_response(rejected: i64, error_message: &str) -> Vec<u8> {
     out
 }
 
+/// The OTLP/JSON mirror of [`export_response`], for exactly the same reason and the same current
+/// limitation: `rejected` is always `0` here too (this module's doc comment), so there's only ever
+/// the all-default `ExportTraceServiceResponse` to render. Unlike the protobuf case, that does
+/// **not** mean an empty body -- proto3 JSON's own rule is that an unset message field is simply
+/// omitted from the object, and `partial_success` (a message-typed field) unset renders as no key
+/// at all, giving `{}`, not `""`. Sending `""` with `content-type: application/json` would be
+/// spec-conformant nowhere: `opentelemetry-js`'s HTTP exporter parses the success body looking for
+/// `partialSuccess`, and `JSON.parse("")` throws before it gets the chance to find none. When
+/// `partial_success` gains a real per-signal reject count (`docs/known-gaps.md`), this grows the
+/// same `rejected`/`error_message` parameters `export_response` already has, rendering
+/// `rejectedSpans`/`rejectedLogRecords`/`rejectedDataPoints` (the JSON key differs per [`Signal`],
+/// unlike the protobuf field, which shares one tag number across all three
+/// `Export*ServiceResponse` messages).
+fn export_response_json() -> Vec<u8> {
+    b"{}".to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,8 +804,48 @@ mod tests {
         assert!(received.events[0].span.is_some());
     }
 
+    /// One span, as an OTLP/JSON literal describing the same span [`one_span_payload`] encodes --
+    /// used everywhere the JSON decode path needs a real, spec-shaped body.
+    fn one_span_json() -> Vec<u8> {
+        br#"{"resourceSpans": [{"scopeSpans": [{"spans": [{
+            "traceId": "09090909090909090909090909090909",
+            "spanId": "0808080808080808",
+            "name": "s",
+            "startTimeUnixNano": "1",
+            "endTimeUnixNano": "2"
+        }]}]}]}"#
+            .to_vec()
+    }
+
     #[tokio::test]
-    async fn a_json_content_type_is_rejected_with_415_and_a_clear_message() {
+    async fn a_json_post_to_v1_traces_reaches_the_fanout_as_an_event_batch() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let response = post_raw(
+            &addr,
+            "/v1/traces",
+            "Content-Type: application/json\r\nConnection: close\r\n",
+            &one_span_json(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+
+        let received = recv_batch(&mut rx).await;
+        assert_eq!(received.events.len(), 1);
+        let span = received.events[0].span.as_ref().expect("event should carry a span");
+        assert_eq!(span.trace_id, [9; 16]);
+        assert_eq!(span.span_id, [8; 8]);
+    }
+
+    /// The interop guard: `opentelemetry-js`'s HTTP exporter parses the success response body
+    /// looking for `partialSuccess`, so a JSON request must never get protobuf's empty-body
+    /// shortcut back -- `{}`, with a JSON content type, or a conformant client's own response
+    /// parsing breaks before it ever sees "this succeeded."
+    #[tokio::test]
+    async fn a_json_request_gets_a_json_response_body_and_content_type() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
@@ -737,11 +855,153 @@ mod tests {
             &addr,
             "/v1/traces",
             "Content-Type: application/json\r\nConnection: close\r\n",
-            b"{}",
+            &one_span_json(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        assert!(response.contains("content-type: application/json"), "got: {response}");
+        assert!(response.trim_end().ends_with("{}"), "expected a `{{}}` body, got: {response}");
+    }
+
+    /// Regression guard on the arm that didn't change: a protobuf request must keep getting
+    /// protobuf's response shape, not JSON's, now that both exist side by side.
+    #[tokio::test]
+    async fn a_protobuf_request_still_gets_a_protobuf_content_type() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let response = post_raw(
+            &addr,
+            "/v1/traces",
+            "Content-Type: application/x-protobuf\r\nConnection: close\r\n",
+            &one_span_payload(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        assert!(response.contains("content-type: application/x-protobuf"), "got: {response}");
+    }
+
+    /// The surviving half of the old JSON-always-415 test: an actually-unsupported type is still
+    /// rejected, and the message now names every type this input *does* accept.
+    #[tokio::test]
+    async fn an_unknown_content_type_is_rejected_with_415_listing_what_is_accepted() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let response = post_raw(
+            &addr,
+            "/v1/traces",
+            "Content-Type: text/xml\r\nConnection: close\r\n",
+            b"<x/>",
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 415"), "got: {response}");
-        assert!(response.contains("OTLP/JSON is not supported"), "got: {response}");
+        assert!(response.contains("application/x-protobuf"), "got: {response}");
+        assert!(response.contains("application/protobuf"), "got: {response}");
+        assert!(response.contains("application/json"), "got: {response}");
+    }
+
+    /// HTTP media types are case-insensitive (`Content-Type: Application/JSON` is conformant) --
+    /// the exact-string match this replaced would have 415'd this.
+    #[tokio::test]
+    async fn a_content_type_is_matched_case_insensitively() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let response = post_raw(
+            &addr,
+            "/v1/traces",
+            "Content-Type: Application/JSON\r\nConnection: close\r\n",
+            &one_span_json(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        recv_batch(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_json_over_http_returns_400() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let response = post_raw(
+            &addr,
+            "/v1/traces",
+            "Content-Type: application/json\r\nConnection: close\r\n",
+            b"not json at all",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+    }
+
+    /// The two headers compose: `Content-Encoding` and `Content-Type` are handled independently,
+    /// so a gzipped JSON body is exactly as valid as a gzipped protobuf one.
+    #[tokio::test]
+    async fn a_gzipped_json_body_is_decoded() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let gzipped = gzip(&one_span_json());
+        let response = post_raw(
+            &addr,
+            "/v1/traces",
+            "Content-Type: application/json\r\nContent-Encoding: gzip\r\n\
+             Connection: close\r\n",
+            &gzipped,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+
+        let received = recv_batch(&mut rx).await;
+        assert_eq!(received.events.len(), 1);
+        assert!(received.events[0].span.is_some());
+    }
+
+    /// The scope decision made testable: all three signals, not traces only.
+    #[tokio::test]
+    async fn a_json_post_to_v1_logs_and_v1_metrics_also_works() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let log_body = br#"{"resourceLogs": [{"scopeLogs": [{"logRecords": [{
+            "timeUnixNano": "1", "body": {"stringValue": "hi"}
+        }]}]}]}"#;
+        let response = post_raw(
+            &addr,
+            "/v1/logs",
+            "Content-Type: application/json\r\nConnection: close\r\n",
+            log_body,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "logs, got: {response}");
+        let received = recv_batch(&mut rx).await;
+        assert!(received.events[0].log.is_some());
+
+        let metric_body = br#"{"resourceMetrics": [{"scopeMetrics": [{"metrics": [{
+            "name": "m", "gauge": {"dataPoints": [{"timeUnixNano": "1", "asDouble": 1.0}]}
+        }]}]}]}"#;
+        let response = post_raw(
+            &addr,
+            "/v1/metrics",
+            "Content-Type: application/json\r\nConnection: close\r\n",
+            metric_body,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "metrics, got: {response}");
+        let received = recv_batch(&mut rx).await;
+        assert!(!received.events[0].metrics.is_empty());
     }
 
     /// `identity` is the standard, legal way to declare "not compressed" -- it must not be

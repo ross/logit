@@ -335,8 +335,10 @@ services:
   # other tier's own listener). Its own OTel request spans bypass `logit` entirely and go straight
   # to `tempo`'s own OTLP/HTTP receiver (below) -- deliberate, not every telemetry leg needs
   # `logit` in front of it, and `demo/logit.yaml`'s header comment explains why this is the one
-  # that doesn't. `otlp_in` (`crates/logit-inputs/src/otlp.rs`) is consequently still unexercised
-  # by this demo.
+  # that doesn't. `otlp_in` (`crates/logit-inputs/src/otlp.rs`) is wired into this stack now too,
+  # just not for `app`'s own spans -- see `haproxy`'s (below) `/v1/*` route and
+  # `demo/logit.yaml`'s `browser_in`. No port published here for it: reached through `haproxy`'s
+  # already-published `:8080`, not directly.
   app:
     build:
       context: ./app

@@ -22,8 +22,11 @@ DEBUG = False
 ALLOWED_HOSTS = ["*"]
 
 # No `django.contrib.staticfiles` -- this tier's one template is inline-styled and serves no
-# static assets of its own (`graph.svg` is a dynamic view reading a shared volume, not a static
-# file), so there's nothing for it to collect or serve.
+# static assets of its own (`graph.svg`/`architecture.svg` are dynamic views reading a shared
+# volume, and now `telemetry.js` -- docs/plans/browser-tracing.md's Workstream C -- is a dynamic
+# view reading the bundle esbuild produced at image-build time, not a static file), so there's
+# nothing for it to collect or serve. A whole app + `STATIC_URL`/`STATIC_ROOT`/`collectstatic` for
+# one bundled JS file would be more machinery than the thing it serves.
 INSTALLED_APPS = [
     "pages",
 ]
@@ -49,6 +52,9 @@ TEMPLATES = [
             "context_processors": [
                 "django.template.context_processors.debug",
                 "django.template.context_processors.request",
+                # docs/plans/browser-tracing.md's Workstream C -- see
+                # pages/context_processors.py's own header comment.
+                "pages.context_processors.traceparent",
             ],
         },
     },
