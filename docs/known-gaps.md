@@ -33,7 +33,7 @@ already built that have a known, accepted rough edge.
   (`crates/logit-inputs/src/statsd.rs`); `logit-transforms::Aggregator` passes `MetricKind::Set`
   through unaggregated rather than fake-merging it
   ([ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)); `logit-outputs::influxdb` errors on it
-  rather than writing a wrong encoding.
+  rather than writing a wrong encoding. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 - **Native wire protocol: the format and the transport are both done; credit-based flow control,
   QUIC, and an OTLP passthrough codec aren't.** `crates/logit-proto/src/frame.rs`/`src/native/`
   (the codec, [ADR `native-wire-format-encoding`](adr/native-wire-format-encoding.md)) and
@@ -466,14 +466,14 @@ already built that have a known, accepted rough edge.
   scheme for `[id@32473 k="v"]` invented without a consumer would be guesswork). Both stay
   additive-later on the *input* side specifically — `syslog_out` (the egress side,
   `docs/adr/syslog-output.md`) does support both UDP and TCP, and that asymmetry is
-  deliberate, not a sign this entry needs closing to match.
+  deliberate, not a sign this entry needs closing to match. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 - **`syslog_out` doesn't emit RFC 5424 structured data either** — everything a `json`/`kv_metrics`
   stage merged into `event.attributes` is lost on the way out unless the message body already
   carried it, so `syslog_in -> json -> syslog_out` is *less* than a byte-for-byte relay. Mapping
   attributes to SD-ELEMENTs would need an SD-ID convention (a private enterprise number, RFC 5424
   §7.2.2) that shouldn't be picked in passing while implementing the sink itself. Same reason a
   log's native trace context (`log.trace`, [ADR `log-record-trace-context`](adr/log-record-trace-context.md))
-  has nowhere to go over this wire today — no SD-ELEMENT convention exists to carry it.
+  has nowhere to go over this wire today — no SD-ELEMENT convention exists to carry it. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 - **`syslog_out` re-stamps a relayed message's timestamp rather than preserving the origin's** —
   every emitted message's TIMESTAMP is `event.timestamp` (receipt time), never the `syslog.
   timestamp` attribute `syslog_in` may have left on the event, for the same reason `syslog_in`
@@ -512,7 +512,7 @@ already built that have a known, accepted rough edge.
   merged `DdSketch` no longer holds the original samples it combined, so "how does a merged sketch
   become one or more statsd lines" (one line per fixed quantile? synthesized samples at quantile
   boundaries?) is a real design question deserving its own ADR, not a guess made while landing the
-  sink itself. See `docs/adr/statsd-output.md`.
+  sink itself. See `docs/adr/statsd-output.md`. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 - **`statsd_out` has no egress timestamp, no `unit`, and no metric renaming/prefixing** — the
   classic statsd grammar has no timestamp segment at all (and `statsd_in` would silently ignore
   one if emitted, so it wouldn't even round-trip through this repo's own input), so every relayed
@@ -522,7 +522,7 @@ already built that have a known, accepted rough edge.
   (`docs/design/lua-api.md` notes a metric's value/fields are unexposed to Lua) — a sink-side
   `prefix` field was considered and rejected for `statsd_out` specifically
   (`docs/adr/statsd-output.md`'s Alternatives) in favor of a future general metric-rename
-  transform, which doesn't exist yet either.
+  transform, which doesn't exist yet either. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 - **`statsd_out` has no TLS/DTLS** — plaintext UDP/TCP only, same gap as `syslog_out`'s above, and
   the same `TlsClientConfig`/`TlsServerConfig` pair would be the config-plumbing exercise if it
   lands.
@@ -535,7 +535,7 @@ already built that have a known, accepted rough edge.
   ASCII header fields directly off the line's raw bytes instead of a validated `&str`, deferring
   UTF-8 validation to the MSG slice alone — a real change, not a one-line fix, and nginx's
   `escape=json` access-log writer never emits invalid UTF-8 in practice, so there's no production
-  producer forcing the issue yet.
+  producer forcing the issue yet. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 
   **UTF-8 rejection is not the only thing standing between a syslog line and an arbitrary-binary
   payload.** `SyslogDecoder::decode_into` (`crates/logit-inputs/src/syslog.rs:190-197`) splits a
@@ -597,7 +597,7 @@ already built that have a known, accepted rough edge.
   arbitrary amount when the sender's clock is skewed or when messages are replayed or forwarded
   through a relay. Everything downstream keyed on time — `aggregate`'s tumbling window, the point
   timestamp `influxdb_out` writes — uses `event.timestamp`, so today a delayed or replayed message
-  lands in the window it *arrived* in, not the one it *happened* in.
+  lands in the window it *arrived* in, not the one it *happened* in. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 
   Deriving `event.timestamp` from the sender instead was considered and deliberately not done here:
   RFC 3164's timestamp carries no year and no timezone, so resolving it to an instant means guessing
@@ -882,8 +882,10 @@ already built that have a known, accepted rough edge.
   what a peer protocol expects" shows up as more than a one-line doc-comment footnote. Filed as its
   own entry, meant to grow as more codecs and more of OTLP's own surface (exemplars, profiles,
   OTLP's log `event_name`, ...) get real mappings, rather than re-discovered by grepping doc
-  comments across encoders each time. Every mapping below is deliberate, counted, and documented at
-  its own call site — this entry exists so the list is in one place too:
+  comments across encoders each time. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md);
+  see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream. Every
+  mapping below is deliberate, counted, and documented at its own call site — this entry exists so
+  the list is in one place too:
 
   | Direction | Mapping | Counter | Why |
   |---|---|---|---|

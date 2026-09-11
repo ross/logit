@@ -146,7 +146,11 @@ ready (`2`). `internal`'s own `logs:` setting (`warn` by default, `error`, or `o
 `logit`'s own `warn`-and-above self-diagnostics into the pipeline as ordinary log events through
 `logit_core::telemetry::TelemetryLayer`, alongside its existing points and spans -- see
 `internal-telemetry.md`'s "Logs" section. `docs/deploying.md`'s "Probes and exit codes" and
-"Self-logging" sections are the operator-facing account of all of it.
+"Self-logging" sections are the operator-facing account of all of it. [ADR `lossless-transit`](docs/adr/lossless-transit.md)
+now states an explicit goal — a lossless relay for each like-protocol pair
+(`statsd_in`/`statsd_out`, `otlp_in`/`otlp_out`, `syslog_in`/`syslog_out`) — that today's model and
+codecs don't yet meet; [`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md) has the
+assessment and the ordered workstreams closing that gap.
 
 ## Environment
 
@@ -224,6 +228,14 @@ not a style preference:
   `logit-core::metric::DdSketch` is a real wrapper with a working `merge` (`crates/logit-transforms`'
   `aggregate` is its first caller); `HyperLogLog` is still a stub pending a real crate — don't fill
   it with a non-mergeable implementation to get `Set` aggregation working faster.
+- **`statsd_in -> statsd_out`, `otlp_in -> otlp_out`, and `syslog_in -> syslog_out` must each be a
+  lossless relay**, modulo a named list of permitted normalizations (batching, tag reordering, a
+  sink-configured dialect change) — [ADR `lossless-transit`](docs/adr/lossless-transit.md). A
+  decoder never pre-summarizes what an explicit `aggregate`/Lua stage should decide about, and a
+  field a protocol can carry that `Event` can't represent is tracked debt
+  ([`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md)), not an accepted codec
+  limitation — don't add a new lossy mapping without checking that plan and the survey it's built
+  on ([`docs/design/telemetry-landscape.md`](docs/design/telemetry-landscape.md)) first.
 - **The wire encoding is decided: hand-rolled, shipped as `logit_proto::native`** — a four-arm
   bake-off (`crates/logit-bench/src/bakeoff/`) settled it against `rkyv`, `postcard`, and OTLP
   itself; see [ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md) and
