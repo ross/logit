@@ -835,6 +835,43 @@ pub enum ComponentKind {
         #[schemars(with = "String")]
         connect_timeout: Duration,
     },
+    /// statsd / DogStatsD egress over UDP or TCP -- the mirror of `StatsdIn`, and a real relay:
+    /// names, values, and tags round-trip through the real decoder on the other end. See
+    /// `docs/adr/statsd-output.md`.
+    StatsdOut {
+        /// `host:port`. Resolved at connect/bind time, never at config-load time -- the same
+        /// `syslog_out`/`logit_out` precedent.
+        endpoint: String,
+        #[serde(default)]
+        transport: StatsdTransport,
+        /// Which statsd dialect to emit. `dogstatsd` (default) includes the `|#tag:value,...`
+        /// segment; `statsd` omits it entirely for a plain-statsd receiver that would otherwise
+        /// reject it.
+        #[serde(default)]
+        format: StatsdFormat,
+        /// Encodes a `MetricKind::GaugeDelta` (statsd/DogStatsD's own `+n`/`-n` relative-gauge
+        /// syntax) natively as a signed value, instead of dropping it with a
+        /// `gauge_delta_unresolved` diagnostic. Off by default: a delta reaching *any* sink means
+        /// the pipeline is missing an `aggregate` component (`docs/adr/relative-gauge-
+        /// adjustments.md`) -- this is the one sink able to round-trip a delta losslessly, so
+        /// it's an opt-in relay behavior, not a silent default across every sink.
+        #[serde(default)]
+        relative_gauges: bool,
+        /// Bounds one UDP datagram's worth of packed lines (several statsd lines newline-joined
+        /// per send) -- not a single line's length. Defaults to 1432: Etsy statsd's own
+        /// "commodity Ethernet LAN" recommendation and DataDog's documented DogStatsD client
+        /// default, which is 1500 MTU minus IPv4/UDP headers minus headroom for VXLAN/IPsec
+        /// encapsulation -- exactly where a 1472-byte datagram would silently fragment or
+        /// `EMSGSIZE`. A string via [`human_bytes`], exactly like `SyslogOut::max_message_bytes`.
+        /// Ignored for `transport: tcp`, which has no datagram to overflow.
+        #[serde(default = "default_statsd_max_packet_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_packet_bytes: u64,
+        /// TCP only, ignored for UDP. See `SyslogOut::connect_timeout`.
+        #[serde(default = "default_statsd_connect_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        connect_timeout: Duration,
+    },
 }
 
 fn default_max_message_bytes() -> u64 {
@@ -998,6 +1035,18 @@ fn default_logit_out_request_timeout() -> Duration {
     Duration::from_secs(10)
 }
 
+/// Mirrors `logit_outputs::statsd::DEFAULT_MAX_PACKET_BYTES` -- can't reference it directly, same
+/// reason as [`default_syslog_connect_timeout`].
+fn default_statsd_max_packet_bytes() -> u64 {
+    1432
+}
+
+/// Mirrors `logit_outputs::statsd::DEFAULT_CONNECT_TIMEOUT` -- can't reference it directly, same
+/// reason as [`default_syslog_connect_timeout`].
+fn default_statsd_connect_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
 fn default_trace_id_field() -> String {
     "trace.id".to_string()
 }
@@ -1094,6 +1143,28 @@ pub enum SyslogFormat {
     Rfc3164,
     #[default]
     Rfc5424,
+}
+
+/// `statsd_out`'s transport. UDP (the default) matches classic statsd and DogStatsD clients;
+/// TCP is what makes `Fault` classification meaningful for this sink, same as `SyslogTransport`.
+/// Deliberately its own enum rather than reusing `SyslogTransport`: schemars publishes a type's
+/// own name into the schema's `$defs`, so sharing one would make `statsd_out` document its
+/// transport by pointing at a syslog-named type.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StatsdTransport {
+    #[default]
+    Udp,
+    Tcp,
+}
+
+/// Which statsd dialect `statsd_out` emits. See `StatsdOut::format`'s doc comment.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StatsdFormat {
+    #[default]
+    Dogstatsd,
+    Statsd,
 }
 
 /// The syslog PRI facility, named rather than a bare `0..=23` integer so schemars publishes a
@@ -2425,6 +2496,84 @@ mod tests {
                 assert_eq!(request_timeout, Duration::from_secs(30));
             }
             other => panic!("expected LogitOut with tls set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn statsd_out_defaults_to_dogstatsd_over_udp_with_relative_gauges_off() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "statsd_out", "sources": ["in"], "endpoint": "127.0.0.1:8125"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::StatsdOut {
+                endpoint,
+                transport,
+                format,
+                relative_gauges,
+                max_packet_bytes,
+                connect_timeout,
+            } => {
+                assert_eq!(endpoint, "127.0.0.1:8125");
+                assert_eq!(transport, StatsdTransport::Udp);
+                assert_eq!(format, StatsdFormat::Dogstatsd);
+                assert!(!relative_gauges);
+                assert_eq!(max_packet_bytes, 1432);
+                assert_eq!(connect_timeout, Duration::from_secs(5));
+            }
+            other => panic!("expected StatsdOut, got {other:?}"),
+        }
+    }
+
+    /// The easiest thing in this whole variant to get silently wrong: `rename_all = "snake_case"`
+    /// on a variant spelled `DogStatsd` turns it into `dog_statsd`, not `dogstatsd`.
+    #[test]
+    fn the_dogstatsd_format_variant_deserializes_from_the_single_word_dogstatsd_not_dog_statsd() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "statsd_out", "sources": ["in"], "endpoint": "127.0.0.1:8125",
+                "format": "dogstatsd"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            component.kind,
+            ComponentKind::StatsdOut { format: StatsdFormat::Dogstatsd, .. }
+        ));
+
+        let result: Result<Component, _> = serde_json::from_str(
+            r#"{"type": "statsd_out", "sources": ["in"], "endpoint": "127.0.0.1:8125",
+                "format": "dog_statsd"}"#,
+        );
+        assert!(result.is_err(), "\"dog_statsd\" must not be accepted alongside \"dogstatsd\"");
+    }
+
+    #[test]
+    fn statsd_out_max_packet_bytes_accepts_a_human_byte_string_and_defaults_to_1432() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "statsd_out", "sources": ["in"], "endpoint": "127.0.0.1:8125",
+                "max_packet_bytes": "8KiB"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::StatsdOut { max_packet_bytes, .. } => {
+                assert_eq!(max_packet_bytes, 8 * 1024);
+            }
+            other => panic!("expected StatsdOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn statsd_out_connect_timeout_accepts_a_humantime_string_and_defaults_to_five_seconds() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "statsd_out", "sources": ["in"], "endpoint": "127.0.0.1:8125",
+                "transport": "tcp", "connect_timeout": "30s"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::StatsdOut { transport, connect_timeout, .. } => {
+                assert_eq!(transport, StatsdTransport::Tcp);
+                assert_eq!(connect_timeout, Duration::from_secs(30));
+            }
+            other => panic!("expected StatsdOut, got {other:?}"),
         }
     }
 

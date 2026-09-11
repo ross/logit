@@ -80,7 +80,12 @@ is real now too -- `logit_in`/`logit_out` (`crates/logit-inputs/src/logit.rs`/`c
 logit-outputs/src/logit.rs`) are implemented, tested `ComponentKind`s: one TCP (optionally TLS)
 connection, a `Hello`/`HelloAck` version/codec/compression handshake, one native frame per batch
 acknowledged before the next is sent
-([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md)). Not
+([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md)).
+`statsd_out` (`crates/logit-outputs/src/statsd.rs`, the mirror of `statsd_in`, UDP or TCP,
+DogStatsD tags round-tripped through the real decoder,
+[ADR `statsd-output`](docs/adr/statsd-output.md)) is also implemented and tested now -- v1 only
+encodes `Counter`/`Gauge`/`GaugeDelta`, so a `statsd_in -> aggregate -> statsd_out` relay still
+drops every timer metric (`docs/known-gaps.md`). Not
 yet built: credit-based flow control beyond one frame in flight, and QUIC (`docs/known-gaps.md`).
 Config is a flat graph of named components (ADR `component-graph-configuration`,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
@@ -260,7 +265,7 @@ crates/
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry)
-  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog
+  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, logfmt, kv, regex
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
