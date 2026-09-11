@@ -6,7 +6,7 @@ each file's frontmatter is what orders this index, not the filename.
 
 | Plan | Created | Updated |
 |---|---|---|
-| [Closing plan: lossless like-protocol transit](lossless-transit.md) | 2026-09-10 | 2026-09-10 |
+| [Closing plan: lossless like-protocol transit](lossless-transit.md) | 2026-09-10 | 2026-09-11 |
 | [Enabling plan: `logit_out`/`logit_in` — the native transport](native-transport.md) | 2026-09-09 | 2026-09-09 |
 | [Closing plan: durable, disk-backed sink buffering](durable-sink-buffer.md) | 2026-09-09 | 2026-09-09 |
 | [Enabling plan: operator surface — readiness/liveness, leveled structured self-logging, internal logs](operator-surface.md) | 2026-09-09 | 2026-09-09 |
@@ -19,7 +19,7 @@ each file's frontmatter is what orders this index, not the filename.
 | [Closing plan: signal-aware filter components, and `otlp_out`'s remaining config gaps](signal-filtering-and-otlp-out-config-gaps.md) | 2026-09-03 | 2026-09-03 |
 | [Enabling plan: operator-declared resource identity, and a Loki-direct log leg](otlp-logs-and-resource-identity.md) | 2026-09-02 | 2026-09-03 |
 | [Closing plan: OTLP end-to-end — internal spans, an OTLP codec, `otlp_in`/`otlp_out`, and the demo](otlp-end-to-end.md) | 2026-09-02 | 2026-09-02 |
-| [Closing plan: decoupled listener I/O](decoupled-listener-io.md) | 2026-09-02 | 2026-09-02 |
+| [Closing plan: decoupled listener I/O](decoupled-listener-io.md) | 2026-09-02 | 2026-09-11 |
 | [Enabling plan: a user-facing demo stack](demo-stack.md) | 2026-09-01 | 2026-09-03 |
 | [Closing plan: buffered, decoupled sink delivery](buffered-sink-delivery.md) | 2026-09-01 | 2026-09-02 |
 | [Enabling plan: a real nginx workload](nginx-integration.md) | 2026-08-30 | 2026-08-30 |

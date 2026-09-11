@@ -47,7 +47,7 @@ mod tests {
         for (k, v) in attrs {
             attributes.insert(k, *v);
         }
-        Resource { attributes }
+        Resource { attributes, ..Default::default() }
     }
 
     fn event_with(attrs: &[(&str, &str)]) -> Event {

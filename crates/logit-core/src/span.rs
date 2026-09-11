@@ -13,8 +13,9 @@ pub struct SpanRecord {
     pub links: Vec<SpanLink>,
     /// Unix nanoseconds. The span's start time is `Event::timestamp`.
     pub end_timestamp: i64,
-    /// W3C trace flags (low 8 bits of OTLP's own `Span.flags`); bit 0 is the `SAMPLED` flag. `0`
-    /// means unset.
+    /// OTLP's `Span.flags`, carried verbatim: the low 8 bits are the W3C trace flags (bit 0 =
+    /// `SAMPLED`), the bits above them OTLP's own (`CONTEXT_HAS_IS_REMOTE`/`CONTEXT_IS_REMOTE`).
+    /// `0` means unset.
     pub flags: u32,
     /// Boxed: populated only on an error span or one carrying a `trace_state`/dropped counts, so
     /// the overwhelmingly common span (no status message, no `tracestate`) doesn't pay for these

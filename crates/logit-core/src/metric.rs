@@ -13,7 +13,7 @@ pub enum Temporality {
     Cumulative,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetricRecord {
     pub name: Symbol,
     pub unit: Option<Symbol>,
@@ -24,17 +24,6 @@ pub struct MetricRecord {
     /// Empty `Vec` allocates nothing on the common no-exemplars path.
     pub exemplars: Vec<Exemplar>,
     pub kind: MetricKind,
-}
-
-impl PartialEq for MetricRecord {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.unit == other.unit
-            && self.description == other.description
-            && self.start_timestamp == other.start_timestamp
-            && self.exemplars == other.exemplars
-            && self.kind == other.kind
-    }
 }
 
 impl MetricRecord {

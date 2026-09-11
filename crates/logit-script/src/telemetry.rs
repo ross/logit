@@ -168,8 +168,8 @@ mod tests {
         let events = registry.drain(0);
         assert_eq!(events.len(), 1);
         match &events[0].metrics[0].kind {
-            MetricKind::Counter(v) => assert_eq!(*v, 3.0),
-            other => panic!("expected Counter, got {other:?}"),
+            MetricKind::Sum(sum) => assert_eq!(sum.value, 3.0),
+            other => panic!("expected Sum, got {other:?}"),
         }
         assert_eq!(interner::resolve(events[0].metrics[0].name), "orders.total");
     }

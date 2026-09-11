@@ -519,8 +519,12 @@ async fn decode_loop<D: Decoder + Send>(
 
         scratch.clear();
         match decoder.decode_into(datagram.bytes, datagram.received_at, &mut scratch) {
-            Ok(resource) => {
-                if let Some((batch, reason)) = accumulator.absorb(resource, &mut scratch) {
+            Ok((resource, scope)) => {
+                // `scope` is whatever `decoder.decode_into` returned -- `None` for every decoder
+                // this loop drives today (statsd/syslog datagrams have no OTLP
+                // instrumentation-scope concept), but threaded through rather than hardcoded so a
+                // future `Decoder` on this same loop that does carry one isn't silently dropped.
+                if let Some((batch, reason)) = accumulator.absorb(resource, scope, &mut scratch) {
                     emit(&sink, &telemetry, batch, reason).await;
                 }
             }
@@ -581,14 +585,14 @@ mod tests {
             bytes: Bytes,
             received_at: i64,
             out: &mut Vec<Event>,
-        ) -> Result<Arc<Resource>, CodecError> {
+        ) -> Result<(Arc<Resource>, Option<Arc<logit_core::Scope>>), CodecError> {
             if &bytes[..] == b"BAD" {
                 return Err(CodecError::Malformed("bad datagram".to_string()));
             }
             let mut attrs = AttrMap::new();
             attrs.insert("payload", logit_core::Value::str(String::from_utf8_lossy(&bytes)));
             out.push(Event::empty(received_at, attrs));
-            Ok(Arc::clone(&self.resource))
+            Ok((Arc::clone(&self.resource), None))
         }
     }
 

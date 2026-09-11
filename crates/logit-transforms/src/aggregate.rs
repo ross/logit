@@ -1,20 +1,23 @@
 //! The built-in `aggregate` transform: a stateful, tumbling-window metric aggregator.
 //!
 //! Windowing/merge semantics are recorded in `docs/adr/aggregation-window-semantics.md` and
-//! come from `docs/design/data-model.md`'s mergeable-metric-kinds design: `Counter` sums, `Gauge`
-//! keeps the value with the latest source timestamp, `Distribution` merges via `DdSketch::merge`
-//! (this is that method's first real caller anywhere in the codebase). `Set`/`Histogram`/`Summary`
-//! have no defined merge rule here yet (`Set` specifically is blocked on `HyperLogLog` still being a
-//! method-less stub) and pass through untouched rather than being dropped -- this project's
-//! consistent stance on data it doesn't know how to handle correctly. Since an event can now carry
-//! a log and/or a span alongside its metrics (docs/adr/multi-payload-events.md), pass-through
-//! is per *metric*, not per *event*: this stage absorbs every mergeable metric off an event and
-//! forwards whatever's left -- the unmergeable metrics, plus any log/span -- rather than treating
-//! "can't merge one metric" as a reason to forward the whole event untouched.
+//! come from `docs/design/data-model.md`'s mergeable-metric-kinds design: a delta `Sum` sums
+//! (`docs/adr/metrics-model-v2.md` -- what `Counter` used to mean, now `Sum { temporality: Delta,
+//! .. }`), `Gauge` keeps the value with the latest source timestamp, `Distribution` merges via
+//! `DdSketch::merge` (this is that method's first real caller anywhere in the codebase). A
+//! cumulative `Sum`, `Samples`, `SetMembers`, `Set`, `Histogram`, `ExponentialHistogram`, and
+//! `Summary` have no defined merge rule here yet (`Set` specifically is blocked on `HyperLogLog`
+//! still being a method-less stub) and pass through untouched rather than being dropped -- this
+//! project's consistent stance on data it doesn't know how to handle correctly. Since an event can
+//! now carry a log and/or a span alongside its metrics (docs/adr/multi-payload-events.md),
+//! pass-through is per *metric*, not per *event*: this stage absorbs every mergeable metric off an
+//! event and forwards whatever's left -- the unmergeable metrics, plus any log/span -- rather than
+//! treating "can't merge one metric" as a reason to forward the whole event untouched.
 
 use logit_core::interner::Symbol;
 use logit_core::{
-    AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, SpanLink, Telemetry, Value,
+    AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, SpanLink, Sum, Telemetry,
+    Temporality, Value,
 };
 use logit_pipeline::{FlushOutput, TraceContext, Transform};
 use smallvec::SmallVec;
@@ -75,6 +78,9 @@ impl ContributingContexts {
                 trace_id: ctx.trace_id,
                 span_id: ctx.span_id,
                 attributes: AttrMap::new(),
+                flags: 0,
+                trace_state: None,
+                dropped_attributes_count: 0,
             })
             .collect();
         (links, self.dropped)
@@ -136,7 +142,15 @@ struct SeriesState {
 }
 
 enum Accumulator {
-    Counter(f64),
+    /// A delta `Sum` merges the way `Counter` used to: the accumulator sums `value` and carries
+    /// the *first* record's `monotonic` flag (later merges don't overwrite it, even if a
+    /// well-behaved producer would never send mismatched flags under one series identity).
+    /// `temporality` is always `Delta` here -- a cumulative `Sum` never reaches an accumulator at
+    /// all, see `process`'s pass-through `matches!`.
+    Sum {
+        total: f64,
+        monotonic: bool,
+    },
     /// `at` is the source event's timestamp, used to pick the last-write-wins value -- not the
     /// window's timestamp, which doesn't exist until flush.
     Gauge {
@@ -193,7 +207,7 @@ impl Aggregator {
         self.interval
     }
 
-    /// Absorbs every mergeable metric (`Counter`/`Gauge`/`Distribution`) off `event` into this
+    /// Absorbs every mergeable metric (a delta `Sum`/`Gauge`/`Distribution`) off `event` into this
     /// aggregator's window state, and forwards whatever's left -- unmergeable metric kinds, a
     /// kind conflict with an already-accumulating series, and/or a log or span, if the event
     /// carries any (docs/adr/multi-payload-events.md). `None` only when nothing at all
@@ -224,10 +238,22 @@ impl Aggregator {
         for record in metrics {
             // No merge rule defined for these (docs/design/data-model.md) -- leave them on the
             // event rather than absorbing or dropping them. `GaugeDelta` is *not* here -- it has
-            // a real resolution below, unlike these three (docs/adr/relative-gauge-adjustments.md).
+            // a real resolution below, unlike these (docs/adr/relative-gauge-adjustments.md). A
+            // cumulative `Sum` is also pass-through -- only a *delta* `Sum` merges (below), the
+            // same way `Counter` used to.
+            //
+            // Kept in sync with `Accumulator::new_for`'s `unreachable!` arm *deliberately* -- a
+            // kind listed as pass-through here must also be listed there, and vice versa; a
+            // mismatch between the two is a runtime panic, not a compile error.
             if matches!(
                 record.kind,
-                MetricKind::Set(_) | MetricKind::Histogram { .. } | MetricKind::Summary { .. }
+                MetricKind::Sum(Sum { temporality: Temporality::Cumulative, .. })
+                    | MetricKind::Samples(_)
+                    | MetricKind::SetMembers(_)
+                    | MetricKind::Set(_)
+                    | MetricKind::Histogram(_)
+                    | MetricKind::ExponentialHistogram(_)
+                    | MetricKind::Summary(_)
             ) {
                 event.metrics.push(record);
                 continue;
@@ -243,7 +269,7 @@ impl Aggregator {
             // Whether this metric opened a brand-new series -- not derivable from the
             // accumulator's `at`/`value` afterward, since a genuine `Gauge(0.0)` at `at:
             // i64::MIN` looks identical to an unseeded delta's result. Only meaningful for
-            // `GaugeDelta` below; a fresh `Counter`/`Distribution` series has no equivalent
+            // `GaugeDelta` below; a fresh `Sum`/`Distribution` series has no equivalent
             // "resolved against a placeholder" hazard, since there's no prior value to have
             // wanted.
             let was_vacant = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
@@ -254,8 +280,11 @@ impl Aggregator {
                 updated_this_window: false,
             });
             let accumulated = match (&mut state.accumulator, &record.kind) {
-                (Accumulator::Counter(sum), MetricKind::Counter(v)) => {
-                    *sum += v;
+                (
+                    Accumulator::Sum { total, .. },
+                    MetricKind::Sum(Sum { temporality: Temporality::Delta, value, .. }),
+                ) => {
+                    *total += value;
                     true
                 }
                 (Accumulator::Gauge { value, at }, MetricKind::Gauge(v)) => {
@@ -285,13 +314,13 @@ impl Aggregator {
                     sketch.merge(incoming);
                     true
                 }
-                // A series already accumulating under one kind (e.g. it started as a counter)
+                // A series already accumulating under one kind (e.g. it started as a delta sum)
                 // just saw a metric of a different kind under the same name/unit/tags (e.g. a
                 // gauge). No correct merge exists for that -- leave this one metric on the event
                 // rather than silently dropping it or corrupting the existing accumulator with a
                 // type-punned value. Per-metric now, not per-event: a sibling metric on the same
                 // event that *does* merge cleanly is still absorbed. A `GaugeDelta` against a
-                // `Counter`/`Distribution` series lands here too, same as `Gauge` always has.
+                // `Sum`/`Distribution` series lands here too, same as `Gauge` always has.
                 _ => false,
             };
             if accumulated {
@@ -433,18 +462,9 @@ impl Aggregator {
                             Accumulator::Gauge { value, .. } => value,
                             _ => unreachable!("is_gauge guards this"),
                         };
-                        events.push((
-                            Event::metric(
-                                now,
-                                key.attributes.clone(),
-                                MetricRecord {
-                                    name: key.name,
-                                    kind: MetricKind::Gauge(value),
-                                    unit: key.unit,
-                                },
-                            ),
-                            links,
-                        ));
+                        let mut record = MetricRecord::new(key.name, MetricKind::Gauge(value));
+                        record.unit = key.unit;
+                        events.push((Event::metric(now, key.attributes.clone(), record), links));
                         // A retained gauge keeps `value` but resets `at` to `i64::MIN`: LWW is a
                         // within-window tiebreak, and retention must not promote it to a
                         // cross-window ordering guarantee -- an ordinary absolute gauge in the
@@ -461,14 +481,9 @@ impl Aggregator {
                         // retention existed -- zero-cost for `Distribution` (the sketch's backing
                         // `Vec`s move rather than being cloned).
                         let kind = state.accumulator.into_kind();
-                        events.push((
-                            Event::metric(
-                                now,
-                                key.attributes,
-                                MetricRecord { name: key.name, kind, unit: key.unit },
-                            ),
-                            links,
-                        ));
+                        let mut record = MetricRecord::new(key.name, kind);
+                        record.unit = key.unit;
+                        events.push((Event::metric(now, key.attributes, record), links));
                     }
                 } else {
                     // A previously-retained, still-idle gauge series (only reachable when
@@ -580,9 +595,14 @@ impl Transform for Aggregator {
 }
 
 impl Accumulator {
+    /// Kept in sync with `process`'s pass-through `matches!` *deliberately* -- see that
+    /// `matches!`'s own doc comment. A kind reaching this function that `matches!` should have
+    /// already filtered out is a runtime panic here, not a compile error.
     fn new_for(kind: &MetricKind) -> Self {
         match kind {
-            MetricKind::Counter(_) => Accumulator::Counter(0.0),
+            MetricKind::Sum(Sum { temporality: Temporality::Delta, monotonic, .. }) => {
+                Accumulator::Sum { total: 0.0, monotonic: *monotonic }
+            }
             // `Gauge` and `GaugeDelta` share one accumulator -- they're not a kind conflict, just
             // two different ways to update the same running value (`docs/adr/
             // relative-gauge-adjustments.md`). This makes `new_for` non-injective on
@@ -593,7 +613,13 @@ impl Accumulator {
                 Accumulator::Gauge { value: 0.0, at: i64::MIN }
             }
             MetricKind::Distribution(_) => Accumulator::Distribution(logit_core::DdSketch::new()),
-            MetricKind::Set(_) | MetricKind::Histogram { .. } | MetricKind::Summary { .. } => {
+            MetricKind::Sum(Sum { temporality: Temporality::Cumulative, .. })
+            | MetricKind::Samples(_)
+            | MetricKind::SetMembers(_)
+            | MetricKind::Set(_)
+            | MetricKind::Histogram(_)
+            | MetricKind::ExponentialHistogram(_)
+            | MetricKind::Summary(_) => {
                 unreachable!("process() never creates an accumulator for a pass-through kind")
             }
         }
@@ -601,7 +627,9 @@ impl Accumulator {
 
     fn into_kind(self) -> MetricKind {
         match self {
-            Accumulator::Counter(sum) => MetricKind::Counter(sum),
+            Accumulator::Sum { total, monotonic } => {
+                MetricKind::Sum(Sum { value: total, temporality: Temporality::Delta, monotonic })
+            }
             Accumulator::Gauge { value, .. } => MetricKind::Gauge(value),
             Accumulator::Distribution(sketch) => MetricKind::Distribution(sketch),
         }
@@ -728,11 +756,7 @@ mod tests {
     use logit_core::interner::intern;
 
     fn metric_event(name: &str, kind: MetricKind, timestamp: i64) -> Event {
-        Event::metric(
-            timestamp,
-            AttrMap::new(),
-            MetricRecord { name: intern(name), kind, unit: None },
-        )
+        Event::metric(timestamp, AttrMap::new(), MetricRecord::new(intern(name), kind))
     }
 
     fn metric_event_with_tags(
@@ -776,8 +800,8 @@ mod tests {
 
     fn counter_value(kind: &MetricKind) -> f64 {
         match kind {
-            MetricKind::Counter(v) => *v,
-            other => panic!("expected Counter, got {other:?}"),
+            MetricKind::Sum(sum) => sum.value,
+            other => panic!("expected Sum, got {other:?}"),
         }
     }
 
@@ -786,13 +810,13 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
         assert!(agg
-            .process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0))
+            .process(&resource, metric_event("hits", MetricKind::counter(1.0), 0))
             .is_none());
         assert!(agg
-            .process(&resource, metric_event("hits", MetricKind::Counter(2.0), 1))
+            .process(&resource, metric_event("hits", MetricKind::counter(2.0), 1))
             .is_none());
         assert!(agg
-            .process(&resource, metric_event("hits", MetricKind::Counter(3.0), 2))
+            .process(&resource, metric_event("hits", MetricKind::counter(3.0), 2))
             .is_none());
 
         let flushed = flush_events(&mut agg, 100);
@@ -847,7 +871,7 @@ mod tests {
     fn a_second_flush_after_the_first_emits_nothing() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
 
         assert_eq!(agg.flush(100).len(), 1, "first flush should emit the window");
         assert!(agg.flush(200).is_empty(), "tumbling: state resets, second flush is empty");
@@ -865,6 +889,9 @@ mod tests {
                 severity: None,
                 body_format: logit_core::BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let passed = agg.process(&resource, log);
@@ -872,14 +899,45 @@ mod tests {
         assert!(agg.flush(100).is_empty(), "nothing should have been accumulated");
     }
 
+    /// Every kind with no defined merge rule (`process`'s pass-through `matches!`) survives
+    /// `process` untouched -- a cumulative `Sum` included, since only a *delta* `Sum` merges.
     #[test]
     fn set_histogram_and_summary_pass_through_untouched() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
         for kind in [
+            MetricKind::Sum(Sum {
+                value: 1.0,
+                temporality: Temporality::Cumulative,
+                monotonic: true,
+            }),
+            MetricKind::Samples(logit_core::Samples::new([1.0, 2.0])),
+            MetricKind::SetMembers(vec![bytes::Bytes::from_static(b"member")]),
             MetricKind::Set(logit_core::HyperLogLog::default()),
-            MetricKind::Histogram { buckets: vec![(10.0, 1)] },
-            MetricKind::Summary { quantiles: vec![(0.5, 1.0)] },
+            MetricKind::Histogram(logit_core::Histogram {
+                buckets: vec![(10.0, 1)],
+                temporality: Temporality::Cumulative,
+                sum: None,
+                min: None,
+                max: None,
+            }),
+            MetricKind::ExponentialHistogram(logit_core::ExpHistogram {
+                scale: 0,
+                zero_count: 0,
+                zero_threshold: 0.0,
+                positive: (0, vec![1]),
+                negative: (0, vec![]),
+                temporality: Temporality::Cumulative,
+                count: 1,
+                sum: None,
+                min: None,
+                max: None,
+            }),
+            MetricKind::Summary(logit_core::Summary {
+                quantiles: vec![(0.5, 1.0)],
+                count: 1,
+                sum: 1.0,
+            }),
         ] {
             let event = metric_event("m", kind, 0);
             assert!(
@@ -888,6 +946,85 @@ mod tests {
             );
         }
         assert!(agg.flush(100).is_empty());
+    }
+
+    /// The other half of `set_histogram_and_summary_pass_through_untouched`'s coverage: a
+    /// cumulative `Sum` must not merge into an already-accumulating *delta* `Sum` series either --
+    /// it's a kind conflict from that series' point of view, same as `Gauge` vs. a delta `Sum`
+    /// always has been. Pins the plan's explicit `(Sum{Delta}, Sum{Delta})` merges /
+    /// `(Sum{Delta}, Sum{Cumulative})` doesn't distinction.
+    #[test]
+    fn a_cumulative_sum_never_merges_into_an_existing_delta_sum_series() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        assert!(agg.process(&resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
+
+        let cumulative = metric_event(
+            "m",
+            MetricKind::Sum(Sum {
+                value: 5.0,
+                temporality: Temporality::Cumulative,
+                monotonic: true,
+            }),
+            0,
+        );
+        let passed = agg.process(&resource, cumulative);
+        assert!(
+            passed.is_some(),
+            "a cumulative sum must pass through untouched, never merge with a delta series"
+        );
+        assert!(matches!(
+            passed.unwrap().metrics[0].kind,
+            MetricKind::Sum(Sum { temporality: Temporality::Cumulative, .. })
+        ));
+
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
+        assert_eq!(counter_value(kind_of(&events[0])), 1.0, "the delta series should be untouched");
+    }
+
+    /// The accumulator carries the *first* record's `monotonic` flag, not the last -- a later
+    /// merge into the same series doesn't overwrite it, even though a well-behaved producer would
+    /// never send mismatched flags under one series identity.
+    #[test]
+    fn sum_merge_carries_the_first_records_monotonic_flag() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        agg.process(
+            &resource,
+            metric_event(
+                "m",
+                MetricKind::Sum(Sum {
+                    value: 1.0,
+                    temporality: Temporality::Delta,
+                    monotonic: false,
+                }),
+                0,
+            ),
+        );
+        agg.process(
+            &resource,
+            metric_event(
+                "m",
+                MetricKind::Sum(Sum {
+                    value: 2.0,
+                    temporality: Temporality::Delta,
+                    monotonic: true,
+                }),
+                0,
+            ),
+        );
+
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
+        match kind_of(&events[0]) {
+            MetricKind::Sum(sum) => {
+                assert_eq!(sum.value, 3.0);
+                assert_eq!(sum.temporality, Temporality::Delta);
+                assert!(!sum.monotonic, "should carry the first record's monotonic flag (false)");
+            }
+            other => panic!("expected Sum, got {other:?}"),
+        }
     }
 
     /// Guards `process`'s pass-through `matches!` directly, not just by implication
@@ -928,11 +1065,11 @@ mod tests {
         let drained = registry.drain(0);
         let unseeded = drained.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Counter(v)
+                MetricKind::Sum(sum)
                     if logit_core::interner::resolve(m.name)
                         == "logit.transform.gauge.delta.unseeded" =>
                 {
-                    Some(*v)
+                    Some(sum.value)
                 }
                 _ => None,
             })
@@ -1017,7 +1154,7 @@ mod tests {
     fn gauge_delta_against_a_counter_series_is_a_kind_conflict_and_is_forwarded() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        assert!(agg.process(&resource, metric_event("m", MetricKind::Counter(1.0), 0)).is_none());
+        assert!(agg.process(&resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
 
         let conflicting = metric_event("m", MetricKind::GaugeDelta(5.0), 0);
         let passed = agg.process(&resource, conflicting);
@@ -1053,11 +1190,11 @@ mod tests {
         let resource = default_resource();
         agg.process(
             &resource,
-            metric_event_with_tags("hits", MetricKind::Counter(1.0), 0, &[("host", "a")]),
+            metric_event_with_tags("hits", MetricKind::counter(1.0), 0, &[("host", "a")]),
         );
         agg.process(
             &resource,
-            metric_event_with_tags("hits", MetricKind::Counter(1.0), 0, &[("host", "b")]),
+            metric_event_with_tags("hits", MetricKind::counter(1.0), 0, &[("host", "b")]),
         );
 
         let flushed = flush_events(&mut agg, 100);
@@ -1073,7 +1210,7 @@ mod tests {
             &resource,
             metric_event_with_tags(
                 "hits",
-                MetricKind::Counter(1.0),
+                MetricKind::counter(1.0),
                 0,
                 &[("host", "a"), ("env", "prod")],
             ),
@@ -1082,7 +1219,7 @@ mod tests {
             &resource,
             metric_event_with_tags(
                 "hits",
-                MetricKind::Counter(1.0),
+                MetricKind::counter(1.0),
                 0,
                 &[("env", "prod"), ("host", "a")],
             ),
@@ -1102,8 +1239,8 @@ mod tests {
         let mut resource_b = Resource::default();
         resource_b.attributes.insert("host", "b");
 
-        agg.process(&Arc::new(resource_a), metric_event("hits", MetricKind::Counter(1.0), 0));
-        agg.process(&Arc::new(resource_b), metric_event("hits", MetricKind::Counter(1.0), 0));
+        agg.process(&Arc::new(resource_a), metric_event("hits", MetricKind::counter(1.0), 0));
+        agg.process(&Arc::new(resource_b), metric_event("hits", MetricKind::counter(1.0), 0));
 
         let flushed = agg.flush(100);
         assert_eq!(flushed.len(), 2, "distinct resources should produce distinct batches");
@@ -1113,9 +1250,9 @@ mod tests {
     fn nan_attribute_value_keys_stably_across_events() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        let mut e1 = metric_event("hits", MetricKind::Counter(1.0), 0);
+        let mut e1 = metric_event("hits", MetricKind::counter(1.0), 0);
         e1.attributes.insert("score", f64::NAN);
-        let mut e2 = metric_event("hits", MetricKind::Counter(1.0), 0);
+        let mut e2 = metric_event("hits", MetricKind::counter(1.0), 0);
         e2.attributes.insert("score", f64::NAN);
 
         agg.process(&resource, e1);
@@ -1135,7 +1272,7 @@ mod tests {
         // or silently corrupt the counter accumulator already in progress.
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        assert!(agg.process(&resource, metric_event("m", MetricKind::Counter(1.0), 0)).is_none());
+        assert!(agg.process(&resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
         let conflicting = metric_event("m", MetricKind::Gauge(5.0), 0);
         let passed = agg.process(&resource, conflicting);
         assert!(passed.is_some(), "the conflicting event should be forwarded, not absorbed");
@@ -1162,13 +1299,12 @@ mod tests {
                 severity: None,
                 body_format: logit_core::BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
-        event.metrics.push(MetricRecord {
-            name: intern("hits"),
-            kind: MetricKind::Counter(1.0),
-            unit: None,
-        });
+        event.metrics.push(MetricRecord::new(intern("hits"), MetricKind::counter(1.0)));
 
         let passed = agg.process(&resource, event).expect("the log half should be forwarded");
         assert!(passed.metrics.is_empty(), "the counter should have been absorbed");
@@ -1187,17 +1323,22 @@ mod tests {
     fn a_mixed_metric_event_absorbs_the_mergeable_ones_and_keeps_the_rest() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        let mut event = metric_event("hits", MetricKind::Counter(1.0), 0);
-        event.metrics.push(MetricRecord {
-            name: intern("sizes"),
-            kind: MetricKind::Histogram { buckets: vec![(10.0, 1)] },
-            unit: None,
-        });
+        let mut event = metric_event("hits", MetricKind::counter(1.0), 0);
+        event.metrics.push(MetricRecord::new(
+            intern("sizes"),
+            MetricKind::Histogram(logit_core::Histogram {
+                buckets: vec![(10.0, 1)],
+                temporality: Temporality::Cumulative,
+                sum: None,
+                min: None,
+                max: None,
+            }),
+        ));
 
         let passed =
             agg.process(&resource, event).expect("the histogram should survive as the remainder");
         assert_eq!(passed.metrics.len(), 1, "only the unmergeable histogram should remain");
-        assert!(matches!(passed.metrics[0].kind, MetricKind::Histogram { .. }));
+        assert!(matches!(passed.metrics[0].kind, MetricKind::Histogram(_)));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -1209,12 +1350,8 @@ mod tests {
     fn a_metric_only_event_fully_absorbed_returns_none() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        let mut event = metric_event("a", MetricKind::Counter(1.0), 0);
-        event.metrics.push(MetricRecord {
-            name: intern("b"),
-            kind: MetricKind::Counter(2.0),
-            unit: None,
-        });
+        let mut event = metric_event("a", MetricKind::counter(1.0), 0);
+        event.metrics.push(MetricRecord::new(intern("b"), MetricKind::counter(2.0)));
 
         assert!(
             agg.process(&resource, event).is_none(),
@@ -1226,12 +1363,8 @@ mod tests {
     fn two_metrics_of_the_same_series_on_one_event_sum_into_one_flushed_series() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        let mut event = metric_event("hits", MetricKind::Counter(1.0), 0);
-        event.metrics.push(MetricRecord {
-            name: intern("hits"),
-            kind: MetricKind::Counter(2.0),
-            unit: None,
-        });
+        let mut event = metric_event("hits", MetricKind::counter(1.0), 0);
+        event.metrics.push(MetricRecord::new(intern("hits"), MetricKind::counter(2.0)));
 
         assert!(agg.process(&resource, event).is_none());
 
@@ -1245,14 +1378,10 @@ mod tests {
     fn a_kind_conflict_leaves_only_the_conflicting_metric_on_the_event() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        assert!(agg.process(&resource, metric_event("m", MetricKind::Counter(1.0), 0)).is_none());
+        assert!(agg.process(&resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
 
-        let mut event = metric_event("m", MetricKind::Counter(1.0), 0);
-        event.metrics.push(MetricRecord {
-            name: intern("m"),
-            kind: MetricKind::Gauge(5.0),
-            unit: None,
-        });
+        let mut event = metric_event("m", MetricKind::counter(1.0), 0);
+        event.metrics.push(MetricRecord::new(intern("m"), MetricKind::Gauge(5.0)));
 
         let passed =
             agg.process(&resource, event).expect("the conflicting gauge should be forwarded");
@@ -1274,11 +1403,11 @@ mod tests {
 
         let ctx_a = TraceContext::new_root();
         agg.observe_batch_context(ctx_a);
-        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
 
         let ctx_b = TraceContext::new_root();
         agg.observe_batch_context(ctx_b);
-        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
 
         let flushed = agg.flush(100);
         let (_, events) = &flushed[0];
@@ -1297,8 +1426,8 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
         agg.observe_batch_context(TraceContext::new_root());
-        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
-        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
 
         let flushed = agg.flush(100);
         let (_, events) = &flushed[0];
@@ -1318,7 +1447,7 @@ mod tests {
 
         for _ in 0..9 {
             agg.observe_batch_context(TraceContext::new_root());
-            agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+            agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
         }
 
         let flushed = agg.flush(100);
@@ -1329,10 +1458,10 @@ mod tests {
         let drained = registry.drain(0);
         let dropped = drained.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Counter(v)
+                MetricKind::Sum(sum)
                     if logit_core::interner::resolve(m.name) == "logit.transform.links.dropped" =>
                 {
-                    Some(*v)
+                    Some(sum.value)
                 }
                 _ => None,
             })
@@ -1349,12 +1478,12 @@ mod tests {
         let resource = default_resource();
         let ctx_a = TraceContext::new_root();
         agg.observe_batch_context(ctx_a);
-        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
         agg.flush(100); // first window's links discarded along with its accumulator
 
         let ctx_b = TraceContext::new_root();
         agg.observe_batch_context(ctx_b);
-        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
 
         let flushed = agg.flush(200);
         let (_, events) = &flushed[0];
@@ -1385,8 +1514,8 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_telemetry(telemetry);
         let resource = default_resource();
 
-        agg.process(&resource, metric_event("a", MetricKind::Counter(1.0), 0));
-        agg.process(&resource, metric_event("b", MetricKind::Counter(1.0), 0));
+        agg.process(&resource, metric_event("a", MetricKind::counter(1.0), 0));
+        agg.process(&resource, metric_event("b", MetricKind::counter(1.0), 0));
         agg.flush(100);
 
         let events = registry.drain(0);
@@ -1415,14 +1544,14 @@ mod tests {
 
         let mut resource_a = logit_core::AttrMap::new();
         resource_a.insert("host", "a");
-        let resource_a = Arc::new(Resource { attributes: resource_a });
+        let resource_a = Arc::new(Resource { attributes: resource_a, ..Default::default() });
         let mut resource_b = logit_core::AttrMap::new();
         resource_b.insert("host", "b");
-        let resource_b = Arc::new(Resource { attributes: resource_b });
+        let resource_b = Arc::new(Resource { attributes: resource_b, ..Default::default() });
 
-        agg.process(&resource_a, metric_event("a", MetricKind::Counter(1.0), 0));
-        agg.process(&resource_b, metric_event("b", MetricKind::Counter(1.0), 0));
-        agg.process(&resource_b, metric_event("c", MetricKind::Counter(1.0), 0));
+        agg.process(&resource_a, metric_event("a", MetricKind::counter(1.0), 0));
+        agg.process(&resource_b, metric_event("b", MetricKind::counter(1.0), 0));
+        agg.process(&resource_b, metric_event("c", MetricKind::counter(1.0), 0));
         agg.flush(100);
 
         let events = registry.drain(0);
@@ -1495,11 +1624,11 @@ mod tests {
         let drained = registry.drain(0);
         let unseeded = drained.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Counter(v)
+                MetricKind::Sum(sum)
                     if logit_core::interner::resolve(m.name)
                         == "logit.transform.gauge.delta.unseeded" =>
                 {
-                    Some(*v)
+                    Some(sum.value)
                 }
                 _ => None,
             })
@@ -1564,7 +1693,7 @@ mod tests {
     fn a_counter_series_does_not_survive_its_window_even_with_gauge_retention_enabled() {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(5, 100);
         let resource = default_resource();
-        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
         assert_eq!(flush_events(&mut agg, 100).len(), 1);
         assert!(
             agg.flush(200).is_empty(),
@@ -1580,7 +1709,7 @@ mod tests {
             .with_gauge_retention(5, 100)
             .with_telemetry(telemetry);
         let resource = default_resource();
-        agg.process(&resource, metric_event("hits", MetricKind::Counter(1.0), 0));
+        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
         agg.flush(100);
         // A second flush's own `resource.groups` sample reflects state as of right before it --
         // i.e. right after the first flush pruned the now-empty counters-only group.
@@ -1614,11 +1743,11 @@ mod tests {
                 return None;
             }
             e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Counter(v)
+                MetricKind::Sum(sum)
                     if logit_core::interner::resolve(m.name)
                         == "logit.transform.series.evicted" =>
                 {
-                    Some(*v)
+                    Some(sum.value)
                 }
                 _ => None,
             })

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-02
+updated: 2026-09-11
 ---
 
 # Relative gauge adjustments (`+`/`-` in statsd)
@@ -136,3 +136,16 @@ rather than the generic `encode_error`) once this lands. See Consequences.
   instance forwards to, is legitimate and not visible to a single config's graph. `logit validate`
   also has no warning channel today, only pass/fail. **Deferred**, not silently skipped — tracked in
   `docs/known-gaps.md`.
+- **The recorded size-growth fallback above did not fire, confirmed on 2026-09-11.** [ADR
+  `metrics-model-v2`](metrics-model-v2.md) added four new `MetricKind` variants (`Sum`, `Samples`,
+  `SetMembers`, `ExponentialHistogram`) in the same PR that reshaped `Counter` into `Sum`, and
+  `MetricKind` still measures exactly 176 bytes (`crates/logit-core/tests/type_sizes.rs`) —
+  `SAMPLES_INLINE`'s sizing (that ADR's own Decision) is what kept the envelope from growing, the
+  same way `GaugeDelta`'s single `f64` payload fit into the discriminant's existing slack here.
+  `GaugeDelta` itself survives unchanged, still its own variant, not folded into `Gauge { value,
+  relative: bool }` — the fallback this record's Decision section named was never triggered, so it
+  was never taken either. The "four exhaustive matches" list in the Decision section above is
+  superseded by `metrics-model-v2`'s own accounting of every exhaustive `MetricKind` match in the
+  codebase, now six call sites, not four: `event::metric_record_heap_bytes`, `native/record.rs`,
+  `otlp/metrics.rs`, `outputs/{influxdb,stdio,statsd}.rs`, `transforms/aggregate.rs`, and
+  `bench/bakeoff/wire_mirror.rs`.

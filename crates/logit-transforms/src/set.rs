@@ -70,7 +70,14 @@ impl Transform for Set {
         for (key, value) in &self.resource_pairs {
             attrs.insert_sym(*key, value.clone());
         }
-        let out = Arc::new(Resource { attributes: attrs });
+        // `dropped_attributes_count`/`schema_url` aren't configurable through `set` -- carry them
+        // over from the input resource explicitly rather than defaulting them, so rebuilding the
+        // resource here doesn't silently discard what it already reported.
+        let out = Arc::new(Resource {
+            attributes: attrs,
+            dropped_attributes_count: resource.dropped_attributes_count,
+            schema_url: resource.schema_url.clone(),
+        });
         self.telemetry.count("logit.transform.set.resource.rebuilt", 1.0, &[]);
         self.cache = Some((resource.clone(), out.clone()));
         Some(out)
@@ -91,6 +98,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         )
     }
@@ -100,7 +110,7 @@ mod tests {
         for (k, v) in pairs {
             attrs.insert(k, Value::str(*v));
         }
-        Arc::new(Resource { attributes: attrs })
+        Arc::new(Resource { attributes: attrs, ..Default::default() })
     }
 
     #[test]
@@ -189,11 +199,11 @@ mod tests {
         let events = registry.drain(0);
         let rebuilt = events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
-                logit_core::MetricKind::Counter(v)
+                logit_core::MetricKind::Sum(sum)
                     if logit_core::interner::resolve(m.name)
                         == "logit.transform.set.resource.rebuilt" =>
                 {
-                    Some(*v)
+                    Some(sum.value)
                 }
                 _ => None,
             })

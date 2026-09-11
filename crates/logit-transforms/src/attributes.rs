@@ -200,13 +200,14 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
-        event.metrics.push(MetricRecord {
-            name: logit_core::interner::intern("m"),
-            kind: MetricKind::Counter(1.0),
-            unit: None,
-        });
+        event
+            .metrics
+            .push(MetricRecord::new(logit_core::interner::intern("m"), MetricKind::counter(1.0)));
         event
     }
 
@@ -215,7 +216,7 @@ mod tests {
         for (k, v) in attrs {
             map.insert(k, v.clone());
         }
-        Arc::new(Resource { attributes: map })
+        Arc::new(Resource { attributes: map, ..Default::default() })
     }
 
     fn default_resource() -> Arc<Resource> {
@@ -225,7 +226,9 @@ mod tests {
     fn counter_value(events: &[Event], name: &str) -> Option<f64> {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Counter(v) if logit_core::interner::resolve(m.name) == name => Some(*v),
+                MetricKind::Sum(sum) if logit_core::interner::resolve(m.name) == name => {
+                    Some(sum.value)
+                }
                 _ => None,
             })
         })

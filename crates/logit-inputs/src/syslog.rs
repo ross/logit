@@ -79,7 +79,7 @@ use crate::Input;
 use bytes::Bytes;
 use logit_core::time::{parse_rfc3339_to_nanos, TimestampError};
 use logit_core::{
-    AttrMap, BodyFormat, Diagnostics, Event, LogRecord, Resource, Severity, Telemetry, Value,
+    AttrMap, BodyFormat, Diagnostics, Event, LogRecord, Resource, Scope, Severity, Telemetry, Value,
 };
 use logit_pipeline::Fanout;
 use logit_proto::{CodecError, Decoder};
@@ -185,7 +185,7 @@ impl Decoder for SyslogDecoder {
         bytes: Bytes,
         received_at: i64,
         out: &mut Vec<Event>,
-    ) -> Result<Arc<Resource>, CodecError> {
+    ) -> Result<(Arc<Resource>, Option<Arc<Scope>>), CodecError> {
         // Per line, not per datagram -- exactly `StatsdDecoder::decode_into`'s precedent. nginx's
         // `escape=json` guarantees no raw newline inside an access-log body, so this split is
         // safe for the target workload. Splitting happens on the raw bytes, before any UTF-8
@@ -222,7 +222,8 @@ impl Decoder for SyslogDecoder {
                 None => break,
             }
         }
-        Ok(self.resource.clone())
+        // syslog datagrams carry no OTLP instrumentation-scope concept -- `None`, always.
+        Ok((self.resource.clone(), None))
     }
 }
 
@@ -502,7 +503,15 @@ fn parse_3164(
     Event::log(
         recv_ts,
         attrs,
-        LogRecord { message, severity: Some(severity), body_format: BodyFormat::Raw, trace: None },
+        LogRecord {
+            message,
+            severity: Some(severity),
+            body_format: BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        },
     )
 }
 
@@ -643,7 +652,15 @@ fn parse_5424(
     Ok(Event::log(
         recv_ts,
         attrs,
-        LogRecord { message, severity: Some(severity), body_format: BodyFormat::Raw, trace: None },
+        LogRecord {
+            message,
+            severity: Some(severity),
+            body_format: BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        },
     ))
 }
 

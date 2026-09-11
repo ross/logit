@@ -293,7 +293,7 @@ impl Decoder for NativeDecoder {
         bytes: Bytes,
         _received_at: i64,
         out: &mut Vec<Event>,
-    ) -> Result<Arc<Resource>, CodecError> {
+    ) -> Result<(Arc<Resource>, Option<Arc<logit_core::Scope>>), CodecError> {
         let mut bytes = bytes;
         let (codec, mut payload) = read_frame(&mut bytes)?;
         if codec != CODEC_NATIVE_V1 {
@@ -303,7 +303,7 @@ impl Decoder for NativeDecoder {
         }
         let batch = decode_batch(&mut payload)?;
         out.extend(batch.events);
-        Ok(batch.resource)
+        Ok((batch.resource, batch.scope))
     }
 }
 
@@ -392,9 +392,10 @@ mod tests {
 
         let mut decoder = NativeDecoder;
         let mut events = Vec::new();
-        let resource = decoder.decode_into(framed, 999, &mut events).unwrap();
+        let (resource, scope) = decoder.decode_into(framed, 999, &mut events).unwrap();
 
         assert_eq!(resource.attributes, batch.resource.attributes);
+        assert!(scope.is_none());
         assert_eq!(events.len(), 3);
         // The whole point of this decoder: original timestamps survive, `received_at` (999) never
         // overwrites them.
@@ -411,7 +412,7 @@ mod tests {
 
         let mut decoder = NativeDecoder;
         let mut events = Vec::new();
-        let resource = decoder.decode_into(framed, 0, &mut events).unwrap();
+        let (resource, _scope) = decoder.decode_into(framed, 0, &mut events).unwrap();
         assert_eq!(resource.attributes, batch.resource.attributes);
         assert_eq!(events.len(), 3);
     }
@@ -450,6 +451,31 @@ mod tests {
         let payload = encode_batch(&batch);
         let decoded = decode_batch(&mut payload.clone()).unwrap();
         assert_eq!(decoded.scope.as_deref(), Some(&*scope));
+    }
+
+    /// The `Decoder`/`Encoder` trait seam, not the free `encode_batch`/`decode_batch` functions
+    /// directly: `NativeDecoder::decode_into` returns `(Arc<Resource>, Option<Arc<Scope>>)`
+    /// specifically so `Decoder::decode`'s default body can carry the scope through into the
+    /// `EventBatch` it builds, rather than hardcoding `scope: None` the way it did before this
+    /// field existed on the trait. `assert_eq!` on the whole batch (not just its scope) is the
+    /// point -- proves nothing else about the round trip regressed either.
+    #[test]
+    fn a_batch_with_a_scope_round_trips_through_the_decoder_trait() {
+        let scope = std::sync::Arc::new(logit_core::Scope {
+            name: bytes::Bytes::from_static(b"trait_test_scope"),
+            version: bytes::Bytes::from_static(b"2.0.0"),
+            ..Default::default()
+        });
+        let mut batch = sample_batch();
+        batch.scope = Some(scope);
+
+        let mut encoder = NativeEncoder::default();
+        let framed = encoder.encode(&batch).unwrap();
+
+        let mut decoder = NativeDecoder;
+        let decoded = decoder.decode(framed).unwrap();
+
+        assert_eq!(decoded, batch);
     }
 
     #[test]

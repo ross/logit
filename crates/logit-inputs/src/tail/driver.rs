@@ -533,8 +533,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             self.telemetry.count("logit.input.line.bytes", line.len() as f64, &[]);
             match tracked.decoder.decode_line(line, read_at, &mut scratch) {
                 Ok(resource) => {
+                    // No scope: tail/docker line decoders carry no OTLP instrumentation-scope
+                    // concept, same as every other batch this input synthesizes from nothing.
                     if let Some((batch, reason)) =
-                        tracked.accumulator.absorb(resource, &mut scratch)
+                        tracked.accumulator.absorb(resource, None, &mut scratch)
                     {
                         emit(sink, &self.telemetry, batch, reason).await;
                     }
@@ -643,7 +645,9 @@ async fn close_decoder<D: TailDecoder>(
         let partial = ensure_utf8(partial, diag);
         match tracked.decoder.decode_line(partial, now_nanos(), &mut scratch) {
             Ok(resource) => {
-                if let Some((batch, reason)) = tracked.accumulator.absorb(resource, &mut scratch) {
+                if let Some((batch, reason)) =
+                    tracked.accumulator.absorb(resource, None, &mut scratch)
+                {
                     emit(sink, telemetry, batch, reason).await;
                 }
             }
@@ -657,7 +661,7 @@ async fn close_decoder<D: TailDecoder>(
     tracked.decoder.close(&mut scratch);
     if !scratch.is_empty() {
         let resource = tracked.decoder.resource();
-        if let Some((batch, reason)) = tracked.accumulator.absorb(resource, &mut scratch) {
+        if let Some((batch, reason)) = tracked.accumulator.absorb(resource, None, &mut scratch) {
             emit(sink, telemetry, batch, reason).await;
         }
     }

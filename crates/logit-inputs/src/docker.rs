@@ -114,7 +114,7 @@ impl ContainerMeta {
                 attrs.insert(&format!("container.label.{key}"), value.as_str());
             }
         }
-        Arc::new(Resource { attributes: attrs })
+        Arc::new(Resource { attributes: attrs, ..Default::default() })
     }
 }
 
@@ -205,6 +205,9 @@ impl DockerDecoder {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         ));
     }
@@ -356,7 +359,7 @@ impl DecoderFactory<DockerDecoder> for DockerDecoderFactory {
                 let id = container_dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
                 let mut attrs = AttrMap::new();
                 attrs.insert("container.id", id);
-                Arc::new(Resource { attributes: attrs })
+                Arc::new(Resource { attributes: attrs, ..Default::default() })
             }
         };
         Ok(DockerDecoder::new(resource, self.max_line_bytes).with_diagnostics(self.diag.clone()))

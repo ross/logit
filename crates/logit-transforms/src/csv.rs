@@ -289,6 +289,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         )
     }
@@ -302,6 +305,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         )
     }
@@ -603,11 +609,7 @@ mod tests {
         let event = Event::metric(
             0,
             AttrMap::new(),
-            MetricRecord {
-                name: logit_core::interner::intern("m"),
-                kind: MetricKind::Counter(1.0),
-                unit: None,
-            },
+            MetricRecord::new(logit_core::interner::intern("m"), MetricKind::counter(1.0)),
         );
         let event = csv.process(&resource, event).expect("metric-only events pass through");
         assert!(event.attributes.is_empty());
@@ -630,6 +632,8 @@ mod tests {
                 events: Vec::<SpanEvent>::new(),
                 links: Vec::new(),
                 end_timestamp: 0,
+                flags: 0,
+                ext: None,
             },
         );
         let event = csv.process(&resource, event).expect("span-only events pass through");
@@ -641,11 +645,9 @@ mod tests {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
         let mut event = log_event("1,2");
-        event.metrics.push(MetricRecord {
-            name: logit_core::interner::intern("m"),
-            kind: MetricKind::Counter(1.0),
-            unit: None,
-        });
+        event
+            .metrics
+            .push(MetricRecord::new(logit_core::interner::intern("m"), MetricKind::counter(1.0)));
         let event = csv.process(&resource, event).expect("mixed events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(event.metrics.len(), 1, "the metric should ride through unaffected");
@@ -663,6 +665,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let event = csv.process(&resource, event).expect("always forwards");

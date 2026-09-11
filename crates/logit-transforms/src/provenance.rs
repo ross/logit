@@ -158,6 +158,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         )
     }
@@ -173,10 +176,10 @@ mod tests {
     fn counter_value(events: &[Event], name: &str) -> Option<f64> {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
-                logit_core::MetricKind::Counter(v)
+                logit_core::MetricKind::Sum(sum)
                     if logit_core::interner::resolve(m.name) == name =>
                 {
-                    Some(*v)
+                    Some(sum.value)
                 }
                 _ => None,
             })
@@ -265,6 +268,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         let out = has.process(&default_resource(), ev).expect("matches");
@@ -366,6 +372,9 @@ mod tests {
                     severity: None,
                     body_format: BodyFormat::Raw,
                     trace: None,
+                    event_name: None,
+                    observed_timestamp: 0,
+                    dropped_attributes_count: 0,
                 },
             )
         }
@@ -451,10 +460,16 @@ mod tests {
             graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (result_tx, result_rx) = std::sync::mpsc::channel();
-        let web_batch =
-            EventBatch { resource: default_resource(), events: vec![tagged_event("web")] };
-        let api_batch =
-            EventBatch { resource: default_resource(), events: vec![tagged_event("api")] };
+        let web_batch = EventBatch {
+            resource: default_resource(),
+            scope: None,
+            events: vec![tagged_event("web")],
+        };
+        let api_batch = EventBatch {
+            resource: default_resource(),
+            scope: None,
+            events: vec![tagged_event("api")],
+        };
 
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(

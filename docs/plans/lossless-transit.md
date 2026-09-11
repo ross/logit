@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-10
+updated: 2026-09-11
 ---
 
 # Closing plan: lossless like-protocol transit
@@ -242,6 +242,22 @@ own variant rather than always materializing explicit buckets on decode, specifi
 `otlp_in -> otlp_out` is a fixed point for this type — `aggregate` may still choose to convert one to
 `Distribution` when summarizing.
 
+**W1 outcome (measured, not estimated — [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)):**
+every shape above landed as designed, confirmed against `crates/logit-core/tests/type_sizes.rs`
+rather than left at the estimates above. `MetricKind` held exactly at 176 bytes, but only once
+`SAMPLES_INLINE` was picked correctly: `size_of::<DdSketch>()` measures 176 (confirming the
+assumption this target model was written against), and `Samples` had to be sized to fit *under*
+that footprint rather than at it — `SAMPLES_INLINE = 20` (a `Samples` at exactly 176 bytes too)
+forces a real discriminant on top and pushes `MetricKind` to 184; `SAMPLES_INLINE = 19` leaves
+`size_of::<Samples>() == 168`, just enough slack for the discriminant to land inside the existing
+envelope. `MetricRecord` measured exactly 224 (`MetricList` 232); `LogRecord` grew 72 → 88;
+`SpanRecord` grew 136 → 144. `Event` landed at 864 — 8 bytes over this plan's pre-implementation
+"~856" estimate, and the actual sum of the measured per-field deltas (`+16` `LogRecord`, `+40`
+`MetricList`, `+8` `SpanRecord`, over the 800-byte baseline) accounts for the full 64-byte growth
+exactly; ~856 was simply an approximation made before any of the four record types had been
+implemented and measured. See [`docs/design/memory.md`](../design/memory.md) §1 for the full,
+current term-by-term breakdown.
+
 ### Attribute conventions (additions to `docs/design/data-model.md`'s well-known attribute table)
 
 - `otel.severity_number` (`Value::I64`, 1-24), `otel.severity_text` (`Value::Str`): stamped by
@@ -338,10 +354,10 @@ metric-kind fields, not just presence.
 | # | Work | Size | Depends on |
 |---|---|---|---|
 | W0 | This PR: ADR, survey, and this plan | S | — |
-| W1 | Core model reshape (every type in "Target model" above), `PartialEq` derives, `type_sizes.rs` + `memory.md` §1, `estimated_heap_bytes`, and every exhaustive match site updated (`event.rs`, `outputs/{influxdb,stdio,statsd}.rs`, `proto/native/record.rs`, `proto/otlp/metrics.rs`, `transforms/aggregate.rs`, `bench/bakeoff/wire_mirror.rs`) — plus the native codec reshape in the same PR, since `record.rs` can't compile against the old model otherwise. New ADR `metrics-model-v2` (single `Sum`, raw-vs-sketch pairs for `Samples`/`SetMembers`, the `ExponentialHistogram` variant, boxed `SpanExt`, batch-level `Scope`); amends `relative-gauge-adjustments` (its recorded size-growth fallback is not triggered — `MetricKind` stays 176) | L | W0 |
+| W1 | **Landed (this PR).** Core model reshape (every type in "Target model" above), `PartialEq` derives, `type_sizes.rs` + `memory.md` §1, `estimated_heap_bytes`, and every exhaustive match site updated (`event.rs`, `outputs/{influxdb,stdio,statsd}.rs`, `proto/native/record.rs`, `proto/otlp/metrics.rs`, `transforms/aggregate.rs`, `bench/bakeoff/wire_mirror.rs`) — plus the native codec reshape in the same PR, since `record.rs` can't compile against the old model otherwise. New ADR `metrics-model-v2` (single `Sum`, raw-vs-sketch pairs for `Samples`/`SetMembers`, the `ExponentialHistogram` variant, boxed `SpanExt`, batch-level `Scope`); amends `relative-gauge-adjustments` (its recorded size-growth fallback is not triggered — `MetricKind` stays 176) | L | W0 |
 | W2 | `aggregate`: `Samples` sketching moved out of decode, `distributions: sketch \| samples` config, `SetMembers` union plus a real `HyperLogLog`, cumulative-kind pass-through; amends `aggregation-window-semantics` | M | W1 |
 | W3 | statsd pair: `Samples`/`SetMembers` in and out, `|c:`, `|T`, sample-rate retention on timers, `statsd_round_trip.rs`, updated `allocations.rs` cases; amends `statsd-output` (v1 deferral narrowed to post-sketch kinds; "no sample rate/timestamp" reversed) | M | W1, W2 |
-| W4 | OTLP pair: `Sum`/temporality/monotonic, start_time, description, exemplars, histogram/summary extras, `ExponentialHistogram`, `NO_RECORDED_VALUE` round-tripped as a flagged point, batch-level scope grouping + `schema_url`, `event_name`, `observed_timestamp`, dropped-attribute counts, span fields, `otel.severity_*`; `otlp_round_trip.rs` rewritten to per-field assertions | L | W1 |
+| W4 | OTLP pair: start_time, description, exemplars, `NO_RECORDED_VALUE` round-tripped as a flagged point, batch-level scope grouping + `schema_url`, `event_name`, `observed_timestamp`, dropped-attribute counts, span fields, `otel.severity_*`; `otlp_round_trip.rs` rewritten to per-field assertions. (`Sum`/temporality/monotonic, `ExponentialHistogram`'s 1:1 mapping, and histogram sum/min/max + summary count/sum were pulled forward into W1 — see its "W1 outcome" note above.) | L | W1 |
 | W5 | syslog pair: structured-data parse and emit, timestamp precedence and the nil case, `Value::Bytes` MSG, `Value::Str` PROCID, opt-in PEN-qualified structured-data element; `syslog_round_trip.rs`; new ADR `syslog-structured-data-convention`; amends `syslog-output` | M | W0 (parallel with W1) |
 | W6 | DogStatsD events and service checks, in and out | S | W3 |
 | W7 | Expose the new fields through the Lua proxy (`docs/design/lua-api.md`) — otherwise the model is lossless but the scripting surface can't see any of it | M | W1 |

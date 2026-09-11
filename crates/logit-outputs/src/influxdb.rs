@@ -7,7 +7,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use logit_core::interner::resolve;
 use logit_core::{
-    Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
+    DdSketch, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
 };
 use logit_pipeline::Fault;
 use logit_proto::{CodecError, Encoder};
@@ -504,13 +504,19 @@ fn allocate_timestamp(
 /// whether anything was written. `false` means every field was unrepresentable, which makes the
 /// whole point unwritable -- an empty field set is invalid line protocol.
 ///
-/// `Counter`/`Gauge` are a single `value` field; `Distribution` writes `count` (as an unsigned
-/// integer -- see [`push_uint`]) plus a few fixed quantiles; `Histogram` maps its buckets onto
-/// fields directly; `Summary` maps its quantiles onto fields keyed by the raw quantile value
-/// rather than a rounded percentage, since rounding isn't collision-free (0.991 and 0.994 would
-/// both round to "p99" and overwrite each other within one line's field set). `Set` has no
-/// encoding yet: it needs a real `HyperLogLog` (`logit_core::metric::HyperLogLog` is still a
-/// stub), so this returns an error rather than inventing a meaningless one.
+/// `Sum`/`Gauge` are a single `value` field -- `Sum` regardless of temporality or monotonicity:
+/// line protocol has no notion of either, so a cumulative or non-monotonic sum still just writes
+/// its current `value`. `Samples` sketches its raw observations into a temporary `DdSketch` (each
+/// value re-weighted by its sample rate via `DdSketch::add_weighted`) and renders exactly like
+/// `Distribution` below -- `count` (as an unsigned integer -- see [`push_uint`]) plus a few fixed
+/// quantiles. `Histogram` maps its buckets onto fields directly; `Summary` maps its quantiles onto
+/// fields keyed by the raw quantile value rather than a rounded percentage, since rounding isn't
+/// collision-free (0.991 and 0.994 would both round to "p99" and overwrite each other within one
+/// line's field set). `Set`/`SetMembers` have no encoding yet: `Set` needs a real `HyperLogLog`
+/// (`logit_core::metric::HyperLogLog` is still a stub) and `SetMembers` is raw, unsummarized data
+/// with nothing to render a scalar field from, so both return an error rather than inventing a
+/// meaningless one -- as does `ExponentialHistogram`, cross-protocol debt line protocol has no
+/// shape for (`docs/plans/lossless-transit.md`).
 ///
 /// **Field names are written unescaped, and that is not a shortcut.** Every name this can produce
 /// is either a literal (`value`, `count`) or built purely out of formatted numbers
@@ -518,30 +524,53 @@ fn allocate_timestamp(
 /// equals, or space -- so the escaping the previous version applied was provably a no-op, and the
 /// output is byte-for-byte what it was. A future field name derived from anything user-supplied
 /// would have to go back through [`push_escaped_tag`].
+/// Shared by `MetricKind::Distribution` and `MetricKind::Samples` (once re-sketched) -- `count` (as
+/// an unsigned integer -- see [`push_uint`]) plus a few fixed quantiles. Unconditional on `count`,
+/// so a rendered sketch always has at least one field.
+fn render_sketch_fields(out: &mut String, sketch: &DdSketch) {
+    out.push_str("count=");
+    push_uint(out, sketch.count() as u64);
+    for q in [0.5, 0.9, 0.99] {
+        if let Some(v) = sketch.quantile(q).filter(|v| v.is_finite()) {
+            let percentile = (q * 100.0).round() as u32;
+            let _ = write!(out, ",p{percentile}=");
+            push_float(out, v);
+        }
+    }
+}
+
 fn render_fields(out: &mut String, kind: &MetricKind) -> Result<bool, CodecError> {
     out.clear();
 
     match kind {
-        MetricKind::Counter(v) | MetricKind::Gauge(v) => {
+        MetricKind::Sum(s) => {
+            if s.value.is_finite() {
+                out.push_str("value=");
+                push_float(out, s.value);
+            }
+        }
+        MetricKind::Gauge(v) => {
             if v.is_finite() {
                 out.push_str("value=");
                 push_float(out, *v);
             }
         }
         MetricKind::Distribution(sketch) => {
-            // Unconditional, so a Distribution always has at least one field.
-            out.push_str("count=");
-            push_uint(out, sketch.count() as u64);
-            for q in [0.5, 0.9, 0.99] {
-                if let Some(v) = sketch.quantile(q).filter(|v| v.is_finite()) {
-                    let percentile = (q * 100.0).round() as u32;
-                    let _ = write!(out, ",p{percentile}=");
-                    push_float(out, v);
-                }
-            }
+            render_sketch_fields(out, sketch);
         }
-        MetricKind::Histogram { buckets } => {
-            for (bound, count) in buckets {
+        MetricKind::Samples(s) => {
+            // Re-sketch the raw observations into a temporary `DdSketch` -- each value re-weighted
+            // by the inverse of its sample rate, the same extrapolation `aggregate` applies when it
+            // builds a real `Distribution` from a run of these -- and render exactly like one.
+            let mut sketch = DdSketch::new();
+            let weight = (1.0 / s.sample_rate).round().clamp(1.0, 1000.0) as u64;
+            for v in &s.values {
+                sketch.add_weighted(*v, weight);
+            }
+            render_sketch_fields(out, &sketch);
+        }
+        MetricKind::Histogram(h) => {
+            for (bound, count) in &h.buckets {
                 if bound.is_finite() {
                     separator(out);
                     let _ = write!(out, "bucket_{bound}=");
@@ -549,8 +578,8 @@ fn render_fields(out: &mut String, kind: &MetricKind) -> Result<bool, CodecError
                 }
             }
         }
-        MetricKind::Summary { quantiles } => {
-            for (q, v) in quantiles {
+        MetricKind::Summary(s) => {
+            for (q, v) in &s.quantiles {
                 if v.is_finite() {
                     separator(out);
                     let _ = write!(out, "q{q}=");
@@ -561,6 +590,16 @@ fn render_fields(out: &mut String, kind: &MetricKind) -> Result<bool, CodecError
         MetricKind::Set(_) => {
             return Err(CodecError::Malformed(
                 "Set metrics have no line-protocol encoding yet".to_string(),
+            ))
+        }
+        MetricKind::SetMembers(_) => {
+            return Err(CodecError::Malformed(
+                "SetMembers metrics have no line-protocol encoding yet".to_string(),
+            ))
+        }
+        MetricKind::ExponentialHistogram(_) => {
+            return Err(CodecError::Malformed(
+                "ExponentialHistogram metrics have no line-protocol encoding yet".to_string(),
             ))
         }
         MetricKind::GaugeDelta(_) => {
@@ -670,11 +709,11 @@ fn push_escaped(out: &mut String, s: &str, needs_escape: &[char]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::{AttrMap, BodyFormat, LogRecord, MetricKind};
+    use logit_core::{AttrMap, BodyFormat, Histogram, LogRecord, MetricKind, Summary};
     use std::sync::Arc;
 
     fn batch_with(events: Vec<Event>) -> EventBatch {
-        EventBatch { resource: Arc::new(Resource::default()), events }
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
     }
 
     fn metric_event(name: &str, kind: MetricKind, attrs: &[(&str, &str)]) -> Event {
@@ -685,7 +724,7 @@ mod tests {
         Event::metric(
             1_700_000_000_000_000_000,
             attributes,
-            MetricRecord { name: logit_core::interner::intern(name), kind, unit: None },
+            MetricRecord::new(logit_core::interner::intern(name), kind),
         )
     }
 
@@ -693,7 +732,7 @@ mod tests {
     /// `allocate_timestamp` regression tests below, all of which care about the exact timestamp
     /// a series of events shares.
     fn counter_event_at(ts: i64, name: &str, v: f64) -> Event {
-        let mut event = metric_event(name, MetricKind::Counter(v), &[]);
+        let mut event = metric_event(name, MetricKind::counter(v), &[]);
         event.timestamp = ts;
         event
     }
@@ -707,7 +746,23 @@ mod tests {
     #[test]
     fn counter_line() {
         let out =
-            encode(vec![metric_event("page.views", MetricKind::Counter(3.0), &[("env", "prod")])]);
+            encode(vec![metric_event("page.views", MetricKind::counter(3.0), &[("env", "prod")])]);
+        assert_eq!(out, "page.views,env=prod value=3 1700000000000000000\n");
+    }
+
+    /// A cumulative (or non-monotonic) `Sum` renders identically to a delta-monotonic one -- line
+    /// protocol has no notion of temporality or monotonicity, only a current `value`.
+    #[test]
+    fn a_cumulative_sum_renders_the_same_as_a_counter() {
+        let out = encode(vec![metric_event(
+            "page.views",
+            MetricKind::Sum(logit_core::Sum {
+                value: 3.0,
+                temporality: logit_core::Temporality::Cumulative,
+                monotonic: false,
+            }),
+            &[("env", "prod")],
+        )]);
         assert_eq!(out, "page.views,env=prod value=3 1700000000000000000\n");
     }
 
@@ -735,7 +790,13 @@ mod tests {
     fn histogram_bucket_counts_are_unsigned_integers() {
         let out = encode(vec![metric_event(
             "resp.size",
-            MetricKind::Histogram { buckets: vec![(100.0, 5), (500.0, 2)] },
+            MetricKind::Histogram(Histogram {
+                buckets: vec![(100.0, 5), (500.0, 2)],
+                temporality: logit_core::Temporality::Cumulative,
+                sum: None,
+                min: None,
+                max: None,
+            }),
             &[],
         )]);
         assert!(out.contains("bucket_100=5u"), "got: {out}");
@@ -748,18 +809,82 @@ mod tests {
         // point of this test is that they must not collapse onto the same field key.
         let out = encode(vec![metric_event(
             "req.latency",
-            MetricKind::Summary { quantiles: vec![(0.991, 10.0), (0.994, 20.0)] },
+            MetricKind::Summary(Summary {
+                quantiles: vec![(0.991, 10.0), (0.994, 20.0)],
+                count: 2,
+                sum: 30.0,
+            }),
             &[],
         )]);
         assert!(out.contains("q0.991=10"), "got: {out}");
         assert!(out.contains("q0.994=20"), "got: {out}");
     }
 
+    /// `Samples` re-sketches its raw observations, at `sample_rate: 1.0` (unweighted), and renders
+    /// exactly like a `Distribution` built from the same values would.
+    #[test]
+    fn samples_renders_like_a_distribution_built_from_the_same_values() {
+        let out = encode(vec![metric_event(
+            "latency",
+            MetricKind::Samples(logit_core::Samples::new([120.0])),
+            &[],
+        )]);
+        assert!(
+            out.starts_with("latency count=1u,"),
+            "count should be an unsigned int field: {out}"
+        );
+        assert!(out.contains("p50="));
+    }
+
+    /// `SetMembers`/`ExponentialHistogram` have no line-protocol encoding yet (cross-protocol
+    /// debt, `docs/plans/lossless-transit.md`) -- `render_fields` returns `Malformed` for them, but
+    /// `encode` logs and skips per-metric errors rather than propagating them (same reasoning as
+    /// `set_metrics_are_skipped_not_fatal` above), so a sibling metric on the same batch still
+    /// comes through.
+    #[test]
+    fn set_members_has_no_line_protocol_encoding_yet() {
+        let out = encode(vec![
+            metric_event(
+                "unique_visitors",
+                MetricKind::SetMembers(vec![bytes::Bytes::from_static(b"a")]),
+                &[],
+            ),
+            metric_event("page.views", MetricKind::counter(1.0), &[]),
+        ]);
+        assert!(!out.contains("unique_visitors"), "got: {out}");
+        assert!(out.contains("page.views value=1"), "got: {out}");
+    }
+
+    #[test]
+    fn exponential_histogram_has_no_line_protocol_encoding_yet() {
+        let out = encode(vec![
+            metric_event(
+                "resp.size",
+                MetricKind::ExponentialHistogram(logit_core::ExpHistogram {
+                    scale: 0,
+                    zero_count: 0,
+                    zero_threshold: 0.0,
+                    positive: (0, vec![]),
+                    negative: (0, vec![]),
+                    temporality: logit_core::Temporality::Cumulative,
+                    count: 0,
+                    sum: None,
+                    min: None,
+                    max: None,
+                }),
+                &[],
+            ),
+            metric_event("page.views", MetricKind::counter(1.0), &[]),
+        ]);
+        assert!(!out.contains("resp.size"), "got: {out}");
+        assert!(out.contains("page.views value=1"), "got: {out}");
+    }
+
     #[test]
     fn tag_values_with_special_characters_are_escaped() {
         let out = encode(vec![metric_event(
             "page.views",
-            MetricKind::Counter(1.0),
+            MetricKind::counter(1.0),
             &[("path", "a,b c=d")],
         )]);
         assert!(out.contains("path=a\\,b\\ c\\=d"), "got: {out}");
@@ -789,7 +914,7 @@ mod tests {
         )
         .expect("script should load");
 
-        let mut event = metric_event("page.views", MetricKind::Counter(1.0), &[]);
+        let mut event = metric_event("page.views", MetricKind::counter(1.0), &[]);
         event.attributes.insert("host", Value::Bytes(Bytes::from_static(b"web-01")));
         let event = match worker.process(event).expect("process should succeed") {
             logit_script::ProcessOutcome::Emit(event) => *event,
@@ -810,11 +935,11 @@ mod tests {
         let mut resource = Resource::default();
         resource.attributes.insert("host", "web1");
         resource.attributes.insert("env", "staging");
-        let mut event = metric_event("page.views", MetricKind::Counter(1.0), &[("env", "prod")]);
+        let mut event = metric_event("page.views", MetricKind::counter(1.0), &[("env", "prod")]);
         event.attributes.insert("env", "prod"); // already set by metric_event; explicit for clarity
 
         let mut encoder = InfluxLineEncoder::default();
-        let batch = EventBatch { resource: Arc::new(resource), events: vec![event] };
+        let batch = EventBatch { resource: Arc::new(resource), scope: None, events: vec![event] };
         let out = String::from_utf8(encoder.encode(&batch).unwrap().to_vec()).unwrap();
 
         assert!(out.contains("host=web1"), "got: {out}");
@@ -826,7 +951,7 @@ mod tests {
     fn set_metrics_are_skipped_not_fatal() {
         let out = encode(vec![
             metric_event("unique.users", MetricKind::Set(logit_core::HyperLogLog::default()), &[]),
-            metric_event("page.views", MetricKind::Counter(1.0), &[]),
+            metric_event("page.views", MetricKind::counter(1.0), &[]),
         ]);
         // The Set line is dropped; the Counter line alongside it still comes through.
         assert!(!out.contains("unique.users"), "got: {out}");
@@ -841,7 +966,7 @@ mod tests {
     fn gauge_delta_is_skipped_not_fatal() {
         let out = encode(vec![
             metric_event("conns", MetricKind::GaugeDelta(5.0), &[]),
-            metric_event("page.views", MetricKind::Counter(1.0), &[]),
+            metric_event("page.views", MetricKind::counter(1.0), &[]),
         ]);
         assert!(!out.contains("conns"), "got: {out}");
         assert!(out.contains("page.views value=1"), "got: {out}");
@@ -871,7 +996,7 @@ mod tests {
 
     #[test]
     fn non_finite_values_are_skipped_not_written_as_invalid_line_protocol() {
-        let out = encode(vec![metric_event("bad", MetricKind::Counter(f64::NAN), &[])]);
+        let out = encode(vec![metric_event("bad", MetricKind::counter(f64::NAN), &[])]);
         assert_eq!(out, "", "a NaN-only line should produce no output, not `value=NaN`");
     }
 
@@ -885,6 +1010,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
         assert_eq!(encode(vec![log_event]), "");
@@ -895,8 +1023,8 @@ mod tests {
         // A line starting with '#' is a comment in line protocol -- writing it would make
         // InfluxDB report success while storing nothing. It must be rejected up front instead.
         let out = encode(vec![
-            metric_event("#requests", MetricKind::Counter(1.0), &[]),
-            metric_event("page.views", MetricKind::Counter(1.0), &[]),
+            metric_event("#requests", MetricKind::counter(1.0), &[]),
+            metric_event("page.views", MetricKind::counter(1.0), &[]),
         ]);
         assert!(!out.contains("#requests"), "got: {out}");
         assert!(out.contains("page.views value=1"), "got: {out}");
@@ -905,7 +1033,7 @@ mod tests {
     #[test]
     fn empty_tag_value_is_dropped_not_the_whole_metric() {
         let out =
-            encode(vec![metric_event("page.views", MetricKind::Counter(1.0), &[("env", "")])]);
+            encode(vec![metric_event("page.views", MetricKind::counter(1.0), &[("env", "")])]);
         assert!(!out.contains("env="), "empty tag should be dropped entirely: {out}");
         assert!(out.contains("page.views value=1"), "the rest of the point should survive: {out}");
     }
@@ -916,9 +1044,9 @@ mod tests {
         // and bail, corrupting whatever line got appended after it. Two full, valid lines must
         // come out the other side of a batch containing a newline-poisoned tag value in between.
         let out = encode(vec![
-            metric_event("ok.before", MetricKind::Counter(1.0), &[]),
-            metric_event("bad", MetricKind::Counter(1.0), &[("env", "prod\ninjected")]),
-            metric_event("ok.after", MetricKind::Counter(1.0), &[]),
+            metric_event("ok.before", MetricKind::counter(1.0), &[]),
+            metric_event("bad", MetricKind::counter(1.0), &[("env", "prod\ninjected")]),
+            metric_event("ok.after", MetricKind::counter(1.0), &[]),
         ]);
         assert!(out.contains("ok.before value=1"), "got: {out}");
         assert!(out.contains("ok.after value=1"), "got: {out}");
@@ -1025,17 +1153,15 @@ mod tests {
     /// each keeps the event's own timestamp untouched, and each still carries the event's tags.
     #[test]
     fn several_metrics_on_one_event_share_its_tags_and_each_get_a_line() {
-        let mut event = metric_event("requests", MetricKind::Counter(1.0), &[("env", "prod")]);
-        event.metrics.push(MetricRecord {
-            name: logit_core::interner::intern("latency"),
-            kind: MetricKind::Gauge(5.0),
-            unit: None,
-        });
-        event.metrics.push(MetricRecord {
-            name: logit_core::interner::intern("bytes"),
-            kind: MetricKind::Counter(100.0),
-            unit: None,
-        });
+        let mut event = metric_event("requests", MetricKind::counter(1.0), &[("env", "prod")]);
+        event.metrics.push(MetricRecord::new(
+            logit_core::interner::intern("latency"),
+            MetricKind::Gauge(5.0),
+        ));
+        event.metrics.push(MetricRecord::new(
+            logit_core::interner::intern("bytes"),
+            MetricKind::counter(100.0),
+        ));
 
         let out = encode(vec![event]);
         let lines: Vec<&str> = out.lines().collect();
@@ -1056,12 +1182,11 @@ mod tests {
     /// byte-for-byte the same allocator behavior.
     #[test]
     fn the_same_metric_name_twice_on_one_event_gets_distinct_timestamps() {
-        let mut event = metric_event("page.views", MetricKind::Counter(1.0), &[]);
-        event.metrics.push(MetricRecord {
-            name: logit_core::interner::intern("page.views"),
-            kind: MetricKind::Counter(2.0),
-            unit: None,
-        });
+        let mut event = metric_event("page.views", MetricKind::counter(1.0), &[]);
+        event.metrics.push(MetricRecord::new(
+            logit_core::interner::intern("page.views"),
+            MetricKind::counter(2.0),
+        ));
 
         let out = encode(vec![event]);
         assert_eq!(out.lines().count(), 2, "got: {out}");
@@ -1077,11 +1202,10 @@ mod tests {
     fn a_bad_metric_skips_only_itself_not_the_rest_of_its_event() {
         let mut event =
             metric_event("unique.users", MetricKind::Set(logit_core::HyperLogLog::default()), &[]);
-        event.metrics.push(MetricRecord {
-            name: logit_core::interner::intern("page.views"),
-            kind: MetricKind::Counter(1.0),
-            unit: None,
-        });
+        event.metrics.push(MetricRecord::new(
+            logit_core::interner::intern("page.views"),
+            MetricKind::counter(1.0),
+        ));
 
         let out = encode(vec![event]);
         assert!(!out.contains("unique.users"), "got: {out}");
@@ -1104,13 +1228,15 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
-        event.metrics.push(MetricRecord {
-            name: logit_core::interner::intern("nginx.requests"),
-            kind: MetricKind::Counter(1.0),
-            unit: None,
-        });
+        event.metrics.push(MetricRecord::new(
+            logit_core::interner::intern("nginx.requests"),
+            MetricKind::counter(1.0),
+        ));
 
         let out = encode(vec![event]);
         assert_eq!(out, "nginx.requests value=1 1700000000000000000\n");
@@ -1164,7 +1290,7 @@ mod tests {
     }
 
     fn one_metric_batch() -> EventBatch {
-        batch_with(vec![metric_event("x", MetricKind::Counter(1.0), &[])])
+        batch_with(vec![metric_event("x", MetricKind::counter(1.0), &[])])
     }
 
     /// `send` now makes exactly one attempt per call -- retry timing moved to `logit-pipeline`'s
@@ -1314,8 +1440,8 @@ mod tests {
                         }
                     }
                     e.metrics.iter().find_map(|m| match &m.kind {
-                        MetricKind::Counter(v) if logit_core::interner::resolve(m.name) == name => {
-                            Some(*v)
+                        MetricKind::Sum(s) if logit_core::interner::resolve(m.name) == name => {
+                            Some(s.value)
                         }
                         _ => None,
                     })

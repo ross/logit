@@ -752,9 +752,12 @@ mod tests {
                 severity: Some(Severity::Info),
                 body_format: logit_core::BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         );
-        EventBatch { resource: Arc::new(Resource::default()), events: vec![event] }
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![event] }
     }
 
     // ---- client-side handshake/frame helpers ---------------------------------------------
@@ -835,7 +838,7 @@ mod tests {
                     return None;
                 }
                 match m.kind {
-                    MetricKind::Counter(v) => Some(v),
+                    MetricKind::Sum(sum) => Some(sum.value),
                     _ => None,
                 }
             })

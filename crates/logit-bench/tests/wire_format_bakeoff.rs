@@ -8,24 +8,73 @@
 //! gracefully) lives closer to what it tests, in `crates/logit-proto/src/native/{value,record}.rs`'s
 //! own unit tests -- only the native format claims that property, so there's nothing to compare it
 //! against here.
+//!
+//! **Native/postcard/rkyv are exact codecs** (`docs/plans/lossless-transit.md`'s W1): `EventBatch`
+//! now derives `PartialEq`, so these three arms compare with a plain `assert_eq!` on the whole
+//! batch rather than a hand-rolled field walk. **OTLP is not** -- W1 pulled three narrow exceptions
+//! forward (`Sum`/`Histogram`/`ExponentialHistogram` temporality, `ExponentialHistogram` itself,
+//! `Histogram`/`Summary`'s new scalar fields) but everything else (`scope`, `description`,
+//! `start_timestamp`, `exemplars`, `event_name`, `observed_timestamp`, dropped counts, span
+//! `flags`/`ext`) is W4's; OTLP tests stay field-level, documenting exactly what's still lossy
+//! rather than pretending otherwise.
 
 use bytes::Bytes;
 use logit_bench::{bakeoff, fixtures};
 use logit_core::{
-    AttrMap, BodyFormat, Event, EventBatch, LogRecord, MetricKind, MetricRecord, Resource,
-    Severity, SpanKind, SpanRecord, SpanStatus, Value,
+    AttrMap, BodyFormat, Event, EventBatch, ExpHistogram, LogRecord, MetricKind, MetricRecord,
+    Resource, Samples, Scope, Severity, SpanExt, SpanKind, SpanRecord, SpanStatus, Sum,
+    Temporality, Value,
 };
 use logit_proto::{Signal, SignalEncoder};
 use std::sync::Arc;
 
 fn single_event_batch(event: Event) -> EventBatch {
-    EventBatch { resource: Arc::new(Resource::default()), events: vec![event] }
+    EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![event] }
+}
+
+fn metric_batch(kind: MetricKind) -> EventBatch {
+    let record = MetricRecord::new(logit_core::interner::intern("bakeoff_kind_test_metric"), kind);
+    single_event_batch(Event::metric(0, AttrMap::new(), record))
+}
+
+/// [`fixtures::nginx_batch`], with a populated [`Scope`] attached -- exercises the new batch-level
+/// section through every arm.
+fn scoped_nginx_batch() -> EventBatch {
+    let mut batch = fixtures::nginx_batch(2);
+    let mut scope_attrs = AttrMap::new();
+    scope_attrs.insert("scope.attr", "value");
+    batch.scope = Some(Arc::new(Scope {
+        name: Bytes::from_static(b"bakeoff_scope"),
+        version: Bytes::from_static(b"9.9.9"),
+        attributes: scope_attrs,
+        dropped_attributes_count: 2,
+        schema_url: Some(Bytes::from_static(b"https://example.com/scope-schema")),
+    }));
+    batch
+}
+
+/// [`fixtures::span_event`], with a populated [`SpanExt`] attached -- exercises the boxed,
+/// rarely-populated half of span fidelity through every arm.
+fn span_with_ext_batch() -> EventBatch {
+    let mut event = fixtures::span_event();
+    if let Some(span) = event.span.as_mut() {
+        span.flags = 1;
+        span.ext = Some(Box::new(SpanExt {
+            status_message: Some(Bytes::from_static(b"boom")),
+            trace_state: Some(Bytes::from_static(b"vendor=value")),
+            dropped_attributes_count: 2,
+            dropped_events_count: 1,
+            dropped_links_count: 1,
+        }));
+    }
+    single_event_batch(event)
 }
 
 /// Every fixture this gate runs each arm against -- deliberately the same shapes
 /// `crates/logit-bench/src/fixtures.rs`'s own doc comment argues for (mixed, logs-only,
 /// wide-JSON, distribution-heavy, span), per `AGENTS.md`'s "don't generalize a measurement from
-/// one event shape".
+/// one event shape", plus one batch per new W1 metric kind and one each for a populated
+/// `Scope`/`SpanExt`.
 fn representative_batches() -> Vec<EventBatch> {
     vec![
         fixtures::nginx_batch(3),
@@ -33,62 +82,42 @@ fn representative_batches() -> Vec<EventBatch> {
         single_event_batch(fixtures::distribution_event()),
         single_event_batch(fixtures::distribution_heavy_event()),
         single_event_batch(fixtures::span_event()),
+        metric_batch(MetricKind::Sum(Sum {
+            value: 5.0,
+            temporality: Temporality::Cumulative,
+            monotonic: false,
+        })),
+        metric_batch(MetricKind::Samples({
+            let mut s = Samples::new([1.0, 2.5, 3.75]);
+            s.sample_rate = 0.1;
+            s
+        })),
+        metric_batch(MetricKind::SetMembers(vec![
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"b"),
+        ])),
+        metric_batch(MetricKind::ExponentialHistogram(ExpHistogram {
+            scale: 2,
+            zero_count: 1,
+            zero_threshold: 0.001,
+            positive: (0, vec![1, 2, 3]),
+            negative: (-1, vec![4]),
+            temporality: Temporality::Cumulative,
+            count: 11,
+            sum: Some(50.0),
+            min: Some(0.1),
+            max: Some(9.5),
+        })),
+        scoped_nginx_batch(),
+        span_with_ext_batch(),
     ]
-}
-
-/// A field-level comparison, not a derived `PartialEq` -- `Event` doesn't implement it (nothing in
-/// the production code needs to), and `MetricKind::Distribution`'s `DDSketch` has no `PartialEq` at
-/// all (`crates/logit-core/src/metric.rs`), so a distribution is compared on `count()`/`quantile()`
-/// instead, the same fidelity check `crates/logit-proto/src/native/record.rs`'s own tests use.
-fn assert_batches_match(actual: &EventBatch, expected: &EventBatch, arm: &str) {
-    assert_eq!(
-        actual.resource.attributes, expected.resource.attributes,
-        "{arm}: resource attributes"
-    );
-    assert_eq!(actual.events.len(), expected.events.len(), "{arm}: event count");
-    for (a, e) in actual.events.iter().zip(expected.events.iter()) {
-        assert_eq!(a.timestamp, e.timestamp, "{arm}: event timestamp");
-        assert_eq!(a.attributes, e.attributes, "{arm}: event attributes");
-        assert_eq!(a.log.is_some(), e.log.is_some(), "{arm}: log presence");
-        if let (Some(al), Some(el)) = (&a.log, &e.log) {
-            assert_eq!(al.message, el.message, "{arm}: log message");
-            assert_eq!(al.severity, el.severity, "{arm}: log severity");
-            assert_eq!(al.body_format, el.body_format, "{arm}: log body_format");
-            assert_eq!(al.trace, el.trace, "{arm}: log trace");
-        }
-        assert_eq!(a.metrics.len(), e.metrics.len(), "{arm}: metric count");
-        for (am, em) in a.metrics.iter().zip(e.metrics.iter()) {
-            assert_eq!(am.name, em.name, "{arm}: metric name");
-            assert_eq!(am.unit, em.unit, "{arm}: metric unit");
-            match (&am.kind, &em.kind) {
-                (MetricKind::Distribution(a), MetricKind::Distribution(b)) => {
-                    assert_eq!(a.count(), b.count(), "{arm}: distribution count");
-                    assert_eq!(a.quantile(0.5), b.quantile(0.5), "{arm}: distribution p50");
-                    assert_eq!(a.quantile(0.99), b.quantile(0.99), "{arm}: distribution p99");
-                }
-                (a, b) => assert_eq!(format!("{a:?}"), format!("{b:?}"), "{arm}: metric kind"),
-            }
-        }
-        assert_eq!(a.span.is_some(), e.span.is_some(), "{arm}: span presence");
-        if let (Some(asp), Some(esp)) = (&a.span, &e.span) {
-            assert_eq!(asp.trace_id, esp.trace_id, "{arm}: span trace_id");
-            assert_eq!(asp.span_id, esp.span_id, "{arm}: span span_id");
-            assert_eq!(asp.parent_span_id, esp.parent_span_id, "{arm}: span parent_span_id");
-            assert_eq!(asp.name, esp.name, "{arm}: span name");
-            assert_eq!(asp.kind, esp.kind, "{arm}: span kind");
-            assert_eq!(asp.status, esp.status, "{arm}: span status");
-            assert_eq!(asp.end_timestamp, esp.end_timestamp, "{arm}: span end_timestamp");
-            assert_eq!(asp.events.len(), esp.events.len(), "{arm}: span events");
-            assert_eq!(asp.links.len(), esp.links.len(), "{arm}: span links");
-        }
-    }
 }
 
 #[test]
 fn native_round_trips_every_representative_fixture_losslessly() {
     for batch in representative_batches() {
         let decoded = bakeoff::native_decode(bakeoff::native_encode(&batch));
-        assert_batches_match(&decoded, &batch, "native");
+        assert_eq!(decoded, batch, "native");
     }
 }
 
@@ -96,7 +125,7 @@ fn native_round_trips_every_representative_fixture_losslessly() {
 fn postcard_round_trips_every_representative_fixture_losslessly() {
     for batch in representative_batches() {
         let decoded = bakeoff::postcard_decode(&bakeoff::postcard_encode(&batch));
-        assert_batches_match(&decoded, &batch, "postcard");
+        assert_eq!(decoded, batch, "postcard");
     }
 }
 
@@ -104,7 +133,7 @@ fn postcard_round_trips_every_representative_fixture_losslessly() {
 fn rkyv_round_trips_every_representative_fixture_losslessly() {
     for batch in representative_batches() {
         let decoded = bakeoff::rkyv_decode(&bakeoff::rkyv_encode(&batch));
-        assert_batches_match(&decoded, &batch, "rkyv");
+        assert_eq!(decoded, batch, "rkyv");
     }
 }
 
@@ -171,6 +200,9 @@ fn otlp_collapses_timestamp_to_i64_and_loses_u64_above_i64_max() {
             severity: None,
             body_format: BodyFormat::Raw,
             trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
         },
     );
     let decoded = bakeoff::otlp_round_trip(&single_event_batch(log));
@@ -190,6 +222,70 @@ fn otlp_collapses_timestamp_to_i64_and_loses_u64_above_i64_max() {
     );
 }
 
+// -- OTLP's remaining W1 lossy fields (W4 owns closing these) ------------------------------------
+
+/// `scope`/`description`/`start_timestamp`/`exemplars`/dropped counts/span `ext` are filled with
+/// their defaults on OTLP decode and ignored on encode until W4
+/// (`crates/logit-proto/src/otlp/metrics.rs`'s module doc, `docs/plans/lossless-transit.md`).
+/// Field-level, not `assert_eq!` on the whole batch -- unlike native/postcard/rkyv, OTLP is not
+/// (yet) an exact codec, so this documents precisely what's still lossy rather than papering over
+/// it with a looser comparison.
+#[test]
+fn otlp_still_drops_metric_record_fields_w4_owns() {
+    let record = MetricRecord {
+        description: Some(logit_core::interner::intern("a description")),
+        start_timestamp: 100,
+        ..MetricRecord::new(
+            logit_core::interner::intern("bakeoff_otlp_lossy_metric"),
+            MetricKind::Sum(Sum {
+                value: 3.0,
+                temporality: Temporality::Cumulative,
+                monotonic: true,
+            }),
+        )
+    };
+    let batch = single_event_batch(Event::metric(0, AttrMap::new(), record));
+
+    let decoded = bakeoff::otlp_round_trip(&batch);
+    assert_eq!(decoded.len(), 1, "a lone Sum metric should produce one Metrics payload");
+    let out = &decoded[0].events[0].metrics[0];
+    assert_eq!(out.description, None, "OTLP decode fills description with its default until W4");
+    assert_eq!(
+        out.start_timestamp, 0,
+        "OTLP decode fills start_timestamp with its default until W4"
+    );
+}
+
+#[test]
+fn otlp_still_drops_scope_until_w4() {
+    let decoded = bakeoff::otlp_round_trip(&scoped_nginx_batch());
+    assert!(
+        !decoded.is_empty() && decoded.iter().all(|b| b.scope.is_none()),
+        "OTLP decode leaves EventBatch::scope None until W4"
+    );
+}
+
+/// `Samples` degrades into an OTLP `Summary` (same lossy path `Distribution` already took);
+/// `SetMembers` is skipped outright, exactly like `Set` already was.
+#[test]
+fn otlp_degrades_samples_to_a_summary_and_skips_set_members() {
+    let samples_batch = metric_batch(MetricKind::Samples(Samples::new([1.0, 2.0, 3.0])));
+    let decoded = bakeoff::otlp_round_trip(&samples_batch);
+    assert_eq!(decoded.len(), 1, "Samples degrades into a Metrics payload, not dropped outright");
+    match &decoded[0].events[0].metrics[0].kind {
+        MetricKind::Summary(_) => {}
+        other => panic!("Samples should degrade to a Summary over OTLP, got {other:?}"),
+    }
+
+    let set_members_batch = metric_batch(MetricKind::SetMembers(vec![Bytes::from_static(b"a")]));
+    let mut encoder = logit_proto::otlp::OtlpEncoder::new();
+    let payloads = encoder.encode_signals(&set_members_batch).expect("otlp encode");
+    assert!(
+        payloads.iter().all(|(signal, _)| *signal != Signal::Metrics),
+        "SetMembers should be skipped like Set, producing no Metrics payload"
+    );
+}
+
 // -- Multi-payload events: the shape ADR `multi-payload-events` exists for -----------------------
 
 fn multi_payload_event() -> Event {
@@ -201,12 +297,14 @@ fn multi_payload_event() -> Event {
         severity: Some(Severity::Info),
         body_format: BodyFormat::Raw,
         trace: None,
+        event_name: None,
+        observed_timestamp: 0,
+        dropped_attributes_count: 0,
     });
-    event.metrics.push(MetricRecord {
-        name: logit_core::interner::intern("bakeoff_multi_payload_metric"),
-        kind: MetricKind::Counter(1.0),
-        unit: None,
-    });
+    event.metrics.push(MetricRecord::new(
+        logit_core::interner::intern("bakeoff_multi_payload_metric"),
+        MetricKind::counter(1.0),
+    ));
     event.span = Some(SpanRecord {
         trace_id: [1; 16],
         span_id: [2; 8],
@@ -217,6 +315,8 @@ fn multi_payload_event() -> Event {
         events: Vec::new(),
         links: Vec::new(),
         end_timestamp: 2,
+        flags: 0,
+        ext: None,
     });
     event
 }
@@ -270,12 +370,7 @@ fn otlp_shatters_a_multi_payload_event_across_separate_batches() {
 #[test]
 fn native_postcard_and_rkyv_preserve_gauge_delta_and_set_identity_that_otlp_drops() {
     for kind in [MetricKind::GaugeDelta(2.5), MetricKind::Set(logit_core::HyperLogLog::default())] {
-        let record = MetricRecord {
-            name: logit_core::interner::intern("bakeoff_undroppable_metric"),
-            kind,
-            unit: None,
-        };
-        let batch = single_event_batch(Event::metric(0, AttrMap::new(), record));
+        let batch = metric_batch(kind);
 
         for (arm, decoded) in [
             ("native", bakeoff::native_decode(bakeoff::native_encode(&batch))),
@@ -300,7 +395,8 @@ fn native_postcard_and_rkyv_preserve_gauge_delta_and_set_identity_that_otlp_drop
 
 #[test]
 fn an_empty_batch_round_trips_through_every_arm() {
-    let batch = EventBatch { resource: Arc::new(Resource::default()), events: Vec::new() };
+    let batch =
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events: Vec::new() };
     assert_eq!(bakeoff::native_decode(bakeoff::native_encode(&batch)).events.len(), 0);
     assert_eq!(bakeoff::postcard_decode(&bakeoff::postcard_encode(&batch)).events.len(), 0);
     assert_eq!(bakeoff::rkyv_decode(&bakeoff::rkyv_encode(&batch)).events.len(), 0);

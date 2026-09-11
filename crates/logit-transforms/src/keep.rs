@@ -118,6 +118,9 @@ mod tests {
                 severity: None,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         )
     }
@@ -197,11 +200,7 @@ mod tests {
     fn neither_transform_touches_log_metrics_or_span() {
         let resource = default_resource();
         let mut event = event_with_attrs(&[("a", "1")]);
-        event.metrics.push(MetricRecord {
-            name: intern("m"),
-            kind: MetricKind::Counter(1.0),
-            unit: None,
-        });
+        event.metrics.push(MetricRecord::new(intern("m"), MetricKind::counter(1.0)));
         let original_message = event.log.as_ref().unwrap().message.clone();
 
         let mut keep = Keep::new(vec![]);
@@ -221,7 +220,7 @@ mod tests {
     fn counter_value(events: &[Event], name: &str) -> Option<f64> {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Counter(v) if resolve(m.name) == name => Some(*v),
+                MetricKind::Sum(sum) if resolve(m.name) == name => Some(sum.value),
                 _ => None,
             })
         })

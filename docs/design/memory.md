@@ -38,14 +38,14 @@ explicitly meant to cover**:
 
 | Workload | Carries | Wasted per event today |
 |---|---|---:|
-| Logs only (syslog, file tail → forward) | attributes + `log` | 328 B (`MetricList` + `SpanRecord`) |
-| Metrics only (statsd, collectd, scrape → aggregate) | attributes + 1 metric | 208 B, plus ~176 of `MetricList` a `Counter` can't use |
-| Traces only (OTLP → forward) | attributes + `span` | 264 B (`LogRecord` + `MetricList`) |
+| Logs only (syslog, file tail → forward) | attributes + `log` | 376 B (`MetricList` + `SpanRecord`) |
+| Metrics only (statsd, collectd, scrape → aggregate) | attributes + 1 metric | 232 B, plus ~176 of `MetricKind` a `Sum` can't use |
+| Traces only (OTLP → forward) | attributes + `span` | 320 B (`LogRecord` + `MetricList`) |
 | Mixed (the nginx shape — the first one measured) | all three | least of any shape |
 
 Two consequences that matter for how much weight to put on §8:
 
-- **Everything in §1 (sizing) applies to every workload**, because `Event`'s 800 bytes are paid on
+- **Everything in §1 (sizing) applies to every workload**, because `Event`'s 864 bytes are paid on
   every hop whatever the event carries. Every shape above wastes 208-328 bytes on payloads it never
   holds. That argument doesn't depend on the fixture at all.
 - **Several specific *fixes* are workload-dependent, and one flips sign** depending on the mix. A
@@ -63,12 +63,12 @@ items 7-9 in §8; it doesn't by itself settle the *sizing* decisions those items
 ## 1. The event model's footprint
 
 ```
-Event                                       800 bytes
+Event                                       864 bytes
 ├── timestamp: i64                            8
 ├── attributes: AttrMap                      392   ← SmallVec<[(Symbol, Value); 8]>
-├── log: Option<LogRecord>                    72
-├── metrics: MetricList                      192   ← SmallVec<[MetricRecord; 1]>
-└── span: Option<SpanRecord>                 136
+├── log: Option<LogRecord>                    88
+├── metrics: MetricList                      232   ← SmallVec<[MetricRecord; 1]>
+└── span: Option<SpanRecord>                 144
 ```
 
 with the constituent parts:
@@ -79,12 +79,18 @@ with the constituent parts:
 | `Value` | 40 | sized by `Bytes` (4 words) plus an aligned discriminant |
 | `(Symbol, Value)` | 48 | 4 bytes of padding after `Symbol` |
 | `AttrMap` | 392 | 8 × 48 inline, + 8 of smallvec overhead (`union` feature, below) |
-| `MetricKind` | 176 | almost entirely the inlined `DDSketch` |
-| `MetricRecord` | 184 | `MetricKind` + name + unit |
-| `MetricList` | 192 | 1 × 184 inline + 8 |
+| `DdSketch` | 176 | `sketches_ddsketch::DDSketch` inlined directly (no `Box`): two `Store`s plus a `Config` |
+| `Samples` | 168 | `SmallVec<[f64; SAMPLES_INLINE]>` (`SAMPLES_INLINE = 19`) + `sample_rate: f64` -- deliberately sized to sit just under `DdSketch`'s 176, see `MetricKind` below |
+| `MetricKind` | 176 | sized by the larger of its two big variants (`Distribution`'s inlined `DdSketch`), with just enough room left over for a real discriminant that `Samples`'s smaller payload doesn't use up -- every other variant (`Sum`/`Gauge`/`GaugeDelta`/`SetMembers`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary`) is far smaller and pays the same 176 regardless |
+| `MetricRecord` | 224 | `MetricKind` (176) + `name`/`unit`/`description` (4 each, one padded) + `start_timestamp: i64` (8) + `exemplars: Vec<Exemplar>` (24) |
+| `MetricList` | 232 | 1 × 224 inline + 8 |
 | `TraceRef` | 26 | `[u8;16]` trace id + `Option<[u8;8]>` span id + a flags byte; `Option<TraceRef>` is also 26 -- niche-filled through `Option<[u8;8]>`'s own tag |
-| `LogRecord` | 72 | `Value` (40) + `Option<TraceRef>` (26) + `Severity`/`BodyFormat` (2); `Option<LogRecord>` is also 72 — `Severity`'s niche absorbs `None` |
-| `SpanRecord` | 136 | `Option<SpanRecord>` is also 136 — `SpanKind`'s niche absorbs `None` |
+| `LogRecord` | 88 | `Value` (40) + `Option<TraceRef>` (26) + `Severity`/`BodyFormat` (2) + `event_name: Option<Symbol>` (4) + `observed_timestamp: i64` (8) + `dropped_attributes_count: u32` (4, padded); `Option<LogRecord>` is also 88 — `Severity`'s niche absorbs `None` |
+| `SpanExt` | 80 | boxed off `SpanRecord` (below): `status_message`/`trace_state: Option<Bytes>` (32 each) + three `u32` dropped counts (12, padded to 16) |
+| `Option<Box<SpanExt>>` | 8 | `Box`'s non-null-pointer niche absorbs `None` |
+| `SpanRecord` | 144 | the pre-`metrics-model-v2` 136 bytes + `flags: u32` (4, padded to 8) + `ext: Option<Box<SpanExt>>` (8); `Option<SpanRecord>` is also 144 — `SpanKind`'s niche absorbs `None` |
+| `Resource` | 432 | `AttrMap` (392) + `dropped_attributes_count: u32` (4, padded) + `schema_url: Option<Bytes>` (32, no niche) -- no longer just `AttrMap`'s own size now that it carries these two extra fields |
+| `Scope` | 496 | `name`/`version: Bytes` (32 each) + `AttrMap` (392) + `dropped_attributes_count: u32` (4, padded) + `schema_url: Option<Bytes>` (32) |
 
 **Three things about this are worth internalizing.**
 
@@ -93,17 +99,21 @@ heap `(ptr, cap)` pair share one slot, sized by the larger. So an event with 13 
 heap allocation *and* the full 392 bytes. Inline capacity 8 is therefore not "free up to 8" — it is
 384 bytes on every event, forever, and the reference nginx pipeline spills past it anyway.
 
-**A statsd counter costs the same 800 bytes as a fully-populated nginx access log.** `Event` has no
+**A statsd counter costs the same 864 bytes as a fully-populated nginx access log.** `Event` has no
 compact representation for the common case; the space for attributes, a sketch, and a span is
 reserved unconditionally. That is the price of "an event is whatever it carries"
 ([ADR `multi-payload-events`](../adr/multi-payload-events.md)) implemented with inline storage.
 
-**`MetricKind::Distribution` sets the size of every metric.** A `Counter(f64)` needs 8 bytes and
-pays 176, because `DDSketch` (two `Store`s and a `Config`) is inlined into the enum — deliberately,
-per [ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md): boxing it would save 144 bytes
+**`MetricKind::Distribution` sets the size of every metric.** A `Sum(Sum { value, temporality,
+monotonic })` — the replacement for the old `Counter(f64)`, per [ADR `metrics-model-v2`](../adr/metrics-model-v2.md) —
+needs a fraction of that and still pays 176, because `DDSketch` (two `Store`s and a `Config`) is
+inlined into the enum — deliberately, per [ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md): boxing it would save 144 bytes
 here but cost an allocation on every distribution metric actually constructed or cloned, and
 distributions are a shipping, commonly-populated feature (`kv_metrics`, statsd's `ms`/`h`/`d`), not
-a rare one — see below.
+a rare one — see below. `MetricKind::Samples` (raw statsd timer/histogram observations) is
+deliberately sized to sit *under* this ceiling rather than push it: `SAMPLES_INLINE = 19` keeps
+`size_of::<Samples>()` at 168, just shy of `DdSketch`'s 176, so `MetricKind` stays exactly 176
+rather than growing to accommodate a second large, inlined variant.
 
 ### What was reclaimed, and what was deliberately not
 
@@ -112,13 +122,16 @@ Sized here so the trade is visible, and the trades are not all in the same direc
 | Change | Saves | Real cost | Outcome |
 |---|---:|---|---|
 | smallvec's `union` feature | 16 B | none — it's a feature flag | **done** — applied, no tradeoff |
-| `Box` `SpanRecord` | 128 B | +1 alloc per event that carries a span | **not done** — see below |
+| `Box` `SpanRecord` | 136 B | +1 alloc per event that carries a span | **not done** — see below |
 | `Box` the `DdSketch` in `MetricKind::Distribution` | ~168 B | +1 alloc per distribution metric created | **not done** — see below |
 | Re-pick `AttrMap`'s inline capacity | up to 192 B | more spills, or (if increased) more bytes | **deferred** — see below |
 
-Only the `union` feature landed; `Event` is 792 → 776 bytes from that alone. The other two boxing
-changes were measured, implemented, and then **reverted** — worth explaining why, since the numbers
-alone would suggest taking them.
+Only the `union` feature landed; `Event` was 792 → 776 bytes from that alone at the time. `Event`
+has grown since, for reasons unrelated to this table: to 800 once `LogRecord::trace` landed, and to
+864 with [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)'s reshape (`SpanRecord`'s row above
+moved from 128 B to 136 B for the same reason — the record itself is 8 bytes bigger now). The other
+two boxing changes were measured, implemented, and then **reverted** — worth explaining why, since
+the numbers alone would suggest taking them.
 
 **Both boxing changes trade `Event`'s size for allocation count, and this project now has a stated
 priority for that exact conflict: minimize allocations, not size**
@@ -145,7 +158,7 @@ deferring the same mistake to whenever that input lands. That prediction is now 
 without any external input at all:
 [ADR `internal-span-emission-and-deterministic-sampling`](../adr/internal-span-emission-and-deterministic-sampling.md) makes `internal`
 itself a real, if low-volume by default, producer of `span`-carrying events — a drained span
-event costs exactly what this table already prices (800 bytes inline, `SpanRecord`'s 136 of it),
+event costs exactly what this table already prices (864 bytes inline, `SpanRecord`'s 144 of it),
 no new type and no change to this row's reasoning, just the first real caller of the shape this
 section was already sized for.
 
@@ -163,10 +176,11 @@ guess in either direction: see §8.
 **`MetricList`'s inline capacity (currently 1 — `SmallVec<[MetricRecord; 1]>`) is the same open
 question, never yet asked.** Any event with 2+ metrics spills — which includes the nginx reference
 config's event (4 metrics) unconditionally, and `kv_metrics` configurations generally, by design.
-Worth noting a real interaction with the `DdSketch` decision above: `MetricRecord` is 184 bytes
-with the sketch inlined (per ADR `minimize-allocations-over-event-size`), so widening `MetricList`'s capacity is considerably more
-expensive in bytes per additional slot than it would have been if the sketch had stayed boxed (40
-bytes/slot). The two decisions aren't independent of each other. Also recorded as an open knob,
+Worth noting a real interaction with the `DdSketch` decision above: `MetricRecord` is 224 bytes
+with the sketch inlined (per ADR `minimize-allocations-over-event-size`; up from 184 before ADR
+`metrics-model-v2` added `description`/`start_timestamp`/`exemplars`), so widening `MetricList`'s
+capacity is considerably more expensive in bytes per additional slot than it would have been if the
+sketch had stayed boxed. The two decisions aren't independent of each other. Also recorded as an open knob,
 same reasoning as `AttrMap`'s: real per-event metric-count data is needed before picking a number,
 not more synthetic-fixture measurement. See §8.
 
@@ -230,7 +244,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `stdio_out` encode 100 events | **102** | ~1/event -- fixed, see below, was 1801; +1 since measured through `Encoder::encode` (`&EventBatch` -> `Bytes`) rather than the inherent `render` (`&EventBatch` -> `String`) directly, ADR `rotating-file-output` -- `Bytes::from(String)`'s own small shared-refcount allocation |
 | `influxdb_out` encode 100 events | **30** | ~0.3/event — see below |
 | receive queue: push then pop, warm | **0** | `BoundedQueue<Datagram>`, ADR `decoupled-listener-io` -- see below |
-| `disk_queue`: push one batch (encode + write) | **27** | `native::encode_batch_v2` + `frame::write_frame` + one `write_all` -- breaks the zero-clone `Arc<EventBatch>` property by design, see `docs/adr/disk-backed-sink-buffer.md`; 25 -> 27 once `encode_batch_v2` (the provenance trailer, `docs/adr/batch-provenance-on-delivered.md`) replaced `encode_batch` here -- it builds v1's payload as its own `Bytes`, then copies it into a fresh `BytesMut` alongside the trailer rather than extending in place |
+| `disk_queue`: push one batch (encode + write) | **36** | `native::encode_batch_v2` + `frame::write_frame` + one `write_all` -- breaks the zero-clone `Arc<EventBatch>` property by design, see `docs/adr/disk-backed-sink-buffer.md`; 25 -> 27 once `encode_batch_v2` (the provenance trailer, `docs/adr/batch-provenance-on-delivered.md`) replaced `encode_batch` here -- it builds v1's payload as its own `Bytes`, then copies it into a fresh `BytesMut` alongside the trailer rather than extending in place; 27 -> 36 with [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)'s TLV-framed records (same +9 as `NativeEncoder::encode` below) |
 | `disk_queue`: peek, cached (no re-decode) | **0** | `write_loop`'s retry loop calls `peek` once per attempt; only the first (uncached) peek after a push touches disk |
 | accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR `decoupled-listener-io` -- see below |
 | `syslog_out` encode_into 100 events | **100** | ~1/event -- reused struct-held scratch buffers, was 401, see below |
@@ -429,7 +443,7 @@ draft actually established:
 | `has_attributes`/`drop_attributes`, resource match, cache hit (same input `Arc`) | **0** | `Matcher`'s one-entry `Arc::ptr_eq` cache — `Set::map_resource`'s caching idiom, applied to a read instead of a rebuild |
 | `has_attributes`/`drop_attributes`, resource match, cache miss (distinct input `Arc`) | **0**, not **1** | the one place this diverges from `set.map_resource`'s own cache-miss row above: a miss here only re-evaluates `AttrMap::get_sym` against the `Arc` a caller already passed in, never allocates a replacement `Resource` — `native::decode` mints a fresh `Arc<Resource>` per frame, so the fan-out-after-`logit_in` topology this component exists for (`docs/adr/attribute-filtering-components.md`) always misses this cache, and this row is why that's fine |
 | `trace_context`, lifting a valid `trace_id` | **1** | identical to `keep`/`set`'s own rows — `process_batch`'s own `Vec` is the whole cost; `parse_trace_id` (`logit_core::trace`) works on stack arrays and `AttrMap::remove` (`keep_source: false`) is an in-place `SmallVec` shift |
-| `trace_context` with a `span:` block, minting a `SpanRecord` from the convention (`traceparent` + ids + `span.end_s`/`span.duration_s`) | **1** | the same `Vec`; ids parse to stack arrays, timing is integer arithmetic, the span's `name` is the transform's pre-built `Value` cloned (a `Bytes` refcount bump), `events`/`links` are `Vec::new()`, `SpanRecord` is inline in `Event` (§1) so `event.span = Some(..)` is a 136-byte move, and the ~7 consumed attributes are in-place removes (`docs/adr/trace-context-span-lifting.md`) |
+| `trace_context` with a `span:` block, minting a `SpanRecord` from the convention (`traceparent` + ids + `span.end_s`/`span.duration_s`) | **1** | the same `Vec`; ids parse to stack arrays, timing is integer arithmetic, the span's `name` is the transform's pre-built `Value` cloned (a `Bytes` refcount bump), `events`/`links` are `Vec::new()`, `SpanRecord` is inline in `Event` (§1) so `event.span = Some(..)` is a 144-byte move, and the ~7 consumed attributes are in-place removes (`docs/adr/trace-context-span-lifting.md`) |
 | `run_lua`: `set_resource` + `process` + `take_resource`, script never writes `resource` | **9** | identical to plain `process` (below) — `set_resource`/`take_resource` are field assignments, no allocation |
 | `run_lua`: `set_resource` + `process` + `take_resource`, script writes `resource` | **7** | see `crates/logit-script/src/resource.rs` — lower than the row above because this script (unlike `LUA_ENRICH_SCRIPT`) never touches `event.attributes`, skipping its `AttrsProxy` cost; the `+1` here is `take_resource`'s `Arc::new(Resource { .. })` commit |
 | `process` reading `event.log.trace_id` (`LogProxy`) | **9** | same total a script touching `event.attributes` instead pays (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event`) despite touching no attributes at all — creating and caching the `LogProxy` userdata costs what `AttrsProxy` does there, `to_hex`'s returned `String` costs what an attribute write does; a script that never touches `event.log` pays none of it, unchanged at 9 either way |
@@ -519,7 +533,7 @@ back to this table's pre-existing state except the one line below.
 
 **Size: `size_of::<Delivered>()` goes from 32 to 56 -- exactly `TraceContext`'s 24 bytes, no padding
 overhead.** This is a per-*batch* cost, on the channel payload, not a per-event one: contrast with
-`Event`'s 800 bytes, where ADR `minimize-allocations-over-event-size` already settled that a much smaller per-event size cost is
+`Event`'s 864 bytes, where ADR `minimize-allocations-over-event-size` already settled that a much smaller per-event size cost is
 worth avoiding an allocation. `Delivered` isn't `Event` -- this is a different type, on a different
 part of the pipeline, at a different multiplier (one per batch, not one per event within it), so
 0017's conclusion doesn't transfer here by default; it's cited for contrast, not as the answer.
@@ -579,8 +593,14 @@ change.
 plus an 8-byte `Provenance` -- which component created a batch, which one most recently handled it,
 `docs/adr/batch-provenance-on-delivered.md`), not `TraceContext` alone.** Same reasoning as above --
 two `Option<Symbol>`s, no allocation, `Copy` -- so this is a channel-capacity-times-8-bytes cost
-(`CHANNEL_CAPACITY * 8` per inbox, noise against `Event`'s 800), not a new allocation-count entry
+(`CHANNEL_CAPACITY * 8` per inbox, noise against `Event`'s 864), not a new allocation-count entry
 anywhere in this section's table.
+
+**And to 72 with [ADR `metrics-model-v2`](../adr/metrics-model-v2.md):** `EventBatch` gained
+`scope: Option<Arc<Scope>>`, one more pointer-sized field on the batch every `Delivered` wraps
+(`Arc<Resource>` 8 + `Option<Arc<Scope>>` 8 + `Vec<Event>` 24 = 40, plus `BatchContext`'s 32).
+Same character as the two growths above -- per-inbox-slot, no allocation -- and pinned by the same
+`fanout.rs` test.
 
 `SpanGuard`'s own "disabled/unsampled holds no state" shape (mirroring `Timer`'s) is what's *meant*
 to make the unsampled path free the same way a disabled `Telemetry` handle already is -- but stated
@@ -691,8 +711,8 @@ the way `NativeDecoder::decode_into` does, since `Fanout::send` takes the `Event
 
 | Stage | allocs | Notes |
 |---|---:|---|
-| `NativeEncoder::encode`, 1 event | **23** | dictionary build + the per-field TLV scratch buffers `native::record::write_field` allocates for each of `Event`'s up-to-five fields (`docs/adr/native-wire-format-encoding.md`'s own Decision section notes this as a known, unoptimized cost of the field-level skip-unknown framing) |
-| `logit_out`: encode + frame, 1 event | **23** | `encode_batch` + `write_frame_with_flags` directly — same cost as `NativeEncoder::encode` above, since it's the same two steps; pinned separately so a future change to just this sink's path is caught here |
+| `NativeEncoder::encode`, 1 event | **32** | dictionary build + the per-field TLV scratch buffers `native::record::write_field` allocates for each of `Event`'s up-to-five fields -- 23 -> 32 with [ADR `metrics-model-v2`](../adr/metrics-model-v2.md), which TLV-framed every record too: the fixture's four metrics each pay one scratch buffer for their `kind` field and one length prefix as a list entry (+8), and the log's `message` one (+1) (`docs/adr/native-wire-format-encoding.md`'s own Decision section notes this as a known, unoptimized cost of the field-level skip-unknown framing) |
+| `logit_out`: encode + frame, 1 event | **32** | `encode_batch` + `write_frame_with_flags` directly — same cost as `NativeEncoder::encode` above, since it's the same two steps; pinned separately so a future change to just this sink's path is caught here |
 | `NativeDecoder::decode_into`, 1 event | **8** | dictionary re-intern + `AttrMap`/`Event` construction; no intermediate object graph, unlike the bake-off's `rkyv`/`postcard` arms, which run through a `WireBatch` mirror first (`docs/adr/native-wire-format-encoding.md`'s finding 4) |
 | `logit_in`: read + decode, 1 event | **7** | `read_frame_with_header` + `decode_batch` directly — one allocation cheaper than `NativeDecoder::decode_into` above: no caller-held `Vec<Event>` to `out.extend` into, since `decode_batch`'s own freshly allocated `Vec` is what `Fanout::send` takes as-is |
 
@@ -718,7 +738,7 @@ branch, with nothing extra to design or maintain for that guarantee. `runtime.rs
 it's the thing every change described below was built to never regress — including through three
 rounds of correcting an initial performance claim, per that section.
 
-For scale: the deep clone this section used to describe unconditionally (4 allocations, an 800-byte
+For scale: the deep clone this section used to describe unconditionally (4 allocations, an 864-byte
 memcpy per event per extra branch, 228 ns, ~11% of the ingest chain) is still exactly what a
 mutating branch pays when it has to.
 
@@ -811,7 +831,7 @@ Two things that didn't change through any of this:
   `Arc<Inner>` with copy-on-write for the same reason.
 
 A second, separable change: `Transform::process(&mut self, &Arc<Resource>, &mut Event) -> bool`
-plus `Vec::retain_mut` in `run_transform` would remove one full 800-byte `Event` memcpy per node
+plus `Vec::retain_mut` in `run_transform` would remove one full 864-byte `Event` memcpy per node
 hop and one `Vec` allocation per batch per node. Nothing is lost — the trait already can't emit
 more than one event per input. Deserves its own ADR; gets more expensive to make with every
 transform that lands (§8 item 14).
@@ -928,12 +948,15 @@ case: each tracked file gets its own `BatchAccumulator` under the same config-vi
 The byte-aware bound is `EventBatch::estimated_heap_bytes()` (`crates/logit-core/src/event.rs`): a
 deliberately approximate, O(events) walk. The dominant term, added after an initial pass
 undercounted it, is the `Vec<Event>` backing storage itself --
-`events.capacity() * size_of::<Event>()` -- which every event pays (800 bytes each, §1) *before*
+`events.capacity() * size_of::<Event>()` -- which every event pays (864 bytes each, §1) *before*
 any nested heap payload; a batch of numeric-only metrics with no string attributes would otherwise
 estimate close to zero despite genuinely holding hundreds of bytes per event. On top of that: a
-batch's attribute keys/values, log bodies, span-owned data (name, and every `SpanEvent`/`SpanLink`'s
-own backing storage and attributes), and metric records, plus its `Resource`'s attributes counted
-once per batch rather than once per event (the resource is `Arc`-shared, not copied per event). It
+batch's attribute keys/values, log bodies, span-owned data (name, every `SpanEvent`/`SpanLink`'s own
+backing storage and attributes, and -- since ADR `metrics-model-v2` -- a boxed `SpanExt`'s own
+size), and metric records (name/unit/description symbols, exemplars, a spilled `Samples`'s heap
+capacity, `SetMembers`'s own member byte lengths, and `Histogram`/`ExponentialHistogram`'s bucket
+`Vec`s), plus its `Resource`'s and, if present, its `Scope`'s attributes, each counted once per
+batch rather than once per event (both are `Arc`-shared across the batch, not copied per event). It
 is an admission-control estimate, not an allocator-accounting figure — unlike §1's numbers, it is
 *not* asserted exactly anywhere, and is deliberately exempt from `type_sizes.rs`/`allocations.rs`'s
 exact-equality discipline: a `MetricKind::Distribution`'s `DDSketch` is approximated with a fixed
@@ -1170,7 +1193,10 @@ might regress a workload the fixtures don't cover.
     (full ingest chain 5 → 7) — distributions are a shipping, commonly-populated feature, not the
     rare case the byte saving alone would suggest trading for.
 11. ~~**Enable smallvec's `union` feature.**~~ **Done** — 16 bytes off every `Event`, no tradeoff,
-    exactly as predicted. `Event`: 792 → 776 bytes.
+    exactly as predicted. `Event`: 792 → 776 bytes at the time (776 was the pre-`LogRecord::trace`
+    figure; `Event` grew to 800 once that field landed, and to 864 with ADR `metrics-model-v2`'s
+    reshape — the union-feature saving itself is unaffected, still 16 bytes off whatever the
+    current baseline is).
 12. ~~**Give `syslog_out` the same treatment `influxdb_out`/`stdio_out` got.**~~ **Done** — 401 →
     100 allocations per 100 events, ~4× (§2). `SyslogEncoder` now holds `line`/`raw_msg`/`scratch`
     as reused struct fields instead of allocating fresh `String`s per event (three of them as
@@ -1193,12 +1219,14 @@ traffic, which doesn't exist yet and can't be synthesized honestly.
 13. **`MetricList`'s inline capacity (currently 1).** Any event with 2+ metrics spills — always
     true for the nginx reference config (4 metrics) and for `kv_metrics` configurations generally,
     by design. Note the interaction with item 10 above: with `DdSketch` staying inlined,
-    `MetricRecord` is 184 bytes, so widening this capacity costs considerably more per additional
-    slot than it would have if the sketch had been boxed — the two decisions aren't independent.
+    `MetricRecord` is 224 bytes (up from 184 before ADR `metrics-model-v2` added
+    `description`/`start_timestamp`/`exemplars`), so widening this capacity costs considerably more
+    per additional slot than it would have if the sketch had been boxed — the two decisions aren't
+    independent.
 
 ### Later — needs a reason first
 
-14. **`Transform::process(&mut Event) -> bool`.** Removes an 800-byte memcpy per node hop. Gets more
+14. **`Transform::process(&mut Event) -> bool`.** Removes an 864-byte memcpy per node hop. Gets more
     expensive to decide with every transform that lands, so decide it early even if applied late.
     Touches `runtime.rs`, the same file item 7's three rounds just settled — a fresh reason to
     check `unwrap_batch`'s current shape before starting, not a blocker any more.

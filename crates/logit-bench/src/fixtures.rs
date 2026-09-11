@@ -158,6 +158,9 @@ pub fn logfmt_event() -> Event {
             severity: None,
             body_format: BodyFormat::Raw,
             trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
         },
     )
 }
@@ -173,6 +176,9 @@ pub fn logfmt_escaped_event() -> Event {
             severity: None,
             body_format: BodyFormat::Raw,
             trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
         },
     )
 }
@@ -188,6 +194,9 @@ pub fn kv_event() -> Event {
             severity: None,
             body_format: BodyFormat::Raw,
             trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
         },
     )
 }
@@ -254,7 +263,15 @@ pub fn csv_event(line: &str) -> Event {
     Event::log(
         0,
         AttrMap::new(),
-        LogRecord { message, severity: None, body_format: BodyFormat::Raw, trace: None },
+        LogRecord {
+            message,
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        },
     )
 }
 
@@ -407,7 +424,11 @@ pub fn nginx_event() -> Event {
 /// `count` copies of [`nginx_event`] in one batch, for measuring the output encoders.
 pub fn nginx_batch(count: usize) -> EventBatch {
     let event = nginx_event();
-    EventBatch { resource: resource(), events: (0..count).map(|_| event.clone()).collect() }
+    EventBatch {
+        resource: resource(),
+        scope: None,
+        events: (0..count).map(|_| event.clone()).collect(),
+    }
 }
 
 /// A metric-only event of the shape `statsd_in` produces: one counter, a handful of tags, no log
@@ -429,9 +450,11 @@ pub fn distribution_event() -> Event {
         0,
         AttrMap::new(),
         MetricRecord {
-            name: logit_core::interner::intern("nginx.request_time"),
-            kind: MetricKind::Distribution(sketch),
             unit: Some(logit_core::interner::intern("s")),
+            ..MetricRecord::new(
+                logit_core::interner::intern("nginx.request_time"),
+                MetricKind::Distribution(sketch),
+            )
         },
     )
 }
@@ -449,11 +472,7 @@ pub fn wide_gauge_event(name: &str, value: f64) -> Event {
     Event::metric(
         0,
         attributes,
-        MetricRecord {
-            name: logit_core::interner::intern(name),
-            kind: MetricKind::Gauge(value),
-            unit: None,
-        },
+        MetricRecord::new(logit_core::interner::intern(name), MetricKind::Gauge(value)),
     )
 }
 
@@ -552,6 +571,9 @@ pub fn sshd_message_event() -> Event {
             severity: None,
             body_format: BodyFormat::Raw,
             trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
         },
     )
 }
@@ -641,9 +663,11 @@ pub fn distribution_heavy_event() -> Event {
         let mut sketch = DdSketch::new();
         sketch.add(value);
         event.metrics.push(MetricRecord {
-            name: logit_core::interner::intern(name),
-            kind: MetricKind::Distribution(sketch),
             unit: Some(logit_core::interner::intern("ms")),
+            ..MetricRecord::new(
+                logit_core::interner::intern(name),
+                MetricKind::Distribution(sketch),
+            )
         });
     }
     event
@@ -701,19 +725,26 @@ pub fn span_event() -> Event {
                 timestamp: 1_725_091_200_050_000_000,
                 name: Value::str("cache.miss"),
                 attributes: cache_miss_attrs,
+                dropped_attributes_count: 0,
             },
             SpanEvent {
                 timestamp: 1_725_091_200_070_000_000,
                 name: Value::str("db.slow_query"),
                 attributes: slow_query_attrs,
+                dropped_attributes_count: 0,
             },
         ],
         links: vec![SpanLink {
             trace_id: [0xCD; 16],
             span_id: [0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27],
             attributes: link_attrs,
+            flags: 0,
+            trace_state: None,
+            dropped_attributes_count: 0,
         }],
         end_timestamp: 1_725_091_200_090_000_000,
+        flags: 0,
+        ext: None,
     };
     Event::span(1_725_091_200_000_000_000, attrs, record)
 }

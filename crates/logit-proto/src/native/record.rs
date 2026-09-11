@@ -117,14 +117,54 @@ fn write_record_list<T>(
     }
 }
 
-/// The inverse of [`write_record_list`]. `count` is capped at 4096 for the initial `Vec`
-/// allocation, the same defensive pattern every other counted collection in this codec uses.
-fn read_record_list<T>(
+/// A destination [`read_record_list_into`] can decode straight into -- `reserve` up front (so the
+/// loop never reallocates more than once) then `push` per decoded item. Implemented for `Vec<T>`
+/// (what [`read_record_list`] hands back) and for [`MetricList`] directly, so `read_event`'s
+/// `FIELD_METRICS` arm can decode straight into the event's own `SmallVec` instead of building a
+/// throwaway `Vec` first and `.collect()`-ing it across -- see [`read_record_list_into`]'s doc
+/// comment for why that second step was a real, avoidable allocation.
+trait ListSink<T> {
+    fn reserve(&mut self, additional: usize);
+    fn push_item(&mut self, item: T);
+}
+
+impl<T> ListSink<T> for Vec<T> {
+    fn reserve(&mut self, additional: usize) {
+        Vec::reserve(self, additional);
+    }
+    fn push_item(&mut self, item: T) {
+        self.push(item);
+    }
+}
+
+impl ListSink<MetricRecord> for MetricList {
+    fn reserve(&mut self, additional: usize) {
+        // Inherent `SmallVec::reserve` -- no `smallvec` dependency needed here, since calling an
+        // inherent method only requires naming the type (`MetricList`, re-exported by
+        // `logit_core`), not depending on the crate that defines it.
+        MetricList::reserve(self, additional);
+    }
+    fn push_item(&mut self, item: MetricRecord) {
+        self.push(item);
+    }
+}
+
+/// The inverse of [`write_record_list`], decoding straight into a caller-supplied `out` rather
+/// than building a fresh collection and handing it back -- what lets `read_event`'s `FIELD_METRICS`
+/// arm decode directly into the event's `MetricList` (a `SmallVec<[MetricRecord; 1]>`) instead of
+/// collecting into an intermediate `Vec<MetricRecord>` first and `.into_iter().collect()`-ing that
+/// into the `SmallVec` -- two allocations (the `Vec`, then the `SmallVec`'s own spill) for what a
+/// single upfront `reserve` plus a push loop does in one. `count` is capped at 4096 for the
+/// `reserve` call, the same defensive pattern every other counted collection in this codec uses.
+/// [`read_record_list`] below is the `Vec`-returning convenience wrapper every other caller
+/// (exemplars, span events, span links) still uses -- its own single allocation is unchanged.
+fn read_record_list_into<T>(
     bytes: &mut Bytes,
     read_one: impl Fn(&mut Bytes) -> Result<T, CodecError>,
-) -> Result<Vec<T>, CodecError> {
+    out: &mut impl ListSink<T>,
+) -> Result<(), CodecError> {
     let count = read_uvarint(bytes)? as usize;
-    let mut items = Vec::with_capacity(count.min(4096));
+    out.reserve(count.min(4096));
     for _ in 0..count {
         let len = read_uvarint(bytes)? as usize;
         if bytes.len() < len {
@@ -134,11 +174,23 @@ fn read_record_list<T>(
             )));
         }
         let mut item = bytes.split_to(len);
-        items.push(read_one(&mut item)?);
+        let value = read_one(&mut item)?;
         if !item.is_empty() {
             return Err(CodecError::Malformed("list entry had trailing bytes".to_string()));
         }
+        out.push_item(value);
     }
+    Ok(())
+}
+
+/// [`read_record_list_into`]'s `Vec`-returning convenience wrapper -- see that function's doc
+/// comment for the allocation story this split exists for.
+fn read_record_list<T>(
+    bytes: &mut Bytes,
+    read_one: impl Fn(&mut Bytes) -> Result<T, CodecError>,
+) -> Result<Vec<T>, CodecError> {
+    let mut items = Vec::new();
+    read_record_list_into(bytes, read_one, &mut items)?;
     Ok(items)
 }
 
@@ -1095,8 +1147,7 @@ pub fn read_event(body: &mut Bytes, dict: &Dict) -> Result<Event, CodecError> {
             FIELD_ATTRIBUTES => attributes = read_attr_map(field, dict)?,
             FIELD_LOG => log = Some(read_log_record(field, dict)?),
             FIELD_METRICS => {
-                metrics =
-                    read_record_list(field, |b| read_metric_record(b, dict))?.into_iter().collect();
+                read_record_list_into(field, |b| read_metric_record(b, dict), &mut metrics)?;
             }
             FIELD_SPAN => span = Some(read_span_record(field, dict)?),
             _unknown => { /* forward compatibility -- see this function's own doc comment */ }

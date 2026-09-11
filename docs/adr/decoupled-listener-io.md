@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-02
+updated: 2026-09-11
 ---
 
 # Decoupled listener I/O
@@ -181,6 +181,11 @@ pub trait Decoder {
     fn decode(&mut self, bytes: Bytes) -> Result<EventBatch, CodecError> { ... }
 }
 ```
+
+(Since [ADR `metrics-model-v2`](metrics-model-v2.md) gave `EventBatch` a batch-level `scope`, the
+return type is `Result<(Arc<Resource>, Option<Arc<Scope>>), CodecError>` -- the batch-level pair a
+frame decodes to, which `BatchAccumulator::absorb` keys on. The shape of the seam is otherwise as
+decided here.)
 
 The default `decode()` method is what kept this a zero-test-churn change: all ~28 existing call
 sites across `logit-inputs`/`logit-bench` kept compiling and passing unmodified, since `decode()`

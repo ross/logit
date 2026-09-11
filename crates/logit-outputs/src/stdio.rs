@@ -296,6 +296,33 @@ fn render_merged_attrs(out: &mut String, resource: &AttrMap, event: &AttrMap) {
     }
 }
 
+fn temporality_str(t: logit_core::Temporality) -> &'static str {
+    match t {
+        logit_core::Temporality::Delta => "delta",
+        logit_core::Temporality::Cumulative => "cumulative",
+    }
+}
+
+/// Shared by `Histogram`/`ExponentialHistogram`'s render arms: a trailing ` sum=/min=/max=`
+/// appended only for whichever of the three is actually `Some` -- a debug sink must never print a
+/// bare `sum=` for a metric that carried no sum, so absence renders as absence, not `sum=None`.
+fn render_optional_sum_min_max(
+    out: &mut String,
+    sum: Option<f64>,
+    min: Option<f64>,
+    max: Option<f64>,
+) {
+    if let Some(sum) = sum {
+        let _ = write!(out, " sum={sum}");
+    }
+    if let Some(min) = min {
+        let _ = write!(out, " min={min}");
+    }
+    if let Some(max) = max {
+        let _ = write!(out, " max={max}");
+    }
+}
+
 /// `<name> <kind-specific fields>`, plus a trailing ` unit=<unit>` when the metric has one.
 /// Single-valued kinds (`counter`/`gauge`) render as `kind=value`; multi-field kinds render the
 /// kind name followed by space-separated `field=value` pairs, matching the module doc comment's
@@ -304,9 +331,14 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
     render_key(out, resolve(metric.name));
     out.push(' ');
     match &metric.kind {
-        MetricKind::Counter(v) => {
-            out.push_str("counter=");
-            let _ = write!(out, "{v}");
+        MetricKind::Sum(s) => {
+            let _ = write!(
+                out,
+                "sum={} temporality={} monotonic={}",
+                s.value,
+                temporality_str(s.temporality),
+                s.monotonic
+            );
         }
         MetricKind::Gauge(v) => {
             out.push_str("gauge=");
@@ -336,17 +368,51 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
                 }
             }
         }
-        MetricKind::Histogram { buckets } => {
+        MetricKind::Samples(s) => {
+            out.push_str("samples=[");
+            for (i, v) in s.values.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                let _ = write!(out, "{v}");
+            }
+            let _ = write!(out, "] rate={}", s.sample_rate);
+        }
+        MetricKind::SetMembers(members) => {
+            out.push_str("set_members=[");
+            for (i, m) in members.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&String::from_utf8_lossy(m));
+            }
+            out.push(']');
+        }
+        MetricKind::Histogram(h) => {
             out.push_str("histogram");
-            for (bound, count) in buckets {
+            for (bound, count) in &h.buckets {
                 let _ = write!(out, " bucket_{bound}={count}");
             }
+            render_optional_sum_min_max(out, h.sum, h.min, h.max);
         }
-        MetricKind::Summary { quantiles } => {
+        MetricKind::ExponentialHistogram(e) => {
+            let _ = write!(
+                out,
+                "exp_histogram scale={} count={} zero={} pos={} neg={}",
+                e.scale,
+                e.count,
+                e.zero_count,
+                e.positive.1.len(),
+                e.negative.1.len()
+            );
+            render_optional_sum_min_max(out, e.sum, e.min, e.max);
+        }
+        MetricKind::Summary(s) => {
             out.push_str("summary");
-            for (q, v) in quantiles {
+            for (q, v) in &s.quantiles {
                 let _ = write!(out, " q{q}={v}");
             }
+            let _ = write!(out, " count={} sum={}", s.count, s.sum);
         }
         MetricKind::Set(_) => {
             // `HyperLogLog` is still a stub (`logit_core::metric::HyperLogLog`,
@@ -745,7 +811,7 @@ mod tests {
     use std::sync::Arc;
 
     fn batch_with(events: Vec<Event>) -> EventBatch {
-        EventBatch { resource: Arc::new(Resource::default()), events }
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
     }
 
     fn encode(events: Vec<Event>) -> String {
@@ -761,6 +827,9 @@ mod tests {
                 severity,
                 body_format: BodyFormat::Raw,
                 trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
             },
         )
     }
@@ -769,7 +838,7 @@ mod tests {
         Event::metric(
             ts,
             AttrMap::new(),
-            MetricRecord { name: logit_core::interner::intern(name), kind, unit: None },
+            MetricRecord::new(logit_core::interner::intern(name), kind),
         )
     }
 
@@ -787,6 +856,8 @@ mod tests {
                 events: vec![],
                 links: vec![],
                 end_timestamp: end,
+                flags: 0,
+                ext: None,
             },
         )
     }
@@ -838,8 +909,11 @@ mod tests {
 
     #[test]
     fn metrics_only_event_renders_a_metric_line_and_no_log_prefix() {
-        let out = encode(vec![metric_event(0, "nginx.requests", MetricKind::Counter(1.0))]);
-        assert_eq!(out, "1970-01-01T00:00:00.000000000Z\n  metric  nginx.requests counter=1\n");
+        let out = encode(vec![metric_event(0, "nginx.requests", MetricKind::counter(1.0))]);
+        assert_eq!(
+            out,
+            "1970-01-01T00:00:00.000000000Z\n  metric  nginx.requests sum=1 temporality=delta monotonic=true\n"
+        );
     }
 
     #[test]
@@ -864,10 +938,18 @@ mod tests {
             timestamp: 1_200_000_000,
             name: Value::str("retrying"),
             attributes: event_attrs,
+            dropped_attributes_count: 0,
         };
         let mut link_attrs = AttrMap::new();
         link_attrs.insert("relation", "follows_from");
-        let link = SpanLink { trace_id: [0xEF; 16], span_id: [0x12; 8], attributes: link_attrs };
+        let link = SpanLink {
+            trace_id: [0xEF; 16],
+            span_id: [0x12; 8],
+            attributes: link_attrs,
+            flags: 0,
+            trace_state: None,
+            dropped_attributes_count: 0,
+        };
         match &mut event.span {
             Some(span) => {
                 span.events.push(span_evt);
@@ -890,14 +972,16 @@ mod tests {
     #[test]
     fn mixed_log_and_metric_event_renders_both_sections() {
         let mut event = log_event(0, "GET /", Some(Severity::Info));
-        event.metrics.push(MetricRecord {
-            name: logit_core::interner::intern("nginx.requests"),
-            kind: MetricKind::Counter(1.0),
-            unit: None,
-        });
+        event.metrics.push(MetricRecord::new(
+            logit_core::interner::intern("nginx.requests"),
+            MetricKind::counter(1.0),
+        ));
         let out = encode(vec![event]);
         assert!(out.contains("log[info] \"GET /\""), "got: {out}");
-        assert!(out.contains("  metric  nginx.requests counter=1"), "got: {out}");
+        assert!(
+            out.contains("  metric  nginx.requests sum=1 temporality=delta monotonic=true"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -918,7 +1002,7 @@ mod tests {
         resource.attributes.insert("env", "staging");
         let mut event = Event::empty(0, AttrMap::new());
         event.attributes.insert("env", "prod");
-        let batch = EventBatch { resource: Arc::new(resource), events: vec![event] };
+        let batch = EventBatch { resource: Arc::new(resource), scope: None, events: vec![event] };
         let out = EventDump::default().render(&batch);
 
         assert!(out.contains(r#"host="web-1""#), "got: {out}");
@@ -937,10 +1021,12 @@ mod tests {
 
         let out_a = EventDump::default().render(&EventBatch {
             resource: Arc::new(resource_a),
+            scope: None,
             events: vec![Event::empty(0, AttrMap::new())],
         });
         let out_b = EventDump::default().render(&EventBatch {
             resource: Arc::new(resource_b),
+            scope: None,
             events: vec![Event::empty(0, AttrMap::new())],
         });
 
@@ -971,10 +1057,35 @@ mod tests {
         let out = encode(vec![metric_event(
             0,
             "resp.size",
-            MetricKind::Histogram { buckets: vec![(100.0, 5), (500.0, 2)] },
+            MetricKind::Histogram(logit_core::Histogram {
+                buckets: vec![(100.0, 5), (500.0, 2)],
+                temporality: logit_core::Temporality::Cumulative,
+                sum: None,
+                min: None,
+                max: None,
+            }),
         )]);
         assert!(out.contains("bucket_100=5"), "got: {out}");
         assert!(out.contains("bucket_500=2"), "got: {out}");
+        assert!(!out.contains("sum="), "no sum/min/max should render when absent: {out}");
+    }
+
+    #[test]
+    fn histogram_renders_sum_min_max_when_present() {
+        let out = encode(vec![metric_event(
+            0,
+            "resp.size",
+            MetricKind::Histogram(logit_core::Histogram {
+                buckets: vec![(100.0, 5)],
+                temporality: logit_core::Temporality::Cumulative,
+                sum: Some(42.0),
+                min: Some(1.0),
+                max: Some(99.0),
+            }),
+        )]);
+        assert!(out.contains("sum=42"), "got: {out}");
+        assert!(out.contains("min=1"), "got: {out}");
+        assert!(out.contains("max=99"), "got: {out}");
     }
 
     #[test]
@@ -982,9 +1093,62 @@ mod tests {
         let out = encode(vec![metric_event(
             0,
             "req.latency",
-            MetricKind::Summary { quantiles: vec![(0.99, 12.5)] },
+            MetricKind::Summary(logit_core::Summary {
+                quantiles: vec![(0.99, 12.5)],
+                count: 3,
+                sum: 40.0,
+            }),
         )]);
         assert!(out.contains("q0.99=12.5"), "got: {out}");
+        assert!(out.contains("count=3"), "got: {out}");
+        assert!(out.contains("sum=40"), "got: {out}");
+    }
+
+    #[test]
+    fn samples_renders_values_and_rate() {
+        let out = encode(vec![metric_event(
+            0,
+            "latency",
+            MetricKind::Samples(logit_core::Samples::new([1.0, 2.0])),
+        )]);
+        assert!(out.contains("samples=[1,2] rate=1"), "got: {out}");
+    }
+
+    #[test]
+    fn set_members_renders_as_lossy_utf8_strings() {
+        let out = encode(vec![metric_event(
+            0,
+            "unique_visitors",
+            MetricKind::SetMembers(vec![
+                bytes::Bytes::from_static(b"a"),
+                bytes::Bytes::from_static(b"b"),
+            ]),
+        )]);
+        assert!(out.contains("set_members=[a,b]"), "got: {out}");
+    }
+
+    #[test]
+    fn exponential_histogram_renders_shape_and_optional_sum_min_max() {
+        let out = encode(vec![metric_event(
+            0,
+            "resp.size",
+            MetricKind::ExponentialHistogram(logit_core::ExpHistogram {
+                scale: 3,
+                zero_count: 2,
+                zero_threshold: 0.0,
+                positive: (0, vec![1, 2, 3]),
+                negative: (0, vec![4, 5]),
+                temporality: logit_core::Temporality::Cumulative,
+                count: 10,
+                sum: Some(11.0),
+                min: Some(0.0),
+                max: Some(9.0),
+            }),
+        )]);
+        assert!(out.contains("exp_histogram scale=3 count=10 zero=2 pos=3 neg=2"), "got: {out}");
+        assert!(out.contains("sum=11"), "got: {out}");
+        assert!(out.contains("min=0"), "got: {out}");
+        assert!(out.contains("max=9"), "got: {out}");
     }
 
     #[test]
@@ -1017,15 +1181,14 @@ mod tests {
 
     #[test]
     fn unit_appears_when_present_and_is_absent_otherwise() {
-        let with_unit = encode(vec![Event::metric(
-            0,
-            AttrMap::new(),
-            MetricRecord {
-                name: logit_core::interner::intern("request_time"),
-                kind: MetricKind::Gauge(0.5),
-                unit: Some(logit_core::interner::intern("s")),
-            },
-        )]);
+        let with_unit = encode(vec![Event::metric(0, AttrMap::new(), {
+            let mut record = MetricRecord::new(
+                logit_core::interner::intern("request_time"),
+                MetricKind::Gauge(0.5),
+            );
+            record.unit = Some(logit_core::interner::intern("s"));
+            record
+        })]);
         assert!(with_unit.contains("unit=s"), "got: {with_unit}");
 
         let without_unit = encode(vec![metric_event(0, "request_time", MetricKind::Gauge(0.5))]);
@@ -1142,9 +1305,9 @@ mod tests {
     #[test]
     fn a_multi_event_batch_renders_one_block_per_event_in_batch_order() {
         let out = encode(vec![
-            metric_event(0, "first", MetricKind::Counter(1.0)),
-            metric_event(1, "second", MetricKind::Counter(2.0)),
-            metric_event(2, "third", MetricKind::Counter(3.0)),
+            metric_event(0, "first", MetricKind::counter(1.0)),
+            metric_event(1, "second", MetricKind::counter(2.0)),
+            metric_event(2, "third", MetricKind::counter(3.0)),
         ]);
         let first = out.find("first").unwrap();
         let second = out.find("second").unwrap();
@@ -1160,12 +1323,12 @@ mod tests {
 
         let mut output = StreamOutput::open_path(&path).expect("path should open");
         output
-            .send(&batch_with(vec![metric_event(0, "x", MetricKind::Counter(1.0))]))
+            .send(&batch_with(vec![metric_event(0, "x", MetricKind::counter(1.0))]))
             .await
             .expect("send should succeed");
 
         let contents = std::fs::read_to_string(&path).expect("file should exist and be readable");
-        assert!(contents.contains("x counter=1"), "got: {contents}");
+        assert!(contents.contains("x sum=1 temporality=delta monotonic=true"), "got: {contents}");
         std::fs::remove_file(&path).ok();
     }
 
@@ -1177,17 +1340,23 @@ mod tests {
 
         let mut output = StreamOutput::open_path(&path).expect("path should open");
         output
-            .send(&batch_with(vec![metric_event(0, "first", MetricKind::Counter(1.0))]))
+            .send(&batch_with(vec![metric_event(0, "first", MetricKind::counter(1.0))]))
             .await
             .expect("send should succeed");
         output
-            .send(&batch_with(vec![metric_event(0, "second", MetricKind::Counter(2.0))]))
+            .send(&batch_with(vec![metric_event(0, "second", MetricKind::counter(2.0))]))
             .await
             .expect("send should succeed");
 
         let contents = std::fs::read_to_string(&path).expect("file should exist and be readable");
-        assert!(contents.contains("first counter=1"), "got: {contents}");
-        assert!(contents.contains("second counter=2"), "got: {contents}");
+        assert!(
+            contents.contains("first sum=1 temporality=delta monotonic=true"),
+            "got: {contents}"
+        );
+        assert!(
+            contents.contains("second sum=2 temporality=delta monotonic=true"),
+            "got: {contents}"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -1227,7 +1396,7 @@ mod tests {
         let mut output =
             StreamOutput::open_path(&path).expect("path should open").with_telemetry(telemetry);
         output
-            .send(&batch_with(vec![metric_event(0, "x", MetricKind::Counter(1.0))]))
+            .send(&batch_with(vec![metric_event(0, "x", MetricKind::counter(1.0))]))
             .await
             .expect("send should succeed");
 
@@ -1239,10 +1408,10 @@ mod tests {
             .iter()
             .find_map(|e| {
                 e.metrics.iter().find_map(|m| match &m.kind {
-                    MetricKind::Counter(v)
+                    MetricKind::Sum(s)
                         if logit_core::interner::resolve(m.name) == "logit.output.batch.bytes" =>
                     {
-                        Some(*v)
+                        Some(s.value)
                     }
                     _ => None,
                 })
@@ -1264,7 +1433,7 @@ mod tests {
         let mut output = StreamOutput::open_path(&path).expect("path should open");
         for i in 0..20 {
             output
-                .send(&batch_with(vec![metric_event(0, "x", MetricKind::Counter(i as f64))]))
+                .send(&batch_with(vec![metric_event(0, "x", MetricKind::counter(i as f64))]))
                 .await
                 .expect("send should succeed");
         }
@@ -1298,11 +1467,11 @@ mod tests {
             .with_telemetry(telemetry);
 
         output
-            .send(&batch_with(vec![metric_event(0, "first", MetricKind::Counter(1.0))]))
+            .send(&batch_with(vec![metric_event(0, "first", MetricKind::counter(1.0))]))
             .await
             .expect("send should succeed");
         output
-            .send(&batch_with(vec![metric_event(0, "second", MetricKind::Counter(2.0))]))
+            .send(&batch_with(vec![metric_event(0, "second", MetricKind::counter(2.0))]))
             .await
             .expect("send should succeed");
 
@@ -1317,11 +1486,11 @@ mod tests {
             .iter()
             .find_map(|e| {
                 e.metrics.iter().find_map(|m| match &m.kind {
-                    MetricKind::Counter(v)
+                    MetricKind::Sum(s)
                         if logit_core::interner::resolve(m.name)
                             == "logit.output.file.rotations" =>
                     {
-                        Some(*v)
+                        Some(s.value)
                     }
                     _ => None,
                 })
@@ -1351,7 +1520,7 @@ mod tests {
             .with_telemetry(telemetry);
 
         output
-            .send(&batch_with(vec![metric_event(0, "first", MetricKind::Counter(1.0))]))
+            .send(&batch_with(vec![metric_event(0, "first", MetricKind::counter(1.0))]))
             .await
             .expect("send should succeed");
 
@@ -1360,17 +1529,17 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         output
-            .send(&batch_with(vec![metric_event(0, "second", MetricKind::Counter(2.0))]))
+            .send(&batch_with(vec![metric_event(0, "second", MetricKind::counter(2.0))]))
             .await
             .expect("send should still succeed even though the rename underneath it failed");
 
         let events = registry.drain(0);
         let rotations = events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Counter(v)
+                MetricKind::Sum(s)
                     if logit_core::interner::resolve(m.name) == "logit.output.file.rotations" =>
                 {
-                    Some(*v)
+                    Some(s.value)
                 }
                 _ => None,
             })
@@ -1388,10 +1557,10 @@ mod tests {
     fn stream_encoder_human_delegates_to_event_dump() {
         let mut encoder = StreamEncoder::human();
         let bytes = encoder
-            .encode(&batch_with(vec![metric_event(0, "x", MetricKind::Counter(1.0))]))
+            .encode(&batch_with(vec![metric_event(0, "x", MetricKind::counter(1.0))]))
             .expect("should encode");
         let text = String::from_utf8(bytes.to_vec()).expect("human output is always valid utf-8");
-        assert!(text.contains("x counter=1"), "got: {text}");
+        assert!(text.contains("x sum=1 temporality=delta monotonic=true"), "got: {text}");
     }
 
     /// Not just "it doesn't panic" -- decodes the frame with the real
@@ -1402,7 +1571,7 @@ mod tests {
     fn stream_encoder_native_round_trips_through_the_real_native_decoder() {
         let mut encoder = StreamEncoder::native(NativeCompression::None);
         let mut bytes = encoder
-            .encode(&batch_with(vec![metric_event(0, "x", MetricKind::Counter(1.0))]))
+            .encode(&batch_with(vec![metric_event(0, "x", MetricKind::counter(1.0))]))
             .expect("native encode should succeed");
 
         let (codec_id, mut payload) =
@@ -1412,8 +1581,8 @@ mod tests {
             logit_proto::native::decode_batch(&mut payload).expect("payload should decode");
         assert_eq!(decoded.events.len(), 1);
         match &decoded.events[0].metrics[0].kind {
-            MetricKind::Counter(v) => assert_eq!(*v, 1.0),
-            other => panic!("expected Counter, got {other:?}"),
+            MetricKind::Sum(s) => assert_eq!(s.value, 1.0),
+            other => panic!("expected Sum, got {other:?}"),
         }
     }
 
@@ -1459,11 +1628,11 @@ mod tests {
             .with_format(StreamEncoder::native(NativeCompression::None));
 
         output
-            .send(&batch_with(vec![metric_event(0, "first", MetricKind::Counter(1.0))]))
+            .send(&batch_with(vec![metric_event(0, "first", MetricKind::counter(1.0))]))
             .await
             .expect("send should succeed");
         output
-            .send(&batch_with(vec![metric_event(0, "second", MetricKind::Counter(2.0))]))
+            .send(&batch_with(vec![metric_event(0, "second", MetricKind::counter(2.0))]))
             .await
             .expect("send should succeed");
         assert!(rotated.exists(), "the first batch should have been rotated out to .1");

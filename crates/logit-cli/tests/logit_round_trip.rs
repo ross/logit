@@ -37,11 +37,14 @@ fn sample_batch() -> EventBatch {
             severity: Some(logit_core::Severity::Info),
             body_format: logit_core::BodyFormat::Raw,
             trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
         },
     );
     let mut resource = Resource::default();
     resource.attributes.insert("service.name", "roundtrip-service");
-    EventBatch { resource: Arc::new(resource), events: vec![event] }
+    EventBatch { resource: Arc::new(resource), scope: None, events: vec![event] }
 }
 
 /// Runs `input` in the background, sends `batch` through `output`, and returns every
@@ -71,21 +74,9 @@ async fn round_trip(
 
 fn assert_round_tripped(received: &[EventBatch], batch: &EventBatch) {
     assert_eq!(received.len(), 1, "one send should produce exactly one received batch");
-    let got = &received[0];
-    assert_eq!(got.events.len(), batch.events.len());
-    assert_eq!(
-        got.events[0].timestamp, batch.events[0].timestamp,
-        "the original timestamp should survive -- native ignores received_at by design"
-    );
-    assert_eq!(
-        got.events[0].log.as_ref().map(|l| &l.message),
-        batch.events[0].log.as_ref().map(|l| &l.message)
-    );
-    assert_eq!(
-        got.resource.attributes.get("service.name").and_then(|v| v.as_str()),
-        batch.resource.attributes.get("service.name").and_then(|v| v.as_str()),
-        "the resource attribute should have round-tripped"
-    );
+    // The native codec is exact (`EventBatch` derives `PartialEq` as of W1) -- a plain `assert_eq!`
+    // on the whole batch subsumes every field-by-field check this used to spell out by hand.
+    assert_eq!(&received[0], batch, "native round-trip should be exact");
 }
 
 /// Like [`round_trip`], but the listener's `Fanout` carries a component id and `output` is
@@ -218,7 +209,7 @@ async fn a_statsd_decoded_batch_forwards_through_logit_out_and_logit_in_with_its
     decoder
         .decode_into(Bytes::from_static(b"requests:1|c"), received_at, &mut events)
         .expect("a well-formed statsd line should decode");
-    let batch = EventBatch { resource, events };
+    let batch = EventBatch { resource, scope: None, events };
     assert_eq!(batch.events.len(), 1, "one statsd line should decode to one event");
 
     let addr = ephemeral_addr().await;

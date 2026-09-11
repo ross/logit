@@ -203,9 +203,10 @@ fn event_size() {
     assert_eq!(
         size_of::<Event>(),
         864,
-        "800 (pre-lossless-transit-v2 baseline) + the 16 bytes LogRecord grew by (72 -> 88) + \
-         the 8 bytes SpanRecord grew by (136 -> 144), both niche-free through their enclosing \
-         Option -- see docs/adr/metrics-model-v2.md and record_types above"
+        "800 (pre-metrics-model-v2 baseline) + 16 (LogRecord 72 -> 88) + 40 (MetricList 192 -> \
+         232, via MetricRecord 184 -> 224) + 8 (SpanRecord 136 -> 144); the two records stay \
+         niche-free through their enclosing Option -- see docs/adr/metrics-model-v2.md and \
+         record_types/metric_kind_is_sized_by_the_inlined_ddsketch above"
     );
 
     // The breakdown, asserted so it can't drift out of sync with the total above.
