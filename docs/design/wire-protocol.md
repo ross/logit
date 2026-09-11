@@ -153,6 +153,7 @@ hygiene against a torn write, not to support mixed-version readers and writers.
 | 4 | `start_timestamp` | `i64` LE |
 | 5 | `exemplars` | list of `Exemplar` TLV |
 | 6 | `kind` | `MetricKind` payload — kind tag (`u8`) + `len` (uvarint) + kind-specific body, see below |
+| 7 | `flags` | `u32` LE — OTLP `DataPointFlags` bitmask (bit 0 = `MetricRecord::FLAG_NO_RECORDED_VALUE`); skipped on the wire when `0`, same as every other default-valued field |
 
 **`Exemplar`**
 

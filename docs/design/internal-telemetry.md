@@ -75,9 +75,17 @@ resource it's handed, so `container.*` survives sitting downstream of it untouch
 InfluxDB tags (`crates/logit-outputs/src/influxdb.rs`'s `render_tag_suffix`) — so this attribute is
 also a tag on every `logit.*` series. That's why it's `service.name` alone and not
 `service.version`: a constant tag is a one-time, harmless addition to series identity, but a
-version would re-key every series on each release. `otel.scope.version` on the OTLP instrumentation
-scope (`crates/logit-proto/src/otlp/common.rs`'s `logit_scope`) already carries that information on
-the trace side without that cost.
+version would re-key every series on each release. The OTLP instrumentation scope carries that
+information on the trace side without that cost instead: `internal` stamps a real
+`Scope { name: "logit", version: env!("CARGO_PKG_VERSION") }` on every batch it sends
+(`crates/logit-inputs/src/internal.rs`'s `InternalInput::scope`), `Arc`-shared across the batch the
+same way its `resource` is. That's the one real producer of this identity -- it's what an earlier
+codec revision used to *invent* on `otlp_out` for any OTLP-sourced batch with no wire scope of its
+own, until W4 retired that fabrication everywhere else (`crates/logit-proto/src/otlp/common.rs`'s
+`scope_to_pb`/`pb_to_scope`, [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)): a batch with
+`scope: None` now encodes an empty `InstrumentationScope` (empty name), never a fabricated
+`"logit"`/version. `internal` is the one input with a genuine claim to that identity, so it stamps
+it itself rather than relying on a codec default.
 
 ## The emit API
 

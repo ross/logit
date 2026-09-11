@@ -23,9 +23,10 @@ impl Resource {
 }
 
 /// The instrumentation scope a batch's events were reported through -- OTLP's `InstrumentationScope`
-/// (a name/version pair, e.g. `"nginx-otel-module"`/`"1.0.0"`), moved to the batch level rather
-/// than the well-known `otel.scope.*` attributes it used to ride as (`docs/adr/lossless-transit.md`
-/// retires those). `None` means no scope was reported or carried -- most non-OTLP producers.
+/// (a name/version pair, e.g. `"nginx-otel-module"`/`"1.0.0"`), carried at the batch level rather
+/// than duplicated onto every event's own attributes the way an earlier, since-retired convention
+/// did (`docs/adr/lossless-transit.md`). `None` means no scope was reported or carried -- most
+/// non-OTLP producers.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Scope {
     pub name: Bytes,

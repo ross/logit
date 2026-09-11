@@ -18,22 +18,27 @@
 //!   decodes back as `Value::I64`, not `Value::Timestamp`.
 //!
 //! **Nesting.** A batch's single `Arc<Resource>` becomes one `Resource*` message
-//! ([`resource_to_pb`]/[`pb_to_resource`]); every signal stamps one fixed
-//! `InstrumentationScope { name: "logit", version: env!("CARGO_PKG_VERSION") }`
-//! ([`logit_scope`]). On decode, scope name/version land as `otel.scope.name`/`otel.scope.version`
-//! attributes ([`scope_attrs`]), a base every record's own attributes are layered onto
-//! (`AttrMap::insert`'s overwrite-on-collision semantics mean a data-point-level attribute always
-//! wins over a same-named scope one). Resource attributes are never copied into `Event::attributes`
-//! at all -- they stay on `EventBatch::resource`, `Arc`-shared across every event exactly the way
-//! every other codec in this crate already treats a batch's resource (see `crates/logit-core/src/
-//! event.rs`). A downstream consumer that wants the full resource → scope → data-point precedence
-//! merge-joins resource and event attributes at the point it renders them, the same way
-//! `crates/logit-outputs/src/influxdb.rs`'s `render_tag_suffix` already does for line-protocol tags.
+//! ([`resource_to_pb`]/[`pb_to_resource`]), carrying the resource's own `dropped_attributes_count`
+//! and (at the wrapping `Resource*` message's own `schema_url` field, not part of the `Resource`
+//! message itself) its `schema_url`. A batch's single `Option<Arc<Scope>>` becomes one `Scope*`
+//! message the same way ([`scope_to_pb`]/[`pb_to_scope`]): `batch.scope == None` encodes an empty
+//! `InstrumentationScope` (empty name -- never a fabricated `"logit"`/version; see `../mod.rs`'s own
+//! doc for why nothing invents an identity that was never there), never a fixed, hardcoded scope.
+//! Decode groups every `(Resource*, Scope*)` pair in a request into its own `EventBatch` -- see
+//! `../mod.rs`'s own "Nesting" note for the full grouping rule and why a request with several scopes
+//! under one resource decodes to several batches, never flattened into one. Resource attributes are
+//! never copied into `Event::attributes` at all -- they stay on `EventBatch::resource`, `Arc`-shared
+//! across every event exactly the way every other codec in this crate already treats a batch's
+//! resource (see `crates/logit-core/src/event.rs`); the same is true of scope attributes, which now
+//! live on `EventBatch::scope` rather than being copied per event. A downstream consumer that wants
+//! the full resource → scope → data-point precedence merge-joins resource, scope, and event
+//! attributes at the point it renders them, the same way `crates/logit-outputs/src/influxdb.rs`'s
+//! `render_tag_suffix` already does for line-protocol tags.
 
 use crate::otlp::generated::opentelemetry::proto::common::v1 as pb;
 use bytes::Bytes;
 use logit_core::interner::resolve;
-use logit_core::{AttrMap, Resource, Value};
+use logit_core::{AttrMap, Resource, Scope, Value};
 
 /// Converts one [`Value`] into an [`pb::AnyValue`]. See the module doc for the two lossy cases.
 pub(crate) fn value_to_any_value(value: &Value) -> pb::AnyValue {
@@ -116,32 +121,23 @@ pub(crate) fn key_values_into_attrs(kvs: Vec<pb::KeyValue>, attrs: &mut AttrMap)
     }
 }
 
-/// The one `InstrumentationScope` every encoded request stamps. Not configurable -- there is
-/// exactly one `logit` producing this data, so there is exactly one scope.
-pub(crate) fn logit_scope() -> pb::InstrumentationScope {
-    pb::InstrumentationScope {
-        name: "logit".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        attributes: Vec::new(),
-        dropped_attributes_count: 0,
-    }
+/// A textual OTLP field (`schema_url`, `InstrumentationScope.name`/`.version`) stored as `Bytes`
+/// on `logit`'s own model -- lossy only in the sense any non-UTF-8 byte sequence a well-behaved
+/// producer would never send becomes the Unicode replacement character, the same tradeoff
+/// `Value::Str`'s own "always valid UTF-8" contract already makes throughout this crate.
+pub(crate) fn bytes_to_string(bytes: &Bytes) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// The `otel.scope.name`/`otel.scope.version` + scope-level attributes base every record in one
-/// `ScopeLogs`/`ScopeSpans`/`ScopeMetrics` group starts from -- cloned once per record, then
-/// overlaid with that record's own attributes (see the module doc's precedence note).
-pub(crate) fn scope_attrs(scope: &Option<pb::InstrumentationScope>) -> AttrMap {
-    let mut attrs = AttrMap::new();
-    if let Some(scope) = scope {
-        if !scope.name.is_empty() {
-            attrs.insert("otel.scope.name", scope.name.as_str());
-        }
-        if !scope.version.is_empty() {
-            attrs.insert("otel.scope.version", scope.version.as_str());
-        }
-        key_values_into_attrs(scope.attributes.clone(), &mut attrs);
+/// The inverse of [`bytes_to_string`]: an empty string is "unset" (`None`), matching every other
+/// `Option<Bytes>` field in the model (`Resource::schema_url`, `Scope::schema_url`, `SpanExt`'s own
+/// fields) where the wire's empty-string convention and the model's `None` convention agree.
+pub(crate) fn string_to_bytes(s: String) -> Option<Bytes> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(Bytes::from(s))
     }
-    attrs
 }
 
 pub(crate) fn resource_to_pb(
@@ -149,19 +145,85 @@ pub(crate) fn resource_to_pb(
 ) -> crate::otlp::generated::opentelemetry::proto::resource::v1::Resource {
     crate::otlp::generated::opentelemetry::proto::resource::v1::Resource {
         attributes: attrs_to_key_values(&resource.attributes),
-        dropped_attributes_count: 0,
+        dropped_attributes_count: resource.dropped_attributes_count,
         entity_refs: Vec::new(),
     }
 }
 
+/// `schema_url` is the wrapping `Resource*` message's own field (`ResourceLogs.schema_url` etc.),
+/// not part of the inner `Resource` message itself -- see the module doc's "Nesting" note -- so it
+/// arrives as a separate parameter rather than living on `resource`.
 pub(crate) fn pb_to_resource(
     resource: Option<crate::otlp::generated::opentelemetry::proto::resource::v1::Resource>,
+    schema_url: &str,
 ) -> Resource {
     let mut attrs = AttrMap::new();
+    let mut dropped_attributes_count = 0;
     if let Some(resource) = resource {
         key_values_into_attrs(resource.attributes, &mut attrs);
+        dropped_attributes_count = resource.dropped_attributes_count;
     }
-    Resource { attributes: attrs, dropped_attributes_count: 0, schema_url: None }
+    Resource {
+        attributes: attrs,
+        dropped_attributes_count,
+        schema_url: string_to_bytes(schema_url.to_string()),
+    }
+}
+
+/// One `EventBatch`'s `Option<Arc<Scope>>` -> the one `InstrumentationScope` its request carries.
+/// `None` (no OTLP-sourced scope at all) becomes an empty `InstrumentationScope` -- empty name,
+/// nothing invented -- never a fabricated `"logit"`/version identity (`../mod.rs`'s own doc, and
+/// `docs/adr/lossless-transit.md`'s retirement of that convention).
+pub(crate) fn scope_to_pb(scope: Option<&Scope>) -> pb::InstrumentationScope {
+    match scope {
+        None => pb::InstrumentationScope::default(),
+        Some(scope) => pb::InstrumentationScope {
+            name: bytes_to_string(&scope.name),
+            version: bytes_to_string(&scope.version),
+            attributes: attrs_to_key_values(&scope.attributes),
+            dropped_attributes_count: scope.dropped_attributes_count,
+        },
+    }
+}
+
+/// The mirror of [`scope_to_pb`]. `schema_url` is the wrapping `Scope*` message's own field
+/// (`ScopeLogs.schema_url` etc.), same reasoning as [`pb_to_resource`]'s own `schema_url`
+/// parameter.
+/// `None` when the wire scope is entirely empty -- no `InstrumentationScope` message at all, or
+/// one with an empty name/version, no attributes, and `dropped_attributes_count == 0` -- **and**
+/// the wrapping `Scope*` message's own `schema_url` is also empty. An all-empty scope on the wire
+/// is indistinguishable from "no scope was ever there" (both encode identically via
+/// [`scope_to_pb`]/an empty `schema_url` string), so decode has to collapse them to the same
+/// result: otherwise `EventBatch { scope: None, .. }` -- every statsd/syslog/native-sourced batch,
+/// none of which ever had an OTLP scope to begin with -- would not be a decode/encode fixed point
+/// (`docs/adr/lossless-transit.md`'s round-trip requirement).
+pub(crate) fn pb_to_scope(
+    scope: Option<pb::InstrumentationScope>,
+    schema_url: &str,
+) -> Option<Scope> {
+    let mut attributes = AttrMap::new();
+    let (name, version, dropped_attributes_count) = match scope {
+        Some(scope) => {
+            key_values_into_attrs(scope.attributes, &mut attributes);
+            (scope.name, scope.version, scope.dropped_attributes_count)
+        }
+        None => (String::new(), String::new(), 0),
+    };
+    if name.is_empty()
+        && version.is_empty()
+        && attributes.is_empty()
+        && dropped_attributes_count == 0
+        && schema_url.is_empty()
+    {
+        return None;
+    }
+    Some(Scope {
+        name: Bytes::from(name),
+        version: Bytes::from(version),
+        attributes,
+        dropped_attributes_count,
+        schema_url: string_to_bytes(schema_url.to_string()),
+    })
 }
 
 #[cfg(test)]
@@ -236,20 +298,82 @@ mod tests {
     }
 
     #[test]
-    fn scope_name_and_version_land_as_prefixed_attributes() {
-        let scope = Some(pb::InstrumentationScope {
-            name: "logit".to_string(),
-            version: "0.1.0".to_string(),
-            attributes: Vec::new(),
-            dropped_attributes_count: 0,
-        });
-        let attrs = scope_attrs(&scope);
-        assert_eq!(attrs.get("otel.scope.name").and_then(|v| v.as_str()), Some("logit"));
-        assert_eq!(attrs.get("otel.scope.version").and_then(|v| v.as_str()), Some("0.1.0"));
+    fn a_none_scope_encodes_as_an_empty_instrumentation_scope_not_a_fabricated_identity() {
+        let pb_scope = scope_to_pb(None);
+        assert_eq!(pb_scope.name, "", "must never invent a \"logit\" scope identity");
+        assert_eq!(pb_scope.version, "");
+        assert!(pb_scope.attributes.is_empty());
+        assert_eq!(pb_scope.dropped_attributes_count, 0);
     }
 
     #[test]
-    fn a_missing_scope_produces_no_scope_attributes() {
-        assert!(scope_attrs(&None).is_empty());
+    fn a_populated_scope_round_trips_through_pb_and_back() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("k", "v");
+        let scope = Scope {
+            name: Bytes::from_static(b"nginx-otel-module"),
+            version: Bytes::from_static(b"1.0.0"),
+            attributes: attrs,
+            dropped_attributes_count: 3,
+            schema_url: Some(Bytes::from_static(b"https://example.com/schema")),
+        };
+        let pb_scope = scope_to_pb(Some(&scope));
+        assert_eq!(pb_scope.name, "nginx-otel-module");
+        assert_eq!(pb_scope.version, "1.0.0");
+        assert_eq!(pb_scope.dropped_attributes_count, 3);
+
+        let decoded = pb_to_scope(Some(pb_scope), "https://example.com/schema");
+        assert_eq!(decoded, Some(scope));
+    }
+
+    #[test]
+    fn a_missing_scope_message_decodes_to_a_default_scope_but_keeps_a_present_schema_url() {
+        // The wrapping Scope* message's own schema_url is independent of whether an
+        // InstrumentationScope message itself was present -- see pb_to_scope's own doc comment. A
+        // present schema_url alone is enough to keep this from collapsing to None.
+        let decoded = pb_to_scope(None, "https://example.com/schema")
+            .expect("a present schema_url must not collapse to None");
+        assert_eq!(decoded.name, Bytes::new());
+        assert_eq!(decoded.version, Bytes::new());
+        assert!(decoded.attributes.is_empty());
+        assert_eq!(decoded.schema_url, Some(Bytes::from_static(b"https://example.com/schema")));
+    }
+
+    /// The fixed-point half of the same rule: a wire scope that is entirely empty -- no message
+    /// at all, or one whose every field is the zero/empty value -- and an empty wrapping
+    /// `schema_url` must decode to `None`, not `Some(Scope::default())`, or
+    /// `EventBatch { scope: None, .. }` (every statsd/syslog/native-sourced batch) would not
+    /// survive an OTLP decode/encode round trip.
+    #[test]
+    fn a_fully_empty_scope_and_schema_url_decodes_to_none() {
+        assert_eq!(pb_to_scope(None, ""), None);
+        assert_eq!(
+            pb_to_scope(Some(pb::InstrumentationScope::default()), ""),
+            None,
+            "an explicitly-present but all-default InstrumentationScope message is still \
+             indistinguishable from no scope at all"
+        );
+    }
+
+    #[test]
+    fn resource_dropped_attributes_count_and_schema_url_round_trip() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("service.name", "orders-api");
+        let resource = Resource {
+            attributes: attrs,
+            dropped_attributes_count: 5,
+            schema_url: Some(Bytes::from_static(b"https://example.com/schema")),
+        };
+        let pb_resource = resource_to_pb(&resource);
+        assert_eq!(pb_resource.dropped_attributes_count, 5);
+
+        let decoded = pb_to_resource(Some(pb_resource), "https://example.com/schema");
+        assert_eq!(decoded, resource);
+    }
+
+    #[test]
+    fn a_missing_resource_schema_url_decodes_to_none() {
+        let decoded = pb_to_resource(None, "");
+        assert_eq!(decoded.schema_url, None);
     }
 }

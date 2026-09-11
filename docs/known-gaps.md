@@ -880,9 +880,8 @@ already built that have a known, accepted rough edge.
 - **Cross-protocol semantic gaps.** OTLP (`crates/logit-proto/src/otlp/`) is `logit`'s first
   *second* wire model, and its codec is the first place "our internal model can't cleanly express
   what a peer protocol expects" shows up as more than a one-line doc-comment footnote. Filed as its
-  own entry, meant to grow as more codecs and more of OTLP's own surface (exemplars, profiles,
-  OTLP's log `event_name`, ...) get real mappings, rather than re-discovered by grepping doc
-  comments across encoders each time. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md);
+  own entry, meant to grow as more codecs and more of OTLP's own surface (profiles, ...) get real
+  mappings, rather than re-discovered by grepping doc comments across encoders each time. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md);
   see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream. Every
   mapping below is deliberate, counted, and documented at its own call site — this entry exists so
   the list is in one place too:
@@ -894,15 +893,21 @@ already built that have a known, accepted rough edge.
   | encode | `Value::U64` above `i64::MAX` → OTLP `AnyValue.DoubleValue` | none (numeric, not a metric point) | OTLP's only integer type is signed 64-bit; exact up to `f64`'s 2^53 range, approximate above it. Any `Value::U64` (even in range) also loses the "this was unsigned" fact on decode, coming back as `Value::I64` — `otlp/common.rs`'s module doc has the full case list. |
   | encode | `Value::Timestamp` → OTLP `AnyValue.IntValue` | none | OTLP's `AnyValue` has no timestamp variant at all; decodes back as `Value::I64`, indistinguishable from a value that was always an integer. |
   | encode | `MetricKind::Samples` (raw statsd `ms`/`h`/`d` observations) → OTLP `Summary` of 5 fixed quantiles (p50/p75/p90/p95/p99), sketched into a temporary `DdSketch` first | `logit.output.metrics.degraded{metric_kind="samples"}` | Same shape as the `Distribution` row above — OTLP has no raw-sample-list metric type either, so `otlp_out` sketches first (`add_weighted` per value, weighted by `(1/sample_rate).round()` clamped to `[1, 1000]`) and takes the same degraded path ([ADR `metrics-model-v2`](adr/metrics-model-v2.md)). |
-  | decode | any OTLP data point with `flags & DATA_POINT_FLAGS_NO_RECORDED_VALUE_MASK` → skipped | `logit.input.metrics.skipped{metric_kind, reason="no_recorded_value"}` | Never fails the whole request — OTLP has its own channel for reporting rejected points back (`partial_success`), wired in PR3, not invented here as a second one. |
+  | encode | `MetricRecord.exemplars` on a `Summary` point → dropped | none (documented) | `SummaryDataPoint` has no `exemplars` field on the wire at all (OTLP spec) — every other kind (`Sum`/`Gauge`/`Histogram`/`ExponentialHistogram`) carries them onto the wire; a `Samples`/`Distribution` degrading into a `Summary` loses its exemplars for the same structural reason (`crates/logit-proto/src/otlp/metrics.rs`'s module doc). |
 
-  One residual, narrower gap in the same codec, not yet worth its own table row: `BodyFormat`/a
-  span's `Status.message` have no OTLP field of their own and round-trip through a reserved
-  attribute (`logit.body_format`, `otel.status_message`) instead — lossless, just an
-  attribute-shaped workaround, documented in `otlp/logs.rs`'s and `otlp/traces.rs`'s own module
-  docs. (A bare `LogRecord`'s OTLP `trace_id`/`span_id`/`flags` fields used to be filed here too —
+  One residual, narrower gap in the same codec, not yet worth its own table row: `BodyFormat` has
+  no OTLP field of its own and round-trips through a reserved attribute (`logit.body_format`)
+  instead — lossless, just an attribute-shaped workaround, documented in `otlp/logs.rs`'s own module
+  doc; [ADR `lossless-transit`](adr/lossless-transit.md) rule (c) names it the standing example of a
+  `logit`-only concept with nowhere else on the wire to go, so unlike the rows closed below this one
+  stays. (A bare `LogRecord`'s OTLP `trace_id`/`span_id`/`flags` fields used to be filed here too —
   closed, `logit_core::LogRecord::trace` now carries them,
-  [ADR `log-record-trace-context`](adr/log-record-trace-context.md).)
+  [ADR `log-record-trace-context`](adr/log-record-trace-context.md). A span's `Status.message` was
+  the same shape — closed in W4 too: `SpanRecord.ext`'s boxed `SpanExt.status_message`
+  ([ADR `metrics-model-v2`](adr/metrics-model-v2.md)) is a real field now, and `otlp/traces.rs` no
+  longer stamps or reads `otel.status_message`. A `NO_RECORDED_VALUE`-flagged data point used to be
+  skipped on decode too — closed the same amendment: `MetricRecord.flags` carries the bit forward
+  and the point round-trips instead of being dropped.)
 
   Both `Distribution`→`Summary` and `Set`→skip are a real, if narrow, qualification of
   [ADR `native-wire-format-with-otlp-bridge`](adr/native-wire-format-with-otlp-bridge.md)'s claim that the internal model "must
@@ -921,8 +926,11 @@ already built that have a known, accepted rough edge.
   count today — only a self-telemetry counter (`logit.input.metrics.skipped{metric_kind, reason}`)
   — so there's nothing for `otlp_in` to echo back into the wire response yet: every successful
   decode replies with an empty (all-default, meaning "fully accepted") `partial_success`, even when
-  the request silently skipped a metric point internally (an over-cap exponential histogram, a
-  `NO_RECORDED_VALUE`-flagged point). A fully malformed request (bad protobuf, an invalid span id)
+  the request silently skipped a metric point internally — the one remaining case is a `Metric`
+  whose `data` oneof isn't set at all (`crates/logit-proto/src/otlp/metrics.rs::decode_metric`'s
+  `None => Vec::new()` arm); an over-cap exponential histogram and a `NO_RECORDED_VALUE`-flagged
+  point both round-trip in full now and are no longer examples of this (W4,
+  [ADR `metrics-model-v2`](adr/metrics-model-v2.md)). A fully malformed request (bad protobuf, an invalid span id)
   still correctly fails the *whole* request (`400`/`grpc-status: 3`), which is the one shape
   `otlp_in`'s response *does* reflect today. Threading a real per-call count through would be a
   `SignalDecoder` API change (`crates/logit-proto`), out of scope for the PR that added `otlp_in`
@@ -1081,7 +1089,11 @@ already built that have a known, accepted rough edge.
   timestamp of its own to trust. Receipt time isn't a repo-wide invariant either: `otlp_in`
   independently prefers a record's own `time_unix_nano` when the sender set one, falling back to
   `observed_time_unix_nano` only for the zero "unknown" sentinel — a wire format that carries an
-  origin timestamp is trusted for it.
+  origin timestamp is trusted for it. `observed_time_unix_nano` itself is preserved the same way,
+  both directions: decode copies it onto `LogRecord.observed_timestamp` verbatim (`0` stays `0`),
+  and encode prefers that field over the wall clock whenever it is non-zero — what makes
+  `otlp_in -> otlp_out` a fixed point for this field too (`otlp/logs.rs`'s module doc,
+  [ADR `metrics-model-v2`](adr/metrics-model-v2.md)'s W4 amendment).
 - **No per-input stream filter on `docker_in`** — an operator who wants only `stdout` (or only
   `stderr`) needs a downstream stage reading `log.iostream` themselves (`demo/logit.yaml`'s
   `nginx_stdout`, an inline `lua` component, is the worked example), not a config field on

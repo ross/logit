@@ -1,27 +1,33 @@
 //! `MetricRecord` ↔ OTLP `Metric` -- the hard direction, both ways.
 //!
-//! **Encode.** `start_time_unix_nano` and `time_unix_nano` are both stamped with
-//! `Event::timestamp`: `MetricRecord::start_timestamp` mapping is W4's, not this module's yet
-//! (still `0`/unknown on everything this crate itself produces). Event attributes become the data
-//! point's attributes; the metric name/unit come from the `MetricRecord` itself. One `MetricRecord`
-//! becomes exactly one OTLP `Metric` with exactly one data point -- this does **not** coalesce
-//! same-named metrics across events into one wire-level `Metric.data_points` list the way a
-//! canonical OTLP producer would. That's spec-legal (multiple `Metric` entries sharing a name is
-//! explicitly permitted; most consumers -- including this crate's own decoder -- treat them as more
-//! points of the same series) and keeps this mapping a pure per-record function instead of a
-//! batch-wide grouping pass.
+//! **Encode.** `time_unix_nano` is stamped with `Event::timestamp`; `start_time_unix_nano` is
+//! `record.start_timestamp` when non-zero, else `Event::timestamp` (`start_timestamp == 0` is
+//! this model's own "unknown" convention, same as OTLP's). `record.flags` (OTLP `DataPointFlags`,
+//! e.g. `NO_RECORDED_VALUE`) is written into every data point's own `flags`. `record.description`
+//! resolves onto `Metric.description` when `Some`, else the wire field stays empty. Event
+//! attributes become the data point's attributes; the metric name/unit come from the
+//! `MetricRecord` itself. One `MetricRecord` becomes exactly one OTLP `Metric` with exactly one
+//! data point -- this does **not** coalesce same-named metrics across events into one wire-level
+//! `Metric.data_points` list the way a canonical OTLP producer would. That's spec-legal (multiple
+//! `Metric` entries sharing a name is explicitly permitted; most consumers -- including this
+//! crate's own decoder -- treat them as more points of the same series) and keeps this mapping a
+//! pure per-record function instead of a batch-wide grouping pass.
 //!
 //! | `MetricKind` | Encodes to | Fidelity |
 //! |---|---|---|
-//! | `Sum{value,temporality,monotonic}` | `Sum{temporality,monotonic}` | exact -- both flags ride real fields now, not a well-known attribute |
-//! | `Gauge(v)` | `Gauge` | exact |
+//! | `Sum{value,temporality,monotonic}` | `Sum{temporality,monotonic}` | exact -- both flags ride real fields now, not a well-known attribute; carries `record.exemplars` |
+//! | `Gauge(v)` | `Gauge` | exact; carries `record.exemplars` |
 //! | `Histogram{buckets,temporality,sum,min,max}` | `Histogram{temporality,sum,min,max}` | exact -- `buckets` is already per-bucket, not
 //! |   |   | cumulative (`metric.rs`'s doc comment, which describes the *count per bucket*, not the
 //! |   |   | series' own temporality); a trailing `f64::INFINITY` bound becomes the implicit final
-//! |   |   | bucket OTLP's `explicit_bounds` convention expects. |
+//! |   |   | bucket OTLP's `explicit_bounds` convention expects; carries `record.exemplars`. |
 //! | `ExponentialHistogram(e)` | `ExponentialHistogram` | exact -- 1:1 field mapping, kept as its own
-//! |   |   | variant specifically so `otlp_in -> otlp_out` is a fixed point for this type. |
-//! | `Summary{quantiles,count,sum}` | `Summary{count,sum}` | exact |
+//! |   |   | variant specifically so `otlp_in -> otlp_out` is a fixed point for this type; carries `record.exemplars`. |
+//! | `Summary{quantiles,count,sum}` | `Summary{count,sum}` | exact on `quantiles`/`count`/`sum` --
+//! |   |   | **but `record.exemplars` is dropped**: `SummaryDataPoint` has no `exemplars` field on
+//! |   |   | the wire at all (OTLP spec), so this is a genuine, documented degradation, not this
+//! |   |   | module's choice. A `Samples`/`Distribution` degrading into a `Summary` below loses its
+//! |   |   | exemplars for the same reason. |
 //! | `Samples(s)` | `Summary` of 5 fixed quantiles (p50/p75/p90/p95/p99) | **Lossy, deliberately**
 //! |   |   | -- sketched into a temporary `DdSketch` first (`add_weighted` per value, weighted by
 //! |   |   | `(1/sample_rate).round()` clamped to `[1, 1000]`), then takes the same degraded path
@@ -52,33 +58,38 @@
 //! `ExponentialHistogram` 1:1 (scale, zero_count, zero_threshold, positive/negative
 //! offset+bucket_counts, temporality, count, sum/min/max) -- no bucket materialization, no
 //! `MAX_DERIVED_BUCKETS` cap, since the variant now carries the wire shape directly instead of
-//! deriving explicit bounds from it.
+//! deriving explicit bounds from it. `start_time_unix_nano` → `record.start_timestamp` verbatim
+//! (`0` stays `0`, this model's own "unknown" convention). `Metric.description`, when non-empty,
+//! interns onto `record.description`. A data point's `exemplars` decode onto `record.exemplars`
+//! for every kind that carries them on the wire (`Sum`/`Gauge`/`Histogram`/`ExponentialHistogram`
+//! -- `SummaryDataPoint` has none, per the encode table above).
 //!
-//! Any point with `flags & DATA_POINT_FLAGS_NO_RECORDED_VALUE_MASK` set is skipped and counted,
-//! never fails the whole request -- OTLP has its own channel for reporting this back
-//! (`partial_success`), wired in PR3.
+//! **`NO_RECORDED_VALUE` keeps the point, flagged, rather than skipping it.** A data point with
+//! `DataPointFlags::FLAG_NO_RECORDED_VALUE` set (bit 0 of `flags`) decodes like any other point --
+//! `record.flags` carries the bit forward and the point's numeric value decodes exactly as sent
+//! (typically the wire's own zero value for a flagged point, since a well-behaved producer has
+//! nothing meaningful to put there) -- rather than being silently dropped. This is what makes
+//! `otlp_in -> otlp_out` a fixed point for a flagged point: encode below writes `record.flags`
+//! back onto the re-encoded data point unchanged. `docs/adr/metrics-model-v2.md`'s W4 amendment.
 //!
-//! `MetricRecord`'s other new fields (`description`, `start_timestamp`, `exemplars`) are filled
-//! with their defaults on decode (`None`/`0`/empty) and ignored on encode -- mapping them is W4's,
-//! not this module's yet.
+//! `Metric.metadata` stays dropped both ways -- nothing in this model has anywhere to put a
+//! metric-level (not data-point-level) attribute set, and OTLP itself documents it as informational
+//! only (`metrics.proto`: "Consumers SHOULD NOT need to be aware of these attributes").
 //!
-//! Decode-side skips count via `logit.input.metrics.skipped{metric_kind, reason}` -- distinct
-//! names from the encode side's `logit.output.metrics.{degraded,skipped}` since these are the two
-//! directions of one component (`OtlpEncoder`/`OtlpDecoder`), not two components sharing counters.
+//! Decode-side skips (a malformed point, an unrecognized oneof) count via
+//! `logit.input.metrics.skipped{metric_kind, reason}` -- distinct names from the encode side's
+//! `logit.output.metrics.{degraded,skipped}` since these are the two directions of one component
+//! (`OtlpEncoder`/`OtlpDecoder`), not two components sharing counters.
 
 use crate::otlp::common;
 use crate::otlp::generated::opentelemetry::proto::metrics::v1 as pb;
 use logit_core::interner::{intern, resolve};
 use logit_core::{
-    DdSketch, Diagnostics, Event, ExpHistogram, Histogram, MetricKind, MetricRecord, Sum, Summary,
-    Telemetry, Temporality,
+    AttrMap, DdSketch, Diagnostics, Event, Exemplar, ExpHistogram, Histogram, MetricKind,
+    MetricRecord, Sum, Summary, Telemetry, Temporality, TraceRef,
 };
 
 const DISTRIBUTION_QUANTILES: [f64; 5] = [0.5, 0.75, 0.90, 0.95, 0.99];
-
-fn no_recorded_value(flags: u32) -> bool {
-    flags & 1 != 0 // DATA_POINT_FLAGS_NO_RECORDED_VALUE_MASK
-}
 
 fn temporality_to_pb(t: Temporality) -> i32 {
     match t {
@@ -97,17 +108,70 @@ fn temporality_from_pb(raw: i32) -> Temporality {
     }
 }
 
+/// `record.start_timestamp` if non-zero, else `ts` (`Event::timestamp`) -- OTLP's own
+/// `start_time_unix_nano` convention for "unknown" (`0`) matches this model's, so there is no
+/// separate sentinel to translate.
+fn start_time(record_start: i64, ts: u64) -> u64 {
+    if record_start != 0 {
+        record_start.max(0) as u64
+    } else {
+        ts
+    }
+}
+
+fn encode_exemplar(e: &Exemplar) -> pb::Exemplar {
+    let (trace_id, span_id) = match &e.trace {
+        Some(t) => (t.trace_id.to_vec(), t.span_id.map(|id| id.to_vec()).unwrap_or_default()),
+        None => (Vec::new(), Vec::new()),
+    };
+    pb::Exemplar {
+        filtered_attributes: common::attrs_to_key_values(&e.filtered_attributes),
+        time_unix_nano: e.timestamp.max(0) as u64,
+        span_id,
+        trace_id,
+        value: Some(pb::exemplar::Value::AsDouble(e.value)),
+    }
+}
+
+/// `trace`/`span` id bytes become a [`TraceRef`] only when `trace_id` is a genuine, non-empty,
+/// non-all-zero 16 bytes -- [`TraceRef::from_bytes`]'s own validity rule (the same one
+/// `../logs.rs` applies to a `LogRecord`'s trace context), since an `Exemplar`'s correlation is
+/// optional, best-effort metadata a decoder degrades gracefully without.
+fn decode_exemplar(e: pb::Exemplar) -> Exemplar {
+    let value = match e.value {
+        Some(pb::exemplar::Value::AsDouble(d)) => d,
+        Some(pb::exemplar::Value::AsInt(i)) => i as f64,
+        None => 0.0,
+    };
+    let trace = TraceRef::from_bytes(&e.trace_id, &e.span_id, 0);
+    let mut filtered_attributes = AttrMap::new();
+    common::key_values_into_attrs(e.filtered_attributes, &mut filtered_attributes);
+    Exemplar { timestamp: e.time_unix_nano as i64, value, trace, filtered_attributes }
+}
+
+fn encode_exemplars(exemplars: &[Exemplar]) -> Vec<pb::Exemplar> {
+    exemplars.iter().map(encode_exemplar).collect()
+}
+
+fn decode_exemplars(exemplars: Vec<pb::Exemplar>) -> Vec<Exemplar> {
+    exemplars.into_iter().map(decode_exemplar).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn number_data_point(
     attributes: Vec<crate::otlp::generated::opentelemetry::proto::common::v1::KeyValue>,
+    start_time_unix_nano: u64,
     ts: u64,
+    flags: u32,
+    exemplars: Vec<pb::Exemplar>,
     value: f64,
 ) -> pb::NumberDataPoint {
     pb::NumberDataPoint {
         attributes,
-        start_time_unix_nano: ts,
+        start_time_unix_nano,
         time_unix_nano: ts,
-        exemplars: Vec::new(),
-        flags: 0,
+        exemplars,
+        flags,
         value: Some(pb::number_data_point::Value::AsDouble(value)),
     }
 }
@@ -130,17 +194,34 @@ pub(crate) fn encode_metric(
 ) -> Option<pb::Metric> {
     let name = resolve(record.name).to_string();
     let unit = record.unit.map(resolve).unwrap_or_default().to_string();
+    let description = record.description.map(resolve).unwrap_or_default().to_string();
     let attributes = common::attrs_to_key_values(&event.attributes);
     let ts = event.timestamp.max(0) as u64;
+    let start = start_time(record.start_timestamp, ts);
+    let exemplars = encode_exemplars(&record.exemplars);
 
     let data = match &record.kind {
         MetricKind::Sum(s) => pb::metric::Data::Sum(pb::Sum {
-            data_points: vec![number_data_point(attributes, ts, s.value)],
+            data_points: vec![number_data_point(
+                attributes,
+                start,
+                ts,
+                record.flags,
+                exemplars,
+                s.value,
+            )],
             aggregation_temporality: temporality_to_pb(s.temporality),
             is_monotonic: s.monotonic,
         }),
         MetricKind::Gauge(v) => pb::metric::Data::Gauge(pb::Gauge {
-            data_points: vec![number_data_point(attributes, ts, *v)],
+            data_points: vec![number_data_point(
+                attributes,
+                start,
+                ts,
+                record.flags,
+                exemplars,
+                *v,
+            )],
         }),
         MetricKind::Histogram(h) => {
             let bucket_counts: Vec<u64> = h.buckets.iter().map(|(_, c)| *c).collect();
@@ -150,14 +231,14 @@ pub(crate) fn encode_metric(
             pb::metric::Data::Histogram(pb::Histogram {
                 data_points: vec![pb::HistogramDataPoint {
                     attributes,
-                    start_time_unix_nano: ts,
+                    start_time_unix_nano: start,
                     time_unix_nano: ts,
                     count,
                     sum: h.sum,
                     bucket_counts,
                     explicit_bounds,
-                    exemplars: Vec::new(),
-                    flags: 0,
+                    exemplars,
+                    flags: record.flags,
                     min: h.min,
                     max: h.max,
                 }],
@@ -168,7 +249,7 @@ pub(crate) fn encode_metric(
             pb::metric::Data::ExponentialHistogram(pb::ExponentialHistogram {
                 data_points: vec![pb::ExponentialHistogramDataPoint {
                     attributes,
-                    start_time_unix_nano: ts,
+                    start_time_unix_nano: start,
                     time_unix_nano: ts,
                     count: e.count,
                     sum: e.sum,
@@ -182,8 +263,8 @@ pub(crate) fn encode_metric(
                         offset: e.negative.0,
                         bucket_counts: e.negative.1.clone(),
                     }),
-                    flags: 0,
-                    exemplars: Vec::new(),
+                    flags: record.flags,
+                    exemplars,
                     min: e.min,
                     max: e.max,
                     zero_threshold: e.zero_threshold,
@@ -194,7 +275,7 @@ pub(crate) fn encode_metric(
         MetricKind::Summary(s) => pb::metric::Data::Summary(pb::Summary {
             data_points: vec![pb::SummaryDataPoint {
                 attributes,
-                start_time_unix_nano: ts,
+                start_time_unix_nano: start,
                 time_unix_nano: ts,
                 count: s.count,
                 sum: s.sum,
@@ -206,7 +287,9 @@ pub(crate) fn encode_metric(
                         value: *v,
                     })
                     .collect(),
-                flags: 0,
+                // No `exemplars` field on the wire type at all -- see the module doc's encode
+                // table.
+                flags: record.flags,
             }],
         }),
         MetricKind::Samples(s) => {
@@ -221,7 +304,13 @@ pub(crate) fn encode_metric(
                 sketch.add_weighted(*v, weight);
             }
             pb::metric::Data::Summary(pb::Summary {
-                data_points: vec![distribution_summary_point(attributes, ts, &sketch)],
+                data_points: vec![distribution_summary_point(
+                    attributes,
+                    start,
+                    ts,
+                    record.flags,
+                    &sketch,
+                )],
             })
         }
         MetricKind::Distribution(sketch) => {
@@ -231,7 +320,13 @@ pub(crate) fn encode_metric(
                 &[("metric_kind", "distribution")],
             );
             pb::metric::Data::Summary(pb::Summary {
-                data_points: vec![distribution_summary_point(attributes, ts, sketch)],
+                data_points: vec![distribution_summary_point(
+                    attributes,
+                    start,
+                    ts,
+                    record.flags,
+                    sketch,
+                )],
             })
         }
         MetricKind::SetMembers(_) => {
@@ -271,18 +366,14 @@ pub(crate) fn encode_metric(
         }
     };
 
-    Some(pb::Metric {
-        name,
-        description: String::new(),
-        unit,
-        metadata: Vec::new(),
-        data: Some(data),
-    })
+    Some(pb::Metric { name, description, unit, metadata: Vec::new(), data: Some(data) })
 }
 
 fn distribution_summary_point(
     attributes: Vec<crate::otlp::generated::opentelemetry::proto::common::v1::KeyValue>,
+    start_time_unix_nano: u64,
     ts: u64,
+    flags: u32,
     sketch: &DdSketch,
 ) -> pb::SummaryDataPoint {
     let quantile_values = DISTRIBUTION_QUANTILES
@@ -295,32 +386,29 @@ fn distribution_summary_point(
         .collect();
     pb::SummaryDataPoint {
         attributes,
-        start_time_unix_nano: ts,
+        start_time_unix_nano,
         time_unix_nano: ts,
         count: sketch.count() as u64,
         sum: 0.0,
         quantile_values,
-        flags: 0,
+        flags,
     }
 }
 
 /// Decodes one OTLP `Metric` into zero or more `Event`s (one per data point). Never fails the
-/// whole point/request -- a malformed or `no_recorded_value` data point is skipped and counted
-/// (see the module doc).
+/// whole point/request -- see the module doc for the `NO_RECORDED_VALUE` handling (the point is
+/// kept, flagged, not skipped).
 pub(crate) fn decode_metric(
     metric: pb::Metric,
     base_attrs: &logit_core::AttrMap,
-    telemetry: &Telemetry,
+    _telemetry: &Telemetry,
 ) -> Vec<Event> {
     let name = intern(&metric.name);
     let unit = if metric.unit.is_empty() { None } else { Some(intern(&metric.unit)) };
-    let record = |kind: MetricKind| MetricRecord {
-        name,
-        unit,
-        description: None,
-        start_timestamp: 0,
-        exemplars: Vec::new(),
-        kind,
+    let description =
+        if metric.description.is_empty() { None } else { Some(intern(&metric.description)) };
+    let record = |kind: MetricKind, start_timestamp: i64, flags: u32, exemplars: Vec<Exemplar>| {
+        MetricRecord { name, unit, description, start_timestamp, exemplars, flags, kind }
     };
 
     match metric.data {
@@ -329,56 +417,41 @@ pub(crate) fn decode_metric(
             let temporality = temporality_from_pb(sum.aggregation_temporality);
             sum.data_points
                 .into_iter()
-                .filter_map(|dp| {
-                    if no_recorded_value(dp.flags) {
-                        telemetry.count(
-                            "logit.input.metrics.skipped",
-                            1.0,
-                            &[("metric_kind", "sum"), ("reason", "no_recorded_value")],
-                        );
-                        return None;
-                    }
+                .map(|dp| {
                     let mut attrs = base_attrs.clone();
                     let ts = dp.time_unix_nano as i64;
                     let value = number_value(dp.value);
                     common::key_values_into_attrs(dp.attributes, &mut attrs);
                     let kind = MetricKind::Sum(Sum { value, temporality, monotonic });
-                    Some(Event::metric(ts, attrs, record(kind)))
+                    let exemplars = decode_exemplars(dp.exemplars);
+                    let rec = record(kind, dp.start_time_unix_nano as i64, dp.flags, exemplars);
+                    Event::metric(ts, attrs, rec)
                 })
                 .collect()
         }
         Some(pb::metric::Data::Gauge(gauge)) => gauge
             .data_points
             .into_iter()
-            .filter_map(|dp| {
-                if no_recorded_value(dp.flags) {
-                    telemetry.count(
-                        "logit.input.metrics.skipped",
-                        1.0,
-                        &[("metric_kind", "gauge"), ("reason", "no_recorded_value")],
-                    );
-                    return None;
-                }
+            .map(|dp| {
                 let mut attrs = base_attrs.clone();
                 let ts = dp.time_unix_nano as i64;
                 let value = number_value(dp.value);
                 common::key_values_into_attrs(dp.attributes, &mut attrs);
-                Some(Event::metric(ts, attrs, record(MetricKind::Gauge(value))))
+                let exemplars = decode_exemplars(dp.exemplars);
+                let rec = record(
+                    MetricKind::Gauge(value),
+                    dp.start_time_unix_nano as i64,
+                    dp.flags,
+                    exemplars,
+                );
+                Event::metric(ts, attrs, rec)
             })
             .collect(),
         Some(pb::metric::Data::Histogram(hist)) => {
             let temporality = temporality_from_pb(hist.aggregation_temporality);
             hist.data_points
                 .into_iter()
-                .filter_map(|dp| {
-                    if no_recorded_value(dp.flags) {
-                        telemetry.count(
-                            "logit.input.metrics.skipped",
-                            1.0,
-                            &[("metric_kind", "histogram"), ("reason", "no_recorded_value")],
-                        );
-                        return None;
-                    }
+                .map(|dp| {
                     let mut attrs = base_attrs.clone();
                     let ts = dp.time_unix_nano as i64;
                     let mut buckets = Vec::with_capacity(dp.bucket_counts.len());
@@ -386,6 +459,9 @@ pub(crate) fn decode_metric(
                         let bound = dp.explicit_bounds.get(i).copied().unwrap_or(f64::INFINITY);
                         buckets.push((bound, *count));
                     }
+                    let start_timestamp = dp.start_time_unix_nano as i64;
+                    let flags = dp.flags;
+                    let exemplars = decode_exemplars(dp.exemplars);
                     common::key_values_into_attrs(dp.attributes, &mut attrs);
                     let kind = MetricKind::Histogram(Histogram {
                         buckets,
@@ -394,48 +470,36 @@ pub(crate) fn decode_metric(
                         min: dp.min,
                         max: dp.max,
                     });
-                    Some(Event::metric(ts, attrs, record(kind)))
+                    Event::metric(ts, attrs, record(kind, start_timestamp, flags, exemplars))
                 })
                 .collect()
         }
         Some(pb::metric::Data::Summary(summary)) => summary
             .data_points
             .into_iter()
-            .filter_map(|dp| {
-                if no_recorded_value(dp.flags) {
-                    telemetry.count(
-                        "logit.input.metrics.skipped",
-                        1.0,
-                        &[("metric_kind", "summary"), ("reason", "no_recorded_value")],
-                    );
-                    return None;
-                }
+            .map(|dp| {
                 let mut attrs = base_attrs.clone();
                 let ts = dp.time_unix_nano as i64;
                 let quantiles = dp.quantile_values.iter().map(|q| (q.quantile, q.value)).collect();
+                let start_timestamp = dp.start_time_unix_nano as i64;
+                let flags = dp.flags;
                 common::key_values_into_attrs(dp.attributes, &mut attrs);
                 let kind = MetricKind::Summary(Summary { quantiles, count: dp.count, sum: dp.sum });
-                Some(Event::metric(ts, attrs, record(kind)))
+                // No `exemplars` field on the wire type at all -- see the module doc.
+                let rec = record(kind, start_timestamp, flags, Vec::new());
+                Event::metric(ts, attrs, rec)
             })
             .collect(),
         Some(pb::metric::Data::ExponentialHistogram(eh)) => {
             let temporality = temporality_from_pb(eh.aggregation_temporality);
             eh.data_points
                 .into_iter()
-                .filter_map(|dp| {
-                    if no_recorded_value(dp.flags) {
-                        telemetry.count(
-                            "logit.input.metrics.skipped",
-                            1.0,
-                            &[
-                                ("metric_kind", "exponential_histogram"),
-                                ("reason", "no_recorded_value"),
-                            ],
-                        );
-                        return None;
-                    }
+                .map(|dp| {
                     let mut attrs = base_attrs.clone();
                     let ts = dp.time_unix_nano as i64;
+                    let start_timestamp = dp.start_time_unix_nano as i64;
+                    let flags = dp.flags;
+                    let exemplars = decode_exemplars(dp.exemplars);
                     common::key_values_into_attrs(dp.attributes, &mut attrs);
                     let positive =
                         dp.positive.map(|b| (b.offset, b.bucket_counts)).unwrap_or((0, Vec::new()));
@@ -453,7 +517,7 @@ pub(crate) fn decode_metric(
                         min: dp.min,
                         max: dp.max,
                     });
-                    Some(Event::metric(ts, attrs, record(kind)))
+                    Event::metric(ts, attrs, record(kind, start_timestamp, flags, exemplars))
                 })
                 .collect()
         }
@@ -821,7 +885,7 @@ mod tests {
             unit: String::new(),
             metadata: Vec::new(),
             data: Some(pb::metric::Data::Sum(pb::Sum {
-                data_points: vec![number_data_point(Vec::new(), 1000, 7.0)],
+                data_points: vec![number_data_point(Vec::new(), 1000, 1000, 0, Vec::new(), 7.0)],
                 aggregation_temporality: pb::AggregationTemporality::Cumulative as i32,
                 is_monotonic: true,
             })),
@@ -848,20 +912,282 @@ mod tests {
         }
     }
 
+    /// `NO_RECORDED_VALUE` keeps the point (flagged), rather than skipping it -- W4 amendment to
+    /// `docs/adr/metrics-model-v2.md`, see the module doc.
     #[test]
-    fn a_no_recorded_value_flag_skips_the_point_and_counts_it_rather_than_failing() {
+    fn a_no_recorded_value_flag_keeps_the_point_flagged_rather_than_skipping_it() {
         let mut metric = encode(MetricKind::Gauge(1.0)).unwrap();
         if let Some(pb::metric::Data::Gauge(g)) = &mut metric.data {
-            g.data_points[0].flags = 1; // DATA_POINT_FLAGS_NO_RECORDED_VALUE_MASK
+            g.data_points[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
         }
-        let registry = Registry::new();
-        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
-        let events = decode_metric(metric, &AttrMap::new(), &telemetry);
-        assert!(events.is_empty());
-        let drained = registry.drain(0);
-        assert!(drained
-            .iter()
-            .any(|e| e.attributes.get("reason").and_then(|v| v.as_str())
-                == Some("no_recorded_value")));
+        let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
+        assert_eq!(events.len(), 1, "a NO_RECORDED_VALUE point must be kept, not skipped");
+        assert_eq!(events[0].metrics[0].flags, MetricRecord::FLAG_NO_RECORDED_VALUE);
+    }
+
+    /// Encode writes `record.flags` back onto the data point unchanged -- what makes
+    /// `otlp_in -> otlp_out` a fixed point for a flagged Sum/Gauge/Histogram/ExponentialHistogram/
+    /// Summary point.
+    #[test]
+    fn a_flagged_record_round_trips_its_flags_for_every_kind() {
+        let flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        let kinds = [
+            MetricKind::counter(1.0),
+            MetricKind::Gauge(2.0),
+            MetricKind::Histogram(histogram(Temporality::Delta)),
+            MetricKind::ExponentialHistogram(exp_histogram(Temporality::Delta)),
+            MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 }),
+        ];
+        for kind in kinds {
+            let rec = MetricRecord { flags, ..MetricRecord::new(intern("m"), kind.clone()) };
+            let mut diag = Diagnostics::default();
+            let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
+            let dp_flags = match &metric.data {
+                Some(pb::metric::Data::Sum(s)) => s.data_points[0].flags,
+                Some(pb::metric::Data::Gauge(g)) => g.data_points[0].flags,
+                Some(pb::metric::Data::Histogram(h)) => h.data_points[0].flags,
+                Some(pb::metric::Data::ExponentialHistogram(h)) => h.data_points[0].flags,
+                Some(pb::metric::Data::Summary(s)) => s.data_points[0].flags,
+                None => panic!("expected data for {kind:?}"),
+            };
+            assert_eq!(dp_flags, flags, "wire flags should carry record.flags for {kind:?}");
+
+            let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
+            assert_eq!(
+                events[0].metrics[0].flags, flags,
+                "decoded flags should round-trip for {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_zero_start_timestamp_is_preferred_over_the_events_timestamp() {
+        let mut rec = record(MetricKind::Gauge(1.0));
+        rec.start_timestamp = 500;
+        let mut diag = Diagnostics::default();
+        let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
+        match &metric.data {
+            Some(pb::metric::Data::Gauge(g)) => {
+                assert_eq!(g.data_points[0].start_time_unix_nano, 500);
+            }
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+        let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
+        assert_eq!(events[0].metrics[0].start_timestamp, 500);
+    }
+
+    #[test]
+    fn a_zero_start_timestamp_falls_back_to_the_events_timestamp_on_encode() {
+        let rec = record(MetricKind::Gauge(1.0)); // start_timestamp: 0 (unknown)
+        let mut diag = Diagnostics::default();
+        let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
+        match &metric.data {
+            Some(pb::metric::Data::Gauge(g)) => {
+                assert_eq!(g.data_points[0].start_time_unix_nano, event().timestamp as u64);
+            }
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_description_round_trips_when_present_and_is_empty_when_absent() {
+        let mut rec = record(MetricKind::Gauge(1.0));
+        rec.description = Some(intern("a metric description"));
+        let mut diag = Diagnostics::default();
+        let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
+        assert_eq!(metric.description, "a metric description");
+        let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
+        assert_eq!(events[0].metrics[0].description.map(resolve), Some("a metric description"));
+
+        let no_description = record(MetricKind::Gauge(1.0));
+        let mut diag = Diagnostics::default();
+        let metric =
+            encode_metric(&event(), &no_description, &Telemetry::default(), &mut diag).unwrap();
+        assert_eq!(metric.description, "");
+        let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
+        assert_eq!(events[0].metrics[0].description, None);
+    }
+
+    fn exemplar() -> Exemplar {
+        let mut filtered_attributes = AttrMap::new();
+        filtered_attributes.insert("dropped", "attr");
+        Exemplar {
+            timestamp: 42,
+            value: 3.5,
+            trace: Some(TraceRef { trace_id: [7; 16], span_id: Some([8; 8]), flags: 0 }),
+            filtered_attributes,
+        }
+    }
+
+    /// Exemplars round trip for every kind that carries them on the wire.
+    #[test]
+    fn exemplars_round_trip_for_sum_gauge_histogram_and_exponential_histogram() {
+        let kinds = [
+            MetricKind::counter(1.0),
+            MetricKind::Gauge(2.0),
+            MetricKind::Histogram(histogram(Temporality::Delta)),
+            MetricKind::ExponentialHistogram(exp_histogram(Temporality::Delta)),
+        ];
+        for kind in kinds {
+            let rec = MetricRecord {
+                exemplars: vec![exemplar()],
+                ..MetricRecord::new(intern("m"), kind.clone())
+            };
+            let mut diag = Diagnostics::default();
+            let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
+            let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
+            assert_eq!(
+                events[0].metrics[0].exemplars,
+                vec![exemplar()],
+                "exemplars should round-trip for {kind:?}"
+            );
+        }
+    }
+
+    /// `SummaryDataPoint` has no `exemplars` field on the wire at all -- a documented degradation,
+    /// not a bug (see the module doc's encode table).
+    #[test]
+    fn a_summary_drops_its_exemplars_because_the_wire_type_has_nowhere_to_put_them() {
+        let s = Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 };
+        let rec = MetricRecord {
+            exemplars: vec![exemplar()],
+            ..MetricRecord::new(intern("m"), MetricKind::Summary(s))
+        };
+        let mut diag = Diagnostics::default();
+        let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
+        let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
+        assert!(
+            events[0].metrics[0].exemplars.is_empty(),
+            "a Summary must not carry exemplars back -- the wire type has no field for them"
+        );
+    }
+
+    // -- proptest: decode(encode(x)) == x over a generator of MetricRecords -----------------
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_temporality() -> impl Strategy<Value = Temporality> {
+            prop_oneof![Just(Temporality::Delta), Just(Temporality::Cumulative)]
+        }
+
+        fn arb_sum() -> impl Strategy<Value = Sum> {
+            (-1e6f64..1e6f64, arb_temporality(), any::<bool>())
+                .prop_map(|(value, temporality, monotonic)| Sum { value, temporality, monotonic })
+        }
+
+        fn arb_histogram() -> impl Strategy<Value = Histogram> {
+            (
+                prop::collection::vec((-1e6f64..1e6f64, 0u64..1000u64), 0..5),
+                arb_temporality(),
+                prop::option::of(-1e6f64..1e6f64),
+                prop::option::of(-1e6f64..1e6f64),
+                prop::option::of(-1e6f64..1e6f64),
+            )
+                .prop_map(|(buckets, temporality, sum, min, max)| Histogram {
+                    buckets,
+                    temporality,
+                    sum,
+                    min,
+                    max,
+                })
+        }
+
+        fn arb_summary() -> impl Strategy<Value = Summary> {
+            (
+                prop::collection::vec((0.0f64..1.0f64, -1e6f64..1e6f64), 0..5),
+                0u64..1000u64,
+                -1e6f64..1e6f64,
+            )
+                .prop_map(|(quantiles, count, sum)| Summary { quantiles, count, sum })
+        }
+
+        /// Restricted to `Sum`/`Gauge`/`Histogram`/`Summary`, per the plan: `ExponentialHistogram`
+        /// already has its own dedicated 1:1 fixed-point tests above, and
+        /// `Samples`/`Distribution`/`SetMembers`/`Set`/`GaugeDelta` either degrade or skip on
+        /// encode by design (see the module doc's table) -- none of those five round-trips
+        /// `decode(encode(x)) == x` at all, so a generator that could produce them would be
+        /// asserting something this codec never promised.
+        fn arb_kind() -> impl Strategy<Value = MetricKind> {
+            prop_oneof![
+                arb_sum().prop_map(MetricKind::Sum),
+                (-1e6f64..1e6f64).prop_map(MetricKind::Gauge),
+                arb_histogram().prop_map(MetricKind::Histogram),
+                arb_summary().prop_map(MetricKind::Summary),
+            ]
+        }
+
+        /// A fixed, non-zero id pattern -- `TraceRef::from_bytes`'s own validity rule rejects an
+        /// all-zero `trace_id` (see `crates/logit-core/src/trace.rs`), so the generator only needs
+        /// to vary *whether* a trace is present, not its exact bytes.
+        fn arb_exemplar() -> impl Strategy<Value = Exemplar> {
+            (0i64..2_000_000_000_000_000_000i64, -1e6f64..1e6f64, any::<bool>()).prop_map(
+                |(timestamp, value, has_trace)| {
+                    let trace = has_trace.then_some(TraceRef {
+                        trace_id: [0xAB; 16],
+                        span_id: Some([0xCD; 8]),
+                        flags: 0,
+                    });
+                    Exemplar { timestamp, value, trace, filtered_attributes: AttrMap::new() }
+                },
+            )
+        }
+
+        /// Non-empty on `Some` -- an empty `Some(String::new())` description would resolve to an
+        /// empty wire string, which `decode_metric` (correctly) treats the same as "absent"
+        /// (`Metric.description.is_empty()`), so it would decode back as `None`, not the `Some("")`
+        /// the record started with. A description is never really an empty string in practice, so
+        /// excluding it from the generator isn't a gap this proptest is pretending doesn't exist.
+        fn arb_description() -> impl Strategy<Value = Option<String>> {
+            prop::option::of("[a-zA-Z][a-zA-Z0-9_]{0,11}")
+        }
+
+        fn arb_metric_record() -> impl Strategy<Value = MetricRecord> {
+            (
+                arb_kind(),
+                arb_description(),
+                0i64..2_000_000_000_000_000_000i64,
+                prop_oneof![Just(0u32), Just(MetricRecord::FLAG_NO_RECORDED_VALUE)],
+                prop::option::of(arb_exemplar()),
+            )
+                .prop_map(|(kind, description, start_timestamp, flags, exemplar)| {
+                    let description = description.map(|s| intern(&s));
+                    let exemplars = exemplar.map(|e| vec![e]).unwrap_or_default();
+                    MetricRecord {
+                        name: intern("proptest_metric"),
+                        unit: None,
+                        description,
+                        start_timestamp,
+                        exemplars,
+                        flags,
+                        kind,
+                    }
+                })
+                // A Summary data point has no `exemplars` field on the wire at all (see the
+                // module doc), so a record pairing Summary with a non-empty exemplars list can
+                // never be a fixed point by construction -- not a case this generator should
+                // produce, the same reasoning `a_summary_drops_its_exemplars_...` pins directly.
+                .prop_filter("Summary carries no wire exemplars", |r| {
+                    !(matches!(r.kind, MetricKind::Summary(_)) && !r.exemplars.is_empty())
+                })
+        }
+
+        proptest! {
+            /// `decode(encode(x)) == x` for every generated `MetricRecord` -- the event's own
+            /// timestamp is fixed at `0` so `start_timestamp`'s "0 falls back to the event
+            /// timestamp" encode rule (module doc) never substitutes a different value than what
+            /// `x` started with.
+            #[test]
+            fn decode_of_encode_is_the_identity(record in arb_metric_record()) {
+                let event = Event::empty(0, AttrMap::new());
+                let mut diag = Diagnostics::default();
+                let metric = encode_metric(&event, &record, &Telemetry::default(), &mut diag)
+                    .expect("Sum/Gauge/Histogram/Summary always encode to Some");
+                let events = decode_metric(metric, &AttrMap::new(), &Telemetry::default());
+                prop_assert_eq!(events.len(), 1);
+                prop_assert_eq!(&events[0].metrics[0], &record);
+            }
+        }
     }
 }

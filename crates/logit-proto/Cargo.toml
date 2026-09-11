@@ -31,3 +31,8 @@ crc32c.workspace = true
 # types are never hand-edited -- ADR `committed-pregenerated-otlp-protobuf`).
 serde_json.workspace = true
 base64.workspace = true
+
+[dev-dependencies]
+# The OTLP fixed-point tests (tests/otlp_fixed_point.rs): decode(encode(b)) == b over a generated
+# corpus of MetricRecords, plus the hand-built fully-populated-batch fixtures.
+proptest.workspace = true

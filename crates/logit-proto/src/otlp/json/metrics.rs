@@ -1,8 +1,9 @@
 //! `MetricsData` from OTLP/JSON. See `super`'s module doc for the dialect rules this leans on, and
-//! for why `exemplars` is parsed nowhere below.
+//! for the `exemplars` JSON shape this module parses (`../metrics.rs`'s own module doc has the
+//! codec-level table of which point kinds carry them).
 
 use super::{
-    array_field, bool_field, enum_field, f64_field, f64_field_opt, get, i32_field,
+    array_field, bool_field, enum_field, f64_field, f64_field_opt, get, hex_bytes, i32_field,
     instrumentation_scope, key_values, malformed, object_field, parse_f64, parse_i64, parse_u64,
     require_object, resource, str_field, u32_field, u64_field, JsonMap, JsonValue,
 };
@@ -120,6 +121,40 @@ fn summary(obj: &JsonMap) -> Result<pb::Summary, CodecError> {
     Ok(pb::Summary { data_points })
 }
 
+/// One JSON `Exemplar` object: `timeUnixNano`, `asDouble`/`asInt` (the same oneof shape as a
+/// `numberDataPoint`'s own value), `spanId`/`traceId` as case-insensitive hex (the same
+/// `hex_bytes` a `Span`'s own ids use, not base64 -- see `super`'s module doc), and
+/// `filteredAttributes` via the same `key_values` helper every other attribute list uses.
+fn exemplar(v: &JsonValue) -> Result<pb::Exemplar, CodecError> {
+    let obj = require_object(v, "an exemplar")?;
+    let value = if let Some(x) = get(obj, "asDouble", "as_double") {
+        Some(pb::exemplar::Value::AsDouble(parse_f64(x, "asDouble")?))
+    } else if let Some(x) = get(obj, "asInt", "as_int") {
+        Some(pb::exemplar::Value::AsInt(parse_i64(x, "asInt")?))
+    } else {
+        None
+    };
+    let span_id = match get(obj, "spanId", "span_id") {
+        Some(x) => hex_bytes(x, 8, "spanId")?,
+        None => Vec::new(),
+    };
+    let trace_id = match get(obj, "traceId", "trace_id") {
+        Some(x) => hex_bytes(x, 16, "traceId")?,
+        None => Vec::new(),
+    };
+    Ok(pb::Exemplar {
+        filtered_attributes: key_values(obj, "filteredAttributes", "filtered_attributes")?,
+        time_unix_nano: u64_field(obj, "timeUnixNano", "time_unix_nano")?,
+        span_id,
+        trace_id,
+        value,
+    })
+}
+
+fn exemplars(obj: &JsonMap) -> Result<Vec<pb::Exemplar>, CodecError> {
+    array_field(obj, "exemplars", "exemplars")?.iter().map(exemplar).collect()
+}
+
 fn number_data_point(v: &JsonValue) -> Result<pb::NumberDataPoint, CodecError> {
     let obj = require_object(v, "a numberDataPoint")?;
     let value = if let Some(x) = get(obj, "asDouble", "as_double") {
@@ -133,8 +168,7 @@ fn number_data_point(v: &JsonValue) -> Result<pb::NumberDataPoint, CodecError> {
         attributes: key_values(obj, "attributes", "attributes")?,
         start_time_unix_nano: u64_field(obj, "startTimeUnixNano", "start_time_unix_nano")?,
         time_unix_nano: u64_field(obj, "timeUnixNano", "time_unix_nano")?,
-        // Deliberately empty -- see the module doc.
-        exemplars: Vec::new(),
+        exemplars: exemplars(obj)?,
         flags: u32_field(obj, "flags", "flags")?,
         value,
     })
@@ -164,7 +198,7 @@ fn histogram_data_point(v: &JsonValue) -> Result<pb::HistogramDataPoint, CodecEr
         sum: f64_field_opt(obj, "sum", "sum")?,
         bucket_counts: u64_array(obj, "bucketCounts", "bucket_counts", "bucketCounts[]")?,
         explicit_bounds: f64_array(obj, "explicitBounds", "explicit_bounds", "explicitBounds[]")?,
-        exemplars: Vec::new(),
+        exemplars: exemplars(obj)?,
         flags: u32_field(obj, "flags", "flags")?,
         min: f64_field_opt(obj, "min", "min")?,
         max: f64_field_opt(obj, "max", "max")?,
@@ -195,7 +229,7 @@ fn exponential_histogram_data_point(
         positive,
         negative,
         flags: u32_field(obj, "flags", "flags")?,
-        exemplars: Vec::new(),
+        exemplars: exemplars(obj)?,
         min: f64_field_opt(obj, "min", "min")?,
         max: f64_field_opt(obj, "max", "max")?,
         zero_threshold: f64_field(obj, "zeroThreshold", "zero_threshold")?,
@@ -290,17 +324,55 @@ mod tests {
     }
 
     #[test]
-    fn exemplars_are_ignored_without_erroring() {
+    fn exemplars_are_parsed_with_hex_ids_and_filtered_attributes() {
         let json = br#"{"resourceMetrics": [{"scopeMetrics": [{"metrics": [{
             "name": "m", "gauge": {"dataPoints": [{
                 "timeUnixNano": "1", "asDouble": 1.0,
-                "exemplars": [{"timeUnixNano": "1", "asDouble": 1.0, "spanId": "0102030405060708"}]
+                "exemplars": [{
+                    "timeUnixNano": "2", "asDouble": 3.5,
+                    "spanId": "0102030405060708",
+                    "traceId": "0102030405060708090a0b0c0d0e0f10",
+                    "filteredAttributes": [{"key": "dropped", "value": {"stringValue": "attr"}}]
+                }]
             }]}
         }]}]}]}"#;
-        let data = metrics_data(json).expect("an exemplar must not fail decoding");
+        let data = metrics_data(json).expect("should decode");
         match &data.resource_metrics[0].scope_metrics[0].metrics[0].data {
-            Some(pb::metric::Data::Gauge(g)) => assert!(g.data_points[0].exemplars.is_empty()),
+            Some(pb::metric::Data::Gauge(g)) => {
+                let ex = &g.data_points[0].exemplars[0];
+                assert_eq!(ex.time_unix_nano, 2);
+                assert_eq!(ex.value, Some(pb::exemplar::Value::AsDouble(3.5)));
+                assert_eq!(ex.span_id, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+                assert_eq!(
+                    ex.trace_id,
+                    vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+                );
+                assert_eq!(ex.filtered_attributes.len(), 1);
+                assert_eq!(ex.filtered_attributes[0].key, "dropped");
+            }
             other => panic!("expected Gauge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_exemplar_with_as_int_decodes_as_an_int_value() {
+        let json = br#"{"resourceMetrics": [{"scopeMetrics": [{"metrics": [{
+            "name": "m", "sum": {
+                "dataPoints": [{"timeUnixNano": "1", "asInt": "5",
+                    "exemplars": [{"timeUnixNano": "1", "asInt": "7"}]
+                }],
+                "aggregationTemporality": "AGGREGATION_TEMPORALITY_DELTA"
+            }
+        }]}]}]}"#;
+        let data = metrics_data(json).expect("should decode");
+        match &data.resource_metrics[0].scope_metrics[0].metrics[0].data {
+            Some(pb::metric::Data::Sum(s)) => {
+                assert_eq!(
+                    s.data_points[0].exemplars[0].value,
+                    Some(pb::exemplar::Value::AsInt(7))
+                );
+            }
+            other => panic!("expected Sum, got {other:?}"),
         }
     }
 

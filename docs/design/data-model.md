@@ -95,12 +95,27 @@ the shape:
 ## Well-known attribute names
 
 `syslog_in` (`syslog.facility`/`.severity`/`.timestamp`/`.hostname`/`.tag`/`.pid`/`.msgid`) and the
-OTLP codec (`otel.status_message`) already stamp dotted, `service.name`-style attribute names as a
-convention rather than a typed field, when the data belongs on the event but doesn't rise to a
-core-model field of its own. `trace_context`'s `span:` block
-([ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md)) is the first place this
-convention is deliberately *read* by more than one producer, so it's worth naming as a real table
-rather than leaving it to be reverse-engineered from that transform's source:
+OTLP codec (`otel.severity_number`/`otel.severity_text`) already stamp dotted, `service.name`-style
+attribute names as a convention rather than a typed field, when the data belongs on the event but
+doesn't rise to a core-model field of its own.
+
+**OTLP severity is the OTLP instance of the same precedent `syslog.severity` already set** —
+`syslog_in`/`syslog_out` deliberately let the raw, protocol-native value outrank the normalized
+field on egress ([ADR `syslog-output`](../adr/syslog-output.md)'s "Header-field precedence",
+generalized into a repo-wide rule by [ADR `lossless-transit`](../adr/lossless-transit.md)'s rule
+(b)): OTLP's 24 raw severity numbers collapse onto this model's 6-variant `Severity` on decode, so
+the raw value rides alongside the normalized one and wins on the way back out.
+
+| Attribute | Value | Meaning |
+|---|---|---|
+| `otel.severity_number` | `Value::I64`, `1..=24` | Stamped by `otlp_in` when the wire's `severity_number` is non-zero. `otlp_out` prefers this over the band-derived value when present, consuming (removing) it from the emitted attribute set the same way `otel.status_message` used to. |
+| `otel.severity_text` | `Value::Str` | Stamped by `otlp_in` when the wire's `severity_text` is non-empty. Same precedence and consumption rule as `otel.severity_number`. |
+
+`trace_context`'s `span:` block
+([ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md)) is the first place the
+same *reserved-attribute* convention is deliberately *read* by more than one producer, so it's worth
+naming as a real table too rather than leaving it to be reverse-engineered from that transform's
+source:
 
 | Attribute | Value | Meaning |
 |---|---|---|
@@ -157,7 +172,7 @@ pub struct LogRecord {
     pub severity: Option<Severity>,   // normalized syslog-style level
     pub body_format: BodyFormat,      // Raw | Json | Structured -- hints downstream parsers
     pub trace: Option<TraceRef>,      // application trace/span this log was emitted under
-    pub event_name: Option<Symbol>,   // OTLP's LogRecord.event_name -- no producer until W4
+    pub event_name: Option<Symbol>,   // OTLP's LogRecord.event_name, mapped both ways by the OTLP codec
     pub observed_timestamp: i64,      // unix nanos observed by the collector; 0 = unset
     pub dropped_attributes_count: u32,
 }
@@ -174,6 +189,7 @@ pub struct MetricRecord {
     pub description: Option<Symbol>,
     pub start_timestamp: i64,         // 0 = unknown, OTLP's own convention -- avoids Option<i64>
     pub exemplars: Vec<Exemplar>,     // empty Vec allocates nothing on the common no-exemplars path
+    pub flags: u32,                   // OTLP DataPointFlags bitmask; bit 0 = FLAG_NO_RECORDED_VALUE
     pub kind: MetricKind,
 }
 

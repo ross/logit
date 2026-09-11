@@ -23,12 +23,24 @@ pub struct MetricRecord {
     pub start_timestamp: i64,
     /// Empty `Vec` allocates nothing on the common no-exemplars path.
     pub exemplars: Vec<Exemplar>,
+    /// OTLP `DataPointFlags` bitmask, `0` default -- exists so a data point flagged
+    /// `NO_RECORDED_VALUE` (bit 0, [`MetricRecord::FLAG_NO_RECORDED_VALUE`]) round-trips as a
+    /// flagged point carrying its type's default value, rather than being silently skipped the
+    /// way the OTLP codec used to treat it (`docs/adr/metrics-model-v2.md`'s W4 amendment). Fills
+    /// the 4 bytes of padding that already followed the three `Symbol`s above, so
+    /// [`MetricRecord`] stays 224 bytes -- see `crates/logit-core/tests/type_sizes.rs`.
+    pub flags: u32,
     pub kind: MetricKind,
 }
 
 impl MetricRecord {
+    /// OTLP `DataPointFlags::FLAG_NO_RECORDED_VALUE` (bit 0) -- the point has no recorded value;
+    /// its numeric payload should be treated as absent rather than a genuine `0`/empty reading.
+    pub const FLAG_NO_RECORDED_VALUE: u32 = 1 << 0;
+
     /// A record carrying just a name and a kind -- `unit`/`description` `None`, `start_timestamp`
-    /// `0` (unknown), `exemplars` empty. What most producers and nearly every test want.
+    /// `0` (unknown), `exemplars` empty, `flags` `0`. What most producers and nearly every test
+    /// want.
     pub fn new(name: Symbol, kind: MetricKind) -> Self {
         MetricRecord {
             name,
@@ -36,6 +48,7 @@ impl MetricRecord {
             description: None,
             start_timestamp: 0,
             exemplars: Vec::new(),
+            flags: 0,
             kind,
         }
     }
@@ -429,5 +442,6 @@ mod tests {
         assert_eq!(record.description, None);
         assert_eq!(record.start_timestamp, 0);
         assert!(record.exemplars.is_empty());
+        assert_eq!(record.flags, 0);
     }
 }

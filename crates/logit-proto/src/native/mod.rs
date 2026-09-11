@@ -436,12 +436,12 @@ mod tests {
 
     #[test]
     fn a_batch_with_a_fully_populated_scope_round_trips() {
-        let mut scope_attrs = AttrMap::new();
-        scope_attrs.insert("k", "v");
+        let mut scope_attributes = AttrMap::new();
+        scope_attributes.insert("k", "v");
         let scope = std::sync::Arc::new(logit_core::Scope {
             name: bytes::Bytes::from_static(b"nginx-otel-module"),
             version: bytes::Bytes::from_static(b"1.0.0"),
-            attributes: scope_attrs,
+            attributes: scope_attributes,
             dropped_attributes_count: 2,
             schema_url: Some(bytes::Bytes::from_static(b"https://example.com/schema")),
         });

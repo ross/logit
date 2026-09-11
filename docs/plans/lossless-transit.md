@@ -116,6 +116,56 @@ The integration test (`crates/logit-cli/tests/otlp_round_trip.rs`, `assert_round
 only checks that a log, a metric, and a span each exist with roughly the right shape — no per-field
 metric-kind assertion exists today, so none of the losses above are currently caught by CI.
 
+**W4 outcome: every named loss above is closed, not just narrowed.**
+
+Metrics: `start_time_unix_nano` ↔ `record.start_timestamp` both ways; `description` interns on
+decode and resolves on encode; `Histogram.sum`/`min`/`max` and `Summary.count`/`sum` are real
+fields both directions; `ExponentialHistogram` keeps its own variant and maps 1:1 (no more explicit-
+bound materialization, no `MAX_DERIVED_BUCKETS` cap — the codec's own decode-side skip path is down
+to one case, a `Metric` whose `data` oneof isn't set at all); exemplars decode/encode on every kind
+that carries them on the wire (`Sum`/`Gauge`/`Histogram`/`ExponentialHistogram`) — `Summary`
+genuinely has none on the wire at all, which stays a real gap, moved into
+`docs/known-gaps.md`'s cross-protocol table as its own row rather than living here; a
+`NumberDataPoint`'s int/double distinction still collapses to `f64` unchanged (a structural choice,
+out of this workstream's scope, not a regression); a `NO_RECORDED_VALUE`-flagged point round-trips
+flagged (`MetricRecord.flags`, `metrics-model-v2`'s W4 amendment) instead of being skipped. Scope
+name/version/attributes, both levels' `dropped_attributes_count`, and `schema_url` are real fields
+now (`EventBatch.scope`), grouped by `(Resource*, Scope*)` pair on decode instead of collapsing into
+`otel.scope.*` event attributes — and `otlp_out`'s hardcoded `{name: "logit", version:
+CARGO_PKG_VERSION}` fallback is gone: a batch with `scope: None` encodes an empty
+`InstrumentationScope` instead. `internal` (`crates/logit-inputs/src/internal.rs`) is the one real
+producer of the `"logit"`/version identity now, stamping a genuine `Scope` on every batch it sends
+rather than the codec inventing one on `otlp_out`'s behalf (`docs/design/internal-telemetry.md`).
+One `MetricRecord` per wire `Metric` with one data point remains a permitted regroup, unchanged.
+
+Logs: `otel.severity_number`/`otel.severity_text` carry the raw wire value alongside the normalized
+`Severity`, the same precedence rule `syslog.severity` already set — `INFO2` no longer collapses to
+an indistinguishable `INFO` on a round trip. `event_name` and `dropped_attributes_count` are real
+fields. `observed_time_unix_nano` is preserved when the decoded value was already non-zero and only
+falls back to wall-clock `now` when it was unset — what makes `otlp_in -> otlp_out` a fixed point on
+this field too. `body_format` stays on `logit.body_format`, unchanged, per the ADR's rule (c). The
+log-and-span `Event` split/enrichment behavior is unchanged and documented in `otlp/logs.rs`'s own
+module doc.
+
+Traces: `trace_state`/`flags` and every `dropped_*_count` on `Span`/`Span.Link` are real fields now
+(`SpanRecord.ext`/`SpanLink`), not parsed-and-discarded. Status message rides
+`SpanRecord.ext.status_message`, a real field — `otel.status_message` is retired, so it no longer
+risks being fought over by a second record type that might someday want the same reserved attribute
+name, the concern the original assessment raised.
+
+Value fidelity (`Value::U64`/`Value::Timestamp` collapsing to `I64`) is unchanged, as expected — it
+was already filed in the cross-protocol table, not this like-to-like assessment, since OTLP itself
+has no source of either.
+
+The integration test is rewritten too: `otlp_round_trip.rs`'s `assert_round_tripped` is now per-
+field `assert_eq!` (whole-`Event`/`EventBatch` equality via the `PartialEq` derives
+`metrics-model-v2` added), covering `Some(scope)`, a populated `SpanExt`, exemplars, and a flagged
+point. A new pure-codec `crates/logit-proto/tests/otlp_fixed_point.rs` checks
+`decode_signal(encode_signals(b)) == vec![b]` and wire-level idempotence directly against
+`OtlpEncoder`/`OtlpDecoder`, with no pipeline, transform, or transport in between, plus a
+`proptest`-based `decode(encode(x)) == x` suite generating arbitrary `MetricRecord`s
+(`otlp/metrics.rs`).
+
 ### syslog_in -> syslog_out
 
 Decode (`crates/logit-inputs/src/syslog.rs`): RFC 5424 STRUCTURED-DATA is parsed only far enough to
@@ -262,11 +312,12 @@ current term-by-term breakdown.
 
 - `otel.severity_number` (`Value::I64`, 1-24), `otel.severity_text` (`Value::Str`): stamped by
   `otlp_in`, outrank the normalized `Severity` on `otlp_out` — the same rule `syslog.severity`
-  already follows.
+  already follows. **Landed in W4** (`docs/design/data-model.md`'s well-known attribute table).
 - `otel.scope.*` attributes are **retired** — scope moves to `EventBatch::scope`. `otlp_in` produces
   one batch per distinct `(resource, scope)` pair instead of folding scope into event attributes;
   `otlp_out` groups outgoing events by the same key. `otel.temporality` and `otel.status_message`
-  are retired once `Sum.temporality` and `SpanExt.status_message` exist as real fields.
+  are retired once `Sum.temporality` and `SpanExt.status_message` exist as real fields. **Landed**
+  — `otel.temporality` in W1, `otel.scope.*`/`otel.status_message` in W4.
 - `statsd.container_id` (`Value::Str`) carries `|c:<id>` both ways. `|T<ts>` sets
   `Event::timestamp` directly and stamps a `statsd.timestamp: true` marker attribute so
   `statsd_out` knows to re-emit `|T` on that specific line (a per-line marker, not a sink-wide
@@ -357,7 +408,7 @@ metric-kind fields, not just presence.
 | W1 | **Landed (this PR).** Core model reshape (every type in "Target model" above), `PartialEq` derives, `type_sizes.rs` + `memory.md` §1, `estimated_heap_bytes`, and every exhaustive match site updated (`event.rs`, `outputs/{influxdb,stdio,statsd}.rs`, `proto/native/record.rs`, `proto/otlp/metrics.rs`, `transforms/aggregate.rs`, `bench/bakeoff/wire_mirror.rs`) — plus the native codec reshape in the same PR, since `record.rs` can't compile against the old model otherwise. New ADR `metrics-model-v2` (single `Sum`, raw-vs-sketch pairs for `Samples`/`SetMembers`, the `ExponentialHistogram` variant, boxed `SpanExt`, batch-level `Scope`); amends `relative-gauge-adjustments` (its recorded size-growth fallback is not triggered — `MetricKind` stays 176) | L | W0 |
 | W2 | `aggregate`: `Samples` sketching moved out of decode, `distributions: sketch \| samples` config, `SetMembers` union plus a real `HyperLogLog`, cumulative-kind pass-through; amends `aggregation-window-semantics` | M | W1 |
 | W3 | statsd pair: `Samples`/`SetMembers` in and out, `|c:`, `|T`, sample-rate retention on timers, `statsd_round_trip.rs`, updated `allocations.rs` cases; amends `statsd-output` (v1 deferral narrowed to post-sketch kinds; "no sample rate/timestamp" reversed) | M | W1, W2 |
-| W4 | OTLP pair: start_time, description, exemplars, `NO_RECORDED_VALUE` round-tripped as a flagged point, batch-level scope grouping + `schema_url`, `event_name`, `observed_timestamp`, dropped-attribute counts, span fields, `otel.severity_*`; `otlp_round_trip.rs` rewritten to per-field assertions. (`Sum`/temporality/monotonic, `ExponentialHistogram`'s 1:1 mapping, and histogram sum/min/max + summary count/sum were pulled forward into W1 — see its "W1 outcome" note above.) | L | W1 |
+| W4 | **Landed.** OTLP pair: start_time, description, exemplars, `NO_RECORDED_VALUE` round-tripped as a flagged point, batch-level scope grouping + `schema_url`, `event_name`, `observed_timestamp`, dropped-attribute counts, span fields, `otel.severity_*`; `otlp_round_trip.rs` rewritten to per-field assertions; new pure-codec `crates/logit-proto/tests/otlp_fixed_point.rs` plus a `proptest`-based `decode(encode(x)) == x` suite in `otlp/metrics.rs`; `internal` stamps a real `Scope` (`crates/logit-inputs/src/internal.rs`) now that `otlp_out` no longer invents one. New `MetricRecord.flags: u32`/`MR_FLAGS` native tag amends `metrics-model-v2`. (`Sum`/temporality/monotonic, `ExponentialHistogram`'s 1:1 mapping, and histogram sum/min/max + summary count/sum were pulled forward into W1 — see its "W1 outcome" note above.) | L | W1 |
 | W5 | syslog pair: structured-data parse and emit, timestamp precedence and the nil case, `Value::Bytes` MSG, `Value::Str` PROCID, opt-in PEN-qualified structured-data element; `syslog_round_trip.rs`; new ADR `syslog-structured-data-convention`; amends `syslog-output` | M | W0 (parallel with W1) |
 | W6 | DogStatsD events and service checks, in and out | S | W3 |
 | W7 | Expose the new fields through the Lua proxy (`docs/design/lua-api.md`) — otherwise the model is lossless but the scripting surface can't see any of it | M | W1 |
