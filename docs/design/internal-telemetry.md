@@ -579,8 +579,12 @@ Worked examples, one per shipped component:
   Layer 2 metric here too, for the same reason as `influxdb_out`.
 - `statsd_out` (`crates/logit-outputs/src/statsd.rs`, `docs/adr/statsd-output.md`):
   `logit.output.batch.bytes`, `logit.output.request.duration`, `logit.output.requests{class="ok"|
-  "error"}` — the same shape as `syslog_out`'s. `logit.output.messages` counts statsd lines
-  (matching `syslog_out`'s messages count); **new**, `logit.output.datagrams` (UDP only) counts
+  "error"}` — the same shape as `syslog_out`'s. `logit.output.messages` counts encoded messages —
+  one per `MessageBuf` entry, on both transports, matching `syslog_out`'s messages count. Usually
+  one entry is one statsd line; a negative-absolute-gauge metric's two-line `0|g`/`-n|g` pair is
+  one indivisible entry (`docs/adr/statsd-output.md`) and so counts once, over UDP and TCP alike,
+  as does its `messages.dropped{reason="oversize_datagram"}` if a packed datagram carrying it is
+  rejected. **New**, `logit.output.datagrams` (UDP only) counts
   the packed datagrams a batch of lines was sent as — the one number an operator tuning
   `max_packet_bytes` needs that a line count alone can't show, since `statsd_out` (unlike
   `syslog_out`) packs several lines per datagram. `logit.output.messages.dropped{reason=

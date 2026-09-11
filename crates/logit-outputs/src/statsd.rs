@@ -87,6 +87,10 @@
 //! receiver. This is the only place an entry contains a newline; every sanitizer above exists
 //! precisely to guarantee nothing else ever does.
 //!
+//! `Gauge(-0.0)` is deliberately *not* a pair: it is numerically zero, so its sign is normalized
+//! away and it renders as the plain `name:0|g` -- the naive `name:-0|g` would decode as a no-op
+//! `GaugeDelta`, since the decoder dispatches on the leading `-` without parsing the value.
+//!
 //! ## Packing and framing
 //!
 //! UDP **packs** several lines into one datagram, up to `max_packet_bytes`
@@ -392,14 +396,24 @@ fn render_metric(
                 );
                 return false;
             }
-            if v.is_sign_negative() && *v != 0.0 {
+            // `-0.0` is numerically zero, and `0` *is* representable as an absolute gauge -- but
+            // `f64`'s `Display` renders it `"-0"`, and `StatsdDecoder::build_event`'s `"g"` arm
+            // decides `Gauge` vs `GaugeDelta` on the leading `-` alone, without parsing the float
+            // first, so the naive rendering would decode back as a no-op `GaugeDelta(-0.0)`
+            // instead of an absolute reset to zero. Normalizing the sign away here emits the
+            // plain `name:0|g` that says exactly that, and keeps the two-line idiom below for
+            // values that really are negative. `stdio_out`'s
+            // `gauge_delta_negative_zero_does_not_double_the_sign` is the same
+            // `Display`-of-negative-zero trap in that sink.
+            let v = if *v == 0.0 { 0.0 } else { *v };
+            if v.is_sign_negative() {
                 // No wire syntax for a negative absolute gauge -- emit the documented two-line
                 // idiom as one indivisible entry (module doc's "Negative absolute gauges").
                 write_gauge_line(line, name, 0.0, tag_suffix);
                 line.push('\n');
-                write_gauge_line(line, name, *v, tag_suffix);
+                write_gauge_line(line, name, v, tag_suffix);
             } else {
-                write_gauge_line(line, name, *v, tag_suffix);
+                write_gauge_line(line, name, v, tag_suffix);
             }
             true
         }
@@ -676,6 +690,21 @@ impl Output for StatsdOutput {
     }
 }
 
+/// Running totals for one [`StatsdOutput::send_udp`] call. `entries_in_packet` is the count that
+/// cannot be recovered from `packet_buf`'s bytes: a negative-absolute-gauge pair is **one**
+/// [`MessageBuf`] entry containing an embedded `\n` (module doc's "Negative absolute gauges"), so
+/// counting `\n` bytes in a packed datagram would report it as two messages over UDP where
+/// `send_tcp` (and `syslog_out`, on both transports) reports one.
+#[derive(Default)]
+struct UdpSendCounts {
+    /// [`MessageBuf`] entries actually written to the socket -- `logit.output.messages`.
+    messages: usize,
+    /// Datagrams actually written to the socket -- `logit.output.datagrams`.
+    datagrams: usize,
+    /// Entries appended to `packet_buf` since the last flush; reset by every flush.
+    entries_in_packet: usize,
+}
+
 impl StatsdOutput {
     /// Packs `lines` into as few UDP datagrams as fit under `max_packet_bytes` (newline-joined, no
     /// trailing newline), then sends one `send_to` per datagram. See the module doc's "Packing and
@@ -702,67 +731,51 @@ impl StatsdOutput {
             .context("statsd_out endpoint resolved to no addresses")
             .context(Fault::Clean)?;
 
-        let mut sent_messages = 0usize;
-        let mut sent_datagrams = 0usize;
+        let mut counts = UdpSendCounts::default();
         packet_buf.clear();
         for msg in lines.iter() {
             let needs_sep = !packet_buf.is_empty();
             let extra = msg.len() + usize::from(needs_sep);
             if !packet_buf.is_empty() && packet_buf.len() + extra > max_packet_bytes {
-                Self::flush_datagram(
-                    socket,
-                    addr,
-                    packet_buf,
-                    &mut sent_messages,
-                    &mut sent_datagrams,
-                    diag,
-                    telemetry,
-                )
-                .await?;
+                Self::flush_datagram(socket, addr, packet_buf, &mut counts, diag, telemetry)
+                    .await?;
             }
             if needs_sep && !packet_buf.is_empty() {
                 packet_buf.push(b'\n');
             }
             packet_buf.extend_from_slice(msg);
+            counts.entries_in_packet += 1;
         }
         if !packet_buf.is_empty() {
-            Self::flush_datagram(
-                socket,
-                addr,
-                packet_buf,
-                &mut sent_messages,
-                &mut sent_datagrams,
-                diag,
-                telemetry,
-            )
-            .await?;
+            Self::flush_datagram(socket, addr, packet_buf, &mut counts, diag, telemetry).await?;
         }
-        Ok((sent_messages, sent_datagrams))
+        Ok((counts.messages, counts.datagrams))
     }
 
-    /// Sends one packed datagram (clearing `packet_buf` after), counting it toward `sent_messages`
-    /// -- one line in the buffer may itself be a negative-gauge pair (two statsd lines joined by
-    /// `\n`), which is still exactly one [`MessageBuf`] entry and so one unit of "messages" here;
-    /// see the module doc's "Negative absolute gauges" section.
+    /// Sends one packed datagram, clearing `packet_buf` and `counts.entries_in_packet` after.
+    /// Counts the datagram's [`MessageBuf`] **entries** -- not its `\n` bytes -- toward
+    /// `counts.messages`: one entry may itself be a negative-gauge pair (two statsd lines joined
+    /// by an embedded `\n`, module doc's "Negative absolute gauges"), and that is still one unit
+    /// of "messages", the same convention [`Self::send_tcp`] (`lines.len()`) and `syslog_out`
+    /// count by on both transports. The same count is what an oversize drop reports under
+    /// `logit.output.messages.dropped{reason="oversize_datagram"}`.
     async fn flush_datagram(
         socket: &UdpSocket,
         addr: std::net::SocketAddr,
         packet_buf: &mut Vec<u8>,
-        sent_messages: &mut usize,
-        sent_datagrams: &mut usize,
+        counts: &mut UdpSendCounts,
         diag: &mut Diagnostics,
         telemetry: &Telemetry,
     ) -> anyhow::Result<()> {
-        let lines_in_packet = packet_buf.iter().filter(|&&b| b == b'\n').count() + 1;
         match socket.send_to(packet_buf, addr).await {
             Ok(_) => {
-                *sent_messages += lines_in_packet;
-                *sent_datagrams += 1;
+                counts.messages += counts.entries_in_packet;
+                counts.datagrams += 1;
             }
             Err(err) if is_message_too_large(&err) => {
                 telemetry.count(
                     "logit.output.messages.dropped",
-                    lines_in_packet as f64,
+                    counts.entries_in_packet as f64,
                     &[("reason", "oversize_datagram")],
                 );
                 diag.warn_throttled(
@@ -771,12 +784,14 @@ impl StatsdOutput {
                 );
             }
             Err(err) => {
-                let fault = if *sent_datagrams > 0 { Fault::Ambiguous } else { Fault::Clean };
+                let fault = if counts.datagrams > 0 { Fault::Ambiguous } else { Fault::Clean };
                 packet_buf.clear();
+                counts.entries_in_packet = 0;
                 return Err(anyhow::Error::new(err).context(fault));
             }
         }
         packet_buf.clear();
+        counts.entries_in_packet = 0;
         Ok(())
     }
 
@@ -1086,6 +1101,13 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_zero_gauge_renders_as_a_plain_zero_not_a_pair() {
+        let (msgs, _) = encode(vec![metric_event("free", MetricKind::Gauge(-0.0), &[])]);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0], "free:0|g");
+    }
+
+    #[test]
     fn distribution_set_histogram_and_summary_each_drop_with_a_clear_message() {
         let events = vec![
             metric_event("d", MetricKind::Distribution(logit_core::DdSketch::new()), &[]),
@@ -1328,6 +1350,51 @@ mod tests {
         assert!(found, "expected a gauge_delta_unresolved diagnostic");
     }
 
+    /// The identical batch must report the identical `logit.output.messages` on both transports.
+    /// A negative-absolute-gauge pair is one `MessageBuf` entry holding two statsd lines; UDP
+    /// used to count its embedded `\n` as a second message where TCP counted the entry.
+    #[tokio::test]
+    async fn udp_and_tcp_report_the_same_message_count_for_the_same_batch() {
+        fn messages(registry: &logit_core::Registry) -> f64 {
+            registry
+                .drain(0)
+                .into_iter()
+                .flat_map(|e| e.metrics)
+                .filter(|m| logit_core::interner::resolve(m.name) == "logit.output.messages")
+                .map(|m| match m.kind {
+                    MetricKind::Counter(v) => v,
+                    _ => panic!("logit.output.messages must be a counter"),
+                })
+                .sum()
+        }
+        let batch = || {
+            batch_with(vec![
+                metric_event("free", MetricKind::Gauge(-5.0), &[]),
+                metric_event("hits", MetricKind::Counter(1.0), &[]),
+            ])
+        };
+
+        let (udp_addr, _collector) = udp_collector().await;
+        let udp_registry = logit_core::Registry::new();
+        let mut udp_out = StatsdOutput::udp(udp_addr.to_string())
+            .unwrap()
+            .with_telemetry(udp_registry.telemetry_for("out", "statsd_out", "sink"));
+        udp_out.send(&batch()).await.expect("udp send should succeed");
+
+        let (tcp_addr, _received, _accepts) = tcp_collector().await;
+        let tcp_registry = logit_core::Registry::new();
+        let mut tcp_out = StatsdOutput::tcp(tcp_addr.to_string(), Duration::from_secs(2))
+            .with_telemetry(tcp_registry.telemetry_for("out", "statsd_out", "sink"));
+        tcp_out.send(&batch()).await.expect("tcp send should succeed");
+
+        assert_eq!(
+            messages(&udp_registry),
+            2.0,
+            "one message per MessageBuf entry: the pair counts once"
+        );
+        assert_eq!(messages(&tcp_registry), 2.0);
+    }
+
     // -- Round-trip through the real StatsdDecoder -----------------------------------------
 
     fn decode_one(line: &str) -> Vec<Event> {
@@ -1394,6 +1461,18 @@ mod tests {
         assert!(matches!(events[0].metrics[0].kind, MetricKind::Gauge(v) if v == 0.0));
         assert!(matches!(events[1].metrics[0].kind, MetricKind::GaugeDelta(v) if v == -5.0));
         // Applied in order against a starting gauge of 0, this reaches -5 -- the value we encoded.
+    }
+
+    /// `f64`'s `Display` renders `-0.0` as `"-0"`, and the decoder's `"g"` arm dispatches on the
+    /// leading `-` without parsing the value -- so a naive rendering would come back as a no-op
+    /// `GaugeDelta`, not the absolute reset to zero it was. Regression for that.
+    #[test]
+    fn a_negative_zero_gauge_does_not_decode_as_a_gauge_delta() {
+        let (msgs, _) = encode(vec![metric_event("free", MetricKind::Gauge(-0.0), &[])]);
+        assert!(!msgs[0].contains('-'), "no minus may reach the wire: {}", msgs[0]);
+        let events = decode_one(&msgs[0]);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].metrics[0].kind, MetricKind::Gauge(v) if v == 0.0));
     }
 
     #[test]

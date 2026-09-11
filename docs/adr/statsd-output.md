@@ -118,6 +118,12 @@ stale value the gauge already held at the receiver, rather than to the `0` this 
 reset it to first. This is the only place an entry contains a newline; every sanitizer this sink
 applies exists precisely to guarantee nothing else ever does.
 
+`Gauge(-0.0)` is the one negative-signed value that is *not* sent as a pair: it is numerically
+zero, and `0` is directly representable as an absolute gauge, so its sign is normalized away and it
+renders as the plain `name:0|g`. Without that normalization `f64`'s `Display` would write
+`name:-0|g`, which the decoder's leading-`-` dispatch reads as a delta — the exact corruption the
+pair exists to prevent, for the one value the pair would be pointless for.
+
 ### Sanitization
 
 A metric name has every one of `: | @ # , \n \r \0`, ASCII control characters, and whitespace
