@@ -577,6 +577,23 @@ Worked examples, one per shipped component:
   truncated` and `logit.output.messages.dropped{reason="oversize_header"|"oversize_datagram"}`
   (per-message size handling, `docs/adr/syslog-output.md`'s "Sizing" section). Retry stays a
   Layer 2 metric here too, for the same reason as `influxdb_out`.
+- `statsd_out` (`crates/logit-outputs/src/statsd.rs`, `docs/adr/statsd-output.md`):
+  `logit.output.batch.bytes`, `logit.output.request.duration`, `logit.output.requests{class="ok"|
+  "error"}` — the same shape as `syslog_out`'s. `logit.output.messages` counts encoded messages —
+  one per `MessageBuf` entry, on both transports, matching `syslog_out`'s messages count. Usually
+  one entry is one statsd line; a negative-absolute-gauge metric's two-line `0|g`/`-n|g` pair is
+  one indivisible entry (`docs/adr/statsd-output.md`) and so counts once, over UDP and TCP alike,
+  as does its `messages.dropped{reason="oversize_datagram"}` if a packed datagram carrying it is
+  rejected. **New**, `logit.output.datagrams` (UDP only) counts
+  the packed datagrams a batch of lines was sent as — the one number an operator tuning
+  `max_packet_bytes` needs that a line count alone can't show, since `statsd_out` (unlike
+  `syslog_out`) packs several lines per datagram. `logit.output.messages.dropped{reason=
+  "unresolved_gauge_delta"|"unsupported_kind"|"unencodable_value"|"empty_name"|"oversize_line"|
+  "oversize_datagram"}` and, **new**, `logit.output.tags.dropped{reason="dialect"|
+  "unrepresentable"}` for `format: statsd` dropping the whole tag segment or an individual
+  unrepresentable tag. A `MetricKind::GaugeDelta` reaching this encoder with `relative_gauges:
+  false` reports under `logit.component.diagnostics{key="gauge_delta_unresolved"}`, the identical
+  key `influxdb_out` uses, so one grep finds both sinks. Retry stays a Layer 2 metric here too.
 - `logit_out` (`crates/logit-outputs/src/logit.rs`, [ADR
   `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md)):
   `logit.proto.frames{direction="out",codec,compression}` and `logit.proto.frame.bytes` — the

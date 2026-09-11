@@ -2,24 +2,29 @@
 # docs/plans/otlp-end-to-end.md, docs/plans/otlp-logs-and-resource-identity.md,
 # docs/plans/access-log-spans.md, docs/plans/file-tailing.md, docs/plans/demo-richer-traces.md,
 # docs/plans/operator-surface.md).
-# Exercises syslog in, tail_in, docker_in, set + json + lua + trace_context + scale + kv_metrics +
-# keep_signals + keep + aggregate, InfluxDB out, OTLP/HTTP out, OTLP/gRPC out, plus `internal`
-# observing the pipeline itself (ADR `internal-telemetry-as-pipeline-events`, ADR
+# Exercises syslog in, tail_in, docker_in, otlp_in, set + json + lua + trace_context + scale +
+# kv_metrics + keep_signals + keep + aggregate, InfluxDB out, OTLP/HTTP out, OTLP/gRPC out, plus
+# `internal` observing the pipeline itself (ADR `internal-telemetry-as-pipeline-events`, ADR
 # `internal-span-emission-and-deterministic-sampling`) -- against traffic that crosses five real
 # tiers: haproxy -> nginx -> app -> postgres, plus an async worker over Redis
 # (demo/compose.yaml's `traffic` service drives the first three; docs/plans/demo-tracing-stack.md's
 # workstream A, docs/plans/demo-richer-traces.md's workstreams C and D). Logs and metrics leave
-# `logit` for a real backend (Loki, InfluxDB); traces reach Tempo three ways -- `logit`'s own
+# `logit` for a real backend (Loki, InfluxDB); traces reach Tempo four ways -- `logit`'s own
 # internal spans via `tempo_out`, haproxy's and nginx's real access-line spans (`docs/adr/
-# trace-context-span-lifting.md`'s `span:` block, also via `tempo_out`), and every real SDK-carried
+# trace-context-span-lifting.md`'s `span:` block, also via `tempo_out`), every real SDK-carried
 # span (`demo-app`'s request/database-client/Celery-producer spans, `demo-worker`'s own
 # Celery-consumer/database-client spans) going straight to Tempo, deliberately not through `logit`
-# at all (see the comment above `stdout` below) -- not every telemetry leg needs `logit` in front
-# of it, and this demo shows that honestly rather than routing everything through `logit` just to
-# prove it can. `postgres`'s own log lines still carry that same trace id back into Loki, though
-# (`postgres_trace_lift`/`postgres_trace` below) -- a `traceparent` lifted out of a
-# sqlcommenter-tagged SQL statement, not a second SDK.
-# `otlp_in` (`crates/logit-inputs/src/otlp.rs`) is consequently still unexercised by this demo.
+# at all (see the comment above `stdout` below), and now real OTLP traces `logit` itself decodes --
+# `browser_in` (`otlp_in`, ADR `otlp-json-decoding`), reachable through `haproxy`'s own `/v1/*`
+# route (`demo/haproxy/haproxy.cfg`) rather than published directly -- not every telemetry leg
+# needs `logit` in front of it, and this demo shows that honestly rather than routing everything
+# through `logit` just to prove it can. `postgres`'s own log lines still carry that same trace id
+# back into Loki, though (`postgres_trace_lift`/`postgres_trace` below) -- a `traceparent` lifted
+# out of a sqlcommenter-tagged SQL statement, not a second SDK.
+# `browser_in` wires `otlp_in` into this demo for the first time (demo/README.md's old "What isn't
+# exercised yet"), closing that gap structurally -- but nothing in this stack's own traffic sends
+# to it yet: a real browser OTel SDK is docs/plans/browser-tracing.md's workstream C, separate and
+# later. This workstream only proves the server-side path, with a manual OTLP/JSON POST.
 #
 # Topology:
 #
@@ -102,6 +107,14 @@
 #             -> worker_trace (trace_context, no `span:` -- the worker's own Celery/psycopg spans
 #             are already real) -> stdout / logs_only -> loki_out
 #
+#   browser (real OTel SDK, or curl) --OTLP/JSON POST /v1/traces--> haproxy (`is_otlp` ACL,
+#             demo/haproxy/haproxy.cfg) --> browser_in (otlp_in, :4318) -> stdout / browser_spans
+#             (keep_signals: [traces]) -> tempo_out. No set/json/trace_context chain -- unlike
+#             every listener above, the sender already carries its own Resource and a real
+#             SpanRecord, so there's nothing for `set` to stamp on. `browser_spans` exists for the
+#             identical reason `trace_only`/`access_spans` do (see `trace_only`'s comment below),
+#             not because a real OTel SDK would ever send this input anything but traces.
+#
 #   logit's own self-diagnostics (warn and above, `internal`'s default `logs:` threshold) ride
 #   the same `self` -> logs_only -> loki_out leg as every other tier's log events, alongside
 #   `self`'s own points/spans (docs/plans/operator-surface.md, workstream D) -- they are ordinary
@@ -175,6 +188,21 @@ components:
     paths: ["/var/log/postgresql/*.json"]
     read_from: beginning
     checkpoint_path: /var/lib/logit/postgres.checkpoint
+
+  # Browser-facing OTLP ingress (docs/plans/demo-tracing-stack.md workstream C,
+  # docs/plans/browser-tracing.md) -- reachable through `haproxy`'s `is_otlp` ACL on its published
+  # `:8080` (demo/haproxy/haproxy.cfg's `/v1/*` route), not published directly (demo/README.md):
+  # a browser SDK needs a same-origin endpoint, and there's no other reason to expose `logit` to
+  # the host. `protocol: http`, not `grpc` -- a browser's `fetch`/`XMLHttpRequest` can't speak
+  # gRPC, and OTLP/JSON decoding (ADR `otlp-json-decoding`) is what makes this endpoint usable from
+  # one at all, not just protobuf. Unlike every syslog/docker/tail-sourced input above, no `set`
+  # stage stamps a resource in front of this one: a real OTel SDK (or a hand-built OTLP/JSON
+  # payload, like this workstream's own curl verification) sets its own `Resource` with
+  # `service.name`, so there's nothing for `set` to supply that the sender didn't already provide.
+  browser_in:
+    type: otlp_in
+    bind: 0.0.0.0:4318
+    protocol: http
 
   # `syslog_in` mustn't invent a resource identity for data it didn't produce
   # (docs/design/internal-telemetry.md's "Resource identity" section) -- `set` is the operator
@@ -295,10 +323,14 @@ components:
   # tiers -- most of `postgres_trace`'s lines carry no trace at all (Postgres logs far more than
   # one line per request), and `worker_trace`'s block for a given trace typically arrives well
   # after the other tiers' own, since the task itself runs after the response already went back
-  # to the client. Both are expected, not bugs.
+  # to the client. Both are expected, not bugs. `browser_in` joins the same sink directly, not
+  # through a `*_trace` stage -- it's already a span, with no companion log line the way every
+  # other source here has -- but nothing in this stack's own traffic sends to it yet (see the
+  # header comment), so its block only shows up after a manual `curl`/browser POST to `/v1/traces`.
   stdout:
     type: stdio_out
-    sources: [haproxy_trace, nginx_trace, app_trace, worker_trace, postgres_trace]
+    sources:
+      [haproxy_trace, nginx_trace, app_trace, worker_trace, postgres_trace, browser_in]
 
   # Loki's OTLP ingestion accepts logs only -- it registers no `TracesService`/`MetricsService` --
   # and `otlp_out` aborts an entire batch's `send` on the first signal request that fails
@@ -338,6 +370,18 @@ components:
   access_spans:
     type: keep_signals
     sources: [haproxy_trace, nginx_trace]
+    signals: [traces]
+
+  # Same reasoning as `trace_only`/`access_spans` above, applied to `browser_in`: `otlp_out`
+  # aborts `tempo_out`'s entire batch send on the first signal request that fails
+  # (`crates/logit-outputs/src/otlp.rs`'s module doc), and Tempo registers no `MetricsService`.
+  # The browser will only ever send traces here -- there's no logs/metrics leg on this input at
+  # all -- but making that structural rather than incidental is the same call this config already
+  # makes for every other source feeding `tempo_out`: `keep_signals` costs nothing and rules the
+  # failure mode out by construction rather than by what a well-behaved sender happens to do.
+  browser_spans:
+    type: keep_signals
+    sources: [browser_in]
     signals: [traces]
 
   # nginx's JSON field names (host/request_method/status/body_bytes_sent/request_time) are
@@ -448,7 +492,8 @@ components:
   # version of this config that fed `self` straight into `tempo_out`: see `docs/known-gaps.md`'s
   # "`otlp_out` aborts an entire batch's `send`..." entry for the full account. `access_spans`
   # above needs the identical gate for the identical reason, once `haproxy_trace`/`nginx_trace`
-  # started producing metric-and-span-carrying batches too.
+  # started producing metric-and-span-carrying batches too -- `browser_spans` needs it too, though
+  # `browser_in` itself only ever emits traces (see `browser_spans`'s own comment above).
   trace_only:
     type: has_signal
     sources: [self]
@@ -457,14 +502,15 @@ components:
   # Deliberately gRPC, not HTTP (docs/adr/hand-rolled-grpc-over-hyper.md) -- Tempo's `:4317`
   # receiver, to exercise the transport the rest of this config doesn't otherwise touch;
   # `endpoint` is a bare `host:port` authority for gRPC, not a URL (see
-  # `crates/logit-outputs/src/otlp.rs`'s `grpc_authority`). Two sources now: `logit`'s own
-  # internal spans (`trace_only`) and haproxy's/nginx's real access-line spans (`access_spans`,
-  # docs/adr/trace-context-span-lifting.md) -- `demo-app`'s real request spans go straight to
-  # Tempo's own OTLP/HTTP receiver instead, never touching `logit` at all (see the comment above
-  # `stdout`). All of it still lands in the same Tempo trace when trace ids agree -- Tempo doesn't
-  # care which of its receivers a span for a given trace arrived through.
+  # `crates/logit-outputs/src/otlp.rs`'s `grpc_authority`). Three sources now: `logit`'s own
+  # internal spans (`trace_only`), haproxy's/nginx's real access-line spans (`access_spans`,
+  # docs/adr/trace-context-span-lifting.md), and whatever real OTLP traces `browser_in` decoded
+  # (`browser_spans`) -- `demo-app`'s real request spans go straight to Tempo's own OTLP/HTTP
+  # receiver instead, never touching `logit` at all (see the comment above `stdout`). All of it
+  # still lands in the same Tempo trace when trace ids agree -- Tempo doesn't care which of its
+  # receivers a span for a given trace arrived through.
   tempo_out:
     type: otlp_out
-    sources: [trace_only, access_spans]
+    sources: [trace_only, access_spans, browser_spans]
     protocol: grpc
     endpoint: tempo:4317

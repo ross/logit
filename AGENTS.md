@@ -50,7 +50,9 @@ unit/integration tests but no longer exercised by the demo, which moved its log 
 `otlp_out` straight to Loki ([docs/plans/otlp-logs-and-resource-identity.md](docs/plans/otlp-logs-and-resource-identity.md)'s
 workstream B) — the demo isn't meant to stay exhaustive over every component as more land.
 `otlp_in`/`otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`, OTLP for logs,
-metrics, and traces, both OTLP/HTTP and a hand-rolled OTLP/gRPC transport,
+metrics, and traces, both OTLP/HTTP and a hand-rolled OTLP/gRPC transport --
+`otlp_in`'s HTTP side accepts OTLP/JSON as well as protobuf
+([ADR `otlp-json-decoding`](docs/adr/otlp-json-decoding.md)) --
 [ADR `committed-pregenerated-otlp-protobuf`](docs/adr/committed-pregenerated-otlp-protobuf.md)/
 [ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md)) are real, implemented `ComponentKind`s —
 `otlp_out` is live in `demo/logit.yaml`'s both `log_out` (HTTP, straight to Loki) and `trace_out`
@@ -78,7 +80,12 @@ is real now too -- `logit_in`/`logit_out` (`crates/logit-inputs/src/logit.rs`/`c
 logit-outputs/src/logit.rs`) are implemented, tested `ComponentKind`s: one TCP (optionally TLS)
 connection, a `Hello`/`HelloAck` version/codec/compression handshake, one native frame per batch
 acknowledged before the next is sent
-([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md)). Not
+([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md)).
+`statsd_out` (`crates/logit-outputs/src/statsd.rs`, the mirror of `statsd_in`, UDP or TCP,
+DogStatsD tags round-tripped through the real decoder,
+[ADR `statsd-output`](docs/adr/statsd-output.md)) is also implemented and tested now -- v1 only
+encodes `Counter`/`Gauge`/`GaugeDelta`, so a `statsd_in -> aggregate -> statsd_out` relay still
+drops every timer metric (`docs/known-gaps.md`). Not
 yet built: credit-based flow control beyond one frame in flight, and QUIC (`docs/known-gaps.md`).
 Config is a flat graph of named components (ADR `component-graph-configuration`,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
@@ -139,7 +146,11 @@ ready (`2`). `internal`'s own `logs:` setting (`warn` by default, `error`, or `o
 `logit`'s own `warn`-and-above self-diagnostics into the pipeline as ordinary log events through
 `logit_core::telemetry::TelemetryLayer`, alongside its existing points and spans -- see
 `internal-telemetry.md`'s "Logs" section. `docs/deploying.md`'s "Probes and exit codes" and
-"Self-logging" sections are the operator-facing account of all of it.
+"Self-logging" sections are the operator-facing account of all of it. [ADR `lossless-transit`](docs/adr/lossless-transit.md)
+now states an explicit goal — a lossless relay for each like-protocol pair
+(`statsd_in`/`statsd_out`, `otlp_in`/`otlp_out`, `syslog_in`/`syslog_out`) — that today's model and
+codecs don't yet meet; [`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md) has the
+assessment and the ordered workstreams closing that gap.
 
 ## Environment
 
@@ -217,6 +228,14 @@ not a style preference:
   `logit-core::metric::DdSketch` is a real wrapper with a working `merge` (`crates/logit-transforms`'
   `aggregate` is its first caller); `HyperLogLog` is still a stub pending a real crate — don't fill
   it with a non-mergeable implementation to get `Set` aggregation working faster.
+- **`statsd_in -> statsd_out`, `otlp_in -> otlp_out`, and `syslog_in -> syslog_out` must each be a
+  lossless relay**, modulo a named list of permitted normalizations (batching, tag reordering, a
+  sink-configured dialect change) — [ADR `lossless-transit`](docs/adr/lossless-transit.md). A
+  decoder never pre-summarizes what an explicit `aggregate`/Lua stage should decide about, and a
+  field a protocol can carry that `Event` can't represent is tracked debt
+  ([`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md)), not an accepted codec
+  limitation — don't add a new lossy mapping without checking that plan and the survey it's built
+  on ([`docs/design/telemetry-landscape.md`](docs/design/telemetry-landscape.md)) first.
 - **The wire encoding is decided: hand-rolled, shipped as `logit_proto::native`** — a four-arm
   bake-off (`crates/logit-bench/src/bakeoff/`) settled it against `rkyv`, `postcard`, and OTLP
   itself; see [ADR `native-wire-format-encoding`](docs/adr/native-wire-format-encoding.md) and
@@ -258,7 +277,7 @@ crates/
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry)
-  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog
+  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, logfmt, kv, regex
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)

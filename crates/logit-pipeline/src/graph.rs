@@ -184,7 +184,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | LogitOut { .. }
         | StdioOut { .. }
         | FileOut { .. }
-        | SyslogOut { .. } => Role::Sink,
+        | SyslogOut { .. }
+        | StatsdOut { .. } => Role::Sink,
     }
 }
 
@@ -232,6 +233,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         StdioOut { .. } => "stdio_out",
         FileOut { .. } => "file_out",
         SyslogOut { .. } => "syslog_out",
+        StatsdOut { .. } => "statsd_out",
     }
 }
 
@@ -275,6 +277,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::SyslogOut { .. }
             | ComponentKind::LogitIn { .. }
             | ComponentKind::LogitOut { .. }
+            | ComponentKind::StatsdOut { .. }
     )
 }
 
@@ -1310,6 +1313,18 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 38: `statsd_out`'s `max_packet_bytes: 0` is rejected the same way rule 15's
+    // `max_batches`/`max_bytes: 0` is -- an impossible bound (every line would overflow it and be
+    // dropped whole), not a small one.
+    for (id, component) in &components {
+        if let ComponentKind::StatsdOut { max_packet_bytes: 0, .. } = &component.kind {
+            anyhow::bail!(
+                "component '{id}': max_packet_bytes: 0 would drop every metric line -- use a \
+                 positive byte size"
+            );
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         let Component { sources, buffer, receive, kind } = component;
@@ -1559,6 +1574,17 @@ mod tests {
             org: "org".to_string(),
             bucket: "bucket".to_string(),
             token: "TOKEN".to_string(),
+        }
+    }
+
+    fn statsd_out(max_packet_bytes: u64) -> ComponentKind {
+        ComponentKind::StatsdOut {
+            endpoint: "127.0.0.1:8125".to_string(),
+            transport: logit_config::StatsdTransport::default(),
+            format: logit_config::StatsdFormat::default(),
+            relative_gauges: false,
+            max_packet_bytes,
+            connect_timeout: Duration::from_secs(5),
         }
     }
 
@@ -3930,5 +3956,29 @@ mod tests {
         assert_eq!(role(&tail_in(vec!["/x"])), Role::Listener);
         assert_eq!(kind_name(&docker_in(vec!["x"], false)), "docker_in");
         assert_eq!(role(&docker_in(vec!["x"], false)), Role::Listener);
+    }
+
+    #[test]
+    fn statsd_out_is_a_sink_and_is_implemented() {
+        let kind = statsd_out(1432);
+        assert_eq!(kind_name(&kind), "statsd_out");
+        assert_eq!(role(&kind), Role::Sink);
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], statsd_out(1432))]))
+            .expect("a well-formed statsd_out should resolve fine");
+    }
+
+    #[test]
+    fn a_statsd_out_with_no_sources_is_rejected() {
+        let err = expect_err(cfg(vec![("out", vec![], statsd_out(1432))]));
+        assert!(err.contains("'out'") && err.contains("sink"), "got: {err}");
+    }
+
+    /// Rule 38: `max_packet_bytes: 0` would drop every metric line -- an impossible bound, not a
+    /// small one, the same shape as rule 15's `buffer.max_batches`/`max_bytes: 0`.
+    #[test]
+    fn a_zero_max_packet_bytes_is_rejected() {
+        let err =
+            expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], statsd_out(0))]));
+        assert!(err.contains("'out'") && err.contains("max_packet_bytes: 0"), "got: {err}");
     }
 }

@@ -38,3 +38,15 @@ this is a deliberate, reviewed act, not a CI check (`script/cibuild` never touch
 To bump the vendored version: update the tag/commit above, re-fetch each file from
 `https://raw.githubusercontent.com/open-telemetry/opentelemetry-proto/<tag>/opentelemetry/proto/...`,
 run `script/protogen`, and review both diffs (`.proto` and generated `.rs`) together.
+
+**`crates/logit-proto/src/otlp/json/` is hand-written against these definitions, not generated
+from them, and `script/protogen` does not touch it.** It's a dialect-parsing layer -- OTLP/JSON's
+camelCase-or-snake_case keys, hex-vs-base64 ids, string-or-number 64-bit fields, enum name-or-
+number -- over the same message shapes `generated/*.v1.rs` declares (see
+[ADR `otlp-json-decoding`](../../../docs/adr/otlp-json-decoding.md) for why it isn't generated
+too: `pbjson`, the natural choice, implements proto3 JSON's bytes-as-base64 rule faithfully, and
+OTLP's hex trace/span ids are exactly where OTLP deviates from that rule). **Bumping the vendored
+version is consequently a two-step review, not one**: after `script/protogen` regenerates
+`generated/*.v1.rs`, check whether any new/renamed/retyped field the diff introduces needs a
+matching hand-written accessor in `otlp/json/` -- a field prost's struct gains for free, the JSON
+path does not pick up automatically.

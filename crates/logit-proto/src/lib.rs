@@ -140,6 +140,14 @@ pub trait SignalEncoder {
 /// The mirror of [`SignalEncoder`]. Returns several batches, not one: a single OTLP request can
 /// carry data from N distinct `Resource*` entries, and an [`EventBatch`] holds exactly one
 /// `Arc<Resource>` -- collapsing every entry under the first would silently mislabel the rest.
+///
+/// **OTLP/JSON decoding (`otlp::OtlpDecoder::decode_signal_json`) is deliberately not on this
+/// trait.** `OtlpDecoder` is this trait's only implementor, and nothing in the crate is generic
+/// over `SignalDecoder` -- every call site already holds a concrete `OtlpDecoder`. A trait method
+/// would need either a default body (silently giving any future implementor "JSON unsupported"
+/// with no compile error to catch it) or forcing every implementor to answer a question that's
+/// only meaningful for OTLP in the first place. An inherent method costs nothing today and adds
+/// friction only if a second `SignalDecoder` ever needs the same asymmetry solved for real.
 pub trait SignalDecoder {
     fn decode_signal(
         &mut self,
