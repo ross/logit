@@ -7,6 +7,7 @@ each file's frontmatter is what orders this index, not the filename.
 | Plan | Created | Updated |
 |---|---|---|
 | [Closing plan: lossless like-protocol transit](lossless-transit.md) | 2026-09-10 | 2026-09-11 |
+| [Recorded interop fixtures: real producers, captured once, replayed as tests forever](recorded-interop-fixtures.md) | 2026-09-10 | 2026-09-10 |
 | [Enabling plan: `logit_out`/`logit_in` — the native transport](native-transport.md) | 2026-09-09 | 2026-09-09 |
 | [Closing plan: durable, disk-backed sink buffering](durable-sink-buffer.md) | 2026-09-09 | 2026-09-09 |
 | [Enabling plan: operator surface — readiness/liveness, leveled structured self-logging, internal logs](operator-surface.md) | 2026-09-09 | 2026-09-09 |

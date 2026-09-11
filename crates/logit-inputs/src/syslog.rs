@@ -1034,4 +1034,105 @@ mod tests {
         assert!(event.metrics.is_empty(), "syslog_in emits log-only events");
         assert!(event.span.is_none(), "syslog_in emits log-only events");
     }
+
+    // ---- recorded interop fixtures (testdata/interop/syslog/) ---------------------------------
+    //
+    // Real captured wire traffic from real senders (util-linux `logger(1)`, Python's
+    // `logging.handlers.SysLogHandler`, and rsyslog itself), recorded by `script/record-fixtures`
+    // -- see testdata/interop/README.md and docs/plans/recorded-interop-fixtures.md for how and
+    // why. These assert on *decoded, identifiable values* (message content, tag, severity), not on
+    // the fixture bytes staying byte-for-byte stable across a re-record -- see
+    // testdata/interop/README.md's "Consuming these fixtures" section for why.
+
+    /// `testdata/interop/syslog/<name>` as a `String` -- every fixture here is UTF-8 text, so this
+    /// reuses `decode`'s existing `&str` signature rather than adding a byte-oriented variant.
+    fn interop_fixture(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/interop/syslog")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading interop fixture {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn interop_fixture_logger_rfc3164_basic_decodes_message_tag_and_severity() {
+        let event = only_event(decode(&interop_fixture("logger-rfc3164-basic-000.raw")));
+        assert_eq!(
+            message_str(&event),
+            "hello from logger(1), captured for logit interop fixtures"
+        );
+        assert_eq!(
+            event.attributes.get("syslog.tag").and_then(Value::as_str),
+            Some("logit-fixture")
+        );
+        assert_eq!(event.log.as_ref().unwrap().severity, Some(Severity::Info)); // user.notice = 13 % 8 = 5
+    }
+
+    #[test]
+    fn interop_fixture_logger_rfc3164_unicode_preserves_multibyte_message_content() {
+        // A real sender emitting non-ASCII MSG, not a hand-typed test literal -- see
+        // testdata/interop/syslog/README.md's row for this fixture.
+        let event = only_event(decode(&interop_fixture("logger-rfc3164-unicode-000.raw")));
+        assert_eq!(message_str(&event), "héllo wörld — ünïcödé ✓ (UTF-8 multibyte smoke test)");
+    }
+
+    #[test]
+    fn interop_fixture_logger_rfc5424_basic_decodes_message_and_skips_structured_data() {
+        // This capture's STRUCTURED-DATA (`[timeQuality tzKnown="1" ...]`, util-linux logger's own
+        // addition) is real, not hand-typed -- exercising the balanced-bracket skip the module doc
+        // describes, with PROCID/MSGID both nil ("-").
+        let event = only_event(decode(&interop_fixture("logger-rfc5424-basic-000.raw")));
+        assert_eq!(
+            message_str(&event),
+            "hello from logger(1) in RFC 5424 mode, captured for logit interop fixtures"
+        );
+        assert_eq!(
+            event.attributes.get("syslog.tag").and_then(Value::as_str),
+            Some("logit-fixture")
+        );
+        assert!(event.attributes.get("syslog.pid").is_none());
+        assert!(event.attributes.get("syslog.msgid").is_none());
+    }
+
+    #[test]
+    fn interop_fixture_python_syslog_handler_plain_message_has_no_trailing_garbage() {
+        // NoNulSysLogHandler (demo/app/pages/syslog_handler.py) exists because the base
+        // SysLogHandler's trailing NUL byte breaks the json transform -- this fixture is real
+        // captured output from that handler; a trailing byte here would make `decode` see it as
+        // part of the message (syslog_in has no NUL-stripping of its own), so an exact match
+        // doubles as an empirical check that the real handler output stays NUL-free.
+        let event = only_event(decode(&interop_fixture("python-syslog-handler-000.raw")));
+        assert_eq!(
+            message_str(&event),
+            "hello from python logging.handlers.SysLogHandler, captured for logit interop fixtures"
+        );
+    }
+
+    #[test]
+    fn interop_fixture_python_syslog_handler_json_body_is_clean_for_the_json_transform() {
+        // The exact shape demo/logit.yaml's app tier logs in production: a JSON MSG body with no
+        // trailing NUL to trip up the downstream `json` transform.
+        let event = only_event(decode(&interop_fixture("python-syslog-handler-001.raw")));
+        assert_eq!(
+            message_str(&event),
+            r#"{"level": "info", "msg": "request handled", "path": "/", "status": 200}"#
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(message_str(&event)).is_ok(),
+            "a trailing NUL (or any other trailing byte) would make this fail, the way it used to \
+             before NoNulSysLogHandler -- see demo/app/pages/syslog_handler.py's docstring"
+        );
+    }
+
+    #[test]
+    fn interop_fixture_rsyslog_forwarded_message_decodes_tag_and_message() {
+        // rsyslog's own omfwd RFC 3164 formatting, from a real second-hop forwarder rather than a
+        // direct sender -- see testdata/interop/syslog/README.md's row for this fixture.
+        let event = only_event(decode(&interop_fixture("rsyslog-000.raw")));
+        assert_eq!(
+            event.attributes.get("syslog.tag").and_then(Value::as_str),
+            Some("logit-fixture")
+        );
+        assert_eq!(message_str(&event), "hello from rsyslog, captured for logit interop fixtures");
+    }
 }
