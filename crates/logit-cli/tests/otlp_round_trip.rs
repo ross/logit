@@ -121,14 +121,12 @@ fn fixture_described_metric() -> MetricRecord {
     }
 }
 
-/// `flags = FLAG_NO_RECORDED_VALUE`. `start_timestamp` is set explicitly non-zero (rather than
-/// left at `MetricRecord::new`'s `0` default): OTLP's own encode falls back to the data point's
-/// own `time_unix_nano` when `start_timestamp` is `0` (`otlp/metrics.rs`'s `start_time`), so a
-/// record built with the default `0` would come back non-zero and *not* equal itself -- correct
-/// codec behavior, but the wrong fixture shape for a whole-value equality assertion.
+/// `flags = FLAG_NO_RECORDED_VALUE`, `start_timestamp` left at `MetricRecord::new`'s `0` default --
+/// a genuine fixed point now that encode writes `start_timestamp` through verbatim with no
+/// fallback to the data point's own `time_unix_nano` (`otlp/metrics.rs`'s `start_time`); no longer
+/// needs an explicit non-zero value to dodge that old substitution.
 fn fixture_flagged_metric() -> MetricRecord {
     MetricRecord {
-        start_timestamp: 1_698_000_000_000_000_000,
         flags: MetricRecord::FLAG_NO_RECORDED_VALUE,
         ..MetricRecord::new(intern("round_trip_flagged_metric"), MetricKind::Gauge(0.0))
     }

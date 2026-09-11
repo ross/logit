@@ -170,6 +170,28 @@ fn metric_batch() -> EventBatch {
     }
 }
 
+/// A bare `MetricRecord::new(..)` metric -- `start_timestamp: 0`, `flags: 0`, no description, no
+/// exemplars -- the shape every non-OTLP-sourced producer (statsd, `kv_metrics`, `internal`,
+/// `aggregate` output) actually builds. Fix 5 (`docs/adr/lossless-transit.md`) makes this a fixed
+/// point: `start_timestamp` writes through verbatim with no fallback to `Event::timestamp`, so a
+/// `0` start stays `0` on the wire instead of coming back equal to the event's own timestamp.
+fn metric_batch_with_new_defaults() -> EventBatch {
+    let mut attrs = AttrMap::new();
+    attrs.insert("host", "web-1");
+    let record = MetricRecord::new(intern("fixture_default_gauge"), MetricKind::Gauge(1.5));
+    let event = Event::metric(1_700_000_000_000_000_000, attrs, record);
+    EventBatch {
+        resource: fully_populated_resource(),
+        scope: Some(fully_populated_scope()),
+        events: vec![event],
+    }
+}
+
+#[test]
+fn a_metric_record_new_metric_is_a_fixed_point() {
+    assert_fixed_point(Signal::Metrics, metric_batch_with_new_defaults());
+}
+
 fn span_batch() -> EventBatch {
     let mut event_attrs = AttrMap::new();
     event_attrs.insert("checkpoint.attr", "value");
@@ -264,6 +286,37 @@ fn a_fully_populated_span_batch_is_a_fixed_point() {
 fn without_scope(mut batch: EventBatch) -> EventBatch {
     batch.scope = None;
     batch
+}
+
+/// One-sided severity fixtures: only `otel.severity_number` present -- the missing
+/// `otel.severity_text` must round-trip as OTLP's own unset sentinel (empty string), not the
+/// band-derived variant name (`docs/adr/lossless-transit.md`'s pair-as-a-unit rule).
+fn log_batch_with_severity_number_only() -> EventBatch {
+    let mut batch = log_batch();
+    batch.events[0].attributes.remove("otel.severity_text");
+    batch
+}
+
+/// The mirror one-sided fixture: only `otel.severity_text` present -- the missing
+/// `otel.severity_number` must round-trip as `0` (`SEVERITY_NUMBER_UNSPECIFIED`), not the
+/// band-derived number.
+fn log_batch_with_severity_text_only() -> EventBatch {
+    let mut batch = log_batch();
+    let event = &mut batch.events[0];
+    event.attributes.remove("otel.severity_number");
+    event.attributes.insert("otel.severity_text", "warn");
+    event.log.as_mut().unwrap().severity = Some(Severity::Warn);
+    batch
+}
+
+#[test]
+fn a_log_batch_with_only_severity_number_is_a_fixed_point() {
+    assert_fixed_point(Signal::Logs, log_batch_with_severity_number_only());
+}
+
+#[test]
+fn a_log_batch_with_only_severity_text_is_a_fixed_point() {
+    assert_fixed_point(Signal::Logs, log_batch_with_severity_text_only());
 }
 
 #[test]

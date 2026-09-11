@@ -82,7 +82,7 @@ with the constituent parts:
 | `DdSketch` | 176 | `sketches_ddsketch::DDSketch` inlined directly (no `Box`): two `Store`s plus a `Config` |
 | `Samples` | 168 | `SmallVec<[f64; SAMPLES_INLINE]>` (`SAMPLES_INLINE = 19`) + `sample_rate: f64` -- deliberately sized to sit just under `DdSketch`'s 176, see `MetricKind` below |
 | `MetricKind` | 176 | sized by the larger of its two big variants (`Distribution`'s inlined `DdSketch`), with just enough room left over for a real discriminant that `Samples`'s smaller payload doesn't use up -- every other variant (`Sum`/`Gauge`/`GaugeDelta`/`SetMembers`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary`) is far smaller and pays the same 176 regardless |
-| `MetricRecord` | 224 | `MetricKind` (176) + `name`/`unit`/`description` (4 each, one padded) + `start_timestamp: i64` (8) + `exemplars: Vec<Exemplar>` (24) |
+| `MetricRecord` | 224 | `MetricKind` (176) + `name`/`unit`/`description` (4 each, one padded) + `start_timestamp: i64` (8) + `exemplars: Vec<Exemplar>` (24) + `flags: u32` (4, fills former padding) |
 | `MetricList` | 232 | 1 × 224 inline + 8 |
 | `TraceRef` | 26 | `[u8;16]` trace id + `Option<[u8;8]>` span id + a flags byte; `Option<TraceRef>` is also 26 -- niche-filled through `Option<[u8;8]>`'s own tag |
 | `LogRecord` | 88 | `Value` (40) + `Option<TraceRef>` (26) + `Severity`/`BodyFormat` (2) + `event_name: Option<Symbol>` (4) + `observed_timestamp: i64` (8) + `dropped_attributes_count: u32` (4, padded); `Option<LogRecord>` is also 88 — `Severity`'s niche absorbs `None` |

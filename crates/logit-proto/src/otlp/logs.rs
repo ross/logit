@@ -1,13 +1,18 @@
 //! `Event`/`LogRecord` ↔ OTLP `LogRecord`.
 //!
-//! **`Severity` ↔ `SeverityNumber`.** Encode: each band's base value (`Trace`→1, `Debug`→5,
-//! `Info`→9, `Warn`→13, `Error`→17, `Fatal`→21; `log.severity == None` leaves `severity_number`
-//! unset at `SEVERITY_NUMBER_UNSPECIFIED`/`0`), with `severity_text` set to the variant's name --
-//! **unless** the event carries an `otel.severity_number`/`otel.severity_text` attribute (see
-//! below), each of which independently overrides the band-derived value for that one field. Decode
-//! prefers `severity_number`'s band (any of the 4 numbers in a band -- e.g. `TRACE2..TRACE4` -- map
-//! to that band's `Severity`), falls back to a case-insensitive `severity_text` match when the
-//! number is unspecified or out of range, else `None`.
+//! **`Severity` ↔ `SeverityNumber`.** Encode treats `otel.severity_number`/`otel.severity_text`
+//! (see below) as one unit, not two independent overrides: when the event carries **neither**
+//! raw attribute, each band's base value (`Trace`→1, `Debug`→5, `Info`→9, `Warn`→13, `Error`→17,
+//! `Fatal`→21; `log.severity == None` leaves `severity_number` unset at
+//! `SEVERITY_NUMBER_UNSPECIFIED`/`0`) is used, with `severity_text` set to the variant's name.
+//! When the event carries **either** raw attribute, the present side's raw value wins and the
+//! *other*, missing side falls back to OTLP's own unset sentinel
+//! (`SEVERITY_NUMBER_UNSPECIFIED`/empty string) -- never to the band-derived value, which would
+//! invent a value (or a mismatched pairing, e.g. `10`/`"Info"` instead of the wire's `10`/`""`)
+//! the original producer never sent for that field. Decode prefers `severity_number`'s band (any
+//! of the 4 numbers in a band -- e.g. `TRACE2..TRACE4` -- map to that band's `Severity`), falls
+//! back to a case-insensitive `severity_text` match when the number is unspecified or out of
+//! range, else `None`.
 //!
 //! **Raw severity survives alongside the normalized `Severity`**, the same shape `syslog_in`/
 //! `syslog_out` already use for `syslog.severity` (`docs/adr/syslog-output.md`'s "Header-field
@@ -16,10 +21,14 @@
 //! construction (`INFO2` and `INFO4` both decode to `Severity::Info`). Decode stamps
 //! `otel.severity_number` (`Value::I64`, the raw `1..=24`, only when non-zero) and
 //! `otel.severity_text` (`Value::Str`, raw, only when non-empty) on the event's own attributes
-//! alongside the normalized `Severity`; encode prefers each of those two attributes over the
-//! band-derived value when present -- consumed (removed from the emitted attribute set) the same
-//! way `traces.rs` handles its own retired status-message attribute convention, so neither raw
-//! severity attribute leaks into every other sink's tag set.
+//! alongside the normalized `Severity`; encode reads those back per the pair-as-a-unit rule above
+//! -- consumed (removed from the emitted attribute set) only when *usable* (`take_severity_attrs`
+//! peeks the value's type/range before removing it: `I64`/`U64` in `1..=24` for the number, any
+//! `as_str`-able value for the text), the same way `traces.rs` handles its own retired
+//! status-message attribute convention, so neither raw severity attribute leaks into every other
+//! sink's tag set. An attribute present but unusable (wrong type, or a number outside `1..=24`) is
+//! left in place as an ordinary attribute and treated as *absent* for the fallback rule above --
+//! it is never used as the raw value.
 //! A log with no OTLP-sourced severity attributes (built by `kv_metrics`, a Lua script, `json`, ...)
 //! still encodes the band base + variant name exactly as before.
 //!
@@ -158,15 +167,25 @@ fn encode_trace(event: &Event, log: &LogRecord) -> (Vec<u8>, Vec<u8>, u32) {
 }
 
 /// Reads and removes `otel.severity_number`/`otel.severity_text` from `attrs` (`Value::I64`/
-/// `Value::Str` respectively, per the module doc's severity precedence) -- consumed the same way
-/// `decode_body_format` consumes `logit.body_format`, so neither leaks into the emitted attribute
-/// set as a plain attribute too.
+/// `Value::U64` in `1..=24` for the number, any `as_str`-able value for the text, per the module
+/// doc's severity precedence) -- consumed the same way `decode_body_format` consumes
+/// `logit.body_format`, so neither leaks into the emitted attribute set as a plain attribute too.
+/// **Peeks before removing**: an attribute of the wrong type, or a number outside `1..=24`, is
+/// left in `attrs` untouched -- it was never a usable raw override, so it's an ordinary attribute
+/// as far as this codec is concerned, not a value to consume and discard.
 fn take_severity_attrs(attrs: &mut AttrMap) -> (Option<i32>, Option<String>) {
-    let number = attrs.remove("otel.severity_number").and_then(|v| match v {
-        Value::I64(i) => Some(i as i32),
+    let number = match attrs.get("otel.severity_number") {
+        Some(Value::I64(i)) if (1..=24).contains(i) => Some(*i as i32),
+        Some(Value::U64(u)) if (1..=24).contains(u) => Some(*u as i32),
         _ => None,
-    });
-    let text = attrs.remove("otel.severity_text").and_then(|v| v.as_str().map(str::to_string));
+    };
+    if number.is_some() {
+        attrs.remove("otel.severity_number");
+    }
+    let text = attrs.get("otel.severity_text").and_then(|v| v.as_str()).map(str::to_string);
+    if text.is_some() {
+        attrs.remove("otel.severity_text");
+    }
     (number, text)
 }
 
@@ -181,16 +200,19 @@ pub(crate) fn encode_log_record(event: &Event, log: &LogRecord) -> pb::LogRecord
         key_strindex: 0,
     });
 
-    // Each of the two raw-severity attributes independently overrides the band-derived value for
-    // its own field -- see the module doc's severity section.
-    let number = severity_number_attr.unwrap_or_else(|| match log.severity {
-        Some(sev) => severity_number(sev),
-        None => pb::SeverityNumber::Unspecified as i32,
-    });
-    let text = severity_text_attr.unwrap_or_else(|| match log.severity {
-        Some(sev) => severity_text(sev).to_string(),
-        None => String::new(),
-    });
+    // The raw-severity pair is treated as a unit -- see the module doc's severity section. When
+    // neither raw attribute is present, fall back to the band-derived value; when either is
+    // present, the missing side falls back to OTLP's own unset sentinel, never the band-derived
+    // value (which would invent a value the producer never sent for that field).
+    let (number, text) = match (severity_number_attr, severity_text_attr) {
+        (None, None) => match log.severity {
+            Some(sev) => (severity_number(sev), severity_text(sev).to_string()),
+            None => (pb::SeverityNumber::Unspecified as i32, String::new()),
+        },
+        (number, text) => {
+            (number.unwrap_or(pb::SeverityNumber::Unspecified as i32), text.unwrap_or_default())
+        }
+    };
 
     let (trace_id, span_id, flags) = encode_trace(event, log);
 
@@ -744,5 +766,108 @@ mod tests {
         });
         assert_eq!(record.severity_number, pb::SeverityNumber::Info as i32, "Info's own band base");
         assert_eq!(record.severity_text, "Info");
+    }
+
+    /// One-sided severity, number only: `{10, ""}` must decode then re-encode back to `{10, ""}`
+    /// -- the missing `severity_text` must fall back to OTLP's unset sentinel (empty string), not
+    /// the band-derived variant name (`"Info"`), which would invent a value the producer never
+    /// sent. This is the fix-1 regression the review flagged: `decode(encode(decode(x))) != x`
+    /// before this fix, for either one-sided input.
+    #[test]
+    fn a_severity_number_with_no_text_round_trips_without_inventing_text() {
+        let wire = pb::LogRecord {
+            time_unix_nano: 1000,
+            observed_time_unix_nano: 0,
+            severity_number: 10,
+            severity_text: String::new(),
+            body: Some(common::value_to_any_value(&Value::str("hi"))),
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            flags: 0,
+            trace_id: Vec::new(),
+            span_id: Vec::new(),
+            event_name: String::new(),
+        };
+        let decoded = decode_log_record(wire, AttrMap::new());
+        let re_encoded = encode_log_record(&decoded, decoded.log.as_ref().unwrap());
+        assert_eq!(re_encoded.severity_number, 10);
+        assert_eq!(
+            re_encoded.severity_text, "",
+            "the missing severity_text must stay unset, not become the band-derived \"Info\""
+        );
+    }
+
+    /// The mirror case, text only: `{0, "warn"}` must decode then re-encode back to `{0, "warn"}`
+    /// -- the missing `severity_number` must fall back to `0` (`SEVERITY_NUMBER_UNSPECIFIED`),
+    /// not the band-derived number (`13`, Warn's own base), which would invent a number the
+    /// producer never sent.
+    #[test]
+    fn a_severity_text_with_no_number_round_trips_without_inventing_a_number() {
+        let wire = pb::LogRecord {
+            time_unix_nano: 1000,
+            observed_time_unix_nano: 0,
+            severity_number: 0,
+            severity_text: "warn".to_string(),
+            body: Some(common::value_to_any_value(&Value::str("hi"))),
+            attributes: Vec::new(),
+            dropped_attributes_count: 0,
+            flags: 0,
+            trace_id: Vec::new(),
+            span_id: Vec::new(),
+            event_name: String::new(),
+        };
+        let decoded = decode_log_record(wire, AttrMap::new());
+        let re_encoded = encode_log_record(&decoded, decoded.log.as_ref().unwrap());
+        assert_eq!(
+            re_encoded.severity_number,
+            pb::SeverityNumber::Unspecified as i32,
+            "the missing severity_number must stay unset, not become the band-derived 13"
+        );
+        assert_eq!(re_encoded.severity_text, "warn");
+    }
+
+    /// `take_severity_attrs` peeks before removing (fix 2): a `Value::U64` number in `1..=24` is a
+    /// usable raw override, same as `Value::I64`.
+    #[test]
+    fn take_severity_attrs_honours_a_u64_number() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("otel.severity_number", Value::U64(10));
+        let (number, _text) = take_severity_attrs(&mut attrs);
+        assert_eq!(number, Some(10));
+        assert_eq!(attrs.get("otel.severity_number"), None, "a usable value must be removed");
+    }
+
+    /// An out-of-range or wrong-type `otel.severity_number` is left in place as an ordinary
+    /// attribute, not removed and not used as a raw override -- the "peek before removing" half
+    /// of fix 2.
+    #[test]
+    fn take_severity_attrs_leaves_an_unusable_number_in_place() {
+        for value in [Value::I64(-1), Value::I64(99), Value::str("10")] {
+            let mut attrs = AttrMap::new();
+            attrs.insert("otel.severity_number", value.clone());
+            let (number, _text) = take_severity_attrs(&mut attrs);
+            assert_eq!(number, None, "{value:?} must not be used as a raw override");
+            assert_eq!(
+                attrs.get("otel.severity_number"),
+                Some(&value),
+                "{value:?} must be left in place as an ordinary attribute"
+            );
+        }
+    }
+
+    /// A wrong-type `otel.severity_text` (e.g. raw `Bytes`, not `Str`) is left in place, same
+    /// rule as the number.
+    #[test]
+    fn take_severity_attrs_leaves_unusable_text_in_place() {
+        let mut attrs = AttrMap::new();
+        let value = Value::Bytes(bytes::Bytes::from_static(b"\xff\xfe"));
+        attrs.insert("otel.severity_text", value.clone());
+        let (_number, text) = take_severity_attrs(&mut attrs);
+        assert_eq!(text, None, "non-string bytes must not be used as a raw override");
+        assert_eq!(
+            attrs.get("otel.severity_text"),
+            Some(&value),
+            "must be left in place as an ordinary attribute"
+        );
     }
 }

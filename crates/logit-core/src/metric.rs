@@ -24,11 +24,18 @@ pub struct MetricRecord {
     /// Empty `Vec` allocates nothing on the common no-exemplars path.
     pub exemplars: Vec<Exemplar>,
     /// OTLP `DataPointFlags` bitmask, `0` default -- exists so a data point flagged
-    /// `NO_RECORDED_VALUE` (bit 0, [`MetricRecord::FLAG_NO_RECORDED_VALUE`]) round-trips as a
-    /// flagged point carrying its type's default value, rather than being silently skipped the
-    /// way the OTLP codec used to treat it (`docs/adr/metrics-model-v2.md`'s W4 amendment). Fills
-    /// the 4 bytes of padding that already followed the three `Symbol`s above, so
-    /// [`MetricRecord`] stays 224 bytes -- see `crates/logit-core/tests/type_sizes.rs`.
+    /// `NO_RECORDED_VALUE` (bit 0, [`MetricRecord::FLAG_NO_RECORDED_VALUE`], see
+    /// [`MetricRecord::is_no_recorded_value`]) round-trips as a flagged point carrying its type's
+    /// default value, rather than being silently skipped the way the OTLP codec used to treat it
+    /// (`docs/adr/metrics-model-v2.md`'s W4 amendment). `otlp_out` keeps and re-encodes a flagged
+    /// point unchanged -- that's the fixed point `docs/adr/lossless-transit.md` requires for
+    /// `otlp_in -> otlp_out`. Everywhere else -- every non-OTLP sink, and `aggregate`'s fold --
+    /// must instead treat a flagged record as carrying no genuine reading: skip it (counted) at a
+    /// sink, pass it through unmerged (counted) at `aggregate`, rather than fold its default
+    /// numeric payload in as though it were a real sample (`docs/known-gaps.md`'s cross-protocol
+    /// table has the one-row summary). Fills the 4 bytes of padding that already followed the
+    /// three `Symbol`s above, so [`MetricRecord`] stays 224 bytes -- see
+    /// `crates/logit-core/tests/type_sizes.rs`.
     pub flags: u32,
     pub kind: MetricKind,
 }
@@ -51,6 +58,12 @@ impl MetricRecord {
             flags: 0,
             kind,
         }
+    }
+
+    /// Whether this record carries `FLAG_NO_RECORDED_VALUE` -- see the doc on [`Self::flags`]
+    /// above for who must check this and what to do about it.
+    pub fn is_no_recorded_value(&self) -> bool {
+        self.flags & Self::FLAG_NO_RECORDED_VALUE != 0
     }
 }
 

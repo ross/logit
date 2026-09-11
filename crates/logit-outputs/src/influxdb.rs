@@ -269,6 +269,22 @@ impl Encoder for InfluxLineEncoder {
             // once per event, not once per metric.
             render_tag_suffix(&mut self.tag_suffix, &mut self.scratch, &batch.resource, event);
             for metric in &event.metrics {
+                // A `NO_RECORDED_VALUE`-flagged point (`docs/adr/lossless-transit.md`,
+                // `crates/logit-core/src/metric.rs`'s `flags` doc) has no genuine reading to
+                // write -- InfluxDB is not OTLP, so unlike `otlp_out` this sink can't keep the
+                // point flagged; it must skip and count it rather than write its default `0`
+                // value as though it were real (`docs/known-gaps.md`'s cross-protocol table).
+                if metric.is_no_recorded_value() {
+                    self.diag.warn_throttled(
+                        "no_recorded_value",
+                        format_args!(
+                            "metric '{}' has no recorded value (OTLP NO_RECORDED_VALUE) -- \
+                             skipped",
+                            resolve(metric.name)
+                        ),
+                    );
+                    continue;
+                }
                 // One bad metric shouldn't drop its event's other metrics, let alone the rest of
                 // the batch, so this logs and skips rather than propagating via `?`. Deliberately
                 // on the inner, per-metric loop: a `Set` or `#`-prefixed metric sharing an event
@@ -957,6 +973,19 @@ mod tests {
         assert!(out.contains("host=web1"), "got: {out}");
         assert!(out.contains("env=prod"), "resource's env=staging should be overridden: {out}");
         assert!(!out.contains("env=staging"), "got: {out}");
+    }
+
+    /// A `NO_RECORDED_VALUE`-flagged point must be skipped, not written as a fabricated `value=0`
+    /// -- fix 3 in PR #123's review (`docs/adr/lossless-transit.md`, `docs/known-gaps.md`'s
+    /// cross-protocol table). A sibling metric on the same event still comes through, same shape
+    /// as `set_metrics_are_skipped_not_fatal` below.
+    #[test]
+    fn a_no_recorded_value_point_is_skipped_not_written_as_a_fabricated_zero() {
+        let mut flagged = metric_event("conns", MetricKind::Gauge(0.0), &[]);
+        flagged.metrics[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        let out = encode(vec![flagged, metric_event("page.views", MetricKind::counter(1.0), &[])]);
+        assert!(!out.contains("conns"), "a flagged point must not be written at all: {out}");
+        assert!(out.contains("page.views value=1"), "got: {out}");
     }
 
     #[test]

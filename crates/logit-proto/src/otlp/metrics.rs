@@ -1,8 +1,12 @@
 //! `MetricRecord` ↔ OTLP `Metric` -- the hard direction, both ways.
 //!
 //! **Encode.** `time_unix_nano` is stamped with `Event::timestamp`; `start_time_unix_nano` is
-//! `record.start_timestamp` when non-zero, else `Event::timestamp` (`start_timestamp == 0` is
-//! this model's own "unknown" convention, same as OTLP's). `record.flags` (OTLP `DataPointFlags`,
+//! `record.start_timestamp` written through verbatim, with no fallback to `Event::timestamp` --
+//! OTLP's own `start_time_unix_nano` "unknown" sentinel is `0` (`start_time.proto`'s own doc
+//! comment: optional, `0` = unknown), the same convention this model's `start_timestamp == 0`
+//! already uses, so a `record.start_timestamp` of `0` must stay `0` on the wire rather than
+//! borrowing the event's own timestamp and advertising a zero-width interval a rate-computing
+//! backend can misread as real. `record.flags` (OTLP `DataPointFlags`,
 //! e.g. `NO_RECORDED_VALUE`) is written into every data point's own `flags`. `record.description`
 //! resolves onto `Metric.description` when `Some`, else the wire field stays empty. Event
 //! attributes become the data point's attributes; the metric name/unit come from the
@@ -76,10 +80,11 @@
 //! metric-level (not data-point-level) attribute set, and OTLP itself documents it as informational
 //! only (`metrics.proto`: "Consumers SHOULD NOT need to be aware of these attributes").
 //!
-//! Decode-side skips (a malformed point, an unrecognized oneof) count via
-//! `logit.input.metrics.skipped{metric_kind, reason}` -- distinct names from the encode side's
-//! `logit.output.metrics.{degraded,skipped}` since these are the two directions of one component
-//! (`OtlpEncoder`/`OtlpDecoder`), not two components sharing counters.
+//! The one decode-side skip -- a `Metric` with no recognized `data` oneof (`data: None`) -- counts
+//! via `logit.input.metrics.skipped{metric_kind="unknown", reason="no_data"}` -- a distinct
+//! counter name from the encode side's `logit.output.metrics.{degraded,skipped}` since these are
+//! the two directions of one component (`OtlpEncoder`/`OtlpDecoder`), not two components sharing
+//! counters.
 
 use crate::otlp::common;
 use crate::otlp::generated::opentelemetry::proto::metrics::v1 as pb;
@@ -108,17 +113,17 @@ fn temporality_from_pb(raw: i32) -> Temporality {
     }
 }
 
-/// `record.start_timestamp` if non-zero, else `ts` (`Event::timestamp`) -- OTLP's own
-/// `start_time_unix_nano` convention for "unknown" (`0`) matches this model's, so there is no
-/// separate sentinel to translate.
-fn start_time(record_start: i64, ts: u64) -> u64 {
-    if record_start != 0 {
-        record_start.max(0) as u64
-    } else {
-        ts
-    }
+/// `record.start_timestamp` written through verbatim -- OTLP's own `start_time_unix_nano`
+/// convention for "unknown" (`0`) matches this model's, so there is no separate sentinel to
+/// translate and no fallback to `Event::timestamp`: see the module doc's encode paragraph for why
+/// substituting the event's own timestamp would be wrong, not just unnecessary.
+fn start_time(record_start: i64) -> u64 {
+    record_start.max(0) as u64
 }
 
+/// OTLP's `Exemplar` message has no trace-flags field at all, so `e.trace`'s `TraceRef.flags` is
+/// dropped here -- a real, permanent lossy mapping (see `decode_exemplar`'s mirror note and
+/// `docs/known-gaps.md`'s cross-protocol table).
 fn encode_exemplar(e: &Exemplar) -> pb::Exemplar {
     let (trace_id, span_id) = match &e.trace {
         Some(t) => (t.trace_id.to_vec(), t.span_id.map(|id| id.to_vec()).unwrap_or_default()),
@@ -136,7 +141,9 @@ fn encode_exemplar(e: &Exemplar) -> pb::Exemplar {
 /// `trace`/`span` id bytes become a [`TraceRef`] only when `trace_id` is a genuine, non-empty,
 /// non-all-zero 16 bytes -- [`TraceRef::from_bytes`]'s own validity rule (the same one
 /// `../logs.rs` applies to a `LogRecord`'s trace context), since an `Exemplar`'s correlation is
-/// optional, best-effort metadata a decoder degrades gracefully without.
+/// optional, best-effort metadata a decoder degrades gracefully without. `TraceRef.flags` is
+/// hardcoded to `0`: OTLP's `Exemplar` has no wire field to read it from (see `encode_exemplar`'s
+/// mirror note) -- a real, permanent lossy mapping, not a decode shortcut.
 fn decode_exemplar(e: pb::Exemplar) -> Exemplar {
     let value = match e.value {
         Some(pb::exemplar::Value::AsDouble(d)) => d,
@@ -197,7 +204,7 @@ pub(crate) fn encode_metric(
     let description = record.description.map(resolve).unwrap_or_default().to_string();
     let attributes = common::attrs_to_key_values(&event.attributes);
     let ts = event.timestamp.max(0) as u64;
-    let start = start_time(record.start_timestamp, ts);
+    let start = start_time(record.start_timestamp);
     let exemplars = encode_exemplars(&record.exemplars);
 
     let data = match &record.kind {
@@ -401,7 +408,7 @@ fn distribution_summary_point(
 pub(crate) fn decode_metric(
     metric: pb::Metric,
     base_attrs: &logit_core::AttrMap,
-    _telemetry: &Telemetry,
+    telemetry: &Telemetry,
 ) -> Vec<Event> {
     let name = intern(&metric.name);
     let unit = if metric.unit.is_empty() { None } else { Some(intern(&metric.unit)) };
@@ -521,7 +528,14 @@ pub(crate) fn decode_metric(
                 })
                 .collect()
         }
-        None => Vec::new(),
+        None => {
+            telemetry.count(
+                "logit.input.metrics.skipped",
+                1.0,
+                &[("metric_kind", "unknown"), ("reason", "no_data")],
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -912,6 +926,34 @@ mod tests {
         }
     }
 
+    /// A `Metric` with no recognized `data` oneof (`data: None`) decodes to no events, same as
+    /// before, but must now also count `logit.input.metrics.skipped{metric_kind="unknown",
+    /// reason="no_data"}` -- the counter this test pins was dead code before this fix (review
+    /// finding 4).
+    #[test]
+    fn a_metric_with_no_data_is_skipped_and_counted() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "source");
+        let metric = pb::Metric {
+            name: "no_data_metric".to_string(),
+            description: String::new(),
+            unit: String::new(),
+            metadata: Vec::new(),
+            data: None,
+        };
+        let events = decode_metric(metric, &AttrMap::new(), &telemetry);
+        assert!(events.is_empty(), "a Metric with no data must decode to no events");
+        let counted = registry.drain(0);
+        let skipped = counted.iter().find(|e| {
+            e.attributes.get("metric_kind").and_then(|v| v.as_str()) == Some("unknown")
+                && e.attributes.get("reason").and_then(|v| v.as_str()) == Some("no_data")
+        });
+        assert!(
+            skipped.is_some(),
+            "should count logit.input.metrics.skipped{{metric_kind=\"unknown\", reason=\"no_data\"}}"
+        );
+    }
+
     /// `NO_RECORDED_VALUE` keeps the point (flagged), rather than skipping it -- W4 amendment to
     /// `docs/adr/metrics-model-v2.md`, see the module doc.
     #[test]
@@ -977,13 +1019,17 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_start_timestamp_falls_back_to_the_events_timestamp_on_encode() {
+    fn a_zero_start_timestamp_stays_zero_on_the_wire() {
         let rec = record(MetricKind::Gauge(1.0)); // start_timestamp: 0 (unknown)
         let mut diag = Diagnostics::default();
         let metric = encode_metric(&event(), &rec, &Telemetry::default(), &mut diag).unwrap();
         match &metric.data {
             Some(pb::metric::Data::Gauge(g)) => {
-                assert_eq!(g.data_points[0].start_time_unix_nano, event().timestamp as u64);
+                assert_eq!(
+                    g.data_points[0].start_time_unix_nano, 0,
+                    "an unknown start_timestamp must stay 0 on the wire, not borrow the \
+                     event's own timestamp"
+                );
             }
             other => panic!("expected Gauge, got {other:?}"),
         }
@@ -1174,10 +1220,11 @@ mod tests {
         }
 
         proptest! {
-            /// `decode(encode(x)) == x` for every generated `MetricRecord` -- the event's own
-            /// timestamp is fixed at `0` so `start_timestamp`'s "0 falls back to the event
-            /// timestamp" encode rule (module doc) never substitutes a different value than what
-            /// `x` started with.
+            /// `decode(encode(x)) == x` for every generated `MetricRecord` -- `start_timestamp`
+            /// now writes through verbatim regardless of the event's own timestamp (no more
+            /// "0 falls back to the event timestamp" encode rule to sidestep), so the event's
+            /// timestamp here is just a fixed, arbitrary value, not load-bearing for this fixed
+            /// point.
             #[test]
             fn decode_of_encode_is_the_identity(record in arb_metric_record()) {
                 let event = Event::empty(0, AttrMap::new());

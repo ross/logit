@@ -167,6 +167,11 @@ pub struct EncodeStats {
     /// makes for the same shape of event.
     pub skipped_no_metrics: usize,
     pub dropped_gauge_delta: usize,
+    /// A `NO_RECORDED_VALUE`-flagged point -- statsd has no wire concept of "no value here," so
+    /// unlike `otlp_out` this sink can't keep the point flagged; it drops it rather than write its
+    /// default value as a fabricated real sample (`docs/adr/lossless-transit.md`,
+    /// `docs/known-gaps.md`'s cross-protocol table).
+    pub dropped_no_recorded_value: usize,
     pub dropped_unsupported_kind: usize,
     pub dropped_unencodable_value: usize,
     pub dropped_empty_name: usize,
@@ -366,6 +371,18 @@ fn render_metric(
             format_args!(
                 "statsd_out: metric name {:?} sanitizes to nothing; dropping",
                 logit_core::interner::resolve(metric.name)
+            ),
+        );
+        return false;
+    }
+
+    if metric.is_no_recorded_value() {
+        stats.dropped_no_recorded_value += 1;
+        diag.warn_throttled(
+            "no_recorded_value",
+            format_args!(
+                "statsd_out: metric {name:?} has no recorded value (OTLP NO_RECORDED_VALUE); \
+                 dropping"
             ),
         );
         return false;
@@ -625,6 +642,11 @@ impl Output for StatsdOutput {
             "logit.output.messages.dropped",
             stats.dropped_unsupported_kind as f64,
             &[("reason", "unsupported_kind")],
+        );
+        self.telemetry.count(
+            "logit.output.messages.dropped",
+            stats.dropped_no_recorded_value as f64,
+            &[("reason", "no_recorded_value")],
         );
         self.telemetry.count(
             "logit.output.messages.dropped",
@@ -1082,6 +1104,18 @@ mod tests {
         let (msgs, stats) = encode(vec![metric_event("hits", MetricKind::counter(f64::NAN), &[])]);
         assert!(msgs.is_empty());
         assert_eq!(stats.dropped_unencodable_value, 1);
+    }
+
+    /// A `NO_RECORDED_VALUE`-flagged point must be dropped and counted, not written as a
+    /// fabricated `name:0|g` -- fix 3 in PR #123's review (`docs/adr/lossless-transit.md`,
+    /// `docs/known-gaps.md`'s cross-protocol table).
+    #[test]
+    fn a_no_recorded_value_point_is_dropped_and_counted() {
+        let mut flagged = metric_event("conns", MetricKind::Gauge(0.0), &[]);
+        flagged.metrics[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        let (msgs, stats) = encode(vec![flagged]);
+        assert!(msgs.is_empty(), "a flagged point must not be written at all: {msgs:?}");
+        assert_eq!(stats.dropped_no_recorded_value, 1);
     }
 
     #[test]
