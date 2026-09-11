@@ -11,7 +11,6 @@ use logit_core::{
 };
 use logit_pipeline::Fault;
 use logit_proto::{CodecError, Encoder};
-use std::cmp::Ordering;
 use std::collections::HashMap;
 // `std::fmt::Write`, for `write!` into a `String` -- formatting straight into the output buffer
 // instead of building an intermediate `String` per number (`docs/design/memory.md`).
@@ -313,11 +312,9 @@ impl Encoder for InfluxLineEncoder {
 /// one with an embedded newline -- line protocol has no escape for that at all) is dropped
 /// individually rather than escalated to a whole-point error.
 ///
-/// The two attribute maps are **merge-joined** rather than combined by cloning the resource's map
-/// and inserting the event's over the top. Both iterate in sorted-`Symbol` order (`AttrMap::iter`),
-/// so walking them in lockstep and preferring the event's value on an equal key produces exactly
-/// the same sequence the clone-and-insert did -- without copying an `AttrMap` per event, and
-/// without the `resolve` -> `intern` round trip that re-inserting every key required.
+/// The two attribute maps are **merge-joined** ([`crate::attrs::merged`]) rather than combined by
+/// cloning the resource's map and inserting the event's over the top -- no copy of an `AttrMap`
+/// per event, and no `resolve` -> `intern` round trip that re-inserting every key would cost.
 fn render_tag_suffix(
     suffix: &mut String,
     scratch: &mut String,
@@ -325,27 +322,7 @@ fn render_tag_suffix(
     event: &Event,
 ) {
     suffix.clear();
-    let mut resource_attrs = resource.attributes.iter().peekable();
-    let mut event_attrs = event.attributes.iter().peekable();
-
-    loop {
-        let next =
-            match (resource_attrs.peek().map(|(k, _)| *k), event_attrs.peek().map(|(k, _)| *k)) {
-                (Some(r), Some(e)) => match r.cmp(&e) {
-                    Ordering::Less => resource_attrs.next(),
-                    Ordering::Greater => event_attrs.next(),
-                    // Same key on both: the event's value wins, and the resource's is discarded.
-                    Ordering::Equal => {
-                        resource_attrs.next();
-                        event_attrs.next()
-                    }
-                },
-                (Some(_), None) => resource_attrs.next(),
-                (None, Some(_)) => event_attrs.next(),
-                (None, None) => break,
-            };
-        let Some((key, value)) = next else { break };
-
+    for (key, value) in crate::attrs::merged(resource, event) {
         let key = resolve(key);
         let Some(value) = tag_value(scratch, value) else {
             continue;
@@ -613,8 +590,9 @@ fn separator(out: &mut String) {
 /// "NaN"/"inf" -- so that guard isn't theoretical.
 ///
 /// `write!` rather than `to_string()`: identical output (`to_string` is `format!("{}")`), no
-/// intermediate allocation.
-fn push_float(out: &mut String, v: f64) {
+/// intermediate allocation. `pub(crate)`: `statsd_out` renders the same `Counter`/`Gauge` values
+/// and needs identical, non-locale-dependent float formatting.
+pub(crate) fn push_float(out: &mut String, v: f64) {
     debug_assert!(v.is_finite(), "callers must reject non-finite values before formatting");
     let _ = write!(out, "{v}");
 }
@@ -633,8 +611,10 @@ fn push_i64(out: &mut String, v: i64) {
 /// One tag value as a `&str`, or `None` for a `Value` with no sensible plain-text tag
 /// representation. A `Value::Str` is borrowed straight out of the attribute (no copy, since it's
 /// already UTF-8 `Bytes`); everything else is formatted into `scratch`, which is cleared first and
-/// reused across tags.
-fn tag_value<'a>(scratch: &'a mut String, v: &'a Value) -> Option<&'a str> {
+/// reused across tags. `pub(crate)`: `statsd_out` needs the identical `Value` -> tag-text mapping
+/// for its own DogStatsD tags (cross-sink reuse precedent: `syslog.rs` already does this with
+/// `crate::stdio::render_value`).
+pub(crate) fn tag_value<'a>(scratch: &'a mut String, v: &'a Value) -> Option<&'a str> {
     match v {
         Value::Str(s) => std::str::from_utf8(s).ok(),
         Value::Bool(_) | Value::I64(_) | Value::U64(_) | Value::F64(_) => {

@@ -282,10 +282,12 @@ the pipeline diagram on the landing page as intended.
 
 ## C. Write down what browser tracing would take
 
-**Status: landed as documentation** — see [browser-tracing.md](browser-tracing.md). No `demo/`
-code changes; the summary is that same-origin OTLP export through HAProxy works with no `logit`
-change, but a real OTel *browser SDK* needs `otlp_in` to accept OTLP/JSON, which it doesn't
-today. Recorded in [known-gaps.md](../known-gaps.md).
+**Status: landed as documentation, then unblocked** — see [browser-tracing.md](browser-tracing.md).
+No `demo/` code changed as part of *this* workstream; the finding at the time was that same-origin
+OTLP export through HAProxy works with no `logit` change, but a real OTel *browser SDK* needs
+`otlp_in` to accept OTLP/JSON, which it didn't. `otlp_in` accepts OTLP/JSON now
+([ADR `otlp-json-decoding`](../adr/otlp-json-decoding.md)) — see `browser-tracing.md` for what
+that unblocks and its own follow-on plan for wiring it into the demo.
 
 ## Verification, across the whole plan
 

@@ -2,6 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<!-- docs/plans/browser-tracing.md's Workstream C: this request's own server span, handed back to
+     the page so @opentelemetry/instrumentation-document-load (browser/telemetry.js) can associate
+     its documentLoad span with this same trace -- rendered by
+     pages/context_processors.py's `traceparent`. Not Server-Timing: that header is for
+     sub-resources, not the document itself (see browser/telemetry.js's own comment). -->
+<meta name="traceparent" content="{{ traceparent }}">
 <title>logit demo</title>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 3rem auto;
@@ -9,7 +15,14 @@
   code { background: #f0f0f0; padding: 0.1em 0.3em; }
   img { max-width: 100%; border: 1px solid #ddd; }
   .caption { color: #666; font-size: 0.85rem; }
+  button { font: inherit; padding: 0.4em 0.8em; }
 </style>
+<!-- The real OTel browser SDK, esbuild-bundled from browser/telemetry.js
+     (docs/plans/browser-tracing.md's Workstream C) -- served by pages.views.browser_telemetry_js,
+     not django.contrib.staticfiles (demoproj/settings.py's own comment on why). `type="module"`:
+     telemetry.js is bundled with esbuild's `--format=esm`; `defer` either way, so this never
+     blocks the page's own render. -->
+<script type="module" defer src="/telemetry.js"></script>
 </head>
 <body>
 <h1>Hello from the <code>logit</code> demo</h1>
@@ -27,12 +40,9 @@ JavaScript runs before the browser issues that request -- so haproxy mints each 
 request a fresh trace id of its own, unconnected to the page's. The correlation for those has to
 run backwards instead: haproxy already sends a <code>Server-Timing: traceparent;desc="..."</code>
 response header on every request, which the browser exposes to JavaScript as
-<code>PerformanceResourceTiming.serverTiming</code>; reading that back would let a browser-side
-resource-load span link to the exact <code>logit</code>-minted span -- lifted from a plain
-haproxy or nginx access log line -- that served it. That's arguably the single most instructive
-thing about how <code>logit</code>'s span-lifting is useful to a browser client, worth explaining
-even though the browser-side code that would actually do this hasn't landed in this demo yet (see
-<code>docs/plans/browser-tracing.md</code> for the plan).</p>
+<code>PerformanceResourceTiming.serverTiming</code>. The browser instrumentation reads that back
+and links each resource-load span to the exact <code>logit</code>-minted span -- lifted from a
+plain haproxy or nginx access log line -- that served it.</p>
 
 <h2>This demo is not a production example</h2>
 <p>This stack exists to show a large portion of <code>logit</code>'s functionality in a way
@@ -68,6 +78,11 @@ OpenTelemetry span) -- both give the demo's Tempo traces a shape worth looking a
 flat chain of 200s. <code>traffic</code> itself is a plain <code>curl</code> loop -- no browser
 involved -- so any browser-originated telemetry only shows up once a person actually opens this
 page in one.</p>
+<p><button id="work-btn" type="button">Call /work via fetch()</button>
+<span class="caption">Unlike the plain link above, this goes through
+<code>@opentelemetry/instrumentation-fetch</code> (browser/telemetry.js) -- the resulting fetch
+span becomes a real parent of this call's own Django request span, one trace spanning browser
+&rarr; haproxy &rarr; nginx &rarr; app &rarr; Postgres/Celery.</span></p>
 
 <h2>See it in Grafana</h2>
 <ol>

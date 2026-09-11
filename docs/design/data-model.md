@@ -203,7 +203,11 @@ config or script explicitly set; `logit`'s own code never invents one. See
 
 **Metric kinds are chosen to be mergeable**, because the split-collection topology
 ([overview](../OVERVIEW.md)) means two edge nodes' aggregates may need to combine into one
-downstream, and that has to be correct, not approximate-and-hope:
+downstream, and that has to be correct, not approximate-and-hope. The kinds below are also being
+reshaped under [ADR `lossless-transit`](../adr/lossless-transit.md) — see
+[docs/plans/lossless-transit.md](../plans/lossless-transit.md)'s target model for the fuller shape
+this section will grow into (raw-sample and raw-member representations alongside the sketch/HLL
+ones, temporality and monotonicity on sums, sum/count/min/max on histograms):
 
 - `Distribution` uses **DDSketch** (`sketches-ddsketch`), which merges with a guaranteed relative
   error bound. Plain reservoir sampling or naive percentile-of-percentiles does not merge correctly
@@ -259,8 +263,11 @@ trait Encoder { fn encode(&mut self, batch: &EventBatch) -> Result<Bytes>; }
 statsd, syslog, collectd, OTLP, and the native protocol
 ([docs/design/wire-protocol.md](wire-protocol.md)) are all just implementations of these two
 traits — OTLP has no special status in the core, per [ADR `native-wire-format-with-otlp-bridge`](../adr/native-wire-format-with-otlp-bridge.md).
-This is also why the model has to be a strict superset of what OTLP can express: anything OTLP can
-carry that `Event` can't represent makes the OTLP codec lossy.
+[ADR `lossless-transit`](../adr/lossless-transit.md) generalizes this from OTLP specifically to
+every protocol `logit` ships an `_in`/`_out` pair for: the model has to be a strict superset of
+what each of them can express, or that codec's own relay becomes lossy. See
+[docs/design/telemetry-landscape.md](telemetry-landscape.md) for what each protocol can express and
+[docs/plans/lossless-transit.md](../plans/lossless-transit.md) for the resulting target shape.
 
 ## Open question
 

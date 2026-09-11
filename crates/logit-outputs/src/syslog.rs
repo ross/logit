@@ -119,44 +119,10 @@ pub enum Format {
     Rfc5424,
 }
 
-/// A reusable buffer of encoded messages: one contiguous byte buffer plus a range per message, so
-/// encoding a batch allocates once (the backing `Vec<u8>` grows as needed and is never freed
-/// between calls) rather than once per message. `SyslogOutput` reuses one across every `send`.
-#[derive(Debug, Default)]
-pub struct MessageBuf {
-    bytes: Vec<u8>,
-    ranges: Vec<std::ops::Range<usize>>,
-}
-
-impl MessageBuf {
-    fn clear(&mut self) {
-        self.bytes.clear();
-        self.ranges.clear();
-    }
-
-    fn push(&mut self, msg: &str) {
-        let start = self.bytes.len();
-        self.bytes.extend_from_slice(msg.as_bytes());
-        self.ranges.push(start..self.bytes.len());
-    }
-
-    /// One slice per encoded message, in batch order.
-    pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
-        self.ranges.iter().map(move |r| &self.bytes[r.clone()])
-    }
-
-    pub fn len(&self) -> usize {
-        self.ranges.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
-    }
-
-    pub fn total_bytes(&self) -> usize {
-        self.bytes.len()
-    }
-}
+/// `SyslogOutput` reuses one across every `send`. Lifted out to [`crate::msgbuf`] once
+/// `statsd_out` needed the identical shape; re-exported here under its original path since
+/// `crates/logit-bench` names it as `logit_outputs::syslog::MessageBuf`.
+pub use crate::msgbuf::MessageBuf;
 
 /// Per-batch outcome counts from [`SyslogEncoder::encode_into`] -- what `SyslogOutput::send` turns
 /// into `logit.output.*` telemetry (`docs/design/internal-telemetry.md`).

@@ -6,13 +6,15 @@ each file's frontmatter is what orders this index, not the filename.
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Closing plan: lossless like-protocol transit](lossless-transit.md) | 2026-09-10 | 2026-09-10 |
 | [Enabling plan: `logit_out`/`logit_in` — the native transport](native-transport.md) | 2026-09-09 | 2026-09-09 |
 | [Closing plan: durable, disk-backed sink buffering](durable-sink-buffer.md) | 2026-09-09 | 2026-09-09 |
 | [Enabling plan: operator surface — readiness/liveness, leveled structured self-logging, internal logs](operator-surface.md) | 2026-09-09 | 2026-09-09 |
+| [Enabling plan: richer traces in the demo stack](demo-richer-traces.md) | 2026-09-07 | 2026-09-07 |
 | [Enabling plan: file tailing and Docker json-file container logs](file-tailing.md) | 2026-09-06 | 2026-09-06 |
 | [Enabling plan: access log lines become trace spans](access-log-spans.md) | 2026-09-04 | 2026-09-04 |
 | [Enabling plan: a traced demo stack — HAProxy → nginx → app](demo-tracing-stack.md) | 2026-09-03 | 2026-09-04 |
-| [Enabling plan: browser tracing for the demo](browser-tracing.md) | 2026-09-03 | 2026-09-03 |
+| [Enabling plan: browser tracing for the demo](browser-tracing.md) | 2026-09-03 | 2026-09-10 |
 | [Closing plan: TLS for `otlp_out`/`otlp_in`](otlp-tls.md) | 2026-09-03 | 2026-09-03 |
 | [Closing plan: signal-aware filter components, and `otlp_out`'s remaining config gaps](signal-filtering-and-otlp-out-config-gaps.md) | 2026-09-03 | 2026-09-03 |
 | [Enabling plan: operator-declared resource identity, and a Loki-direct log leg](otlp-logs-and-resource-identity.md) | 2026-09-02 | 2026-09-03 |

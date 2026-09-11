@@ -1298,6 +1298,58 @@
               ]
             }
           }
+        },
+        {
+          "description": "statsd / DogStatsD egress over UDP or TCP -- the mirror of `StatsdIn`, and a real relay: names, values, and tags round-trip through the real decoder on the other end. See `docs/adr/statsd-output.md`.",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "type"
+          ],
+          "properties": {
+            "connect_timeout": {
+              "description": "TCP only, ignored for UDP. See `SyslogOut::connect_timeout`.",
+              "default": "5s",
+              "type": "string"
+            },
+            "endpoint": {
+              "description": "`host:port`. Resolved at connect/bind time, never at config-load time -- the same `syslog_out`/`logit_out` precedent.",
+              "type": "string"
+            },
+            "format": {
+              "description": "Which statsd dialect to emit. `dogstatsd` (default) includes the `|#tag:value,...` segment; `statsd` omits it entirely for a plain-statsd receiver that would otherwise reject it.",
+              "default": "dogstatsd",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/StatsdFormat"
+                }
+              ]
+            },
+            "max_packet_bytes": {
+              "description": "Bounds one UDP datagram's worth of packed lines (several statsd lines newline-joined per send) -- not a single line's length. Defaults to 1432: Etsy statsd's own \"commodity Ethernet LAN\" recommendation and DataDog's documented DogStatsD client default, which is 1500 MTU minus IPv4/UDP headers minus headroom for VXLAN/IPsec encapsulation -- exactly where a 1472-byte datagram would silently fragment or `EMSGSIZE`. A string via [`human_bytes`], exactly like `SyslogOut::max_message_bytes`. Ignored for `transport: tcp`, which has no datagram to overflow.",
+              "default": "1432",
+              "type": "string"
+            },
+            "relative_gauges": {
+              "description": "Encodes a `MetricKind::GaugeDelta` (statsd/DogStatsD's own `+n`/`-n` relative-gauge syntax) natively as a signed value, instead of dropping it with a `gauge_delta_unresolved` diagnostic. Off by default: a delta reaching *any* sink means the pipeline is missing an `aggregate` component (`docs/adr/relative-gauge- adjustments.md`) -- this is the one sink able to round-trip a delta losslessly, so it's an opt-in relay behavior, not a silent default across every sink.",
+              "default": false,
+              "type": "boolean"
+            },
+            "transport": {
+              "default": "udp",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/StatsdTransport"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "statsd_out"
+              ]
+            }
+          }
         }
       ],
       "properties": {
@@ -1711,6 +1763,22 @@
         }
       },
       "additionalProperties": false
+    },
+    "StatsdFormat": {
+      "description": "Which statsd dialect `statsd_out` emits. See `StatsdOut::format`'s doc comment.",
+      "type": "string",
+      "enum": [
+        "dogstatsd",
+        "statsd"
+      ]
+    },
+    "StatsdTransport": {
+      "description": "`statsd_out`'s transport. UDP (the default) matches classic statsd and DogStatsD clients; TCP is what makes `Fault` classification meaningful for this sink, same as `SyslogTransport`. Deliberately its own enum rather than reusing `SyslogTransport`: schemars publishes a type's own name into the schema's `$defs`, so sharing one would make `statsd_out` document its transport by pointing at a syslog-named type.",
+      "type": "string",
+      "enum": [
+        "udp",
+        "tcp"
+      ]
     },
     "StdioTarget": {
       "type": "string"

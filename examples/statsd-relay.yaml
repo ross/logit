@@ -1,0 +1,39 @@
+# A statsd/DogStatsD relay: receive on one edge, aggregate, forward to a central statsd/DogStatsD
+# agent -- the topology `statsd_out` exists for (docs/adr/statsd-output.md). Counters and gauges
+# round-trip losslessly through the real decoder on the other end; a timer/histogram/distribution
+# metric (`ms`/`h`/`d` on the wire) is deliberately dropped here in v1 (docs/known-gaps.md) --
+# `statsd_out` only encodes `Counter`/`Gauge`/`GaugeDelta` today.
+#
+# Config is a flat graph of components (docs/design/pipeline-graph.md,
+# docs/adr/component-graph-configuration.md): each names its own `sources`, rather than sitting in
+# a fixed inputs/transforms/outputs pipeline.
+components:
+  statsd_in:
+    type: statsd_in
+    bind: 0.0.0.0:8125
+
+  windowed:
+    type: aggregate
+    sources: [statsd_in]
+    interval: 10s
+
+  statsd_out:
+    type: statsd_out
+    sources: [windowed]
+    endpoint: central-statsd:8125
+    # Every field below defaults -- an omitted field is exactly the value shown here, commented
+    # out purely as a reference for tuning a real deployment.
+    # transport: udp             # udp | tcp -- classic statsd/DogStatsD is udp
+    # format: dogstatsd          # dogstatsd | statsd -- statsd omits the "|#tag:value,..." segment
+    #                            # entirely, for a plain-statsd receiver that would otherwise reject it
+    # relative_gauges: false     # encode a GaugeDelta (statsd's own "+n"/"-n" relative-gauge syntax)
+    #                            # natively instead of dropping it with a gauge_delta_unresolved
+    #                            # diagnostic -- see docs/adr/relative-gauge-adjustments.md; on by
+    #                            # convention only when relaying gauges through with no `aggregate`
+    #                            # resolving them first
+    # max_packet_bytes: "1432"   # bounds one UDP datagram's worth of packed lines, not a single
+    #                            # line's length -- ignored under transport: tcp
+    # connect_timeout: 5s        # tcp only
+    # buffer: (all defaults, see docs/adr/buffered-sink-delivery.md -- max_batches 1024,
+    #          max_bytes "64MiB", overflow block, retry_budget 60s, retry_max_delay 10s,
+    #          shutdown_grace 5s, plus an optional `disk:` sub-block for durable buffering)

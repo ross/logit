@@ -27,6 +27,7 @@ use logit_outputs::otlp::{
     OtlpCompression as OtlpOutCompression, OtlpOutput, OtlpTransport as OtlpOutTransport,
     SignalPaths,
 };
+use logit_outputs::statsd::{StatsdEncoder, StatsdOutput};
 use logit_outputs::stdio::StreamOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
@@ -610,6 +611,35 @@ fn build_spec(
                 write_config(&component.buffer),
             )
         }
+
+        StatsdOut {
+            endpoint,
+            transport,
+            format,
+            relative_gauges,
+            max_packet_bytes,
+            connect_timeout,
+        } => {
+            // Eager for UDP, lazy for TCP -- same reasoning as `SyslogOut` above.
+            let output = match transport {
+                logit_config::StatsdTransport::Udp => StatsdOutput::udp(endpoint.clone())?,
+                logit_config::StatsdTransport::Tcp => {
+                    StatsdOutput::tcp(endpoint.clone(), *connect_timeout)
+                }
+            };
+            let encoder =
+                StatsdEncoder::new(statsd_format(*format)).with_relative_gauges(*relative_gauges);
+            let output = output
+                .with_encoder(encoder)
+                .with_max_packet_bytes(*max_packet_bytes as usize)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
     };
     Ok((spec, telemetry))
 }
@@ -820,6 +850,15 @@ fn syslog_format(cfg: logit_config::SyslogFormat) -> logit_outputs::syslog::Form
     match cfg {
         logit_config::SyslogFormat::Rfc3164 => logit_outputs::syslog::Format::Rfc3164,
         logit_config::SyslogFormat::Rfc5424 => logit_outputs::syslog::Format::Rfc5424,
+    }
+}
+
+/// The sole place `logit_config::StatsdFormat` crosses into `logit_outputs::statsd::Format` --
+/// same reasoning as [`syslog_format`].
+fn statsd_format(cfg: logit_config::StatsdFormat) -> logit_outputs::statsd::Format {
+    match cfg {
+        logit_config::StatsdFormat::Dogstatsd => logit_outputs::statsd::Format::DogStatsd,
+        logit_config::StatsdFormat::Statsd => logit_outputs::statsd::Format::Statsd,
     }
 }
 

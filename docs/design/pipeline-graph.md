@@ -176,7 +176,7 @@ the tag's literal argument string instead of failing.
 |---|---|---|
 | Listener (`statsd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
-| Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`) | ≥1 required | must not be |
+| Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
 considered and rejected (ADR `component-graph-configuration`): a typo'd source reference would silently turn a real sink into
@@ -361,6 +361,9 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     configured id names a component present in this graph — `origin`/`previous` are exactly as
     likely to name a component in a different process's graph, relayed unchanged across
     `logit_out`/`logit_in`.
+38. A `statsd_out` `max_packet_bytes: 0` is rejected, the same shape as rule 15's
+    `buffer.max_batches`/`max_bytes: 0` — an impossible bound (every metric line would overflow it
+    and be dropped whole), not a small one (`docs/adr/statsd-output.md`).
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

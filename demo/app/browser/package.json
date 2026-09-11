@@ -1,0 +1,23 @@
+{
+  "name": "logit-demo-browser-telemetry",
+  "private": true,
+  "version": "0.0.0",
+  "_description": "Build-only package: browser/telemetry.js and its OTel SDK dependencies, bundled by esbuild (see the Dockerfile's `bundle` stage) into a single file demo/app/pages/views.py's browser_telemetry_js view serves. Never published, never installed outside that build stage.",
+  "_pinning": "Every version below is pinned exactly, matching demo/app/requirements.txt's discipline (see its own header comment) -- no semver ranges. The stable OTel JS 'core' packages (api/resources/sdk-trace-web) and the still-experimental instrumentation/exporter/context packages version independently: 1.x/2.x vs 0.x is upstream's own split (opentelemetry-js vs opentelemetry-js-contrib release trains), not a typo here.",
+  "scripts": {
+    "build": "esbuild telemetry.js --bundle --minify --format=esm --outfile=telemetry.bundle.js"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "1.9.1",
+    "@opentelemetry/resources": "2.11.0",
+    "@opentelemetry/sdk-trace-web": "2.11.0",
+    "@opentelemetry/instrumentation": "0.222.0",
+    "@opentelemetry/instrumentation-document-load": "0.67.0",
+    "@opentelemetry/instrumentation-fetch": "0.222.0",
+    "@opentelemetry/context-zone": "2.11.0",
+    "@opentelemetry/exporter-trace-otlp-http": "0.222.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

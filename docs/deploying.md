@@ -487,6 +487,22 @@ cardinality. This matters most for a deployment where `otlp_in` faces something 
 `docs/known-gaps.md`'s interner entry for when the underlying "listeners are private by deployment
 shape" premise is worth re-checking at all.
 
+## `otlp_in`: accepted `Content-Type`s, and what a browser client needs
+
+`otlp_in`'s HTTP transport accepts a POST body as `application/x-protobuf`, `application/protobuf`,
+or `application/json` — an absent or empty `Content-Type` is treated as protobuf, matching every
+client that predates this input's OTLP/JSON support. The response mirrors whichever encoding the
+request used: a protobuf request gets a protobuf response, a JSON request gets a JSON one. gRPC is
+protobuf-only regardless — OTLP/gRPC's framing *is* protobuf by definition. See
+[ADR `otlp-json-decoding`](adr/otlp-json-decoding.md) for the JSON decoding design.
+
+That covers a **same-origin** browser exporter — one reaching `otlp_in` through a reverse proxy
+sharing the page's own origin. `otlp_in` has no CORS support of any kind (`handle_http` 404s an
+`OPTIONS` preflight, and sets no `Access-Control-Allow-Origin`), so a **cross-origin** browser
+exporter — one pointed at `otlp_in` directly, on a different origin than the page — cannot reach it
+at all; put a reverse proxy in front that shares the page's origin instead of trying to open
+`otlp_in` up to arbitrary browser origins (`docs/known-gaps.md`).
+
 ## TLS
 
 `otlp_out` (both `protocol: http` and `protocol: grpc`) and `otlp_in` (both transports) can speak

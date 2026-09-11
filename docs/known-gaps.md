@@ -33,7 +33,7 @@ already built that have a known, accepted rough edge.
   (`crates/logit-inputs/src/statsd.rs`); `logit-transforms::Aggregator` passes `MetricKind::Set`
   through unaggregated rather than fake-merging it
   ([ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)); `logit-outputs::influxdb` errors on it
-  rather than writing a wrong encoding.
+  rather than writing a wrong encoding. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 - **Native wire protocol: the format and the transport are both done; credit-based flow control,
   QUIC, and an OTLP passthrough codec aren't.** `crates/logit-proto/src/frame.rs`/`src/native/`
   (the codec, [ADR `native-wire-format-encoding`](adr/native-wire-format-encoding.md)) and
@@ -466,14 +466,14 @@ already built that have a known, accepted rough edge.
   scheme for `[id@32473 k="v"]` invented without a consumer would be guesswork). Both stay
   additive-later on the *input* side specifically — `syslog_out` (the egress side,
   `docs/adr/syslog-output.md`) does support both UDP and TCP, and that asymmetry is
-  deliberate, not a sign this entry needs closing to match.
+  deliberate, not a sign this entry needs closing to match. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 - **`syslog_out` doesn't emit RFC 5424 structured data either** — everything a `json`/`kv_metrics`
   stage merged into `event.attributes` is lost on the way out unless the message body already
   carried it, so `syslog_in -> json -> syslog_out` is *less* than a byte-for-byte relay. Mapping
   attributes to SD-ELEMENTs would need an SD-ID convention (a private enterprise number, RFC 5424
   §7.2.2) that shouldn't be picked in passing while implementing the sink itself. Same reason a
   log's native trace context (`log.trace`, [ADR `log-record-trace-context`](adr/log-record-trace-context.md))
-  has nowhere to go over this wire today — no SD-ELEMENT convention exists to carry it.
+  has nowhere to go over this wire today — no SD-ELEMENT convention exists to carry it. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 - **`syslog_out` re-stamps a relayed message's timestamp rather than preserving the origin's** —
   every emitted message's TIMESTAMP is `event.timestamp` (receipt time), never the `syslog.
   timestamp` attribute `syslog_in` may have left on the event, for the same reason `syslog_in`
@@ -496,10 +496,36 @@ already built that have a known, accepted rough edge.
   those same types, not a design decision to redo.
 - **`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
   per-message framing** — `syslog_out` needs one UDP datagram or one octet-counted TCP frame per
-  *message*, which one opaque `Bytes` per *batch* can't express, so it bypasses the trait entirely
-  (`crates/logit-outputs/src/syslog.rs`'s module doc has the full reasoning). Generalizing the
-  trait (an associated framing type, or a sink-driven push interface) is deferred until a second
-  sink needs the same thing, so it isn't designed against a single caller.
+  *message*, and `statsd_out` needs one statsd line per metric packed up to a datagram size cap,
+  neither of which one opaque `Bytes` per *batch* can express, so both bypass the trait entirely
+  (`crates/logit-outputs/src/syslog.rs`/`statsd.rs`'s module docs have the full reasoning). Two
+  sinks now independently need this shape, which is exactly the signal that was being waited for —
+  generalizing the trait (an associated framing type, or a sink-driven push interface) is still
+  deferred, but no longer for lack of a second caller to design against; it's simply not yet been
+  done.
+- **`statsd_out` only encodes `Counter`/`Gauge`/`GaugeDelta` in v1 — every `Distribution`/`Set`/
+  `Histogram`/`Summary` metric is dropped** — `ms`/`h`/`d` on the statsd wire all decode to
+  `MetricKind::Distribution` (`crates/logit-inputs/src/statsd.rs::build_event`), so a
+  `statsd_in -> aggregate -> statsd_out` relay drops every timer metric today: the single most
+  common statsd workload makes it through the input and the aggregator, then dies at this sink,
+  loudly counted (`unsupported_metric_kind`) but dropped. Not implemented because the aggregator's
+  merged `DdSketch` no longer holds the original samples it combined, so "how does a merged sketch
+  become one or more statsd lines" (one line per fixed quantile? synthesized samples at quantile
+  boundaries?) is a real design question deserving its own ADR, not a guess made while landing the
+  sink itself. See `docs/adr/statsd-output.md`. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+- **`statsd_out` has no egress timestamp, no `unit`, and no metric renaming/prefixing** — the
+  classic statsd grammar has no timestamp segment at all (and `statsd_in` would silently ignore
+  one if emitted, so it wouldn't even round-trip through this repo's own input), so every relayed
+  metric is stamped with the receiver's own receipt time, exactly like `syslog_out`'s receipt-time
+  entry above. `MetricRecord::unit` has no statsd wire representation and is dropped the same way.
+  There is also no way to rename or namespace a metric on egress anywhere in the pipeline today
+  (`docs/design/lua-api.md` notes a metric's value/fields are unexposed to Lua) — a sink-side
+  `prefix` field was considered and rejected for `statsd_out` specifically
+  (`docs/adr/statsd-output.md`'s Alternatives) in favor of a future general metric-rename
+  transform, which doesn't exist yet either. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+- **`statsd_out` has no TLS/DTLS** — plaintext UDP/TCP only, same gap as `syslog_out`'s above, and
+  the same `TlsClientConfig`/`TlsServerConfig` pair would be the config-plumbing exercise if it
+  lands.
 - **A non-UTF-8 syslog MSG is a rejected line, not a `Value::Bytes` event** — RFC 5424's `MSG-ANY`
   permits arbitrary octets, and `logit-core::Value` already has a `Bytes` variant for exactly this.
   `syslog_in` isolates UTF-8 validation to one line at a time (so one bad line no longer takes its
@@ -509,7 +535,7 @@ already built that have a known, accepted rough edge.
   ASCII header fields directly off the line's raw bytes instead of a validated `&str`, deferring
   UTF-8 validation to the MSG slice alone — a real change, not a one-line fix, and nginx's
   `escape=json` access-log writer never emits invalid UTF-8 in practice, so there's no production
-  producer forcing the issue yet.
+  producer forcing the issue yet. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 
   **UTF-8 rejection is not the only thing standing between a syslog line and an arbitrary-binary
   payload.** `SyslogDecoder::decode_into` (`crates/logit-inputs/src/syslog.rs:190-197`) splits a
@@ -571,7 +597,7 @@ already built that have a known, accepted rough edge.
   arbitrary amount when the sender's clock is skewed or when messages are replayed or forwarded
   through a relay. Everything downstream keyed on time — `aggregate`'s tumbling window, the point
   timestamp `influxdb_out` writes — uses `event.timestamp`, so today a delayed or replayed message
-  lands in the window it *arrived* in, not the one it *happened* in.
+  lands in the window it *arrived* in, not the one it *happened* in. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 
   Deriving `event.timestamp` from the sender instead was considered and deliberately not done here:
   RFC 3164's timestamp carries no year and no timezone, so resolving it to an instant means guessing
@@ -856,8 +882,10 @@ already built that have a known, accepted rough edge.
   what a peer protocol expects" shows up as more than a one-line doc-comment footnote. Filed as its
   own entry, meant to grow as more codecs and more of OTLP's own surface (exemplars, profiles,
   OTLP's log `event_name`, ...) get real mappings, rather than re-discovered by grepping doc
-  comments across encoders each time. Every mapping below is deliberate, counted, and documented at
-  its own call site — this entry exists so the list is in one place too:
+  comments across encoders each time. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md);
+  see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream. Every
+  mapping below is deliberate, counted, and documented at its own call site — this entry exists so
+  the list is in one place too:
 
   | Direction | Mapping | Counter | Why |
   |---|---|---|---|
@@ -898,24 +926,57 @@ already built that have a known, accepted rough edge.
   still correctly fails the *whole* request (`400`/`grpc-status: 3`), which is the one shape
   `otlp_in`'s response *does* reflect today. Threading a real per-call count through would be a
   `SignalDecoder` API change (`crates/logit-proto`), out of scope for the PR that added `otlp_in`
-  itself — a natural next step whenever OTLP input volume makes the gap worth closing.
+  itself — a natural next step whenever OTLP input volume makes the gap worth closing. Now that
+  `otlp_in` speaks two wire encodings (below), closing this means rendering the per-signal reject
+  count as `rejectedSpans`/`rejectedLogRecords`/`rejectedDataPoints` on the JSON path — the JSON key
+  differs per [`Signal`], where the protobuf field shares one tag number across all three
+  `Export*ServiceResponse` messages (`export_response_json`'s doc comment,
+  `crates/logit-inputs/src/otlp.rs`).
   (Compression was the other half of this entry — `otlp_in` now decodes gzip on both transports,
   bounded the same way `otlp_out` bounds it on encode; see
   [ADR `otlp-compression-and-decompression-bounds`](adr/otlp-compression-and-decompression-bounds.md).)
 
-- **`otlp_in` only accepts OTLP/protobuf, not OTLP/JSON.** `crates/logit-inputs/src/otlp.rs`
-  rejects any `Content-Type` other than `application/x-protobuf`/`application/protobuf` with a
-  `415` and an explicit message (line ~194) — a deliberate scope cut for the PR that added
-  `otlp_in`, not an oversight. It's now a real blocker for one concrete consumer:
-  [docs/plans/browser-tracing.md](plans/browser-tracing.md) (workstream C of
-  [demo-tracing-stack.md](plans/demo-tracing-stack.md)) wants a real OpenTelemetry-JS browser SDK
-  exporting spans into the demo, and every browser trace exporter speaks OTLP/JSON —
-  `@opentelemetry/exporter-trace-otlp-proto` is Node-only (protobuf-in-the-browser has been an
-  open upstream request since 2022, `open-telemetry/opentelemetry-js#3118`). Closing this is a
-  bounded, well-specified feature — OTLP/JSON is a documented 1:1 mapping of the same protobuf
-  messages onto JSON, not a new wire format — but it's `logit-proto`/`otlp_in` work, not demo
-  work, which is why `browser-tracing.md` stopped short of it rather than reaching into `logit`
-  to build it in passing.
+- **`otlp_in` only accepted OTLP/protobuf, not OTLP/JSON — closed.** `otlp_in`
+  (`crates/logit-inputs/src/otlp.rs`) now accepts `Content-Type: application/json` alongside
+  protobuf on the HTTP transport, decoding through a hand-written dialect layer
+  (`crates/logit-proto/src/otlp/json/`) onto the same generated types and decode path the protobuf
+  side already used. See [ADR `otlp-json-decoding`](adr/otlp-json-decoding.md) for the design (and
+  for why `pbjson`/generated `serde::Deserialize` impls were rejected — OTLP's hex trace/span ids
+  are exactly where OTLP deviates from proto3 JSON's own bytes-as-base64 rule, which those
+  generators implement faithfully and can't be told to skip for one field type without hand-editing
+  generated code). What's still open, tracked below and in that ADR's Consequences: CORS, the
+  `text/plain` error-body deviation, and the JSON path's real (if still bounded) memory cost
+  relative to protobuf.
+
+- **`otlp_in` has no CORS support — `OPTIONS` 404s, no `Access-Control-Allow-Origin`.** A browser
+  exporter posting cross-origin to `otlp_in` fails at preflight: `handle_http` answers any
+  non-`POST` method, `OPTIONS` included, with a `404`
+  (`crates/logit-inputs/src/otlp.rs`). Same-origin export (a reverse proxy in front of both the
+  page and `otlp_in`, e.g. `demo/haproxy/haproxy.cfg` routing `/v1/traces` to `logit`) sidesteps
+  this entirely and is the supported path today — see `docs/plans/browser-tracing.md`. A real
+  `cors:` config surface (allowed origins, an `OPTIONS` handler, response headers) is unbuilt; it's
+  a config/security surface in its own right (an allowed-origins list, whether a reflexive `*` is
+  ever appropriate) rather than something to fold into the OTLP/JSON decoding work that made it
+  worth naming.
+
+- **`otlp_in` answers every 4xx/5xx with `text/plain`, on both encodings — the spec wants a
+  protobuf-encoded `Status`.** *"The response body for all HTTP 4xx and HTTP 5xx responses MUST be
+  a Protobuf-encoded Status message"* — `text_response` (`crates/logit-inputs/src/otlp.rs`) always
+  builds a plain-text body instead, for both the protobuf and the JSON request path. Pre-existing
+  on the protobuf side since `otlp_in` first shipped, not something OTLP/JSON support introduced;
+  left alone when JSON support landed since building a `google.rpc.Status` encoder is orthogonal to
+  decoding and every real client checked (including `opentelemetry-js`) only reads the HTTP status
+  code on error, never the error body's content-type.
+
+- **An OTLP/JSON request costs more peak memory per byte than a same-sized protobuf one, under the
+  same `MAX_REQUEST_BYTES` cap.** The JSON path parses into a `serde_json::Value` tree
+  (`crates/logit-proto/src/otlp/json/`) before any of it reaches the decoded event model — a
+  `Map`/`Vec`/`String`/`Number` allocation per JSON node — where `prost::Message::decode` builds
+  the target structs directly with no such intermediate tree. `MAX_CONCURRENT_CONNECTIONS`'s doc
+  comment (`crates/logit-inputs/src/otlp.rs`) states the bound this doesn't break (worst case
+  across all connections is still a real, finite multiple of the existing 4 GiB figure, not
+  unbounded) without asserting a measured multiplier — nobody has profiled one yet. Worth doing
+  before OTLP/JSON sees production volume.
 
 - **`otlp_out` aborts an entire batch's `send` on the first signal request that fails -- pointed at
   a signal-partial backend fed by a mixed-signal source, that's not just noise, it can end the
