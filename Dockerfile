@@ -3,7 +3,7 @@
 # Unlike Dockerfile.dev (the container contributors build and test in), this is what a consumer
 # builds or pulls to actually run `logit`. Built with `script/image`.
 
-FROM rust:1-bookworm AS builder
+FROM rust:1.98.1-bookworm AS builder
 
 # Build deps for the vendored LuaJIT build (mlua "luajit, vendored" features,
 # crates/logit-script/Cargo.toml). No libssl-dev here: reqwest is pinned to rustls-tls

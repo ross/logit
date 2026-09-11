@@ -1836,7 +1836,8 @@ mod humantime_serde_duration {
 }
 
 /// Generate the published JSON Schema for [`Config`]. Backs the `logit schema` CLI command
-/// (ADR `config-yaml-jsonschema`) -- CI regenerates `schema/logit.schema.json` from this and fails if it's stale.
+/// (ADR `config-yaml-jsonschema`) -- an ordinary workspace test compares its output with the
+/// committed `schema/logit.schema.json` and fails if it is stale.
 pub fn json_schema() -> schemars::schema::RootSchema {
     schemars::schema_for!(Config)
 }
@@ -1844,6 +1845,16 @@ pub fn json_schema() -> schemars::schema::RootSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_schema_is_current() {
+        let generated = format!("{}\n", serde_json::to_string_pretty(&json_schema()).unwrap());
+        let committed = include_str!("../../../schema/logit.schema.json");
+        assert_eq!(
+            committed, generated,
+            "schema/logit.schema.json is stale; run ./script/schema and commit the result"
+        );
+    }
 
     // Deserialized via `serde_json` rather than the YAML this crate is actually fed through
     // `logit-cli` (deliberately not a dependency here -- see the crate doc comment): JSON and

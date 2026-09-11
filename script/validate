@@ -17,7 +17,15 @@ source "${SCRIPT_PATH}/common.sh"
 
 export INFLUXDB_TOKEN="${INFLUXDB_TOKEN:-logit-dev-token}"
 
+if ! in_project_environment; then
+    run ./script/validate "$@"
+    exit
+fi
+
+cargo build --quiet -p logit-cli
+LOGIT_BIN="${CARGO_TARGET_DIR:-${ROOT}/target}/debug/logit"
+
 for config in demo/logit.yaml examples/*.yaml; do
     echo "-- ${config}"
-    run cargo run -q -p logit-cli -- validate "${config}"
+    "${LOGIT_BIN}" validate "${config}"
 done

@@ -81,7 +81,9 @@ networks:
   logit: {}
 
 volumes:
-  cargo_home: {}
-  target_cache: {}
+  cargo_home:
+    name: logit_cargo_home
+  target_cache:
+    name: logit_target_cache
   influxdb_data: {}
   grafana_data: {}

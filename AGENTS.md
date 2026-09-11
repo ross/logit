@@ -163,8 +163,9 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/test [args]` | `cargo nextest run --workspace` |
 | `script/lint` | `cargo clippy --workspace --all-targets -- -D warnings` |
 | `script/format [--check]` | `cargo fmt --all` |
+| `script/check [test args]` | Routine format-check + lint + workspace tests, in one dev container |
 | `script/schema` | Regenerate `schema/logit.schema.json` — run after any `logit-config` type change, and commit the result |
-| `script/validate` | `logit validate` over every shipped config (`demo/`, `examples/`) — part of `cibuild` |
+| `script/validate` | Manually run `logit validate` over every shipped config (`demo/`, `examples/`); ordinary tests enforce this too |
 | `script/bench [filter]` | `cargo bench -p logit-bench` — throughput + per-benchmark allocation counts. Not part of `cibuild` |
 | `script/audit` | `cargo-deny` + `cargo-audit` |
 | `script/cibuild` | The exact sequence CI runs, in order — run this before opening a PR |
@@ -181,6 +182,9 @@ All default to `sudo docker`; `DOCKER=docker` or `DOCKER=podman` overrides. See
 Work happens on a branch, landed via pull request — never commit straight to `main`. Run
 `script/cibuild` locally before opening one; it's the same sequence `.github/workflows/ci.yml`
 runs, so a clean local run means a clean CI run.
+
+Use `script/check` for the ordinary edit/verify loop. Cargo downloads and compiled artifacts use
+shared project-wide Docker volumes across worktrees; do not remove them as part of routine cleanup.
 
 **To bring a branch with an open PR up to date with `main`, `git merge origin/main` — don't
 rebase.** A rebase rewrites the branch's commits, which means a force-push to update the PR; that's

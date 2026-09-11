@@ -1,8 +1,9 @@
+# syntax=docker/dockerfile:1
 # Development/build image for logit.
 #
 # Not (yet) a production runtime image -- this is the container contributors build and test in,
 # so nobody needs Rust, LuaJIT build deps, or anything else installed on the host.
-FROM rust:1-bookworm
+FROM rust:1.98.1-bookworm
 
 ARG USERNAME=dev
 ARG USER_UID=1000
@@ -18,9 +19,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install cargo-nextest --locked \
-    && cargo install cargo-deny --locked \
-    && cargo install cargo-audit --locked
+RUN rustup component add rustfmt clippy
+
+ARG CARGO_NEXTEST_VERSION=0.9.144
+RUN --mount=type=cache,id=logit-dev-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=logit-dev-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=logit-dev-cargo-tools-target,target=/tmp/cargo-tools-target,sharing=locked \
+    CARGO_TARGET_DIR=/tmp/cargo-tools-target \
+    cargo install cargo-nextest --version ${CARGO_NEXTEST_VERSION} --locked
+
+ARG CARGO_DENY_VERSION=0.20.2
+RUN --mount=type=cache,id=logit-dev-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=logit-dev-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=logit-dev-cargo-tools-target,target=/tmp/cargo-tools-target,sharing=locked \
+    CARGO_TARGET_DIR=/tmp/cargo-tools-target \
+    cargo install cargo-deny --version ${CARGO_DENY_VERSION} --locked
+
+ARG CARGO_AUDIT_VERSION=0.22.2
+RUN --mount=type=cache,id=logit-dev-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=logit-dev-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=logit-dev-cargo-tools-target,target=/tmp/cargo-tools-target,sharing=locked \
+    CARGO_TARGET_DIR=/tmp/cargo-tools-target \
+    cargo install cargo-audit --version ${CARGO_AUDIT_VERSION} --locked
 
 # Match the host user (see compose.yaml `user: "1000:1000"`) so bind-mounted files written from
 # inside the container come back owned by the host account, not root.

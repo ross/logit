@@ -7,5 +7,10 @@ set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
 source "${SCRIPT_PATH}/common.sh"
 
-run cargo deny check
-run cargo audit
+if ! in_project_environment; then
+    run ./script/audit "$@"
+    exit
+fi
+
+cargo deny check
+cargo audit

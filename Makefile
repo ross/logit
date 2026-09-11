@@ -3,7 +3,7 @@
 # https://github.blog/engineering/scripts-to-rule-them-all/) -- see AGENTS.md and README.md, and
 # add new commands there, not here.
 
-.PHONY: bootstrap setup update server demo test bench lint fmt fmt-check schema validate audit cibuild console image up down clean
+.PHONY: bootstrap setup update server demo test bench lint fmt fmt-check check schema validate audit cibuild console image up down clean
 
 bootstrap:  ## Build the dev container image.
 	./script/bootstrap
@@ -34,6 +34,9 @@ fmt:        ## cargo fmt
 
 fmt-check:  ## cargo fmt --check
 	./script/format --check
+
+check:      ## Routine format + lint + test loop
+	./script/check
 
 schema:     ## Regenerate schema/logit.schema.json
 	./script/schema

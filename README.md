@@ -75,6 +75,7 @@ who reaches for `make` out of habit.
 | `script/bench [filter]` | Throughput and allocation benchmarks ([docs/design/memory.md](docs/design/memory.md)) |
 | `script/lint` | `cargo clippy`, warnings denied |
 | `script/format [--check]` | `cargo fmt` |
+| `script/check [test args]` | Routine format-check + lint + workspace tests in one container |
 | `script/schema` | Regenerate `schema/logit.schema.json` from the config types |
 | `script/validate` | `logit validate` over every shipped config (`demo/`, `examples/`) |
 | `script/audit` | Supply-chain checks (`cargo-deny`, `cargo-audit`) |
@@ -89,6 +90,12 @@ for `sudo` entirely), or `DOCKER=podman script/...` for rootless Podman — both
 compatible with the plain `Dockerfile.dev`/`compose.yaml` here. See
 [ADR `containerized-development`](docs/adr/containerized-development.md) for why and how.
 
+Cargo downloads and build artifacts live in project-wide `logit_cargo_home` and
+`logit_target_cache` Docker volumes, so a new worktree reuses warm dependencies. Older
+worktree-scoped volumes are deliberately not removed automatically; inspect them with
+`docker volume ls` and remove only explicitly named volumes belonging to worktrees you no longer
+need. See [ADR `fast-local-development-loop`](docs/adr/fast-local-development-loop.md).
+
 ## Local test stack
 
 `script/setup` (or `make up`) starts InfluxDB 2.x (seeded with a `logit`/`metrics` org/bucket and
@@ -99,7 +106,8 @@ is the config the v0.1 slice targets against this stack.
 ## Contributing
 
 Work happens on branches, landed via pull request — nothing is pushed straight to `main`.
-`script/cibuild` is what CI runs; it's the thing to run locally before opening a PR. See
+Use `script/check` while iterating. `script/cibuild` is what CI runs; it's the thing to run locally
+before opening a PR. See
 [AGENTS.md](AGENTS.md) if you're an AI coding agent working in this repo.
 
 ## Repo layout

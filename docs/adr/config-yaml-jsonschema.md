@@ -1,6 +1,6 @@
 ---
 created: 2026-08-28
-updated: 2026-08-28
+updated: 2026-09-11
 ---
 
 # Configuration: YAML with a generated JSON Schema
@@ -14,9 +14,9 @@ comfortable to hand-write, and be validatable by editors and CI before `logit` e
 
 ## Decision
 YAML, deserialized with `serde`. A JSON Schema is generated directly from the Rust config types via
-[`schemars`](https://github.com/GREsau/schemars) and published (`logit schema` prints it; CI writes
-it to `schema/logit.schema.json`), so the schema can never drift from what the binary actually
-accepts.
+[`schemars`](https://github.com/GREsau/schemars) and published (`logit schema` prints it). An
+ordinary `logit-config` test compares generated output with `schema/logit.schema.json`, so every
+workspace test run detects drift without regenerating a tracked file as a side effect.
 
 For YAML parsing: use a maintained fork — `serde_norway` or `serde_yaml_ng` (decide at
 implementation time; check crates.io activity) — rather than `serde_yaml`, which its author archived
