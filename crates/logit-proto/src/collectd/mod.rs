@@ -15,7 +15,8 @@
 //! and collectd egress genuinely needs per-*datagram* boundaries, since the receiver resets its
 //! sticky identity state at every datagram edge and a `max_packet_bytes` cap decides where those
 //! edges fall. [`CollectdEncoder::encode_into`] fills a [`crate::MessageBuf`]`<usize>` instead: one
-//! entry per datagram, whose `usize` meta is the value-list count that datagram carries (what
+//! entry per datagram, whose `usize` meta is the number of *messages* (value lists or
+//! notifications -- a notification is always alone, meta `1`) that datagram carries (what
 //! `collectd_out` needs to attribute an `EMSGSIZE` drop to the right number of metrics). The
 //! decode direction has no such problem -- one datagram in, N events out -- so [`CollectdDecoder`]
 //! is an ordinary [`crate::Decoder`].
@@ -100,6 +101,7 @@
 //! |---|---|---|
 //! | event with `collectd.type` present (merged: event attributes, then resource) | **like-relay**: one Values part carrying every record of `event.metrics` in order, identity straight off the `collectd.*` attributes | -- |
 //! | event without `collectd.type` | **fallback**: one single-data-source list per record -- plugin = the record name up to its first `.` (the whole name if it has none), type_instance = the remainder, type = `counter`/`gauge`/`derive`/`absolute` by kind (all single-data-source types in a stock `types.db`), no plugin_instance | -- |
+//! | an event with `event.metrics` non-empty **and** an [`ATTR_SEVERITY`] attribute | metrics win: the event encodes as an ordinary value list (like-relay or fallback, per the two rows above); `collectd.severity` has no wire form on a value list and is dropped like any other unrepresentable `collectd.*` carrier | `logit.output.tags.dropped{reason="unrepresentable"}` |
 //! | `Sum{Cumulative, monotonic}`, integral, in `u64` range | COUNTER | -- |
 //! | `Sum{Cumulative, !monotonic}`, integral, in `i64` range | DERIVE | -- |
 //! | `Sum{Delta, monotonic}`, integral, in `u64` range | ABSOLUTE | -- |
@@ -126,25 +128,26 @@
 //! | a list that alone exceeds `max_packet_bytes` | dropped whole, never split | `logit.output.metrics.skipped{reason="oversize_value_list"}` + diag `oversize_value_list` |
 //! | an event with no metrics at all, no [`ATTR_SEVERITY`] attribute (present in any form) either | skipped | [`EncodeStats::skipped_no_metrics`] (no counter of its own -- nothing was lost, there was nothing to send) |
 //! | `MetricRecord`'s `unit`, `description`, `start_timestamp`, `exemplars`; `EventBatch::scope`; `Resource::schema_url` | dropped | none; `docs/known-gaps.md` rows -- the protocol has no field for any of them |
-//! | an event with no metrics, `Event::log` set, and an [`ATTR_SEVERITY`] attribute present (any `Value` type) | a **notification**: TimeHR, Severity, Host, Plugin, PluginInstance, Type, TypeInstance (the last four only when non-empty; identity written in **full**, never elided against the previous list -- see below), Message | -- |
+//! | an event with no metrics, `Event::log` set, and an [`ATTR_SEVERITY`] attribute present (any `Value` type) | a **notification**, always its own datagram: TimeHR, Severity, Host, Plugin, PluginInstance, Type, TypeInstance (the last four only when non-empty; identity written in full, no elision state read or left behind -- see below), Message | -- |
 //! | that notification's [`ATTR_SEVERITY`] is not `Value::U64` or not one of {1, 2, 4} | dropped whole | `logit.output.metrics.skipped{reason="notification_dropped"}` + diag `notification_dropped` ([`EncodeStats::dropped_notification`]) |
 //! | that notification's `LogRecord::message` is empty, or not a `Str`/`Bytes` `Value` | dropped whole | `logit.output.metrics.skipped{reason="empty_message"}` + diag `empty_message` ([`EncodeStats::dropped_empty_message`]) |
 //! | that notification's message, `Str` or `Bytes`, NUL byte | written verbatim, NUL → `_` (uncounted -- collectd's own C strings make this substitution routine, unlike an identity field where it changes what a receiver keys a series on) | -- |
 //! | that notification's message longer than [`NOTIF_MAX_MSG_LEN`] `- 1` (255) bytes | truncated on a character (`Str`) or byte (`Bytes`) boundary | `logit.output.messages.truncated` + diag `message_truncated` ([`EncodeStats::notification_messages_truncated`]) |
 //! | a notification alone exceeding `max_packet_bytes` | dropped whole, never split | `logit.output.metrics.skipped{reason="oversize_notification"}` + diag `oversize_notification` ([`EncodeStats::dropped_oversize_notification`]) |
 //!
-//! A notification's identity is **always written in full**, never elided against the previous
-//! list's -- unlike a value list, which elides every string part matching `last`. collectd's own
-//! `notification_t` and `value_list_t` are distinct C structs, and the network plugin's write
-//! callback (`network.c`'s `nc_dispatch`/`write_notification`) is not reachable from this repo to
-//! confirm bit-for-bit whether it compares a notification's fields against the same "last written"
-//! state a value list would; writing every field unconditionally is correct regardless of which
-//! way that turns out (a receiver reads whatever is on the wire, whether or not it was strictly
-//! necessary to write it), so this codec takes the always-write side of that uncertainty rather
-//! than risk relaying a notification with a stale plugin or type inherited from an unrelated list
-//! earlier in the datagram. `last` is still **updated** after a notification's own write, so a
-//! value list immediately following one in the same datagram can still elide against it -- the
-//! elision *state* is shared, even though the notification's own encoding never reads from it.
+//! A notification is **always its own datagram**, carrying its identity in full -- confirmed by
+//! the recorded capture this workstream added (`testdata/interop/collectd/
+//! collectd-notification-000.raw`), not merely assumed: collectd's own sender flushes whatever
+//! value-list packet is in progress, writes the notification alone (TimeHR, Severity, Host,
+//! Plugin, Type, Message -- no PluginInstance/TypeInstance in that capture, since `load` has
+//! neither), and the *next* value list restates its identity in full too. [`encode::CollectdEncoder`]
+//! does exactly the same: [`encode::pack_notification`] flushes any in-progress packet first (if one
+//! is open), pushes the notification as a one-message datagram of its own, and clears the elision
+//! state (`last`) both before and after -- a notification never elides against a preceding list's
+//! identity, and never leaves state behind for a following one to elide against either. Every
+//! Plugin/PluginInstance/Type/TypeInstance part is still written only when non-empty, exactly like
+//! an absent instance on a value list -- "in full" means "not elided", not "every field always
+//! present".
 //!
 //! ## Well-known attributes (`collectd.*`)
 //!
@@ -163,7 +166,7 @@
 //! | [`ATTR_TYPE`] | `Str`/`Bytes` | the wire Type; **its presence is what selects like-relay encoding** |
 //! | [`ATTR_TYPE_INSTANCE`] | `Str`/`Bytes` | the wire TypeInstance, only when non-empty |
 //! | [`ATTR_INTERVAL`] | `F64` seconds | `cdtime / 2³⁰`, exact; absent when the wire carried no interval or a zero one |
-//! | [`ATTR_SEVERITY`] | `U64` ∈ {1, 2, 4} | the raw wire severity of a *notification* (1 FAILURE, 2 WARNING, 4 OKAY); its presence is what makes `collectd_out` encode a `log`-only event as a notification rather than skip it, and its value -- not the normalized [`logit_core::LogRecord::severity`] -- is what reaches the wire, outranking it exactly as `syslog.severity`/`otel.severity_number` outrank their own normalized field (rule (b) of [ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md)) |
+//! | [`ATTR_SEVERITY`] | `U64` ∈ {1, 2, 4} | the raw wire severity of a *notification* (1 FAILURE, 2 WARNING, 4 OKAY); its presence on a **metrics-empty** event is what makes `collectd_out` encode it as a notification rather than skip it, and its value -- not the normalized [`logit_core::LogRecord::severity`] -- is what reaches the wire, outranking it exactly as `syslog.severity`/`otel.severity_number` outrank their own normalized field (rule (b) of [ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md)). **Metrics win**: on an event that also carries `event.metrics`, this attribute has no wire form -- a value list has no severity concept -- and is dropped and counted like any other unrepresentable `collectd.*` carrier. |
 //!
 //! ## Sanitization
 //!
@@ -209,9 +212,10 @@
 //!     datagram grows and may split across `max_packet_bytes`. Only (3)'s *string* parts are
 //!     elided on egress. Added by the ADR's "an eleventh normalization" amendment, where the same
 //!     entry is numbered 11 because that list splits (3) in two;
-//! 11. a notification always leaves as its own datagram, carrying its identity in full -- a
-//!     notification dispatched from elided sticky state on the way in leaves with its own full
-//!     identity, never inherited from (or shared with) a value list packed elsewhere in the batch;
+//! 11. a notification always leaves as its own datagram, carrying its identity in full and
+//!     sharing no elision state with any value list -- a notification dispatched from elided
+//!     sticky state on the way in leaves with its own full identity, and neither reads nor leaves
+//!     behind elision state for a list packed elsewhere in the batch;
 //! 12. NUL in a notification message becomes `_` (uncounted); a message longer than 255 bytes is
 //!     truncated (counted).
 //!

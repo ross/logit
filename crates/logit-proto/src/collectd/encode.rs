@@ -6,8 +6,8 @@
 //! implements [`crate::FramedEncoder`] (ADR `framed-encoder`) rather than [`crate::Encoder`] -- see
 //! [`super`]'s "No `crate::Encoder`" paragraph for why a datagram-framed sink needs the former: the
 //! output is a [`crate::MessageBuf`]`<usize>`, one entry per datagram, whose `usize` meta is the
-//! value-list count that datagram carries -- what `collectd_out` needs to attribute an `EMSGSIZE`
-//! drop to the right number of metrics.
+//! number of messages (value lists or notifications) that datagram carries -- what `collectd_out`
+//! needs to attribute an `EMSGSIZE` drop to the right number of metrics.
 
 use super::part::{self, DsValue};
 use super::{
@@ -269,7 +269,8 @@ impl CollectdEncoder {
 }
 
 impl FramedEncoder for CollectdEncoder {
-    /// The value-list count each datagram carries -- see this module's doc comment.
+    /// The number of messages (value lists or notifications) each datagram carries -- see this
+    /// module's doc comment. A notification's own datagram always carries exactly `1`.
     type Meta = usize;
     type Stats = EncodeStats;
 
@@ -329,6 +330,15 @@ impl FramedEncoder for CollectdEncoder {
             }
 
             let carriers = collect_carriers(&batch.resource, event, &mut ctx);
+
+            // Metrics win: `collectd.severity` has no wire form on a value list (only a
+            // metrics-empty `log` event can be a notification -- `mod.rs`'s module doc). A
+            // wrong-typed carrier was already counted inside `collect_carriers`'s own match; this
+            // is the correctly-typed case, which that function deliberately leaves uncounted since
+            // it doesn't yet know which path the caller is on.
+            if carriers.severity.is_some() {
+                ctx.tag_dropped_unrepresentable();
+            }
 
             // How many value lists this event would have produced: one for a like-relay event, one
             // per record for a fallback one. The two whole-event drops below happen before either
@@ -741,6 +751,11 @@ fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx)
                     // decode side divided by, so `10.0` seconds comes back as `10 << 30` ticks.
                     carriers.interval_cdtime = (seconds * CDTIME_ONE_SECOND as f64).round() as u64;
                 }
+                // Captured regardless of whether the caller turns out to be on the notification
+                // path or the value-list one -- `collect_carriers` runs before that's decided.
+                // The value-list path counts this `tags_dropped_unrepresentable` itself
+                // (`encode_into`'s own comment): metrics win, and `collectd.severity` has no wire
+                // form there.
                 ("severity", Value::U64(v)) => {
                     carriers.severity_present = true;
                     carriers.severity = Some(*v);
@@ -1111,9 +1126,10 @@ fn write_notification(
     part::write_string_part(notif, part::TYPE_MESSAGE, message);
 }
 
-/// Encodes one notification and appends it to the packet being packed, flushing the packet first
-/// if it will not fit -- [`pack_list`]'s notification twin, simpler in exactly one way: because
-/// [`write_notification`] never elides, there is no need to re-encode after a flush.
+/// Encodes one notification and flushes it as its **own** datagram -- [`pack_list`]'s notification
+/// twin, and simpler in two ways: because [`write_notification`] never elides, there is no need to
+/// re-encode after a flush, and because a notification never shares a datagram with anything else,
+/// there is no packing decision to make beyond "flush what's there, then push this alone".
 #[allow(clippy::too_many_arguments)]
 fn pack_notification(
     packet: &mut Vec<u8>,
@@ -1130,24 +1146,29 @@ fn pack_notification(
 ) {
     write_notification(notif, cur, time_cdtime, severity, message);
 
-    if !packet.is_empty() && packet.len() + notif.len() > max_packet_bytes {
-        out.push_with(packet, *lists_in_packet);
-        packet.clear();
-        *lists_in_packet = 0;
-        last.clear();
-    }
-
     if notif.len() > max_packet_bytes {
         ctx.drop_oversize_notification(max_packet_bytes);
         return;
     }
 
-    packet.extend_from_slice(notif);
-    *lists_in_packet += 1;
-    // Elision state is shared with value lists even though a notification's own encoding never
-    // reads it: a value list immediately following this notification, in the same datagram, may
-    // still elide against the identity just written.
-    last.clone_from(cur);
+    // A notification is always its own datagram, exactly as collectd's own sender does (the
+    // recorded capture confirms it, `mod.rs`'s module doc has the detail): flush whatever
+    // value-list packet is already in progress, then push the notification alone. `last` is
+    // cleared both before and after -- a notification neither elides against a preceding list's
+    // identity (`write_notification` never reads `last` at all) nor leaves elision state behind
+    // for a following one. Without the trailing `clear`, a list right behind this notification
+    // would wrongly see `last` as whatever `cur` the notification carried and elide a field the
+    // real receiver's sticky state never actually held (the field `write_notification` omitted
+    // because it was empty on this notification, not because it was unchanged from the list
+    // before it).
+    if !packet.is_empty() {
+        out.push_with(packet, *lists_in_packet);
+        packet.clear();
+        *lists_in_packet = 0;
+        last.clear();
+    }
+    out.push_with(notif, 1);
+    last.clear();
 }
 
 /// Encodes one `log`-only event that has already been established as an *attempted* notification
@@ -2160,6 +2181,29 @@ mod tests {
         assert_eq!(attr(&decoded[0], ATTR_PLUGIN), Some(Value::from("from-event")));
     }
 
+    /// Metrics win: a `collectd.severity` attribute on an event that also carries `event.metrics`
+    /// has no wire form at all -- a value list has no severity concept, and only a metrics-empty
+    /// `log` event is ever a notification. Counted `tags_dropped_unrepresentable`, the review's own
+    /// finding that this reached `EncodeStats::default()` uncounted before the fix.
+    #[test]
+    fn a_severity_attribute_on_a_metrics_bearing_event_is_dropped_and_counted() {
+        let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        event.attributes.insert(ATTR_SEVERITY, Value::U64(2));
+        let (packets, stats, registry, _) =
+            encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(stats.tags_dropped_unrepresentable, 1);
+        assert!(counted(&registry, "logit.output.tags.dropped", ("reason", "unrepresentable")));
+
+        let decoded = decode_all(&packets);
+        assert_eq!(decoded.len(), 1, "the event still encodes as an ordinary value list");
+        assert_eq!(decoded[0].metrics[0].kind, MetricKind::Gauge(0.5));
+        assert_eq!(
+            decoded[0].attributes.get(ATTR_SEVERITY),
+            None,
+            "collectd.severity never reaches the wire on a value list"
+        );
+    }
+
     /// Every packet this encoder writes must be readable by a real decoder, byte for byte -- a
     /// weaker but much broader guard than any single assertion above, over a hand-built input.
     #[test]
@@ -2397,23 +2441,34 @@ mod tests {
         assert_eq!(decoded[0].log.as_ref().unwrap().message, Value::from("disk_full"));
     }
 
-    /// A notification's identity is written in full every time, never elided against a preceding
-    /// value list's identity -- even one carrying the exact same host/plugin/type.
+    /// A notification is always its own datagram -- confirmed by the recorded capture
+    /// (`testdata/interop/collectd/collectd-notification-000.raw`), not merely written in full:
+    /// a preceding value list's packet is flushed first, so the notification never shares a
+    /// datagram (and therefore never shares elision state) with it, even when both carry the
+    /// exact same host/plugin/type.
     #[test]
-    fn a_notifications_identity_is_never_elided_against_a_preceding_list() {
+    fn a_notification_is_always_its_own_datagram_never_packed_with_a_preceding_list() {
         let list_event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
         let notif_event = notification_event(Value::U64(2), Severity::Warn, "load high");
         let (packets, stats) =
             encode(&batch(vec![list_event, notif_event]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(stats, EncodeStats::default());
-        assert_eq!(packets.len(), 1, "both fit one datagram");
-        let bytes = packets.iter().next().unwrap();
-        // Two Host parts: the value list's own, and the notification's full (non-elided) one.
-        assert_eq!(count_parts(bytes, part::TYPE_HOST), 2);
-        assert_eq!(count_parts(bytes, part::TYPE_PLUGIN), 2);
-        assert_eq!(count_parts(bytes, part::TYPE_TYPE), 2);
-        assert_eq!(count_parts(bytes, part::TYPE_MESSAGE), 1);
-        assert_eq!(count_parts(bytes, part::TYPE_SEVERITY), 1);
+        assert_eq!(
+            packets.len(),
+            2,
+            "the notification flushes the list's packet and starts its own"
+        );
+        let (list_bytes, notif_bytes) = {
+            let mut iter = packets.iter();
+            (iter.next().unwrap().to_vec(), iter.next().unwrap().to_vec())
+        };
+        assert_eq!(count_parts(&list_bytes, part::TYPE_HOST), 1);
+        assert_eq!(count_parts(&list_bytes, part::TYPE_MESSAGE), 0);
+        assert_eq!(count_parts(&notif_bytes, part::TYPE_HOST), 1);
+        assert_eq!(count_parts(&notif_bytes, part::TYPE_PLUGIN), 1);
+        assert_eq!(count_parts(&notif_bytes, part::TYPE_TYPE), 1);
+        assert_eq!(count_parts(&notif_bytes, part::TYPE_MESSAGE), 1);
+        assert_eq!(count_parts(&notif_bytes, part::TYPE_SEVERITY), 1);
 
         let decoded = decode_all(&packets);
         assert_eq!(decoded.len(), 2);
@@ -2421,25 +2476,34 @@ mod tests {
         assert!(decoded[1].log.is_some() && decoded[1].metrics.is_empty());
     }
 
-    /// A value list immediately after a notification, sharing its identity, still elides -- the
-    /// elision *state* the notification updates even though its own bytes never read it.
+    /// A value list immediately after a notification, even sharing its identity, does **not**
+    /// elide against it: `last` is cleared after a notification's own datagram is pushed, so the
+    /// next list restates its identity in full -- the mirror of the previous test, and the other
+    /// half of "a notification shares no elision state with anything".
     #[test]
-    fn a_value_list_after_a_notification_still_elides_against_it() {
+    fn a_value_list_after_a_notification_does_not_elide_against_it() {
         let notif_event = notification_event(Value::U64(2), Severity::Warn, "load high");
         let list_event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
         let (packets, stats) =
             encode(&batch(vec![notif_event, list_event]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(stats, EncodeStats::default());
-        let bytes = packets.iter().next().unwrap();
         assert_eq!(
-            count_parts(bytes, part::TYPE_HOST),
-            1,
-            "the value list must elide against the notification's identity"
+            packets.len(),
+            2,
+            "the list starts its own fresh datagram after the notification"
         );
+        let list_bytes = packets.iter().nth(1).unwrap();
+        assert_eq!(
+            count_parts(list_bytes, part::TYPE_HOST),
+            1,
+            "the value list must restate its identity, not elide against the notification's"
+        );
+        assert_eq!(count_parts(list_bytes, part::TYPE_PLUGIN), 1);
+        assert_eq!(count_parts(list_bytes, part::TYPE_TYPE), 1);
     }
 
     #[test]
-    fn a_datagram_mixing_a_value_list_and_a_notification_round_trips() {
+    fn a_batch_mixing_a_value_list_and_a_notification_round_trips() {
         let list_event = relay_event(vec![
             record("load.load.0", MetricKind::Gauge(0.1)),
             record("load.load.1", MetricKind::Gauge(0.2)),
@@ -2448,9 +2512,58 @@ mod tests {
         let (packets, stats) =
             encode(&batch(vec![list_event.clone(), notif_event.clone()]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(stats, EncodeStats::default());
+        assert_eq!(packets.len(), 2, "a notification is always its own datagram");
         let decoded = decode_all(&packets);
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].metrics.len(), 2);
         assert_eq!(decoded[1].log.as_ref().unwrap().message, Value::from("load spiked"));
+    }
+
+    /// The regression this workstream's review caught: a notification packed (in the *batch*,
+    /// not necessarily the same wire datagram) between two value lists that share an identity but
+    /// differ in `type_instance` must not let the second list inherit the first's `type_instance`
+    /// through stale encoder-side elision state. Before the fix, `pack_notification` cloned the
+    /// notification's own (empty) `type_instance` into `last` unconditionally; since the second
+    /// list's `type_instance` was *also* empty, `cur == last` made the encoder elide it too --
+    /// which a real receiver (whose sticky state a notification's own missing `TypeInstance` part
+    /// never touched) would read as still `"free"`, silently relabeling the second list's series.
+    #[test]
+    fn a_notification_between_two_value_lists_does_not_poison_elision() {
+        let mut first = relay_event(vec![record("load.load", MetricKind::Gauge(512.0))]);
+        first.attributes.insert(ATTR_TYPE_INSTANCE, Value::from("free"));
+        let notif = notification_event(Value::U64(2), Severity::Warn, "low memory");
+        let mut third = relay_event(vec![record("load.load", MetricKind::Gauge(256.0))]);
+        third.attributes.remove(ATTR_TYPE_INSTANCE);
+
+        let (packets, stats) = encode(&batch(vec![first, notif, third]), DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(packets.len(), 3, "list, notification, list -- three separate datagrams");
+
+        let decoded = decode_all(&packets);
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(
+            attr(&decoded[0], ATTR_TYPE_INSTANCE),
+            Some(Value::from("free")),
+            "the first list keeps its own type_instance"
+        );
+        assert_eq!(
+            attr(&decoded[1], ATTR_TYPE_INSTANCE),
+            None,
+            "the notification never had a type_instance"
+        );
+        assert_eq!(
+            attr(&decoded[2], ATTR_TYPE_INSTANCE),
+            None,
+            "the second list must NOT have inherited \"free\" from the first"
+        );
+
+        // The wire-level guarantee behind that: the third datagram (the second list) restates
+        // Host/Plugin/Type in full and writes no TypeInstance part at all -- not an elided one,
+        // an *absent* one, which is the only honest way to say "this list never had one."
+        let third_bytes = packets.iter().nth(2).unwrap();
+        assert_eq!(count_parts(third_bytes, part::TYPE_HOST), 1);
+        assert_eq!(count_parts(third_bytes, part::TYPE_PLUGIN), 1);
+        assert_eq!(count_parts(third_bytes, part::TYPE_TYPE), 1);
+        assert_eq!(count_parts(third_bytes, part::TYPE_TYPE_INSTANCE), 0);
     }
 }

@@ -359,21 +359,29 @@ type_instance/time — collectd's own `notification_t` has no interval field, so
 carries `collectd.interval` even when an earlier value list in the same datagram set one. Dropped
 (`notification_dropped`) when severity is outside `{1, 2, 4}`, the message is empty, or no host is
 set; time `0` is lenient, exactly as for a value list (`received_at`). Encode: a `log`-only event
-(no metrics) carrying a `collectd.severity` attribute is a notification; its identity is written
-**in full every time**, never elided against a preceding list's, because this repo cannot confirm
-bit-for-bit whether collectd's own sender shares elision state between notifications and value
-lists (`crates/logit-proto/src/collectd/mod.rs`'s module doc has the full reasoning) — writing
-everything unconditionally is correct either way, since a receiver reads whatever is on the wire.
-The elision *state* a notification leaves behind is still shared, so a value list immediately
-following one in the same datagram can elide against it. A message is sanitized on a narrower rule
-than an identity field: NUL becomes `_` (uncounted), `/` rides through untouched, and it is
-truncated to `NOTIF_MAX_MSG_LEN - 1` (255) bytes, counted `logit.output.messages.truncated`. Severity
-absent-despite-being-attempted or out of `{1, 2, 4}`, an empty message, and an oversize notification
-are each their own counted drop (`notification_dropped`/`empty_message`/`oversize_notification`); a
-`log`-only event with no `collectd.severity` attribute at all is not a notification attempt and
-still falls through to the ordinary `skipped_no_metrics` path. The recorded interop corpus gained a
-fourth, separate fixture (`testdata/interop/collectd/collectd-notification-000.raw`, from the
-`threshold` plugin) rather than touching the original three.
+(no metrics) carrying a `collectd.severity` attribute is a notification; **metrics win** on an
+event carrying both, which drops and counts the attribute (`tags.dropped{reason="unrepresentable"}`)
+exactly as any other unrepresentable `collectd.*` carrier is. A notification is **always its own
+datagram** — confirmed by the recorded capture below, not merely assumed: real collectd flushes
+whatever value-list packet is in progress, writes the notification alone, and the next value list
+restates its identity in full. `CollectdEncoder` does the same and shares no elision state with a
+notification in either direction — it neither elides against a preceding list's identity nor
+leaves any behind for a following one, since a real receiver's sticky state resets at exactly that
+boundary too. (An earlier revision of this amendment shared elision state with a notification on
+the assumption that a receiver's sticky state might do the same; the recorded capture settled it,
+and a review of this workstream's own PR caught the resulting bug before merge — a packed
+notification's `last.clone_from(cur)` could make a *following* list wrongly elide a field the
+notification never actually set, mislabeling it on the wire.) A message is sanitized on a narrower
+rule than an identity field: NUL becomes `_` (uncounted), `/` rides through untouched, and it is
+truncated to `NOTIF_MAX_MSG_LEN - 1` (255) bytes, counted `logit.output.messages.truncated`.
+Severity absent-despite-being-attempted or out of `{1, 2, 4}`, an empty message, and an oversize
+notification are each their own counted drop
+(`notification_dropped`/`empty_message`/`oversize_notification`); a `log`-only event with no
+`collectd.severity` attribute at all is not a notification attempt and still falls through to the
+ordinary `skipped_no_metrics` path. The recorded interop corpus gained a fourth, separate fixture
+(`testdata/interop/collectd/collectd-notification-000.raw`, from the `threshold` plugin, its own
+`collectd-threshold.conf` so the `threshold` plugin never loads for the plain value-list capture
+too) rather than touching the original three.
 
 ### No `logit_proto::Encoder`
 

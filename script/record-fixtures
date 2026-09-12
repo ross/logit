@@ -163,13 +163,14 @@ record_rsyslog() {
 # so `crates/logit-inputs/src/collectd.rs`'s value-list interop tests keep reading exactly
 # `collectd-00{0,1,2}.raw` and this addition never perturbs them. The two captures are sequential,
 # not concurrent -- the first `finish_capture` tears down its listener container entirely before
-# the second `start_capture` stands up a new one on the same port -- so even though both `docker
-# run`s share one `collectd.conf` (the `threshold` plugin is loaded unconditionally, W5's own
-# amendment to that file), the first capture's `load`/`memory`/`interface` value lists are already
-# safely on disk as `collectd-00{0,1,2}.raw` before the second container -- and the notification it
-# emits -- ever starts. One datagram is enough: `WarningMax 0.0` fires on the very first read (see
-# `collectd.conf`'s own comment), so the notification's Message/Severity parts land in the capture
-# listener's very first datagram.
+# the second `start_capture` stands up a new one on the same port -- but that alone is not enough:
+# the second `docker run` mounts its own `collectd-threshold.conf` (a copy of `collectd.conf` plus
+# the `threshold` plugin), never the plain `collectd.conf` the first run uses, because `threshold`
+# fires on the very first read (`WarningMax 0.0`, see that file's own comment) -- if the *first*
+# capture's collectd also loaded it, a notification would land inside `collectd-00{0,1,2}.raw`
+# too, breaking every test that assumes those three datagrams are pure value lists. One datagram is
+# enough for the second capture: the notification's Message/Severity parts land in the listener's
+# very first datagram.
 record_collectd() {
     echo "== recording: collectd (network plugin, debian:bookworm-slim) =="
     local out="${OUT_ROOT}/collectd"
@@ -183,7 +184,7 @@ record_collectd() {
     echo "== recording: collectd threshold notification =="
     start_capture udp 25826 "${out}" collectd-notification 1 90
     ${DOCKER} run --rm --network "${NET}" \
-        -v "${TOOLS_DIR}/collectd.conf:/etc/collectd-fixture.conf:ro,z" \
+        -v "${TOOLS_DIR}/collectd-threshold.conf:/etc/collectd-fixture.conf:ro,z" \
         -v "${TOOLS_DIR}/collectd-entrypoint.sh:/entrypoint.sh:ro,z" \
         debian:bookworm-slim bash /entrypoint.sh
     finish_capture

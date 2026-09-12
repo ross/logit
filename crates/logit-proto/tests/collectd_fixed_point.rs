@@ -38,10 +38,11 @@
 //!   arbitrary `cdtime_t` below 2^53 ticks. The high-resolution branch is what reaches
 //!   **normalization 2** — a `TimeHR` that may move ≤1 tick on the first hop and is stable after —
 //!   which a whole-second `TimeHR` cannot, since it is bit-identical to its own legacy spelling;
-//! - an optional notification (`0x0101`/`0x0100`) trailing the packet, dispatched against whatever
-//!   sticky identity the last generated list left behind, with a valid severity and a non-empty
-//!   message (an invalid severity or an empty message is a counted drop, not a fixed point, and has
-//!   its own unit tests in `encode.rs` instead).
+//! - an optional notification (`0x0101`/`0x0100`) after any generated list, so it can precede a
+//!   later list or trail the whole packet, dispatched against whatever sticky identity that list
+//!   left behind, with a valid severity and a non-empty message (an invalid severity or an empty
+//!   message is a counted drop, not a fixed point, and has its own unit tests in `encode.rs`
+//!   instead).
 //!
 //! Because of that last point the property is asserted **from the first hop on**, not from the
 //! input bytes: see the test's own doc comment for the exact chain, and for why the model half of
@@ -719,21 +720,37 @@ fn gen_list() -> impl Strategy<Value = GenList> {
         )
 }
 
-/// An optional trailing notification for one generated packet: a valid severity (an invalid one
-/// would be a counted drop, not a fixed point, and has its own unit tests in `encode.rs`) and a
-/// non-empty message (an empty one drops the notification entirely, same reasoning) from the same
-/// restricted alphabet [`identity_string`] uses.
+/// An optional notification dispatched right after one generated list, in one generated packet: a
+/// valid severity (an invalid one would be a counted drop, not a fixed point, and has its own unit
+/// tests in `encode.rs`) and a non-empty message (an empty one drops the notification entirely,
+/// same reasoning) from the same restricted alphabet [`identity_string`] uses.
 fn gen_notification() -> impl Strategy<Value = (u64, String)> {
     (prop_oneof![Just(1u64), Just(2u64), Just(4u64)], identity_string())
+}
+
+/// `lists` alongside one optional notification *per list*, dispatched immediately after that
+/// list's own Values part -- so a notification can precede a later list (for every index but the
+/// last) or trail the whole packet (at the last index), covering both placements this codec's own
+/// `pack_notification` treats identically (always its own datagram, sharing no elision state with
+/// anything). Generated together, rather than as two independently-sized vectors, so
+/// `notifications.len() == lists.len()` always holds without a truncate/pad step.
+fn gen_lists_and_notifications() -> impl Strategy<Value = (Vec<GenList>, Vec<Option<(u64, String)>>)>
+{
+    proptest::collection::vec(gen_list(), 1..8).prop_flat_map(|lists| {
+        let len = lists.len();
+        proptest::collection::vec(proptest::option::of(gen_notification()), len)
+            .prop_map(move |notifications| (lists.clone(), notifications))
+    })
 }
 
 /// Renders generated lists into one datagram, writing only the parts each list actually names --
 /// so elision within the packet is part of what is generated, not something this helper decides.
 /// The first list always gets a full host/plugin/type, since a datagram whose opening list has no
-/// identity is one collectd itself rejects (and this codec skips, counted). `notification`, when
-/// present, is dispatched last, against whatever sticky identity the final list left behind --
-/// exactly the shape a `threshold` plugin's notification takes alongside ordinary value lists.
-fn render(lists: &[GenList], notification: &Option<(u64, String)>) -> Bytes {
+/// identity is one collectd itself rejects (and this codec skips, counted). `notifications[i]`,
+/// when present, is dispatched immediately after list `i`, against whatever sticky identity that
+/// list left behind -- by construction (list 0 always sets a full identity first) every generated
+/// notification always has a host to dispatch against, so none is ever dropped for that reason.
+fn render(lists: &[GenList], notifications: &[Option<(u64, String)>]) -> Bytes {
     let mut builder = PacketBuilder::new();
     for (index, list) in lists.iter().enumerate() {
         let first = index == 0;
@@ -771,9 +788,10 @@ fn render(lists: &[GenList], notification: &Option<(u64, String)>) -> Bytes {
                 builder.string(TYPE_TYPE_INSTANCE, instance.as_deref().unwrap_or("").as_bytes());
         }
         builder = builder.values(&list.values);
-    }
-    if let Some((severity, message)) = notification {
-        builder = builder.number(TYPE_SEVERITY, *severity).string(TYPE_MESSAGE, message.as_bytes());
+        if let Some((severity, message)) = &notifications[index] {
+            builder =
+                builder.number(TYPE_SEVERITY, *severity).string(TYPE_MESSAGE, message.as_bytes());
+        }
     }
     builder.build()
 }
@@ -797,15 +815,15 @@ proptest! {
     /// would catch that stopping being true.
     #[test]
     fn a_generated_packet_is_a_fixed_point_at_every_cap(
-        lists in proptest::collection::vec(gen_list(), 1..8),
-        notification in proptest::option::of(gen_notification()),
+        (lists, notifications) in gen_lists_and_notifications()
     ) {
-        let packet = render(&lists, &notification);
+        let packet = render(&lists, &notifications);
         let resource = Arc::new(Resource::default());
         let mut decoder = CollectdDecoder::new(resource.clone());
         let mut d1 = Vec::new();
         decoder.decode_into(packet, RECEIVED_AT, &mut d1).expect("a generated packet must decode");
-        prop_assert_eq!(d1.len(), lists.len() + notification.is_some() as usize);
+        let notif_count = notifications.iter().filter(|n| n.is_some()).count();
+        prop_assert_eq!(d1.len(), lists.len() + notif_count);
 
         for cap in CAPS {
             let e1 = encode_at(&rebatch(&resource, d1.clone()), cap);

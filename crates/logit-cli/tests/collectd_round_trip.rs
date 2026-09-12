@@ -53,6 +53,10 @@
 //! 9. An absent interval leaves as `IntervalHR 0`.
 //! 10. `TimeHR`/`IntervalHR` are written for **every** value list, so a sender's elided (unchanged)
 //!     time or interval part is restored.
+//! 11. A notification always leaves as its own datagram, carrying its identity in full and sharing
+//!     no elision state with any value list.
+//! 12. NUL in a notification message becomes `_` (uncounted); a message longer than 255 bytes is
+//!     truncated (counted).
 //!
 //! **(10) is worth spelling out, because it is the one that costs bytes.** `collectd_out` re-states
 //! both numeric parts on every list and never elides an unchanged one
@@ -86,6 +90,7 @@
 //! | `unknown-and-signature-parts` | **5** | a `0x00FF` part from a future collectd and a `0x0200` Signature part, both between two lists: skipped by length, dropped on egress, and the list behind them still decodes |
 //! | `nan-gauge` | **6** | a non-canonical NaN payload (`0xFFF8_0000_0000_0001`) decodes to a `NO_RECORDED_VALUE`-flagged `Gauge(0.0)` and leaves as this platform's canonical `f64::NAN` |
 //! | `sub-second-time` | **2** | a `cdtime_t` with live sub-second bits, chosen because it genuinely *does* move: the first hop shifts it by one 2⁻³⁰ s tick, the second is byte-identical to the first (both asserted, neither assumed) |
+//! | `notification-failure`/`-warning`/`-okay` | none ([`SAME_AS_INPUT`]) | one notification each, severity 1/2/4 -- `Event::log` with `collectd.severity`, `LogRecord::severity` `Error`/`Warn`/`Info`, no metrics; TimeHR, Severity, Host, Plugin, Type, Message, no PluginInstance/TypeInstance since neither was ever set |
 //!
 //! One case asserts its `.expected` wire bytes **only**, with no decoded-equality claim, because it
 //! is genuinely one-way lossy -- the substituted byte is gone for good. (`statsd_round_trip.rs`'s
@@ -101,6 +106,15 @@
 //! |---|---|---|
 //! | `repacked-at-1024` | **3**, **9** | 30 lists in one 1412-byte input carrying no interval part, re-packed by a sink capped at 1024: ≥2 datagrams, none over the cap, whole-batch equality. No `.expected` -- datagram boundaries are exactly what this case lets move, which is also why the `IntervalHR 0` it gains per list is pinned byte-for-byte by `no-interval` above rather than here |
 //!
+//! One multi-datagram case, whose `.in`/`.expected` are each a concatenation of several *separate*
+//! wire datagrams -- decoded one at a time, as a real listener's successive receives would be,
+//! never as one shared decode (see [`notification_between_lists_datagrams`]) -- and asserted by
+//! its own dedicated test rather than [`assert_byte_for_byte`]:
+//!
+//! | Fixture | Normalizations | What it pins |
+//! |---|---|---|
+//! | `notification-between-lists` | **11** | list (`type_instance=free`), notification (none), list (none), decoded from three real datagrams into one `BatchAccumulator`-shaped batch and relayed: the notification always lands in its own datagram, and the second list restates Host/Plugin/Type in full rather than eliding against a notification's `last` (the encoder bug this workstream's review caught) or inheriting a `type_instance` neither the notification nor the second list ever had |
+//!
 //! Decode-only cases, replayed through the live `collectd_in` and asserted on the delivered events
 //! plus the throttled-diagnostic counters a [`Registry`] collects:
 //!
@@ -113,7 +127,7 @@
 //!
 //! ## What this corpus does *not* cover
 //!
-//! ADR `lossless-transit` reads "no fixture" as "not covered", so the two remaining items are named
+//! ADR `lossless-transit` reads "no fixture" as "not covered", so the one remaining item is named
 //! rather than left to inference:
 //!
 //! - **Normalization 4 (list reordering within a batch)** has no fixture here and needs none: it is
@@ -123,10 +137,6 @@
 //!   compares an ordered `Vec<Event>`, so any reordering the encoder introduced would fail it. The
 //!   entry exists to license a *downstream* reorder (a `Fanout`, a buffered sink retry), not one
 //!   this codec performs.
-//! - **Notifications** (`Message` 0x0100 / `Severity` 0x0101) are the one wire feature this pair
-//!   does not carry yet: they are skipped by length on decode and never emitted on encode. W5 of
-//!   `docs/plans/collectd-binary-relay.md` adds them, and its own corpus fixtures with them; until
-//!   it lands, `collectd_in -> collectd_out` is a fixed point for *value lists* only.
 //!
 //! ## Cross-protocol
 //!
@@ -177,6 +187,8 @@ const TYPE_VALUES: u16 = 0x0006;
 const TYPE_INTERVAL: u16 = 0x0007;
 const TYPE_TIME_HR: u16 = 0x0008;
 const TYPE_INTERVAL_HR: u16 = 0x0009;
+const TYPE_MESSAGE: u16 = 0x0100;
+const TYPE_SEVERITY: u16 = 0x0101;
 const TYPE_SIGNATURE: u16 = 0x0200;
 const TYPE_ENCRYPTION: u16 = 0x0210;
 /// A part type no collectd defines -- normalization 5's "unknown part types are skipped by length."
@@ -519,6 +531,43 @@ fn build_in(name: &str) -> Vec<u8> {
             builder.build()
         }
 
+        // -- notifications (W5) ------------------------------------------------------------------
+        //
+        // Wire order: TimeHR, Severity, Host, Plugin, Type, Message -- collectd's own sender
+        // order (this module doc's "Notifications" table), with no PluginInstance/TypeInstance at
+        // all since neither is set: `write_notification` omits both when empty, matching decode's
+        // "absent" reading of them, so the round trip is byte-for-byte with no normalization.
+        "notification-failure" => PacketBuilder::new()
+            .number(TYPE_TIME_HR, TIME_HR)
+            .number(TYPE_SEVERITY, 1)
+            .string(TYPE_HOST, b"web-1")
+            .string(TYPE_PLUGIN, b"load")
+            .string(TYPE_TYPE, b"load")
+            .string(TYPE_MESSAGE, b"load average critical")
+            .build(),
+
+        "notification-warning" => PacketBuilder::new()
+            .number(TYPE_TIME_HR, TIME_HR)
+            .number(TYPE_SEVERITY, 2)
+            .string(TYPE_HOST, b"web-1")
+            .string(TYPE_PLUGIN, b"load")
+            .string(TYPE_TYPE, b"load")
+            .string(TYPE_MESSAGE, b"load average high")
+            .build(),
+
+        "notification-okay" => PacketBuilder::new()
+            .number(TYPE_TIME_HR, TIME_HR)
+            .number(TYPE_SEVERITY, 4)
+            .string(TYPE_HOST, b"web-1")
+            .string(TYPE_PLUGIN, b"load")
+            .string(TYPE_TYPE, b"load")
+            .string(TYPE_MESSAGE, b"load average back to normal")
+            .build(),
+
+        // Three separate wire datagrams concatenated -- see [`notification_between_lists_datagrams`]
+        // for why each is built (and must be read) on its own, never as one shared decode.
+        "notification-between-lists" => notification_between_lists_datagrams().concat(),
+
         // -- decode only -------------------------------------------------------------------------
 
         // The second list is ciphertext as far as this codec is concerned, and must never decode.
@@ -588,6 +637,9 @@ const BYTE_FOR_BYTE: &[&str] = &[
     "unknown-and-signature-parts",
     "nan-gauge",
     "sub-second-time",
+    "notification-failure",
+    "notification-warning",
+    "notification-okay",
 ];
 
 /// The one-way-lossy case: its `.expected` wire bytes are asserted, the decoded batch deliberately
@@ -602,9 +654,74 @@ const STRUCTURAL: &[&str] = &["repacked-at-1024"];
 /// delivered events and diagnostics rather than on any sink output.
 const DECODE_ONLY: &[&str] = &["encrypted", "no-time", "truncated-values", "incomplete-identity"];
 
+/// The one multi-datagram case: an `.in`/`.expected` pair that is a concatenation of several
+/// *separate* wire datagrams (never one shared decode -- see
+/// [`notification_between_lists_datagrams`]), asserted by its own dedicated test rather than
+/// [`assert_byte_for_byte`], which assumes exactly one captured datagram per case.
+const MULTI_DATAGRAM: &[&str] = &["notification-between-lists"];
+
 /// Every `.in` file this corpus commits.
 fn in_fixtures() -> impl Iterator<Item = &'static str> {
-    BYTE_FOR_BYTE.iter().chain(ONE_WAY).chain(STRUCTURAL).chain(DECODE_ONLY).copied()
+    BYTE_FOR_BYTE
+        .iter()
+        .chain(ONE_WAY)
+        .chain(STRUCTURAL)
+        .chain(DECODE_ONLY)
+        .chain(MULTI_DATAGRAM)
+        .copied()
+}
+
+/// The three wire datagrams `notification-between-lists` concatenates -- built and read separately
+/// on purpose: collectd's own sender never packs a notification alongside a value list (this
+/// corpus's own recorded capture, `testdata/interop/collectd/collectd-notification-000.raw`, is one
+/// notification alone), so a "list, notification, list" sequence is always three real UDP sends,
+/// never one datagram with elided identity between them. This is the corpus-level regression for
+/// the encoder bug that shape used to trigger: `last` (the encoder's own elision-tracking state)
+/// used to survive a packed notification unconditionally cloned from its `cur`, so a
+/// `BatchAccumulator` batch built from these three real datagrams could make the *third* list
+/// wrongly elide against the first's `type_instance` on re-encode, even though the two never shared
+/// a datagram and the notification carried no `type_instance` of its own at all.
+///
+/// Every one of the three already has full identity, since that is what a real second and third
+/// send restate -- so both list datagrams round-trip [`SAME_AS_INPUT`] and this fixture's
+/// `.expected` is byte-identical to its `.in`; the point is that the fix keeps it that way (the old
+/// bug would have elided the third list's Host/Plugin/Type against the notification's, corrupting
+/// rather than merely shrinking it).
+fn notification_between_lists_datagrams() -> Vec<Vec<u8>> {
+    vec![
+        // A value list, `type_instance=free`.
+        PacketBuilder::new()
+            .string(TYPE_HOST, b"web-1")
+            .number(TYPE_TIME_HR, TIME_HR)
+            .number(TYPE_INTERVAL_HR, INTERVAL_HR)
+            .string(TYPE_PLUGIN, b"memory")
+            .string(TYPE_TYPE, b"memory")
+            .string(TYPE_TYPE_INSTANCE, b"free")
+            .values(&[gauge(512.0)])
+            .build(),
+        // A notification: its own datagram, no `TypeInstance` at all -- not "cleared", genuinely
+        // never set, which is exactly what a fresh datagram's un-set sticky state means.
+        PacketBuilder::new()
+            .number(TYPE_TIME_HR, TIME_HR)
+            .number(TYPE_SEVERITY, 2)
+            .string(TYPE_HOST, b"web-1")
+            .string(TYPE_PLUGIN, b"memory")
+            .string(TYPE_TYPE, b"memory")
+            .string(TYPE_MESSAGE, b"low memory")
+            .build(),
+        // Another value list, same plugin/type as the first, again no `TypeInstance` -- its own
+        // datagram too, restating Host/Plugin/Type in full rather than eliding against the first
+        // list's (which the encoder never packs alongside it, so there is nothing to elide
+        // against even if this list's identity happened to match it exactly).
+        PacketBuilder::new()
+            .string(TYPE_HOST, b"web-1")
+            .number(TYPE_TIME_HR, TIME_HR)
+            .number(TYPE_INTERVAL_HR, INTERVAL_HR)
+            .string(TYPE_PLUGIN, b"memory")
+            .string(TYPE_TYPE, b"memory")
+            .values(&[gauge(256.0)])
+            .build(),
+    ]
 }
 
 // -- corpus files ---------------------------------------------------------------------------------
@@ -676,6 +793,23 @@ fn every_committed_in_file_matches_its_builder() {
 fn direct_batch(raw: &[u8]) -> EventBatch {
     let mut decoder = CollectdDecoder::new(Arc::new(Resource::default()));
     decoder.decode(Bytes::copy_from_slice(raw)).expect("fixture should decode")
+}
+
+/// [`direct_batch`]'s multi-datagram sibling: decodes each of `datagrams` with **one** decoder
+/// reused across calls -- mimicking a real listener's successive receives, each of which resets
+/// the decoder's own sticky state (`decode_into`'s own contract), never one shared decode over the
+/// concatenation -- and flattens the result into one `EventBatch`, the shape a `BatchAccumulator`
+/// hands a sink when several real datagrams arrive close together.
+fn direct_batch_multi(datagrams: &[Vec<u8>]) -> EventBatch {
+    let resource = Arc::new(Resource::default());
+    let mut decoder = CollectdDecoder::new(resource.clone());
+    let mut events = Vec::new();
+    for datagram in datagrams {
+        decoder
+            .decode_into(Bytes::copy_from_slice(datagram), 0, &mut events)
+            .expect("fixture datagram should decode");
+    }
+    EventBatch { resource, scope: None, events }
 }
 
 /// Real UDP harness: a plain "byte capture" socket (for the raw-datagram half of every byte-for-byte
@@ -1109,6 +1243,70 @@ async fn thirty_lists_in_one_datagram_repack_at_a_lower_cap() {
         decoded, batch,
         "the whole batch must survive re-packing, however the datagrams were cut"
     );
+}
+
+// -- multi-datagram: notifications --------------------------------------------------------------
+
+/// The corpus-level regression for the elision-poisoning bug this workstream's review caught:
+/// three real, separate datagrams -- list, notification, list, sharing plugin/type but not
+/// `type_instance` -- decoded into one batch (as a `BatchAccumulator` would), then relayed. The
+/// notification must land in its own datagram, and neither it nor the list behind it may inherit
+/// the first list's `type_instance` from stale encoder-side elision state.
+#[tokio::test]
+async fn a_notification_between_two_value_lists_is_its_own_datagram_and_the_next_list_restates_identity(
+) {
+    let datagrams = notification_between_lists_datagrams();
+    let batch = direct_batch_multi(&datagrams);
+    assert_eq!(batch.events.len(), 3);
+    assert!(batch.events[0].log.is_none() && !batch.events[0].metrics.is_empty());
+    assert!(batch.events[1].log.is_some() && batch.events[1].metrics.is_empty());
+    assert!(batch.events[2].log.is_none() && !batch.events[2].metrics.is_empty());
+    assert_eq!(attr(&batch.events[0], ATTR_TYPE_INSTANCE), Some(Value::from("free")));
+    assert_eq!(attr(&batch.events[1], ATTR_TYPE_INSTANCE), None, "the notification never had one");
+    assert_eq!(
+        attr(&batch.events[2], ATTR_TYPE_INSTANCE),
+        None,
+        "the second list never had one either"
+    );
+
+    let mut harness = Harness::new().await;
+    let (captured, decoded) = harness.round_trip(&batch).await;
+
+    assert_eq!(captured.len(), 3, "the notification forces a flush on both sides of it");
+    let expected_concat = read_fixture("notification-between-lists", "expected");
+    let mut at = 0usize;
+    for (index, expected_piece) in datagrams.iter().enumerate() {
+        let piece = &expected_concat[at..at + expected_piece.len()];
+        assert_eq!(
+            &captured[index], piece,
+            "datagram {index} did not match the committed .expected slice"
+        );
+        at += expected_piece.len();
+    }
+    assert_eq!(
+        at,
+        expected_concat.len(),
+        "the .expected file must be exactly these three datagrams, back to back"
+    );
+
+    // The critical assertion: the third datagram (the second list) restates Host/Plugin/Type in
+    // full, and `TypeInstance` stays absent on both the notification and the second list -- never
+    // inherited as "free" from the first, which is exactly what the old bug would have done.
+    assert_eq!(count_parts(&captured[2], TYPE_HOST), 1, "the second list must restate Host");
+    assert_eq!(count_parts(&captured[2], TYPE_PLUGIN), 1, "...and Plugin");
+    assert_eq!(count_parts(&captured[2], TYPE_TYPE), 1, "...and Type");
+    assert_eq!(
+        count_parts(&captured[2], TYPE_TYPE_INSTANCE),
+        0,
+        "...but never a stale TypeInstance"
+    );
+    assert_eq!(
+        count_parts(&captured[1], TYPE_TYPE_INSTANCE),
+        0,
+        "the notification never had one either"
+    );
+
+    assert_eq!(decoded, batch, "the whole three-event batch must survive the relay unchanged");
 }
 
 // -- decode only ------------------------------------------------------------------------------------
