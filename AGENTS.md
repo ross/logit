@@ -181,7 +181,19 @@ prometheus_out` and `internal -> aggregate -> prometheus_out` expose real runnin
 per `lossless-transit`'s "summarization is opt-in and named" rule) — see that same ADR's
 "Temporality is `aggregate`'s job" section and the
 [ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md) cumulative
-amendment.
+amendment. `collectd_in`/`collectd_out` (`crates/logit-proto`'s `collectd` codec, both directions in
+one module whose doc is the mapping table) are the fifth like-protocol pair, and cover both kinds
+collectd's binary `network` protocol carries — value lists now, notifications still to come: a
+sticky-identity decoder turns one datagram into one event per Values part with its N data sources as
+N `MetricRecord`s in wire order, a multicast `bind:` is detected from the address and joined with no
+extra field, an optional `types_db:` names those data sources without ever changing what goes back
+on the wire, and `CollectdEncoder` implements
+[`FramedEncoder`](docs/adr/framed-encoder.md) (a `MessageBuf<usize>` of already-packed datagrams,
+since the receiver resets its sticky state at every datagram edge and `max_packet_bytes` decides
+where those edges fall) rather than the one-blob-per-batch `Encoder`. So `collectd_in ->
+collectd_out` is a fixed point modulo its own named normalization list
+([ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md),
+[examples/collectd-relay.yaml](examples/collectd-relay.yaml)).
 
 ## Environment
 
@@ -263,7 +275,8 @@ not a style preference:
   `logit-core::metric::DdSketch` is a real wrapper with a working `merge` (`crates/logit-transforms`'
   `aggregate` is its first caller); `HyperLogLog` has wrapped the `cardinality-estimator` crate since
   W2, also a real, mergeable sketch — don't replace either with a non-mergeable shortcut.
-- **`statsd_in -> statsd_out`, `otlp_in -> otlp_out`, and `syslog_in -> syslog_out` must each be a
+- **`statsd_in -> statsd_out`, `otlp_in -> otlp_out`, `syslog_in -> syslog_out`, `prometheus_in ->
+  prometheus_out`, and `collectd_in -> collectd_out` must each be a
   lossless relay**, modulo a named list of permitted normalizations (batching, tag reordering, a
   sink-configured dialect change) — [ADR `lossless-transit`](docs/adr/lossless-transit.md). A
   decoder never pre-summarizes what an explicit `aggregate`/Lua stage should decide about, and a
