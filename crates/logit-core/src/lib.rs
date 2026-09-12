@@ -10,7 +10,7 @@ pub mod telemetry;
 pub mod time;
 pub mod value;
 
-mod attrs;
+pub mod attrs;
 mod event;
 mod metric;
 mod resource;
