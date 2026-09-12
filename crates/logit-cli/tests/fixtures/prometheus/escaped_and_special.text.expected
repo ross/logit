@@ -1,0 +1,5 @@
+# TYPE nanvalue gauge
+nanvalue{instance="{port}"} NaN
+# TYPE weird untyped
+weird{instance="{port}",note="line\nbreak \"quoted\"",path="C:\\tmp"} 1
+weird{instance="{port}",problem="division by zero"} +Inf

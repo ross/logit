@@ -60,3 +60,9 @@ async-trait.workspace = true
 # `StatsdDecoder` directly, which takes its input as `bytes::Bytes` -- already a transitive
 # dependency via every crate above, named directly here because the test constructs one itself.
 bytes.workspace = true
+# tests/prometheus_round_trip.rs's scrape client, and its canned-target server (the same
+# `hyper`/`hyper-util`/`http-body-util` stack `crates/logit-inputs/src/prometheus.rs`'s own tests
+# use, all already ordinary dependencies above). `reqwest` is already a transitive dependency at
+# this exact version via `logit-inputs`/`logit-outputs`, so this adds no new crate version to the
+# graph.
+reqwest.workspace = true

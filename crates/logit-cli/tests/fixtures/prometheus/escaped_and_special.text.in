@@ -1,0 +1,5 @@
+# TYPE weird untyped
+weird{path="C:\\tmp",note="line\nbreak \"quoted\""} 1
+weird{problem="division by zero"} +Inf
+# TYPE nanvalue gauge
+nanvalue NaN

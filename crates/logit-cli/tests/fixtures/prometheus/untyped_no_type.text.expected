@@ -1,0 +1,2 @@
+# TYPE bare_metric untyped
+bare_metric{instance="{port}"} 42

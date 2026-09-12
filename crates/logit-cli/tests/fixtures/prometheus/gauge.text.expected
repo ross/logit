@@ -1,0 +1,4 @@
+# HELP temperature_celsius Current temperature.
+# TYPE temperature_celsius gauge
+temperature_celsius{instance="{port}",room="attic"} -Inf
+temperature_celsius{instance="{port}",room="kitchen"} 21.5

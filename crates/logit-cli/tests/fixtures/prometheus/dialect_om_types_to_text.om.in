@@ -1,0 +1,13 @@
+# TYPE unannotated unknown
+unannotated 42
+# TYPE build info
+build_info{version="1.2.3"} 1
+# TYPE state stateset
+state{state="starting"} 0
+state{state="running"} 1
+# TYPE sizes gaugehistogram
+sizes_bucket{le="10"} 5
+sizes_bucket{le="+Inf"} 7
+sizes_gsum 300.5
+sizes_gcount 7
+# EOF
