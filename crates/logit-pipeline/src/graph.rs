@@ -4226,54 +4226,80 @@ mod tests {
         assert!(err.contains("'out'") && err.contains("max_packet_bytes: 0"), "got: {err}");
     }
 
-    fn prometheus_out(path: &str, max_series: usize) -> ComponentKind {
-        ComponentKind::PrometheusOut {
-            bind: "127.0.0.1:9464".to_string(),
-            path: path.to_string(),
-            expire_after: Duration::from_secs(300),
-            max_series,
+    /// An `aggregate` with the given temporality and retention bounds -- rule 39's fixture.
+    fn aggregate(
+        temporality: logit_config::AggregateTemporality,
+        series_retention: u32,
+        max_retained_series: usize,
+    ) -> ComponentKind {
+        ComponentKind::Aggregate {
+            interval: Duration::from_secs(10),
+            temporality,
+            series_retention,
+            max_retained_series,
+            distributions: logit_config::Distributions::default(),
+            max_samples_per_series: 1000,
+            sets: logit_config::Sets::default(),
+            max_set_members_per_series: 1000,
         }
     }
 
+    /// Rule 39: `temporality: cumulative` with no retention can only ever emit each window's own
+    /// increment labelled as a running total -- an impossible combination, not a tuning choice
+    /// (`docs/adr/aggregation-window-semantics.md`'s cumulative amendment).
     #[test]
-    fn prometheus_out_is_a_sink_and_is_implemented() {
-        let kind = prometheus_out("/metrics", 100_000);
-        assert_eq!(kind_name(&kind), "prometheus_out");
-        assert_eq!(role(&kind), Role::Sink);
-        resolve(cfg(vec![
-            ("in", vec![], listener()),
-            ("out", vec!["in"], prometheus_out("/metrics", 100_000)),
-        ]))
-        .expect("a well-formed prometheus_out should resolve fine");
-    }
-
-    #[test]
-    fn a_prometheus_out_with_no_sources_is_rejected() {
-        let err = expect_err(cfg(vec![("out", vec![], prometheus_out("/metrics", 100_000))]));
-        assert!(err.contains("'out'") && err.contains("sink"), "got: {err}");
-    }
-
-    /// Rule 41: a request URI's path is always absolute, so a relative or empty `path:` could never
-    /// be scraped -- every request would 404 against an endpoint that looks configured.
-    #[test]
-    fn a_prometheus_out_path_that_does_not_start_with_a_slash_is_rejected() {
-        for path in ["metrics", ""] {
-            let err = expect_err(cfg(vec![
-                ("in", vec![], listener()),
-                ("out", vec!["in"], prometheus_out(path, 100_000)),
-            ]));
-            assert!(err.contains("'out'") && err.contains("must start with '/'"), "got: {err}");
-        }
-    }
-
-    /// Rule 41: `max_series: 0` is rule 38's impossible bound in another shape.
-    #[test]
-    fn a_zero_prometheus_out_max_series_is_rejected() {
+    fn a_cumulative_aggregate_with_zero_series_retention_is_rejected() {
         let err = expect_err(cfg(vec![
             ("in", vec![], listener()),
-            ("out", vec!["in"], prometheus_out("/metrics", 0)),
+            (
+                "agg",
+                vec!["in"],
+                aggregate(logit_config::AggregateTemporality::Cumulative, 0, 10_000),
+            ),
+            ("out", vec!["agg"], sink()),
         ]));
-        assert!(err.contains("'out'") && err.contains("max_series: 0"), "got: {err}");
+        assert!(err.contains("'agg'") && err.contains("temporality: cumulative"), "got: {err}");
+    }
+
+    /// The cap half of rule 39: a zero `max_retained_series` evicts every survivor immediately,
+    /// which is the same failure as never retaining at all.
+    #[test]
+    fn a_cumulative_aggregate_with_a_zero_retained_series_cap_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("agg", vec!["in"], aggregate(logit_config::AggregateTemporality::Cumulative, 5, 0)),
+            ("out", vec!["agg"], sink()),
+        ]));
+        assert!(err.contains("max_retained_series"), "got: {err}");
+    }
+
+    /// Rule 39 is scoped to `cumulative`: `series_retention: 0` stays legal in `delta` mode, where
+    /// it is the documented opt-out reproducing the strictly-tumbling behavior every config had
+    /// before retention existed.
+    #[test]
+    fn a_delta_aggregate_with_zero_series_retention_is_accepted() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("agg", vec!["in"], aggregate(logit_config::AggregateTemporality::Delta, 0, 0)),
+            ("out", vec!["agg"], sink()),
+        ]))
+        .expect("delta mode without retention is the pre-existing default behavior");
+    }
+
+    /// A well-formed cumulative `aggregate` resolves fine -- the positive case rule 39's two
+    /// rejection tests are the complement of.
+    #[test]
+    fn a_cumulative_aggregate_with_both_bounds_set_resolves() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "agg",
+                vec!["in"],
+                aggregate(logit_config::AggregateTemporality::Cumulative, 5, 10_000),
+            ),
+            ("out", vec!["agg"], sink()),
+        ]))
+        .expect("cumulative with both retention bounds set should resolve");
     }
 
     // ---- rule 40: prometheus_in --------------------------------------------------------------
@@ -4496,79 +4522,55 @@ mod tests {
         );
     }
 
-    /// An `aggregate` with the given temporality and retention bounds -- rule 39's fixture.
-    fn aggregate(
-        temporality: logit_config::AggregateTemporality,
-        series_retention: u32,
-        max_retained_series: usize,
-    ) -> ComponentKind {
-        ComponentKind::Aggregate {
-            interval: Duration::from_secs(10),
-            temporality,
-            series_retention,
-            max_retained_series,
-            distributions: logit_config::Distributions::default(),
-            max_samples_per_series: 1000,
-            sets: logit_config::Sets::default(),
-            max_set_members_per_series: 1000,
+    // ---- rule 41: prometheus_out --------------------------------------------------------------
+
+    fn prometheus_out(path: &str, max_series: usize) -> ComponentKind {
+        ComponentKind::PrometheusOut {
+            bind: "127.0.0.1:9464".to_string(),
+            path: path.to_string(),
+            expire_after: Duration::from_secs(300),
+            max_series,
         }
     }
 
-    /// Rule 39: `temporality: cumulative` with no retention can only ever emit each window's own
-    /// increment labelled as a running total -- an impossible combination, not a tuning choice
-    /// (`docs/adr/aggregation-window-semantics.md`'s cumulative amendment).
     #[test]
-    fn a_cumulative_aggregate_with_zero_series_retention_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            (
-                "agg",
-                vec!["in"],
-                aggregate(logit_config::AggregateTemporality::Cumulative, 0, 10_000),
-            ),
-            ("out", vec!["agg"], sink()),
-        ]));
-        assert!(err.contains("'agg'") && err.contains("temporality: cumulative"), "got: {err}");
-    }
-
-    /// The cap half of rule 39: a zero `max_retained_series` evicts every survivor immediately,
-    /// which is the same failure as never retaining at all.
-    #[test]
-    fn a_cumulative_aggregate_with_a_zero_retained_series_cap_is_rejected() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            ("agg", vec!["in"], aggregate(logit_config::AggregateTemporality::Cumulative, 5, 0)),
-            ("out", vec!["agg"], sink()),
-        ]));
-        assert!(err.contains("max_retained_series"), "got: {err}");
-    }
-
-    /// Rule 39 is scoped to `cumulative`: `series_retention: 0` stays legal in `delta` mode, where
-    /// it is the documented opt-out reproducing the strictly-tumbling behavior every config had
-    /// before retention existed.
-    #[test]
-    fn a_delta_aggregate_with_zero_series_retention_is_accepted() {
+    fn prometheus_out_is_a_sink_and_is_implemented() {
+        let kind = prometheus_out("/metrics", 100_000);
+        assert_eq!(kind_name(&kind), "prometheus_out");
+        assert_eq!(role(&kind), Role::Sink);
         resolve(cfg(vec![
             ("in", vec![], listener()),
-            ("agg", vec!["in"], aggregate(logit_config::AggregateTemporality::Delta, 0, 0)),
-            ("out", vec!["agg"], sink()),
+            ("out", vec!["in"], prometheus_out("/metrics", 100_000)),
         ]))
-        .expect("delta mode without retention is the pre-existing default behavior");
+        .expect("a well-formed prometheus_out should resolve fine");
     }
 
-    /// A well-formed cumulative `aggregate` resolves fine -- the positive case rule 39's two
-    /// rejection tests are the complement of.
     #[test]
-    fn a_cumulative_aggregate_with_both_bounds_set_resolves() {
-        resolve(cfg(vec![
+    fn a_prometheus_out_with_no_sources_is_rejected() {
+        let err = expect_err(cfg(vec![("out", vec![], prometheus_out("/metrics", 100_000))]));
+        assert!(err.contains("'out'") && err.contains("sink"), "got: {err}");
+    }
+
+    /// Rule 41: a request URI's path is always absolute, so a relative or empty `path:` could never
+    /// be scraped -- every request would 404 against an endpoint that looks configured.
+    #[test]
+    fn a_prometheus_out_path_that_does_not_start_with_a_slash_is_rejected() {
+        for path in ["metrics", ""] {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                ("out", vec!["in"], prometheus_out(path, 100_000)),
+            ]));
+            assert!(err.contains("'out'") && err.contains("must start with '/'"), "got: {err}");
+        }
+    }
+
+    /// Rule 41: `max_series: 0` is rule 38's impossible bound in another shape.
+    #[test]
+    fn a_zero_prometheus_out_max_series_is_rejected() {
+        let err = expect_err(cfg(vec![
             ("in", vec![], listener()),
-            (
-                "agg",
-                vec!["in"],
-                aggregate(logit_config::AggregateTemporality::Cumulative, 5, 10_000),
-            ),
-            ("out", vec!["agg"], sink()),
-        ]))
-        .expect("cumulative with both retention bounds set should resolve");
+            ("out", vec!["in"], prometheus_out("/metrics", 0)),
+        ]));
+        assert!(err.contains("'out'") && err.contains("max_series: 0"), "got: {err}");
     }
 }
