@@ -459,6 +459,14 @@ draft actually established:
 | `run_lua`: `set_resource` + `process` + `take_resource`, script never writes `resource` | **9** | identical to plain `process` (below) — `set_resource`/`take_resource` are field assignments, no allocation |
 | `run_lua`: `set_resource` + `process` + `take_resource`, script writes `resource` | **7** | see `crates/logit-script/src/resource.rs` — lower than the row above because this script (unlike `LUA_ENRICH_SCRIPT`) never touches `event.attributes`, skipping its `AttrsProxy` cost; the `+1` here is `take_resource`'s `Arc::new(Resource { .. })` commit |
 | `process` reading `event.log.trace_id` (`LogProxy`) | **9** | same total a script touching `event.attributes` instead pays (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event`) despite touching no attributes at all — creating and caching the `LogProxy` userdata costs what `AttrsProxy` does there, `to_hex`'s returned `String` costs what an attribute write does; a script that never touches `event.log` pays none of it, unchanged at 9 either way |
+| `process` reading `event.metrics[1].value` (`MetricsProxy`/`MetricProxy`) | **11** | not the 9 a naive add-up predicts (4 baseline + 1 `Box` + 3 for `MetricsProxy`'s own first-access create-and-cache + 1 for the "one small allocation" `MetricProxy`'s doc comment assumes a per-index handle costs) — measured directly (`lua_process_one_event_reading_metric_value`) against a script that indexes `event.metrics[1]` but never reads `.value` (still 11, so the field read itself is free, the same reason `event.span.name` below is) and one that indexes it *twice* (14, exactly +3 more) — a fresh, uncached `MetricProxy` costs the same 3 allocations `AttrsProxy`/`LogProxy`/`SpanProxy` pay for create-**and**-cache via a `RegistryKey`, even though it never caches one; see §8 item 6 and `crates/logit-bench/tests/allocations.rs`'s comment for the full finding |
+| `process` reading `#event.metrics` only (`MetricsProxy`, no index) | **8** | 4 baseline + 1 `Box` + 3 for `MetricsProxy`'s first-access create-and-cache, and nothing more — confirms the row above's extra 3 comes entirely from indexing, not from touching `event.metrics` at all (`lua_process_one_event_reading_metric_len`) |
+| `process` reading `event.span.name` (`SpanProxy`) | **8** | 4 baseline + 1 `Box` + 3 for `SpanProxy`'s first-access create-and-cache, the same bucket `AttrsProxy`/`LogProxy`/`MetricsProxy` pay for theirs; the `Value::Str` read itself costs nothing (`lua_process_one_event_reading_span_name`) |
+| `run_lua`: `set_scope` + `process` + `take_scope`, script never writes `scope` | **9** | identical to plain `process` — `set_scope`/`take_scope` are field assignments, no allocation, the same contract `set_resource`/`take_resource` already have (`lua_process_one_event_with_scope_hooks_but_no_write_costs_the_same_as_process_alone`) |
+| `process` reading `scope.name` | **5** | 4 baseline + 1 `Box`, **no** first-access `+3` — unlike every `EventProxy` sub-proxy, `scope`'s `ScopeProxy`/`ScopeAttrsProxy` are installed once in `ScriptWorker::new`, before any measured call, so there is no per-event userdata to create or cache here (`lua_process_one_event_reading_scope_name`) |
+| `process` writing `scope.attributes.k` (first write this batch) | **7** | 4 baseline + 1 `Box` + 1 (`lua_to_scope_value`'s `Bytes::copy_from_slice` for the new string) + 1 (`take_scope`'s `Arc::new(Scope { .. })` commit) — **not** a separate cost for `ensure_modified`'s `Scope` clone: the fixture's `name`/`version` are `Bytes::from_static` (never promoted) and `attributes` starts empty and inline, so the clone itself is a plain memcpy (`lua_process_one_event_writing_scope_attribute`) |
+| `process` writing `resource.schema_url` | **7** | 4 baseline + 1 `Box` + 1 (`write_schema_url`'s `Bytes::copy_from_slice`) + 1 (`take_resource`'s `Arc::new(Resource { .. })` commit) — same total as writing a resource attribute, for the same reason (`lua_process_one_event_writing_resource_schema_url`) |
+| `process` with `scope.name = scope.name` (identity write) | **5** | identical to a plain `scope.name` read above — the no-op check (`scope_name(&state) == s`) catches the identity assignment before `ensure_modified` ever runs, so `take_scope` still returns `None` (`lua_process_one_event_identity_write_to_scope_name_is_free`) |
 | `process_batch`, fully absorbed (`aggregate`) | **1** | the same `Vec`, built before any event is processed, thrown away unused when nothing survives |
 | `process_batch` through `keep`, telemetry live, **steady state** | **1** | identical to disabled — `count`/`timer` update an existing `ComponentBuffer` entry in place, no allocation of their own |
 | `process_batch`, **first call after an `internal` drain** | **3** | the `out` `Vec` (1) + a `HashMap` table rebuild (1) + a fresh `DdSketch` (1) — see below |
@@ -1183,6 +1191,26 @@ might regress a workload the fixtures don't cover.
    `flush` global that exists but isn't a function is now a load-time error — matching
    `process`'s existing `MissingProcess` — instead of being silently treated as "no `flush()`" and
    quietly losing every flush tick's events forever.
+
+   **The newer Lua surfaces (`event.metrics`, `event.span`, `scope`) mostly follow the same
+   shape, with one exception worth flagging.** `SpanProxy` (read-only) and `MetricsProxy` (its
+   `#`/`Len` form) both cost the same first-access `+3` `AttrsProxy`/`LogProxy` do, cached the
+   same `RegistryKey` way, once per event (§2's `event.span.name`/`#event.metrics` rows). `scope`
+   costs *less* than any of them to read (`+0` beyond the call baseline) because, unlike every
+   `EventProxy` sub-proxy, it's a batch-lifetime global installed once in `ScriptWorker::new`
+   rather than a per-event userdata — there's nothing to create or cache on a `process()` call at
+   all. Writing through it (`scope.attributes.k`, `resource.schema_url`) costs exactly what the
+   existing `resource` attribute/`resource` write rows already established: one allocation for the
+   new value, one for the `take_*`-time `Arc::new(..)` commit, and — confirmed, not assumed —
+   nothing extra for the copy-on-write clone itself when the fixture's `Bytes` fields are already
+   `'static` and its `attributes` map starts empty and inline. The exception is `event.metrics[i]`
+   indexing: `MetricProxy`'s own doc comment argues a per-index handle isn't worth caching because
+   it's "one small allocation," but it measures at the *same* 3 allocations a cached, registry-keyed
+   proxy costs — paid on *every* index, not once per event. Left as measured and reported (this
+   file's own rule: report an avoidable-looking cost in `logit-script` rather than fix it here),
+   since whether that's worth a per-event cache (trading a `RegistryKey` slot for scripts that
+   never touch `event.metrics` against one for scripts that index it repeatedly) is a real design
+   trade-off, not a bug.
 7. ~~**`Arc<EventBatch>` copy-on-write on channels.**~~ **Done, with real caveats** (§3) — landed
    over three rounds (`docs/adr/arc-eventbatch-copy-on-write.md`), each correcting an
    overclaim the previous one made. Single-consumer edges and all-`Output` fan-outs are

@@ -2205,6 +2205,228 @@ fn lua_process_one_event_reading_log_trace() {
     expect_allocs("lua: process 1 event, reading event.log.trace_id", stats, 9);
 }
 
+/// What a script reading `event.metrics[1].value` costs (`crates/logit-script/src/proxy.rs`'s
+/// `MetricsProxy`/`MetricProxy`). **11**, not the 9 a naive add-up from
+/// [`lua_process_one_event_reading_log_trace`]'s breakdown would predict (4 baseline + 1 `Box` +
+/// 3 for creating and caching `MetricsProxy` on the first `event.metrics` access, the same cost
+/// `AttrsProxy`/`LogProxy` pay for their own first access, + 1 for the "one small allocation"
+/// `MetricsProxy`'s own doc comment says a per-index `MetricProxy` costs).
+///
+/// Measured, not assumed, against two narrower scripts: one indexing `event.metrics[1]` but
+/// never reading `.value` off it (still 11 -- confirming the field read itself, a plain `f64`
+/// copied into `LuaValue::Number`, costs nothing, the same reason `event.span.name`'s
+/// `create_string` doesn't show up below either), and one indexing `event.metrics[1]` *twice*
+/// (14 -- confirming each index costs exactly +3, not +1, since 14 - 11 = 11 - 8 =
+/// [`lua_process_one_event_reading_metric_len`]'s own baseline). So a fresh, uncached
+/// `MetricProxy` costs the *same* 3 allocations `AttrsProxy`/`LogProxy`/`SpanProxy` pay for
+/// create-**and**-cache via a `RegistryKey`, even though `MetricProxy` never calls
+/// `create_registry_value` at all -- `lua.create_userdata` alone, returned as a fresh value from
+/// an `Index` metamethod rather than handed to Lua as a call argument the way `EventProxy` itself
+/// is, is evidently not the single cheap allocation `MetricsProxy`'s doc comment assumes when it
+/// argues against caching per-index handles. **Not changed here** (out of this crate's scope,
+/// `crates/logit-script/src/proxy.rs`) -- reported as a finding: a script that indexes the same
+/// metric repeatedly (`event.metrics[1].value`, then `.temporality`, then `.monotonic`, say) pays
+/// this 3-allocation mint on *every* index, not once per event the way every other sub-proxy in
+/// this module does.
+#[test]
+fn lua_process_one_event_reading_metric_value() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_METRIC_VALUE_READ_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::sum_metric_event()));
+
+    let event = fixtures::sum_metric_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: process 1 event, reading event.metrics[1].value", stats, 11);
+}
+
+/// What a script reading only `#event.metrics` costs -- no `event.metrics[i]` indexing at all, so
+/// this isolates `MetricsProxy`'s own first-access cost (**+3**, same as `AttrsProxy`/`LogProxy`)
+/// from the per-index `MetricProxy` [`lua_process_one_event_reading_metric_value`] above also
+/// pays. **8** = 4 (baseline) + 1 (`Box` on `Emit`) + 3 (`MetricsProxy` create-and-cache) -- one
+/// less than that test's 9, confirming the `MetricProxy` index is exactly where the extra
+/// allocation comes from, not from touching `event.metrics` at all.
+#[test]
+fn lua_process_one_event_reading_metric_len() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_METRIC_LEN_READ_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::sum_metric_event()));
+
+    let event = fixtures::sum_metric_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: process 1 event, reading #event.metrics", stats, 8);
+}
+
+/// What a script reading `event.span.name` costs (`crates/logit-script/src/proxy.rs`'s
+/// `SpanProxy`). **8** = 4 (baseline) + 1 (`Box` on `Emit`) + 3 (creating and caching the
+/// `SpanProxy` userdata on the first `event.span` access, the same cost every other first-access
+/// proxy in this file pays). `span.name` is a `Value::Str`, read via the same `value_to_lua` ->
+/// `lua.create_string` path `event.attributes`/`event.log.message` use -- no Rust-side allocation
+/// of its own, the same reason `event.metrics[1].value`'s plain number above costs nothing extra
+/// either: LuaJIT's own string/number representations aren't tracked by this file's counting
+/// allocator.
+#[test]
+fn lua_process_one_event_reading_span_name() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_SPAN_NAME_READ_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::span_event()));
+
+    let event = fixtures::span_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: process 1 event, reading event.span.name", stats, 8);
+}
+
+/// `run_lua`'s full per-batch `scope` contract (`crates/logit-script/src/scope.rs`): a
+/// `set_scope` call before `process`, then `take_scope` after -- for a script that never touches
+/// `scope` at all, this must cost exactly what `lua_process_one_event` costs, the same contract
+/// `lua_process_one_event_with_resource_hooks_but_no_write_costs_the_same_as_process_alone`
+/// already establishes for `resource`. `set_scope` only assigns two fields (`ScopeState::base`/
+/// `modified`) and `take_scope` returns `None` (`modified` stays `None`) without touching the
+/// heap -- neither has a reason to cost anything, and this confirms it.
+#[test]
+fn lua_process_one_event_with_scope_hooks_but_no_write_costs_the_same_as_process_alone() {
+    let worker = ScriptWorker::new(fixtures::LUA_ENRICH_SCRIPT).expect("script should load");
+    let scope = Some(fixtures::scope());
+    worker.set_scope(&scope);
+    drop(worker.process(fixtures::nginx_event()));
+    drop(worker.take_scope());
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| {
+        worker.set_scope(&scope);
+        let outcome = worker.process(event).expect("script should run");
+        assert!(worker.take_scope().is_none(), "the script never writes scope");
+        outcome
+    });
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: set_scope + process + take_scope, no write", stats, 9);
+}
+
+/// What a script reading `scope.name` costs. **5** = 4 (baseline) + 1 (`Box` on `Emit`) -- no
+/// `+3` first-access cost the way `event.attributes`/`event.log`/`event.metrics`/`event.span` all
+/// pay, because `scope` (unlike every `EventProxy` sub-proxy) is installed **once**, in
+/// `ScriptWorker::new`, before this measurement's warm-up call ever runs -- there is no per-event
+/// userdata to create or cache, only a global table lookup and a field read off state already in
+/// hand. `scope.name`'s `lua.create_string` call is the same LuaJIT-internal, host-allocation-free
+/// path `event.span.name` uses above.
+#[test]
+fn lua_process_one_event_reading_scope_name() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_SCOPE_NAME_READ_SCRIPT).expect("script should load");
+    let scope = Some(fixtures::scope());
+    worker.set_scope(&scope);
+    drop(worker.process(fixtures::nginx_event()));
+    drop(worker.take_scope());
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| {
+        worker.set_scope(&scope);
+        let outcome = worker.process(event).expect("script should run");
+        drop(worker.take_scope());
+        outcome
+    });
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: set_scope + process (reading scope.name) + take_scope", stats, 5);
+}
+
+/// What a script's first write to `scope.attributes` in a batch costs
+/// (`crates/logit-script/src/scope.rs`'s `ensure_modified` copy-on-write path). **7** = 4
+/// (baseline) + 1 (`Box` on `Emit`) + 1 (`lua_to_scope_value`'s `Bytes::copy_from_slice` for the
+/// new `"v"` string, the same cost an event-attribute write pays) + 1 (`take_scope`'s
+/// `Arc::new(Scope { .. })` commit, the same cost `take_resource`'s does for `resource`) -- and
+/// **not** a separate allocation for `ensure_modified`'s `Scope` clone itself: the fixture's
+/// `scope.name`/`version` are `Bytes::from_static` (never-allocated, refcount-free) and its
+/// `attributes` map starts empty and inline, so cloning the whole `Scope` struct is a plain
+/// memcpy here, the same reason `lua_process_one_event_writing_resource`'s own `AttrMap` clone is
+/// free. Confirms the module doc comment's claim that `modified: None` -- not the clone itself --
+/// is what makes an *unwritten* batch allocation-free; a write's cost is the new value plus the
+/// commit, not the copy-on-write step in between.
+#[test]
+fn lua_process_one_event_writing_scope_attribute() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_SCOPE_ATTR_WRITE_SCRIPT).expect("script should load");
+    let scope = Some(fixtures::scope());
+    worker.set_scope(&scope);
+    drop(worker.process(fixtures::nginx_event()));
+    drop(worker.take_scope());
+
+    let event = fixtures::nginx_event();
+    let (committed, stats) = measure(|| {
+        worker.set_scope(&scope);
+        let outcome = worker.process(event).expect("script should run");
+        assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+        worker.take_scope()
+    });
+    let committed = committed.expect("the script writes scope on every call");
+    assert_eq!(committed.attributes.get("k"), Some(&Value::str("v")));
+    expect_allocs("lua: set_scope + process (writing scope.attributes.k) + take_scope", stats, 7);
+}
+
+/// What a script writing `resource.schema_url` costs
+/// (`crates/logit-script/src/resource.rs`'s `write_schema_url`), over
+/// [`lua_process_one_event_writing_resource`]'s attribute-write baseline above. **7** = 4
+/// (baseline) + 1 (`Box` on `Emit`) + 1 (`Bytes::copy_from_slice` for the new URL, the same
+/// `write_schema_url` cost an attribute write pays through `lua_to_resource_value`) + 1
+/// (`take_resource`'s `Arc::new(Resource { .. })` commit) -- the same total as
+/// `lua_process_one_event_writing_resource` even though the two scripts write different fields,
+/// because both pay exactly one "new value" allocation and one commit allocation on top of the
+/// same 5-allocation baseline (4 + `Box`), and this fixture's `Resource::default()` starts with
+/// `schema_url: None` and an empty, inline `AttrMap`, so `ensure_modified`'s clone is free here
+/// too.
+#[test]
+fn lua_process_one_event_writing_resource_schema_url() {
+    let worker = ScriptWorker::new(fixtures::LUA_RESOURCE_SCHEMA_URL_WRITE_SCRIPT)
+        .expect("script should load");
+    let resource = fixtures::resource();
+    worker.set_resource(&resource);
+    drop(worker.process(fixtures::nginx_event()));
+    drop(worker.take_resource());
+
+    let event = fixtures::nginx_event();
+    let (committed, stats) = measure(|| {
+        worker.set_resource(&resource);
+        let outcome = worker.process(event).expect("script should run");
+        assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+        worker.take_resource()
+    });
+    let committed = committed.expect("the script writes resource.schema_url on every call");
+    assert_eq!(committed.schema_url.as_deref(), Some(b"https://example.com/schema".as_slice()));
+    expect_allocs(
+        "lua: set_resource + process (writing resource.schema_url) + take_resource",
+        stats,
+        7,
+    );
+}
+
+/// `scope.name = scope.name` -- an identity write, which `crate::scope`'s no-op check
+/// (`scope_name(&state) == s`, a byte-slice comparison against the string already installed)
+/// must catch *before* ever calling `ensure_modified`, mirroring `AttrsProxy`/`ResourceProxy`'s
+/// own identity-write no-ops. Must cost exactly what
+/// [`lua_process_one_event_reading_scope_name`] costs (**5**): the comparison reads `scope.name`
+/// the same way that test does, then a string-equality check that touches no heap, and
+/// `take_scope` still returns `None` since `modified` was never set.
+#[test]
+fn lua_process_one_event_identity_write_to_scope_name_is_free() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_SCOPE_IDENTITY_NAME_SCRIPT).expect("script should load");
+    let scope = Some(fixtures::scope());
+    worker.set_scope(&scope);
+    drop(worker.process(fixtures::nginx_event()));
+    drop(worker.take_scope());
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| {
+        worker.set_scope(&scope);
+        let outcome = worker.process(event).expect("script should run");
+        assert!(worker.take_scope().is_none(), "an identity write must not count as a write");
+        outcome
+    });
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: set_scope + process (scope.name = scope.name) + take_scope", stats, 5);
+}
+
 // ---------------------------------------------------------------------------------------------
 // End to end
 // ---------------------------------------------------------------------------------------------

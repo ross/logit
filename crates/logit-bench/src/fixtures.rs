@@ -19,7 +19,7 @@
 use bytes::Bytes;
 use logit_core::{
     AttrMap, BodyFormat, DdSketch, Event, EventBatch, LogRecord, MetricKind, MetricRecord,
-    Resource, Samples, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus, Value,
+    Resource, Samples, Scope, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus, Value,
 };
 use logit_inputs::statsd::StatsdDecoder;
 use logit_inputs::syslog::SyslogDecoder;
@@ -581,6 +581,112 @@ function process(event)
   return event
 end
 "#;
+
+/// Reads `event.metrics[1].value` on every call -- for measuring what a script touching the
+/// `event.metrics` surface (`crates/logit-script/src/proxy.rs`'s `MetricsProxy`/`MetricProxy`)
+/// costs, over [`LUA_ENRICH_SCRIPT`]'s baseline
+/// (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event_reading_metric_value`).
+/// A pure read, discarded rather than written back into `event.attributes` -- see that test's own
+/// doc comment for why, and for what the write variant would cost instead.
+pub const LUA_METRIC_VALUE_READ_SCRIPT: &str = r#"
+function process(event)
+  local _ = event.metrics[1].value
+  return event
+end
+"#;
+
+/// Reads `#event.metrics` (`MetaMethod::Len`) only -- no `event.metrics[i]` indexing at all, so
+/// this isolates `MetricsProxy`'s own creation-and-caching cost from `MetricProxy`'s per-index
+/// one (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event_reading_metric_len`).
+pub const LUA_METRIC_LEN_READ_SCRIPT: &str = r#"
+function process(event)
+  local _ = #event.metrics
+  return event
+end
+"#;
+
+/// Reads `event.span.name` on every call -- for measuring what a script touching the
+/// `event.span` surface (`crates/logit-script/src/proxy.rs`'s `SpanProxy`) costs, over
+/// [`LUA_ENRICH_SCRIPT`]'s baseline (`crates/logit-bench/tests/allocations.rs`'s
+/// `lua_process_one_event_reading_span_name`).
+pub const LUA_SPAN_NAME_READ_SCRIPT: &str = r#"
+function process(event)
+  local _ = event.span.name
+  return event
+end
+"#;
+
+/// Reads `scope.name` on every call -- for measuring what a script touching the batch-level
+/// `scope` global (`crates/logit-script/src/scope.rs`) costs
+/// (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event_reading_scope_name`).
+pub const LUA_SCOPE_NAME_READ_SCRIPT: &str = r#"
+function process(event)
+  local _ = scope.name
+  return event
+end
+"#;
+
+/// Writes `scope.attributes.k` on every call -- the first-write copy-on-write path
+/// (`crates/logit-script/src/scope.rs`'s `ensure_modified`)
+/// (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event_writing_scope_attribute`).
+pub const LUA_SCOPE_ATTR_WRITE_SCRIPT: &str = r#"
+function process(event)
+  scope.attributes.k = "v"
+  return event
+end
+"#;
+
+/// Writes `resource.schema_url` on every call -- the named-field write path added alongside
+/// `resource`'s attribute map (`crates/logit-script/src/resource.rs`'s `write_schema_url`)
+/// (`crates/logit-bench/tests/allocations.rs`'s
+/// `lua_process_one_event_writing_resource_schema_url`).
+pub const LUA_RESOURCE_SCHEMA_URL_WRITE_SCRIPT: &str = r#"
+function process(event)
+  resource.schema_url = "https://example.com/schema"
+  return event
+end
+"#;
+
+/// Assigns `scope.name = scope.name` on every call -- an identity write, which
+/// `crates/logit-script/src/scope.rs`'s no-op check must catch before ever calling
+/// `ensure_modified` (`crates/logit-bench/tests/allocations.rs`'s
+/// `lua_process_one_event_identity_write_to_scope_name_is_free`).
+pub const LUA_SCOPE_IDENTITY_NAME_SCRIPT: &str = r#"
+function process(event)
+  scope.name = scope.name
+  return event
+end
+"#;
+
+/// A metric-only event carrying one `MetricKind::Sum` record -- a counter, the shape
+/// `kv_metrics`'s `nginx.requests` spec (`fn kv_metrics` above) produces on the wire, and the
+/// fixture the Lua `event.metrics[i].value`/`#event.metrics` surface
+/// (`crates/logit-script/src/proxy.rs`'s `MetricsProxy`/`MetricProxy`) is measured against
+/// (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event_reading_metric_value`/
+/// `_reading_metric_len`).
+pub fn sum_metric_event() -> Event {
+    Event::metric(
+        0,
+        AttrMap::new(),
+        MetricRecord::new(logit_core::interner::intern("nginx.requests"), MetricKind::counter(1.0)),
+    )
+}
+
+/// The batch-level `scope` (OTLP's `InstrumentationScope`) `run_lua` installs before a batch's
+/// events reach `process` (`crates/logit-script/src/scope.rs`) -- non-empty `name`/`version`, no
+/// attributes, mirroring [`resource`]'s own minimal shape above. `Bytes::from_static` rather than
+/// `Bytes::copy_from_slice` for `name`/`version`: a `'static` `Bytes` never needs the
+/// one-time shared-representation promotion a `Vec`-backed one pays on its first clone (see
+/// `cached_message`'s own doc comment above), which would otherwise leak into
+/// `lua_process_one_event_writing_scope_attribute`'s measured first-write clone as an unrelated
+/// one-time cost.
+pub fn scope() -> Arc<Scope> {
+    Arc::new(Scope {
+        name: Bytes::from_static(b"nginx-otel-module"),
+        version: Bytes::from_static(b"1.0.0"),
+        ..Scope::default()
+    })
+}
 
 // -------------------------------------------------------------------------------------------
 // Logs-only: a plain-text syslog line with no JSON body at all

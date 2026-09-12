@@ -312,16 +312,19 @@ already built that have a known, accepted rough edge.
   at all still costs a full clone (6, one worse than the original code), with no path to
   improvement under the current design. See [memory.md](design/memory.md) §3 for the complete,
   shape-by-shape account — there is no single number for "what fan-out costs now."
-- **A Lua component's `flush()` has no resource of its own at a timer tick** — unlike an `aggregate`
-  component, which tracks its own per-resource windows, a Lua component's flushed events default to
-  whichever resource it most recently saw on a real batch
-  (`crates/logit-pipeline/src/runtime.rs`, see [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)).
-  A script can now override that default explicitly by writing `resource` inside `flush()` itself
-  (`crates/logit-script/src/resource.rs`, [ADR `operator-declared-resource-attributes`](adr/operator-declared-resource-attributes.md)) —
-  a workaround available to the script author, not a fix to the underlying gap: `logit` still has
-  no way to attribute a flush-driven emission to a *specific* one of several upstream resources on
-  its own. Fine for every config today (one listener, one resource); would need a real answer once
-  a component has more than one upstream resource and no script-side override.
+- **A Lua component's `flush()` has no resource or scope of its own at a timer tick** — unlike an
+  `aggregate` component, which tracks its own per-resource windows, a Lua component's flushed
+  events default to whichever resource (and, since W7, scope) it most recently saw on a real batch
+  (`crates/logit-pipeline/src/runtime.rs`'s `last_resource`/`last_scope`, see [ADR
+  `aggregation-window-semantics`](adr/aggregation-window-semantics.md)). A script can now override
+  either default explicitly by writing `resource`/`scope` inside `flush()` itself
+  (`crates/logit-script/src/resource.rs`/`scope.rs`, [ADR
+  `operator-declared-resource-attributes`](adr/operator-declared-resource-attributes.md)) — a
+  workaround available to the script author, not a fix to the underlying gap: `logit` still has no
+  way to attribute a flush-driven emission to a *specific* one of several upstream resources (or
+  scopes) on its own. Fine for every config today (one listener, one resource/scope); would need a
+  real answer once a component has more than one upstream resource/scope and no script-side
+  override.
 - **A Lua component's `flush()` sees a stale trace context, for the same reason.** `trace.trace_id`/
   `trace.span_id` (`docs/design/lua-api.md`'s "Reading trace context") reflect whichever batch
   `process()` most recently saw, not any single batch a flush-driven emission could correctly
@@ -348,15 +351,17 @@ already built that have a known, accepted rough edge.
   not designed around yet: it stamps *logit's* identity onto *application* data, which must stay
   strictly opt-in (never a default, same posture as everything else on this page), and no concrete
   consumer has needed it yet. Revisit once one does.
-- **Lua has no span API at all** — `event.has_span` (a read-only boolean) is the whole surface
-  (`docs/design/lua-api.md`); there is no way for a script to create, read, or mutate a
-  `SpanRecord`. `trace_context`'s `span:` block
-  ([ADR `trace-context-span-lifting`](adr/trace-context-span-lifting.md)) is consequently the
-  *only* way to turn a log line into a span today. A script ahead of it can still prepare the
-  convention attributes (compute `span.start` from whatever the line actually carries, say) for
-  `trace_context` to consume — genuinely useful, just not a substitute for a real API. Real span
-  read/write access is its own design pass, the same posture typed record access on `event.log`
-  already took before it got one.
+- ~~**Lua has no span API at all**~~ — **narrowed to span writes/minting from Lua.** `event.span`
+  (`docs/design/lua-api.md`'s "Reading `event.span`") is now a real, read-only proxy — a script can
+  read every field a `SpanRecord` carries, including its `events`/`links` tables, once one exists.
+  What's left: there is still no way for a script to *create* or *mutate* a span.
+  `trace_context`'s `span:` block ([ADR
+  `trace-context-span-lifting`](adr/trace-context-span-lifting.md)) is still the *only* way to
+  turn a log line into a span today. A script ahead of it can still prepare the convention
+  attributes (compute `span.start` from whatever the line actually carries, say) for
+  `trace_context` to consume — genuinely useful, just not a substitute for write access. Span
+  *write* access is its own design pass, the same posture typed record access on `event.log`
+  already took before its own read/write half landed.
 - **A haproxy/nginx access line derives only its own server span, not the CLIENT-side child span
   for the hop to its upstream** — `trace_context`'s `span:` block mints one `SpanRecord` per
   event, and `Transform::process` is one-in-one-out, so there's nowhere to put a second span for
@@ -598,11 +603,17 @@ already built that have a known, accepted rough edge.
   `dropped_dialect_fields`), and any event with no `U64` carrier set — everything that isn't a
   relayed `|T`-carrying line — is still stamped with the receiver's own receipt time, exactly like
   `syslog_out`'s receipt-time entry above. `MetricRecord::unit` still has no statsd wire
-  representation and is dropped the same way. There is also still no way to rename or namespace a
-  metric on egress anywhere in the pipeline today (`docs/design/lua-api.md` notes a metric's
-  value/fields are unexposed to Lua) — a sink-side `prefix` field was considered and rejected for
-  `statsd_out` specifically (`docs/adr/statsd-output.md`'s Alternatives) in favor of a future
-  general metric-rename transform, which doesn't exist yet either. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+  representation and is dropped the same way. There is still no *native*, sink-level way to rename
+  or namespace a metric on egress (~~`docs/design/lua-api.md` notes a metric's value/fields are
+  unexposed to Lua~~ — narrowed by W7: `event.metrics` now exposes every metric field for reading
+  and `name`/`unit`/`description`/`start_timestamp` for writing on every kind, so a `lua` component
+  placed ahead of `statsd_out` *can* rename or retag a metric today, `event.metrics[i].name =
+  "..."`; what W7 didn't add is a way to *construct or append* a new metric from Lua, or to write
+  any field besides `value`/`temporality`/`monotonic` on kinds other than `sum`/`gauge` — see
+  `docs/design/lua-api.md`'s "Reading and writing `event.metrics`") — a sink-side `prefix` field
+  was considered and rejected for `statsd_out` specifically (`docs/adr/statsd-output.md`'s
+  Alternatives) in favor of a future general metric-rename *transform* (a native component, not
+  Lua), which still doesn't exist. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 - **A repeated DogStatsD tag key collapses to its last value.** `#team:a,team:b` is legal
   DogStatsD, but `AttrMap` is a map, not a multiset, so `statsd_in` overwrites the first `team:a`
   with `team:b` while building the event's attributes, before any sink ever sees the line —
