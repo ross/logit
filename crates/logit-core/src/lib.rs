@@ -66,8 +66,8 @@ pub struct LogRecord {
     /// `docs/adr/log-record-trace-context.md`.
     pub trace: Option<TraceRef>,
     /// OTLP's `LogRecord.event_name` -- a short, stable identifier for the kind of event this log
-    /// represents (distinct from its free-form `message`). No producer until W4
-    /// (`docs/plans/lossless-transit.md`).
+    /// represents (distinct from its free-form `message`). Produced by the OTLP codec since W4
+    /// (`docs/plans/lossless-transit.md`); readable and writable from Lua since W7.
     pub event_name: Option<Symbol>,
     /// Unix nanoseconds this log was observed by the collector, as distinct from when it was
     /// generated (`Event::timestamp`) -- OTLP's `LogRecord.observed_time_unix_nano`. `0` means

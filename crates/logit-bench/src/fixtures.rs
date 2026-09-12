@@ -19,7 +19,7 @@
 use bytes::Bytes;
 use logit_core::{
     AttrMap, BodyFormat, DdSketch, Event, EventBatch, LogRecord, MetricKind, MetricRecord,
-    Resource, Samples, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus, Value,
+    Resource, Samples, Scope, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus, Value,
 };
 use logit_inputs::statsd::StatsdDecoder;
 use logit_inputs::syslog::SyslogDecoder;
@@ -53,17 +53,40 @@ pub const NGINX_SYSLOG_LINE: &str = concat!(
 pub const STATSD_LINE: &str = "page.views:1|c|@0.5|#env:prod,region:us-east-1,service:web";
 
 /// A statsd distribution (`ms`) line at the default, unsampled rate -- the baseline
-/// [`STATSD_SAMPLED_DISTRIBUTION_LINE`]'s allocation count is measured against: decode-time
-/// sample-rate extrapolation (`DdSketch::add_weighted`, `crates/logit-inputs/src/statsd.rs`) must
-/// add zero allocations over this unsampled case, which `add_weighted`'s delegation to
-/// `sketches_ddsketch::DDSketch::add_with_count` (constant-time, one bin touch regardless of
-/// weight) satisfies for free.
+/// [`STATSD_SAMPLED_DISTRIBUTION_LINE`]'s allocation count is measured against. Decodes straight
+/// to a raw `MetricKind::Samples` now (`docs/adr/lossless-transit.md`'s W3,
+/// `crates/logit-inputs/src/statsd.rs`) -- no `DdSketch`, no decode-time sample-rate
+/// extrapolation; only `aggregate` sketches these.
 pub const STATSD_DISTRIBUTION_LINE: &str = "request.latency:120|ms";
 
-/// The same line as [`STATSD_DISTRIBUTION_LINE`], sampled at `@0.1` -- ten weighted samples
-/// instead of one, exercising `DdSketch::add_weighted`'s `add_with_count` delegation on the decode
-/// path.
+/// The same line as [`STATSD_DISTRIBUTION_LINE`], sampled at `@0.1` -- the raw `sample_rate` now
+/// rides verbatim on the decoded `Samples` (`docs/adr/lossless-transit.md`'s W3: no decode-time
+/// extrapolation any more, `crates/logit-inputs/src/statsd.rs`).
 pub const STATSD_SAMPLED_DISTRIBUTION_LINE: &str = "request.latency:120|ms|@0.1";
+
+/// A statsd set (`s`) line -- decodes to one [`logit_core::MetricKind::SetMembers`] event, a
+/// single zero-copy member slice of the datagram.
+pub const STATSD_SET_LINE: &str = "unique.users:abc123|s";
+
+/// A DogStatsD event (`_e{tlen,xlen}:title|text|...`) line whose `TEXT` has nothing to unescape --
+/// the docs' own canonical event example (`crates/logit-inputs/src/statsd.rs`'s
+/// `dogstatsd_docs_example_event_decodes`) -- so `parse_event`'s `unescape_event_text` takes its
+/// zero-copy path, the same `slice_of`-backed slicing every other statsd field here gets.
+pub const STATSD_EVENT_LINE: &str =
+    "_e{21,36}:An exception occurred|Cannot parse CSV file from 10.0.0.17|t:warning|#err_type:bad_file";
+
+/// The same shape as [`STATSD_EVENT_LINE`], except `TEXT` contains one `\n` (backslash, `n`)
+/// escape -- the one case `unescape_event_text` can't slice, since the decoded message needs a
+/// real newline byte the wire text doesn't have. Isolates that one extra allocation
+/// (`Bytes::from(raw.replace(...))`) from the zero-copy baseline [`STATSD_EVENT_LINE`] measures.
+pub const STATSD_EVENT_LINE_WITH_ESCAPED_NEWLINE: &str = "_e{5,12}:title|line1\\nline2";
+
+/// A DogStatsD service check (`_sc|name|status|...`) line -- the docs' own canonical example
+/// (`crates/logit-inputs/src/statsd.rs`'s `dogstatsd_docs_example_service_check_decodes`).
+/// Decodes to one [`logit_core::MetricKind::Gauge`] event carrying the
+/// `statsd.service_check.*` carriers alongside it.
+pub const STATSD_SERVICE_CHECK_LINE: &str =
+    "_sc|Redis connection|2|#env:dev|m:Redis connection timed out after 10s";
 
 /// A logfmt-shaped log line (go-kit style), used to exercise the quoted-value scan path.
 pub const LOGFMT_LINE: &str = "level=info ts=2026-09-07T06:52:01Z caller=metrics.go:159 \
@@ -100,6 +123,26 @@ pub fn statsd_distribution_datagram(count: usize) -> Bytes {
 /// `count` copies of [`STATSD_SAMPLED_DISTRIBUTION_LINE`], newline-separated.
 pub fn statsd_sampled_distribution_datagram(count: usize) -> Bytes {
     join_lines(STATSD_SAMPLED_DISTRIBUTION_LINE, count)
+}
+
+/// `count` copies of [`STATSD_SET_LINE`], newline-separated.
+pub fn statsd_set_datagram(count: usize) -> Bytes {
+    join_lines(STATSD_SET_LINE, count)
+}
+
+/// `count` copies of [`STATSD_EVENT_LINE`], newline-separated.
+pub fn statsd_event_datagram(count: usize) -> Bytes {
+    join_lines(STATSD_EVENT_LINE, count)
+}
+
+/// `count` copies of [`STATSD_EVENT_LINE_WITH_ESCAPED_NEWLINE`], newline-separated.
+pub fn statsd_event_with_escaped_newline_datagram(count: usize) -> Bytes {
+    join_lines(STATSD_EVENT_LINE_WITH_ESCAPED_NEWLINE, count)
+}
+
+/// `count` copies of [`STATSD_SERVICE_CHECK_LINE`], newline-separated.
+pub fn statsd_service_check_datagram(count: usize) -> Bytes {
+    join_lines(STATSD_SERVICE_CHECK_LINE, count)
 }
 
 fn join_lines(line: &str, count: usize) -> Bytes {
@@ -429,8 +472,8 @@ pub fn aggregator_with_samples_retention(max_samples_per_series: usize) -> Aggre
 }
 
 /// A metric-only event carrying one `MetricKind::Samples` record -- the raw shape statsd's
-/// `ms`/`h`/`d` timings will arrive as once W3 lands a producer (`docs/plans/lossless-transit.md`),
-/// used to measure what `aggregate` pays to absorb one
+/// `ms`/`h`/`d` timings decode to since W3 (`crates/logit-inputs/src/statsd.rs`,
+/// `docs/plans/lossless-transit.md`), used to measure what `aggregate` pays to absorb one
 /// (`aggregate_absorb_one_samples_event_sketch_mode`/
 /// `aggregate_absorb_25_samples_values_into_one_series_samples_mode`,
 /// `crates/logit-bench/tests/allocations.rs`). Unsampled (`sample_rate: 1.0`, `Samples::new`'s
@@ -566,6 +609,148 @@ function process(event)
   return event
 end
 "#;
+
+/// Reads `event.metrics[1].value` on every call -- for measuring what a script touching the
+/// `event.metrics` surface (`crates/logit-script/src/proxy.rs`'s `MetricsProxy`/`MetricProxy`)
+/// costs, over [`LUA_ENRICH_SCRIPT`]'s baseline
+/// (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event_reading_metric_value`).
+/// A pure read, discarded rather than written back into `event.attributes` -- see that test's own
+/// doc comment for why, and for what the write variant would cost instead.
+pub const LUA_METRIC_VALUE_READ_SCRIPT: &str = r#"
+function process(event)
+  local _ = event.metrics[1].value
+  return event
+end
+"#;
+
+/// Reads `#event.metrics` (`MetaMethod::Len`) only -- no `event.metrics[i]` indexing at all, so
+/// this isolates `MetricsProxy`'s own creation-and-caching cost from `MetricProxy`'s per-index
+/// one (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event_reading_metric_len`).
+pub const LUA_METRIC_LEN_READ_SCRIPT: &str = r#"
+function process(event)
+  local _ = #event.metrics
+  return event
+end
+"#;
+
+/// Reads `event.span.name` on every call -- for measuring what a script touching the
+/// `event.span` surface (`crates/logit-script/src/proxy.rs`'s `SpanProxy`) costs, over
+/// [`LUA_ENRICH_SCRIPT`]'s baseline (`crates/logit-bench/tests/allocations.rs`'s
+/// `lua_process_one_event_reading_span_name`).
+pub const LUA_SPAN_NAME_READ_SCRIPT: &str = r#"
+function process(event)
+  local _ = event.span.name
+  return event
+end
+"#;
+
+/// Reads `scope.name` on every call -- for measuring what a script touching the batch-level
+/// `scope` global (`crates/logit-script/src/scope.rs`) costs
+/// (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event_reading_scope_name`).
+pub const LUA_SCOPE_NAME_READ_SCRIPT: &str = r#"
+function process(event)
+  local _ = scope.name
+  return event
+end
+"#;
+
+/// Writes `scope.attributes.k` on every call -- the first-write copy-on-write path
+/// (`crates/logit-script/src/scope.rs`'s `ensure_modified`)
+/// (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event_writing_scope_attribute`).
+pub const LUA_SCOPE_ATTR_WRITE_SCRIPT: &str = r#"
+function process(event)
+  scope.attributes.k = "v"
+  return event
+end
+"#;
+
+/// Writes `resource.schema_url` on every call -- the named-field write path added alongside
+/// `resource`'s attribute map (`crates/logit-script/src/resource.rs`'s `write_schema_url`)
+/// (`crates/logit-bench/tests/allocations.rs`'s
+/// `lua_process_one_event_writing_resource_schema_url`).
+pub const LUA_RESOURCE_SCHEMA_URL_WRITE_SCRIPT: &str = r#"
+function process(event)
+  resource.schema_url = "https://example.com/schema"
+  return event
+end
+"#;
+
+/// Assigns `scope.name = scope.name` on every call -- an identity write, which
+/// `crates/logit-script/src/scope.rs`'s no-op check must catch before ever calling
+/// `ensure_modified` (`crates/logit-bench/tests/allocations.rs`'s
+/// `lua_process_one_event_identity_write_to_scope_name_is_free`).
+pub const LUA_SCOPE_IDENTITY_NAME_SCRIPT: &str = r#"
+function process(event)
+  scope.name = scope.name
+  return event
+end
+"#;
+
+/// A metric-only event carrying one `MetricKind::Sum` record -- a counter, the shape
+/// `kv_metrics`'s `nginx.requests` spec (`fn kv_metrics` above) produces on the wire, and the
+/// fixture the Lua `event.metrics[i].value`/`#event.metrics` surface
+/// (`crates/logit-script/src/proxy.rs`'s `MetricsProxy`/`MetricProxy`) is measured against
+/// (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event_reading_metric_value`/
+/// `_reading_metric_len`).
+pub fn sum_metric_event() -> Event {
+    Event::metric(
+        0,
+        AttrMap::new(),
+        MetricRecord::new(logit_core::interner::intern("nginx.requests"), MetricKind::counter(1.0)),
+    )
+}
+
+/// The batch-level `scope` (OTLP's `InstrumentationScope`) `run_lua` installs before a batch's
+/// events reach `process` (`crates/logit-script/src/scope.rs`) -- non-empty `name`/`version`, no
+/// attributes, mirroring [`resource`]'s own minimal shape above. `Bytes::from_static` rather than
+/// `Bytes::copy_from_slice` for `name`/`version`: a `'static` `Bytes` never needs the
+/// one-time shared-representation promotion a `Vec`-backed one pays on its first clone (see
+/// `cached_message`'s own doc comment above), which would otherwise leak into
+/// `lua_process_one_event_writing_scope_attribute`'s measured first-write clone as an unrelated
+/// one-time cost.
+pub fn scope() -> Arc<Scope> {
+    Arc::new(Scope {
+        name: Bytes::from_static(b"nginx-otel-module"),
+        version: Bytes::from_static(b"1.0.0"),
+        ..Scope::default()
+    })
+}
+
+/// Touches nothing at all -- no `.attributes`, `.log`, `.metrics`, `.span`, `resource`, or
+/// `scope` access, just the identity function. Isolates whatever a *fixture's own shape* costs
+/// (e.g. `Event::clone`, when something forces one) from any proxy's own first-access cost, since
+/// a script this narrow creates no proxy and therefore no extra strong reference to `event`'s
+/// `Rc<RefCell<Event>>` beyond `EventProxy`'s own -- `EventProxy::into_inner`'s `Rc::try_unwrap`
+/// fast path always succeeds here, regardless of the event's shape
+/// (`crates/logit-bench/tests/allocations.rs`'s
+/// `lua_process_one_event_passthrough_on_a_spilled_event`).
+pub const LUA_PASSTHROUGH_SCRIPT: &str = r#"
+function process(event)
+  return event
+end
+"#;
+
+/// [`sum_metric_event`], but with a *spilled* (9, past `AttrMap`'s 8-slot inline capacity)
+/// event-level attribute map -- makes a real `Event::clone` allocate instead of the free memcpy
+/// `sum_metric_event`'s own empty, inline `AttrMap` gets away with (mirrors `wide_gauge_event`'s
+/// own reasoning above). Exists to guard `MetricProxy`'s `Weak<RefCell<Event>>` field
+/// (`crates/logit-script/src/proxy.rs`): before that field was a `Weak`, a leftover, not-yet-GC'd
+/// `event.metrics[i]` temporary held a *strong* `Rc`, so `EventProxy::into_inner`'s
+/// `Rc::try_unwrap` fast path could fail and fall back to a real `Event::clone` -- a cost
+/// `sum_metric_event`'s own free clone could never make visible to this file's exact-equality
+/// assertions (`crates/logit-bench/tests/allocations.rs`'s
+/// `lua_process_one_event_reading_metric_value_on_a_spilled_event`).
+pub fn sum_metric_event_with_spilled_attributes() -> Event {
+    let mut attributes = AttrMap::new();
+    for i in 0..9 {
+        attributes.insert(&format!("tag{i}"), format!("value{i}").as_str());
+    }
+    Event::metric(
+        0,
+        attributes,
+        MetricRecord::new(logit_core::interner::intern("nginx.requests"), MetricKind::counter(1.0)),
+    )
+}
 
 // -------------------------------------------------------------------------------------------
 // Logs-only: a plain-text syslog line with no JSON body at all

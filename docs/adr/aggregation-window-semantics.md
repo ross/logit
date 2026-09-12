@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-09-11
+updated: 2026-09-12
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -282,9 +282,9 @@ drives the merge match in `process` regardless of mode.
   series' `DdSketch` via `Samples::sketch`'s weighting rule (`add_weighted(v, weight)`, `weight =
   round(1/sample_rate)` clamped to `[1, Samples::MAX_WEIGHT]`) — no raw values ever survive past
   the absorb. `weight == Samples::MAX_WEIGHT` counts
-  `logit.transform.samples.weight_clamped` and throttle-warns `sample_rate_clamped`, the same
-  diagnostic `statsd_in` reports today (both fire on a `statsd_in -> aggregate` pipeline until W3
-  deletes `statsd_in`'s own copy).
+  `logit.transform.samples.weight_clamped` and throttle-warns `sample_rate_clamped` -- the
+  diagnostic `statsd_in` used to report at decode time, now emitted only here (the decoder no
+  longer sketches or clamps since W3, [ADR `statsd-output`](statsd-output.md)'s amendment).
 - **`distributions: samples`**: a series opens as `Accumulator::Samples`, seeded with the
   *first* record's `sample_rate`, and an incoming `Samples` record concatenates its values
   (`held.values.extend(..)`) — raw retention, bounded by `max_samples_per_series` (default `1000`).

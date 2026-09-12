@@ -38,17 +38,28 @@ a transform like `kv_metrics` produces. `event:clone()` (an independent deep cop
 fan-out — see the script contract below) rounds out the proxy's surface for now.
 
 **`event.log` is the first typed record access**, read/write on its trace context
-(`trace_id`/`span_id`/`trace_flags`) and read-only on `message`/`severity`/`body_format` — see
-"Reading and writing `event.log`" below. A metric's value and a span's fields remain unexposed:
-real API surface that deserves its own design pass once a concrete consumer needs it (a
-metrics-from-attributes transform is the obvious one for a metric value), rather than being
-guessed at ahead of that. Same for any `Event.new(...)`-style constructor.
+(`trace_id`/`span_id`/`trace_flags`) and on `event_name`/`observed_timestamp`, read-only on
+`message`/`severity`/`body_format`/`dropped_attributes_count` — see "Reading and writing
+`event.log`" below. **`event.metrics`** and **`event.span`** followed the same path once a
+concrete consumer needed them (W7 of
+[`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)): `event.metrics` is a
+read/write, array-like proxy over the event's metric list — read/write only on the handful of
+fields a script can legitimately mutate in place without breaking a kind's own invariants (a
+`sum`/`gauge`'s `value`, a `sum`'s `temporality`/`monotonic`), read-only everywhere else — see
+"Reading and writing `event.metrics`" below. `event.span` is entirely read-only, the same posture
+`provenance` takes, since there is still no script-visible way to construct or mutate a span — see
+"Reading `event.span`" below. Same for any `Event.new(...)`-style constructor: still not built,
+still the same "design pass once a consumer needs it" posture this section originally took for
+metrics and span themselves.
 
 No `__pairs`: it isn't available under LuaJIT. `mlua::MetaMethod::Pairs` requires Lua 5.2+, and
 LuaJIT is Lua 5.1 semantics — this was in the original version of this section and is wrong.
 `event:to_table()` is the answer instead: a real, disconnected Lua table with `timestamp`,
 `attributes`, `log` (itself a table -- see "Reading and writing `event.log`" below -- or `nil`),
-`has_log`, `has_metrics`, and `has_span`, for anything the proxy doesn't expose directly —
+`metrics` (an array of tables, one per `event.metrics[i]` -- see "Reading and writing
+`event.metrics`" below -- always present, empty when the event carries none), `span` (itself a
+table -- see "Reading `event.span`" below -- or `nil`), `has_log`, `has_metrics`, and `has_span`,
+for anything the proxy doesn't expose directly —
 including full attribute iteration
 (`for k, v in pairs(event:to_table().attributes) do ... end`, native `pairs()` on a real table) and
 building new structures or logging for debugging. The cost is opt-in and visible at the call site
@@ -306,6 +317,85 @@ The `set` native transform (`logit_config::ComponentKind::Set`) offers the same 
 writing Lua at all, for the common case of stamping a handful of constant values -- see that ADR
 for why an operator reaches for a graph component here rather than a per-input config field.
 
+**`schema_url` and `dropped_attributes_count` round out `resource`** (W7 of
+[`docs/plans/lossless-transit.md`](../plans/lossless-transit.md), mirroring OTLP's own `Resource`
+fields). `schema_url` is read/write, a string or `nil` (`nil` clears it, the same "`nil` means
+removal for this one field only" exception `event.log.trace_id` below also has);
+`dropped_attributes_count` is read-only -- OTLP's own count of attributes a *producer* dropped
+before the resource ever reached `logit`, not something a Lua-side write could meaningfully
+change, the same "read-only, name it" rule `provenance` already follows
+(`resource.dropped_attributes_count = 5` raises `resource.dropped_attributes_count is read-only`).
+
+**A named field takes precedence over an attribute of the same name.** `resource["schema_url"]`
+and `resource["dropped_attributes_count"]` always resolve to the named field above, never to an
+attribute literally keyed `schema_url`/`dropped_attributes_count` -- such an attribute still shows
+up in `resource:to_table()` (a flat attribute snapshot: `resource:to_table()["schema_url"]`), it
+just isn't reachable through `resource[...]` indexing. The
+same trade `event`'s own fixed fields (`timestamp`, `attributes`, `log`, ...) already make against
+an attribute of the same name, documented rather than guarded against.
+
+## Reading and writing `scope`
+
+A `scope` global gives `process()` (and `flush()`) read *and* write access to the incoming batch's
+OTLP instrumentation scope (`EventBatch::scope: Option<Arc<Scope>>`, added alongside batch-level
+scope grouping in W4), proxied the same way `resource` is above (`crates/logit-script/src/scope.rs`):
+
+```lua
+function process(event)
+  scope.name = "nginx-otel-module"
+  scope.version = "1.0.0"
+  scope.attributes["deployment.environment"] = "prod"
+  return event
+end
+```
+
+| Field | Type | Read/write |
+|---|---|---|
+| `name` | string | read/write -- no `nil` meaning; reads `""` before any batch/write |
+| `version` | string | read/write -- same |
+| `schema_url` | string or `nil` | read/write -- `nil` clears it |
+| `dropped_attributes_count` | integer | read-only |
+| `attributes` | sub-object, open map | read/write per key -- same `__index`/`__newindex` shape as `event.attributes` |
+
+**Unlike `resource`, `scope`'s attributes live behind their own `scope.attributes` sub-object, not
+directly on `scope[key]`.** `resource["service.name"]` indexes the resource's attribute map
+directly (there is no `resource.attributes` sub-object); `scope["k"]` does not fall through to an
+attribute the way `resource["k"]` does -- a script writes `scope.attributes["k"]`, mirroring
+`event.attributes` rather than `resource`. `scope.attributes = ...` itself is read-only (the
+sub-object can't be replaced wholesale, only written into per key).
+
+**Unlike `resource`, a batch may carry no scope at all.** `EventBatch::scope` is `Option`al, so
+reading any field before a write reports the all-clear value `resource` doesn't need to (`""` for
+`name`/`version`, `nil` for `schema_url`, `0` for `dropped_attributes_count`, an empty table for
+`attributes`) -- the same values `logit_core::Scope::default()` itself carries. A write on such a
+batch starts `modified` from `Scope::default()` rather than erroring, exactly the way `resource`'s
+write path starts from an empty `Resource` when nothing has stamped one yet.
+
+**Per batch, not per event, with the same blast radius `resource` has -- widened.** A `scope`
+write inside `process()`/`flush()` applies to the whole outgoing batch, and **regroups OTLP
+output the same way a `resource` write does**: `otlp_out` groups outgoing events by their
+`(Resource*, Scope*)` pair (W4), so writing `scope` mid-batch changes which wire
+`InstrumentationScope` every event in that batch -- not just the one being processed -- ends up
+under. `scope` starts at the same kind of all-clear starting point `resource` does -- no batch's
+scope seen yet, reading as the defaults above (`base: None`, unlike `resource`'s own `base`, which
+is always a real, if empty, `Arc<Resource>`, never absent) -- before any batch has arrived, and is
+reset once per incoming batch before any of its events reach `process()`, the same timing
+`resource` uses.
+
+**Copy-on-write, and stale during `flush()`, the same way and for the same reason as `resource`.**
+A script that never touches `scope` costs nothing (`crates/logit-script/src/scope.rs`); a `flush()`
+tick sees whatever the most recently processed batch's scope was, unless the script writes `scope`
+inside `flush()` itself, which gives that flush-driven emission a real identity the same way a
+`resource` write does (`crates/logit-pipeline/src/runtime.rs`'s `run_lua` commits a `scope` write
+the same way it commits a `resource` write, for both the per-batch and the `flush()` path). See
+`docs/known-gaps.md`'s Lua-`flush()`-staleness entry, which now covers both globals.
+
+`scope:to_table()` is the enumeration escape hatch, as `resource:to_table()` is (no `__pairs`
+under LuaJIT), but its shape differs: `resource:to_table()` is the flat attribute map, while
+`scope:to_table()` returns the named fields with the attributes nested --
+`{name=, version=, schema_url=, attributes={...}, dropped_attributes_count=}`, `schema_url`
+present only when set.
+
 ## Reading and writing `event.log`
 
 `event.log` is `nil` on an event with no log (`event.has_log == false`); otherwise it's a proxy
@@ -342,16 +432,193 @@ matching `stdio_out`'s own rendering) or `nil` if the record carries none; `body
 `"raw"`/`"json"`/`"structured"`. Assigning to any of the three is a clear "read-only for now"
 error.
 
+**`event_name`, `observed_timestamp`, and `dropped_attributes_count` round out the record** (W7 of
+[`docs/plans/lossless-transit.md`](../plans/lossless-transit.md), following W4's addition of all
+three as real `LogRecord` fields). `event_name` is read/write, a plain string or `nil` --
+`event.log.event_name = "request.completed"` interns the string the same way a string-valued
+attribute write does. **Prefer a name from a fixed, bounded vocabulary in the script's own
+source, not one built from event data** -- the same cardinality caution `telemetry.count`'s metric
+name argument already carries ("Emitting telemetry from a script" above): a name built from a
+request id or order id leaks one process-wide interner entry per distinct value, forever
+(`docs/known-gaps.md`'s interner entry). `observed_timestamp` is read/write, a decimal-digit
+string, not a Lua number -- the same 2^53 precision reasoning `event.timestamp` documents above,
+since this is also a unix-nanos value; `0` (OTLP's own "unset" convention) reads back as the
+string `"0"`, not `nil` -- unlike `event.log` itself, there's no "unset means absent" convention
+for this particular field. `dropped_attributes_count` is read-only: OTLP's own count of
+attributes a *producer* dropped before the record ever reached `logit`, not something a Lua-side
+write could meaningfully change -- the same "read-only, name it" rule `provenance` already
+follows (`event.log.dropped_attributes_count = 5` raises
+`event.log.dropped_attributes_count is read-only`), not an oversight.
+
 The `trace_context` native transform (`logit_config::ComponentKind::TraceContext`) offers the
 common case -- lifting a trace id already sitting in an attribute (a JSON log body's own
 `trace.id` field, or a W3C `traceparent`) onto the log record -- without writing Lua, the same
 relationship `set` has to `resource`/`event.attributes`. See `docs/adr/log-record-trace-context.md`.
 Its `span:` block goes one step further than any script can today: it mints a `SpanRecord` from an
 access line's ids and timing (`docs/adr/trace-context-span-lifting.md`,
-`docs/design/data-model.md`'s "Well-known attribute names"). A script has no span API at all --
-`event.has_span` is the whole surface -- so a Lua component can *prepare* those attributes (compute
-`span.start` from whatever the line carries, say) for a `trace_context` placed after it, but cannot
-create the span itself. Tracked in `docs/known-gaps.md`.
+`docs/design/data-model.md`'s "Well-known attribute names"). A script can *read* a span once one
+exists -- `event.span`, read-only, see "Reading `event.span`" below -- and can *prepare* the
+attributes a `trace_context` placed after it needs (compute `span.start` from whatever the line
+carries, say), but still has no way to *create* or *mutate* a span itself. Narrowed in
+`docs/known-gaps.md` (W7): the remaining gap is span writes/minting specifically, not span access
+as a whole.
+
+## Reading and writing `event.metrics`
+
+An `event.metrics` global gives `process()` (and `flush()`) access to the event's metric list --
+an indexable, array-like proxy over `logit_core::MetricList`
+(`crates/logit-script/src/proxy.rs`), always present, even for an event with no metrics at all
+(`#event.metrics == 0` is a normal, valid read -- unlike `event.log`/`event.span`, there's no
+`nil` gate on the container itself, only on what indexing into it returns):
+
+```lua
+-- derive an attribute from a metric
+function process(event)
+  if event.has_metrics and event.metrics[1].kind == "gauge" then
+    event.attributes["metric.value"] = event.metrics[1].value
+  end
+  return event
+end
+
+-- adjust a gauge in place
+function process(event)
+  for i = 1, #event.metrics do
+    local m = event.metrics[i]
+    if m.kind == "gauge" and m.name == "queue.depth" then
+      m.value = m.value + 1
+    end
+  end
+  return event
+end
+```
+
+`#event.metrics` (`MetaMethod::Len`) and 1-based `event.metrics[i]` (`MetaMethod::Index`) are the
+container's whole surface -- no way to add, remove, or reorder metrics from Lua. Indexing out of
+range (including `<= 0`) reads `nil`, the same as an ordinary Lua array read past its end; only a
+genuinely non-integer key is a hard error. Each `event.metrics[i]` access mints a small, fresh
+`MetricProxy` rather than reusing a cached one the way `event.attributes`/`event.log` do -- a
+metric list is typically short and usually read once per access, so this trades a per-access
+allocation for not holding a registry slot per index for the event's whole lifetime; measured in
+`crates/logit-bench/tests/allocations.rs`, see [`memory.md`](memory.md) §2. **Robust to a stale
+index**: nothing in today's Lua surface can shrink `event.metrics` mid-script, but every access
+checks the index against the current list length anyway, raising `event.metrics[i] no longer
+exists` rather than trusting a handle a script held onto past a point that could someday
+invalidate it (cheap insurance against a future surface that *can* shrink the list, e.g. an
+eventual `event.metrics:remove(i)`).
+
+Every metric kind is named by `kind`: `"sum"`, `"gauge"`, `"gauge_delta"`, `"samples"`,
+`"distribution"`, `"set_members"`, `"set"`, `"histogram"`, `"exponential_histogram"`, `"summary"`
+(`crates/logit-core/src/metric.rs`'s `MetricKind`, [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s
+target model). Every field is readable regardless of kind (`nil` when the current kind doesn't
+carry it); **only a handful are writable, and only on the kind that makes them meaningful**:
+
+| Field | Type | Read/write | Present on |
+|---|---|---|---|
+| `name` | string | read/write | every kind |
+| `unit` | string or `nil` | read/write | every kind |
+| `description` | string or `nil` | read/write | every kind |
+| `start_timestamp` | nanos-string | read/write | every kind |
+| `flags` | integer | read-only | every kind |
+| `is_no_recorded_value` | boolean | read-only | every kind (derived from `flags`) |
+| `kind` | string (list above) | read-only | every kind |
+| `exemplars` | table, array of exemplar tables | read-only | every kind (empty when none) |
+| `value` | number | read on `sum`/`gauge`/`gauge_delta`; **write only on `sum`/`gauge`** | see note below |
+| `temporality` | `"delta"` or `"cumulative"` | read on `sum`/`histogram`/`exponential_histogram`; **write only on `sum`** | see note below |
+| `monotonic` | boolean | read/write on `sum` only | `sum` |
+| `values` | table, array of numbers | read-only | `samples` |
+| `sample_rate` | number | read-only | `samples` |
+| `members` | table, array of strings | read-only | `set_members` |
+| `estimate` | integer | read-only | `set` |
+| `buckets` | table, array of `{bound=, count=}` | read-only | `histogram` |
+| `sum` | number or `nil` | read-only | `histogram`/`exponential_histogram` (optional), `summary` (always a number) |
+| `min` | number or `nil` | read-only | `histogram`/`exponential_histogram` |
+| `max` | number or `nil` | read-only | `histogram`/`exponential_histogram` |
+| `count` | integer | read-only | `distribution` (the sketch's own observation count, `DdSketch::count()`), `exponential_histogram`, `summary` |
+| `scale` | integer | read-only | `exponential_histogram` |
+| `zero_count` | integer | read-only | `exponential_histogram` |
+| `zero_threshold` | number | read-only | `exponential_histogram` |
+| `positive` | table, `{offset=, counts=[...]}` | read-only | `exponential_histogram` |
+| `negative` | table, `{offset=, counts=[...]}` | read-only | `exponential_histogram` |
+| `quantiles` | table, array of `{quantile=, value=}` | read-only | `summary` |
+| `:quantile(q)` | method, returns a number or `nil` | -- | meaningful only on `distribution`; `nil` on every other kind |
+
+`count` is a plain read-only integer field, not a method -- unlike `:quantile(q)`, there's no
+argument that changes its meaning, so there's no reason to make a script write `m:count()` instead
+of `m.count`. A write to any field a metric's current kind doesn't allow -- either an
+unconditionally read-only field (`flags`, `kind`, `exemplars`, `values`, `sum`, `count`, ...) or a
+kind-specific one (`value`, `temporality`, `monotonic`) on a kind that doesn't support writing it
+-- raises `event.metrics[i].<field> is read-only on a <kind> metric`, naming the kind so a script
+knows *why*, since the same field name is legitimately writable on a different kind. **A write to
+`value` on `gauge_delta` is rejected the same way**, even though `value` is readable there --
+`gauge_delta` is explicitly *unresolved* state (`docs/known-gaps.md`'s relative-gauge-adjustments
+entry: it must never reach a sink un-resolved), so there's no meaningful in-place adjustment for a
+script to make to it.
+
+**Only `sum`/`gauge` are mutable in place; every other kind stays entirely read-only** -- a script
+can adjust a counter or a gauge, or rename/retag/re-time any metric regardless of kind, but can't
+mint a sketch or a cardinality estimate by hand. This mirrors `AGENTS.md`'s "metric kinds must
+stay mergeable" rule for the Rust side of this model: `distribution` (`DdSketch`) and `set`
+(`HyperLogLog`) carry real merge invariants a naive field write could violate, and `samples`/
+`set_members` are raw pre-aggregation collections `aggregate` still needs to fold correctly --
+none of these have a script-safe partial-write surface today, so none get one.
+
+`exemplars` is a read-only snapshot table, one entry per `logit_core::Exemplar`: `{timestamp=
+<nanos-string>, value=<number>, trace_id=<hex-or-nil>, span_id=<hex-or-nil>, attributes=<table>}`
+-- there is no way to add, remove, or mutate an individual exemplar from Lua, only to read the
+whole list as it currently stands.
+
+## Reading `event.span`
+
+`event.span` is `nil` on an event with no span (`event.has_span == false`); otherwise it's a
+proxy onto the span record, entirely read-only -- there is no script-visible way to construct or
+mutate a span, only to read one `trace_context`'s `span:` block already minted
+([ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md)) or a wire codec already
+decoded (`crates/logit-script/src/proxy.rs`):
+
+```lua
+function process(event)
+  if event.has_span and event.span.status == "error" then
+    event.attributes["span.status_message"] = event.span.status_message
+  end
+  return event
+end
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `trace_id` | string, 32 hex chars | |
+| `span_id` | string, 16 hex chars | |
+| `parent_span_id` | string (16 hex) or `nil` | |
+| `name` | whatever `Value` the span name holds (a string, most commonly) | |
+| `kind` | string: `"internal"`/`"server"`/`"client"`/`"producer"`/`"consumer"` | |
+| `status` | string: `"unset"`/`"ok"`/`"error"` | |
+| `status_message` | string or `nil` | `nil` when the span carries no `ext` (the common case -- see below) |
+| `trace_state` | string or `nil` | `nil` when the span carries no `ext` |
+| `end_timestamp` | nanos-string | same string-not-number rule as `event.timestamp` above |
+| `flags` | integer | |
+| `dropped_attributes_count` | integer | `0` when the span carries no `ext` |
+| `dropped_events_count` | integer | `0` when the span carries no `ext` |
+| `dropped_links_count` | integer | `0` when the span carries no `ext` |
+| `events` | table, array of span-event tables | see below |
+| `links` | table, array of span-link tables | see below |
+
+`SpanRecord.ext` (`crates/logit-core/src/span.rs`) is boxed and `None` on the common case -- a
+span with no error status message and no W3C tracestate -- so `status_message`/`trace_state` read
+`nil` and every `dropped_*_count` reads `0` rather than the proxy erroring or fabricating a `Some`.
+`events[i]` is `{timestamp=<nanos-string>, name=<value>, attributes=<table>,
+dropped_attributes_count=<integer>}`; `links[i]` is `{trace_id=<hex>, span_id=<hex>,
+trace_state=<string-or-nil>, flags=<integer>, dropped_attributes_count=<integer>,
+attributes=<table>}`.
+
+**Note what's *not* here: `event.span` has no `attributes` field of its own.** A `SpanRecord` has
+no attribute map separate from the event's -- a span-carrying event's attributes are
+`event.attributes`, the same single attribute set every event has, so there's nothing for
+`event.span.attributes` to be.
+
+Unlike every other proxy in this module, `event.span`'s write path doesn't distinguish an unknown
+field from a known-but-read-only one -- any assignment at all, to any key, raises the flat
+`event.span is read-only`, since there's no field-specific case worth naming when nothing on a
+span is writable.
 
 ## Config shape
 
@@ -453,3 +720,15 @@ Verified with real scripts, not just configured and assumed: `os`, `io`, `ffi`, 
 `loadfile`, `dofile`, `load`, `loadstring`, `getfenv`, and `setfenv` are all confirmed absent
 (`crates/logit-script/src/lib.rs`'s tests) — ten checks, each its own test, not one combined
 assertion, so a regression in any single one fails on its own.
+
+## Costs
+
+| Surface | Where to look |
+|---|---|
+| `event.attributes`, `event:to_table()` (proxy vs. table conversion) | [`memory.md`](memory.md) §2, §8 |
+| `resource`, `scope` (copy-on-write, read vs. write path) | [`memory.md`](memory.md) §2 |
+| `event.metrics`, `event.span` (per-access `MetricProxy`, `to_table()` growth) | [`memory.md`](memory.md) §2 |
+
+Every number for the surfaces above is measured in `crates/logit-bench/tests/allocations.rs`, not
+estimated here -- this table intentionally carries none, so it can't drift out of date the moment
+a benchmark changes. See [`memory.md`](memory.md) §2 for the current figures.

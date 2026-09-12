@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-09-11
+updated: 2026-09-12
 ---
 
 # Metrics model v2: `Sum` replaces `Counter`, raw/summarized pairs, boxed span fidelity, batch-level `Scope`
@@ -263,3 +263,18 @@ just enough room inside the existing 176-byte envelope for `MetricKind`'s discri
   influxdb.rs`, and `aggregate`'s own sketch-mode absorb alike. See `docs/adr/
   aggregation-window-semantics.md`'s own amendment for `aggregate`'s side of W2 (the `distributions`/
   `sets` modes, their caps, and the fallback-and-count rule).
+- **(2026-09-12) W3 landed, giving `Samples`/`SetMembers` their first producer.**
+  [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W3 gave the two raw variants
+  this ADR introduced their first real producer and consumer: `crates/logit-inputs/src/statsd.rs`'s
+  `ms`/`h`/`d`/`s` lines decode straight to `MetricKind::Samples`/`SetMembers` — no sketching, no
+  sample-rate extrapolation, at decode time — and `crates/logit-outputs/src/statsd.rs` encodes both
+  back to real statsd lines. `statsd_in`'s own copy of the `MAX_SAMPLE_WEIGHT`/`sample_rate_clamped`
+  clamp, kept until this workstream per W2's own amendment, is deleted; `aggregate` is now the only
+  place that diagnostic fires. `SAMPLES_INLINE`'s sizing (this ADR's own Decision section) is now
+  exercised by real, decoded network traffic rather than only `type_sizes.rs`'s assertion and a
+  single-value benchmark fixture — a statsd timer/histogram line with up to 19 `:`-separated values
+  still costs nothing beyond the per-line/per-batch `Vec<Event>` allocations
+  `crates/logit-bench/tests/allocations.rs` already pinned before this landed
+  (`statsd_decode_one_distribution_line`/`statsd_decode_one_sampled_distribution_line`, both **2**
+  allocations, down from **3** when a `DdSketch` was still built at decode time). See
+  [ADR `statsd-output`](statsd-output.md)'s own amendment for the wire-level detail.

@@ -27,19 +27,22 @@ already built that have a known, accepted rough edge.
   that shape natively. Sampling, throttling, dedup, and anything needing an actual operator
   (`>=`, `contains`, cross-attribute comparison) remain Lua-only; the gap above still applies to
   them unchanged.
-- **`HyperLogLog` is real now; statsd still has no producer for it.** [`docs/plans/lossless-transit.md`](plans/lossless-transit.md)'s
-  W2 gave `HyperLogLog` (`crates/logit-core/src/metric.rs`) a real implementation wrapping the
-  `cardinality-estimator` crate — merge (union), `estimate()`, and a canonical `to_bytes`/`from_bytes`
-  pinned to that crate's version, no longer a method-less placeholder. `logit-transforms::Aggregator`
-  now really merges `MetricKind::SetMembers` into a `Set` (`sets: estimate`, the default) or retains
-  an exact deduplicated member set (`sets: members`, bounded by `max_set_members_per_series`, falling
-  back to an estimate on overflow) — see [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s
+- ~~**`HyperLogLog` is real now; statsd still has no producer for it.**~~ — **closed, both halves,
+  as of W3.** [`docs/plans/lossless-transit.md`](plans/lossless-transit.md)'s W2 gave `HyperLogLog`
+  (`crates/logit-core/src/metric.rs`) a real implementation wrapping the `cardinality-estimator`
+  crate — merge (union), `estimate()`, and a canonical `to_bytes`/`from_bytes` pinned to that
+  crate's version, no longer a method-less placeholder. `logit-transforms::Aggregator` really
+  merges `MetricKind::SetMembers` into a `Set` (`sets: estimate`, the default) or retains an exact
+  deduplicated member set (`sets: members`, bounded by `max_set_members_per_series`, falling back
+  to an estimate on overflow) — see [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s
   amendment for the full design; `logit-outputs::influxdb` renders a `Set`'s estimate as a `value=`
-  field instead of erroring, and `logit-outputs::stdio` renders `set=<estimate>`. What's still open:
-  statsd's `s` (set) metric type is still a clear decode error, not silently losing data
-  (`crates/logit-inputs/src/statsd.rs`) — no *producer* for `SetMembers`/`Set` until W3 wires up `s`
-  the same way `ms`/`h`/`d` already produce `Samples`/`Distribution`. Tracked as debt against
-  [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+  field instead of erroring, and `logit-outputs::stdio` renders `set=<estimate>`. W3 closed the
+  other half: statsd's `s` (set) metric type is no longer a decode error —
+  `crates/logit-inputs/src/statsd.rs` decodes `s` straight to `MetricKind::SetMembers`, one event
+  per line, every member a zero-copy datagram slice, and `crates/logit-outputs/src/statsd.rs`
+  encodes it back as one `name:<member>|s` line per member — `SetMembers`/`Set`'s own producer, the
+  same way `ms`/`h`/`d` already produce `Samples`/`Distribution`. See
+  [ADR `statsd-output`](adr/statsd-output.md)'s amendment.
 - **`HyperLogLog::from_bytes` (`crates/logit-core/src/metric.rs`) works around an upstream
   allocation-layout bug in `cardinality-estimator` 1.0.3, not just a byte-shape mismatch.** That
   crate's `Array::from_vec` rounds a deserialized `Vec<u32>`'s length up to the next power of two,
@@ -255,6 +258,17 @@ already built that have a known, accepted rough edge.
   `logit.component.diagnostics{key="sample_rate_clamped"}` by `Diagnostics` for free — no separate
   counter), never silent. A sample rate on `g` (gauge) or `s` (set) stays ignored — extrapolating
   an absolute or a cardinality-estimator value is meaningless, unlike a count.
+
+  **Updated 2026-09-12 (W3):** the mechanism described in the paragraph above no longer lives in
+  `statsd_in` at all. [`docs/plans/lossless-transit.md`](plans/lossless-transit.md)'s W2 moved the
+  sketch-and-clamp step (verbatim, including `MAX_SAMPLE_WEIGHT`/`sample_rate_clamped`) into
+  `aggregate`'s default `distributions: sketch` absorb path (`Samples::sketch`/`Samples::MAX_WEIGHT`,
+  `crates/logit-core/src/metric.rs`), and W3 deleted `statsd_in`'s own copy entirely: `ms`/`h`/`d`
+  now decode straight to a raw `MetricKind::Samples` with `sample_rate` carried verbatim and no
+  sketching or extrapolation at decode time at all. A `statsd_in -> aggregate` pipeline reports
+  `sample_rate_clamped` exactly once now, not twice. See [ADR `statsd-output`](adr/statsd-output.md)'s
+  amendment and [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s own
+  amendment.
 - ~~**`eprintln!` instead of a real diagnostics facility** — every component's diagnostic now goes
   through `logit_core::diag::Diagnostics`, which closes the two concrete hazards this entry used to
   name: every message is prefixed with its component's id, and a message that can fire once per
@@ -302,16 +316,19 @@ already built that have a known, accepted rough edge.
   at all still costs a full clone (6, one worse than the original code), with no path to
   improvement under the current design. See [memory.md](design/memory.md) §3 for the complete,
   shape-by-shape account — there is no single number for "what fan-out costs now."
-- **A Lua component's `flush()` has no resource of its own at a timer tick** — unlike an `aggregate`
-  component, which tracks its own per-resource windows, a Lua component's flushed events default to
-  whichever resource it most recently saw on a real batch
-  (`crates/logit-pipeline/src/runtime.rs`, see [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)).
-  A script can now override that default explicitly by writing `resource` inside `flush()` itself
-  (`crates/logit-script/src/resource.rs`, [ADR `operator-declared-resource-attributes`](adr/operator-declared-resource-attributes.md)) —
-  a workaround available to the script author, not a fix to the underlying gap: `logit` still has
-  no way to attribute a flush-driven emission to a *specific* one of several upstream resources on
-  its own. Fine for every config today (one listener, one resource); would need a real answer once
-  a component has more than one upstream resource and no script-side override.
+- **A Lua component's `flush()` has no resource or scope of its own at a timer tick** — unlike an
+  `aggregate` component, which tracks its own per-resource windows, a Lua component's flushed
+  events default to whichever resource (and, since W7, scope) it most recently saw on a real batch
+  (`crates/logit-pipeline/src/runtime.rs`'s `last_resource`/`last_scope`, see [ADR
+  `aggregation-window-semantics`](adr/aggregation-window-semantics.md)). A script can now override
+  either default explicitly by writing `resource`/`scope` inside `flush()` itself
+  (`crates/logit-script/src/resource.rs`/`scope.rs`, [ADR
+  `operator-declared-resource-attributes`](adr/operator-declared-resource-attributes.md)) — a
+  workaround available to the script author, not a fix to the underlying gap: `logit` still has no
+  way to attribute a flush-driven emission to a *specific* one of several upstream resources (or
+  scopes) on its own. Fine for every config today (one listener, one resource/scope); would need a
+  real answer once a component has more than one upstream resource/scope and no script-side
+  override.
 - **A Lua component's `flush()` sees a stale trace context, for the same reason.** `trace.trace_id`/
   `trace.span_id` (`docs/design/lua-api.md`'s "Reading trace context") reflect whichever batch
   `process()` most recently saw, not any single batch a flush-driven emission could correctly
@@ -338,15 +355,17 @@ already built that have a known, accepted rough edge.
   not designed around yet: it stamps *logit's* identity onto *application* data, which must stay
   strictly opt-in (never a default, same posture as everything else on this page), and no concrete
   consumer has needed it yet. Revisit once one does.
-- **Lua has no span API at all** — `event.has_span` (a read-only boolean) is the whole surface
-  (`docs/design/lua-api.md`); there is no way for a script to create, read, or mutate a
-  `SpanRecord`. `trace_context`'s `span:` block
-  ([ADR `trace-context-span-lifting`](adr/trace-context-span-lifting.md)) is consequently the
-  *only* way to turn a log line into a span today. A script ahead of it can still prepare the
-  convention attributes (compute `span.start` from whatever the line actually carries, say) for
-  `trace_context` to consume — genuinely useful, just not a substitute for a real API. Real span
-  read/write access is its own design pass, the same posture typed record access on `event.log`
-  already took before it got one.
+- ~~**Lua has no span API at all**~~ — **narrowed to span writes/minting from Lua.** `event.span`
+  (`docs/design/lua-api.md`'s "Reading `event.span`") is now a real, read-only proxy — a script can
+  read every field a `SpanRecord` carries, including its `events`/`links` tables, once one exists.
+  What's left: there is still no way for a script to *create* or *mutate* a span.
+  `trace_context`'s `span:` block ([ADR
+  `trace-context-span-lifting`](adr/trace-context-span-lifting.md)) is still the *only* way to
+  turn a log line into a span today. A script ahead of it can still prepare the convention
+  attributes (compute `span.start` from whatever the line actually carries, say) for
+  `trace_context` to consume — genuinely useful, just not a substitute for write access. Span
+  *write* access is its own design pass, the same posture typed record access on `event.log`
+  already took before its own read/write half landed.
 - **A haproxy/nginx access line derives only its own server span, not the CLIENT-side child span
   for the hop to its upstream** — `trace_context`'s `span:` block mints one `SpanRecord` per
   event, and `Transform::process` is one-in-one-out, so there's nowhere to put a second span for
@@ -553,26 +572,59 @@ already built that have a known, accepted rough edge.
   generalizing the trait (an associated framing type, or a sink-driven push interface) is still
   deferred, but no longer for lack of a second caller to design against; it's simply not yet been
   done.
-- **`statsd_out` only encodes `Sum`/`Gauge`/`GaugeDelta` in v1 — every `Distribution`/`Set`/
-  `Histogram`/`Summary` metric is dropped** — `ms`/`h`/`d` on the statsd wire all decode to
-  `MetricKind::Distribution` (`crates/logit-inputs/src/statsd.rs::build_event`), so a
-  `statsd_in -> aggregate -> statsd_out` relay drops every timer metric today: the single most
-  common statsd workload makes it through the input and the aggregator, then dies at this sink,
-  loudly counted (`unsupported_metric_kind`) but dropped. Not implemented because the aggregator's
-  merged `DdSketch` no longer holds the original samples it combined, so "how does a merged sketch
-  become one or more statsd lines" (one line per fixed quantile? synthesized samples at quantile
-  boundaries?) is a real design question deserving its own ADR, not a guess made while landing the
-  sink itself. See `docs/adr/statsd-output.md`. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
-- **`statsd_out` has no egress timestamp, no `unit`, and no metric renaming/prefixing** — the
-  classic statsd grammar has no timestamp segment at all (and `statsd_in` would silently ignore
-  one if emitted, so it wouldn't even round-trip through this repo's own input), so every relayed
-  metric is stamped with the receiver's own receipt time, exactly like `syslog_out`'s receipt-time
-  entry above. `MetricRecord::unit` has no statsd wire representation and is dropped the same way.
-  There is also no way to rename or namespace a metric on egress anywhere in the pipeline today
-  (`docs/design/lua-api.md` notes a metric's value/fields are unexposed to Lua) — a sink-side
-  `prefix` field was considered and rejected for `statsd_out` specifically
-  (`docs/adr/statsd-output.md`'s Alternatives) in favor of a future general metric-rename
-  transform, which doesn't exist yet either. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+- **`statsd_out` drops post-sketch metric kinds — `Distribution`/`Set`/`Histogram`/
+  `ExponentialHistogram`/`Summary`/a cumulative or non-monotonic `Sum`, counted
+  (`unsupported_metric_kind`).** **Narrowed by W3** — the original v1 deferral covered every
+  timer/set metric outright: `ms`/`h`/`d` on the statsd wire all decoded to
+  `MetricKind::Distribution` and `s` was a hard decode error, so a `statsd_in -> aggregate ->
+  statsd_out` relay dropped every timer/set metric regardless of `aggregate`'s config.
+  `crates/logit-outputs/src/statsd.rs` now encodes `MetricKind::Samples`/`SetMembers` — the raw
+  shapes `statsd_in` decodes `ms`/`h`/`d`/`s` to losslessly (`docs/adr/lossless-transit.md`'s W3) —
+  back to real statsd lines (`name:v1:v2|<type>|@rate` under `format: dogstatsd`, one line per
+  value under `format: statsd`; `name:m|s` one line per member for sets). **This means a
+  `statsd_in -> statsd_out` relay with no `aggregate` in between, or one configured
+  `distributions: samples`/`sets: members`, now round-trips a timer or set line intact; only
+  `aggregate`'s *default* summarizing config (`distributions: sketch`/`sets: estimate`) still drops
+  every timer/set metric** — the kinds still dropped above only ever exist *after* some stage has
+  already summarized, and a merged `DdSketch`/`HyperLogLog` has no lossless statsd rendering (see
+  `docs/adr/statsd-output.md`'s original Decision section for why that mapping still deserves its
+  own design, not a guess made in passing). **The `samples`/`members` config keeps a window's raw
+  shape only while every sample landing in it shares one sample rate and the window stays under
+  `max_samples_per_series`/`max_set_members_per_series`** — once either limit is crossed,
+  `aggregate` falls back to a sketch/estimate for that window regardless of the config, and this
+  sink has no lossless rendering for that fallback either; it drops and counts it exactly like the
+  default-summarized case (`docs/adr/statsd-output.md`'s amendment). Tracked as debt against
+  [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing assessment's residual-debt list.
+- **`statsd_out` has no `unit` and no metric renaming/prefixing; egress timestamp is now carried,
+  but only on a `|T`-marked line.** **Narrowed by W3** — DogStatsD's own `|T<unix-seconds>` segment
+  (`format: dogstatsd` only) now round-trips: `statsd_in` sets `Event::timestamp` from an incoming
+  `|T<secs>` and stamps a `statsd.timestamp: Value::U64(secs)` per-line carrier holding the raw
+  wire value itself, not just a marker bit (`docs/adr/statsd-output.md`'s amendment), and
+  `statsd_out` re-emits `|T<secs>` from that carrier's own value — never derived from
+  `Event::timestamp`, so a stage that rebuilds `Event::timestamp` after decode (`aggregate`'s
+  flush, notably) can't fabricate or collapse a `|T` on the way back out. The classic grammar still
+  has no timestamp segment at all (`format: statsd` drops `|T` and counts it,
+  `dropped_dialect_fields`), and any event with no `U64` carrier set — everything that isn't a
+  relayed `|T`-carrying line — is still stamped with the receiver's own receipt time, exactly like
+  `syslog_out`'s receipt-time entry above. `MetricRecord::unit` still has no statsd wire
+  representation and is dropped the same way. There is still no *native*, sink-level way to rename
+  or namespace a metric on egress (~~`docs/design/lua-api.md` notes a metric's value/fields are
+  unexposed to Lua~~ — narrowed by W7: `event.metrics` now exposes every metric field for reading
+  and `name`/`unit`/`description`/`start_timestamp` for writing on every kind, so a `lua` component
+  placed ahead of `statsd_out` *can* rename or retag a metric today, `event.metrics[i].name =
+  "..."`; what W7 didn't add is a way to *construct or append* a new metric from Lua, or to write
+  any field besides `value`/`temporality`/`monotonic` on kinds other than `sum`/`gauge` — see
+  `docs/design/lua-api.md`'s "Reading and writing `event.metrics`") — a sink-side `prefix` field
+  was considered and rejected for `statsd_out` specifically (`docs/adr/statsd-output.md`'s
+  Alternatives) in favor of a future general metric-rename *transform* (a native component, not
+  Lua), which still doesn't exist. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing assessment's residual-debt list.
+- **A repeated DogStatsD tag key collapses to its last value.** `#team:a,team:b` is legal
+  DogStatsD, but `AttrMap` is a map, not a multiset, so `statsd_in` overwrites the first `team:a`
+  with `team:b` while building the event's attributes, before any sink ever sees the line —
+  `x:1|c|#team:a,team:b` relays through `statsd_out` as `x:1|c|#team:b`, silently dropping the
+  first value rather than the whole tag. This is a model gap (`AttrMap` itself, not a decoder or
+  sink bug), tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see
+  [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing assessment's residual-debt list.
 - **`statsd_out` has no TLS/DTLS** — plaintext UDP/TCP only, same gap as `syslog_out`'s above, and
   the same `TlsClientConfig`/`TlsServerConfig` pair would be the config-plumbing exercise if it
   lands.
@@ -652,7 +704,7 @@ already built that have a known, accepted rough edge.
   *has* changed: `syslog_out`'s own emitted TIMESTAMP field now follows the precedence rule in
   [ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md), so a
   `syslog_in -> syslog_out` relay's *wire* timestamp can reflect the origin again even though
-  `event.timestamp` itself does not. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+  `event.timestamp` itself does not. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing assessment's residual-debt list.
 
   Deriving `event.timestamp` from the sender instead was considered and deliberately not done here:
   RFC 3164's timestamp carries no year and no timezone, so resolving it to an instant means guessing
@@ -942,7 +994,7 @@ already built that have a known, accepted rough edge.
   [ADR `prometheus-scrape-and-exposition`](adr/prometheus-scrape-and-exposition.md)) — a second wire
   model with its own idea of what a metric is, and the first one whose *decode* direction is
   lossless enough that every row here is on the way out. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md);
-  see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream. Every
+  see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing assessment's residual-debt list. Every
   mapping below is deliberate, counted, and documented at its own call site — this entry exists so
   the list is in one place too:
 
@@ -965,12 +1017,12 @@ already built that have a known, accepted rough edge.
   | encode (Prometheus) | Label values: `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Array/Map` dropped | `logit.output.labels.dropped{reason="unrepresentable"}` | Prometheus labels are always strings, so every kind that has a faithful string form gets one and the type is lost (a `Value::I64(3)` and a `Value::Str("3")` become the same label). The five dropped kinds have no honest string form: a `Bytes` need not be UTF-8, and flattening an `Array`/`Map` into one label value would invent a syntax nothing parses back. |
   | encode (Prometheus) | Name/label sanitization: every byte outside `[a-zA-Z0-9_:]` (metric) / `[a-zA-Z0-9_]` (label) → `_`, a leading digit → `_` prefix; two labels colliding after that keep the one whose original name sorts first, and an attribute colliding with a generated `le`/`quantile` is dropped | `logit.output.labels.dropped{reason="collision"\|"reserved"}` | Substitution, not deletion, is the `statsd_out` precedent (`crates/logit-outputs/src/statsd.rs`'s `sanitize_into`): distinct inputs stay distinct in the common case. Collisions are the residue — `a.b` and `a-b` are one label name on the wire; the *metric*-name case is resolved the same way and counted in its own row below. Prometheus 3's quoted UTF-8 names would remove the need for most of this; supporting them is a tracked follow-up. |
   | encode (Prometheus) | `EventBatch::scope`, `Resource::schema_url`, and every `dropped_attributes_count` → dropped | none (documented) | The exposition format has no scope, schema or dropped-count concept — a family is a name, a type, two metadata strings and a set of labelled samples, full stop. `otlp_in -> prometheus_out` therefore loses instrumentation-scope identity; `otlp_in -> otlp_out` does not. Rendering a scope as `otel_scope_name`/`otel_scope_version` labels (OTel's own Prometheus convention) is a tracked follow-up, not a silent default. |
-  | encode (Prometheus) | Two model names sanitizing onto one wire name → the family whose model name sorts first is exposed, the rest **skipped** | `logit.output.metrics.skipped{reason="name_collision"}` | Exposing both would be *invalid*, not merely lossy: a second `# TYPE` line for one name (or the same series twice) makes Prometheus reject the whole scrape, so one naming clash would poison every other metric in the body. Resolved deterministically on the model names rather than on arrival order, the same way a post-sanitization *label* collision is (the row above). |
+  | encode (Prometheus) | Two model names sanitizing onto one wire name → the family whose model name sorts first is exposed, the rest **skipped** | `logit.output.metrics.skipped{reason="name_collision"}` | Exposing both would be *invalid*, not merely lossy: a second `# TYPE` line for one name (or the same series twice) makes Prometheus reject the whole scrape, so one naming clash would poison every other metric in the body. Resolved deterministically on the model names rather than on arrival order, the same way a post-sanitization *label* collision is (the sanitization row above). |
   | encode (Prometheus) | An OpenMetrics `# UNIT` whose unit is not the family name's `_<unit>` suffix, or carries anything outside `[a-zA-Z0-9_]` → dropped | `logit.output.metrics.degraded{reason="unit_not_suffix"}` | OpenMetrics 1.0 requires "an underscore and the unit MUST be the suffix of the MetricFamily name", and Prometheus's parser fails the *entire* body when it isn't (`unit %q not a suffix of metric %q`) — so an OTLP-sourced `MetricRecord { name: "request_duration", unit: "s" }` has to lose its unit rather than take every other family down with it. Appending the unit to the name instead (what Prometheus's own OTLP translation does) is a tracked follow-up, not something to do silently. |
   | encode (Prometheus) | An exemplar with no OpenMetrics line to sit on → dropped | `logit.output.metrics.degraded{reason="exemplar_dropped"}` | OpenMetrics allows one exemplar per `_total`/`_bucket` line ("a bucket MUST NOT have more than one exemplar") and caps its label set at 128 code points. So a counter carrying N exemplars keeps one, two exemplars whose values fall in one bucket's range keep one, and an over-budget label set keeps none — truncating a trace id would make it a lie. Text 0.0.4 drops every exemplar *uncounted*: that is the operator's dialect choice, on the permitted-normalization list rather than here. |
   | encode (Prometheus) | Two records sharing one name but disagreeing on family type → the first type wins, the rest **skipped** | `logit.output.metrics.skipped{reason="type_conflict"}` | The wire has exactly one `# TYPE` line per name, so a `Gauge` and a `Sum` of the same name cannot both be exposed — and Prometheus rejects a body that tries. `prometheus_out`'s registry has the same conflict at a longer time scale (a series changing type between scrapes) and resolves it by replacing the family, counted separately. |
   | encode (OTLP + Prometheus) | `MetricKind::GaugeDelta` → **skipped** at every sink | `logit.output.metrics.skipped{metric_kind="gauge_delta"}`, throttled diagnostic key `gauge_delta_unresolved` | A relative gauge adjustment is explicitly *unresolved* ([ADR `relative-gauge-adjustments`](adr/relative-gauge-adjustments.md)): only `aggregate` carries the running gauge value a delta applies against. No wire format has a "adjust the previous value by" concept, so encoding one as an absolute reading would silently invent a value. Every sink reports it under the one greppable diagnostic key, so a missing `aggregate` is findable with a single grep regardless of which output noticed. |
-  | encode (Prometheus) | A `MetricRecord` flagged `NO_RECORDED_VALUE` → **skipped** | `logit.output.metrics.skipped{reason="no_recorded_value"}` | The same rule every non-OTLP sink follows (the row above): exposition has no "no value here" marker, so emitting the flag's default numeric payload would fabricate a reading the producer never sent. Prometheus's own staleness handling is a scrape-level concept (a series that stops appearing), which a relay cannot synthesize from one flagged point. |
+  | encode (Prometheus) | A `MetricRecord` flagged `NO_RECORDED_VALUE` → **skipped** | `logit.output.metrics.skipped{reason="no_recorded_value"}` | The same rule every non-OTLP sink follows (the `non-OTLP sinks / `aggregate`` row above): exposition has no "no value here" marker, so emitting the flag's default numeric payload would fabricate a reading the producer never sent. Prometheus's own staleness handling is a scrape-level concept (a series that stops appearing), which a relay cannot synthesize from one flagged point. |
 
   One residual, narrower gap in the same codec, not yet worth its own table row: `BodyFormat` has
   no OTLP field of its own and round-trips through a reserved attribute (`logit.body_format`)

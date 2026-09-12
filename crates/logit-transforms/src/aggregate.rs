@@ -831,10 +831,10 @@ impl Aggregator {
                     );
                 }
                 if samples_weight_clamped {
-                    // Moved from `statsd_in`'s own copy of this diagnostic (`docs/plans/
-                    // lossless-transit.md`'s W2) -- `statsd_in` keeps its copy until W3 deletes
-                    // it, so a `statsd_in -> aggregate` pipeline reports this twice today
-                    // (input-side and here); that's expected during this workstream, not a bug.
+                    // Moved here from `statsd_in` (`docs/plans/lossless-transit.md`'s W2/W3):
+                    // the decoder no longer sketches or clamps, so this is the one place a
+                    // sample rate that implies more than `Samples::MAX_WEIGHT` observations per
+                    // value is noticed.
                     self.telemetry.count("logit.transform.samples.weight_clamped", 1.0, &[]);
                     self.diag.warn_throttled(
                         "sample_rate_clamped",
@@ -1911,8 +1911,9 @@ mod tests {
         }
     }
 
-    /// A `GaugeDelta` against an already-accumulating `Counter` series is a real kind conflict --
-    /// the same `_ => false` / `kind_conflict` path a `Gauge` vs. `Counter` conflict always took.
+    /// A `GaugeDelta` against an already-accumulating counter (`Sum`) series is a real kind
+    /// conflict -- the same `_ => false` / `kind_conflict` path a `Gauge` vs. counter conflict
+    /// always took.
     #[test]
     fn gauge_delta_against_a_counter_series_is_a_kind_conflict_and_is_forwarded() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
