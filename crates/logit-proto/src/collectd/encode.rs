@@ -6,7 +6,9 @@
 //! [`Packets`], not one opaque `Bytes` -- see [`super`]'s "No `crate::Encoder`" paragraph.
 
 use super::part::{self, DsValue};
-use super::{nanos_to_cdtime, ATTR_PREFIX, CDTIME_ONE_SECOND, DATA_MAX_NAME_LEN};
+use super::{
+    nanos_to_cdtime, ATTR_PREFIX, CDTIME_ONE_SECOND, DATA_MAX_NAME_LEN, MAX_VALUES_PER_LIST,
+};
 use bytes::Bytes;
 use logit_core::{
     Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Temporality,
@@ -89,13 +91,22 @@ pub struct EncodeStats {
     /// A `MetricKind::GaugeDelta`, which means a missing `aggregate` stage rather than a bad metric.
     pub dropped_gauge_delta: usize,
     /// An event whose `timestamp` is zero or negative: there is no cdtime before the epoch, and
-    /// stamping "now" instead would invent an instant nothing upstream reported.
+    /// stamping "now" instead would invent an instant nothing upstream reported. Counted once per
+    /// value **list** the event would have produced -- 1 for a like-relay event, one per record for
+    /// a fallback one -- so this number means the same thing as every other sink's
+    /// `metrics.skipped`.
     pub dropped_unencodable_timestamp: usize,
     /// An event with no host to write: no `collectd.host`, no `host.name`, and no configured
     /// [`CollectdEncoder::with_hostname`]. collectd's receiver rejects an empty host outright, and
-    /// this encoder has no business inventing one -- see that builder's own doc. Counted once per
-    /// event dropped, not once per list it would have produced.
+    /// this encoder has no business inventing one -- see that builder's own doc. Counted per value
+    /// list, exactly as [`Self::dropped_unencodable_timestamp`] is.
     pub dropped_no_host: usize,
+    /// A like-relay event carrying more than [`MAX_VALUES_PER_LIST`] records. One list, one `u16`
+    /// `count` on the wire, and the decode side of this very codec rejects a longer one as a
+    /// malformed part -- which would take every unrelated list packed behind it in the same
+    /// datagram with it. Counted once: it is one list that was dropped, however many records it
+    /// held.
+    pub dropped_too_many_values: usize,
     /// A list whose plugin or type sanitized to nothing -- collectd's receiver rejects both.
     pub dropped_empty_name: usize,
     /// A single value list larger than `max_packet_bytes` all by itself: dropped whole, never split
@@ -258,19 +269,27 @@ impl CollectdEncoder {
 
             let carriers = collect_carriers(&batch.resource, event, &mut ctx);
 
+            // How many value lists this event would have produced: one for a like-relay event, one
+            // per record for a fallback one. The two whole-event drops below happen before either
+            // path runs, so this is the number they have to count -- `logit.output.metrics.skipped`
+            // is a *per record* figure at every other sink (`prometheus/mod.rs` counts inside its
+            // own `for record in &event.metrics`), and an operator summing it across sinks needs
+            // this one to mean the same thing.
+            let lists = if carriers.type_.is_some() { 1 } else { event.metrics.len() };
+
             // `nanos_to_cdtime` returns 0 for any non-positive instant, which is also collectd's own
             // "no time given" -- and a list with no time is one its receiver rejects, so this is a
             // drop rather than a zero on the wire.
             let time_cdtime = nanos_to_cdtime(event.timestamp);
             if time_cdtime == 0 {
-                ctx.drop_unencodable_timestamp(event.timestamp);
+                ctx.drop_unencodable_timestamp(event.timestamp, lists);
                 continue;
             }
 
             // The host is the same for every list this event produces, so it is resolved once --
-            // and if it cannot be resolved at all, the whole event goes, counted once.
+            // and if it cannot be resolved at all, every one of those lists goes.
             cur.host.clear();
-            if !resolve_host(&mut cur.host, &carriers, hostname.as_deref(), &mut ctx) {
+            if !resolve_host(&mut cur.host, &carriers, hostname.as_deref(), lists, &mut ctx) {
                 continue;
             }
 
@@ -278,6 +297,19 @@ impl CollectdEncoder {
                 // Like-relay: the event arrived from `collectd_in` (or was given `collectd.*`
                 // attributes on purpose), so its identity is the wire's own and its whole
                 // `MetricList` is one value list, in order.
+                //
+                // Which is why the encode side needs the same cap the decode side enforces: the
+                // wire's `count` is a `u16`, this codec accepts at most `MAX_VALUES_PER_LIST` of
+                // them, and a longer list would sail under the byte cap only to be rejected as a
+                // malformed part by any receiver built on this codec -- taking every unrelated list
+                // packed behind it in the same datagram down with it. `aggregate`/`kv_metrics` can
+                // both put far more than 64 records on one event, and a `set` stamping
+                // `collectd.type` is all it takes to route that here.
+                if event.metrics.len() > MAX_VALUES_PER_LIST {
+                    ctx.drop_too_many_values(event.metrics.len());
+                    continue;
+                }
+
                 cur.clear_below_host();
                 sanitize_carrier(&mut cur.plugin, carriers.plugin, &mut ctx);
                 sanitize_carrier(&mut cur.plugin_instance, carriers.plugin_instance, &mut ctx);
@@ -455,11 +487,14 @@ impl Ctx<'_> {
         );
     }
 
-    fn drop_unencodable_timestamp(&mut self, timestamp: i64) {
-        self.stats.dropped_unencodable_timestamp += 1;
+    /// `lists` is how many value lists the dropped event would have produced -- see
+    /// [`EncodeStats::dropped_unencodable_timestamp`] for why both whole-event drops are counted
+    /// per list rather than per event.
+    fn drop_unencodable_timestamp(&mut self, timestamp: i64, lists: usize) {
+        self.stats.dropped_unencodable_timestamp += lists;
         self.telemetry.count(
             "logit.output.metrics.skipped",
-            1.0,
+            lists as f64,
             &[("reason", "unencodable_timestamp")],
         );
         self.diag.warn_throttled(
@@ -471,9 +506,14 @@ impl Ctx<'_> {
         );
     }
 
-    fn drop_no_host(&mut self) {
-        self.stats.dropped_no_host += 1;
-        self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("reason", "no_host")]);
+    /// `lists` as in [`Ctx::drop_unencodable_timestamp`].
+    fn drop_no_host(&mut self, lists: usize) {
+        self.stats.dropped_no_host += lists;
+        self.telemetry.count(
+            "logit.output.metrics.skipped",
+            lists as f64,
+            &[("reason", "no_host")],
+        );
         self.diag.warn_throttled(
             "no_host",
             "collectd_out: no host to write -- the event carries neither `collectd.host` nor \
@@ -481,6 +521,20 @@ impl Ctx<'_> {
              on the sink, or stamp `host.name` with a `set` transform: collectd's receiver rejects \
              an empty host, and inventing one would merge every unlabelled sender into one host's \
              metrics",
+        );
+    }
+
+    fn drop_too_many_values(&mut self, records: usize) {
+        self.stats.dropped_too_many_values += 1;
+        self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("reason", "too_many_values")]);
+        self.diag.warn_throttled(
+            "too_many_values",
+            format_args!(
+                "collectd_out: a value list of {records} data sources exceeds the \
+                 {MAX_VALUES_PER_LIST}-source cap this codec reads and writes; dropping it whole \
+                 rather than emitting a list the receiver would reject as a malformed part, \
+                 taking every list packed behind it with it"
+            ),
         );
     }
 
@@ -576,6 +630,7 @@ fn resolve_host(
     out: &mut Vec<u8>,
     carriers: &Carriers,
     hostname: Option<&[u8]>,
+    lists: usize,
     ctx: &mut Ctx,
 ) -> bool {
     for candidate in [carriers.host, carriers.host_name] {
@@ -592,7 +647,7 @@ fn resolve_host(
         out.extend_from_slice(hostname);
         return true;
     }
-    ctx.drop_no_host();
+    ctx.drop_no_host(lists);
     false
 }
 
@@ -630,7 +685,7 @@ fn sanitize_into(out: &mut Vec<u8>, raw: &[u8], is_utf8: bool, ctx: &mut Ctx) {
 /// Writes `raw` into `out` (cleared first) with NUL and `/` replaced by `_`, truncated to
 /// [`MAX_IDENTITY_BYTES`]. Returns `(substituted, truncated)`.
 ///
-/// Pure, so [`CollectdEncoder::with_host_fallback`] can sanitize a configured hostname at
+/// Pure, so [`CollectdEncoder::with_hostname`] can sanitize a configured hostname at
 /// construction with nothing to count. Substitution rather than deletion, following
 /// `crates/logit-outputs/src/statsd.rs`'s `sanitize_into`: distinct inputs stay distinct.
 /// `is_utf8` truncates on a character boundary instead of a byte one -- neither substitution
@@ -943,6 +998,29 @@ mod tests {
             event.metrics.iter().any(|m| logit_core::interner::resolve(m.name) == metric)
                 && event.attributes.get(tag.0).and_then(|v| v.as_str()) == Some(tag.1)
         })
+    }
+
+    /// The **total** recorded on `logit.output.metrics.skipped{reason}` -- [`counted`] only answers
+    /// "was anything recorded at all", and a per-list count needs the number itself. Drains, so call
+    /// it once.
+    fn skipped_total(registry: &Registry, reason: &str) -> f64 {
+        let events = registry.drain(0);
+        let mut total = 0.0;
+        for event in &events {
+            if event.attributes.get("reason").and_then(|v| v.as_str()) != Some(reason) {
+                continue;
+            }
+            for metric in &event.metrics {
+                if logit_core::interner::resolve(metric.name) != "logit.output.metrics.skipped" {
+                    continue;
+                }
+                match &metric.kind {
+                    MetricKind::Sum(sum) => total += sum.value,
+                    other => panic!("expected a Sum counter, got {other:?}"),
+                }
+            }
+        }
+        total
     }
 
     /// Decodes everything `packets` holds back into events, the way a real `collectd_in` would.
@@ -1500,6 +1578,98 @@ mod tests {
         event.attributes.remove(ATTR_HOST);
         let (packets, _) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("fixture-host")));
+    }
+
+    /// A whole-event drop is counted per value **list** the event would have produced, so
+    /// `metrics.skipped` means the same thing here as at every other sink: a three-record fallback
+    /// event would have been three one-source lists, and losing it loses three.
+    #[test]
+    fn a_whole_event_drop_is_counted_once_per_list_the_event_would_have_produced() {
+        let mut fallback = Event::empty(TS, AttrMap::new());
+        for name in ["a.one", "a.two", "a.three"] {
+            fallback.metrics.push(counter_record(name, 1.0));
+        }
+
+        for (label, mut event, expected) in [
+            ("fallback, 3 records", fallback.clone(), 3),
+            // A like-relay event is a single list however many records it carries, so it counts 1.
+            (
+                "like-relay, 3 records",
+                relay_event(vec![
+                    record("load.load.0", MetricKind::Gauge(0.1)),
+                    record("load.load.1", MetricKind::Gauge(0.2)),
+                    record("load.load.2", MetricKind::Gauge(0.3)),
+                ]),
+                1,
+            ),
+        ] {
+            // No host anywhere and no configured hostname.
+            event.attributes.remove(ATTR_HOST);
+            let registry = Registry::new();
+            let mut encoder = CollectdEncoder::new().with_telemetry(registry.telemetry_for(
+                "collectd_out",
+                "collectd_out",
+                "sink",
+            ));
+            let mut packets = Packets::default();
+            let stats = encoder.encode_into(
+                &batch(vec![event.clone()]),
+                DEFAULT_MAX_PACKET_BYTES,
+                &mut packets,
+            );
+            assert!(packets.is_empty(), "{label}");
+            assert_eq!(stats.dropped_no_host, expected, "{label}: no_host stat");
+            assert_eq!(
+                skipped_total(&registry, "no_host"),
+                expected as f64,
+                "{label}: no_host counter"
+            );
+
+            // The same rule for the other whole-event drop.
+            event.timestamp = 0;
+            event.attributes.insert(ATTR_HOST, Value::from("web-1"));
+            let (packets, stats, registry, _) =
+                encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+            assert!(packets.is_empty(), "{label}");
+            assert_eq!(stats.dropped_unencodable_timestamp, expected, "{label}: timestamp stat");
+            assert_eq!(
+                skipped_total(&registry, "unencodable_timestamp"),
+                expected as f64,
+                "{label}: timestamp counter"
+            );
+        }
+    }
+
+    /// The encode-side half of `MAX_VALUES_PER_LIST`. Without it a 65-record like-relay event fits
+    /// under the byte cap, encodes with `EncodeStats::default()`, and is then rejected as a
+    /// malformed part by any receiver running this codec -- taking every list packed behind it in
+    /// that datagram with it.
+    #[test]
+    fn a_like_relay_list_over_the_value_cap_is_dropped_whole_and_counted() {
+        let records: Vec<MetricRecord> = (0..MAX_VALUES_PER_LIST + 1)
+            .map(|i| record("load.load", MetricKind::Gauge(i as f64)))
+            .collect();
+        let (packets, stats, registry, diag_registry) =
+            encode_counted(&batch(vec![relay_event(records)]), DEFAULT_MAX_PACKET_BYTES);
+        assert!(packets.is_empty(), "65 data sources must not reach the wire");
+        assert_eq!(stats.dropped_too_many_values, 1, "one list dropped, not one per record");
+        assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "too_many_values")));
+        assert!(counted(&diag_registry, "logit.component.diagnostics", ("key", "too_many_values")));
+    }
+
+    /// And the value exactly at the cap still round-trips -- an off-by-one here would silently drop
+    /// every 64-source list instead.
+    #[test]
+    fn a_like_relay_list_exactly_at_the_value_cap_still_round_trips() {
+        let records: Vec<MetricRecord> = (0..MAX_VALUES_PER_LIST)
+            .map(|i| record(&format!("load.load.{i}"), MetricKind::Gauge(i as f64)))
+            .collect();
+        let event = relay_event(records);
+        let (packets, stats) = encode(&batch(vec![event.clone()]), DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(stats, EncodeStats::default());
+        let decoded = decode_all(&packets);
+        assert_eq!(decoded, vec![event]);
+        assert_eq!(decoded[0].metrics.len(), MAX_VALUES_PER_LIST);
     }
 
     /// No host anywhere -- and no invented one either. The event is dropped, counted and named in a

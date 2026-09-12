@@ -94,7 +94,7 @@ natively:
 | like-relay list where any record fails | whole list dropped (receiver's `ds_num` check would reject a partial one anyway) | the failing reason, once |
 | `timestamp > 0` / `<= 0` | TimeHR / dropped | `unencodable_timestamp` |
 | `collectd.interval` finite >0 / absent or bad | IntervalHR round(v·2³⁰) / IntervalHR 0 | bad non-absent: `logit.output.tags.dropped{reason="unrepresentable"}` |
-| host | `collectd.host` → `host.name` (event, then resource) → encoder `host_fallback`; **never empty** | — |
+| host | `collectd.host` → `host.name` (event, then resource) → configured `hostname:`; none resolved → **list dropped** | `{reason="no_host"}` |
 | `collectd.*` `Str`/`Bytes` | verbatim after sanitizing (`Bytes` byte-verbatim) | `logit.output.identity.sanitized{reason="substituted"\|"truncated"}` |
 | `collectd.*` other `Value` types | treated as absent | `tags.dropped{unrepresentable}` |
 | every non-`collectd.*` attribute | dropped (collectd has no tags) | `tags.dropped{reason="no_wire_form"}` |
@@ -204,18 +204,31 @@ part with no `Time` part at all decodes with `timestamp = received_at` (lenient 
 receiver rejects a list with `time == 0` outright; `logit` observes and stamps rather than rejecting)
 and re-emits `TimeHR = received_at`, since there is no better time to hand back.
 
-### Host is never empty
+### Host is never empty on the wire
 
 collectd's own receiver (`network_dispatch_values`) rejects any `Values` list with an empty host (or
-plugin, or type) with `-EINVAL`. `collectd_out` treats that as a hard invariant on its own egress: a
-`collectd.host` attribute wins when present and non-empty, falling back to `host.name` (event, then
-resource attribute) next, and finally to the sink's own `hostname:` config field — which defaults, if
-the operator leaves it unset, to the OS hostname (`/proc/sys/kernel/hostname`, trimmed) rather than
-some placeholder string, mirroring `syslog_out`'s own `hostname:` fallback field. Unlike
-`syslog_out`'s fallback (which only matters cosmetically, since RFC 5424 tolerates an absent or `-`
-hostname), collectd's fallback is **mandatory by construction**: there is no wire representation of
-"no host," so an event that somehow reaches encoding with no host anywhere in the chain still gets
-one, because the alternative is a packet collectd's own daemon would refuse on arrival.
+plugin, or type) with `-EINVAL`. `collectd_out` treats that as a hard invariant on its own egress,
+but resolves it by **omission, not fabrication**: a `collectd.host` attribute wins when present and
+non-empty, falling back to `host.name` (event, then resource attribute) next, and finally to the
+sink's own optional `hostname:` config field — config-supplied only, exactly like `syslog_out`'s own
+`hostname:` field (`crates/logit-config/src/lib.rs`'s `SyslogOut::hostname` doc: omitted entirely
+rather than a literal `logit` default, "so a relayed line's origin is never silently overwritten
+with something that looks like a config mistake"). There is deliberately **no OS-hostname read and
+no placeholder default**: `docs/known-gaps.md` already records that an OS-hostname source is
+*deferred pending a dependency, not added as a one-off* (its `internal` resource-identity entry —
+"there is no OS-hostname source anywhere in the workspace"), and this pair leaves that deferral
+untouched rather than working around it with a Linux-only `/proc/sys/kernel/hostname` read of its
+own.
+
+When none of the three resolves — no `collectd.host`, no `host.name` anywhere on event or resource,
+and no configured `hostname:` — the value list is **dropped whole**, counted
+`logit.output.metrics.skipped{reason="no_host"}`, with a throttled `no_host` diagnostic telling the
+operator to set `hostname:` or stamp `host.name` with a `set` transform. This is the one case in the
+encode table above where host resolution doesn't always succeed — but every like-relay list (one
+whose event carries `collectd.type`) already carries `collectd.host` as part of the same attribute
+set the like-relay encoding requires, so `no_host` only ever bites cross-protocol ingress (an event
+from some other input with no host anywhere on it), never a genuine `collectd_in -> collectd_out`
+relay.
 
 ### NaN is a flagged point, not a dropped one
 
@@ -229,6 +242,16 @@ languages and float implementations, while the flag does. Encoding reverses this
 `Gauge` (any value, canonically 0.0) re-emits as GAUGE NaN; the specific NaN bit pattern is not
 preserved (a permitted normalization, below), and a *non*-`Gauge` record carrying the flag has no
 GAUGE-NaN equivalent on the wire and is dropped (`{reason="no_recorded_value"}`).
+
+This makes `collectd_out` the **second** sink, after `otlp_out`, whose wire has a genuine no-value
+concept. `crates/logit-core/src/metric.rs`'s `MetricRecord::flags` doc and
+`docs/known-gaps.md`'s `NO_RECORDED_VALUE` entry both currently state the rule as "every non-OTLP
+sink... must instead treat a flagged record as carrying no genuine reading" / "[o]nly `otlp_out`
+can keep a flagged point on the wire... [n]o other sink or transform has a wire/model concept of
+'no value here'." Both are narrowed by this ADR from "every non-OTLP sink" / "no other sink" to
+**"every sink whose wire has no no-value concept"** — `collectd_out`'s GAUGE-NaN re-encode is the
+second, narrower exception the existing wording didn't anticipate, not a violation of the rule
+once restated. See Consequences for where those two edits land.
 
 ### Sanitization
 
@@ -305,9 +328,10 @@ Same reasoning as [ADR `statsd-output`](statsd-output.md)'s "No `logit_proto::En
 that trait returns one opaque `Bytes` per batch with no framing metadata, which cannot express the
 per-datagram boundaries a UDP sink genuinely needs — packing several value lists into one datagram up
 to `max_packet_bytes`, and flushing at a boundary, is exactly the kind of decision a single
-`encode(&self) -> Bytes` call has no way to make. `CollectdEncoder`/`CollectdDecoder` instead expose
-plain, directly-unit-testable methods with `with_telemetry`/`with_diagnostics` builders, the same
-shape `PrometheusEncoder`/`PrometheusDecoder` and `StatsdEncoder` already established.
+`encode(&mut self, &EventBatch) -> Result<Bytes, _>` call has no way to make. `CollectdEncoder`/
+`CollectdDecoder` instead expose plain, directly-unit-testable methods with
+`with_telemetry`/`with_diagnostics` builders, the same shape `PrometheusEncoder`/`PrometheusDecoder`
+already established.
 
 ## Alternatives considered
 
@@ -355,6 +379,11 @@ shape `PrometheusEncoder`/`PrometheusDecoder` and `StatsdEncoder` already establ
   `Histogram`/`ExponentialHistogram`/`Summary` unsupported on collectd egress; `unit`/`description`/
   `start_timestamp`/exemplars/`Scope`/`schema_url` dropped; `MAX_VALUES_PER_LIST` (64) as a hard cap
   on data sources per list; no signing or encryption support in either direction.
+- Two existing documents get amended, not just added to, by W1: `crates/logit-core/src/metric.rs`'s
+  `MetricRecord::flags` doc and `docs/known-gaps.md`'s `NO_RECORDED_VALUE` entry both narrow from
+  "every non-OTLP sink"/"no other sink" to "every sink whose wire has no no-value concept," per
+  "NaN is a flagged point, not a dropped one" above — `collectd_out` becomes the second sink (after
+  `otlp_out`) that can keep a flagged point on the wire.
 - Multicast support lands inside the shared UDP listener (`bind_one`), not `collectd_in`-specific
   code, so `statsd_in` and `syslog_in` gain the ability to join a multicast group for free the moment
   `collectd_in`'s workstream lands, with no config or code change of their own required.

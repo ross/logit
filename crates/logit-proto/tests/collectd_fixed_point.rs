@@ -21,9 +21,27 @@
 //! boundaries are on the permitted-normalization list and must not change what decodes back out.
 //!
 //! The `proptest` at the bottom does the same over a generated packet *grammar*, starting from wire
-//! bytes rather than a hand-built batch, so the fixtures above stay readable while the coverage
-//! (elision patterns, data-source type mixes, legacy vs. high-resolution parts) is not limited to
-//! what anyone thought to write down.
+//! bytes rather than a hand-built batch, so the fixtures above stay readable while the coverage is
+//! not limited to what anyone thought to write down. What it generates, precisely:
+//!
+//! - 1–8 value lists in one datagram, each naming any subset of the five identity parts (the
+//!   opening list always gets a host/plugin/type, since a datagram whose first list has none is one
+//!   collectd itself rejects) — so **elision is generated, not assumed**: a list that names no
+//!   plugin is inheriting the sticky one, exactly as a real sender's elision does;
+//! - 1–7 data sources per list, any mix of all four types, over `any::<u64>`/`any::<i64>`/
+//!   `any::<f64>` — so `NaN`, `±inf`, `u64::MAX` and the whole `f64` space are in range;
+//! - identity strings from `[A-Za-z0-9._-]{1,20}` — deliberately **excluding** `/` and NUL, which
+//!   the encoder substitutes (normalization 8) and which therefore are not a fixed point; that
+//!   substitution has its own unit test in `encode.rs` instead;
+//! - times as either whole seconds through the legacy `Time` part *or* an arbitrary `cdtime_t` in
+//!   `[2^60, 2^61)` with every sub-second bit live, and intervals likewise legacy-seconds or an
+//!   arbitrary `cdtime_t` below 2^53 ticks. The high-resolution branch is what reaches
+//!   **normalization 2** — a `TimeHR` that may move ≤1 tick on the first hop and is stable after —
+//!   which a whole-second `TimeHR` cannot, since it is bit-identical to its own legacy spelling.
+//!
+//! Because of that last point the property is asserted **from the first hop on**, not from the
+//! input bytes: see the test's own doc comment for the exact chain, and for why the model half of
+//! it (`d1 == d2`) nonetheless holds unconditionally.
 
 use bytes::Bytes;
 use logit_core::interner::intern;
@@ -130,6 +148,12 @@ fn decode_all(packets: &[Vec<u8>], resource: &Arc<Resource>) -> Vec<Event> {
             .expect("every datagram this encoder writes must decode");
     }
     events
+}
+
+/// One batch over `events`, sharing `resource` -- the `EventBatch` wrapper the encoder wants, built
+/// often enough in the property below to be worth naming.
+fn rebatch(resource: &Arc<Resource>, events: Vec<Event>) -> EventBatch {
+    EventBatch { resource: resource.clone(), scope: None, events }
 }
 
 /// Both properties, at every cap in [`CAPS`].
@@ -340,6 +364,25 @@ fn a_legacy_time_and_interval_packet_is_a_fixed_point_after_the_hr_rewrite() {
     );
 }
 
+/// Normalization 2, made concrete and deterministic rather than left to the generator: a `TimeHR`
+/// and an `IntervalHR` with real sub-second bits. The *bytes* are entitled to come back one tick
+/// (2⁻³⁰ s) away from where they started — `cdtime -> ns -> cdtime` is not quite the identity —
+/// while the model's timestamp does not move at all, because `ns -> cdtime -> ns` is.
+#[test]
+fn a_sub_second_time_and_interval_packet_is_a_fixed_point_from_the_first_hop() {
+    assert_wire_fixed_point(
+        PacketBuilder::new()
+            .string(TYPE_HOST, b"web-1")
+            .number(TYPE_TIME_HR, (1_700_000_000u64 << 30) | 0x2C0F_FEE1)
+            .number(TYPE_INTERVAL_HR, (10u64 << 30) | 0x0001_2345)
+            .string(TYPE_PLUGIN, b"load")
+            .string(TYPE_TYPE, b"load")
+            .values(&[(DS_GAUGE, 0.5f64.to_le_bytes())])
+            .build(),
+        1,
+    );
+}
+
 /// A sender's own elision pattern: one Host/Plugin/Type for three lists, each changing only its
 /// TypeInstance. The encoder re-derives elision per output datagram and must land on the same
 /// events.
@@ -505,9 +548,20 @@ struct GenList {
     plugin_instance: Option<Option<String>>,
     type_: Option<String>,
     type_instance: Option<Option<String>>,
-    time: Option<(bool, u64)>,
-    interval: Option<(bool, u64)>,
+    time: Option<GenNumber>,
+    interval: Option<GenNumber>,
     values: Vec<(u8, [u8; 8])>,
+}
+
+/// A generated time or interval, in one of the two spellings the wire has for each: whole seconds
+/// (the legacy `Time`/`Interval` parts) or raw `cdtime_t` ticks (`TimeHR`/`IntervalHR`). Kept as an
+/// enum rather than a `(bool, value)` pair so the two branches can generate genuinely different
+/// *values* -- a whole-second `TimeHR` exercises none of the sub-second arithmetic, which is what
+/// made the earlier `(bool, whole seconds)` shape inert.
+#[derive(Debug, Clone, Copy)]
+enum GenNumber {
+    Legacy(u64),
+    Hr(u64),
 }
 
 /// `[A-Za-z0-9._-]{1,20}` -- collectd's own identity alphabet minus the two bytes this codec
@@ -527,6 +581,28 @@ fn ds_value() -> impl Strategy<Value = (u8, [u8; 8])> {
     ]
 }
 
+/// A list's time: whole seconds through the legacy part, or an **arbitrary** `cdtime_t` in
+/// `[2^60, 2^61)` — roughly 2004..2038, with every one of the 30 sub-second bits live. That range is
+/// what makes the property reach normalization 2 at all: a `cdtime` with real low bits is exactly
+/// the case where `cdtime -> ns -> cdtime` may land one tick away from where it started.
+fn gen_time() -> impl Strategy<Value = GenNumber> {
+    prop_oneof![
+        (1u64..2_000_000_000).prop_map(GenNumber::Legacy),
+        ((1u64 << 60)..(2u64 << 60)).prop_map(GenNumber::Hr),
+    ]
+}
+
+/// A list's interval: whole seconds through the legacy part, or an arbitrary `cdtime_t` below 2^53
+/// ticks (~97 days). The bound is `f64`'s exact-integer range, which is the honest limit of the
+/// `Value::F64` seconds carrier `collectd.interval` uses — above it the tick count itself stops
+/// being representable, which is a documented `f64` gap rather than a codec property to assert.
+fn gen_interval() -> impl Strategy<Value = GenNumber> {
+    prop_oneof![
+        (0u64..3600).prop_map(GenNumber::Legacy),
+        (0u64..(1u64 << 53)).prop_map(GenNumber::Hr),
+    ]
+}
+
 fn gen_list() -> impl Strategy<Value = GenList> {
     (
         proptest::option::of(identity_string()),
@@ -534,9 +610,8 @@ fn gen_list() -> impl Strategy<Value = GenList> {
         proptest::option::of(proptest::option::of(identity_string())),
         proptest::option::of(identity_string()),
         proptest::option::of(proptest::option::of(identity_string())),
-        // `bool` picks the legacy (seconds) or high-resolution (cdtime) spelling of each part.
-        proptest::option::of((any::<bool>(), 1u64..2_000_000_000)),
-        proptest::option::of((any::<bool>(), 0u64..3600)),
+        proptest::option::of(gen_time()),
+        proptest::option::of(gen_interval()),
         proptest::collection::vec(ds_value(), 1..8),
     )
         .prop_map(
@@ -567,22 +642,19 @@ fn render(lists: &[GenList]) -> Bytes {
         if first || list.host.is_some() {
             builder = builder.string(TYPE_HOST, host.as_bytes());
         }
-        if let Some((legacy, value)) = list.time {
-            builder = if legacy {
-                builder.number(TYPE_TIME, value)
-            } else {
-                builder.number(TYPE_TIME_HR, value << 30)
-            };
-        } else if first {
-            builder = builder.number(TYPE_TIME_HR, 1_700_000_000u64 << 30);
-        }
-        if let Some((legacy, value)) = list.interval {
-            builder = if legacy {
-                builder.number(TYPE_INTERVAL, value)
-            } else {
-                builder.number(TYPE_INTERVAL_HR, value << 30)
-            };
-        }
+        builder = match list.time {
+            Some(GenNumber::Legacy(seconds)) => builder.number(TYPE_TIME, seconds),
+            Some(GenNumber::Hr(cdtime)) => builder.number(TYPE_TIME_HR, cdtime),
+            // Only the opening list needs a default: after it the time is sticky like everything
+            // else, and a list that names none is a list deliberately inheriting one.
+            None if first => builder.number(TYPE_TIME_HR, 1_700_000_000u64 << 30),
+            None => builder,
+        };
+        builder = match list.interval {
+            Some(GenNumber::Legacy(seconds)) => builder.number(TYPE_INTERVAL, seconds),
+            Some(GenNumber::Hr(cdtime)) => builder.number(TYPE_INTERVAL_HR, cdtime),
+            None => builder,
+        };
         let plugin = list.plugin.clone().unwrap_or_else(|| "fixture-plugin".to_string());
         if first || list.plugin.is_some() {
             builder = builder.string(TYPE_PLUGIN, plugin.as_bytes());
@@ -609,9 +681,18 @@ proptest! {
     // `tests/robustness.rs`'s module doc sets for this crate.
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// The whole point, over generated packets: `decode(encode(decode(p))) == decode(p)`, and
-    /// `encode` of both is byte-identical -- at every cap, so a re-chosen datagram boundary changes
-    /// the bytes but never the events.
+    /// The whole point, over generated packets, stated the way normalization 2 requires -- from the
+    /// *first hop* on, not from the input bytes:
+    ///
+    /// - `d1 = decode(p)`, `e1 = encode(d1)`, `d2 = decode(e1)`, `e2 = encode(d2)`;
+    /// - `d2 == decode(e2)` -- the model is a fixed point;
+    /// - `e2 == encode(decode(e2))` -- and so are the bytes, from `e1` onward.
+    ///
+    /// `d1 == d2` is asserted too, and holds *unconditionally* rather than only for tick-aligned
+    /// input: the ≤1-tick drift normalization 2 permits is a `cdtime -> ns -> cdtime` drift, which
+    /// lives entirely in the bytes (`p`'s `TimeHR` may differ from `e1`'s), while `ns -> cdtime ->
+    /// ns` is exact -- so the *model's* timestamp never moves at all. Asserting it here is what
+    /// would catch that stopping being true.
     #[test]
     fn a_generated_packet_is_a_fixed_point_at_every_cap(
         lists in proptest::collection::vec(gen_list(), 1..8)
@@ -619,18 +700,24 @@ proptest! {
         let packet = render(&lists);
         let resource = Arc::new(Resource::default());
         let mut decoder = CollectdDecoder::new(resource.clone());
-        let mut first = Vec::new();
-        decoder.decode_into(packet, RECEIVED_AT, &mut first).expect("a generated packet must decode");
-        prop_assert_eq!(first.len(), lists.len());
+        let mut d1 = Vec::new();
+        decoder.decode_into(packet, RECEIVED_AT, &mut d1).expect("a generated packet must decode");
+        prop_assert_eq!(d1.len(), lists.len());
 
-        let batch = EventBatch { resource: resource.clone(), scope: None, events: first };
         for cap in CAPS {
-            let encoded = encode_at(&batch, cap);
-            let decoded = decode_all(&encoded, &resource);
-            prop_assert_eq!(&decoded, &batch.events, "cap {}", cap);
+            let e1 = encode_at(&rebatch(&resource, d1.clone()), cap);
+            let d2 = decode_all(&e1, &resource);
+            prop_assert_eq!(&d2, &d1, "cap {}: the first hop moved the model", cap);
 
-            let again = EventBatch { resource: resource.clone(), scope: None, events: decoded };
-            prop_assert_eq!(encode_at(&again, cap), encoded, "cap {} is not byte-idempotent", cap);
+            let e2 = encode_at(&rebatch(&resource, d2.clone()), cap);
+            let d3 = decode_all(&e2, &resource);
+            prop_assert_eq!(&d3, &d2, "cap {}: decode(encode(d2)) != d2", cap);
+            prop_assert_eq!(
+                encode_at(&rebatch(&resource, d3), cap),
+                e2,
+                "cap {}: the bytes are not idempotent from the first hop on",
+                cap
+            );
         }
     }
 }

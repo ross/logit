@@ -99,6 +99,7 @@
 //! | `collectd.*` identity of any other `Value` type | treated as absent | `logit.output.tags.dropped{reason="unrepresentable"}` |
 //! | every attribute outside the `collectd.` namespace | dropped -- collectd has no tag concept at all, and `host.name` is counted here too even though the host resolution above reads it | `logit.output.tags.dropped{reason="no_wire_form"}`, once per attribute per event |
 //! | plugin or type empty after sanitizing | the list is dropped | `logit.output.metrics.skipped{reason="empty_name"}` |
+//! | a like-relay event carrying more than [`MAX_VALUES_PER_LIST`] records | the list is dropped whole | `logit.output.metrics.skipped{reason="too_many_values"}` + diag `too_many_values`. The cap is pair-wide: a longer list fits comfortably under the byte cap, but the decode side of this very codec rejects it as a malformed part -- and that abandons every unrelated list packed behind it in the same datagram. `aggregate`/`kv_metrics` can both put far more than 64 records on one event. |
 //! | a list that alone exceeds `max_packet_bytes` | dropped whole, never split | `logit.output.metrics.skipped{reason="oversize_value_list"}` + diag `oversize_value_list` |
 //! | an event with no metrics at all (a log- or span-only event) | skipped | [`EncodeStats::skipped_no_metrics`] (no counter of its own -- nothing was lost, there was nothing to send) |
 //! | `MetricRecord`'s `unit`, `description`, `start_timestamp`, `exemplars`; `EventBatch::scope`; `Resource::schema_url` | dropped | none; `docs/known-gaps.md` rows -- the protocol has no field for any of them |
@@ -183,11 +184,24 @@ pub const DATA_MAX_NAME_LEN: usize = 128;
 /// constant.
 pub const NOTIF_MAX_MSG_LEN: usize = 256;
 
-/// The most data sources this codec will accept in one Values part. collectd's own wire format
-/// allows up to `(65535 - 6) / 9 = 7281`, but nothing real comes close (`if_octets` has 2, `load`
-/// 3, `disk_io_time` 2), and the cap is what bounds both the decoder's per-part work and the record
-/// names a hostile sender can force into the process-wide interner (`docs/design/memory.md` §4). A
-/// list over the cap is a malformed part, not a truncated one -- see this module's decode table.
+/// The most data sources this codec will read or write in one Values part. collectd's own wire
+/// format allows up to `(65535 - 6) / 9 = 7281`, but nothing real comes close (`load` has 3,
+/// `if_octets` 2, `disk_io_time` 2).
+///
+/// A **pair-wide** cap, not a decode-side one. Over it, a Values part is malformed on decode (the
+/// rest of the datagram is abandoned, not truncated -- see this module's decode table), and on
+/// encode the list is dropped whole and counted
+/// `logit.output.metrics.skipped{reason="too_many_values"}`: a longer list would sail under the
+/// byte cap only for a receiver running this same codec to reject it, taking every unrelated list
+/// packed behind it in that datagram with it.
+///
+/// What it bounds is the decoder's per-part work and the per-list record-name suffix fan-out
+/// (`<plugin>.<type>.<i>`). It is deliberately **not** a bound on interner growth: the unbounded
+/// axis there is distinct `<plugin>`/`<type>` strings, which the decoder caps in neither count nor
+/// length, and a fresh Plugin part plus a one-value list mints a new interned name for ~21 wire
+/// bytes whatever this constant is. That exposure is exactly the one `statsd_in` already has --
+/// wire-chosen metric names, accepted on `docs/design/memory.md` §4's "listeners are private"
+/// premise.
 pub const MAX_VALUES_PER_LIST: usize = 64;
 
 /// The wire Host. See this module doc's well-known-attribute table.

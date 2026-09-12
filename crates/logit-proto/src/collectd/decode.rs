@@ -1084,6 +1084,31 @@ pub(crate) mod tests {
         assert!(diagnosed(&registry, "bad_part"));
     }
 
+    /// The other half of the per-datagram contract, and the one a malformed part planted *last*
+    /// cannot show: a malformed part **abandons the rest of the datagram**, it does not skip the bad
+    /// part and resume. The mirror of `an_encryption_part_stops_the_walk_and_reports_it`, with a
+    /// perfectly good list behind the break that must not appear.
+    #[test]
+    fn a_malformed_part_abandons_the_rest_of_the_datagram_rather_than_resuming_past_it() {
+        let (mut decoder, registry) = decoder_with_diag();
+        let bytes = PacketBuilder::new()
+            .string(part::TYPE_HOST, b"h")
+            .string(part::TYPE_PLUGIN, b"p")
+            .string(part::TYPE_TYPE, b"t")
+            .values(&[gauge(1.0)])
+            .unterminated_string(part::TYPE_TYPE_INSTANCE, b"broken")
+            // Structurally valid, and unreachable: there is no resync point in a length-prefixed
+            // part stream, so everything after the break is bytes of unknown meaning.
+            .string(part::TYPE_TYPE_INSTANCE, b"fine")
+            .values(&[gauge(2.0)])
+            .build();
+        let mut out = Vec::new();
+        decoder.decode_into(bytes, RECEIVED_AT, &mut out).expect("earlier lists survive");
+        assert_eq!(out.len(), 1, "only the list before the malformed part is decoded");
+        assert_eq!(out[0].metrics[0].kind, MetricKind::Gauge(1.0));
+        assert!(diagnosed(&registry, "bad_part"));
+    }
+
     /// A `count` inflated far past what the buffer holds must be rejected on the declared-length
     /// check, before anything is sized from it -- `crates/logit-proto/tests/robustness.rs` measures
     /// the allocation side of the same property.
