@@ -48,8 +48,9 @@ use logit_core::interner::intern;
 use logit_core::{
     AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource, Sum, Temporality, Value,
 };
+use logit_proto::collectd::types_db::TEST_TYPES_DB;
 use logit_proto::collectd::{
-    CollectdDecoder, CollectdEncoder, Packets, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN,
+    CollectdDecoder, CollectdEncoder, Packets, TypesDb, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN,
     ATTR_PLUGIN_INSTANCE, ATTR_TYPE, ATTR_TYPE_INSTANCE, DEFAULT_MAX_PACKET_BYTES,
 };
 use logit_proto::Decoder;
@@ -457,6 +458,81 @@ fn a_packet_with_one_list_per_data_source_type_is_a_fixed_point() {
             .build(),
         4,
     );
+}
+
+/// **Record names cannot affect the fixed point.** The same `load` packet is decoded twice -- once
+/// with a `types.db` (naming the records `load.load.shortterm`/`midterm`/`longterm`) and once
+/// without (`load.load.0`/`1`/`2`) -- and both encode to byte-identical datagrams, because
+/// `collectd_out` builds a value list from the `collectd.*` attributes, the `MetricList`'s order
+/// and each record's kind, and never reads a name. This is what makes `types_db:` a display
+/// setting rather than a relay-fidelity one (`docs/adr/collectd-binary-relay.md`), and it is why
+/// misconfiguring it can never corrupt a relay.
+#[test]
+fn types_db_names_do_not_affect_the_fixed_point() {
+    let packet = PacketBuilder::new()
+        .string(TYPE_HOST, b"web-1")
+        .number(TYPE_TIME_HR, 1_700_000_000u64 << 30)
+        .number(TYPE_INTERVAL_HR, 10u64 << 30)
+        .string(TYPE_PLUGIN, b"load")
+        .string(TYPE_TYPE, b"load")
+        .values(&[
+            (DS_GAUGE, 0.1f64.to_le_bytes()),
+            (DS_GAUGE, 0.2f64.to_le_bytes()),
+            (DS_GAUGE, 0.3f64.to_le_bytes()),
+        ])
+        .build();
+    let types_db = Arc::new(TypesDb::parse(TEST_TYPES_DB).expect("the fixture types.db parses"));
+
+    let resource = Arc::new(Resource::default());
+    let mut plain = CollectdDecoder::new(resource.clone());
+    let mut named = CollectdDecoder::new(resource.clone()).with_types_db(types_db);
+    let (mut plain_events, mut named_events) = (Vec::new(), Vec::new());
+    plain.decode_into(packet.clone(), RECEIVED_AT, &mut plain_events).expect("must decode");
+    named.decode_into(packet, RECEIVED_AT, &mut named_events).expect("must decode");
+
+    let names = |events: &[Event]| -> Vec<String> {
+        events[0]
+            .metrics
+            .iter()
+            .map(|r| logit_core::interner::resolve(r.name).to_string())
+            .collect()
+    };
+    assert_eq!(names(&plain_events), vec!["load.load.0", "load.load.1", "load.load.2"]);
+    assert_eq!(
+        names(&named_events),
+        vec!["load.load.shortterm", "load.load.midterm", "load.load.longterm"],
+        "the types.db must actually have changed the names, or this proves nothing"
+    );
+
+    let batch = |events: Vec<Event>| EventBatch { resource: resource.clone(), scope: None, events };
+    for cap in CAPS {
+        assert_eq!(
+            encode_at(&batch(named_events.clone()), cap),
+            encode_at(&batch(plain_events.clone()), cap),
+            "cap {cap}: names must not reach the wire"
+        );
+    }
+
+    // The `types.db`-named batch is a fixed point too -- against a decoder holding the same file,
+    // which is what a real `collectd_in` with `types_db:` configured is. (It is deliberately *not*
+    // checked through `assert_fixed_point`, whose decoder has no `types.db`: that round trip comes
+    // back index-named, which is the display-only property this test is about rather than a
+    // fidelity break -- the bytes above are identical either way.)
+    let named_batch = batch(named_events.clone());
+    for cap in CAPS {
+        let mut decoder = CollectdDecoder::new(resource.clone())
+            .with_types_db(Arc::new(TypesDb::parse(TEST_TYPES_DB).expect("parses")));
+        let mut decoded = Vec::new();
+        for packet in encode_at(&named_batch, cap) {
+            decoder
+                .decode_into(Bytes::from(packet), RECEIVED_AT, &mut decoded)
+                .expect("every datagram this encoder writes must decode");
+        }
+        assert_eq!(decoded, named_events, "cap {cap}: decode(encode(b)) must equal b");
+    }
+
+    // The index-named batch is one against an ordinary decoder, as every other fixture here is.
+    assert_fixed_point(batch(plain_events));
 }
 
 // -- the generated grammar -------------------------------------------------------------------

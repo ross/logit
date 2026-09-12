@@ -168,7 +168,7 @@ alert on directly:
 | Event | Level | When |
 |---|---|---|
 | `starting` | info | Config loaded, before graph resolution — named even if the config goes on to fail. |
-| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`otlp_in`; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). |
+| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`collectd_in`/`otlp_in`; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped mid-drain. |
@@ -293,7 +293,7 @@ thing, sized against `buffer.disk.max_bytes`; `batches.dropped` gains `frame_too
 
 ## Listener intake
 
-Every UDP listener (`statsd_in`, `syslog_in`) sits in front of a per-component, in-memory receive
+Every UDP listener (`statsd_in`, `collectd_in`, `syslog_in`) sits in front of a per-component, in-memory receive
 queue that decouples reading the socket from decoding and batching what it received
 ([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md)) — the listener-side sibling of the sink delivery
 buffering above. This is what lets a slow or backed-up destination downstream be ridden out without
@@ -361,6 +361,33 @@ kernel default before deciding whether to raise it.
   runs on its own loop, this is the number that says whether event timestamps (always receipt time,
   stamped at arrival, never decode time) are still trustworthy under load — a healthy listener keeps
   this small; a climbing value under sustained load means decode is genuinely falling behind.
+
+### `collectd_in`: multicast groups and `types_db`
+
+`collectd_in` ([ADR `collectd-binary-relay`](adr/collectd-binary-relay.md)) is an ordinary UDP
+listener — everything above applies to it unchanged — with two settings specific to collectd's own
+deployment conventions:
+
+- **A multicast `bind` is joined automatically.** collectd's `network` plugin defaults to the group
+  `239.192.74.66` (or `ff18::efc0:4a42`) on port `25826`, which is what a sender configured with a
+  bare `Server "239.192.74.66"` writes to. Give `collectd_in` that same address and it sets
+  `SO_REUSEADDR`, binds the unspecified address on the port and joins the group on the host's
+  default multicast interface; the `bound` info line names the group. There is no `multicast:`
+  field — the address says it. A failed join **fails startup** rather than warning, since a
+  listener that bound but never joined would look healthy and receive nothing; in a container this
+  usually means the network has no route for `224.0.0.0/4`, and a unicast `bind` with `Server
+  "<host>" "25826"` on the sender side is the simpler deployment. Note that a group `bind` is not a
+  filter: the socket is bound to the unspecified address on that port, so the listener also accepts
+  ordinary unicast datagrams sent to that port from any source, and reports its address as
+  `0.0.0.0:<port>` rather than the group.
+- **`types_db:` is optional and only affects names.** Point it at the `types.db` your collectd
+  installation already ships (conventionally `/usr/share/collectd/types.db`; `logit` does not ship
+  one, as collectd's is GPL-licensed) and a multi-data-source list is named after its data sources
+  — `load.load.shortterm` rather than `load.load.0`. List several files to merge them in order, a
+  later file overriding an earlier one. A file that cannot be read or parsed fails startup, naming
+  the path and the line. This changes only what a cross-protocol sink (InfluxDB, Prometheus,
+  statsd) calls the series: `collectd_out` re-encodes from the `collectd.*` attributes, so a
+  `collectd_in -> collectd_out` relay puts the same bytes back on the wire either way.
 
 ## Tailing files and Docker logs
 

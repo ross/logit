@@ -207,10 +207,20 @@ Two model-side rules follow from that table rather than from any one attribute. 
 carrying N data sources becomes **one** event whose `metrics` holds N `MetricRecord`s in wire order
 (`logit_core::MetricList` is a `SmallVec` inlined at 1, so the common single-source list costs
 nothing extra) — not N events, which is what lets it be re-encoded as the same single list. And the
-record names are display/cross-protocol only: `<plugin>.<type>` for a single-source list,
-`<plugin>.<type>.<i>` (0-based) otherwise, with W2 resolving `<ds_name>` from an operator-supplied
-`types.db`. Like-relay fidelity rides on the attributes, the `MetricList` order and the metric
-kinds, never on the name.
+record names are **display/cross-protocol only**: like-relay fidelity rides on the attributes, the
+`MetricList` order and the metric kinds, never on the name, so every rule below changes what an
+InfluxDB/Prometheus/statsd sink calls the series and nothing about what `collectd_out` puts back on
+the wire. The wire itself carries no data-source names, so the naming rule is:
+
+| The list's `collectd.type` | Record name |
+|---|---|
+| resolved in an operator-supplied `types.db` (`collectd_in`'s `types_db:`) with a matching data-source **count and kinds**, single-source | `<plugin>.<type>` — the lone data source (conventionally `value`) is omitted, collectd's own `write_graphite` default |
+| resolved likewise, multi-source | `<plugin>.<type>.<ds_name>` (`load.load.shortterm`) |
+| resolved, but its data-source count or kinds disagree with the wire | index naming, plus a throttled `types_db_mismatch` diagnostic — the configured file is not the one the sender is running against |
+| not in the configured files, or no `types_db:` configured at all | index naming, no diagnostic: a type missing from `types.db` is routine |
+
+Index naming is `<plugin>.<type>` for a single-source list and `<plugin>.<type>.<i>` (0-based)
+otherwise.
 
 `tail_in`/`docker_in` (`crates/logit-inputs/src/tail/`, `crates/logit-inputs/src/docker.rs`,
 [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)) stamp two

@@ -51,7 +51,9 @@
 //! | Values with an empty host, plugin or type | list skipped, nothing pushed | `incomplete_identity` (collectd's own receiver rejects the same list with `-EINVAL`) |
 //! | TimeHR (2⁻³⁰ s) / Time (s) / neither | `Event::timestamp` = [`cdtime_to_nanos`] / `s * 1e9` / `received_at` | -- (collectd rejects a `time == 0` list; this codec observes rather than rejects, so a timeless list is stamped with receipt time like every other `logit` input) |
 //! | IntervalHR / Interval | `collectd.interval` = `F64` seconds (`cdtime / 2³⁰`, exact); `0` → absent | -- |
-//! | record name | `<plugin>.<type>` for a one-data-source list, `<plugin>.<type>.<i>` (0-based) otherwise | -- (W2 resolves `<ds_name>` from an operator-supplied `types.db`; names are display/cross-protocol only -- like-relay fidelity rides on the attributes, the `MetricList` order and the kinds, never on the name) |
+//! | record name, no `types_db` configured or the list's type not in it | `<plugin>.<type>` for a one-data-source list, `<plugin>.<type>.<i>` (0-based) otherwise | -- (a type missing from `types.db` is routine, not a misconfiguration) |
+//! | record name, the list's type resolved in [`types_db`] with a matching data-source count **and** kinds | `<plugin>.<type>` for a one-data-source type (the lone data source, conventionally `value`, is omitted -- collectd's own `write_graphite` default), `<plugin>.<type>.<ds_name>` otherwise | -- |
+//! | record name, the type resolved but its count or kinds disagree with the wire | index naming, as above | `types_db_mismatch` -- the configured file is not the one the sender is running against, and naming from it would label a real measurement wrongly |
 //! | a part whose `len` is `< 4`, runs past the datagram, a string part with no NUL terminator, a numeric part not 12 bytes, a Values part where `len != 6 + 9 * count`, `count == 0`, `count > `[`MAX_VALUES_PER_LIST`], or an unknown data-source type byte | the rest of the datagram is abandoned; events already decoded from it are **kept** | `bad_part` when something was already decoded, else `CodecError::Malformed` (the listener's own `bad_datagram`) |
 //! | `0x0200` Signature | skipped by length, **unverified** | -- (`docs/known-gaps.md`) |
 //! | `0x0210` Encryption | the rest of the datagram is dropped | `encrypted_packet_dropped` |
@@ -62,6 +64,12 @@
 //! the [`logit_core::Scope`] is always `None`: a per-host resource would look tidier but
 //! `logit_pipeline::BatchAccumulator::absorb` keys accumulation on `Arc::ptr_eq`, so minting one per
 //! datagram would split every batch by sender. The host rides on `collectd.host` instead.
+//!
+//! **Record names are display/cross-protocol only.** `collectd_out` re-encodes a list from the
+//! `collectd.*` attributes, the `MetricList`'s order and each record's kind, and never reads the
+//! name -- so a pipeline with no `types_db:`, one with a stale file, and one with the sender's own
+//! file all relay the same bytes. What the names change is what an InfluxDB/Prometheus/statsd sink
+//! calls the series, which is the whole reason to configure [`types_db`] at all.
 //!
 //! ## Encode: events → datagrams
 //!
@@ -151,9 +159,11 @@
 pub mod decode;
 pub mod encode;
 pub mod part;
+pub mod types_db;
 
 pub use decode::CollectdDecoder;
 pub use encode::{CollectdEncoder, EncodeStats, Packets};
+pub use types_db::{DataSource, DsKind, TypesDb, TypesDbError};
 
 /// collectd's own default `network` plugin port, for both the listener and the sink.
 pub const DEFAULT_PORT: u16 = 25826;

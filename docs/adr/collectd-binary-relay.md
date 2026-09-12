@@ -161,11 +161,15 @@ name):
   default naming.
 - **Multi-DS list, with `types_db` configured and the type resolves** with a matching DS count and
   kinds: `<plugin>.<type>.<ds_name>` — one record per name.
-- **Multi-DS list, `types_db` configured but the type doesn't resolve, or resolves with a mismatched
-  DS count/kinds**: `<plugin>.<type>.<i>` (0-based index), plus a throttled `types_db_mismatch` diag.
-- **No `types_db` configured at all**: index naming (`<plugin>.<type>.<i>` for multi-DS,
-  `<plugin>.<type>` for single-DS), no diag — a type simply not being resolved is routine, not an
-  error, when no database was ever supplied.
+- **Multi-DS list, `types_db` configured and the type resolves but with a mismatched DS count or
+  kinds**: `<plugin>.<type>.<i>` (0-based index), plus a throttled `types_db_mismatch` diag. The
+  diagnostic is specifically about *disagreement*: the configured file describes this type
+  differently from the way the sender is sending it, so naming from it would attach the wrong label
+  to a real measurement.
+- **The type is not in `types_db` at all, or no `types_db` is configured**: index naming
+  (`<plugin>.<type>.<i>` for multi-DS, `<plugin>.<type>` for single-DS), **no diag** — a type simply
+  not being resolved is routine (a custom plugin, a newer collectd, or no database supplied), not a
+  misconfiguration, and reporting it would fire forever on every interval.
 
 `collectd_in` accepts an optional `types_db: [paths]` field (operator-supplied, e.g.
 `/usr/share/collectd/types.db`) read once at startup and merged (later files override earlier
