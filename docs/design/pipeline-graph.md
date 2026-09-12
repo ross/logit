@@ -364,8 +364,8 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 38. A `statsd_out` `max_packet_bytes: 0` is rejected, the same shape as rule 15's
     `buffer.max_batches`/`max_bytes: 0` — an impossible bound (every metric line would overflow it
     and be dropped whole), not a small one (`docs/adr/statsd-output.md`).
-39. An `aggregate` with `temporality: cumulative` and either `series_retention: 0` or
-    `max_retained_series: 0` is rejected — those two bounds are what keeps a running total alive
+39. An `aggregate` with `temporality: cumulative` requires `series_retention >= 1` (a count of
+    windows, not a duration) and `max_retained_series >= 1` — those two bounds are what keeps a running total alive
     across the window boundary, so with either at `0` no accumulator survives a flush and every
     window would emit its own increment labelled as a cumulative total, a silently wrong number for
     the consumer that mode exists for. `series_retention: 0` stays legal under the default

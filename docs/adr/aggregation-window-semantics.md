@@ -424,7 +424,9 @@ series regardless of how short *R* is, so a second, independent bound on the *pe
 Those two bounds are not gauge-specific in any way — they bound "how many accumulators survive a
 flush, and for how long" — so this amendment reuses them verbatim rather than inventing a parallel
 mechanism, and **renames them to match their now-general role**: `gauge_retention` →
-`series_retention`, `max_retained_gauge_series` → `max_retained_series`. (Pre-release, so a plain
+`series_retention` (still a **count of windows**, never a duration — `interval` alone decides how
+long a window is, and a retention expressed in time would silently mean a different number of windows
+on every differently-tuned stage), `max_retained_gauge_series` → `max_retained_series`. (Pre-release, so a plain
 rename with no serde aliases; the earlier amendments above keep the original spelling as the
 historical record of what those fields were called when they were introduced. The throttled
 diagnostic renamed with them: `gauge_retention_full` → `series_retention_full`.) Eviction keeps the
@@ -436,7 +438,9 @@ dashboards `docs/design/internal-telemetry.md` documents for no gain.
 Retention is therefore *required* for this mode, not merely advisable: with `series_retention: 0` (or
 `max_retained_series: 0`) no accumulator can survive a flush, so every window would emit its own
 increment wearing a `Cumulative` label — a silently wrong number for the one kind of consumer the
-mode exists for. `logit validate`/`logit run` reject that combination
+mode exists for. `temporality: cumulative` therefore requires `series_retention >= 1` (one window,
+counted, is the minimum that lets a total cross a boundary at all) and `max_retained_series >= 1`;
+`logit validate`/`logit run` reject that combination
 (`crates/logit-pipeline/src/graph.rs`, rule 39; `docs/design/pipeline-graph.md`), the same
 "an impossible bound is a config error, not a small one" treatment rules 15/18/38 already give.
 

@@ -1340,9 +1340,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 && (*series_retention == 0 || *max_retained_series == 0)
             {
                 anyhow::bail!(
-                    "component '{id}': temporality: cumulative needs series_retention and \
-                     max_retained_series above 0 -- with either at 0 no series survives a flush, \
-                     so every window would emit its own increment labelled as a cumulative total"
+                    "component '{id}': temporality: cumulative requires series_retention >= 1 \
+                     (a count of windows) and max_retained_series >= 1 -- with either at 0 no \
+                     series survives a flush, so every window would emit its own increment \
+                     labelled as a cumulative total"
                 );
             }
         }
