@@ -1,6 +1,6 @@
 ---
 created: 2026-08-31
-updated: 2026-09-11
+updated: 2026-09-12
 ---
 
 # Internal telemetry as ordinary pipeline events, drained from a component-level buffer
@@ -151,6 +151,27 @@ instead of quietly leaking.
   no rename, no second listener kind — once its own gating question (trace context in `Delivered`,
   ADR `minimize-allocations-over-event-size`) is answered on its own evidence.
 - `docs/known-gaps.md`'s `interner::len()` note is closed: `internal` samples it on every tick.
+
+## Amendment: raw samples exist now; internal telemetry still summarizes
+
+*2026-09-12*
+
+[`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W1/W3 gave `MetricKind` a real
+raw-sample representation, `MetricKind::Samples` — the "`logit`'s `MetricKind` has no raw-sample
+representation at all" claim in this ADR's Decision section above is no longer true as a statement
+about the model. The decision this ADR made stands anyway: `internal`'s buffer still sketches every
+timing into one running `DdSketch` between drains rather than retaining raw per-timing values, and
+that's deliberate, not a gap waiting on a model feature. `Samples` exists for statsd's `ms`/`h`/`d`
+because those values arrive externally, at a rate and cardinality this project doesn't control, and
+a lossless relay has to be able to hand them back one-for-one until `aggregate` explicitly
+summarizes them ([ADR `lossless-transit`](lossless-transit.md)). `internal`'s points are internally
+generated — this project already controls their rate and cardinality directly, via the buffer's own
+1024-key cap — and nothing downstream needs the raw values back verbatim the way a statsd relay
+does. A per-drain running sketch is still the cheaper, already-bounded shape for that case;
+switching this buffer to raw retention would just reintroduce the unbounded-volume problem
+`Samples`' own `max_samples_per_series` cap exists to bound, for a fidelity guarantee nothing here
+asks for. The Decision text above is left as originally written, per this project's ADR convention
+— this amendment is the correction.
 
 ## Amendment: a `prometheus_out` sink is not the rejected scrape endpoint (2026-09-11)
 
