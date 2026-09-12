@@ -24,7 +24,7 @@ mod trace_context;
 
 use logit_core::Value;
 
-pub use aggregate::{Aggregator, Distributions, Sets};
+pub use aggregate::{AggregateTemporality, Aggregator, Distributions, Sets};
 pub use attributes::{DropAttributes, HasAttributes};
 pub use csv::CsvParser;
 pub use json::JsonParser;

@@ -172,3 +172,27 @@ switching this buffer to raw retention would just reintroduce the unbounded-volu
 `Samples`' own `max_samples_per_series` cap exists to bound, for a fidelity guarantee nothing here
 asks for. The Decision text above is left as originally written, per this project's ADR convention
 — this amendment is the correction.
+
+## Amendment: a `prometheus_out` sink is not the rejected scrape endpoint (2026-09-11)
+
+The Alternatives section above rejects "a pull-based `/metrics` scrape endpoint
+(Prometheus-style)" as the *mechanism for internal telemetry specifically* — its objection was
+that such an endpoint would be a second representation of `MetricKind` kept in sync by hand, a
+second HTTP listener with nothing to do with the pipeline, and a dead end for reuse ("no way to
+reuse `aggregate`/`keep`/any sink on the result without first re-ingesting it through some other
+input").
+
+[ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md)'s `prometheus_out`
+is not that endpoint. It is an ordinary `ComponentKind`, implementing the ordinary `Output` trait,
+fed by whatever the resolved graph routes to it — the same as `influxdb_out` or `stdio_out`. When
+it serves internal telemetry, the shape is exactly `internal -> aggregate(cumulative) ->
+prometheus_out`: `internal` already drains `logit`'s self-observed points into ordinary events
+(this ADR's own decision), `aggregate` is the named summarizing stage that ADR requires, and
+`prometheus_out` renders the result — the graph, not a bespoke listener, does the work.
+
+This is precisely the "re-ingest through some other input" path the rejected alternative
+dismissed as unavailable to a bolted-on scrape endpoint; here it's just what the graph already
+does with any signal source, and `internal` already is "some other input." Nothing above is
+reversed: a second, out-of-band metrics representation kept in sync by hand is still rejected. A
+sink that happens to speak Prometheus's wire format, driven by the same graph every other sink is,
+is a different thing entirely.

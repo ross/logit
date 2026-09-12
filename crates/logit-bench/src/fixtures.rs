@@ -26,8 +26,8 @@ use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
 use logit_proto::Decoder;
 use logit_transforms::{
-    Aggregator, CsvParser, Distributions, JsonParser, Keep, Kv, KvMetrics, Logfmt, MetricSpec,
-    RegexParser, Set,
+    AggregateTemporality, Aggregator, CsvParser, Distributions, JsonParser, Keep, Kv, KvMetrics,
+    Logfmt, MetricSpec, RegexParser, Set,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -442,12 +442,23 @@ pub fn aggregator() -> Aggregator {
     Aggregator::new(Duration::from_secs(10))
 }
 
-/// Like [`aggregator`], with cross-flush gauge retention enabled -- for measuring the retained
+/// Like [`aggregator`], with cross-flush series retention enabled -- for measuring the retained
 /// path's own allocation cost (`aggregate_flush_retained_gauges`,
-/// `crates/logit-bench/tests/allocations.rs`), which the default (`gauge_retention: 0`) fixture
+/// `crates/logit-bench/tests/allocations.rs`), which the default (`series_retention: 0`) fixture
 /// above never exercises.
-pub fn aggregator_with_gauge_retention(retention: u32, max_retained: usize) -> Aggregator {
-    Aggregator::new(Duration::from_secs(10)).with_gauge_retention(retention, max_retained)
+pub fn aggregator_with_series_retention(retention: u32, max_retained: usize) -> Aggregator {
+    Aggregator::new(Duration::from_secs(10)).with_series_retention(retention, max_retained)
+}
+
+/// Like [`aggregator_with_series_retention`], in `temporality: cumulative` mode -- for measuring
+/// what a retained *counter* series costs per flush
+/// (`aggregate_flush_cumulative_sums`, `crates/logit-bench/tests/allocations.rs`), the accumulator
+/// shape only that mode ever retains (`docs/adr/aggregation-window-semantics.md`'s cumulative
+/// amendment).
+pub fn aggregator_cumulative(retention: u32, max_retained: usize) -> Aggregator {
+    Aggregator::new(Duration::from_secs(10))
+        .with_temporality(AggregateTemporality::Cumulative)
+        .with_series_retention(retention, max_retained)
 }
 
 /// Like [`aggregator`], with `distributions: samples` and the given cap -- for measuring the raw
@@ -545,6 +556,22 @@ pub fn wide_gauge_event(name: &str, value: f64) -> Event {
         0,
         attributes,
         MetricRecord::new(logit_core::interner::intern(name), MetricKind::Gauge(value)),
+    )
+}
+
+/// [`wide_gauge_event`]'s counter twin -- same spilled 12-attribute map, a delta `Sum` instead of a
+/// `Gauge`, so `aggregate_flush_cumulative_sums` (`crates/logit-bench/tests/allocations.rs`)
+/// measures the retained-*counter* flush path (`temporality: cumulative`) against exactly the same
+/// attribute shape the retained-gauge measurement uses, and the two numbers are comparable.
+pub fn wide_counter_event(name: &str, value: f64) -> Event {
+    let mut attributes = AttrMap::new();
+    for i in 0..12 {
+        attributes.insert(&format!("tag{i}"), format!("value{i}").as_str());
+    }
+    Event::metric(
+        0,
+        attributes,
+        MetricRecord::new(logit_core::interner::intern(name), MetricKind::counter(value)),
     )
 }
 

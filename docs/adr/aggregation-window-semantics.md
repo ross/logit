@@ -378,7 +378,137 @@ modes and their fallbacks; `set_estimate_mode_merges_hyperloglogs_and_estimates_
 `set_merge_of_two_series_is_a_union`, `set_members_mode_dedups_preserving_insertion_order`,
 `set_members_mode_cap_exceeded_falls_back_to_set_and_counts`, and
 `set_members_accumulator_converts_to_set_on_an_incoming_set` for the `sets` modes and their
-fallback; `a_samples_series_never_survives_a_flush_even_with_gauge_retention_enabled` and
-`a_set_members_series_never_survives_a_flush_even_with_gauge_retention_enabled` for tumbling
+fallback; `a_samples_series_never_survives_a_flush_even_with_series_retention_enabled` and
+`a_set_members_series_never_survives_a_flush_even_with_series_retention_enabled` for tumbling
 regardless of retention; and `same_resource_different_scope_flush_as_two_groups_carrying_their_scope`
 for the `(resource, scope)` group key.
+
+## Amendment: cumulative temporality as an opt-in mode (2026-09-11)
+
+This ADR's original "Alternatives considered" rejected **cumulative (never-reset) counters**, in one
+sentence: "it means state grows unbounded with series cardinality and a process restart resets every
+series to zero with no way to detect that from the emitted stream, whereas tumbling-with-reset makes
+each emitted value self-contained." Both halves of that objection have since been answered by work
+done for other reasons, so `aggregate` now offers cumulative accumulation as an explicit,
+named, off-by-default mode: `temporality: delta | cumulative` on `ComponentKind::Aggregate`
+(`crates/logit-config/src/lib.rs`), default `delta` — byte-for-byte today's behavior.
+
+### The restart half: `start_timestamp` is exactly the missing signal
+
+[ADR `metrics-model-v2`](metrics-model-v2.md) added `MetricRecord::start_timestamp` — "unix
+nanoseconds this series started accumulating at; `0` means unknown," OTLP's own
+`start_time_unix_nano`. That field *is* the way to detect a restart from the emitted stream, and not
+an invention of this amendment: it is the same signal OTLP consumers and Prometheus both use for
+reset detection (Prometheus's `_created` series and its staleness/reset handling; OTLP's
+`StartTimeUnixNano` on every cumulative data point). A consumer reading two consecutive points of one
+series compares their start times: equal means the second point continues the first (so a value that
+went *down* is a genuine non-monotonic movement, not a reset), and different means the series
+restarted and the counter must be re-based rather than differenced.
+
+So `temporality: cumulative` stamps every flushed `Sum`/`Histogram` with the series' **first-seen
+time** — the timestamp of the first event ever absorbed into that series (`SeriesState::first_seen`,
+captured from `event.timestamp`, the source's own clock). It never changes while the series lives. It
+changes in exactly one circumstance: the series is evicted and a later record re-creates it, which is
+precisely the event a consumer needs to be told about. A process restart is the same case by
+construction — a fresh `Aggregator` holds no series, so every series' first flush after the restart
+carries a new start time. The objection that there was "no way to detect that from the emitted
+stream" no longer holds, because there is now a field whose whole job is to carry it.
+
+### The unbounded-state half: the gauge amendment already built the answer
+
+The "gauge series carry across the window boundary" amendment above had to answer the identical
+concern for gauges, and did it with **two** bounds rather than one, for the reason argued there at
+length: a windows-count TTL bounds only the *tail* of the retained set (how long one idle series
+lingers), while a sustained stream of *C* never-repeating series names per window would hold *C × R*
+series regardless of how short *R* is, so a second, independent bound on the *peak* is required.
+Those two bounds are not gauge-specific in any way — they bound "how many accumulators survive a
+flush, and for how long" — so this amendment reuses them verbatim rather than inventing a parallel
+mechanism, and **renames them to match their now-general role**: `gauge_retention` →
+`series_retention` (still a **count of windows**, never a duration — `interval` alone decides how
+long a window is, and a retention expressed in time would silently mean a different number of windows
+on every differently-tuned stage), `max_retained_gauge_series` → `max_retained_series`. (Pre-release, so a plain
+rename with no serde aliases; the earlier amendments above keep the original spelling as the
+historical record of what those fields were called when they were introduced. The throttled
+diagnostic renamed with them: `gauge_retention_full` → `series_retention_full`.) Eviction keeps the
+counters it already had: `logit.transform.series.evicted{reason="idle"}` for the TTL and
+`{reason="cardinality"}` for the cap — `"idle"` rather than a new `"expired"`, because the TTL
+eviction path and its counter already existed and renaming a shipped tag value would break the
+dashboards `docs/design/internal-telemetry.md` documents for no gain.
+
+Retention is therefore *required* for this mode, not merely advisable: with `series_retention: 0` (or
+`max_retained_series: 0`) no accumulator can survive a flush, so every window would emit its own
+increment wearing a `Cumulative` label — a silently wrong number for the one kind of consumer the
+mode exists for. `temporality: cumulative` therefore requires `series_retention >= 1` (one window,
+counted, is the minimum that lets a total cross a boundary at all) and `max_retained_series >= 1`;
+`logit validate`/`logit run` reject that combination
+(`crates/logit-pipeline/src/graph.rs`, rule 39; `docs/design/pipeline-graph.md`), the same
+"an impossible bound is a config error, not a small one" treatment rules 15/18/38 already give.
+
+### What the mode actually changes
+
+- A **delta `Sum`** accumulator survives the flush (`flush`'s `retain` predicate, the same branch a
+  retained gauge takes) and keeps summing. Every flush emits the running total as `Sum { temporality:
+  Cumulative, monotonic: <as accumulated — the first record's flag, unchanged> }` with
+  `start_timestamp` = the series' first-seen time.
+- A **delta `Histogram`** gains a merge rule in this mode only: bucket counts add bucket-for-bucket,
+  `sum` adds when *both* sides have one (a running sum missing a window's contribution understates
+  the series outright, which is worse than reporting no sum — a consumer can tell `None` from a wrong
+  number), and `min`/`max` fold across whichever sides have one (unlike a sum, an extreme observed
+  over a subset of windows is still a genuine observation). Bucket **bounds must match exactly**
+  (compared bitwise, so a `NaN` bound keys with itself): a record whose bounds differ from the
+  accumulating series' has no correct merge — adding bucket *i* of one to bucket *i* of the other
+  would attribute counts to bounds they were never observed under — so it is passed through
+  untouched, the same treatment a kind conflict gets, under its own throttled diagnostic key
+  (`histogram_bounds_mismatch`, rather than `kind_conflict`'s, since here the *kind* does match).
+- **`delta` mode is unchanged, including for histograms.** A `Histogram` of either temporality stays
+  pass-through there, exactly as it has been since this ADR was written: a delta histogram has no
+  merge rule in `delta` mode, and giving it one would be a separate decision about what a tumbling
+  histogram window means, not a side effect of adding a cumulative mode. `process`'s pass-through
+  predicate is therefore mode-dependent for that one kind — it moved from an inline `matches!` to the
+  `passes_through` free function precisely so the two places that must agree about it (that check and
+  `Accumulator::new_for`'s `unreachable!` arm) can call the same code instead of restating the same
+  list twice.
+- An **incoming cumulative `Sum`** is still pass-through in *both* modes. `aggregate` re-summing an
+  already-running total would double-count it, and nothing about the stage's output mode changes what
+  an input record means. The same holds for an incoming cumulative `Histogram`.
+- Nothing else changes: `Gauge`/`GaugeDelta` behave exactly as the gauge-retention amendment
+  describes in either mode, and a `Distribution`/`Samples`/`Set`/`SetMembers` series still tumbles in
+  either mode (each window's summary is self-contained — the reasoning in "Why
+  `Samples`/`SetMembers`/`Set` series tumble regardless of `gauge_retention`" above is about the
+  data, not about the mode).
+- An idle retained cumulative series emits **nothing** that window, exactly like an idle retained
+  gauge. Re-emitting an unchanged running total every idle window would multiply this stage's output
+  by its retention depth, and a cumulative consumer already treats the last value it saw as standing
+  until replaced.
+
+### Who needs it: `prometheus_out`
+
+The concrete consumer is [ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md)'s
+`prometheus_out`, which **skips** a delta `Sum`/`Histogram` (counted, with a throttled diagnostic
+naming this mode) because the exposition format has no delta temporality to render it as, and
+resolving deltas inside a sink would be exactly the unnamed, implicit summarization
+[ADR `lossless-transit`](lossless-transit.md) forbids. So the intended pipelines are
+`statsd_in -> aggregate(temporality: cumulative) -> prometheus_out` and
+`internal -> aggregate(temporality: cumulative) -> prometheus_out`: the summarizing stage is
+explicit, named in config, and bounded by its own two documented bounds, rather than hidden in a
+sink. `influxdb_out` and `statsd_out` want the `delta` default, which is why it stays the default.
+
+See `crates/logit-transforms/src/aggregate.rs`'s module doc ("Temporality: what a flushed
+`Sum`/`Histogram` means"), its `passes_through`/`flush`/`Accumulator` for the implementation, and its
+test module for the shapes this amendment adds coverage for:
+`cumulative_mode_sums_accumulate_across_flushes_with_a_stable_start_timestamp`,
+`cumulative_mode_keeps_the_accumulated_monotonic_flag`,
+`an_idle_cumulative_series_emits_nothing_then_resumes_from_its_running_total`,
+`cumulative_mode_histograms_accumulate_per_bucket`,
+`a_histogram_window_without_a_sum_drops_the_running_sum_but_keeps_min_and_max`,
+`a_histogram_with_mismatched_bucket_bounds_is_passed_through`,
+`an_evicted_cumulative_series_restarts_with_a_new_start_timestamp`,
+`the_cardinality_cap_evicts_cumulative_series_and_fires_series_retention_full`,
+`a_cumulative_sum_input_still_passes_through_in_cumulative_mode`,
+`delta_mode_sums_tumble_and_emit_delta_temporality_with_no_start_timestamp`,
+`a_delta_histogram_still_passes_through_in_delta_mode`, and
+`a_distribution_series_still_tumbles_in_cumulative_mode`; plus
+`crates/logit-pipeline/src/graph.rs`'s four rule-39 tests and
+`crates/logit-bench/tests/allocations.rs`' `aggregate_flush_cumulative_sums` (a retained cumulative
+`Sum` costs a flush exactly what a retained gauge does -- 209 allocations for 100 spilled-attribute
+series, `docs/design/memory.md`).
