@@ -47,7 +47,8 @@ field. `EventBatch` (`crates/logit-core/src/event.rs`) has a `resource: Arc<Reso
 Decode (`crates/logit-inputs/src/statsd.rs`, `build_event` ~L254-345): raw timer samples are
 sketched into a `DdSketch` immediately (`add_weighted`, ~L301-327, weight clamped at
 `MAX_SAMPLE_WEIGHT = 1000`) — a decoder pre-summarizing, which the ADR now forbids; `s` sets are a
-hard decode error (~L329-334, `HyperLogLog` is still a stub per `docs/known-gaps.md`); `|c:`
+hard decode error (~L329-334 -- `HyperLogLog` itself is real since W2, but statsd gained no
+producer for it until W3, `docs/known-gaps.md`); `|c:`
 container id and `|T` timestamp are silently accepted and ignored by the generic segment fallthrough
 (~L229-231); DogStatsD events and service checks fail to parse as ordinary lines; `ms`/`h`/`d` all
 collapse into one `Distribution` kind, losing which wire type produced it; `unit` is always `None`.
@@ -377,19 +378,29 @@ current term-by-term breakdown.
 - A non-UTF-8 syslog MSG decodes to a `Value::Bytes` message instead of rejecting the line; header
   fields are parsed off the raw bytes before UTF-8 validation is applied to the MSG slice alone.
 
-### `aggregate`
+### `aggregate` (W2, landed)
 
-`crates/logit-transforms/src/aggregate.rs` gains the sketching step statsd's decoder does today:
-a `Samples` accumulator opens a `Distribution` and calls `add_weighted(v, (1.0 / rate).round().max(1.0).min(MAX_SAMPLE_WEIGHT))`
-per value — the clamp and its diagnostic move here from `crates/logit-inputs/src/statsd.rs` verbatim.
-A new `distributions: sketch | samples` config (default `sketch`) lets an operator keep raw samples
-through the aggregation window too (concatenated, bounded by a `max_samples_per_series` cap;
-overflow falls back to sketching and counts it) — this is what makes a
-`statsd_in -> aggregate -> statsd_out` relay stay exact when the operator asks for it, rather than
-only when `aggregate` is entirely absent. `SetMembers` merges as an exact bounded union (or into a
-real `HyperLogLog`, wiring the still-stubbed crate the same PR needs anyway). Cumulative `Sum`,
-`Histogram`, and `ExponentialHistogram` pass through unmerged, following the existing "no defined
-merge rule → pass through" pattern for `Set`/`Histogram`/`Summary`.
+`crates/logit-transforms/src/aggregate.rs` gained the sketching step statsd's decoder used to do:
+by default (`distributions: sketch`), an absorbed `Samples` record sketches every value directly
+into the series' `DdSketch` via `logit_core::Samples::sketch`'s weighting rule
+(`add_weighted(v, weight)`, `weight = round(1/sample_rate)` clamped to `[1, Samples::MAX_WEIGHT]`) —
+the clamp and its diagnostic (`sample_rate_clamped`) moved here from
+`crates/logit-inputs/src/statsd.rs`, which keeps its own copy until W3 deletes it. A new
+`distributions: sketch | samples` config (default `sketch`) lets an operator keep raw samples
+through the aggregation window instead (concatenated, bounded by a `max_samples_per_series` cap;
+overflow, or an incoming record's `sample_rate` disagreeing with the series' first one, falls back
+to sketching and counts it via `logit.transform.samples.fallback{reason="cap"|"rate_mismatch"}`) —
+this is what will let a `statsd_in -> aggregate -> statsd_out` relay stay exact once W3 adds the
+sink side, rather than only when `aggregate` is entirely absent. `SetMembers` merges as an exact,
+capped, deduplicated union (`sets: members`, `max_set_members_per_series`, overflow falls back to a
+`HyperLogLog` estimate and counts `logit.transform.set_members.fallback{reason="cap"}`) or, by
+default (`sets: estimate`), into a real `HyperLogLog` — `crates/logit-core/src/metric.rs` now wraps
+the `cardinality-estimator` crate (pinned at `1.0.3`) instead of being a method-less stub. Cumulative
+`Sum`, `Histogram`, `ExponentialHistogram`, and `Summary` still pass through unmerged — `Set` no
+longer belongs in that list now that `HyperLogLog` is real. `Transform::flush`'s `FlushOutput` also
+grew a `scope` field (`Aggregator` now groups by `(resource, scope)` value, not resource alone),
+closing the `otlp_in -> aggregate -> otlp_out` scope-loss gap this plan tracked. Full design in
+[ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment.
 
 ### Sinks
 
@@ -432,7 +443,7 @@ metric-kind fields, not just presence.
 |---|---|---|---|
 | W0 | This PR: ADR, survey, and this plan | S | — |
 | W1 | **Landed (this PR).** Core model reshape (every type in "Target model" above), `PartialEq` derives, `type_sizes.rs` + `memory.md` §1, `estimated_heap_bytes`, and every exhaustive match site updated (`event.rs`, `outputs/{influxdb,stdio,statsd}.rs`, `proto/native/record.rs`, `proto/otlp/metrics.rs`, `transforms/aggregate.rs`, `bench/bakeoff/wire_mirror.rs`) — plus the native codec reshape in the same PR, since `record.rs` can't compile against the old model otherwise. New ADR `metrics-model-v2` (single `Sum`, raw-vs-sketch pairs for `Samples`/`SetMembers`, the `ExponentialHistogram` variant, boxed `SpanExt`, batch-level `Scope`); amends `relative-gauge-adjustments` (its recorded size-growth fallback is not triggered — `MetricKind` stays 176) | L | W0 |
-| W2 | `aggregate`: `Samples` sketching moved out of decode, `distributions: sketch \| samples` config, `SetMembers` union plus a real `HyperLogLog`, cumulative-kind pass-through; amends `aggregation-window-semantics` | M | W1 |
+| W2 | **Landed.** `aggregate`: `Samples` sketching moved out of decode, `distributions: sketch \| samples`/`sets: estimate \| members` config with capped raw retention and a fallback-and-count rule, `SetMembers` union plus a real `HyperLogLog` (`cardinality-estimator`), `FlushOutput` scope, cumulative/`Histogram`/`ExponentialHistogram`/`Summary` pass-through unchanged; amends `aggregation-window-semantics` | M | W1 |
 | W3 | statsd pair: `Samples`/`SetMembers` in and out, `|c:`, `|T`, sample-rate retention on timers, `statsd_round_trip.rs`, updated `allocations.rs` cases; amends `statsd-output` (v1 deferral narrowed to post-sketch kinds; "no sample rate/timestamp" reversed) | M | W1, W2 |
 | W4 | **Landed.** OTLP pair: start_time, description, exemplars, `NO_RECORDED_VALUE` round-tripped as a flagged point, batch-level scope grouping + `schema_url`, `event_name`, `observed_timestamp`, dropped-attribute counts, span fields, `otel.severity_*`; `otlp_round_trip.rs` rewritten to per-field assertions; new pure-codec `crates/logit-proto/tests/otlp_fixed_point.rs` plus a `proptest`-based `decode(encode(x)) == x` suite in `otlp/metrics.rs`; `internal` stamps a real `Scope` (`crates/logit-inputs/src/internal.rs`) now that `otlp_out` no longer invents one. New `MetricRecord.flags: u32`/`MR_FLAGS` native tag amends `metrics-model-v2`. (`Sum`/temporality/monotonic, `ExponentialHistogram`'s 1:1 mapping, and histogram sum/min/max + summary count/sum were pulled forward into W1 — see its "W1 outcome" note above.) | L | W1 |
 | W5 | **Landed.** syslog pair: structured-data parse and emit, timestamp precedence and the nil case, `Value::Bytes` MSG, `Value::Str` PROCID, opt-in PEN-qualified structured-data element; `crates/logit-cli/tests/syslog_round_trip.rs` over real UDP sockets with a fixture corpus plus a `proptest` fixed point; new ADR `syslog-structured-data-convention`; amends `syslog-output` | M | W0 (parallel with W1) |

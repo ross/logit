@@ -528,11 +528,12 @@ fn allocate_timestamp(
 /// quantiles. `Histogram` maps its buckets onto fields directly; `Summary` maps its quantiles onto
 /// fields keyed by the raw quantile value rather than a rounded percentage, since rounding isn't
 /// collision-free (0.991 and 0.994 would both round to "p99" and overwrite each other within one
-/// line's field set). `Set`/`SetMembers` have no encoding yet: `Set` needs a real `HyperLogLog`
-/// (`logit_core::metric::HyperLogLog` is still a stub) and `SetMembers` is raw, unsummarized data
-/// with nothing to render a scalar field from, so both return an error rather than inventing a
-/// meaningless one -- as does `ExponentialHistogram`, cross-protocol debt line protocol has no
-/// shape for (`docs/plans/lossless-transit.md`).
+/// line's field set). `Set` is real now (`logit_core::metric::HyperLogLog`, `docs/plans/
+/// lossless-transit.md`'s W2) -- its estimate renders as a single unsigned `value` field, the
+/// same [`push_uint`] formatting `count=` already uses. `SetMembers` is still raw, unsummarized
+/// data with nothing to render a scalar field from, so it still returns an error rather than
+/// inventing a meaningless one -- as does `ExponentialHistogram`, cross-protocol debt line
+/// protocol has no shape for (`docs/plans/lossless-transit.md`).
 ///
 /// **Field names are written unescaped, and that is not a shortcut.** Every name this can produce
 /// is either a literal (`value`, `count`) or built purely out of formatted numbers
@@ -603,10 +604,12 @@ fn render_fields(out: &mut String, kind: &MetricKind) -> Result<bool, CodecError
                 }
             }
         }
-        MetricKind::Set(_) => {
-            return Err(CodecError::Malformed(
-                "Set metrics have no line-protocol encoding yet".to_string(),
-            ))
+        MetricKind::Set(hll) => {
+            // `HyperLogLog` is real now (`docs/plans/lossless-transit.md`'s W2) -- render its
+            // estimate as an unsigned integer field, the same `push_uint` formatting `count=`
+            // already uses for a sketch's own count.
+            out.push_str("value=");
+            push_uint(out, hll.estimate());
         }
         MetricKind::SetMembers(_) => {
             return Err(CodecError::Malformed(
@@ -988,14 +991,21 @@ mod tests {
         assert!(out.contains("page.views value=1"), "got: {out}");
     }
 
+    /// `Set` is real now (`docs/plans/lossless-transit.md`'s W2) -- its estimate renders as an
+    /// unsigned `value` field, closing the "no line-protocol encoding" error this test used to
+    /// pin (see git history for the pre-W2 version of this test, `set_metrics_are_skipped_not_
+    /// fatal`; `set_members_has_no_line_protocol_encoding_yet` below still pins the still-raw
+    /// `SetMembers` kind's own error).
     #[test]
-    fn set_metrics_are_skipped_not_fatal() {
+    fn set_metrics_render_their_hyperloglog_estimate() {
+        let mut hll = logit_core::HyperLogLog::default();
+        hll.insert(b"a");
+        hll.insert(b"b");
         let out = encode(vec![
-            metric_event("unique.users", MetricKind::Set(logit_core::HyperLogLog::default()), &[]),
+            metric_event("unique.users", MetricKind::Set(hll), &[]),
             metric_event("page.views", MetricKind::counter(1.0), &[]),
         ]);
-        // The Set line is dropped; the Counter line alongside it still comes through.
-        assert!(!out.contains("unique.users"), "got: {out}");
+        assert!(out.contains("unique.users value=2u"), "got: {out}");
         assert!(out.contains("page.views value=1"), "got: {out}");
     }
 
@@ -1241,8 +1251,14 @@ mod tests {
     /// metric sharing an event with a good one must not take the good one down too.
     #[test]
     fn a_bad_metric_skips_only_itself_not_the_rest_of_its_event() {
-        let mut event =
-            metric_event("unique.users", MetricKind::Set(logit_core::HyperLogLog::default()), &[]);
+        // `SetMembers`, not `Set` -- `Set` renders now (`set_metrics_render_their_hyperloglog_
+        // estimate` above); `SetMembers` is still raw, unsummarized data with no line-protocol
+        // encoding.
+        let mut event = metric_event(
+            "unique.users",
+            MetricKind::SetMembers(vec![bytes::Bytes::from_static(b"a")]),
+            &[],
+        );
         event.metrics.push(MetricRecord::new(
             logit_core::interner::intern("page.views"),
             MetricKind::counter(1.0),

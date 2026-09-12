@@ -465,6 +465,44 @@ would predict is a sign of a leak (each series' name/tags never repeating) worth
 `max_retained_gauge_series` is undersized for this pipeline's actual gauge cardinality, and deltas
 are silently resolving against 0 as a result.
 
+## Raw samples and set members
+
+By default, `aggregate` summarizes a raw `Samples`/`SetMembers` series the moment it absorbs it —
+sketched into a `DdSketch` (`distributions: sketch`) or estimated into a `HyperLogLog`
+(`sets: estimate`) — so no raw observation ever survives past the window. Two config keys per pair
+opt into keeping the raw data instead, for a `statsd_in -> aggregate -> statsd_out` relay (or any
+consumer downstream) that wants the individual values or the exact member set rather than a
+summary: `distributions: samples` retains raw values for the whole window, bounded by
+`max_samples_per_series` (default `1000`); `sets: members` retains an exact, deduplicated member
+set, bounded by `max_set_members_per_series` (default `1000`). See the field doc comments in the
+schema (`logit schema`) for the exact semantics; all four fields are additive and optional, so no
+existing config needs updating to keep validating.
+
+**Both raw modes fall back to their summarized counterpart, never drop data.** Growing past either
+cap converts what's held (plus the record that tripped the cap) into a sketch or a fresh
+`HyperLogLog` and counts it, rather than dropping the overflow or growing the accumulator
+unboundedly — the same DoS/memory-guard role `max_retained_gauge_series` plays for gauge retention.
+`distributions: samples` has a second fallback trigger a raw member set can't: an incoming record's
+`sample_rate` disagreeing with the series' first one, since a `samples`-mode accumulator can only
+ever report one rate for the whole series, and there's no correct single rate to pick between two
+that disagree.
+
+**What to watch:** `logit.transform.samples.fallback{reason="cap"|"rate_mismatch"}` and
+`logit.transform.set_members.fallback{reason="cap"}` (count) — either firing at a sustained rate
+means the configured cap is undersized for this pipeline's actual per-window sample/member volume,
+so `distributions`/`sets` is spending real memory retaining raw data that keeps getting thrown away
+anyway; the matching throttled diagnostics (`samples_cap_exceeded`, `samples_rate_mismatch`,
+`set_members_cap_exceeded`) name which series and why. `logit.transform.samples.weight_clamped`
+(count) — a `sample_rate` implying a weight beyond `Samples::MAX_WEIGHT` (1000, i.e. `@0.001`) was
+clamped rather than extrapolated without bound; fires in both `distributions` modes (the sketch-mode
+absorb and the `samples`-mode fallback's own re-sketch), and also on `statsd_in`'s own copy of this
+diagnostic until W3 removes it, so a `statsd_in -> aggregate` pipeline reports it twice today.
+
+Neither raw mode changes tumbling: a `Samples`/`SetMembers`/`Set` series never survives a flush,
+even with `gauge_retention` set — retention exists specifically for a gauge's sticky-value
+semantics, which nothing about a raw sample or set member shares (see
+[ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s amendment).
+
 ## `otlp_in`: put `keep` in front of it
 
 `otlp_in`'s attribute *keys* are arbitrary peer-supplied strings, not something `logit`'s own

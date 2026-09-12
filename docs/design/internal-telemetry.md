@@ -497,7 +497,14 @@ Worked examples, one per shipped component:
   `GaugeDelta` opened a brand-new series and resolved against 0.0, statsd's own rule for an
   unseeded gauge, but indistinguishable from a real 0.0 without this). The last two also each fire
   a throttled `logit.component.diagnostics{key="gauge_retention_full"|"gauge_delta_unseeded"}`
-  point via the `Diagnostics` bridge.
+  point via the `Diagnostics` bridge. Absorbing raw kinds (`docs/adr/aggregation-window-semantics.md`'s
+  "raw samples and set members" amendment) adds `logit.transform.samples.fallback{reason="rate_mismatch"|"cap"}`
+  and `logit.transform.set_members.fallback{reason="cap"}` (count -- a `samples`/`members`-mode
+  series gave up raw retention and became a sketch/estimate), and
+  `logit.transform.samples.weight_clamped` (count -- a sample rate implied more than
+  `Samples::MAX_WEIGHT` observations per value), each mirrored through a throttled diagnostic
+  (`samples_rate_mismatch`, `samples_cap_exceeded`, `set_members_cap_exceeded`,
+  `sample_rate_clamped`).
 - `kv_metrics` (`crates/logit-transforms/src/kv_metrics.rs`): `logit.transform.derived{metric_
   kind}` / `.derived.skipped{metric_kind}` — makes the documented silent-skip path (a missing or
   non-numeric field, deliberately never a diagnostic) visible as a rate instead of invisible.

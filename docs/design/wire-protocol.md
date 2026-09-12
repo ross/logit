@@ -254,7 +254,7 @@ with no interpretable value can't be meaningfully carried forward.
 | 3 | `Samples` | `uvarint(n)` + `n` × `f64` LE values + `sample_rate: f64` LE |
 | 4 | `Distribution` | `DdSketch::to_java_bytes()`'s blob, verbatim — the only lossless view the wrapped sketch crate exposes |
 | 5 | `SetMembers` | `uvarint(n)` + `n` × (`uvarint(len)` + member bytes) |
-| 6 | `Set` | empty (0 bytes) — `HyperLogLog` is still a stub with no cardinality state to serialize; the tag alone preserves the metric's identity |
+| 6 | `Set` | `HyperLogLog::to_bytes()`'s blob, verbatim — the wrapped `cardinality_estimator::CardinalityEstimator`'s own `serde` form, driven through a small hand-rolled byte codec and canonicalized (the representation tag's low 2 bits only) so two estimators holding the same members serialize identically regardless of allocation address; pinned to this crate's `cardinality-estimator` dependency version, not a portable interchange format like `Distribution`'s `to_java_bytes` |
 | 7 | `Histogram` | `uvarint(n)` + `n` × (`bound: f64` LE + `count: uvarint`) + `temporality: u8` + `sum`/`min`/`max`, each an `Option<f64>` (presence byte, then `f64` LE if present) |
 | 8 | `ExponentialHistogram` | `scale: ivarint` + `zero_count: uvarint` + `zero_threshold: f64` LE + `positive` buckets (`offset: ivarint` + `uvarint(n)` + `n` × `uvarint` counts) + `negative` buckets (same shape) + `temporality: u8` + `count: uvarint` + `sum`/`min`/`max` (`Option<f64>` each) |
 | 9 | `Summary` | `uvarint(n)` + `n` × (`quantile: f64` LE + `value: f64` LE) + `count: uvarint` + `sum: f64` LE |

@@ -458,6 +458,15 @@
             "type"
           ],
           "properties": {
+            "distributions": {
+              "description": "Whether a raw `Samples` series (statsd `ms`/`h`/`d`, no producer until W3) absorbs into this window as a sketch (the default -- exact, error-bounded quantiles, no raw values retained past the window) or keeps its raw observations for the whole window, only falling back to a sketch when `max_samples_per_series` is exceeded or an incoming record's `sample_rate` disagrees with the series' first one (that fallback is counted, see `docs/adr/aggregation-window-semantics.md`'s amendment). Raw retention is the lossless-transit option (`docs/adr/lossless-transit.md`): a downstream `logit` re-sketching the same samples with a different accuracy target, or a sink that wants the individual values, only has that choice available when this is `samples`.",
+              "default": "sketch",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Distributions"
+                }
+              ]
+            },
             "gauge_retention": {
               "description": "How many consecutive windows a gauge series with no new data is retained past its last update, so a relative gauge adjustment (`docs/adr/relative-gauge-adjustments.md`) arriving in a later window can still resolve against the value it last held. `0` disables retention entirely -- every gauge series is drained every window exactly like a counter, matching this field's absence before it existed. See the `docs/adr/aggregation-window-semantics.md` amendment for the full design.",
               "default": 5,
@@ -474,6 +483,29 @@
               "type": "integer",
               "format": "uint",
               "minimum": 0.0
+            },
+            "max_samples_per_series": {
+              "description": "A hard cap on how many raw values one `Samples` series may retain in one window before `distributions: samples` falls back to sketching what it already holds -- a DoS/memory guard, not a tuning knob, the same role `max_retained_gauge_series` plays for gauges. Meaningless when `distributions` is `sketch` (the default), since nothing raw is ever retained in that mode.",
+              "default": 1000,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "max_set_members_per_series": {
+              "description": "A hard cap on how many distinct members one `SetMembers` series may retain in one window before `sets: members` falls back to a `HyperLogLog` estimate -- a DoS/memory guard, the same role `max_samples_per_series` plays for raw samples. Meaningless when `sets` is `estimate` (the default).",
+              "default": 1000,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "sets": {
+              "description": "Whether a raw `SetMembers` series (statsd `s`, no producer until W3) absorbs into this window as a `HyperLogLog` cardinality estimate (the default) or keeps its exact, deduplicated member set for the whole window, only falling back to an estimate when `max_set_members_per_series` is exceeded (counted, see the amendment). Exact retention is the lossless-transit option: an exact member count/list only survives the window when this is `members`.",
+              "default": "estimate",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Sets"
+                }
+              ]
             },
             "type": {
               "type": "string",
@@ -1464,6 +1496,25 @@
       },
       "additionalProperties": false
     },
+    "Distributions": {
+      "description": "[`ComponentKind::Aggregate`]'s `distributions` field -- whether a raw `Samples` series (statsd `ms`/`h`/`d`) absorbs as a sketch or keeps its raw values for the window. See that field's own doc comment.",
+      "oneOf": [
+        {
+          "description": "Sketch every value on absorb (`DdSketch::add_weighted`) -- no raw samples survive past the window. The right default: bounded memory regardless of how many samples a series sees.",
+          "type": "string",
+          "enum": [
+            "sketch"
+          ]
+        },
+        {
+          "description": "Keep raw values for the whole window (bounded by `max_samples_per_series`), only sketching on overflow or a sample-rate mismatch.",
+          "type": "string",
+          "enum": [
+            "samples"
+          ]
+        }
+      ]
+    },
     "InternalLogs": {
       "description": "[`ComponentKind::Internal`]'s `logs` field -- see its own doc comment.",
       "oneOf": [
@@ -1722,6 +1773,25 @@
         },
         {
           "type": "string"
+        }
+      ]
+    },
+    "Sets": {
+      "description": "[`ComponentKind::Aggregate`]'s `sets` field -- whether a raw `SetMembers` series (statsd `s`) absorbs as a `HyperLogLog` estimate or keeps its exact member set for the window. See that field's own doc comment.",
+      "oneOf": [
+        {
+          "description": "Insert every member into a `HyperLogLog` on absorb -- no exact member set survives past the window. The right default: bounded memory regardless of how many distinct members a series sees.",
+          "type": "string",
+          "enum": [
+            "estimate"
+          ]
+        },
+        {
+          "description": "Keep the exact, deduplicated member set for the whole window (bounded by `max_set_members_per_series`), only falling back to an estimate on overflow.",
+          "type": "string",
+          "enum": [
+            "members"
+          ]
         }
       ]
     },

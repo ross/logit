@@ -205,7 +205,7 @@ pub enum MetricKind {
     Samples(Samples),                     // raw observations, e.g. statsd ms/h/d -- no producer until W3
     Distribution(DdSketch),               // produced only by `aggregate`, merging a run of Samples
     SetMembers(Vec<bytes::Bytes>),        // raw set members, e.g. statsd s -- no producer until W3
-    Set(HyperLogLog),                     // produced only by `aggregate`; still a stub
+    Set(HyperLogLog),                     // produced only by `aggregate`, merging a run of SetMembers
     Histogram(Histogram),                 // fixed, explicit bucket bounds
     ExponentialHistogram(ExpHistogram),   // OTLP/Prometheus base-2 exponential bucketing, kept
                                            // distinct so otlp_in -> otlp_out is a fixed point
@@ -310,10 +310,18 @@ temporality and monotonicity on `Sum`, sum/count/min/max on `Histogram`/`Exponen
   error bound. Plain reservoir sampling or naive percentile-of-percentiles does not merge correctly
   — merging two nodes' p99s is not the p99 of the merged data — so DDSketch is load-bearing for the
   whole distributed-aggregation story, not a nice-to-have. `Samples` (raw statsd `ms`/`h`/`d`
-  observations) is what `aggregate` sketches into a `Distribution` — no producer until W3.
-- `Set` uses a **HyperLogLog**, which merges (union) exactly by construction. `SetMembers` (raw
-  statsd `s` members) is `Set`'s own raw counterpart, same relationship as `Samples`/`Distribution`
-  — no producer until W3.
+  observations) is what `aggregate` sketches into a `Distribution` — no *producer* until W3, but a
+  real absorb rule since W2 (above).
+- `Set` uses a **HyperLogLog** (wrapping the `cardinality-estimator` crate), which merges (union)
+  exactly by construction. `SetMembers` (raw statsd `s` members) is `Set`'s own raw counterpart,
+  same relationship as `Samples`/`Distribution` — no *producer* until W3 (`statsd_in` still decodes
+  straight to `Distribution`/errors on `s`), but `aggregate` (W2) now really absorbs both raw pairs:
+  a `Samples` series sketches into a `Distribution` by default (or retains raw values under
+  `distributions: samples`, bounded by a cap), and a `SetMembers` series estimates into a `Set` by
+  default (or retains an exact deduplicated member set under `sets: members`, bounded by a cap) —
+  see [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment for
+  the full design, including the fallback rule each raw mode's cap (or, for `distributions: samples`,
+  a `sample_rate` mismatch) triggers.
 - `Sum`/`Gauge` merge trivially (sum / last-write-wins by timestamp) for the delta-monotonic case
   `MetricKind::counter` produces; a cumulative or non-monotonic `Sum` has no merge rule defined
   here and passes through unmerged, the same as `Histogram`/`ExponentialHistogram`/`Summary`.

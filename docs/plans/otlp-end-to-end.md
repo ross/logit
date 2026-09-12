@@ -214,11 +214,11 @@ preferring the number, falling back to text. Traces are near-total (`trace_state
 | `Histogram{buckets}` | `Histogram{DELTA}` | exact |
 | `Summary{quantiles}` | `Summary` | `count`/`sum` have no source → `0`/`0.0`, documented |
 | `Distribution(DdSketch)` | `Summary` of 5 fixed quantiles (p50/p75/p90/p95/p99) | **Lossy, deliberately** — `DDSketch` exposes no bin iteration to convert to OTLP's `ExponentialHistogram`. Counted: `logit.output.metrics.degraded{metric_kind="distribution"}`. |
-| `Set(HyperLogLog)` | **skipped** | The stub has no cardinality to read, matching `influxdb.rs`'s existing precedent. Counted: `logit.output.metrics.skipped{metric_kind="set"}`. |
+| `Set(HyperLogLog)` | **skipped** | OTLP has no cardinality-estimate wire type (the estimator itself is real since ADR `metrics-model-v2`'s W2 amendment). Counted: `logit.output.metrics.skipped{metric_kind="set"}`. |
 
 Both rows are a real, if narrow, qualification of [ADR `native-wire-format-with-otlp-bridge`](../adr/native-wire-format-with-otlp-bridge.md)'s
 claim that the internal model "must be a superset of what OTLP can express" — here it's `logit`'s
-own model (a mergeable sketch, a cardinality stub) that can't be losslessly re-expressed *as* OTLP,
+own model (a mergeable sketch, a cardinality estimate) that can't be losslessly re-expressed *as* OTLP,
 the direction ADR `native-wire-format-with-otlp-bridge` didn't anticipate. Decode: `Sum` monotonic + `DELTA` → `Counter`; `Sum`
 monotonic + `CUMULATIVE` → `Gauge` with an `otel.temporality` attribute (summing a running total
 would be wrong; **since retired** — `Sum`/`Histogram`/`ExponentialHistogram` temporality rides a

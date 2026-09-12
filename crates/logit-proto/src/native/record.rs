@@ -366,14 +366,13 @@ fn write_metric_kind(out: &mut BytesMut, kind: &MetricKind) {
             write_uvarint(out, tmp.len() as u64);
             out.extend_from_slice(&tmp);
         }
-        // `HyperLogLog` is still a stub with no cardinality to serialize
-        // (`crates/logit-core/src/metric.rs`) -- the tag alone is enough to preserve the metric's
-        // *identity* (name/unit/timestamp survive), unlike OTLP's encoder, which drops the whole
-        // record (`docs/known-gaps.md`'s cross-protocol-semantic-gaps entry). Once `HyperLogLog`
-        // carries real state, its bytes go here the same way `Distribution`'s blob does.
-        MetricKind::Set(_) => {
+        MetricKind::Set(hll) => {
+            // `HyperLogLog::to_bytes()`'s blob, the same shape `Distribution`'s
+            // `DdSketch::to_java_bytes()` blob takes -- see `crates/logit-core/src/metric.rs`.
+            let blob = hll.to_bytes();
             out.extend_from_slice(&[METRIC_SET]);
-            write_uvarint(out, 0);
+            write_uvarint(out, blob.len() as u64);
+            out.extend_from_slice(&blob);
         }
         MetricKind::Histogram(h) => {
             let mut tmp = BytesMut::new();
@@ -469,7 +468,11 @@ fn read_metric_kind(bytes: &mut Bytes) -> Result<MetricKind, CodecError> {
             }
             MetricKind::SetMembers(members)
         }
-        METRIC_SET => MetricKind::Set(HyperLogLog::default()),
+        METRIC_SET => {
+            let hll = HyperLogLog::from_bytes(&body)
+                .map_err(|e| CodecError::Malformed(format!("bad set blob: {e}")))?;
+            MetricKind::Set(hll)
+        }
         METRIC_HISTOGRAM => {
             let count = read_uvarint(&mut body)? as usize;
             let mut buckets = Vec::with_capacity(count.min(4096));
@@ -1290,7 +1293,12 @@ mod tests {
                 bytes::Bytes::from_static(b"alice"),
                 bytes::Bytes::from_static(b"bob"),
             ]),
-            MetricKind::Set(HyperLogLog::default()),
+            MetricKind::Set({
+                let mut hll = HyperLogLog::new();
+                hll.insert(b"alice");
+                hll.insert(b"bob");
+                hll
+            }),
             MetricKind::Histogram(Histogram {
                 buckets: vec![(1.0, 2), (2.0, 5)],
                 temporality: Temporality::Cumulative,
