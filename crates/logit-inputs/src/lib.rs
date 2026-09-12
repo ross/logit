@@ -10,6 +10,7 @@ pub mod docker;
 pub mod internal;
 pub mod logit;
 pub mod otlp;
+pub mod prometheus;
 pub mod statsd;
 pub mod syslog;
 pub mod tail;
