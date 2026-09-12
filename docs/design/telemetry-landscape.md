@@ -183,8 +183,9 @@ their own, but a receiver that can't verify/decrypt has nothing further to parse
   rejects a type not present in its configured `types.db`, or a value count that doesn't match that
   type's declared data-source count. `escape_slashes` turns a literal `/` into `_` in every identity
   string, since several collectd write plugins treat these fields as filesystem-adjacent.
-  `DATA_MAX_NAME_LEN` is 128 bytes (127 plus the trailing NUL); `parse_part_string` rejects the whole
-  packet if a string part overflows that bound or lacks its terminating NUL.
+  `DATA_MAX_NAME_LEN` is 128 bytes (127 plus the trailing NUL); `parse_part_string` fails, and the
+  parser abandons the rest of the packet (value lists already dispatched from earlier parts stand), if a
+  string part overflows that bound or lacks its terminating NUL.
 
 ### Graphite
 
