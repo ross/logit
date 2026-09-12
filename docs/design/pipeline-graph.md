@@ -174,7 +174,7 @@ the tag's literal argument string instead of failing.
 
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
-| Listener (`statsd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`) | must be empty | required (≥1 consumer) |
+| Listener (`statsd_in`, `collectd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `prometheus_out`) | ≥1 required | must not be |
 
@@ -236,8 +236,8 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` — a config error, not
     something to clamp silently.
 17. A non-default `receive:` block is rejected on any kind that is not a **datagram listener**
-    (`docs/adr/decoupled-listener-io.md`, `statsd_in`/`syslog_in`) or a **tail listener**
-    (`docs/adr/file-tailing-and-docker-json-logs.md`, `tail_in`/`docker_in`). Deliberately not
+    (`docs/adr/decoupled-listener-io.md`, `statsd_in`/`collectd_in`/`syslog_in`) or a **tail
+    listener** (`docs/adr/file-tailing-and-docker-json-logs.md`, `tail_in`/`docker_in`). Deliberately not
     "any non-listener": `internal` is a listener by role but has no socket, no queue, and no
     decoder, so `receive:` on it would be exactly the silently-ignored-setting failure rule 14
     guards against on the sink side. A tail listener has no receive *queue* at all (the tailed

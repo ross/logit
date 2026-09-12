@@ -7,18 +7,19 @@
 //! does every mapping, sanitization, and packing decision (that module's own doc is the spec for
 //! all of it -- decode/encode tables, sanitization rules, permitted normalizations), and this
 //! module is only the thin transport wrapper around it: [`CollectdOutput`] owns the socket, hands
-//! the encoder a batch, and turns its already-packed [`logit_proto::collectd::Packets`] into UDP
+//! the encoder a batch, and turns its already-packed [`logit_proto::MessageBuf`]`<usize>` into UDP
 //! sends. **The codec emits every metric/tag/identity counter and diagnostic itself** (it holds its
 //! own [`Telemetry`]/[`Diagnostics`], fed by this sink's own builders below) -- this module adds
 //! only the transport-level counters a socket send can produce that the codec has no way to know
 //! about: total bytes, request timing, datagrams actually written, and an `EMSGSIZE` drop.
 //!
-//! **This does not implement `logit_proto::Encoder`**, for the identical reason
-//! `statsd_out`/`syslog_out`/`prometheus_out` don't -- see `crate::statsd`'s module doc and the ADR's
-//! "No `logit_proto::Encoder`" section. [`logit_proto::collectd::CollectdEncoder::encode_into`]
-//! fills a [`Packets`] with datagram boundaries already decided (the codec's own packing loop,
-//! elision, and `max_packet_bytes` cap), so this sink's only remaining job is one `send_to` per
-//! datagram already built.
+//! **This implements [`logit_proto::FramedEncoder`], not `logit_proto::Encoder`** -- the identical
+//! reason `statsd_out`/`syslog_out`/`prometheus_out`'s encoders do too (`crate::statsd`'s module
+//! doc, ADR `framed-encoder`). [`logit_proto::collectd::CollectdEncoder::encode_into`] fills a
+//! [`logit_proto::MessageBuf`]`<usize>` with datagram boundaries already decided (the codec's own
+//! packing loop, elision, and `max_packet_bytes` cap -- encoder state, per the trait, rather than a
+//! per-call argument), so this sink's only remaining job is one `send_to` per datagram already
+//! built.
 //!
 //! ## Config
 //!
@@ -34,9 +35,9 @@
 //! ## Packing
 //!
 //! Entirely the codec's job (`CollectdEncoder::encode_into`'s own doc): this sink calls it once per
-//! batch and then just walks the resulting [`Packets`], one `send_to` per already-packed datagram.
-//! Unlike `statsd_out`, there is no live packing-against-a-cap in the send path at all -- the
-//! datagram boundaries are fixed before this module ever touches a socket.
+//! batch and then just walks the resulting [`logit_proto::MessageBuf`]`<usize>`, one `send_to` per
+//! already-packed datagram. Unlike `statsd_out`, there is no live packing-against-a-cap in the send
+//! path at all -- the datagram boundaries are fixed before this module ever touches a socket.
 //!
 //! ## Faults
 //!
@@ -54,10 +55,10 @@
 //! `logit.output.batch.bytes` (total bytes across every datagram in the batch, emitted only when
 //! there is something to send), `logit.output.request.duration` (one timer per `send` call that
 //! actually touches the socket), `logit.output.requests{class="ok"|"error"}`,
-//! `logit.output.messages` (value lists actually sent -- the per-datagram list count
-//! [`Packets`] carries, summed), `logit.output.datagrams` (datagrams actually sent), and
-//! `logit.output.messages.dropped{reason="oversize_datagram"}` plus a throttled
-//! `oversize_datagram` diagnostic for the `EMSGSIZE` case above.
+//! `logit.output.messages` (value lists actually sent -- the per-datagram list count each
+//! [`logit_proto::MessageBuf`] entry's `usize` meta carries, summed), `logit.output.datagrams`
+//! (datagrams actually sent), and `logit.output.messages.dropped{reason="oversize_datagram"}` plus
+//! a throttled `oversize_datagram` diagnostic for the `EMSGSIZE` case above.
 //!
 //! ## Duplicate safety
 //!
@@ -69,7 +70,8 @@
 use anyhow::Context;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::{Fault, Output};
-use logit_proto::collectd::{CollectdEncoder, Packets, DEFAULT_MAX_PACKET_BYTES};
+use logit_proto::collectd::{CollectdEncoder, DEFAULT_MAX_PACKET_BYTES};
+use logit_proto::{FramedEncoder, MessageBuf};
 use tokio::net::{lookup_host, UdpSocket};
 
 /// `logit_pipeline::Output` for `collectd_out`. Built via [`CollectdOutput::udp`] -- never a bare
@@ -78,9 +80,9 @@ pub struct CollectdOutput {
     endpoint: String,
     socket: UdpSocket,
     encoder: CollectdEncoder,
-    max_packet_bytes: usize,
-    /// Reused across `send` calls: the codec's own packing buffer, one entry per datagram.
-    packets: Packets,
+    /// Reused across `send` calls: the codec's own packing buffer, one entry per datagram, whose
+    /// `usize` meta is that datagram's value-list count.
+    buf: MessageBuf<usize>,
     diag: Diagnostics,
     telemetry: Telemetry,
 }
@@ -98,9 +100,11 @@ impl CollectdOutput {
         Ok(Self {
             endpoint: endpoint.into(),
             socket,
-            encoder: CollectdEncoder::new(),
-            max_packet_bytes: DEFAULT_MAX_PACKET_BYTES,
-            packets: Packets::default(),
+            // UDP only, always -- unlike `StatsdEncoder`'s uncapped `usize::MAX` default (shared
+            // with a TCP transport that has no datagram to overflow), `collectd_out` has no TCP
+            // branch at all, so its own default datagram cap applies unconditionally.
+            encoder: CollectdEncoder::new().with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES),
+            buf: MessageBuf::default(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
         })
@@ -111,8 +115,13 @@ impl CollectdOutput {
         self
     }
 
+    /// Forwards straight to the encoder -- [`CollectdEncoder::with_max_packet_bytes`] is encoder
+    /// state now ([`FramedEncoder`]'s one `encode_into` signature has no room for a per-call cap),
+    /// so this sink has no cap of its own to keep in sync. Call after
+    /// [`CollectdOutput::with_encoder`] if both are used together, so the cap lands on the encoder
+    /// that is actually kept.
     pub fn with_max_packet_bytes(mut self, max_packet_bytes: usize) -> Self {
-        self.max_packet_bytes = max_packet_bytes;
+        self.encoder = self.encoder.with_max_packet_bytes(max_packet_bytes);
         self
     }
 
@@ -142,18 +151,18 @@ impl Output for CollectdOutput {
         // Discarded: every counter/diagnostic this produces, the encoder has already emitted
         // itself through the `Telemetry`/`Diagnostics` handles `with_telemetry`/`with_diagnostics`
         // fed it -- this module's doc, "Telemetry".
-        self.encoder.encode_into(batch, self.max_packet_bytes, &mut self.packets);
+        self.encoder.encode_into(batch, &mut self.buf);
 
-        if self.packets.is_empty() {
+        if self.buf.is_empty() {
             return Ok(());
         }
 
-        self.telemetry.count("logit.output.batch.bytes", self.packets.total_bytes() as f64, &[]);
+        self.telemetry.count("logit.output.batch.bytes", self.buf.total_bytes() as f64, &[]);
         let request_timer = self.telemetry.timer("logit.output.request.duration");
         let result = Self::send_udp(
             &self.socket,
             &self.endpoint,
-            &self.packets,
+            &self.buf,
             &mut self.diag,
             &self.telemetry,
         )
@@ -182,14 +191,14 @@ impl Output for CollectdOutput {
 }
 
 impl CollectdOutput {
-    /// Sends every already-packed datagram in `packets`, one `send_to` per datagram -- no packing
+    /// Sends every already-packed datagram in `buf`, one `send_to` per datagram -- no packing
     /// decision left to make here, unlike `StatsdOutput::send_udp`: `CollectdEncoder::encode_into`
-    /// already chose every datagram boundary against `max_packet_bytes`. Returns `(value lists
-    /// sent, datagrams sent)`.
+    /// already chose every datagram boundary against its own `max_packet_bytes`. Returns `(value
+    /// lists sent, datagrams sent)`.
     async fn send_udp(
         socket: &UdpSocket,
         endpoint: &str,
-        packets: &Packets,
+        buf: &MessageBuf<usize>,
         diag: &mut Diagnostics,
         telemetry: &Telemetry,
     ) -> anyhow::Result<(usize, usize)> {
@@ -206,7 +215,8 @@ impl CollectdOutput {
 
         let mut messages = 0usize;
         let mut datagrams = 0usize;
-        for (bytes, lists) in packets.iter() {
+        for (bytes, lists) in buf.iter_with() {
+            let lists = *lists;
             match socket.send_to(bytes, addr).await {
                 Ok(_) => {
                     messages += lists;
@@ -220,9 +230,7 @@ impl CollectdOutput {
                     );
                     diag.warn_throttled(
                         "oversize_datagram",
-                        format_args!(
-                            "collectd_out: packed datagram too large for one send: {err}"
-                        ),
+                        format_args!("collectd_out: packed datagram too large for one send: {err}"),
                     );
                 }
                 Err(err) => {
@@ -251,7 +259,9 @@ mod tests {
         AttrMap, BodyFormat, Event, LogRecord, MetricKind, MetricRecord, Registry, Resource, Sum,
         Temporality, Value,
     };
-    use logit_proto::collectd::{CollectdDecoder, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_TYPE};
+    use logit_proto::collectd::{
+        CollectdDecoder, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_TYPE,
+    };
     use logit_proto::Decoder;
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -333,17 +343,18 @@ mod tests {
         })
     }
 
-    /// The summed value of every counter point named `metric`, regardless of tags. Drains, so call
-    /// once per metric of interest (or after the batch under test is done sending).
-    fn metric_sum(registry: &Registry, metric: &str) -> f64 {
-        registry
-            .drain(0)
-            .into_iter()
-            .flat_map(|e| e.metrics)
+    /// The summed value of every counter point named `metric` in an already-drained `events`,
+    /// regardless of tags. Takes the drained slice rather than the `Registry` itself -- `drain`
+    /// empties the registry, so computing this for several metrics needs one shared drain, not
+    /// one per metric (each of which would find nothing after the first).
+    fn metric_sum(events: &[Event], metric: &str) -> f64 {
+        events
+            .iter()
+            .flat_map(|e| &e.metrics)
             .filter(|m| logit_core::interner::resolve(m.name) == metric)
-            .map(|m| match m.kind {
+            .map(|m| match &m.kind {
                 MetricKind::Sum(s) => s.value,
-                _ => panic!("{metric} must be a counter"),
+                other => panic!("{metric} must be a counter, got {other:?}"),
             })
             .sum()
     }
@@ -393,13 +404,11 @@ mod tests {
         let recv_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let mut got = Vec::new();
-            loop {
-                match tokio::time::timeout(Duration::from_millis(300), collector.recv_from(&mut buf))
+            while let Ok(Ok((n, _))) =
+                tokio::time::timeout(Duration::from_millis(300), collector.recv_from(&mut buf))
                     .await
-                {
-                    Ok(Ok((n, _))) => got.push(buf[..n].to_vec()),
-                    _ => break,
-                }
+            {
+                got.push(buf[..n].to_vec());
             }
             got
         });
@@ -475,10 +484,12 @@ mod tests {
         output.send(&batch).await.expect("send should succeed");
         tokio::time::timeout(Duration::from_secs(2), recv_task).await.unwrap().unwrap();
 
-        assert!(metric_sum(&registry, "logit.output.batch.bytes") > 0.0);
-        assert_eq!(metric_sum(&registry, "logit.output.messages"), 1.0);
-        assert_eq!(metric_sum(&registry, "logit.output.datagrams"), 1.0);
-        assert_eq!(metric_sum(&registry, "logit.output.requests"), 1.0);
+        // One shared drain: `metric_sum` reads an already-drained slice for exactly this reason.
+        let events = registry.drain(0);
+        assert!(metric_sum(&events, "logit.output.batch.bytes") > 0.0);
+        assert_eq!(metric_sum(&events, "logit.output.messages"), 1.0);
+        assert_eq!(metric_sum(&events, "logit.output.datagrams"), 1.0);
+        assert_eq!(metric_sum(&events, "logit.output.requests"), 1.0);
     }
 
     #[tokio::test]
@@ -500,8 +511,11 @@ mod tests {
     async fn a_no_host_diagnostic_is_reported_through_the_shared_diagnostics_handle() {
         let registry = Registry::new();
         let diag_registry = Registry::new();
-        let diag = Diagnostics::new("out")
-            .with_telemetry(diag_registry.telemetry_for("out/diag", "collectd_out", "sink"));
+        let diag = Diagnostics::new("out").with_telemetry(diag_registry.telemetry_for(
+            "out/diag",
+            "collectd_out",
+            "sink",
+        ));
         let mut output = CollectdOutput::udp("127.0.0.1:1")
             .unwrap()
             .with_telemetry(registry.telemetry_for("out", "collectd_out", "sink"))

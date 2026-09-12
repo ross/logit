@@ -8,17 +8,17 @@
 //! is the decision record; [`docs/plans/collectd-binary-relay.md`](../../../../docs/plans/collectd-binary-relay.md)
 //! is the workstream plan.
 //!
-//! **No [`crate::Encoder`]/[`crate::Decoder`] pair, only [`crate::Decoder`]**, for the reason
-//! `statsd_out`/`syslog_out`/`prometheus_out` have no `Encoder` either
-//! (`crates/logit-outputs/src/statsd.rs`'s module doc, ADR `statsd-output` §"No
-//! `logit_proto::Encoder`"): that trait is `fn encode(&mut self, &EventBatch) -> Result<Bytes, _>`
-//! -- one opaque buffer per batch, with no framing metadata -- and collectd egress genuinely needs
-//! per-*datagram* boundaries, since the receiver resets its sticky identity state at every datagram
-//! edge and a `max_packet_bytes` cap decides where those edges fall. [`CollectdEncoder::encode_into`]
-//! fills a [`Packets`] instead: one contiguous buffer, one range per datagram, plus the value-list
-//! count each datagram carries (what `collectd_out` needs to attribute an `EMSGSIZE` drop to the
-//! right number of metrics). The decode direction has no such problem -- one datagram in, N events
-//! out -- so [`CollectdDecoder`] is an ordinary [`crate::Decoder`].
+//! [`CollectdEncoder`] **implements [`crate::FramedEncoder`], not [`crate::Encoder`]** (ADR
+//! `framed-encoder`), for the reason `statsd_out`/`syslog_out`/`prometheus_out`'s encoders do too
+//! (`crates/logit-outputs/src/statsd.rs`'s module doc): `Encoder` is `fn encode(&mut self,
+//! &EventBatch) -> Result<Bytes, _>` -- one opaque buffer per batch, with no framing metadata --
+//! and collectd egress genuinely needs per-*datagram* boundaries, since the receiver resets its
+//! sticky identity state at every datagram edge and a `max_packet_bytes` cap decides where those
+//! edges fall. [`CollectdEncoder::encode_into`] fills a [`crate::MessageBuf`]`<usize>` instead: one
+//! entry per datagram, whose `usize` meta is the value-list count that datagram carries (what
+//! `collectd_out` needs to attribute an `EMSGSIZE` drop to the right number of metrics). The
+//! decode direction has no such problem -- one datagram in, N events out -- so [`CollectdDecoder`]
+//! is an ordinary [`crate::Decoder`].
 //!
 //! ## Wire shape, in one paragraph
 //!
@@ -51,7 +51,9 @@
 //! | Values with an empty host, plugin or type | list skipped, nothing pushed | `incomplete_identity` (collectd's own receiver rejects the same list with `-EINVAL`) |
 //! | TimeHR (2⁻³⁰ s) / Time (s) / neither | `Event::timestamp` = [`cdtime_to_nanos`] / `s * 1e9` / `received_at` | -- (collectd rejects a `time == 0` list; this codec observes rather than rejects, so a timeless list is stamped with receipt time like every other `logit` input) |
 //! | IntervalHR / Interval | `collectd.interval` = `F64` seconds (`cdtime / 2³⁰`, exact); `0` → absent | -- |
-//! | record name | `<plugin>.<type>` for a one-data-source list, `<plugin>.<type>.<i>` (0-based) otherwise | -- (W2 resolves `<ds_name>` from an operator-supplied `types.db`; names are display/cross-protocol only -- like-relay fidelity rides on the attributes, the `MetricList` order and the kinds, never on the name) |
+//! | record name, no `types_db` configured or the list's type not in it | `<plugin>.<type>` for a one-data-source list, `<plugin>.<type>.<i>` (0-based) otherwise | -- (a type missing from `types.db` is routine, not a misconfiguration) |
+//! | record name, the list's type resolved in [`types_db`] with a matching data-source count **and** kinds | `<plugin>.<type>` for a one-data-source type (the lone data source, conventionally `value`, is omitted -- collectd's own `write_graphite` default), `<plugin>.<type>.<ds_name>` otherwise | -- |
+//! | record name, the type resolved but its count or kinds disagree with the wire | index naming, as above | `types_db_mismatch` -- the configured file is not the one the sender is running against, and naming from it would label a real measurement wrongly |
 //! | a part whose `len` is `< 4`, runs past the datagram, a string part with no NUL terminator, a numeric part not 12 bytes, a Values part where `len != 6 + 9 * count`, `count == 0`, `count > `[`MAX_VALUES_PER_LIST`], or an unknown data-source type byte | the rest of the datagram is abandoned; events already decoded from it are **kept** | `bad_part` when something was already decoded, else `CodecError::Malformed` (the listener's own `bad_datagram`) |
 //! | `0x0200` Signature | skipped by length, **unverified** | -- (`docs/known-gaps.md`) |
 //! | `0x0210` Encryption | the rest of the datagram is dropped | `encrypted_packet_dropped` |
@@ -62,6 +64,12 @@
 //! the [`logit_core::Scope`] is always `None`: a per-host resource would look tidier but
 //! `logit_pipeline::BatchAccumulator::absorb` keys accumulation on `Arc::ptr_eq`, so minting one per
 //! datagram would split every batch by sender. The host rides on `collectd.host` instead.
+//!
+//! **Record names are display/cross-protocol only.** `collectd_out` re-encodes a list from the
+//! `collectd.*` attributes, the `MetricList`'s order and each record's kind, and never reads the
+//! name -- so a pipeline with no `types_db:`, one with a stale file, and one with the sender's own
+//! file all relay the same bytes. What the names change is what an InfluxDB/Prometheus/statsd sink
+//! calls the series, which is the whole reason to configure [`types_db`] at all.
 //!
 //! ## Encode: events → datagrams
 //!
@@ -91,6 +99,7 @@
 //! | `collectd.*` identity of any other `Value` type | treated as absent | `logit.output.tags.dropped{reason="unrepresentable"}` |
 //! | every attribute outside the `collectd.` namespace | dropped -- collectd has no tag concept at all, and `host.name` is counted here too even though the host resolution above reads it | `logit.output.tags.dropped{reason="no_wire_form"}`, once per attribute per event |
 //! | plugin or type empty after sanitizing | the list is dropped | `logit.output.metrics.skipped{reason="empty_name"}` |
+//! | a like-relay event carrying more than [`MAX_VALUES_PER_LIST`] records | the list is dropped whole | `logit.output.metrics.skipped{reason="too_many_values"}` + diag `too_many_values`. The cap is pair-wide: a longer list fits comfortably under the byte cap, but the decode side of this very codec rejects it as a malformed part -- and that abandons every unrelated list packed behind it in the same datagram. `aggregate`/`kv_metrics` can both put far more than 64 records on one event. |
 //! | a list that alone exceeds `max_packet_bytes` | dropped whole, never split | `logit.output.metrics.skipped{reason="oversize_value_list"}` + diag `oversize_value_list` |
 //! | an event with no metrics at all (a log- or span-only event) | skipped | [`EncodeStats::skipped_no_metrics`] (no counter of its own -- nothing was lost, there was nothing to send) |
 //! | `MetricRecord`'s `unit`, `description`, `start_timestamp`, `exemplars`; `EventBatch::scope`; `Resource::schema_url` | dropped | none; `docs/known-gaps.md` rows -- the protocol has no field for any of them |
@@ -150,9 +159,11 @@
 pub mod decode;
 pub mod encode;
 pub mod part;
+pub mod types_db;
 
 pub use decode::CollectdDecoder;
-pub use encode::{CollectdEncoder, EncodeStats, Packets};
+pub use encode::{CollectdEncoder, EncodeStats};
+pub use types_db::{DataSource, DsKind, TypesDb, TypesDbError};
 
 /// collectd's own default `network` plugin port, for both the listener and the sink.
 pub const DEFAULT_PORT: u16 = 25826;
@@ -173,11 +184,24 @@ pub const DATA_MAX_NAME_LEN: usize = 128;
 /// constant.
 pub const NOTIF_MAX_MSG_LEN: usize = 256;
 
-/// The most data sources this codec will accept in one Values part. collectd's own wire format
-/// allows up to `(65535 - 6) / 9 = 7281`, but nothing real comes close (`if_octets` has 2, `load`
-/// 3, `disk_io_time` 2), and the cap is what bounds both the decoder's per-part work and the record
-/// names a hostile sender can force into the process-wide interner (`docs/design/memory.md` §4). A
-/// list over the cap is a malformed part, not a truncated one -- see this module's decode table.
+/// The most data sources this codec will read or write in one Values part. collectd's own wire
+/// format allows up to `(65535 - 6) / 9 = 7281`, but nothing real comes close (`load` has 3,
+/// `if_octets` 2, `disk_io_time` 2).
+///
+/// A **pair-wide** cap, not a decode-side one. Over it, a Values part is malformed on decode (the
+/// rest of the datagram is abandoned, not truncated -- see this module's decode table), and on
+/// encode the list is dropped whole and counted
+/// `logit.output.metrics.skipped{reason="too_many_values"}`: a longer list would sail under the
+/// byte cap only for a receiver running this same codec to reject it, taking every unrelated list
+/// packed behind it in that datagram with it.
+///
+/// What it bounds is the decoder's per-part work and the per-list record-name suffix fan-out
+/// (`<plugin>.<type>.<i>`). It is deliberately **not** a bound on interner growth: the unbounded
+/// axis there is distinct `<plugin>`/`<type>` strings, which the decoder caps in neither count nor
+/// length, and a fresh Plugin part plus a one-value list mints a new interned name for ~21 wire
+/// bytes whatever this constant is. That exposure is exactly the one `statsd_in` already has --
+/// wire-chosen metric names, accepted on `docs/design/memory.md` §4's "listeners are private"
+/// premise.
 pub const MAX_VALUES_PER_LIST: usize = 64;
 
 /// The wire Host. See this module doc's well-known-attribute table.

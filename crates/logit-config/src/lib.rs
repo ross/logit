@@ -16,6 +16,7 @@
 use schemars::{gen::SchemaGenerator, schema::Schema, JsonSchema};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -271,6 +272,33 @@ fn default_span_sample_rate() -> f64 {
 pub enum ComponentKind {
     /// statsd / DogStatsD-style tagged metrics over UDP.
     StatsdIn { bind: String },
+    /// collectd's binary "`network` plugin" protocol over UDP
+    /// (`docs/adr/collectd-binary-relay.md`; `crates/logit-inputs/src/collectd.rs` is the
+    /// listener, `crates/logit-proto/src/collectd/` the codec).
+    ///
+    /// `bind` is an ordinary `host:port` -- collectd's own default port is `25826`. When its
+    /// address is a **multicast group** (collectd's defaults are `239.192.74.66` and
+    /// `ff18::efc0:4a42`), the shared UDP listener sets `SO_REUSEADDR`, binds the unspecified
+    /// address on that port and joins the group on the default interface. There is deliberately no
+    /// `multicast:` field: the address already says it. Because the socket is bound to the
+    /// unspecified address rather than to the group, such a listener **also** accepts ordinary
+    /// unicast datagrams sent to that port from any source -- joining a group is additive, not a
+    /// filter that narrows what else the port receives.
+    ///
+    /// `types_db` names zero or more collectd `types.db` files (relative paths resolve against the
+    /// config file's directory), read at startup and merged in order -- a later file overrides an
+    /// earlier one. They only supply **data-source names**: a list whose type resolves with a
+    /// matching data-source count and kinds is named `<plugin>.<type>.<ds_name>` rather than
+    /// `<plugin>.<type>.<i>` (a single-data-source list is `<plugin>.<type>` either way). A
+    /// missing or unparseable file fails startup. Names are display/cross-protocol only --
+    /// `collectd_out` re-encodes from the `collectd.*` attributes, so this setting never changes
+    /// what a `collectd_in -> collectd_out` relay puts back on the wire. collectd's own `types.db`
+    /// is GPL-licensed and is not shipped with `logit`; point this at the installed copy.
+    CollectdIn {
+        bind: String,
+        #[serde(default)]
+        types_db: Vec<PathBuf>,
+    },
     /// RFC 3164 / RFC 5424 syslog over UDP. **Not** TCP, despite this doc comment's old claim --
     /// `crates/logit-inputs/src/syslog.rs`'s own module doc has always said UDP-only (nginx's
     /// `syslog:` writer is UDP-only, so a TCP accept loop would buy this listener nothing;
@@ -2678,6 +2706,44 @@ mod tests {
                 assert_eq!(attributes.get("status"), Some(&SetValue::I64(200)), "not F64");
             }
             other => panic!("expected HasAttributes, got {other:?}"),
+        }
+    }
+
+    /// `types_db` is optional -- a `collectd_in` with only a `bind` is the common case, and gets
+    /// index-named records.
+    #[test]
+    fn collectd_in_component_defaults_types_db_to_empty() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "collectd_in", "bind": "0.0.0.0:25826"}"#).unwrap();
+        match component.kind {
+            ComponentKind::CollectdIn { bind, types_db } => {
+                assert_eq!(bind, "0.0.0.0:25826");
+                assert!(types_db.is_empty(), "types_db defaults to no files at all");
+            }
+            other => panic!("expected CollectdIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collectd_in_component_parses_a_types_db_list_in_order() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "collectd_in", "bind": "239.192.74.66:25826",
+                "types_db": ["/usr/share/collectd/types.db", "local-types.db"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::CollectdIn { bind, types_db } => {
+                assert_eq!(bind, "239.192.74.66:25826", "a multicast group is an ordinary bind");
+                assert_eq!(
+                    types_db,
+                    vec![
+                        PathBuf::from("/usr/share/collectd/types.db"),
+                        PathBuf::from("local-types.db"),
+                    ],
+                    "order matters: a later file overrides an earlier one"
+                );
+            }
+            other => panic!("expected CollectdIn, got {other:?}"),
         }
     }
 

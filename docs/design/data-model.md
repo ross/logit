@@ -207,10 +207,20 @@ Two model-side rules follow from that table rather than from any one attribute. 
 carrying N data sources becomes **one** event whose `metrics` holds N `MetricRecord`s in wire order
 (`logit_core::MetricList` is a `SmallVec` inlined at 1, so the common single-source list costs
 nothing extra) — not N events, which is what lets it be re-encoded as the same single list. And the
-record names are display/cross-protocol only: `<plugin>.<type>` for a single-source list,
-`<plugin>.<type>.<i>` (0-based) otherwise, with W2 resolving `<ds_name>` from an operator-supplied
-`types.db`. Like-relay fidelity rides on the attributes, the `MetricList` order and the metric
-kinds, never on the name.
+record names are **display/cross-protocol only**: like-relay fidelity rides on the attributes, the
+`MetricList` order and the metric kinds, never on the name, so every rule below changes what an
+InfluxDB/Prometheus/statsd sink calls the series and nothing about what `collectd_out` puts back on
+the wire. The wire itself carries no data-source names, so the naming rule is:
+
+| The list's `collectd.type` | Record name |
+|---|---|
+| resolved in an operator-supplied `types.db` (`collectd_in`'s `types_db:`) with a matching data-source **count and kinds**, single-source | `<plugin>.<type>` — the lone data source (conventionally `value`) is omitted, collectd's own `write_graphite` default |
+| resolved likewise, multi-source | `<plugin>.<type>.<ds_name>` (`load.load.shortterm`) |
+| resolved, but its data-source count or kinds disagree with the wire | index naming, plus a throttled `types_db_mismatch` diagnostic — the configured file is not the one the sender is running against |
+| not in the configured files, or no `types_db:` configured at all | index naming, no diagnostic: a type missing from `types.db` is routine |
+
+Index naming is `<plugin>.<type>` for a single-source list and `<plugin>.<type>.<i>` (0-based)
+otherwise.
 
 `tail_in`/`docker_in` (`crates/logit-inputs/src/tail/`, `crates/logit-inputs/src/docker.rs`,
 [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)) stamp two
@@ -442,16 +452,27 @@ either bloat every event or fight the ownership model:
 
 ## Codecs
 
-Every input and output is a codec against this model:
+Every input and output is a codec against this model. Listeners implement one decoder trait;
+sinks implement whichever of three encoder shapes their wire format is:
 
 ```rust
 trait Decoder { fn decode(&mut self, bytes: Bytes) -> Result<EventBatch>; }
+
+// One opaque blob per batch: the native protocol, InfluxDB line protocol, stdio/file.
 trait Encoder { fn encode(&mut self, batch: &EventBatch) -> Result<Bytes>; }
+// One payload per signal: OTLP, whose logs/metrics/traces are three RPCs.
+trait SignalEncoder { fn encode_signals(&mut self, batch: &EventBatch) -> Result<Vec<(Signal, Bytes)>>; }
+// N framed messages per batch, never failing, per-message drops counted: syslog, statsd.
+trait FramedEncoder { type Meta; type Stats; fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf<Self::Meta>) -> Self::Stats; }
 ```
 
-statsd, syslog, collectd, OTLP, and the native protocol
-([docs/design/wire-protocol.md](wire-protocol.md)) are all just implementations of these two
-traits — OTLP has no special status in the core, per [ADR `native-wire-format-with-otlp-bridge`](../adr/native-wire-format-with-otlp-bridge.md).
+statsd, syslog, OTLP, and the native protocol ([docs/design/wire-protocol.md](wire-protocol.md))
+are all just implementations of these traits — which shape a codec gets is decided by what its
+transport needs to frame, not by the protocol's importance
+([ADR `framed-encoder`](../adr/framed-encoder.md)), and OTLP has no special status in the core,
+per [ADR `native-wire-format-with-otlp-bridge`](../adr/native-wire-format-with-otlp-bridge.md).
+(`prometheus` is the one pair outside them: a scrape client and a registry rendered on demand,
+[ADR `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md).)
 [ADR `lossless-transit`](../adr/lossless-transit.md) generalizes this from OTLP specifically to
 every protocol `logit` ships an `_in`/`_out` pair for: the model has to be a strict superset of
 what each of them can express, or that codec's own relay becomes lossy. See

@@ -11,8 +11,9 @@ New ADR checklist: copy `TEMPLATE.md` to `docs/adr/<slug>.md`, fill in `created`
 
 | ADR | Created | Updated |
 |---|---|---|
+| [`FramedEncoder`: a third codec trait for sinks that need per-message framing, over a shared `MessageBuf`](framed-encoder.md) | 2026-09-12 | 2026-09-12 |
 | [collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder](collectd-binary-relay.md) | 2026-09-12 | 2026-09-12 |
-| [Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping](prometheus-scrape-and-exposition.md) | 2026-09-11 | 2026-09-11 |
+| [Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping](prometheus-scrape-and-exposition.md) | 2026-09-11 | 2026-09-12 |
 | [RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission](syslog-structured-data-convention.md) | 2026-09-11 | 2026-09-11 |
 | [Metrics model v2: `Sum` replaces `Counter`, raw/summarized pairs, boxed span fidelity, batch-level `Scope`](metrics-model-v2.md) | 2026-09-11 | 2026-09-12 |
 | [A shared build cache and one-container check execution for the local development loop](fast-local-development-loop.md) | 2026-09-11 | 2026-09-11 |
@@ -42,7 +43,7 @@ New ADR checklist: copy `TEMPLATE.md` to `docs/adr/<slug>.md`, fill in `created`
 | [Operator-declared resource attributes: a `set` transform, not a per-input config field](operator-declared-resource-attributes.md) | 2026-09-03 | 2026-09-03 |
 | [`otlp_out`/`otlp_in` gzip: client never accepts a compressed response, server bounds decompressed size](otlp-compression-and-decompression-bounds.md) | 2026-09-03 | 2026-09-03 |
 | [Signal filtering is two transform components, not a sink field](signal-filtering-components.md) | 2026-09-03 | 2026-09-03 |
-| [Syslog egress: format, transport, and header-field precedence](syslog-output.md) | 2026-09-02 | 2026-09-11 |
+| [Syslog egress: format, transport, and header-field precedence](syslog-output.md) | 2026-09-02 | 2026-09-12 |
 | [Relative gauge adjustments (`+`/`-` in statsd)](relative-gauge-adjustments.md) | 2026-09-02 | 2026-09-11 |
 | [Internal span emission, one span per node-visit, and deterministic-on-`trace_id` sampling](internal-span-emission-and-deterministic-sampling.md) | 2026-09-02 | 2026-09-02 |
 | [Hand-rolled unary gRPC over `hyper`, not `tonic`](hand-rolled-grpc-over-hyper.md) | 2026-09-02 | 2026-09-02 |
