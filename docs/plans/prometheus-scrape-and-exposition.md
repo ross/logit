@@ -46,9 +46,14 @@ text syntax:
   FamilyType, help, unit, series: Vec<Series> }`, `Series { labels, point: Point, timestamp,
   created, exemplars }`, `Point::{Counter | Gauge | Histogram | Summary | Info | StateSet |
   Unknown}`, plus the two conversions `families_to_events(&[MetricFamily], received_at, resource)
-  -> Vec<Event>` and `events_to_families(...)` (model ↔ families) — the full field-by-field mapping
-  is in the ADR's "Model mapping" tables. A future `remote_write.rs` maps prompb messages to and
-  from this same `MetricFamily`, so nothing in the model mapping changes when that lands.
+  -> Vec<Event>` and `events_to_families(&[(&Resource, &Event)]) -> Vec<MetricFamily>` (model ↔
+  families) — the full field-by-field mapping is in the ADR's "Model mapping" tables.
+  `events_to_families` merges each pair internally via `logit_core::attrs::merged` (moved there
+  from `logit-outputs`, pub instead of `pub(crate)`, re-exported from its old path — see the ADR's
+  "Where the resource⊕event label merge lives" note) rather than requiring the caller to pre-merge,
+  since `logit-proto` cannot depend on `logit-outputs` for it. A future `remote_write.rs` maps
+  prompb messages to and from this same `MetricFamily`, so nothing in the model mapping changes
+  when that lands.
 - `text.rs` — parser and writer for both dialects (`enum Dialect { Text0_0_4, OpenMetrics1_0 }`):
   `parse(bytes, dialect) -> Result<Vec<MetricFamily>, CodecError>`, `write(&[MetricFamily],
   dialect, &mut Vec<u8>)`. It has to get the dialect differences exactly right: OpenMetrics
@@ -59,8 +64,12 @@ text syntax:
   0.0.4 has `untyped`, which OpenMetrics lacks. Escaping follows each dialect's own grammar for
   `HELP` text and label values; special floats (`+Inf`/`-Inf`/`NaN`) render and parse in both
   directions (Rust's own `f64` formatter writes lowercase `inf`, which needs a special case).
-  Timestamps parse through `logit_core::time::parse_decimal_nanos` (digit-exact), never through an
-  `f64` intermediate, to avoid floating-point rounding on a value that's supposed to be exact.
+  Timestamps parse through `logit_core::time::parse_decimal_nanos` (digit-exact) for the plain
+  `DIGIT+[.DIGIT*]` form every writer emits; OpenMetrics's own `realnumber` grammar additionally
+  permits a leading sign and an exponent (and negative timestamps are legal), which
+  `parse_decimal_nanos` rejects by design (it has no sign or exponent handling) — a timestamp using
+  either falls back to ordinary `f64` parsing instead of failing the whole scrape, accepting the
+  small rounding a signed/exponent form was never guaranteed to avoid in the first place.
 - No `SignalDecoder`/`SignalEncoder` implementation. Like `syslog_out`/`statsd_out`
   ([ADR `statsd-output`](../adr/statsd-output.md)'s "No `logit_proto::Encoder`" section), both
   `prometheus_in` and `prometheus_out` are stateful in a way a stateless per-batch trait can't
@@ -68,9 +77,10 @@ text syntax:
   with `with_telemetry`/`with_diagnostics` builders, mirroring
   [`crates/logit-outputs/src/statsd.rs`](../../crates/logit-outputs/src/statsd.rs).
 
-The full decode and encode mapping tables, the four `prometheus.*` well-known attributes, the name/
-label sanitization rule, and the list of permitted normalizations for this pair are in the ADR and
-are not repeated here — this plan only orders the work that implements them.
+The full decode and encode mapping tables, the well-known attributes (an unprefixed `instance` plus
+two consumed `prometheus.*` attributes), the name/label sanitization rule, and the list of
+permitted normalizations for this pair are in the ADR and are not repeated here — this plan only
+orders the work that implements them.
 
 ### 2. `prometheus_in`
 
@@ -89,11 +99,13 @@ requests), built on a `reqwest` client promoted into `logit-inputs`.
 - Each tick scrapes every configured target concurrently, sending an `Accept` header that lists
   both dialects (OpenMetrics preferred, text 0.0.4 as fallback, matching Prometheus's own scraper),
   capping response size, and choosing the parse dialect from the response's `Content-Type`. One
-  `EventBatch` per target per tick goes out, carrying a per-target resource
-  (`prometheus.instance`, `prometheus.target`) built once when the input starts. A failed scrape
-  still emits a batch — with `up=0` and the two scrape-stat gauges the ADR names — rather than
-  emitting nothing, so a target going down is itself observable through the pipeline like anything
-  else.
+  `EventBatch` per target per tick goes out, carrying a per-target resource (an unprefixed
+  `instance` — `host:port` — and `prometheus.target`, the full scrape URL) built once when the
+  input starts; `instance` is a plain resource attribute, not `prometheus`-namespaced, since
+  `prometheus_out` renders every resource attribute as a label and this one needs no special-casing
+  to reach the exposed series (see the ADR's "Attribute conventions"). A failed scrape still emits
+  a batch — with `up=0` and the two scrape-stat gauges the ADR names — rather than emitting
+  nothing, so a target going down is itself observable through the pipeline like anything else.
 - Telemetry counters classify each scrape outcome (`&'static str` tags only, per this repo's
   cardinality convention — see the ADR's "Synthetic scrape metrics" section for why the target
   itself can never be a tag value) and record scrape duration and sample counts; diagnostics report
@@ -132,7 +144,10 @@ the registry on demand when scraped.
   [`crates/logit-transforms/src/aggregate.rs`](../../crates/logit-transforms/src/aggregate.rs)'s
   gauge-retention cap already uses). `buffer:` composes unchanged, as a sibling of `kind`. The
   future remote-write sender is an optional `endpoint:` field, additive and mutually exclusive with
-  `bind` by graph rule. No server-side TLS in v1 — tracked as a known gap alongside `admin:`'s own.
+  `bind` by graph rule. No TLS and no auth in v1 — the sink serves its whole registry to any client
+  that connects to `bind:` with no credential check, so the runnable example for this pair binds
+  `127.0.0.1` rather than `0.0.0.0` (see the ADR's "Security posture" note); tracked as a known gap
+  alongside `admin:`'s own no-TLS/no-auth entry.
 - State: an `Arc<Mutex<Registry>>` of families keyed by name, each holding series keyed by their
   sorted label set. `send` converts the batch through `events_to_families` and replaces each
   series — cumulative semantics, latest write wins, exactly the ADR's "Exposition state and
@@ -170,12 +185,33 @@ time in nanoseconds — the restart-detection signal Prometheus and OTLP both ex
 cumulative counter's `start_timestamp`/`_created`.
 
 This state is bounded by generalizing the same two mechanisms that already bound retained-gauge
-state (retention duration and a maximum retained-series count) rather than inventing a second
-bounding scheme for this one mode — renamed from their gauge-specific names to
-`series_retention`/`max_retained_series` now that they bound more than gauges, with
-`demo/`/`examples/` and the existing config tests in
+state (a windows-count TTL and a maximum retained-series count — `gauge_retention` is a `u32`
+count of consecutive idle flush windows, not a duration, per
+[ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md); the rename below
+keeps that type) rather than inventing a second bounding scheme for this one mode — renamed from
+their gauge-specific names to `series_retention`/`max_retained_series` now that they bound more
+than gauges, with `demo/`/`examples/` and the existing config tests in
 [`crates/logit-config/src/lib.rs`](../../crates/logit-config/src/lib.rs) updated for the rename.
-Every eviction is counted, distinguishing cardinality pressure from ordinary expiry.
+Every eviction is counted, distinguishing cardinality pressure from a series aging out under the
+windows-count TTL — `logit.transform.series.evicted{reason="cardinality"|"idle"}`, keeping the
+existing `idle` reason name `gauge_retention` eviction already uses rather than introducing a
+second name for the same TTL concept now that it also applies to cumulative accumulators.
+Reconciling two cumulative accumulations of the same series whose histogram bucket boundaries
+don't match between one flush and the next (an upstream exporter changed its bucket layout
+mid-stream) is a distinct failure from either eviction path — counted
+`logit.transform.metrics.degraded{reason="histogram_bounds_mismatch"}`, keeping the newer
+accumulation's boundaries and discarding the mismatched buckets from the older one, rather than
+silently merging counts that don't line up.
+
+`series_retention: 0` means "drained every window," exactly like `gauge_retention: 0` does today —
+which is a contradiction under `temporality: cumulative`: the mode is defined as the accumulator
+surviving flush, and a retention of zero windows would silently degrade every flush to emitting a
+per-window delta mislabeled `Cumulative`, with nothing in config or at runtime saying so. A graph
+rule closes this: `temporality: cumulative` requires both `series_retention >= 1` and
+`max_retained_series >= 1` (a cap of zero would evict every series the instant it's retained,
+which is the same contradiction from the other knob) — numbered rule 39 in
+[`crates/logit-pipeline/src/graph.rs`](../../crates/logit-pipeline/src/graph.rs)'s validation list
+as part of the W4 workstream.
 
 This amends [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md): its
 original objection to cumulative counters was that there was no way to detect a series restarting
@@ -207,7 +243,7 @@ text-format one.
 | W1 | **Codec:** `logit-proto/src/prometheus/{mod,text}.rs`, both dialects, decode+encode, the shared distribution-quantile constant, telemetry counters; inline tests drawn from the exposition-format docs' and the OpenMetrics spec's own examples; a codec-level fixed-point test (`families -> events -> families`, and byte-level `write(parse(x)) == canonical(x)` over a fixture set plus a property-based grammar generator); `docs/design/data-model.md`'s well-known-attribute rows; `docs/known-gaps.md` cross-protocol rows. | W0 |
 | W2 | **`prometheus_in`:** input, config variant, graph rules, registry arm, the `reqwest` dependency, unit tests against a canned server, a runnable example config, regenerated schema, `docs/design/pipeline-graph.md`'s arity table and rules. | W1 |
 | W3 | **`prometheus_out` + `Output::bind`:** the runtime hook, the sink, config, graph rules, registry arm, unit tests, regenerated schema, `docs/design/pipeline-graph.md`'s lifecycle note. | W1 (parallel with W2) |
-| W4 | **`aggregate` cumulative mode:** config, accumulators, the retention-mechanism rename and generalization, the ADR amendment, tests. | — (parallel with W1–W3; touches different files) |
+| W4 | **`aggregate` cumulative mode:** config, accumulators, the retention-mechanism rename and generalization, the ADR amendment, tests. | — (parallel with W1–W3 by dependency ordering, not file disjointness — W2/W3/W4 all edit `ComponentKind` in `crates/logit-config/src/lib.rs` and regenerate `schema/logit.schema.json`; merges resolve the overlap) |
 | W5 | **Integration and closeout:** an end-to-end test — a canned server through `prometheus_in` through `prometheus_out` to a scrape request, byte-exact in both dialects against fixtures; a `statsd_in -> aggregate(cumulative) -> prometheus_out` case; an `internal -> aggregate(cumulative) -> prometheus_out` case; allocation-count benchmark cases with `docs/design/memory.md` rows; a runnable relay example config; `AGENTS.md`'s current-state paragraph; `docs/known-gaps.md` follow-ups (remote-write, UTF-8 names, TLS on `prometheus_out`, native histograms, histogram `min`/`max`, `otel_scope_*` labels). | W2, W3, W4 |
 
 Landing order: W0 → (W1, W4) → (W2, W3) → W5.
@@ -220,7 +256,9 @@ Landing order: W0 → (W1, W4) → (W2, W3) → W5.
 - W1: the codec's fixed-point tests pass for every fixture drawn from the exposition-format docs
   and the OpenMetrics spec's own examples.
 - W2/W3: the unit tests described above pass; `logit validate` accepts the new example configs.
-- W5: the end-to-end round-trip test is byte-exact in both dialects; `type_sizes.rs` and
+- W5: the end-to-end round-trip test is byte-exact in both dialects modulo the permitted
+  normalizations in the ADR (including the three synthetic families excluded from the comparison
+  by name); `type_sizes.rs` and
   `allocations.rs`'s exact-equality assertions either hold unchanged or are updated together with
   `docs/design/memory.md` in the same commit, per `AGENTS.md`'s own rule for those two files; a
   manual smoke test runs the relay example against a canned `/metrics` file served over plain HTTP
