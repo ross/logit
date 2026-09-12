@@ -275,3 +275,91 @@ fn lua_table_to_value(table: Table) -> mlua::Result<Value> {
         }
     }
 }
+
+/// W9: a repeated DogStatsD tag key decodes to a `team: Value::Array` attribute
+/// (`crates/logit-inputs/src/statsd.rs`'s `insert_tags`) -- these exercise the two functions
+/// above (`value_to_lua`, `lua_table_to_value`) the way a script actually sees them, end to end
+/// through [`crate::ScriptWorker`], rather than calling either directly.
+#[cfg(test)]
+mod array_attribute_tests {
+    use super::*;
+    use crate::{ProcessOutcome, ScriptWorker};
+    use logit_core::Event;
+
+    fn worker(source: &str) -> ScriptWorker {
+        ScriptWorker::new(source).expect("script should load")
+    }
+
+    fn emitted(outcome: ProcessOutcome) -> Event {
+        match outcome {
+            ProcessOutcome::Emit(e) => *e,
+            _ => panic!("expected Emit"),
+        }
+    }
+
+    fn event_with_team(team: Value) -> Event {
+        let mut attrs = AttrMap::new();
+        attrs.insert("team", team);
+        Event::empty(0, attrs)
+    }
+
+    #[test]
+    fn a_multi_valued_array_attribute_is_seen_as_a_two_element_1_based_table() {
+        let w = worker(
+            r#"
+            function process(event)
+                assert(#event.attributes.team == 2, "expected 2 elements")
+                assert(event.attributes.team[1] == "a", "expected element 1 to be a")
+                assert(event.attributes.team[2] == "b", "expected element 2 to be b")
+                return event
+            end
+            "#,
+        );
+        let event = event_with_team(Value::Array(vec![Value::str("a"), Value::str("b")]));
+        // A failed `assert()` inside the script surfaces as a Lua runtime error, so a plain
+        // `.unwrap()` here is itself the assertion that every check above passed.
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(
+            out.attributes.get("team"),
+            Some(&Value::Array(vec![Value::str("a"), Value::str("b")]))
+        );
+    }
+
+    #[test]
+    fn an_untouched_read_write_round_trip_keeps_the_array_and_its_elements() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.team = event.attributes.team
+                return event
+            end
+            "#,
+        );
+        let event = event_with_team(Value::Array(vec![Value::str("a"), Value::str("b")]));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(
+            out.attributes.get("team"),
+            Some(&Value::Array(vec![Value::str("a"), Value::str("b")]))
+        );
+    }
+
+    #[test]
+    fn a_mixed_bool_and_str_array_keeps_each_elements_own_type_through_a_round_trip() {
+        let w = worker(
+            r#"
+            function process(event)
+                assert(event.attributes.team[1] == true, "expected element 1 to be true")
+                assert(event.attributes.team[2] == "1", "expected element 2 to be the string 1")
+                event.attributes.team = event.attributes.team
+                return event
+            end
+            "#,
+        );
+        let event = event_with_team(Value::Array(vec![Value::Bool(true), Value::str("1")]));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(
+            out.attributes.get("team"),
+            Some(&Value::Array(vec![Value::Bool(true), Value::str("1")]))
+        );
+    }
+}

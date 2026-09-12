@@ -1299,6 +1299,16 @@ mod tests {
         assert!(out.contains(r#"nested={k="v"}"#), "got: {out}");
     }
 
+    /// W9: a relayed multi-valued statsd tag (`team: Array[Str("a"), Str("b")]`) renders through
+    /// the existing `Array` arm, one bracketed comma-separated list in array order.
+    #[test]
+    fn a_multi_valued_statsd_tag_attribute_renders_as_a_bracketed_list() {
+        let mut event = Event::empty(0, AttrMap::new());
+        event.attributes.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
+        let out = encode(vec![event]);
+        assert!(out.contains(r#"team=["a", "b"]"#), "got: {out}");
+    }
+
     #[test]
     fn a_quoted_string_escapes_special_characters() {
         let mut event = Event::empty(0, AttrMap::new());

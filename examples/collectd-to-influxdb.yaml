@@ -1,0 +1,105 @@
+# collectd's binary `network` protocol in, InfluxDB 2.x out -- the cross-protocol half of ADR
+# `collectd-binary-relay` (docs/adr/collectd-binary-relay.md). Point an existing collectd fleet's
+# `<Plugin network> Server "<this host>" "25826" </Plugin>` at it and every value list those hosts
+# already collect lands in InfluxDB, with no collectd-side change beyond that one block. This is
+# the deliberately *lossy* direction: the ADR's like-for-like `collectd_in -> collectd_out` pair
+# (collectd in, collectd back out, byte-for-byte modulo a named normalization list) is what
+# preserves everything listed below, and it needs the `collectd_out` sink rather than this one.
+#
+# Matches the `influxdb` service seeded by compose.yaml for local testing. Config is a flat graph of
+# components (docs/design/pipeline-graph.md, docs/adr/component-graph-configuration.md): each names
+# its own `sources`, rather than sitting in a fixed inputs/transforms/outputs pipeline. `token:
+# !env INFLUXDB_TOKEN` below pulls the token from the environment rather than inlining a secret in
+# the file (docs/adr/env-yaml-tag.md) -- any field on any component can use `!env` the same way.
+#
+# **No `aggregate` here, unlike examples/statsd-to-influxdb.yaml.** That is the one real difference
+# between the two topologies, and it is not an oversight: statsd is a firehose of individual
+# samples that has to be summarized into a window before a time-series database is a sane
+# destination, whereas collectd has already done the summarizing -- every value list is one
+# pre-aggregated reading per `Interval` (1s..10s, typically 10s), carrying its own timestamp. An
+# `aggregate` here would re-window already-windowed data and re-stamp it with the flush time, which
+# is how a 10s CPU average quietly becomes a 10s average of 10s averages. Add one only if the
+# incoming interval is genuinely finer than what you want stored, and then say so in a comment.
+#
+# What this topology drops or degrades on the way to InfluxDB (a `collectd_in -> collectd_out`
+# like-relay keeps all of it):
+#
+#   * the `collectd.*` attributes -- host, plugin, plugin_instance, type, type_instance, interval --
+#     become ordinary InfluxDB **tags**, one per attribute. They still identify the series; they are
+#     no longer the wire identity a collectd receiver would reconstruct.
+#   * a multi-data-source value list becomes **N separate measurements**, one per data source, named
+#     `plugin.type.ds` (`load.load.shortterm`, `interface.if_octets.rx`) -- the one wire-level list
+#     that collectd dispatches atomically arrives in InfluxDB as N points sharing a tag set and a
+#     timestamp. Nothing is lost value-wise; the "these N numbers are one reading" fact is.
+#   * `ds` naming needs `types_db:` below. Without it the same list is `load.load.0/1/2`, which is
+#     stable and correct but not what a collectd operator's dashboards are named after.
+#   * COUNTER/DERIVE/ABSOLUTE all land as InfluxDB fields -- the monotonicity and temporality the
+#     model carries have no InfluxDB representation, so rate/derivative is the query's job.
+components:
+  collectd_in:
+    type: collectd_in
+    # collectd's own default port. `0.0.0.0` accepts unicast from any sender; senders reach it with
+    # `Server "<this host>" "25826"`.
+    bind: 0.0.0.0:25826
+    # A **multicast group** instead, for a fleet configured with a bare `Server "239.192.74.66"`
+    # (collectd's own IPv4 default; `ff18::efc0:4a42` is the IPv6 one). No extra field: a multicast
+    # IP is detected from the address itself, and the listener sets SO_REUSEADDR, binds the
+    # unspecified address on that port and joins the group. Note that joining is additive -- such a
+    # listener still accepts ordinary unicast traffic on the same port.
+    # bind: 239.192.74.66:25826
+    #
+    # Optional, and the one line that changes what series names look like: collectd `types.db`
+    # files, read once at startup, that give each data source in a multi-data-source list its real
+    # name. With this, a `load`/`load` list is `load.load.{shortterm,midterm,longterm}`; without it
+    # the same list is `load.load.{0,1,2}`. Nothing else changes -- not the values, not the tags,
+    # not what a `collectd_out` would put back on the wire. collectd's own types.db is GPL-licensed
+    # and is not shipped with logit: point this at the copy the sending hosts already have.
+    # types_db:
+    #   - /usr/share/collectd/types.db
+    #
+    # Every field below defaults (docs/adr/decoupled-listener-io.md) -- an omitted `receive:`
+    # block is exactly the values shown here, commented out purely as a reference for tuning a
+    # real deployment. `receive:` is meaningful only on a datagram listener (collectd_in, statsd_in,
+    # syslog_in); `logit-pipeline`'s graph validation rejects it on any other component kind.
+    # receive:
+    #   max_datagrams: 10000        # receive-queue depth, in datagrams -- whichever of this or max_bytes trips first
+    #   max_bytes: "32MiB"          # bound on undecoded datagram bytes held in the queue
+    #   overflow: drop_oldest       # block | drop_oldest | drop_newest -- what happens once both bounds are full;
+    #                               # drop_oldest (not buffer:'s block) is the default here on purpose -- blocking a
+    #                               # UDP reader relocates loss into the kernel where nothing counts it
+    #   batch_max_events: 1000      # events accumulated across datagrams before one send downstream; 1 means
+    #                               # one send per datagram, today's pre-ADR `decoupled-listener-io` behavior
+    #   batch_max_bytes: "1MiB"     # the other accumulation bound -- whichever trips first
+    #   batch_flush_interval: 100ms # longest an accumulated batch waits before being sent regardless of size;
+    #                               # 0s disables the timer, leaving the two bounds above as the only trigger
+    #   # receive_buffer_bytes: 8MiB  # SO_RCVBUF, requested at bind -- omitted leaves the kernel default alone
+    #   shutdown_grace: 5s          # how long SIGTERM waits for the receive queue to drain before dropping the rest
+
+  influx_out:
+    type: influxdb_out
+    sources: [collectd_in]
+    url: http://influxdb:8086
+    org: logit
+    bucket: metrics
+    token: !env INFLUXDB_TOKEN
+    # Every field below defaults (docs/adr/buffered-sink-delivery.md) -- an omitted `buffer:`
+    # block is exactly the values shown here, commented out purely as a reference for tuning a
+    # real deployment. `buffer:` is meaningful only on a sink; `logit-pipeline`'s graph validation
+    # rejects it on any other component kind.
+    # buffer:
+    #   max_batches: 1024      # queue depth, in batches -- whichever of this or max_bytes trips first
+    #   max_bytes: "64MiB"     # estimated heap footprint bound -- a quoted string, always (KiB/MiB/GiB or a bare number)
+    #   overflow: block        # block | drop_oldest | drop_newest -- what happens once both bounds are full
+    #   # delivery: at_least_once  # at_least_once | at_most_once -- omitted derives from the sink's own
+    #                              # duplicate_safe() fact (true for influxdb_out's idempotent overwrite)
+    #   retry_budget: 60s      # wall-clock ceiling on retrying one batch before it's dropped
+    #   retry_max_delay: 10s   # backoff cap between retry attempts
+    #   shutdown_grace: 5s     # how long SIGTERM waits for the queue to drain before dropping the rest
+    #   # disk:                        # opt-in durable buffering (docs/adr/disk-backed-sink-buffer.md) --
+    #   #                              # replaces the in-memory queue above, not sized alongside it;
+    #   #                              # max_batches/max_bytes above must stay at their defaults if set
+    #   #   path: spool/influxdb_out   # required, resolved relative to this config file's own directory
+    #   #   max_bytes: "1GiB"          # bound on the sum of on-disk segment sizes
+    #   #   segment_bytes: "64MiB"     # soft rotation trigger, not a hard cap
+    #   #   compression: none          # none | lz4, logit_proto::native's per-frame compression
+    #   #   checkpoint_interval: 1s    # how often the read cursor is persisted during normal operation

@@ -551,3 +551,110 @@ a real `aggregate` window intact, `d:`/`m:` included — `aggregate` absorbs it 
 ordinary gauge (its `MetricKind::Gauge` shape, "last write wins"), with every `statsd.service_check.*`
 carrier riding on the series key alongside the value, the same guarantee this ADR's previous
 amendment already pins for `|T` on an ordinary counter.
+
+## Amendment: a repeated tag key is a multi-value tag, not a collapse
+
+[`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W9 closes the residual-debt item
+this ADR's first amendment recorded and deliberately left untouched: a repeated DogStatsD tag key
+(`#team:a,team:b`) silently collapsing to its last value inside `statsd_in`, before this sink ever
+saw the event. `#` is a **list** of `key[:value]` tokens, not a map — the Datadog agent keeps every
+token and dedupes only *exact* duplicates, so `#team:a,team:b` is two live tags and a query grouping
+by `team` places that point in both the `a` and the `b` group. This amendment restates, rather than
+deletes, the earlier "separate, model-level gap" paragraph below with the fix, matching this ADR's
+existing convention of restating history in each amendment rather than editing it out from under a
+reader following the ADR chronologically.
+
+### A repeated tag key folds into `Value::Array` at decode, not a `statsd_out` fix
+
+`#team:a,team:b` was a model-level gap, not a `statsd_out` one: `AttrMap` is a map, not a multiset,
+so the second `team:b` silently overwrote the first inside `statsd_in` itself, before this sink ever
+saw the event — `x:1|c|#team:a,team:b` relayed as `x:1|c|#team:b`. The fix therefore lands in
+`statsd_in`'s `insert_tags`, not here: a repeated tag key now folds into a
+`logit_core::Value::Array` in wire order (`#team:a,team:b` -> `team: Array[Str("a"), Str("b")]`,
+three occurrences -> three elements), the same fold `syslog_in`'s `insert_param` already applies to
+a repeated RFC 5424 PARAM-NAME (`docs/adr/syslog-structured-data-convention.md`). An *exact*
+duplicate token still dedupes at decode, matching the agent (`#team:a,team:a` -> `Str("a")`,
+`#urgent,urgent` -> `Bool(true)`), and a one-element `Array` is never produced, so a non-repeated
+tag's decoded shape is byte-identical to what it was before this fold existed — every fixture,
+allocation row, and unit test that assumed a plain `Value::Str` keeps passing unchanged. See
+`crates/logit-inputs/src/statsd.rs`'s module doc, "DogStatsD tags" section, for the full decode-side
+account, including the `statsd.*`-carrier-key corner (a tag literally named `statsd.type` can now
+decode to an `Array`, which matches no egress carrier arm and is filtered out uncounted, exactly as
+a wrong-typed carrier already was).
+
+The bare-tag note in "Sanitization" above (`Value::Bool(true)` renders as a bare tag) extends to the mixed
+form: a bare token and a valued one that share a key are not duplicates, and **both forms survive,
+in wire order** — `#urgent,urgent:1` decodes to `urgent: Array[Bool(true), Str("1")]` and
+`statsd_out` re-emits it as `urgent,urgent:1`; the reverse wire order (`#urgent:1,urgent`) round-trips
+as `urgent:1,urgent`.
+
+### `statsd_out` expands an `Array`-valued attribute into one tag per element
+
+`build_tag_suffix`'s single-value body factors into a `push_one_tag` helper, called once per element
+for an `Array`-valued attribute, in array order — deliberately **not** sorted, unlike `syslog_out`'s
+SD-ID/PARAM-NAME canonicalization, which exists only because `AttrMap` order is process-global
+intern order; an `Array` has real order already, so nothing needs canonicalizing. Each element
+renders through the same per-element rules a scalar tag already had: a `Bool(true)` element emits
+the bare form, `Bool(false)` emits `key:false`, everything else renders through `tag_value`, and an
+element `tag_value` can't render (`Null`, `Bytes`, `Timestamp`, `Map`, a nested `Array`) is skipped
+and counted `EncodeStats::tags_dropped_unrepresentable` **per element** rather than per attribute —
+today's unrepresentable-tag path, now finer-grained. An `Array` whose every element drops emits no
+tag and leaves no stray separator. Key and value sanitization stays per element with the existing
+rules; there is no cross-element interaction. Under `format: statsd`, which still drops the whole tag
+segment, `tags_dropped_dialect` now counts once **per element** too — the counter's unit is a wire
+tag, not an attribute.
+
+**`statsd_out` does not dedupe an `Array`'s elements on encode.** Decode is where the agent's
+exact-duplicate rule is applied; encode stays a pure function of the array, so a Lua-authored
+`Array[Str("a"), Str("a")]` emits `k:a,k:a` on the wire — duplicate tags the agent itself would
+dedupe on receipt, not something this sink second-guesses.
+
+**The merged resource⊕event walk has the event's `Array` win whole.** `crate::attrs::merged`
+(`logit-core::attrs`) already has the event's value win *entirely* over a resource-level value on an
+equal key; that rule is unchanged by this amendment and applies to an `Array` exactly as it did to a
+scalar — an event-level `Array` overrides a resource-level scalar completely, and a resource-level
+`Array` is overridden whole by an event-level scalar. There is no element-level union: a
+resource-level tag value was never part of this event's own wire tag list.
+
+### Permitted normalizations, restated for the raw shapes
+
+New to this amendment, alongside the previous amendment's tag-reordering, number-formatting,
+multi-value-line-splitting, and timer-letter normalizations: **exact-duplicate tag dedupe**
+(`#team:a,team:a` -> `#team:a`, `#urgent,urgent` -> `#urgent`) — the destination protocol's own
+stated behaviour, applied once at decode rather than on every downstream consumer. **Element order
+within a folded `Array` is wire order** — the order the repeated tokens appeared on the wire, not
+`AttrMap`'s sorted key order (which governs *between* distinct tag keys, unchanged) — so a relay
+that round-trips a multi-valued tag reproduces the exact token order the sender used.
+
+### Closing test enumeration
+
+`crates/logit-inputs/src/statsd.rs` gained: a repeated tag key folding into an `Array` in wire order
+(`#team:a,team:b` -> `Array[Str("a"), Str("b")]`); an exact duplicate deduping instead of folding
+(`#team:a,team:a` -> `Str("a")`, no `Array`); a bare/valued mix folding in order in both directions
+(`#urgent,urgent:1` and `#urgent:1,urgent`); three occurrences folding into three elements; the same
+fold applying on an event line (`_e{...}|#k:a,k:b`) and a service-check line, since both go through
+`insert_tags`; `a_tag_literally_named_statsd_type_folds_into_an_array_like_any_other`; and an
+extension of `dogstatsd_tag_value_is_a_zero_copy_slice_of_the_datagram`'s structural assertion to cover an
+`Array`'s elements. `crates/logit-outputs/src/statsd.rs` gained: `Array[Str,Str]` rendering
+`|#k:a,k:b`; `Array[Bool(true),Str]` rendering `|#k,k:1`; `Array[I64,I64]` rendering `|#k:1,k:2`;
+per-element sanitization (`a@b` -> `a_b`); `Array[Map]`/`Array[Array]`/`Array[Null]` elements dropped
+and counted per element, with an all-unrepresentable array emitting no tag and no stray comma;
+duplicate elements surviving un-deduped on encode; an event-level `Array` overriding a
+resource-level scalar whole; `format: statsd` counting `tags_dropped_dialect` per element; a
+real-decoder relay round-tripping `#team:a,team:b` byte-for-byte; and the `mod fixed_point`
+proptest's `tags()` generator widened to a 2-element key pool with an `Option<value>` per token, so
+repeats and bare/valued mixes are generated routinely, with `decode_encode_decode_is_a_fixed_point`
+holding unchanged. `crates/logit-outputs/src/influxdb.rs` gained: an `Array` rendering its last
+element and counting `multi_value_tags == 1`; the last element being unrepresentable falling back to
+the previous one; an empty array dropping the tag with no count; and
+`logit.output.tags.normalized` being emitted even when the encoded body is empty.
+`crates/logit-cli/tests/fixtures/statsd/` dropped `repeated-tag-key-collapses-to-last-value.{in,expected}`
+and gained, byte-for-byte, `repeated-tag-key-round-trips`, `repeated-tag-three-values`,
+`bare-and-valued-tag-mix`, `repeated-tag-on-event-line`, and, with real `.expected` bytes,
+`repeated-tag-exact-duplicate-deduped` and `bare-tag-exact-duplicate-deduped`; a
+`statsd_in -> aggregate -> statsd_out` relay test with a multi-valued tag asserts one series and
+identical tag bytes after flush, and an `influxdb_out` fixture case pins `team=b` plus the counter.
+`crates/logit-bench` gained `statsd_repeated_tag_datagram`/`statsd_multi_value_repeated_tag_datagram`
+fixtures and two allocation rows, `statsd_in: decode 1 line with a repeated tag key` and
+`statsd_in: decode 1 multi-value counter line with a repeated tag key`, asserted at whatever
+allocation count was actually measured.

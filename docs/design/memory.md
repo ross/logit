@@ -217,6 +217,8 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `statsd_in` decode 1 DogStatsD event line (`_e{...}`, `TEXT` with nothing to unescape) | **2** | same as `statsd_in` decode 1 line -- `parse_event`'s `unescape_event_text` takes its zero-copy `slice_of` path, so an event costs nothing beyond the per-line/per-batch `Vec<Event>` pair every statsd line pays |
 | `statsd_in` decode 1 DogStatsD event line (`TEXT` with one `\n` escape) | **3** | 2 as above + 1 -- the decoded length is known up front (each two-byte escape becomes one byte), so `unescape_event_text` sizes its `Vec` exactly and `Bytes::from(Vec<u8>)` takes its `len == capacity` promotion path: one allocation, no realloc, no second eager control-block alloc of the kind a slack-capacity `String::replace` result would cost |
 | `statsd_in` decode 1 DogStatsD service check line (`_sc\|...`) | **2** | same as `statsd_in` decode 1 line -- every `statsd.service_check.*` carrier is a zero-copy datagram slice, same shape as an ordinary metric line's tags |
+| `statsd_in` decode 1 line with a repeated tag key | **4** | ADR `statsd-output`'s amendment -- 2 as `statsd_in` decode 1 line + 2: `insert_tags` builds the `Value::Array`'s `Vec` spine (`vec![existing, value]`), and `build_event`'s `attributes.clone()` -- run once even on a single-value line -- deep-copies that spine again for the `Event`. A scalar tag's share of that clone is a `Bytes` refcount bump; the `Array` is the one attribute shape whose clone allocates |
+| `statsd_in` decode 1 multi-value counter line with a repeated tag key (`name:1:2:3\|c`) | **6** | 2 + 1 (`insert_tags` builds the spine once) + 3 (one deep copy of that spine per value event, via `build_event`'s per-value `attributes.clone()`) -- the measured correction to that clone's "memcpy plus a refcount bump" account, which holds for a scalar tag but not for an `Array`-valued one |
 | `collectd_in` decode 1 value list (1 data source) | **1** | just the `Vec<Event>`, same as `syslog_in` -- every identity field slices the datagram, the record name is built into the decoder's reused scratch `String` before interning, and a single-data-source list fits `MetricList`'s inline capacity |
 | `collectd_in` `decode_into` into a warm buffer | **0** | ADR `decoupled-listener-io` -- nothing at all is left once the caller's `Vec<Event>` keeps its capacity |
 | `collectd_in` decode 1 three-data-source value list (`load`) | **2** | 1 as above + one `MetricList` spill: `MetricList` is a `SmallVec` inlined at 1, so a multi-data-source list moves its records to the heap exactly once, not once per record |
@@ -300,6 +302,15 @@ And the corresponding times:
 > §2's own notes on each row.) The `statsd_in` DogStatsD event/service-check rows (W6) are the same
 > kind of exception, for the same reason -- their counts are what `statsd_decode_one_event_line`/
 > `statsd_decode_one_event_line_with_an_escaped_newline`/`statsd_decode_one_service_check_line`
+> pin. The two repeated-tag-key rows just above (W9) are a third, pinned by
+> `statsd_decode_one_line_with_a_repeated_tag_key`/
+> `statsd_decode_one_multi_value_counter_line_with_a_repeated_tag_key`.
+
+`value_heap_bytes` (`crates/logit-core/src/event.rs`) counts an `Array`'s element payloads but not
+the `Vec` spine itself (`capacity × size_of::<Value>()`) -- a repeated-tag event's true heap
+footprint is understated by that spine's cost, the same pre-existing gap `syslog.sd`'s own `Array`
+rows already have (an open question W9's plan settled by leaving the
+accounting as is rather than moving both producers' weights for a reason unrelated to either).
 > pin. So is the `statsd_out` encode_into row (ADR `framed-encoder`): its count is what
 > `statsd_encode_into_100_events` pins; `benches/pipeline.rs` has a matching `encode::statsd`
 > arm, but no wall-clock figure has been folded into this table for it. The `collectd_in` rows

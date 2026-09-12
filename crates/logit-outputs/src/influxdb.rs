@@ -120,6 +120,18 @@ impl Output for InfluxDbOutput {
     /// classifies what happened and reports it via [`Fault`] (`.context(fault)`).
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let body = self.encoder.encode(batch)?;
+        // Read here, *before* the empty-body early return below: a batch every one of whose lines
+        // turned out unencodable still normalized the tags it normalized, and an operator chasing
+        // a missing tag value needs to see that even when nothing was written. Guarded rather
+        // than counted unconditionally so an ordinary batch doesn't upsert a permanent zero
+        // series into `logit_core::telemetry` for a normalization that never happens here.
+        if self.encoder.multi_value_tags > 0 {
+            self.telemetry.count(
+                "logit.output.tags.normalized",
+                self.encoder.multi_value_tags as f64,
+                &[("reason", "multi_value")],
+            );
+        }
         if body.is_empty() {
             // Nothing in this batch had a line-protocol encoding (e.g. every event carried only
             // a log or span and no metrics, or every metric was a Set -- see `metric_fields`
@@ -243,6 +255,13 @@ pub struct InfluxLineEncoder {
     /// comment for what this is for. Cleared at the start of every `encode`, which keeps it
     /// batch-scoped exactly as before while letting the maps' allocations survive across batches.
     series: HashMap<String, HashMap<i64, i64>>,
+    /// Multi-value tags this batch collapsed to their last element -- see [`render_tag_suffix`].
+    /// Batch-scoped like `series` (zeroed at the top of `encode`), and read by
+    /// [`InfluxDbOutput::send`] straight after `encode` returns, because [`Encoder::encode`]'s
+    /// signature has nowhere to report it: one opaque `Bytes` per batch and no stats out-param.
+    /// `pub` for the same reason the type is -- `logit-bench` constructs and drives this encoder
+    /// directly.
+    pub multi_value_tags: usize,
 }
 
 impl InfluxLineEncoder {
@@ -266,6 +285,9 @@ impl Encoder for InfluxLineEncoder {
         // per-event or per-metric: that's what lets it disambiguate collisions across the whole
         // batch. It lives on the encoder only so its allocations outlive one call.
         self.series.clear();
+        // Batch-scoped, exactly like `self.series` above: `InfluxDbOutput::send` reads it once per
+        // `encode` call, so it must not carry the previous batch's count into this one.
+        self.multi_value_tags = 0;
         for event in &batch.events {
             if event.metrics.is_empty() {
                 continue; // a log-only, span-only, or empty event: nothing to encode
@@ -273,7 +295,13 @@ impl Encoder for InfluxLineEncoder {
             // Tags come from `resource.attributes` + `event.attributes` only -- nothing
             // metric-specific -- so they're identical for every metric on this event. Rendered
             // once per event, not once per metric.
-            render_tag_suffix(&mut self.tag_suffix, &mut self.scratch, &batch.resource, event);
+            render_tag_suffix(
+                &mut self.tag_suffix,
+                &mut self.scratch,
+                &batch.resource,
+                event,
+                &mut self.multi_value_tags,
+            );
             for metric in &event.metrics {
                 // A `NO_RECORDED_VALUE`-flagged point (`docs/adr/lossless-transit.md`,
                 // `crates/logit-core/src/metric.rs`'s `flags` doc) has no genuine reading to
@@ -347,11 +375,35 @@ impl Encoder for InfluxLineEncoder {
 /// The two attribute maps are **merge-joined** ([`crate::attrs::merged`]) rather than combined by
 /// cloning the resource's map and inserting the event's over the top -- no copy of an `AttrMap`
 /// per event, and no `resolve` -> `intern` round trip that re-inserting every key would cost.
+///
+/// ## Multi-value tags: last-value-wins, counted
+///
+/// A repeated DogStatsD tag key reaches this sink as a [`Value::Array`] in wire order
+/// (`logit_inputs::statsd::insert_tags`; `statsd_out` re-expands it to one tag per element). Line
+/// protocol's tag set is a **map** -- one key, one value -- so there is no faithful rendering of a
+/// multi-value tag here at all. This renders the **last** representable element, walking backwards
+/// so a trailing unrepresentable element falls through to the one before it, and adds one to
+/// `normalized` per such attribute that actually reaches the wire (an array whose chosen element
+/// is then dropped for being empty or newline-bearing reports nothing, exactly as the equivalent
+/// scalar does). "Last" specifically, not first: it reproduces byte for byte the
+/// `team=b` this sink emitted back when the *decoder* collapsed a repeated key to its last token,
+/// so no existing InfluxDB expectation changes and the counter is the only new signal. An empty or
+/// entirely unrepresentable `Array` drops the tag with no counter -- the same silent path every
+/// other unrepresentable value takes.
+///
+/// `normalized` is reported as `logit.output.tags.normalized{reason="multi_value"}` (via
+/// [`InfluxLineEncoder::multi_value_tags`], which [`InfluxDbOutput::send`] reads). **Unlike every
+/// other `*.normalized` reason in `docs/design/internal-telemetry.md`, this one is lossy**: every
+/// `messages.normalized` reason is a lossless-but-different rendering of the same information,
+/// whereas this genuinely discards the non-last elements. It is a `normalized` rather than a
+/// `dropped` because the tag itself survives and the point still lands -- but an operator reading
+/// it should read it as data loss.
 fn render_tag_suffix(
     suffix: &mut String,
     scratch: &mut String,
     resource: &Resource,
     event: &Event,
+    normalized: &mut usize,
 ) {
     suffix.clear();
     for (key, value) in crate::attrs::merged(resource, event) {
@@ -359,7 +411,29 @@ fn render_tag_suffix(
         if key.starts_with("statsd.") {
             continue;
         }
-        let Some(value) = tag_value(scratch, value) else {
+        let is_multi_value = matches!(value, Value::Array(_));
+        let rendered = match value {
+            // Last representable element, walked backwards -- see this function's "Multi-value
+            // tags" section. Rendered twice for the chosen element (once to find it, once to
+            // borrow it out of `scratch`) because `tag_value`'s borrow ties its result to
+            // `scratch`, so the search can't hold onto a candidate; both renders reuse `scratch`
+            // and neither allocates, and the scalar path below never reaches this arm at all.
+            Value::Array(elements) => {
+                let mut chosen = None;
+                for (i, element) in elements.iter().enumerate().rev() {
+                    if tag_value(scratch, element).is_some() {
+                        chosen = Some(i);
+                        break;
+                    }
+                }
+                match chosen {
+                    Some(i) => tag_value(scratch, &elements[i]),
+                    None => None,
+                }
+            }
+            _ => tag_value(scratch, value),
+        };
+        let Some(value) = rendered else {
             continue;
         };
         // InfluxDB 2.x rejects an empty tag value outright, and line protocol has no escape for
@@ -373,6 +447,13 @@ fn render_tag_suffix(
             || value.contains(['\n', '\r'])
         {
             continue;
+        }
+        // Counted here, past every remaining drop check, so the counter means "a multi-value tag
+        // reached the wire collapsed to one element" rather than merely "an `Array` was seen" --
+        // an array whose chosen element then turns out to be empty or newline-bearing disappears
+        // on the silent path above, exactly as the equivalent scalar does, and reports nothing.
+        if is_multi_value {
+            *normalized += 1;
         }
         suffix.push(',');
         push_escaped_tag(suffix, key);
@@ -1019,6 +1100,88 @@ mod tests {
         assert!(!out.contains("env=staging"), "got: {out}");
     }
 
+    /// `encode`, plus the multi-value-tag count the encoder accumulated on the way -- `encode`
+    /// throws its encoder away, and that count is the one thing [`Encoder::encode`]'s signature
+    /// has no way to return.
+    fn encode_counting_multi_value(events: Vec<Event>) -> (String, usize) {
+        let mut encoder = InfluxLineEncoder::default();
+        let bytes = encoder.encode(&batch_with(events)).expect("encode should succeed");
+        let out = String::from_utf8(bytes.to_vec()).expect("output should be valid utf-8");
+        (out, encoder.multi_value_tags)
+    }
+
+    /// A counter event carrying one `Value::Array` attribute -- the shape a repeated DogStatsD tag
+    /// key arrives in. `metric_event` only takes `&str` values, so this has to go in by hand.
+    fn event_with_array_tag(key: &str, elements: Vec<Value>) -> Event {
+        let mut event = metric_event("page.views", MetricKind::counter(1.0), &[]);
+        event.attributes.insert(key, Value::Array(elements));
+        event
+    }
+
+    /// Line protocol's tag set is a map, so a multi-value tag has no faithful rendering here: the
+    /// **last** representable element wins, reproducing the `team=b` this sink emitted back when
+    /// the decoder itself collapsed a repeated key -- and it is counted, because unlike every
+    /// other `*.normalized` reason this one loses data.
+    #[test]
+    fn a_multi_value_tag_renders_its_last_element_and_is_counted() {
+        let (out, normalized) = encode_counting_multi_value(vec![event_with_array_tag(
+            "team",
+            vec![Value::str("a"), Value::str("b")],
+        )]);
+        assert_eq!(out, "page.views,team=b value=1 1700000000000000000\n");
+        assert_eq!(normalized, 1, "once per attribute, not once per element");
+    }
+
+    #[test]
+    fn a_multi_value_tag_whose_last_element_is_unrepresentable_falls_back_to_the_previous_one() {
+        let (out, normalized) = encode_counting_multi_value(vec![event_with_array_tag(
+            "team",
+            vec![Value::str("a"), Value::str("b"), Value::Null],
+        )]);
+        assert!(out.contains("team=b"), "got: {out}");
+        assert_eq!(normalized, 1);
+
+        // And it keeps walking backwards past more than one of them.
+        let (out, normalized) = encode_counting_multi_value(vec![event_with_array_tag(
+            "team",
+            vec![Value::str("a"), Value::Timestamp(1), Value::Map(Box::new(AttrMap::new()))],
+        )]);
+        assert!(out.contains("team=a"), "got: {out}");
+        assert_eq!(normalized, 1);
+    }
+
+    /// An empty or entirely unrepresentable `Array` drops the tag on the same silent path every
+    /// other unrepresentable value takes -- nothing was normalized, so nothing is counted.
+    #[test]
+    fn an_empty_or_all_unrepresentable_array_tag_drops_the_tag_with_no_count() {
+        let (out, normalized) =
+            encode_counting_multi_value(vec![event_with_array_tag("team", Vec::new())]);
+        assert_eq!(out, "page.views value=1 1700000000000000000\n");
+        assert_eq!(normalized, 0);
+
+        let (out, normalized) = encode_counting_multi_value(vec![event_with_array_tag(
+            "team",
+            vec![Value::Null, Value::Map(Box::new(AttrMap::new()))],
+        )]);
+        assert_eq!(out, "page.views value=1 1700000000000000000\n");
+        assert_eq!(normalized, 0);
+    }
+
+    /// `multi_value_tags` is batch-scoped, like `series` -- zeroed at the top of every `encode`,
+    /// so `send` reading it after one call can never see the previous batch's count added in.
+    #[test]
+    fn the_multi_value_tag_count_is_zeroed_per_encode_not_accumulated_across_batches() {
+        let mut encoder = InfluxLineEncoder::default();
+        for _ in 0..3 {
+            let batch = batch_with(vec![event_with_array_tag(
+                "team",
+                vec![Value::str("a"), Value::str("b")],
+            )]);
+            encoder.encode(&batch).expect("encode should succeed");
+            assert_eq!(encoder.multi_value_tags, 1);
+        }
+    }
+
     /// A `NO_RECORDED_VALUE`-flagged point must be skipped, not written as a fabricated `value=0`
     /// -- fix 3 in PR #123's review (`docs/adr/lossless-transit.md`, `docs/known-gaps.md`'s
     /// cross-protocol table). A sibling metric on the same event still comes through, same shape
@@ -1512,6 +1675,50 @@ mod tests {
              classify_transport_error must downgrade its mapping to Ambiguous instead (see this \
              workstream's plan/report)"
         );
+    }
+
+    /// `logit.output.tags.normalized{reason="multi_value"}` has to be emitted **before** `send`'s
+    /// empty-body early return: a batch whose every line turned out unencodable still normalized
+    /// the tags it normalized, and an operator chasing a missing tag value needs to see it. The
+    /// unreachable port is part of the assertion -- an empty body must never reach the HTTP call.
+    #[tokio::test]
+    async fn the_multi_value_tag_counter_is_emitted_even_when_the_batch_encodes_to_nothing() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
+        let mut output = InfluxDbOutput::new(
+            "http://127.0.0.1:1".to_string(),
+            "org".into(),
+            "bucket".into(),
+            "token".into(),
+        )
+        .with_telemetry(telemetry);
+
+        // A NaN counter renders no line at all (`non_finite_values_are_skipped_...`), so the body
+        // is empty -- but its tag was still collapsed from two elements to one.
+        let mut event = metric_event("bad", MetricKind::counter(f64::NAN), &[]);
+        event.attributes.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
+        output
+            .send(&batch_with(vec![event]))
+            .await
+            .expect("an all-unencodable batch is not an error");
+
+        let events = registry.drain(0);
+        let counted = events
+            .iter()
+            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("multi_value"))
+            .find_map(|e| {
+                e.metrics.iter().find_map(|m| match &m.kind {
+                    MetricKind::Sum(s)
+                        if logit_core::interner::resolve(m.name)
+                            == "logit.output.tags.normalized" =>
+                    {
+                        Some(s.value)
+                    }
+                    _ => None,
+                })
+            })
+            .unwrap_or(0.0);
+        assert_eq!(counted, 1.0);
     }
 
     /// The layer-3 telemetry example (`docs/design/internal-telemetry.md`): every response class

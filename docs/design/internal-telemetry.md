@@ -598,7 +598,15 @@ Worked examples, one per shipped component:
   `MetricKind::GaugeDelta` reaching this encoder unresolved (`docs/adr/relative-gauge-adjustments.md`
   — means the pipeline is missing an `aggregate` component) reports under its own
   `logit.component.diagnostics{key="gauge_delta_unresolved"}`, not the generic `encode_error` every
-  other unrepresentable kind uses, specifically so it's greppable on its own. **Not**
+  other unrepresentable kind uses, specifically so it's greppable on its own. **New**,
+  `logit.output.tags.normalized{reason="multi_value"}` counts a multi-valued tag (an `Array`, from
+  a relayed, repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s amendment) rendered as its
+  last representable element, once per attribute — line syntax has no multi-value tag, so this is
+  the fallback. **This `normalized` reason is lossy, unlike every other `*.normalized` reason in
+  this doc**: every other one renders a *different but equivalent* wire form (batching, reordering,
+  a dialect substitution), while `multi_value` renders only the tag's last element and silently
+  drops every other element the array carried — a deliberate, counted exception to the "normalized
+  means lossless-but-different" convention this family of counters otherwise holds to. **Not**
   `logit.output.retries` — retry moved out of this sink entirely
   (`docs/adr/buffered-sink-delivery.md`) into the generic `deliver_with_retry` every sink now
   shares, so retry counting is a Layer 2 metric (`logit.component.retries`, above), not something
@@ -632,7 +640,10 @@ Worked examples, one per shipped component:
   out-of-set value -- its own counter, not `unencodable_value`, since the rest of that line still
   renders) and `logit.output.tags.dropped{reason="dialect"|
   "unrepresentable"}` for `format: statsd` dropping the whole tag segment or an individual
-  unrepresentable tag. **New**, `logit.output.messages.normalized{reason="dialect"|
+  unrepresentable tag — counted **per wire tag**, so a multi-valued attribute (an `Array`, from a
+  repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s amendment) that expands to several tags
+  on the wire counts once per element, not once per attribute. **New**,
+  `logit.output.messages.normalized{reason="dialect"|
   "member_sanitized"}` counts a lossless-but-different rendering rather than a drop: a timer's
   `h`/`d` wire-type letter collapsing to `ms` under `format: statsd`, or a `SetMembers` member
   changing after lossy UTF-8 plus sanitization. A `MetricKind::GaugeDelta` reaching this encoder
@@ -669,6 +680,29 @@ Worked examples, one per shipped component:
   unstable. `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` — the `Fault`
   taxonomy itself as request-outcome classes, the same shape `influxdb_out`'s HTTP-status classes
   and `syslog_out`'s `ok`/`error` pair are, just with this sink's own vocabulary.
+- `prometheus_out` (`crates/logit-outputs/src/prometheus.rs`, codec in
+  `crates/logit-proto/src/prometheus/`, [ADR
+  `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md)): the one pull
+  sink, so no `requests`/`request.duration`/`batch.bytes` — nothing is pushed per batch. In their
+  place, `logit.output.scrapes{class="ok"|"not_found"|"method"}` (count, one per inbound HTTP
+  request — `ok` means *rendered*, not acknowledged, since a `Full<Bytes>` body has no completion
+  hook) and `logit.output.scrape.bytes` (post-gzip when negotiated, so transfer cost rather than
+  exposition size). Registry state, which no push sink holds: `logit.output.series` (gauge, series
+  held after each `send`), `logit.output.series.evicted{reason="expired"|"cardinality"}` (the
+  `expire_after` sweep — run on every `send` *and* every scrape — and the `max_series` LRU cap), and
+  `logit.output.metrics.type_conflict` (a family re-typed across batches, evicting every series held
+  under the old type). The codec's `PrometheusEncoder`, shared by `send` and render so both sides
+  total under one component: `logit.output.metrics.skipped{metric_kind="delta_sum"|
+  "delta_histogram"|"gauge_delta"|"exponential_histogram"}` and `{reason="no_recorded_value"|
+  "type_conflict"|"name_collision"}` (the latter two *within* one batch, distinct from the
+  cross-batch `type_conflict` counter above), `logit.output.metrics.degraded{metric_kind=
+  "non_monotonic_sum"|"distribution"|"samples"|"set"|"set_members"}` and `{reason=
+  "exemplar_dropped"|"unit_not_suffix"}` (render-side), and `logit.output.labels.dropped{reason=
+  "unrepresentable"|"reserved"|"collision"}`. Diagnostics: `delta_temporality_unresolved` (both
+  delta arms, naming the `aggregate` with `temporality: cumulative` fix), the shared
+  `gauge_delta_unresolved` key `influxdb_out`/`statsd_out` use, `prometheus_exponential_histogram_
+  skipped`, and `prometheus_accept_failed` from the scrape listener's accept loop. Retry stays a
+  Layer 2 metric, though for a pull sink `send` is an in-memory upsert that has nothing to retry.
 
 ## Metrics from Lua scripts
 
