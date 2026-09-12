@@ -914,6 +914,35 @@ pub enum ComponentKind {
         #[schemars(with = "String")]
         connect_timeout: Duration,
     },
+    /// Scrapes Prometheus `/metrics` endpoints on `interval`, the way Prometheus's own server
+    /// does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each
+    /// target's response declares via its own `Content-Type`. Always synthesizes `up`,
+    /// `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. See
+    /// `docs/adr/prometheus-scrape-and-exposition.md`. A future `bind:` field on this same variant
+    /// (a remote-write receiver) is planned as an additive, non-breaking change -- "exactly one of
+    /// `targets`/`bind`" would become a graph rule once it lands, not a new kind.
+    PrometheusIn {
+        /// Absolute `http://`/`https://` scrape URLs. Required, non-empty (rule 40).
+        targets: Vec<String>,
+        /// Scrape cadence. Rule 9 rejects `0s`.
+        #[serde(default = "default_prometheus_scrape_interval", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        interval: Duration,
+        /// Per-request timeout. Rule 40 rejects `0s`.
+        #[serde(default = "default_prometheus_scrape_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        timeout: Duration,
+        /// Extra headers sent on every scrape request. A name this input sets itself (`accept`,
+        /// `user-agent`, and the other protocol-owned names -- rule 40) is rejected at
+        /// config-validation time, the same shape as `otlp_out`'s `headers:` (rule 22).
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        /// Client-side TLS tuning for any `https://` target -- see [`TlsClientConfig`]. A
+        /// non-default value with no `https://` target is a config error (rule 40), not silently
+        /// ignored.
+        #[serde(default)]
+        tls: TlsClientConfig,
+    },
     /// A Prometheus/OpenMetrics **exposition** endpoint: a stateful sink holding a registry of
     /// current series that an HTTP handler renders on demand, rather than one that writes anywhere.
     /// The mirror of `PrometheusIn` (scrape). Both text dialects are served, negotiated on the
@@ -1182,6 +1211,18 @@ fn default_statsd_max_packet_bytes() -> u64 {
 /// reason as [`default_syslog_connect_timeout`].
 fn default_statsd_connect_timeout() -> Duration {
     Duration::from_secs(5)
+}
+
+/// `PrometheusIn::interval`'s default -- Prometheus's own server ships the same 15s default scrape
+/// interval.
+fn default_prometheus_scrape_interval() -> Duration {
+    Duration::from_secs(15)
+}
+
+/// `PrometheusIn::timeout`'s default -- matches `OtlpOutput`'s/`OtlpInput`'s own 10s default
+/// request timeout.
+fn default_prometheus_scrape_timeout() -> Duration {
+    Duration::from_secs(10)
 }
 
 fn default_trace_id_field() -> String {
@@ -3332,5 +3373,57 @@ mod tests {
             components.object.expect("components should be an object").min_properties,
             Some(1)
         );
+    }
+
+    #[test]
+    fn prometheus_in_requires_only_targets_and_defaults_the_rest() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "prometheus_in", "targets": ["http://node-exporter:9100/metrics"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::PrometheusIn { targets, interval, timeout, headers, tls } => {
+                assert_eq!(targets, vec!["http://node-exporter:9100/metrics".to_string()]);
+                assert_eq!(interval, Duration::from_secs(15));
+                assert_eq!(timeout, Duration::from_secs(10));
+                assert!(headers.is_empty());
+                assert_eq!(tls, TlsClientConfig::default());
+            }
+            other => panic!("expected PrometheusIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prometheus_in_interval_timeout_headers_and_tls_can_all_be_set() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "prometheus_in", "targets": ["https://node-exporter:9100/metrics"],
+                "interval": "30s", "timeout": "5s",
+                "headers": {"X-Scope-OrgID": "tenant-a"},
+                "tls": {"ca_file": "ca.pem"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::PrometheusIn { interval, timeout, headers, tls, .. } => {
+                assert_eq!(interval, Duration::from_secs(30));
+                assert_eq!(timeout, Duration::from_secs(5));
+                assert_eq!(headers.get("X-Scope-OrgID"), Some(&"tenant-a".to_string()));
+                assert_eq!(tls.ca_file, Some("ca.pem".to_string()));
+            }
+            other => panic!("expected PrometheusIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prometheus_in_rejects_an_empty_targets_list_at_deserialize_time_only_if_required() {
+        // `targets` has no `#[serde(default)]`, so an omitted or empty-but-present list both
+        // deserialize fine here -- rule 40 (`logit-pipeline::graph`) is what rejects an empty
+        // list, not this crate's schema (mirrors `TailIn::paths`'s own split of "shape" vs.
+        // "meaning").
+        let component: Component =
+            serde_json::from_str(r#"{"type": "prometheus_in", "targets": []}"#).unwrap();
+        match component.kind {
+            ComponentKind::PrometheusIn { targets, .. } => assert!(targets.is_empty()),
+            other => panic!("expected PrometheusIn, got {other:?}"),
+        }
     }
 }

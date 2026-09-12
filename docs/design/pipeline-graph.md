@@ -174,7 +174,7 @@ the tag's literal argument string instead of failing.
 
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
-| Listener (`statsd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`) | must be empty | required (≥1 consumer) |
+| Listener (`statsd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `prometheus_out`) | ≥1 required | must not be |
 
@@ -364,6 +364,24 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 38. A `statsd_out` `max_packet_bytes: 0` is rejected, the same shape as rule 15's
     `buffer.max_batches`/`max_bytes: 0` — an impossible bound (every metric line would overflow it
     and be dropped whole), not a small one (`docs/adr/statsd-output.md`).
+40. (Number 39 is reserved by a parallel, not-yet-merged workstream — left out here rather than
+    renumbered, so each PR's own rule number stays correct once every branch lands.) A
+    `prometheus_in` `targets` must name at least one absolute `http://`/`https://` scrape URL with
+    a non-empty authority — `logit-pipeline` doesn't depend on `reqwest`/`url` (this document's own
+    "Crate layout" section), so this is a small hand-rolled scheme/authority check, not a full URL
+    parse. `timeout: 0s` is rejected, the same "0 is impossible" reasoning as rule 9's `interval`
+    (which also covers `prometheus_in`'s own `interval: 0s`, via the same generic check). A `tls:`
+    block must be internally consistent — `cert_file`/`key_file` set together, no
+    `insecure_skip_verify` alongside `ca_file` — the same two checks rule 24 makes for `otlp_out`'s
+    own `tls:` block (and rule 34 for `logit_out`'s) — and is rejected outright unless at least one
+    target is `https://` — TLS is selected per-target by its own scheme, so a `tls:` block with
+    nothing to tune would otherwise be silently ignored, the same reasoning as rule 24's third
+    check. `headers` may not name a header this input sets
+    itself (`accept`, `user-agent`, and the other protocol-owned names) or collide with another
+    entry once case is ignored, checked case-insensitively — the same shape rule 22 already checks
+    for `otlp_out`'s own `headers:` (`docs/adr/prometheus-scrape-and-exposition.md`). `receive:` on
+    `prometheus_in` stays rejected via rule 17's own allowlist — it's a listener by role, but isn't
+    wired to either of the two drivers that rule actually permits a non-default block on.
 41. A `prometheus_out` `path:` must start with `/`, and `max_series` must be ≥ 1
     (`docs/adr/prometheus-scrape-and-exposition.md`). A request URI's path is always absolute, so a
     relative or empty `path:` could never match one — every scrape would 404 against an endpoint

@@ -17,6 +17,7 @@ use logit_inputs::docker::{ContainerFilter, DockerInput};
 use logit_inputs::internal::InternalInput;
 use logit_inputs::logit::LogitInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
+use logit_inputs::prometheus::PrometheusInput;
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_inputs::tail::TailInput;
@@ -332,6 +333,15 @@ fn build_spec(
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+        PrometheusIn { targets, interval, timeout, headers, tls } => {
+            let input = PrometheusInput::new(targets.clone(), *interval)
+                .with_timeout(*timeout)
+                .with_headers(headers)?
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                .with_tls(&to_input_tls_client_settings(tls), base_dir)?;
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
         LogitIn { bind, tls, max_frame_bytes } => {
@@ -991,6 +1001,20 @@ fn to_tls_server_settings(
     }
 }
 
+/// [`to_tls_client_settings`]'s `logit-inputs` counterpart -- `prometheus_in` is a client, not a
+/// sink, so it needs `logit_inputs::prometheus::TlsClientSettings` (built on `reqwest`, per that
+/// module's own doc comment) rather than `logit_outputs::otlp::TlsClientSettings`.
+fn to_input_tls_client_settings(
+    tls: &logit_config::TlsClientConfig,
+) -> logit_inputs::prometheus::TlsClientSettings {
+    logit_inputs::prometheus::TlsClientSettings {
+        ca_file: tls.ca_file.clone(),
+        cert_file: tls.cert_file.clone(),
+        key_file: tls.key_file.clone(),
+        insecure_skip_verify: tls.insecure_skip_verify,
+    }
+}
+
 /// Converts config's `MetricSpec` (`logit-config`, which `logit-transforms` deliberately doesn't
 /// depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the transform crate's own
 /// identically-shaped type.
@@ -1296,6 +1320,27 @@ mod tests {
                 "protocol {protocol:?}"
             );
         }
+    }
+
+    #[test]
+    fn build_spec_builds_a_prometheus_input() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::PrometheusIn {
+                targets: vec!["http://127.0.0.1:0/metrics".to_string()],
+                interval: Duration::from_secs(15),
+                timeout: Duration::from_secs(10),
+                headers: HashMap::new(),
+                tls: logit_config::TlsClientConfig::default(),
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
     }
 
     #[test]

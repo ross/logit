@@ -110,6 +110,22 @@
 //!     empty-name clauses are the "can only ever be a no-op" rule again; the duplicate clause is
 //!     the "a repeated entry silently doubles rather than erroring" rule applied to columns
 //!     instead of sources.
+//! 40. (Numbers 32-39 belong to other components' rules that landed after this list's numbering
+//!     already drifted from the code, per the note on rule 12 above -- left unnumbered here rather
+//!     than renumbered, so a rule referenced elsewhere by its own PR keeps the number it was given
+//!     there.) A `prometheus_in` `targets` must be non-empty, and every entry must parse as an
+//!     absolute `http://`/`https://` URL with a non-empty authority -- `logit-pipeline` doesn't
+//!     depend on `reqwest`/`url` (`docs/design/pipeline-graph.md`'s crate layout), so this is a
+//!     small hand-rolled scheme/authority check, not a real URL parse. A `tls:` block must be
+//!     internally consistent -- `cert_file`/`key_file` set together, no `insecure_skip_verify`
+//!     alongside `ca_file` -- the same two checks rule 24 makes for `otlp_out`'s own `tls:` block
+//!     (and rule 34 for `logit_out`'s) -- and is rejected outright unless at least one target is
+//!     `https://` (the same "would have no effect" reasoning as rule 24's third check).
+//!     `timeout: 0s` is rejected (the same "0 is impossible" reasoning as rule 9's `interval`).
+//!     `headers` may not name a header this input sets itself (`accept`, `user-agent`, `host`,
+//!     `content-length`, `te`, `transfer-encoding`, `connection`, an empty name, or an HTTP/2
+//!     pseudo-header starting with `:`), checked case-insensitively, and no two entries may
+//!     collide once case is ignored -- the same shape rule 22 already checks for `otlp_out`.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -157,7 +173,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | TailIn { .. }
         | DockerIn { .. }
         | LogitIn { .. }
-        | Internal { .. } => Role::Listener,
+        | Internal { .. }
+        | PrometheusIn { .. } => Role::Listener,
         Lua { .. }
         | LuaFile { .. }
         | Aggregate { .. }
@@ -207,6 +224,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         DockerIn { .. } => "docker_in",
         LogitIn { .. } => "logit_in",
         Internal { .. } => "internal",
+        PrometheusIn { .. } => "prometheus_in",
         Lua { .. } => "lua",
         LuaFile { .. } => "lua_file",
         Aggregate { .. } => "aggregate",
@@ -251,6 +269,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::TailIn { .. }
             | ComponentKind::DockerIn { .. }
             | ComponentKind::Internal { .. }
+            | ComponentKind::PrometheusIn { .. }
             | ComponentKind::Lua { .. }
             | ComponentKind::LuaFile { .. }
             | ComponentKind::Aggregate { .. }
@@ -291,9 +310,9 @@ fn is_implemented(kind: &ComponentKind) -> bool {
 fn interval(kind: &ComponentKind) -> Option<Duration> {
     match kind {
         ComponentKind::Lua { interval, .. } | ComponentKind::LuaFile { interval, .. } => *interval,
-        ComponentKind::Aggregate { interval, .. } | ComponentKind::Internal { interval, .. } => {
-            Some(*interval)
-        }
+        ComponentKind::Aggregate { interval, .. }
+        | ComponentKind::Internal { interval, .. }
+        | ComponentKind::PrometheusIn { interval, .. } => Some(*interval),
         _ => None,
     }
 }
@@ -356,6 +375,40 @@ const RESERVED_OTLP_HEADERS: &[&str] = &[
     "transfer-encoding",
     "connection",
 ];
+
+/// Header names `prometheus_in`'s scrape client sets itself (rule 40) --
+/// `crates/logit-inputs/src/prometheus.rs`'s `scrape_target` unconditionally sends `Accept` (the
+/// dialect-negotiation header) and `User-Agent`, in addition to the same connection-management
+/// names `RESERVED_OTLP_HEADERS` already reserves for `otlp_out` (this listener never sends a
+/// body, so `content-type`/`content-encoding` aren't actually load-bearing here, but naming them
+/// too costs nothing and keeps this list's shape recognizable next to that one).
+const RESERVED_PROMETHEUS_HEADERS: &[&str] = &[
+    "accept",
+    "user-agent",
+    "content-type",
+    "content-length",
+    "content-encoding",
+    "host",
+    "te",
+    "transfer-encoding",
+    "connection",
+];
+
+/// Rule 40's URL check: `targets` must be absolute `http://`/`https://` URLs with a non-empty
+/// authority. `logit-pipeline` doesn't depend on `reqwest`/`url` (`docs/design/pipeline-graph.md`'s
+/// crate layout keeps this crate free of any concrete protocol's dependencies), so this is a small
+/// hand-rolled scheme/authority check rather than a real URL parse -- good enough to catch a typo'd
+/// scheme or a bare `host:port` with none at all, which is what this rule exists for; the real
+/// parse (`reqwest::Url::parse`) happens once more, harmlessly, in `crates/logit-inputs/src/
+/// prometheus.rs` itself when building each target's resource.
+fn is_absolute_http_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("http://").or_else(|| lower.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    !rest.split(['/', '?', '#']).next().unwrap_or("").is_empty()
+}
 
 pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     let Config { components, .. } = config;
@@ -1328,6 +1381,81 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 40: `prometheus_in`'s `targets`/`timeout`/`tls`/`headers` -- see this module's own doc
+    // comment for the full rule text.
+    for (id, component) in &components {
+        if let ComponentKind::PrometheusIn { targets, timeout, headers, tls, .. } = &component.kind
+        {
+            if targets.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': 'targets' must name at least one scrape URL -- an empty \
+                     list would never scrape anything"
+                );
+            }
+            for target in targets {
+                if !is_absolute_http_url(target) {
+                    anyhow::bail!(
+                        "component '{id}': 'targets' entry {target:?} isn't an absolute \
+                         'http://' or 'https://' URL"
+                    );
+                }
+            }
+            if timeout.is_zero() {
+                anyhow::bail!(
+                    "component '{id}': 'timeout: 0s' would fail every scrape immediately -- use \
+                     a positive duration"
+                );
+            }
+            if tls.cert_file.is_some() != tls.key_file.is_some() {
+                anyhow::bail!(
+                    "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
+                     mutual TLS, or both omitted -- one alone can't be used"
+                );
+            }
+            if tls.insecure_skip_verify && tls.ca_file.is_some() {
+                anyhow::bail!(
+                    "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both \
+                     be set -- 'insecure_skip_verify' trusts any certificate, which makes a \
+                     specific trusted CA meaningless"
+                );
+            }
+            let any_https = targets.iter().any(|t| t.to_ascii_lowercase().starts_with("https://"));
+            if !tls.is_empty() && !any_https {
+                anyhow::bail!(
+                    "component '{id}': 'tls' is set, but no 'targets' entry is 'https://' -- \
+                     TLS is selected per-target by its own scheme, so a 'tls:' block here would \
+                     have no effect"
+                );
+            }
+            let mut seen_lowercase = BTreeSet::new();
+            for name in headers.keys() {
+                if name.is_empty() {
+                    anyhow::bail!("component '{id}': 'headers' has an empty header name");
+                }
+                if name.starts_with(':') {
+                    anyhow::bail!(
+                        "component '{id}': 'headers' names {name:?} -- an HTTP/2 pseudo-header \
+                         (starting with ':') can't be set as a custom header"
+                    );
+                }
+                let lowercase = name.to_ascii_lowercase();
+                if RESERVED_PROMETHEUS_HEADERS.contains(&lowercase.as_str()) {
+                    anyhow::bail!(
+                        "component '{id}': 'headers' names {name:?}, which this input sets \
+                         itself -- it can't be overridden"
+                    );
+                }
+                if !seen_lowercase.insert(lowercase) {
+                    anyhow::bail!(
+                        "component '{id}': 'headers' names {name:?}, which differs only in \
+                         case from another entry -- HTTP header names are case-insensitive, so \
+                         which value would actually be sent is undefined"
+                    );
+                }
+            }
+        }
+    }
+
     // Rule 41: a `prometheus_out` `path:` must be a non-empty absolute path, and `max_series` must
     // admit at least one series. A relative or empty `path` could never match a request URI's own
     // path (always absolute), so every scrape would 404 against an endpoint that looks configured;
@@ -1611,6 +1739,39 @@ mod tests {
             relative_gauges: false,
             max_packet_bytes,
             connect_timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn prometheus_in(targets: Vec<&str>) -> ComponentKind {
+        ComponentKind::PrometheusIn {
+            targets: targets.into_iter().map(String::from).collect(),
+            interval: Duration::from_secs(15),
+            timeout: Duration::from_secs(10),
+            headers: Map::new(),
+            tls: logit_config::TlsClientConfig::default(),
+        }
+    }
+
+    fn prometheus_in_with_headers(targets: Vec<&str>, headers: Vec<(&str, &str)>) -> ComponentKind {
+        ComponentKind::PrometheusIn {
+            targets: targets.into_iter().map(String::from).collect(),
+            interval: Duration::from_secs(15),
+            timeout: Duration::from_secs(10),
+            headers: headers.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            tls: logit_config::TlsClientConfig::default(),
+        }
+    }
+
+    fn prometheus_in_with_tls(
+        targets: Vec<&str>,
+        tls: logit_config::TlsClientConfig,
+    ) -> ComponentKind {
+        ComponentKind::PrometheusIn {
+            targets: targets.into_iter().map(String::from).collect(),
+            interval: Duration::from_secs(15),
+            timeout: Duration::from_secs(10),
+            headers: Map::new(),
+            tls,
         }
     }
 
@@ -4068,5 +4229,225 @@ mod tests {
             ("out", vec!["in"], prometheus_out("/metrics", 0)),
         ]));
         assert!(err.contains("'out'") && err.contains("max_series: 0"), "got: {err}");
+    }
+
+    // ---- rule 40: prometheus_in --------------------------------------------------------------
+
+    #[test]
+    fn prometheus_in_is_a_listener_and_is_implemented() {
+        let kind = prometheus_in(vec!["http://node-exporter:9100/metrics"]);
+        assert_eq!(kind_name(&kind), "prometheus_in");
+        assert_eq!(role(&kind), Role::Listener);
+        resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+            .expect("a well-formed prometheus_in should resolve fine");
+    }
+
+    #[test]
+    fn a_prometheus_in_with_empty_targets_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], prometheus_in(vec![])),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("'in'") && err.contains("'targets'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_in_target_missing_a_scheme_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], prometheus_in(vec!["node-exporter:9100/metrics"])),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("absolute"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_in_target_with_an_empty_authority_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], prometheus_in(vec!["http:///metrics"])),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("absolute"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_in_with_an_https_target_resolves_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], prometheus_in(vec!["https://node-exporter:9100/metrics"])),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("an https:// target should resolve fine");
+    }
+
+    #[test]
+    fn a_prometheus_in_with_zero_interval_is_rejected() {
+        let mut kind = prometheus_in(vec!["http://node-exporter:9100/metrics"]);
+        if let ComponentKind::PrometheusIn { interval, .. } = &mut kind {
+            *interval = Duration::ZERO;
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("interval"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_in_with_zero_timeout_is_rejected() {
+        let mut kind = prometheus_in(vec!["http://node-exporter:9100/metrics"]);
+        if let ComponentKind::PrometheusIn { timeout, .. } = &mut kind {
+            *timeout = Duration::ZERO;
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'timeout: 0s'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_in_tls_block_under_an_all_http_target_list_is_rejected() {
+        let tls =
+            logit_config::TlsClientConfig { insecure_skip_verify: true, ..Default::default() };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], prometheus_in_with_tls(vec!["http://node-exporter:9100/metrics"], tls)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("no 'targets' entry is 'https://'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_in_tls_block_with_one_https_target_resolves_fine() {
+        let tls =
+            logit_config::TlsClientConfig { insecure_skip_verify: true, ..Default::default() };
+        resolve(cfg(vec![
+            (
+                "in",
+                vec![],
+                prometheus_in_with_tls(
+                    vec!["http://a:9100/metrics", "https://b:9100/metrics"],
+                    tls,
+                ),
+            ),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("a tls: block with at least one https:// target should resolve fine");
+    }
+
+    #[test]
+    fn a_prometheus_in_tls_cert_file_without_a_key_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            cert_file: Some("client.pem".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], prometheus_in_with_tls(vec!["https://node-exporter:9100/metrics"], tls)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("cert_file") && err.contains("key_file"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_in_tls_key_file_without_a_cert_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            key_file: Some("client.key".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], prometheus_in_with_tls(vec!["https://node-exporter:9100/metrics"], tls)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("cert_file") && err.contains("key_file"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_in_tls_insecure_skip_verify_with_a_ca_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            insecure_skip_verify: true,
+            ca_file: Some("ca.pem".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], prometheus_in_with_tls(vec!["https://node-exporter:9100/metrics"], tls)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("insecure_skip_verify") && err.contains("ca_file"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_in_tls_cert_and_key_file_together_resolve_fine() {
+        let tls = logit_config::TlsClientConfig {
+            cert_file: Some("client.pem".to_string()),
+            key_file: Some("client.key".to_string()),
+            ..Default::default()
+        };
+        resolve(cfg(vec![
+            ("in", vec![], prometheus_in_with_tls(vec!["https://node-exporter:9100/metrics"], tls)),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("cert_file and key_file set together should resolve fine");
+    }
+
+    #[test]
+    fn a_prometheus_in_header_this_input_sets_itself_is_rejected() {
+        let err = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                prometheus_in_with_headers(
+                    vec!["http://node-exporter:9100/metrics"],
+                    vec![("Accept", "text/plain")],
+                ),
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("sets itself"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_in_with_two_headers_differing_only_in_case_is_rejected() {
+        let err = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                prometheus_in_with_headers(
+                    vec!["http://node-exporter:9100/metrics"],
+                    vec![("X-Scope-OrgID", "a"), ("x-scope-orgid", "b")],
+                ),
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("differs only in case"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_in_with_a_custom_header_resolves_fine() {
+        resolve(cfg(vec![
+            (
+                "in",
+                vec![],
+                prometheus_in_with_headers(
+                    vec!["http://node-exporter:9100/metrics"],
+                    vec![("X-Scope-OrgID", "tenant-a")],
+                ),
+            ),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("should resolve");
+    }
+
+    /// `receive:` stays rejected on `prometheus_in` via rule 17's explicit allowlist -- it's a
+    /// listener by role, but not one of the two drivers (`is_datagram_listener`/
+    /// `is_tail_listener`) rule 17 actually wires `receive:` to, so a non-default block on it is
+    /// caught the same way `internal`'s own is.
+    #[test]
+    fn a_non_default_receive_on_prometheus_in_is_rejected() {
+        let err = expect_err(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                prometheus_in(vec!["http://node-exporter:9100/metrics"]),
+                non_default_receive(),
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(
+            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            "got: {err}"
+        );
     }
 }
