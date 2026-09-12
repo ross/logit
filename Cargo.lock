@@ -1051,6 +1051,7 @@ dependencies = [
 name = "logit-proto"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64",
  "bytes",
  "crc32c",

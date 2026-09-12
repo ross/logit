@@ -17,6 +17,12 @@ doctest = false
 
 [dependencies]
 logit-core.workspace = true
+# `collectd::TypesDb::load` reads operator-supplied files, and the error an unreadable or
+# unparseable one produces has to carry the path alongside the parse error's own line number --
+# `anyhow::Context` is how every other file-reading path in this workspace (`logit-cli`'s config
+# loader, `logit-inputs`' checkpoint files) says that. Already a workspace dependency at this exact
+# version, so this adds nothing to `Cargo.lock` or `script/audit`.
+anyhow.workspace = true
 bytes.workspace = true
 prost.workspace = true
 thiserror.workspace = true

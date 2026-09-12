@@ -7,6 +7,7 @@
 //! and payload design.
 
 pub mod buffer;
+pub mod collectd;
 pub mod frame;
 pub mod msgbuf;
 pub mod native;

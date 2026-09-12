@@ -217,6 +217,11 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `statsd_in` decode 1 DogStatsD event line (`_e{...}`, `TEXT` with nothing to unescape) | **2** | same as `statsd_in` decode 1 line -- `parse_event`'s `unescape_event_text` takes its zero-copy `slice_of` path, so an event costs nothing beyond the per-line/per-batch `Vec<Event>` pair every statsd line pays |
 | `statsd_in` decode 1 DogStatsD event line (`TEXT` with one `\n` escape) | **3** | 2 as above + 1 -- the decoded length is known up front (each two-byte escape becomes one byte), so `unescape_event_text` sizes its `Vec` exactly and `Bytes::from(Vec<u8>)` takes its `len == capacity` promotion path: one allocation, no realloc, no second eager control-block alloc of the kind a slack-capacity `String::replace` result would cost |
 | `statsd_in` decode 1 DogStatsD service check line (`_sc\|...`) | **2** | same as `statsd_in` decode 1 line -- every `statsd.service_check.*` carrier is a zero-copy datagram slice, same shape as an ordinary metric line's tags |
+| `collectd_in` decode 1 value list (1 data source) | **1** | just the `Vec<Event>`, same as `syslog_in` -- every identity field slices the datagram, the record name is built into the decoder's reused scratch `String` before interning, and a single-data-source list fits `MetricList`'s inline capacity |
+| `collectd_in` `decode_into` into a warm buffer | **0** | ADR `decoupled-listener-io` -- nothing at all is left once the caller's `Vec<Event>` keeps its capacity |
+| `collectd_in` decode 1 three-data-source value list (`load`) | **2** | 1 as above + one `MetricList` spill: `MetricList` is a `SmallVec` inlined at 1, so a multi-data-source list moves its records to the heap exactly once, not once per record |
+| `collectd_in` decode a 25-list datagram | **1** | + 3 reallocs (`Vec<Event>` growing 4 → 8 → 16 → 32); a collectd datagram has no header naming its value-list count, so `decode_into` cannot size the `Vec` up front |
+| `collectd_in` decode 1 three-data-source list, `types_db` resolving its names | **2** | **the same as without a `types.db`** -- the lookup is one `HashMap::get` per Values part returning a borrowed slice, and resolved names go into the same reused scratch `String` before interning |
 | `prometheus_in` decode 1 scrape (11 series: 2 counter families, 1 gauge, 1 histogram, 1 summary) | **161** | `text::parse_with` + `families_to_events`, no `Decoder` trait (ADR `prometheus-scrape-and-exposition`'s "No `logit_proto::Encoder`") -- ~14.6/series, dominated by one `String`/`AttrMap` per label pair (labels are decoded as owned `String`s, not sliced from the scrape body, unlike syslog/statsd's zero-copy `Bytes` fields) plus one `Vec` per family's series list; not yet optimized the way syslog/statsd's decode paths were, tracked as follow-up work rather than fixed here |
 | `json` parse + merge (nginx shape) | **1** | fixed -- see below, was 7 |
 | `json` parse + merge (wide-JSON, 28 keys) | **1** | same fix, confirmed to generalize past a small field count |
@@ -296,7 +301,11 @@ And the corresponding times:
 > `statsd_decode_one_event_line_with_an_escaped_newline`/`statsd_decode_one_service_check_line`
 > pin. So is the `statsd_out` encode_into row (ADR `framed-encoder`): its count is what
 > `statsd_encode_into_100_events` pins; `benches/pipeline.rs` has a matching `encode::statsd`
-> arm, but no wall-clock figure has been folded into this table for it.
+> arm, but no wall-clock figure has been folded into this table for it. The `collectd_in` rows
+> are the same kind of exception again, with no wall-clock figure -- their counts are what
+> `collectd_decode_one_list`/`collectd_decode_into_a_warm_reused_buffer_costs_nothing`/
+> `collectd_decode_one_three_value_list`/`collectd_decode_a_25_list_packet`/
+> `collectd_decode_one_list_with_types_db_resolution` pin.
 
 ### Listener I/O decoupling: the `decode_into` buffer-reuse win (ADR `decoupled-listener-io`)
 
@@ -310,7 +319,8 @@ so the original numbers stand unchanged. `decode_into` called directly against a
 cheaper call shape, because the one thing `decode()` couldn't avoid (allocating the output buffer)
 is exactly what the reused buffer removes. `statsd_in` drops from 2 to 1 (`parse_line`'s per-line
 `Vec<Event>` is still real -- internal to `decode_into`, not something the caller's buffer can
-absorb); `syslog_in` drops from 1 to 0 (nothing else was allocating).
+absorb); `syslog_in` drops from 1 to 0 (nothing else was allocating), and `collectd_in` likewise
+drops from 1 to 0.
 
 This is the plan's one strict *improvement* to the hot path, not a neutral refactor, and it exists
 *because* `BatchAccumulator::absorb` needed it: `absorb` takes `&mut Vec<Event>` and merges via

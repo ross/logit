@@ -303,6 +303,94 @@ fn statsd_decode_into_a_warm_reused_buffer_costs_one_not_two() {
     expect_allocs("statsd_in: decode_into into a warm buffer", stats, 1);
 }
 
+// -- collectd_in (docs/adr/collectd-binary-relay.md) -------------------------------------------
+
+/// One allocation, matching `syslog_in`: the `Vec<Event>` the batch is collected into. Every
+/// identity field is a refcounted slice of the datagram (`decode.rs`'s `string_value`), the record
+/// name is built into the decoder's reused scratch `String` before interning, and a
+/// single-data-source list fits `MetricList`'s inline capacity -- so the value list itself costs
+/// nothing.
+#[test]
+fn collectd_decode_one_list() {
+    let mut decoder = fixtures::collectd_decoder();
+    let datagram = fixtures::collectd_packet(1);
+    drop(decoder.decode(datagram.clone())); // warm: interns the six attribute keys and the name
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.events[0].metrics.len(), 1);
+    expect_allocs("collectd_in: decode 1 list", stats, 1);
+}
+
+/// The listener's actual hot path (`docs/adr/decoupled-listener-io.md`): `decode_into` against a
+/// buffer `decode_loop` reuses across datagrams. Zero -- there is nothing left to allocate once the
+/// caller's `Vec<Event>` keeps its capacity, which is the strongest statement this codec can make.
+#[test]
+fn collectd_decode_into_a_warm_reused_buffer_costs_nothing() {
+    let mut decoder = fixtures::collectd_decoder();
+    let datagram = fixtures::collectd_packet(1);
+    let mut out = Vec::new();
+    decoder.decode_into(datagram.clone(), 0, &mut out).expect("should decode");
+    out.clear(); // capacity intact -- this is the property under test
+
+    let (_resource, stats) =
+        measure(|| decoder.decode_into(datagram.clone(), 0, &mut out).expect("should decode"));
+    assert_eq!(out.len(), 1);
+    expect_allocs("collectd_in: decode_into into a warm buffer", stats, 0);
+}
+
+/// Two: the `Vec<Event>`, plus one spill of the event's `MetricList`. `logit_core::MetricList` is a
+/// `SmallVec` inlined at 1, so a three-data-source `load` list is the first shape that has to move
+/// its records to the heap -- exactly once, not once per record (`docs/design/memory.md` §3).
+#[test]
+fn collectd_decode_one_three_value_list() {
+    let mut decoder = fixtures::collectd_decoder();
+    let datagram = fixtures::collectd_load_packet();
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1, "one Values part is one event, whatever its width");
+    assert_eq!(batch.events[0].metrics.len(), 3);
+    expect_allocs("collectd_in: decode 1 three-value list", stats, 2);
+}
+
+/// A 25-list datagram -- what a real collectd host agent packs into one 1452-byte packet. Still one
+/// allocation, not 25: the per-list cost is the `Vec<Event>`'s own growth, which shows up as
+/// *reallocs* rather than allocs (4 -> 8 -> 16 -> 32, three of them) because `decode_into` cannot
+/// know the list count in advance -- a collectd datagram has no header saying how many Values parts
+/// it holds, only a flat part stream.
+#[test]
+fn collectd_decode_a_25_list_packet() {
+    let mut decoder = fixtures::collectd_decoder();
+    let datagram = fixtures::collectd_packet(25);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 25);
+    assert_eq!(stats.reallocs, 3, "the events Vec grows 4 -> 8 -> 16 -> 32");
+    expect_allocs("collectd_in: decode a 25-list packet", stats, 1);
+}
+
+/// The same three-data-source list decoded through a decoder holding a `types.db`, which renames
+/// its records `load.load.shortterm`/`midterm`/`longterm`. **The same count as without it**: the
+/// lookup is one `HashMap::get` per Values part returning a borrowed slice, and the names are
+/// written into the same reused scratch `String` before interning, so resolving them costs no
+/// allocation at all.
+#[test]
+fn collectd_decode_one_list_with_types_db_resolution() {
+    let mut decoder = fixtures::collectd_decoder_with_types_db();
+    let datagram = fixtures::collectd_load_packet();
+    drop(decoder.decode(datagram.clone())); // warm: interns the three resolved names
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(
+        logit_core::interner::resolve(batch.events[0].metrics[0].name),
+        "load.load.shortterm",
+        "the types.db must actually have resolved, or this measures the wrong thing"
+    );
+    expect_allocs("collectd_in: decode 1 list with types.db", stats, 2);
+}
+
 /// `prometheus_in`'s decode path has no `Decoder` trait to go through (`docs/adr/
 /// prometheus-scrape-and-exposition.md`'s "No `logit_proto::Encoder`" section) -- it's the two
 /// plain functions a real scrape tick calls in sequence: `text::parse_with` (bytes -> families)

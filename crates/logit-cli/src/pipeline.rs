@@ -13,6 +13,7 @@ use crate::config;
 use anyhow::Context;
 use logit_config::{BufferConfig, Config, StdioTarget};
 use logit_core::{Diagnostics, Registry, Telemetry};
+use logit_inputs::collectd::CollectdInput;
 use logit_inputs::docker::{ContainerFilter, DockerInput};
 use logit_inputs::internal::InternalInput;
 use logit_inputs::logit::LogitInput;
@@ -37,6 +38,7 @@ use logit_pipeline::{
     DiskQueueConfig, InputRuntimeConfig, NodeSpec, Readiness, RetryConfig, RunError,
     SinkQueueConfig, SinkStoreConfig, WriteLoopConfig,
 };
+use logit_proto::collectd::TypesDb;
 use logit_proto::frame::Compression as NativeCompression;
 use logit_transforms::{
     AggregateTemporality as TransformTemporality, Aggregator, CsvParser,
@@ -318,6 +320,25 @@ fn build_spec(
             ),
             input_runtime_config(&component.receive),
         ),
+        // `types_db` paths resolve against the config file's directory, exactly as `tail_in`'s
+        // `paths` and `lua_file`'s script do, and are read **here**, at startup: an unreadable or
+        // unparseable file is a config error that stops the process before it reports ready, not a
+        // listener that quietly runs with no data-source names (see
+        // `logit_proto::collectd::TypesDb::load`). One `Arc` per component, shared with its
+        // decoder.
+        CollectdIn { bind, types_db } => {
+            let mut input = CollectdInput::new(bind.clone())
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                .with_receive(receive_config(&component.receive));
+            if !types_db.is_empty() {
+                let paths: Vec<PathBuf> = types_db.iter().map(|p| base_dir.join(p)).collect();
+                let loaded = TypesDb::load(&paths)
+                    .with_context(|| format!("component '{id}': loading types_db"))?;
+                input = input.with_types_db(Arc::new(loaded));
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
         SyslogIn { bind } => NodeSpec::Input(
             Box::new(
                 SyslogInput::new(bind.clone())
@@ -1354,6 +1375,50 @@ mod tests {
             build_spec("in", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Input(..)
         ));
+    }
+
+    fn collectd_component(types_db: Vec<PathBuf>) -> ResolvedComponent {
+        ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig {
+                max_datagrams: 4242,
+                ..logit_config::ReceiveConfig::default()
+            },
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::CollectdIn { bind: "127.0.0.1:0".to_string(), types_db },
+        }
+    }
+
+    #[test]
+    fn build_spec_builds_a_collectd_input_with_receive_wired() {
+        let component = collectd_component(vec![]);
+        let (spec, _telemetry) = build_spec("in", &component, Path::new(""), None).unwrap();
+        assert!(matches!(spec, NodeSpec::Input(..)));
+    }
+
+    /// A `types_db` path is resolved against the config file's directory and actually read: a
+    /// relative path that exists under `base_dir` loads, and the same path with no file behind it
+    /// is a startup error naming it.
+    #[test]
+    fn build_spec_loads_a_collectd_types_db_relative_to_base_dir() {
+        let dir = std::env::temp_dir().join(format!("logit-collectd-spec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("types.db"), "load a:GAUGE:U:U, b:GAUGE:U:U\n").unwrap();
+
+        let component = collectd_component(vec![PathBuf::from("types.db")]);
+        let (spec, _telemetry) = build_spec("in", &component, &dir, None)
+            .expect("a types_db under base_dir should load");
+        assert!(matches!(spec, NodeSpec::Input(..)));
+
+        let missing = collectd_component(vec![PathBuf::from("absent.db")]);
+        let err = match build_spec("in", &missing, &dir, None) {
+            Ok(_) => panic!("a missing types_db must fail startup, not warn"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("loading types_db"), "got: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

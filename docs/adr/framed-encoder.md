@@ -128,8 +128,9 @@ warm-then-measure call.
 - `crates/logit-bench`: one `measure_framed` helper over `E: FramedEncoder<Meta = ()>` drives
   the `syslog_out` row (still 100) and a new `statsd_out: encode_into 100 events` row (0 --
   `docs/design/memory.md`), plus a `statsd` arm in `benches/pipeline.rs`'s `encode` group.
-- **The collectd codec should replace its `Packets` copy with `MessageBuf<usize>` and implement
-  `FramedEncoder` when its W3 lands** -- a follow-up on that branch, not part of this change.
+- **The collectd codec (`crates/logit-proto/src/collectd/encode.rs`, on `main` since #137)
+  should replace its `Packets` copy with `MessageBuf<usize>` and implement `FramedEncoder`** --
+  a follow-up PR, before `collectd_out` is written against `Packets`; not part of this change.
 - `prometheus_out` remains the one sink outside all three traits, by design (its ADR's "No
   `logit_proto::Encoder`" section).
 - A fourth framed sink (a Graphite/Carbon line sink, a per-record Kafka/NATS producer) gets the
