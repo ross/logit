@@ -435,35 +435,59 @@ simply sees new bytes on its next read.
   `config.v2.json` couldn't be read or parsed; that container's lines still flow, just with a
   `container.id`-only resource instead of the full identity.
 
-## Gauge retention
+## Series retention
 
 `aggregate` normally drains every series on every flush (tumbling). A statsd gauge is an
 exception: the sender transmits only on change and expects the last value to persist, and a
 relative adjustment (`+`/`-`, `docs/adr/relative-gauge-adjustments.md`) sent in a later window
-needs the gauge's last-known value to apply against. `gauge_retention` (on by default, `5`
-windows) and `max_retained_gauge_series` (on by default, `10,000` series) on an `aggregate`
+needs the gauge's last-known value to apply against. `series_retention` (on by default, `5`
+windows) and `max_retained_series` (on by default, `10,000` series) on an `aggregate`
 component control this — see the field doc comments in the schema (`logit schema`) for the exact
-semantics. `gauge_retention: 0` opts out entirely, reproducing the strictly-tumbling behavior every
+semantics. `series_retention: 0` opts out entirely, reproducing the strictly-tumbling behavior every
 config had before this existed; both fields are additive and optional, so no existing config needs
-updating to keep validating.
+updating to keep validating. The same two bounds are what makes `temporality: cumulative` possible
+(below), which is why they are named for series in general rather than for gauges.
 
 **What retention does not fix:** a delta against a series evicted by the cardinality cap, or a
 delta sent after a process restart, resolves against `0.0` — reported (`logit.transform.gauge
 .delta.unseeded`, `logit.transform.series.evicted{reason="cardinality"}`), never silent, but not
 prevented. The restart case is unfixable without durable aggregator state, which this project has
-deliberately not built (`docs/adr/aggregation-window-semantics.md`'s rejection of cumulative
-counters, for the same underlying reason). If a config's gauges see relative adjustments and an
+deliberately not built (`docs/adr/aggregation-window-semantics.md`'s Alternatives — a cumulative
+series has the same exposure, which is why every cumulative record carries a `start_timestamp` a
+consumer can detect the restart from). If a config's gauges see relative adjustments and an
 operator needs the post-restart value to be exact rather than "resolves against 0 until the next
 absolute," the sending side's own zero-then-set convention (send an absolute periodically, not only
 deltas) is the mitigation, not `logit` itself.
 
 **What to watch:** `logit.transform.series.retained` (gauge) — how many gauge series are currently
-carried idle; a number that keeps climbing past what `gauge_retention × <series churn per window>`
+carried idle; a number that keeps climbing past what `series_retention × <series churn per window>`
 would predict is a sign of a leak (each series' name/tags never repeating) worth investigating with
 `keep` the same way unbounded `series.active` growth already is.
 `logit.transform.series.evicted{reason="cardinality"}` — any sustained nonzero rate here means
-`max_retained_gauge_series` is undersized for this pipeline's actual gauge cardinality, and deltas
+`max_retained_series` is undersized for this pipeline's actual gauge cardinality, and deltas
 are silently resolving against 0 as a result.
+
+## Counter temporality (`delta` vs. `cumulative`)
+
+`aggregate`'s `temporality:` decides what a flushed `Sum`/`Histogram` *means*. `delta` (the default)
+emits each window's own increment — what InfluxDB and statsd expect, and what every config had
+before this key existed. `cumulative` instead keeps the accumulator alive across flushes and emits
+the running total since the series was first seen, labelled `Cumulative` and stamped with that
+first-seen time (`start_timestamp`) so a consumer can tell a genuine restart from a decrease. That
+is the shape a Prometheus scrape carries, so a `prometheus_out` leg needs it: that sink skips delta
+records rather than resolving them itself
+(`docs/adr/prometheus-scrape-and-exposition.md`), making
+`statsd_in -> aggregate(temporality: cumulative) -> prometheus_out` the intended pipeline.
+
+`cumulative` is bounded by the same `series_retention`/`max_retained_series` pair above — that is
+what keeps the running totals alive — so both must be above `0`; `logit validate` rejects the
+combination otherwise, since with no retention every window's increment would be emitted labelled as
+a running total. Watch the same two signals as for gauge retention:
+`logit.transform.series.retained` for how many totals are being carried, and
+`logit.transform.series.evicted{reason="cardinality"|"idle"}` — an evicted cumulative series
+restarts from zero with a new `start_timestamp` (correct, and visible to a consumer, but a gap in
+that series' graph), and hitting the cap also warns under
+`logit.component.diagnostics{key="series_retention_full"}`.
 
 ## Raw samples and set members
 
@@ -481,7 +505,7 @@ existing config needs updating to keep validating.
 **Both raw modes fall back to their summarized counterpart, never drop data.** Growing past either
 cap converts what's held (plus the record that tripped the cap) into a sketch or a fresh
 `HyperLogLog` and counts it, rather than dropping the overflow or growing the accumulator
-unboundedly — the same DoS/memory-guard role `max_retained_gauge_series` plays for gauge retention.
+unboundedly — the same DoS/memory-guard role `max_retained_series` plays for gauge retention.
 `distributions: samples` has a second fallback trigger a raw member set can't: an incoming record's
 `sample_rate` disagreeing with the series' first one, since a `samples`-mode accumulator can only
 ever report one rate for the whole series, and there's no correct single rate to pick between two
@@ -499,7 +523,7 @@ absorb and the `samples`-mode fallback's own re-sketch), and also on `statsd_in`
 diagnostic until W3 removes it, so a `statsd_in -> aggregate` pipeline reports it twice today.
 
 Neither raw mode changes tumbling: a `Samples`/`SetMembers`/`Set` series never survives a flush,
-even with `gauge_retention` set — retention exists specifically for a gauge's sticky-value
+even with `series_retention` set — retention exists specifically for a gauge's sticky-value
 semantics, which nothing about a raw sample or set member shares (see
 [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s amendment).
 

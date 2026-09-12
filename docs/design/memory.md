@@ -235,7 +235,8 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `aggregate` absorb (after `keep`) | **0** | `SeriesKey` clone stays inline |
 | `aggregate` absorb (no `keep`) | **4** | one per metric — the map no longer fits inline |
 | `aggregate` flush 4 series | **6** | +4 since flush-side trace linking landed (ADR `trace-context-propagation-on-delivered`) — one `Vec<SpanLink>` per series, see below |
-| `aggregate` flush 100 retained gauge series (spilled attrs) | **209** | `gauge_retention > 0` only — see below; the default (`0`) tumbling path above is unaffected |
+| `aggregate` flush 100 retained gauge series (spilled attrs) | **209** | `series_retention > 0` only — see below; the default (`0`) tumbling path above is unaffected |
+| `aggregate` flush 100 cumulative sum series (spilled attrs) | **209** | `temporality: cumulative` — identical to the retained-gauge row above, on purpose: see below |
 | `aggregate` absorb 1 `Samples` event (`distributions: sketch`, the default) | **0** | every value sketches directly into the series' `DdSketch` via `Samples::sketch`'s weighting -- no raw values are ever retained, so absorbing into an already-open sketch is as free as `distributions_merge_via_ddsketch` already is |
 | `aggregate` absorb 25 `Samples` values into one series (`distributions: samples`) | **1** | `SAMPLES_INLINE` is 19 -- a series already holding a few inline values that then absorbs 25 more in one record spills the accumulator's `SmallVec` on that call; the warm/still-inline case (a few values) pays nothing |
 | **full ingest chain, 1 line** | **5** | decode → aggregate; was 11 before `json`'s fix |
@@ -332,11 +333,11 @@ the links on the way out, since nothing turns them into a real `SpanRecord` yet
 `aggregate` flushes any series at all, whether or not a config ever routes anything to look at the
 result.
 
-### Gauge retention's own cost, isolated and measured (ADR `aggregation-window-semantics`'s amendment)
+### Series retention's own cost, isolated and measured (ADR `aggregation-window-semantics`'s amendments)
 
-`gauge_retention > 0` (`docs/adr/aggregation-window-semantics.md`'s amendment) adds a real,
+`series_retention > 0` (`docs/adr/aggregation-window-semantics.md`'s amendment) adds a real,
 separate allocation cost on top of the flush numbers above, paid only by series that are actually
-retained -- the default (`gauge_retention: 0`) path above is untouched, confirmed by
+retained -- the default (`series_retention: 0`) path above is untouched, confirmed by
 `aggregate_flush_100_series` re-measuring at exactly the same **6** it was before retention existed.
 `aggregate_flush_retained_gauges` isolates the retained path itself: 100 distinct, deliberately
 un-`keep`ed gauge series (12 attributes each, past `AttrMap`'s 8-slot inline capacity) retained
@@ -353,10 +354,20 @@ retention has to do, not incidental:
   anything.** `flush` takes each group's whole `series` map via `mem::take` and re-inserts survivors
   into the now-empty replacement -- deliberately, so the *far* more common tumbling/drop path can
   move `key.attributes` for free (see above) rather than paying a clone on every series, retained or
-  not. The tradeoff is that a `gauge_retention > 0` pipeline pays a full table-growth cost -- several
+  not. The tradeoff is that a `series_retention > 0` pipeline pays a full table-growth cost -- several
   allocations, not just one -- every flush, for as long as it keeps retaining the same series. This
   is accepted as a real, measured cost of opting into retention (not a bug), and is exactly why this
   fixture exists as its own measurement rather than folding into the default-path number above.
+
+`aggregate_flush_cumulative_sums` measures the other thing retention now keeps alive -- a
+`temporality: cumulative` `Sum` series (that ADR's cumulative amendment) -- deliberately against the
+same 100 series, same spilled 12-attribute maps, same steady-state second flush, and lands on the
+same **209**. That equality is the finding: a retained `Sum` reports through the identical
+copy-then-keep path a retained gauge does (`Accumulator::kind_for_retained`, `Copy` fields on both),
+so cumulative counters cost a flush nothing beyond what gauge retention already costs. The one shape
+that would add to this is a cumulative `Histogram`, which has to clone its bucket `Vec` per series
+per flush; it has no wire producer yet, so there is nothing honest to fixture it from and no number
+to pin.
 
 ### `aggregate` flush now costs one allocation per series, for real trace links
 

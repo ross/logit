@@ -200,31 +200,35 @@ already built that have a known, accepted rough edge.
   otherwise). Resolving a delta in a *later* window than the absolute it should apply against
   needs the gauge's value to survive a flush, which `aggregate` now does for gauge series
   specifically, bounded by two independent mechanisms
-  (`docs/adr/aggregation-window-semantics.md`'s amendment): `gauge_retention` (a windows-count
+  (`docs/adr/aggregation-window-semantics.md`'s amendment): `series_retention` (a windows-count
   TTL per series, on by default at `5` windows — a feature whose entire point is making "resolves
   against 0.0" rare shouldn't default to guaranteeing it; `0` opts out entirely, reproducing the
-  strictly-tumbling behavior every config had before this existed) and `max_retained_gauge_series`
+  strictly-tumbling behavior every config had before this existed) and `max_retained_series`
   (a hard cardinality cap, since the TTL alone bounds only the tail of the retained set, not its
   peak).
 
   What's left open, by design, not oversight:
-  - **Retention is on by default (`gauge_retention: 5`, `max_retained_gauge_series: 10,000`), so
+  - **Retention is on by default (`series_retention: 5`, `max_retained_series: 10,000`), so
     upgrading with no config change turns it on for every existing `aggregate` component.**
     Deliberate — a feature whose entire point is resolving deltas correctly shouldn't ship
     opt-in, and both fields are additive to the schema so no config fails to validate — but it is
     a real behavior change: a config with high-cardinality, slowly-churning gauge tags can see its
-    steady-state memory grow purely from the upgrade (up to `max_retained_gauge_series` idle series
-    held for up to `gauge_retention` extra windows per `aggregate` component), with no line in the
+    steady-state memory grow purely from the upgrade (up to `max_retained_series` idle series
+    held for up to `series_retention` extra windows per `aggregate` component), with no line in the
     config saying so. `logit.transform.series.retained` makes the actual number visible;
-    `gauge_retention: 0` opts back out to the exact pre-upgrade behavior.
+    `series_retention: 0` opts back out to the exact pre-upgrade behavior.
   - **A delta after eviction (the cardinality cap) or after a process restart resolves against
     0.0.** The eviction case is counted and reported (`logit.transform.gauge.delta.unseeded`,
     `logit.transform.series.evicted{reason="cardinality"}`) — never silent. The restart case is
-    unfixable without durable aggregator state, which this project has already declined once for
-    the same underlying reason: ADR `aggregation-window-semantics`'s own rejection of cumulative counters ("state grows
+    unfixable without durable aggregator state, which this project has deliberately not built:
+    ADR `aggregation-window-semantics`'s original objection to cumulative counters ("state grows
     unbounded with series cardinality and a process restart resets every series to zero with no
-    way to detect that from the emitted stream") applies just as much to a retained gauge as to a
-    cumulative counter. Retention narrows the window this can happen in; it does not close it.
+    way to detect that from the emitted stream") applies just as much to a retained gauge.
+    Retention narrows the window this can happen in; it does not close it. A *cumulative* series
+    (`temporality: cumulative`, that ADR's later amendment) has the same exposure but not the same
+    blindness: every emitted point carries a `start_timestamp`, so a consumer can see the restart
+    even though `logit` can't prevent it. A gauge has no such field, and inventing one for it is
+    not on the table.
   - **A `GaugeDelta` reaching a sink with no `aggregate` on its path degrades to a throttled,
     per-metric drop, not a config-time error.** `influxdb_out`'s encoder reports it under its own
     `gauge_delta_unresolved` diagnostic key (not the generic `encode_error`) and skips just that

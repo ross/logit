@@ -364,6 +364,13 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 38. A `statsd_out` `max_packet_bytes: 0` is rejected, the same shape as rule 15's
     `buffer.max_batches`/`max_bytes: 0` — an impossible bound (every metric line would overflow it
     and be dropped whole), not a small one (`docs/adr/statsd-output.md`).
+39. An `aggregate` with `temporality: cumulative` and either `series_retention: 0` or
+    `max_retained_series: 0` is rejected — those two bounds are what keeps a running total alive
+    across the window boundary, so with either at `0` no accumulator survives a flush and every
+    window would emit its own increment labelled as a cumulative total, a silently wrong number for
+    the consumer that mode exists for. `series_retention: 0` stays legal under the default
+    `temporality: delta`, where it is the documented opt-out from gauge retention
+    (`docs/adr/aggregation-window-semantics.md`'s cumulative amendment).
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

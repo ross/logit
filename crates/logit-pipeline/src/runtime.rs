@@ -2184,8 +2184,9 @@ mod tests {
                 sources: vec!["in".to_string()],
                 kind: ComponentKind::Aggregate {
                     interval: Duration::from_secs(3600),
-                    gauge_retention: 5,
-                    max_retained_gauge_series: 10_000,
+                    temporality: logit_config::AggregateTemporality::default(),
+                    series_retention: 5,
+                    max_retained_series: 10_000,
                     distributions: logit_config::Distributions::default(),
                     max_samples_per_series: 1000,
                     sets: logit_config::Sets::default(),
