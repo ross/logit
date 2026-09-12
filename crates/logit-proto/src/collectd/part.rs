@@ -155,10 +155,18 @@ pub fn read_part(bytes: &[u8], at: usize) -> Result<(PartHeader, &[u8]), PartErr
 /// Writes a NUL-terminated string part. `value` is written byte-verbatim (it is already sanitized
 /// and length-bounded by the encoder -- see [`super::encode`]'s sanitizer), so this function never
 /// inspects or truncates it.
+///
+/// # Panics
+///
+/// Panics rather than truncating a `u16` length, for the reason [`write_values_part`] documents at
+/// length. The encoder's sanitizer caps every identity field at [`super::DATA_MAX_NAME_LEN`] minus
+/// its NUL, so the longest part this can produce is 132 bytes.
 pub fn write_string_part(out: &mut Vec<u8>, part_type: u16, value: &[u8]) {
     let len = HEADER_LEN + value.len() + 1;
+    let len = u16::try_from(len)
+        .expect("an identity field is sanitized to DATA_MAX_NAME_LEN, far inside a u16 length");
     out.extend_from_slice(&part_type.to_be_bytes());
-    out.extend_from_slice(&(len as u16).to_be_bytes());
+    out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(value);
     out.push(0);
 }
@@ -174,11 +182,33 @@ pub fn write_number_part(out: &mut Vec<u8>, part_type: u16, value: u64) {
 /// Writes a Values part: the data-source count, then every type byte, then every eight-byte value
 /// -- the two-vector layout collectd's own `write_part_values` uses, not one interleaved
 /// type/value pair per data source.
+///
+/// # Panics
+///
+/// Both the part length and the data-source count are `u16` on the wire, so this panics rather than
+/// truncating if `values` holds more than [`super::MAX_VALUES_PER_LIST`] entries. That is an
+/// invariant [`super::encode::CollectdEncoder::encode_into`] establishes before ever calling here
+/// -- a longer list is dropped whole and counted
+/// `logit.output.metrics.skipped{reason="too_many_values"}` -- so reaching either check means a
+/// caller bypassed that cap, not that an operator sent something unusual. A silent `as u16` would be
+/// far worse than a panic: at 7282 data sources the declared length wraps to 8, shorter than the
+/// part's own header, and every receiver then reads structural garbage from a datagram that looks
+/// well-formed.
 pub fn write_values_part(out: &mut Vec<u8>, values: &[DsValue]) {
+    debug_assert!(
+        values.len() <= super::MAX_VALUES_PER_LIST,
+        "a value list of {} exceeds MAX_VALUES_PER_LIST ({}); the encoder caps this before here",
+        values.len(),
+        super::MAX_VALUES_PER_LIST
+    );
     let len = VALUES_OVERHEAD + BYTES_PER_VALUE * values.len();
+    let len = u16::try_from(len)
+        .expect("a values part is at most MAX_VALUES_PER_LIST sources, far inside a u16 length");
+    let count = u16::try_from(values.len())
+        .expect("a values part is at most MAX_VALUES_PER_LIST sources, far inside a u16 count");
     out.extend_from_slice(&TYPE_VALUES.to_be_bytes());
-    out.extend_from_slice(&(len as u16).to_be_bytes());
-    out.extend_from_slice(&(values.len() as u16).to_be_bytes());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(&count.to_be_bytes());
     for value in values {
         out.push(value.ds_type());
     }
