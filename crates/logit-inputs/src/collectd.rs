@@ -392,10 +392,7 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
     /// Decodes one recorded datagram through a real [`CollectdDecoder`], with the diagnostics
     /// mirrored into a drainable registry so a test can assert that *nothing* was diagnosed -- the
     /// point of a recorded fixture being that a real sender's output should decode clean.
-    fn decode_interop(
-        name: &str,
-        types_db: Option<&str>,
-    ) -> (Vec<Event>, Arc<Registry>) {
+    fn decode_interop(name: &str, types_db: Option<&str>) -> (Vec<Event>, Arc<Registry>) {
         let registry = Registry::new();
         let diag = Diagnostics::new("collectd_in").with_telemetry(registry.telemetry_for(
             "collectd_in",
@@ -436,11 +433,7 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
 
     /// The first event decoded from `name` whose plugin and type match -- collectd packs unrelated
     /// lists into one datagram, so picking one out by identity is how these tests address a list.
-    fn list_of<'a>(
-        events: &'a [Event],
-        plugin: &str,
-        type_: &str,
-    ) -> &'a Event {
+    fn list_of<'a>(events: &'a [Event], plugin: &str, type_: &str) -> &'a Event {
         events
             .iter()
             .find(|e| {
@@ -482,7 +475,8 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
                     Some("logit-fixture"),
                     "{name}: tools/record-fixtures/collectd.conf sets `Hostname \"logit-fixture\"`"
                 );
-                let plugin = attr_str(event, "collectd.plugin").expect("every list carries a plugin");
+                let plugin =
+                    attr_str(event, "collectd.plugin").expect("every list carries a plugin");
                 assert!(
                     matches!(plugin, "load" | "memory" | "interface"),
                     "{name}: the config loads exactly these three read plugins, got {plugin:?}"
