@@ -82,9 +82,11 @@ Two findings worth recording alongside §1's, both specific to how collectd's `n
 behaves rather than to what its protocol says:
 
 - **A datagram is not a read cycle, and `--count 3` is not "three measurements."** The `network`
-  plugin packs value lists into a send buffer (`MaxPacketSize`, default 1452) and only puts a
-  datagram on the wire once that buffer is full, or at shutdown. So the recorded fixtures are
-  ~1.3 KB each rather than the few hundred bytes every syslog fixture is, and each one carries
+  plugin packs value lists into a send buffer and only puts a datagram on the wire once the next
+  list would not fit under `MaxPacketSize` (default 1452) — or at shutdown, which this corpus never
+  sees, since the capture stops on its own datagram count seconds earlier. So the recorded fixtures
+  are ~1.3 KB each, just under that cap, rather than the few hundred bytes every syslog fixture is,
+  and each one carries
   ~25 value lists from several read cycles. This is what makes three datagrams a *good* size for
   this corpus rather than an accident: sender-side identity elision (one Host part for ~25 lists),
   a read cycle split across a packet boundary, and identity being re-stated in full at the start of
@@ -206,13 +208,17 @@ unwieldy — not a concern yet.
 
 ## 3. Size discipline
 
-**Rule of thumb: a few hundred bytes per syslog fixture, low single-digit KB per OTLP fixture,
-whole directory well under 100 KB.** As of this PR it's ~4 KB across nine files. Justification:
-these fixtures exist to exercise decoder *paths* — one or two representative messages per
-construct — not to be a load-testing dataset or a corpus of "everything a producer can possibly
-emit." `record_otlp` enforces this at capture time by using `telemetrygen`'s fixed-count flags
-(`--traces=3`/`--logs=3`/`--metrics=3`) rather than an open-ended `--duration`, so a re-record
-can't accidentally balloon the fixture based on how long the container happened to take to start.
+**Rule of thumb: a few hundred bytes per syslog fixture, ~1.3 KB per collectd fixture (one packed
+datagram, just under collectd's 1452-byte `MaxPacketSize` — the producer, not this corpus, chooses
+that size), low single-digit KB per OTLP fixture, whole directory well under 100 KB.** It was ~4 KB
+across nine files when this plan was written, and is ~8.9 KB across twelve at head, the three
+collectd captures being the difference. Justification: these fixtures exist to exercise decoder
+*paths* — one or two representative messages per construct — not to be a load-testing dataset or a
+corpus of "everything a producer can possibly emit." `record_otlp` enforces this at capture time by
+using `telemetrygen`'s fixed-count flags (`--traces=3`/`--logs=3`/`--metrics=3`) rather than an
+open-ended `--duration`, and `record_collectd` by capturing a fixed count of *datagrams*, so a
+re-record can't accidentally balloon the fixture based on how long the container happened to take
+to start.
 A per-fixture size creeping up over time (padding, verbose repeated attributes, an accidentally
 large `--count`) is a signal something needless crept in, not a corpus that's naturally growing.
 

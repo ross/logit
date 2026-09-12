@@ -52,7 +52,8 @@ fixtures" below.
 
 Every fixture here is a handful of syslog datagrams, one collectd datagram, or a few KB of
 OTLP/JSON -- there's no reason for one to be bigger. As a rule of thumb: **a few hundred bytes per
-syslog fixture, one datagram (so ~1.3 KB, collectd's own `MaxPacketSize`) per collectd fixture, low
+syslog fixture, ~1.3 KB per collectd fixture -- one packed datagram, just under collectd's
+1452-byte `MaxPacketSize` -- low
 single-digit KB per OTLP fixture, and this whole directory should stay well under 100 KB total**
 (it's a few KB as of this writing). If a producer's natural output is bigger than that (a verbose
 OTLP payload with many spans, say), trim it at record time -- `script/record-fixtures`'s OTLP

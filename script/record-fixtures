@@ -149,10 +149,13 @@ record_rsyslog() {
 # plugin dependencies this fixture has no use for.
 #
 # Three datagrams rather than one: collectd's `network` plugin does not send one datagram per read
-# cycle -- it packs value lists into a 1452-byte buffer and flushes when the buffer fills (or at
-# shutdown), eliding identity parts that repeat within a packet. Three captures that packing, that
-# elision, and the smaller shutdown flush. The 90s timeout matches record_rsyslog's, for the same
-# reason: an apt-get install has to finish first.
+# cycle -- it packs value lists into a send buffer and flushes once the next list would not fit
+# under `MaxPacketSize` (1452), eliding identity parts that repeat within a packet. Three captures
+# that packing, that elision, and -- because a read cycle is ~15 lists against 23-26 per datagram --
+# a read cycle split across a datagram boundary, with identity re-stated in full at the start of the
+# next one. All three are packed flushes: the capture stops on its own `--count 3`, a few seconds
+# in, so a shutdown flush is not in the corpus. The 90s timeout matches record_rsyslog's, for the
+# same reason: an apt-get install has to finish first.
 record_collectd() {
     echo "== recording: collectd (network plugin, debian:bookworm-slim) =="
     local out="${OUT_ROOT}/collectd"

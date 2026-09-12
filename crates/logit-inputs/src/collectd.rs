@@ -431,16 +431,26 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
         event.attributes.get(key).and_then(Value::as_str)
     }
 
-    /// The first event decoded from `name` whose plugin and type match -- collectd packs unrelated
-    /// lists into one datagram, so picking one out by identity is how these tests address a list.
-    fn list_of<'a>(events: &'a [Event], plugin: &str, type_: &str) -> &'a Event {
-        events
-            .iter()
-            .find(|e| {
+    /// The first `plugin`/`type_` list anywhere in the corpus, decoded with `types_db`.
+    ///
+    /// Deliberately across `INTEROP_FIXTURES` in order rather than out of one named file:
+    /// collectd's own packing decides which lists land in which datagram, a read cycle is ~15 lists
+    /// against 23-26 per datagram, and nothing guarantees any one datagram holds a complete cycle.
+    /// A test naming `collectd-000.raw` would therefore pass today and panic on a re-record whose
+    /// first datagram happens to open late in a cycle -- exactly the instability
+    /// `docs/plans/recorded-interop-fixtures.md`'s amendment warns about. The corpus as a whole
+    /// spans several read cycles, so every plugin's lists are somewhere in it.
+    fn first_list_across_fixtures(plugin: &str, type_: &str, types_db: Option<&str>) -> Event {
+        for name in INTEROP_FIXTURES {
+            let (events, _) = decode_interop(name, types_db);
+            if let Some(event) = events.into_iter().find(|e| {
                 attr_str(e, "collectd.plugin") == Some(plugin)
                     && attr_str(e, "collectd.type") == Some(type_)
-            })
-            .unwrap_or_else(|| panic!("no {plugin}/{type_} list in this datagram"))
+            }) {
+                return event;
+            }
+        }
+        panic!("no {plugin}/{type_} list anywhere in {INTEROP_FIXTURES:?}")
     }
 
     /// How many parts of `part_type` the raw datagram carries, walked with the codec's own framing
@@ -535,8 +545,7 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
     fn interop_fixture_load_is_three_gauges_index_named_without_a_types_db() {
         // The multi-data-source case, from the real `load` plugin: three GAUGEs in one list, which
         // a types.db-less deployment names by index.
-        let (events, _) = decode_interop("collectd-000.raw", None);
-        let load = list_of(&events, "load", "load");
+        let load = first_list_across_fixtures("load", "load", None);
         let names: Vec<&str> = load.metrics.iter().map(|r| resolve(r.name)).collect();
         assert_eq!(names, ["load.load.0", "load.load.1", "load.load.2"]);
         for record in &load.metrics {
@@ -556,16 +565,15 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
         // becomes shortterm/midterm/longterm. `memory` is single-data-source, so it is
         // `memory.memory` either way -- the omission rule, checked against a real single-DS list
         // rather than a hand-built one.
-        let (events, _) = decode_interop("collectd-000.raw", Some(FIXTURE_TYPES_DB));
-        let load = list_of(&events, "load", "load");
+        let load = first_list_across_fixtures("load", "load", Some(FIXTURE_TYPES_DB));
         let names: Vec<&str> = load.metrics.iter().map(|r| resolve(r.name)).collect();
         assert_eq!(names, ["load.load.shortterm", "load.load.midterm", "load.load.longterm"]);
 
-        let memory = list_of(&events, "memory", "memory");
+        let memory = first_list_across_fixtures("memory", "memory", Some(FIXTURE_TYPES_DB));
         assert_eq!(memory.metrics.len(), 1);
         assert_eq!(resolve(memory.metrics[0].name), "memory.memory");
         assert!(
-            attr_str(memory, "collectd.type_instance").is_some(),
+            attr_str(&memory, "collectd.type_instance").is_some(),
             "the memory plugin distinguishes used/free/cached/... by type_instance"
         );
     }
@@ -575,8 +583,8 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
         // The other data-source kind, from the real `interface` plugin: DERIVE, which the model
         // carries as a non-monotonic cumulative Sum (a counter that can be reset by a NIC reset or
         // an interface going away, which is exactly why collectd has DERIVE and not just COUNTER).
-        let (events, _) = decode_interop("collectd-000.raw", Some(FIXTURE_TYPES_DB));
-        let if_octets = list_of(&events, "interface", "if_octets");
+        let if_octets =
+            first_list_across_fixtures("interface", "if_octets", Some(FIXTURE_TYPES_DB));
         assert_eq!(if_octets.metrics.len(), 2, "if_octets is rx/tx");
         for record in &if_octets.metrics {
             let MetricKind::Sum(sum) = record.kind else {
@@ -588,7 +596,7 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
         let names: Vec<&str> = if_octets.metrics.iter().map(|r| resolve(r.name)).collect();
         assert_eq!(names, ["interface.if_octets.rx", "interface.if_octets.tx"]);
         assert!(
-            attr_str(if_octets, "collectd.plugin_instance").is_some(),
+            attr_str(&if_octets, "collectd.plugin_instance").is_some(),
             "the interface plugin puts the interface name in plugin_instance"
         );
         assert_eq!(if_octets.attributes.get("collectd.type_instance"), None);

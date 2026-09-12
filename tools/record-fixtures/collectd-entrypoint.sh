@@ -18,10 +18,12 @@ echo "collectd-core version: $(dpkg-query -W -f='${Version}' collectd-core)"
 collectd -C /etc/collectd-fixture.conf -f &
 collectd_pid=$!
 
-# Long enough for several read cycles at `Interval 1` to fill the network plugin's 1452-byte send
-# buffer more than three times over; the capture container stops on its own --count, so overshooting
-# here costs nothing but a few seconds. SIGTERM at the end makes collectd flush whatever is left in
-# the buffer on the way out, which is a real sender behaviour worth having in the corpus.
-sleep 30
+# Long enough for several read cycles at `Interval 1` to pack and flush the network plugin's send
+# buffer more than three times over -- which takes about four seconds, so this is generous on
+# purpose rather than tuned. The capture container stops on its own `--count`, well before this
+# sleep ends; the SIGTERM below is only so collectd (and therefore this container) exits cleanly
+# instead of being killed with the container. Whatever collectd flushes on its way out lands after
+# the capture has already gone, so it is *not* part of the corpus.
+sleep 10
 kill "${collectd_pid}" 2>/dev/null || true
 wait "${collectd_pid}" 2>/dev/null || true
