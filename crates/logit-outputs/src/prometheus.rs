@@ -304,6 +304,12 @@ impl Registry {
             .collect()
     }
 
+    /// Renders through the codec's no-telemetry [`text::write`] convenience. The writer is gaining
+    /// an encoder-taking variant (so its own drops -- an exemplar that doesn't fit OpenMetrics'
+    /// label budget, a unit that isn't a name suffix -- get counted); when it lands, this call site
+    /// is the one place to switch, handing it a [`PrometheusEncoder`] built from the sink's
+    /// `Telemetry`/`Diagnostics` clones. Nothing else here changes: family-name collisions after
+    /// sanitization are the encoder's to skip and count, never this registry's to special-case.
     fn render(&self, dialect: Dialect) -> Vec<u8> {
         let mut out = Vec::new();
         text::write(&self.families(), dialect, &mut out);
