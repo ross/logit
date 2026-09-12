@@ -29,11 +29,14 @@ pub struct MetricRecord {
     /// default value, rather than being silently skipped the way the OTLP codec used to treat it
     /// (`docs/adr/metrics-model-v2.md`'s W4 amendment). `otlp_out` keeps and re-encodes a flagged
     /// point unchanged -- that's the fixed point `docs/adr/lossless-transit.md` requires for
-    /// `otlp_in -> otlp_out`. Everywhere else -- every non-OTLP sink, and `aggregate`'s fold --
-    /// must instead treat a flagged record as carrying no genuine reading: skip it (counted) at a
-    /// sink, pass it through unmerged (counted) at `aggregate`, rather than fold its default
-    /// numeric payload in as though it were a real sample (`docs/known-gaps.md`'s cross-protocol
-    /// table has the one-row summary). Fills the 4 bytes of padding that already followed the
+    /// `otlp_in -> otlp_out`. `collectd_out` re-encodes a flagged `Gauge` as a GAUGE `NaN`, which is
+    /// collectd's *own* no-value marker (`crates/logit-proto/src/collectd/mod.rs`'s module doc) --
+    /// the second wire with a real concept for this, and the reason this rule is stated as "whose
+    /// wire has one" rather than "OTLP." Every sink whose wire format has **no** such concept, and
+    /// `aggregate`'s fold, must instead treat a flagged record as carrying no genuine reading: skip
+    /// it (counted) at a sink, pass it through unmerged (counted) at `aggregate`, rather than fold
+    /// its default numeric payload in as though it were a real sample (`docs/known-gaps.md`'s
+    /// cross-protocol table has the one-row summary). Fills the 4 bytes of padding that already followed the
     /// three `Symbol`s above, so [`MetricRecord`] stays 224 bytes -- see
     /// `crates/logit-core/tests/type_sizes.rs`.
     pub flags: u32,

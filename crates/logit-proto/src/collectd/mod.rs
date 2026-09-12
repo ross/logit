@@ -85,7 +85,8 @@
 //! | `collectd.interval` `F64`, finite, `> 0` | IntervalHR = `round(v * 2³⁰)` | -- |
 //! | `collectd.interval` absent | IntervalHR `0` (collectd's own "unspecified") | -- |
 //! | `collectd.interval` present but not a finite positive `F64` | IntervalHR `0` | `logit.output.tags.dropped{reason="unrepresentable"}` |
-//! | host | `collectd.host`, else `host.name`, else the encoder's [`CollectdEncoder::with_host_fallback`] value, else `"logit"` -- the first that survives sanitizing non-empty. **Never empty**: collectd's receiver rejects an empty host outright. | -- |
+//! | host | `collectd.host`, else `host.name`, else the encoder's [`CollectdEncoder::with_hostname`] value -- the first that survives sanitizing non-empty | -- |
+//! | none of those three present | the whole event is dropped | `logit.output.metrics.skipped{reason="no_host"}` + diag `no_host`. collectd's receiver rejects an empty host, and there is no honest substitute: this codec neither reads the OS hostname (deferred work, `docs/known-gaps.md`) nor invents a placeholder, since one made-up name would silently merge every unlabelled sender into a single host's metrics. |
 //! | `collectd.*` identity, `Str` or `Bytes` | verbatim after sanitizing; a `Bytes` is byte-verbatim (collectd's own strings are bytes, not UTF-8) | `logit.output.identity.sanitized{reason="substituted"\|"truncated"}` |
 //! | `collectd.*` identity of any other `Value` type | treated as absent | `logit.output.tags.dropped{reason="unrepresentable"}` |
 //! | every attribute outside the `collectd.` namespace | dropped -- collectd has no tag concept at all, and `host.name` is counted here too even though the host resolution above reads it | `logit.output.tags.dropped{reason="no_wire_form"}`, once per attribute per event |

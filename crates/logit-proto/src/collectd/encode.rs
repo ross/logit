@@ -19,11 +19,6 @@ use std::ops::Range;
 /// taking every unrelated list in it down too, so the encoder truncates rather than hoping.
 const MAX_IDENTITY_BYTES: usize = DATA_MAX_NAME_LEN - 1;
 
-/// The host written when nothing else survives -- `collectd.host`, `host.name` and the configured
-/// [`CollectdEncoder::with_host_fallback`] value all absent or sanitizing to nothing. collectd's
-/// receiver rejects an empty host outright, so "no host" is not an option this encoder has.
-const LAST_RESORT_HOST: &[u8] = b"logit";
-
 /// Encoded datagrams: one contiguous buffer, one range per datagram, and the number of value lists
 /// each datagram carries. [`crate::buffer`]'s `MessageBuf` is the same shape minus that last vector
 /// and lives in `logit-outputs`, which `logit-proto` cannot reach into (the dependency runs the
@@ -96,6 +91,11 @@ pub struct EncodeStats {
     /// An event whose `timestamp` is zero or negative: there is no cdtime before the epoch, and
     /// stamping "now" instead would invent an instant nothing upstream reported.
     pub dropped_unencodable_timestamp: usize,
+    /// An event with no host to write: no `collectd.host`, no `host.name`, and no configured
+    /// [`CollectdEncoder::with_hostname`]. collectd's receiver rejects an empty host outright, and
+    /// this encoder has no business inventing one -- see that builder's own doc. Counted once per
+    /// event dropped, not once per list it would have produced.
+    pub dropped_no_host: usize,
     /// A list whose plugin or type sanitized to nothing -- collectd's receiver rejects both.
     pub dropped_empty_name: usize,
     /// A single value list larger than `max_packet_bytes` all by itself: dropped whole, never split
@@ -156,9 +156,11 @@ impl Identity {
 pub struct CollectdEncoder {
     telemetry: Telemetry,
     diag: Diagnostics,
-    /// Already sanitized at construction, so the per-event host path never re-sanitizes (and never
-    /// counts) a value that came from config rather than from data.
-    host_fallback: Bytes,
+    /// The operator-configured hostname, already sanitized at construction so the per-event host
+    /// path never re-sanitizes (and never counts) a value that came from config rather than data.
+    /// `None` means "not configured", which is not the same as empty -- see
+    /// [`CollectdEncoder::with_hostname`].
+    hostname: Option<Bytes>,
     /// The identity of the last list written into the packet currently being packed.
     last: Identity,
     /// The identity of the list currently being encoded.
@@ -182,7 +184,7 @@ impl CollectdEncoder {
         Self {
             telemetry: Telemetry::default(),
             diag: Diagnostics::default(),
-            host_fallback: Bytes::from_static(LAST_RESORT_HOST),
+            hostname: None,
             last: Identity::default(),
             cur: Identity::default(),
             packet: Vec::new(),
@@ -201,20 +203,26 @@ impl CollectdEncoder {
         self
     }
 
-    /// The host written when neither `collectd.host` nor `host.name` is present --
-    /// `logit-cli::pipeline` passes the local hostname (`collectd_out`'s `hostname:` field, or
-    /// `/proc/sys/kernel/hostname`). Sanitized here, once, rather than per event.
-    pub fn with_host_fallback(mut self, host: impl Into<Bytes>) -> Self {
-        let raw: Bytes = host.into();
+    /// The host written when neither `collectd.host` nor `host.name` is present -- `collectd_out`'s
+    /// own `hostname:` config field (W3), passed straight through.
+    ///
+    /// **Deliberately operator-supplied, with no default of any kind.** This encoder neither reads
+    /// the OS hostname (an OS-hostname source is explicitly deferred work, `docs/known-gaps.md`)
+    /// nor invents a literal placeholder (`syslog_out` rejected exactly that, for exactly the
+    /// reason it would be wrong here: a receiver keys every series on the host, so one made-up name
+    /// silently merges every unlabelled sender into a single host's metrics). With nothing
+    /// configured and nothing on the event, the value list is dropped and counted -- a visible,
+    /// greppable misconfiguration instead of a quiet mislabelling.
+    ///
+    /// Sanitized here, once, rather than per event; an empty or all-substituted-away value is the
+    /// same as not configuring one at all.
+    pub fn with_hostname(mut self, hostname: impl Into<Bytes>) -> Self {
+        let raw: Bytes = hostname.into();
         let mut sanitized = Vec::new();
         // Byte truncation, not character truncation: a configured hostname arrives as bytes here and
         // is not guaranteed UTF-8 any more than a wire one is.
         sanitize_raw(&mut sanitized, &raw, false);
-        self.host_fallback = if sanitized.is_empty() {
-            Bytes::from_static(LAST_RESORT_HOST)
-        } else {
-            sanitized.into()
-        };
+        self.hostname = (!sanitized.is_empty()).then(|| Bytes::from(sanitized));
         self
     }
 
@@ -235,7 +243,7 @@ impl CollectdEncoder {
         // Destructured rather than reached through `self`: `last`, `cur`, `packet`, `list` and
         // `values` are all borrowed at once by the packing loop below, which `&mut self` methods
         // could not express.
-        let Self { telemetry, diag, host_fallback, last, cur, packet, list, values } = self;
+        let Self { telemetry, diag, hostname, last, cur, packet, list, values } = self;
         let mut ctx = Ctx { telemetry, diag, stats: &mut stats };
 
         packet.clear();
@@ -259,9 +267,12 @@ impl CollectdEncoder {
                 continue;
             }
 
-            // The host is the same for every list this event produces, so it is resolved once.
+            // The host is the same for every list this event produces, so it is resolved once --
+            // and if it cannot be resolved at all, the whole event goes, counted once.
             cur.host.clear();
-            resolve_host(&mut cur.host, &carriers, host_fallback, &mut ctx);
+            if !resolve_host(&mut cur.host, &carriers, hostname.as_deref(), &mut ctx) {
+                continue;
+            }
 
             if carriers.type_.is_some() {
                 // Like-relay: the event arrived from `collectd_in` (or was given `collectd.*`
@@ -460,6 +471,19 @@ impl Ctx<'_> {
         );
     }
 
+    fn drop_no_host(&mut self) {
+        self.stats.dropped_no_host += 1;
+        self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("reason", "no_host")]);
+        self.diag.warn_throttled(
+            "no_host",
+            "collectd_out: no host to write -- the event carries neither `collectd.host` nor \
+             `host.name`, and this sink has no `hostname:` configured; dropping. Set `hostname:` \
+             on the sink, or stamp `host.name` with a `set` transform: collectd's receiver rejects \
+             an empty host, and inventing one would merge every unlabelled sender into one host's \
+             metrics",
+        );
+    }
+
     fn drop_empty_name(&mut self) {
         self.stats.dropped_empty_name += 1;
         self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("reason", "empty_name")]);
@@ -544,23 +568,32 @@ fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx)
     carriers
 }
 
-/// This event's host: `collectd.host`, else `host.name`, else the encoder's configured fallback,
-/// else [`LAST_RESORT_HOST`] -- the first that survives sanitizing non-empty. **Never empty.**
-fn resolve_host(out: &mut Vec<u8>, carriers: &Carriers, fallback: &[u8], ctx: &mut Ctx) {
+/// This event's host: `collectd.host`, else `host.name`, else the encoder's configured
+/// [`CollectdEncoder::with_hostname`] -- the first that survives sanitizing non-empty. Returns
+/// whether one was found; `false` means the event is dropped (counted `no_host`), because collectd's
+/// receiver rejects an empty host and no honest value exists to substitute.
+fn resolve_host(
+    out: &mut Vec<u8>,
+    carriers: &Carriers,
+    hostname: Option<&[u8]>,
+    ctx: &mut Ctx,
+) -> bool {
     for candidate in [carriers.host, carriers.host_name] {
         if let Some((raw, is_utf8)) = candidate.and_then(text_of) {
             sanitize_into(out, raw, is_utf8, ctx);
             if !out.is_empty() {
-                return;
+                return true;
             }
         }
     }
-    // `fallback` is already sanitized and non-empty (`with_host_fallback`), so this is a copy.
-    out.clear();
-    out.extend_from_slice(fallback);
-    if out.is_empty() {
-        out.extend_from_slice(LAST_RESORT_HOST);
+    // Already sanitized and known non-empty (`with_hostname`), so this is a copy.
+    if let Some(hostname) = hostname {
+        out.clear();
+        out.extend_from_slice(hostname);
+        return true;
     }
+    ctx.drop_no_host();
+    false
 }
 
 /// [`sanitize_into`] for an optional carrier: an absent one leaves `out` empty, which is exactly
@@ -707,26 +740,31 @@ fn resolve_value(record: &MetricRecord, ctx: &mut Ctx) -> Option<DsValue> {
     }
 }
 
-/// A `Sum`'s `f64` as an exact `u64`, or `None` (counted) when it is non-finite, fractional, or out
-/// of range. Never rounds: statsd's `page.views:2|c|@0.3` reaches a sink as `6.666…`, and both `6`
-/// and `7` are numbers nobody sent.
+/// A `Sum`'s `f64` as a `u64`, or `None` (counted) when it is non-finite, fractional, or out of
+/// range. Never rounds: statsd's `page.views:2|c|@0.3` reaches a sink as `6.666…`, and both `6` and
+/// `7` are numbers nobody sent.
+///
+/// The bounds are inclusive, and the `as` cast saturates (guaranteed since Rust 1.45) -- which
+/// matters at exactly one value: a wire COUNTER of `u64::MAX` decodes to the `f64` `2^64` (the
+/// nearest representable double, since `u64::MAX` itself is not), so an exclusive bound would drop
+/// the very value it round-tripped from. Everything above `2^53` is already imprecise on the way in
+/// (`docs/known-gaps.md`'s shared int/double row); saturating there is the honest end of an
+/// already-documented approximation, and `decode(encode(b)) == b` holds across the whole range.
 fn as_u64(value: f64, name: &str, ctx: &mut Ctx) -> Option<u64> {
-    // `u64::MAX as f64` rounds *up* to 2^64, so the bound has to be exclusive: a value equal to it
-    // would saturate rather than convert in the `as` cast below.
-    if value.is_finite() && value.fract() == 0.0 && value >= 0.0 && value < u64::MAX as f64 {
+    if value.is_finite() && value.fract() == 0.0 && value >= 0.0 && value <= u64::MAX as f64 {
         return Some(value as u64);
     }
     ctx.drop_unencodable_value(name, value);
     None
 }
 
-/// [`as_u64`]'s signed sibling, for DERIVE. `i64::MIN as f64` is exact (-2^63); `i64::MAX as f64`
-/// rounds up to 2^63, hence the exclusive upper bound.
+/// [`as_u64`]'s signed sibling, for DERIVE -- same inclusive bounds, for the same reason
+/// (`i64::MAX as f64` is `2^63`; `i64::MIN as f64` is exactly `-2^63`).
 fn as_i64(value: f64, name: &str, ctx: &mut Ctx) -> Option<i64> {
     if value.is_finite()
         && value.fract() == 0.0
         && value >= i64::MIN as f64
-        && value < i64::MAX as f64
+        && value <= i64::MAX as f64
     {
         return Some(value as i64);
     }
@@ -870,8 +908,11 @@ mod tests {
         event
     }
 
+    /// Every encoding test runs with a configured hostname: without one, an event carrying neither
+    /// `collectd.host` nor `host.name` is dropped outright ([`CollectdEncoder::with_hostname`]'s own
+    /// doc), which is its own test below rather than a trap for every other one.
     fn encode(batch: &EventBatch, max_packet_bytes: usize) -> (Packets, EncodeStats) {
-        let mut encoder = CollectdEncoder::new();
+        let mut encoder = CollectdEncoder::new().with_hostname("fixture-host");
         let mut packets = Packets::default();
         let stats = encoder.encode_into(batch, max_packet_bytes, &mut packets);
         (packets, stats)
@@ -886,6 +927,7 @@ mod tests {
         let registry = Registry::new();
         let diag_registry = Registry::new();
         let mut encoder = CollectdEncoder::new()
+            .with_hostname("fixture-host")
             .with_telemetry(registry.telemetry_for("collectd_out", "collectd_out", "sink"))
             .with_diagnostics(Diagnostics::new("collectd_out").with_telemetry(
                 diag_registry.telemetry_for("collectd_out/diag", "collectd_out", "sink"),
@@ -1244,6 +1286,27 @@ mod tests {
         );
     }
 
+    /// The one value the integer bounds have to be *inclusive* for: a wire `u64::MAX` COUNTER
+    /// decodes to the `f64` 2^64 (the nearest representable double), which an exclusive bound would
+    /// then refuse to re-encode -- dropping the very value it just round-tripped from.
+    #[test]
+    fn a_counter_at_the_top_of_the_u64_range_survives_a_round_trip() {
+        let event = relay_event(vec![
+            counter_record("load.load.0", u64::MAX as f64),
+            record(
+                "load.load.1",
+                MetricKind::Sum(Sum {
+                    value: i64::MAX as f64,
+                    temporality: Temporality::Cumulative,
+                    monotonic: false,
+                }),
+            ),
+        ]);
+        let (packets, stats) = encode(&batch(vec![event.clone()]), DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(decode_all(&packets), vec![event]);
+    }
+
     #[test]
     fn a_gauge_delta_is_dropped_under_the_shared_diagnostic_key() {
         let mut event = Event::empty(TS, AttrMap::new());
@@ -1417,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn the_host_falls_back_from_collectd_host_to_host_name_to_the_configured_value() {
+    fn the_host_falls_back_from_collectd_host_to_host_name_to_the_configured_hostname() {
         // `collectd.host` wins.
         let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
         event.attributes.insert("host.name", Value::from("ignored"));
@@ -1432,45 +1495,85 @@ mod tests {
         assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("from-host-name")));
         assert_eq!(stats.tags_dropped_no_wire_form, 1, "`host.name` is read but still dropped");
 
-        // Then the configured fallback.
+        // Then the configured hostname.
         let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
         event.attributes.remove(ATTR_HOST);
-        let mut encoder = CollectdEncoder::new().with_host_fallback("configured");
-        let mut packets = Packets::default();
-        encoder.encode_into(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES, &mut packets);
-        assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("configured")));
+        let (packets, _) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("fixture-host")));
     }
 
-    /// An empty or all-sanitized-away fallback must still produce *some* host: collectd's receiver
-    /// rejects an empty one outright.
+    /// No host anywhere -- and no invented one either. The event is dropped, counted and named in a
+    /// diagnostic that tells the operator exactly which two knobs fix it.
     #[test]
-    fn the_host_is_never_empty() {
-        for fallback in ["", "/"] {
+    fn an_event_with_no_host_and_no_configured_hostname_is_dropped_and_counted() {
+        let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        event.attributes.remove(ATTR_HOST);
+
+        let registry = Registry::new();
+        let diag_registry = Registry::new();
+        let mut encoder = CollectdEncoder::new()
+            .with_telemetry(registry.telemetry_for("collectd_out", "collectd_out", "sink"))
+            .with_diagnostics(Diagnostics::new("collectd_out").with_telemetry(
+                diag_registry.telemetry_for("collectd_out/diag", "collectd_out", "sink"),
+            ));
+        let mut packets = Packets::default();
+        let stats =
+            encoder.encode_into(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES, &mut packets);
+
+        assert!(packets.is_empty());
+        assert_eq!(stats.dropped_no_host, 1);
+        assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "no_host")));
+        assert!(counted(&diag_registry, "logit.component.diagnostics", ("key", "no_host")));
+    }
+
+    /// An empty, or entirely substituted-away, configured hostname is the same as not configuring
+    /// one -- it must not become a literal `_` host on the wire.
+    #[test]
+    fn an_empty_or_substituted_away_hostname_counts_as_unconfigured() {
+        for hostname in ["", "\0"] {
             let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
             event.attributes.insert(ATTR_HOST, Value::from(""));
-            let mut encoder = CollectdEncoder::new().with_host_fallback(fallback);
+            let mut encoder = CollectdEncoder::new().with_hostname(hostname);
             let mut packets = Packets::default();
-            encoder.encode_into(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES, &mut packets);
-            let host = attr(&decode_all(&packets)[0], ATTR_HOST);
-            assert!(
-                matches!(&host, Some(Value::Str(bytes)) if !bytes.is_empty()),
-                "fallback {fallback:?} produced {host:?}"
-            );
+            let stats =
+                encoder.encode_into(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES, &mut packets);
+            if hostname.is_empty() {
+                assert!(packets.is_empty(), "an empty hostname is not a host");
+                assert_eq!(stats.dropped_no_host, 1);
+            } else {
+                // `\0` sanitizes to `_`, which is a real (if odd) host the operator asked for --
+                // substitution never deletes, so this stays configured rather than becoming empty.
+                assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("_")));
+            }
         }
     }
 
+    /// Normalization (8): `/` and NUL become `_`, counted. This is the one identity transformation
+    /// that is deliberately **not** a fixed point -- a wire string carrying `/` comes back carrying
+    /// `_` -- which is exactly why `tests/collectd_fixed_point.rs`'s generated grammar never
+    /// produces one, and why this test exists in its place.
     #[test]
     fn a_slash_or_nul_in_an_identity_field_becomes_an_underscore_and_is_counted() {
-        let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
-        event.attributes.insert(ATTR_TYPE_INSTANCE, Value::from("sda/1\0x"));
-        let (packets, stats, registry, _) =
-            encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
-        assert_eq!(
-            attr(&decode_all(&packets)[0], ATTR_TYPE_INSTANCE),
-            Some(Value::from("sda_1_x"))
-        );
-        assert_eq!(stats.identity_sanitized_substituted, 1, "counted once per field, not per byte");
-        assert!(counted(&registry, "logit.output.identity.sanitized", ("reason", "substituted")));
+        for (raw, expected) in [("a/b", "a_b"), ("sda/1\0x", "sda_1_x")] {
+            let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+            event.attributes.insert(ATTR_TYPE_INSTANCE, Value::from(raw));
+            let (packets, stats, registry, _) =
+                encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+            assert_eq!(
+                attr(&decode_all(&packets)[0], ATTR_TYPE_INSTANCE),
+                Some(Value::from(expected)),
+                "{raw:?}"
+            );
+            assert_eq!(
+                stats.identity_sanitized_substituted, 1,
+                "counted once per field, not once per byte"
+            );
+            assert!(counted(
+                &registry,
+                "logit.output.identity.sanitized",
+                ("reason", "substituted")
+            ));
+        }
     }
 
     #[test]
@@ -1505,9 +1608,9 @@ mod tests {
     #[test]
     fn an_empty_plugin_or_type_drops_the_list() {
         for key in [ATTR_PLUGIN, ATTR_TYPE] {
+            // An outright empty value, not a `/`: substitution never deletes, so `/` would sanitize
+            // to the perfectly usable `_` rather than to nothing.
             let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
-            event.attributes.insert(key, Value::from("/"));
-            // `/` sanitizes to `_`, which is non-empty -- so use an outright empty value instead.
             event.attributes.insert(key, Value::from(""));
             let (packets, stats, registry, _) =
                 encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
