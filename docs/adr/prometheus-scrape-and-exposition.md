@@ -98,19 +98,21 @@ MetricRecord] }` per series; labels become `Value::Str` attributes verbatim.
 **The `+Inf` bucket is a successive difference like every other bucket, not a separate total.**
 Decoding `histogram`/`gaugehistogram` computes each finite bucket's count as the difference
 between its cumulative value and the previous (lower) bound's, exactly as the table above says;
-the `+Inf` bucket (always present and always cumulative-equal-to-`_count` per the exposition
-grammar) follows the identical rule: `n = _count − cumulative(last finite bound)`. When `_count`
-disagrees with the `+Inf` line's own cumulative value (a malformed or hand-written exposition),
-the `+Inf` line's value wins — it's the one actually walked bucket-by-bucket — and the mismatch is
+the `+Inf` bucket (always present, and always cumulative-equal-to-`_count` per the exposition
+grammar) follows the identical rule, using its own cumulative value: `n = cumulative(+Inf) −
+cumulative(last finite bound)`. `_count` is not part of that formula — it's used only as a
+cross-check: when `_count` disagrees with the `+Inf` line's own cumulative value (a malformed or
+hand-written exposition), the `+Inf` line's cumulative value is the one actually walked
+bucket-by-bucket and is what the formula above already uses, and the mismatch against `_count` is
 counted `logit.input.metrics.degraded{reason="histogram_count_mismatch"}` rather than silently
-picked one way.
+going unremarked.
 
 **Encode (`Event`s → families)** is the inverse, plus rules for model kinds Prometheus's wire
 can't carry natively:
 
 | Model | Wire |
 |---|---|
-| `Sum{Cumulative, monotonic}` | `counter`; family name (used for `# TYPE`/`# HELP`/`# UNIT`) = name with any trailing `_total` stripped, in **both** dialects; sample name = `<family>_total`, appended if the model name lacked it, in **both** dialects; `_created` from `start_timestamp` when non-zero (OM only) |
+| `Sum{Cumulative, monotonic}` | `counter`; sample name = `<name>_total`, appended if the model name lacked it, in **both** dialects. Text 0.0.4 has no family/sample split: `# TYPE`/`# HELP`/`# UNIT` name that same full sample name (`# TYPE http_requests_total counter` / `http_requests_total 5`). OM strips the trailing `_total` for `# TYPE`/`# HELP`/`# UNIT` (`# TYPE http_requests counter`) while the sample line keeps it (`http_requests_total 5`); `_created` from `start_timestamp` when non-zero |
 | `Sum{Cumulative, !monotonic}` | `gauge` (Prometheus has no non-monotonic counter) — counted `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"}` |
 | `Sum{Delta}` / `Histogram{Delta}` | **skipped**, `logit.output.metrics.skipped{metric_kind="delta_sum"\|"delta_histogram"}` + `warn_throttled("delta_temporality_unresolved")` naming `aggregate`'s `temporality: cumulative` |
 | `Gauge` | `gauge`; `prometheus.type` attr (consumed) overrides the family type to `untyped`/`unknown`/`info`/`stateset` — see "Cross-dialect family types" below for what each becomes when the output dialect lacks that wire type |
@@ -124,7 +126,7 @@ can't carry natively:
 | `flags & NO_RECORDED_VALUE` | skipped, `skipped{reason="no_recorded_value"}` |
 | exemplars | OM only, on `_total`/`_bucket` lines (bucket chosen by value); text mode drops them (dialect choice, not counted) |
 | `Event::timestamp` | emitted only when `prometheus.timestamp: true` is present (consumed); ms in text, float s in OM |
-| labels | `logit_core::attrs::merged(resource, event)` (event wins), skipping `prometheus.target`; `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Array/Map` dropped — `logit.output.labels.dropped{reason="unrepresentable"}` |
+| labels | `logit_core::attrs::merged(resource, event)` (event wins), skipping the consumed `prometheus.type`/`prometheus.timestamp`/`prometheus.target` attributes; `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Array/Map` dropped — `logit.output.labels.dropped{reason="unrepresentable"}` |
 | names | see "Names and sanitization" below |
 | `unit` / `description` | `# UNIT` (OM only) / `# HELP` |
 | `EventBatch::scope`, `Resource.schema_url`, `dropped_attributes_count` | dropped (known-gaps rows) |
@@ -137,13 +139,15 @@ emitting a spec-invalid family:
 - **OM egress:** `untyped` (text 0.0.4's catch-all, which OpenMetrics dropped) becomes `unknown`
   (OpenMetrics's own catch-all). A `prometheus.type: "info"` attribute re-appends the `_info`
   suffix OM's `info` type requires on the sample name (decode strips it — see the decode table
-  above — so this is the exact inverse).
+  above — so this is the exact inverse): `# TYPE X info` / sample `X_info 1`, family name `X`
+  bare, matching the counter row's family/sample split above.
 - **Text 0.0.4 egress:** `unknown` (OM's catch-all, which text lacks) becomes `untyped`. `info`
-  becomes `gauge` with the sample named `<name>_info` (text has no `info` type, but the `_info`
-  suffix convention still reads sensibly as an ordinary gauge name). `stateset` becomes `gauge`
-  (one series per state, unchanged from the decode shape). `gaugehistogram` becomes `histogram`,
-  with `_gsum`/`_gcount` renamed to `_sum`/`_count` (text has no `gaugehistogram`, and a histogram
-  whose count can decrease is still a histogram on the wire).
+  becomes `gauge` — and since text has no family/sample split (as the counter row above), the
+  metadata line names the *full* sample name too: `# TYPE X_info gauge` / sample `X_info 1`, not
+  `# TYPE X gauge`. `stateset` becomes `gauge` (one series per state, unchanged from the decode
+  shape). `gaugehistogram` becomes `histogram`, with `_gsum`/`_gcount` renamed to `_sum`/`_count`
+  (text has no `gaugehistogram`, and a histogram whose count can decrease is still a histogram on
+  the wire).
 
 Each of these is a dialect-choice normalization (the operator picked the output dialect), listed
 again under "Permitted normalizations for this pair" below.
@@ -245,7 +249,9 @@ equality modulo:
   downstream transform wins over it (`honor_labels` semantics).
 - **A counter sample name gains a `_total` suffix if it lacked one**, in either dialect — see the
   "Model mapping" encode table above; every client library does this normalization on the way out
-  regardless of which dialect it's writing.
+  regardless of which dialect it's writing. In text 0.0.4, the `# TYPE`/`# HELP`/`# UNIT` lines
+  name that same full (`_total`-suffixed) sample name, since text has no separate family name; in
+  OpenMetrics they name the family (`_total` stripped) instead, per the format's own split.
 - **A cross-dialect family-type substitution** per "Cross-dialect family types" above
   (`untyped`↔`unknown`, `info`/`stateset`/`gaugehistogram` down-converted on text egress, `_info`
   re-appended on OM egress) when the output dialect lacks the wire type the model attribute names.
@@ -329,15 +335,17 @@ safe. `duplicate_safe() -> true` follows directly.
 **Security posture: no TLS, no auth, in v1.** `prometheus_out` serves the entire registry — every
 label on every series it currently holds — to any client that connects to `bind:`, with no
 credential check and no transport encryption, the same posture
-[ADR `admin-readiness-endpoint`](admin-readiness-endpoint.md) accepted for `/readyz`/`/healthz`.
-Unlike that endpoint, though, `bind:` is a *required* field an operator sets themselves, not a
-fixed loopback default, and the payload here is the full metric surface rather than a coarse
-lifecycle phase — so this ADR states the gap explicitly rather than leaving it implicit: an
-example config for this pair binds `127.0.0.1`, not `0.0.0.0`, so a first-time reader gets a safe
-default to start from rather than an accidental network-wide exposure, and an operator who needs
-`prometheus_out` reachable from outside the host is the one making that choice, not inheriting it
-from the example. Real TLS/auth support is tracked in `docs/known-gaps.md` alongside `admin:`'s
-own entry, not designed here.
+[ADR `admin-readiness-endpoint`](admin-readiness-endpoint.md) accepted for `/readyz`/`/healthz`
+(`AdminConfig::bind` is an `Option<String>` defaulting to `None`, i.e. off, and when an operator
+does set it, it's bound verbatim with no loopback default or enforcement of its own — there is no
+fixed loopback default on that endpoint either). The real difference from `admin:` is that
+`prometheus_out`'s `bind:` is **required**, not off-by-default, and the payload here is the full
+metric surface rather than a coarse lifecycle phase — so this ADR states the gap explicitly rather
+than leaving it implicit: an example config for this pair binds `127.0.0.1`, not `0.0.0.0`, so a
+first-time reader gets a safe default to start from rather than an accidental network-wide
+exposure, and an operator who needs `prometheus_out` reachable from outside the host is the one
+making that choice, not inheriting it from the example. Real TLS/auth support is tracked in
+`docs/known-gaps.md` alongside `admin:`'s own entry, not designed here.
 
 ### `Output::bind`
 
