@@ -94,10 +94,13 @@ the shape:
 
 ## Well-known attribute names
 
-`syslog_in` (`syslog.facility`/`.severity`/`.timestamp`/`.hostname`/`.tag`/`.pid`/`.msgid`) and the
-OTLP codec (`otel.severity_number`/`otel.severity_text`) already stamp dotted, `service.name`-style
-attribute names as a convention rather than a typed field, when the data belongs on the event but
-doesn't rise to a core-model field of its own.
+`syslog_in` (`syslog.facility`/`.severity`/`.timestamp`/`.hostname`/`.tag`/`.pid`/`.msgid`/`.sd`)
+and the OTLP codec (`otel.severity_number`/`otel.severity_text`) already stamp dotted, `service.name`-style attribute
+names as a convention rather than a typed field, when the data belongs on the event but doesn't
+rise to a core-model field of its own. `syslog.pid` may be `Value::Str` as well as `Value::U64`
+(RFC 5424's PROCID is free-form PRINTUSASCII, not necessarily numeric), and `syslog.timestamp` may
+be `Value::Null` (a nil `-` RFC 5424 TIMESTAMP) as well as `Value::Timestamp`/`Value::Str` — see
+[ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md).
 
 **OTLP severity is the OTLP instance of the same precedent `syslog.severity` already set** —
 `syslog_in`/`syslog_out` deliberately let the raw, protocol-native value outrank the normalized
@@ -134,8 +137,10 @@ source:
 | `span.duration_{us,ms}` | integer | haproxy's `%Ta` → `span.duration_ms`. |
 | `span.duration_s` | decimal seconds (number or `Str`) | nginx's `$request_time`. |
 | `span.{start,end}_rfc3339` | RFC 3339 string | Parsed by `logit_core::parse_rfc3339_to_nanos`, up to 9 fractional digits. |
+| `syslog.sd` | `Value::Map { "<SD-ID>" -> Value::Map { "<PARAM-NAME>" -> Value::Str \| Value::Array<Value::Str> } }` | `syslog_in`'s parsed RFC 5424 STRUCTURED-DATA (absent when the wire carried the nil `-`); a repeated PARAM-NAME within one SD-ELEMENT becomes the `Array` form, in order. `syslog_out` re-emits every element, escaped per RFC 5424 §6.3.3; see [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md). |
 
-Rules that apply across the whole table: `""`, `"-"`, and `Null` all count as absent — how nginx's
+Rules that apply across the whole table (the trace/span rows above; `syslog.sd`'s own rules are the
+linked ADR's, not these): `""`, `"-"`, and `Null` all count as absent — how nginx's
 `escape=json` and a plain log format spell "this variable had no value," and how an unset HAProxy
 `txn` var renders. Exactly one form of a given timing quantity may be present — the base
 nanosecond form together with any suffix, or two suffixes, for the *same* quantity is invalid, not

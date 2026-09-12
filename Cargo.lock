@@ -1017,6 +1017,7 @@ dependencies = [
  "logit-pipeline",
  "logit-proto",
  "logit-script",
+ "proptest",
  "reqwest",
  "rustls",
  "rustls-pki-types",

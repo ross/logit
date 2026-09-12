@@ -19,14 +19,27 @@
 //!
 //! ## Timestamp semantics
 //!
-//! Every emitted message's TIMESTAMP is `event.timestamp`, **not** the `syslog.timestamp`
-//! attribute `syslog_in` may have left on the event. `syslog_in`'s own module doc explains why
-//! that attribute can't be resolved to an instant for RFC 3164 (no year, no timezone) without
-//! guessing -- re-emitting it here would reintroduce exactly that guess on the way back out. The
-//! consequence, recorded in `docs/known-gaps.md`: a `syslog_in -> syslog_out` relay re-stamps
-//! with receipt time rather than preserving the origin's own clock. The opt-in `syslog_timestamp`
-//! transform `docs/known-gaps.md` already sketches is the right place to resolve `syslog.timestamp`
-//! onto `event.timestamp` explicitly, for either direction -- not this sink.
+//! `event.timestamp` (receipt time) is now the **fallback**, not the rule: per event, the
+//! `syslog.timestamp` attribute `syslog_in` may have left on the event takes precedence when it
+//! can be rendered without guessing, mirroring the decoder's own shapes:
+//!
+//! - `Value::Timestamp` (5424's parsed, unambiguous RFC 3339 TIMESTAMP) renders directly, on
+//!   *either* output format -- an origin instant survives a `5424 -> 3164` or `5424 -> 5424` relay
+//!   either way.
+//! - `Value::Str` (3164's raw, unresolvable 15-byte token -- no year, no timezone) is written
+//!   verbatim only when the *output* format is also 3164, after validating it is exactly that
+//!   shape ([`is_rfc3164_timestamp_shape`]); a 5424 output has nowhere to put a token with no
+//!   year or timezone, so it falls through to `event.timestamp` instead of reintroducing the
+//!   guess `syslog_in`'s own module doc declines to make on the way in.
+//! - `Value::Null` (5424's nil `-` TIMESTAMP) renders as `-` on a 5424 output; RFC 3164 has no
+//!   NILVALUE concept for TIMESTAMP at all, so a 3164 output falls through to `event.timestamp`.
+//! - An absent attribute, or any other `Value` variant, falls through to `event.timestamp` exactly
+//!   as before.
+//!
+//! `event.timestamp` itself is still always receipt time (`docs/adr/decoupled-listener-io.md`) --
+//! this sink never resolves `syslog.timestamp` onto it. The opt-in `syslog_timestamp` transform
+//! `docs/known-gaps.md` already sketches remains the right place to do that explicitly, for either
+//! direction, before an event reaches this sink.
 //!
 //! ## Header-field precedence
 //!
@@ -39,6 +52,61 @@
 //! survive it; [`syslog_severity_of`] is only the fallback for an event whose log record came from
 //! somewhere other than `syslog_in`.
 //!
+//! **PROCID** (`syslog.pid`) is a `Value::U64` or, when the origin's PROCID wasn't numeric, a
+//! `Value::Str` -- [`resolve_pid`] returns the [`Pid`] enum covering both. A `Pid::Str` is
+//! sanitized with [`sanitize_5424_field`] and capped at 128 bytes (RFC 5424's own PROCID maximum)
+//! on a 5424 output; on a 3164 output it still renders as `tag[pid]` after [`sanitize_3164_token`]
+//! (3164 defines no PROCID length cap of its own, so the same 128-byte bound is reused for
+//! consistency, not because the RFC requires it).
+//!
+//! ## STRUCTURED-DATA
+//!
+//! RFC 5424's STRUCTURED-DATA field ([`write_structured_data`]) is the exact inverse of the
+//! decoder's `syslog.sd` shape: `Value::Map { "<SD-ID>" -> Value::Map { "<PARAM-NAME>" ->
+//! Value::Str | Value::Array<Value::Str> } }` renders as `[<SD-ID> <PARAM-NAME>="<value>" ...]`
+//! per element, concatenated with no separator between elements. **SD-ID and PARAM-NAME order is
+//! canonicalized by name** (sorted by name bytes, independent of interning history) -- a relay
+//! that saw `[b@2 ..][a@1 ..]` re-emits `[a@1 ..][b@2 ..]`; a repeated PARAM-NAME's occurrences
+//! (already grouped under one `Value::Array` by the decoder) stay grouped, so a wire `a b a`
+//! interleaving is not preserved (`docs/known-gaps.md`). PARAM-VALUEs are escaped (`"` -> `\"`,
+//! `\` -> `\\`, `]` -> `\]`, plus every C0 control character and DEL using [`sanitize_msg`]'s
+//! own mnemonics with the mnemonic's own backslash itself escaped -- see the module doc's
+//! "Injection safety" section -- all via [`push_sd_escaped`]). A repeated `Array` element emits
+//! one `PARAM-NAME="..."` per item, in order. Both SD-ID and PARAM-NAME are
+//! validated as RFC 5424 section 6.3.2's `SD-NAME` ([`is_valid_sd_name`]: 1-32 `PRINTUSASCII`
+//! characters excluding `=`, SP, `]`, `"`) -- an invalid SD-ID skips the whole element, an invalid
+//! PARAM-NAME skips just that param, both counted in [`EncodeStats::dropped_invalid_sd`] and
+//! reported via a throttled `invalid_structured_data` diagnostic. `syslog.sd` absent, not a
+//! `Value::Map`, or producing zero elements renders as `-` (NILVALUE). A non-`Str`/`Array`
+//! PARAM-VALUE (a number, a bool, a nested container) still renders, via [`render_sd_value`]'s
+//! string conversion -- the `syslog.sd` contract only requires the outer two `Value::Map` layers,
+//! not the leaf type.
+//!
+//! **Opt-in `structured_data`**: when [`SyslogEncoder::with_structured_data`] configures an SD-ID
+//! and the output format is 5424, every event attribute whose key does *not* start with
+//! `syslog.` is emitted as one extra SD-ELEMENT under that SD-ID (PARAM-NAME = attribute key, same
+//! validation/skip/count rule as above; the element itself is omitted entirely when no attribute
+//! qualifies). This is what closes the `syslog_in -> json -> syslog_out` gap -- an attribute a
+//! transform added along the way, not part of the original `syslog.sd`, still reaches the wire
+//! when an operator opts in. **No default private enterprise number is shipped.** `sd_id` must
+//! contain exactly one `@` (a PEN-qualified id, e.g. `myapp@12345`), validated at
+//! `with_structured_data` construction time; RFC 5424's own `32473` example PEN is documentation
+//! only, never a shipped default -- registering a real one (or an operator supplying their own) is
+//! a decision for whoever turns this on. `syslog_in` decodes this element back into `syslog.sd`
+//! like any other -- there is no automatic re-lifting of it back into top-level attributes; that
+//! remains a transform's job. **A duplicate SD-ID is refused, not emitted twice**: when `sd_id`
+//! already names a key of the event's own `syslog.sd` (an origin element with the same id --
+//! `structured_data.sd_id` colliding with a live private enterprise number in transit), the
+//! opt-in element is skipped entirely ([`EncodeStats::dropped_invalid_sd`], a throttled
+//! `invalid_structured_data` diagnostic naming the collision) -- `syslog_in`'s own
+//! `parse_structured_data` rejects a message whose STRUCTURED-DATA repeats an SD-ID, so emitting
+//! both here would make a `syslog_in -> syslog_out -> syslog_in` relay fail on the far end.
+//!
+//! **RFC 3164 output never emits STRUCTURED-DATA** -- 3164 has no such field at all, so
+//! `syslog.sd` (and the opt-in `structured_data`) is silently dropped on a `5424 -> 3164` relay.
+//! Recorded as one of the plan's permitted normalizations (a sink-configured dialect change), not
+//! data loss this sink is expected to work around.
+//!
 //! ## Injection safety
 //!
 //! `syslog_in` splits a datagram into lines on `\n`, and Grafana Alloy's `loki.source.syslog` UDP
@@ -49,6 +117,15 @@
 //! bytes on the wire don't depend on which transport is configured. On TCP, octet-counting framing
 //! ([`frame_octet_counting`]) is already newline-transparent, making this defense-in-depth rather
 //! than the only guard on that path.
+//!
+//! **STRUCTURED-DATA PARAM-VALUEs get the identical control-character treatment**, via
+//! [`push_sd_escaped`] rather than [`sanitize_msg`] itself (composed with RFC 5424 section
+//! 6.3.3's own `"`/`\`/`]` escaping, since a PARAM-VALUE already sits inside a quoted string) --
+//! a `\n`/`\r`/NUL/other C0/DEL in a `syslog.sd` value or an opt-in `structured_data` attribute
+//! can no more forge a second message than one in the message body can. Like `sanitize_msg`, this
+//! is a one-way sanitizer normalization (`docs/adr/lossless-transit.md`'s permitted list): the
+//! decoder reads the escaped bytes back as the literal text `\n` (backslash, `n`), never a real
+//! newline -- same as the message body.
 //!
 //! **A literal backslash is deliberately not escaped.** The demo's message body is a JSON
 //! document (`access_json`'s output), where a real newline inside a JSON string is already
@@ -73,15 +150,25 @@
 //! reuse `stdio::render_value` for that case, since that function quotes and escapes a string for
 //! a human reading a terminal. `Value::Map`/`Value::Array` do reuse it, as a container-encoding
 //! fallback rather than a second implementation, since [`sanitize_msg`] still runs over whatever
-//! it produces.
+//! it produces. **`Value::Bytes` bypasses this entirely**: it is never lossy-UTF-8-decoded.
+//! [`sanitize_msg_bytes`] applies the same control-character escapes directly to the raw bytes,
+//! and the result is appended to the line buffer as raw bytes ([`MessageBuf::push_bytes`]) rather
+//! than through a `String` -- so a non-UTF-8 payload reaches the wire unmangled instead of losing
+//! bytes to `char::REPLACEMENT_CHARACTER`.
 //!
 //! ## Sizing
 //!
-//! `max_message_bytes` bounds one whole encoded message (PRI + header + MSG), defaulting to
-//! 8192 -- Grafana Alloy's own `loki.source.syslog` `max_message_length` default, the receiver the
-//! demo stack points this at, rather than RFC 3164 §4.1's traditional 1024 (which would truncate
-//! a JSON-bodied message on every modern relay chain). An oversize MSG is truncated on a UTF-8
-//! character boundary, counted, and throttle-warned -- truncating rather than dropping, since a
+//! `max_message_bytes` bounds one whole encoded message (PRI + header + MSG). STRUCTURED-DATA is
+//! part of the *header* for this accounting -- it is written into the line buffer before the
+//! header-length check, so a `syslog.sd`/`structured_data` element that pushes the header over the
+//! limit drops the whole message ([`EncodeStats::dropped_oversize_header`]) exactly like an
+//! oversize hostname or app-name would, rather than being truncated or silently omitted. Defaults
+//! to 8192 -- Grafana Alloy's own `loki.source.syslog` `max_message_length` default, the receiver
+//! the demo stack points this at, rather than RFC 3164 §4.1's traditional 1024 (which would
+//! truncate a JSON-bodied message on every modern relay chain). An oversize MSG is truncated on a
+//! UTF-8 character boundary for a `Value::Str` message ([`truncate_on_char_boundary`]), or a plain
+//! byte boundary for a `Value::Bytes` one ([`truncate_bytes`]; arbitrary bytes have no "character"
+//! to respect) -- counted and throttle-warned either way, truncating rather than dropping, since a
 //! truncated line still carries a correct header and a readable prefix. An oversize *header*
 //! (unreachable except with an absurdly small `max_message_bytes`) drops the whole message instead
 //! of emitting a malformed one.
@@ -90,7 +177,7 @@ use crate::stdio::render_value;
 use crate::Output;
 use anyhow::Context;
 use logit_core::time::format_rfc3339_utc;
-use logit_core::{AttrMap, Diagnostics, Event, EventBatch, Severity, Telemetry, Value};
+use logit_core::{interner, AttrMap, Diagnostics, Event, EventBatch, Severity, Telemetry, Value};
 use logit_pipeline::Fault;
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -135,6 +222,17 @@ pub struct EncodeStats {
     pub skipped_no_log: usize,
     pub truncated: usize,
     pub dropped_oversize_header: usize,
+    /// A `syslog.sd`/opt-in `structured_data` SD-ELEMENT or SD-PARAM skipped for failing
+    /// `is_valid_sd_name` -- see the module doc's "STRUCTURED-DATA" section. Reported alongside a
+    /// throttled `invalid_structured_data` diagnostic.
+    pub dropped_invalid_sd: usize,
+}
+
+/// The validated `sd_id` behind [`SyslogEncoder::with_structured_data`] -- see the module doc's
+/// "STRUCTURED-DATA" section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StructuredDataConfig {
+    sd_id: String,
 }
 
 /// Encodes events as syslog messages. Pure -- no socket anywhere -- so every format/precedence/
@@ -157,10 +255,21 @@ pub struct SyslogEncoder {
     /// `render_message`'s pre-sanitize rendering of `log.message`, reused the same way as `line`.
     raw_msg: String,
     /// Reused for every per-field sanitize call in a header (`sanitize_5424_field`/
-    /// `sanitize_3164_token`, once each for hostname/app-name/msgid) *and* for `sanitize_msg`'s
-    /// output afterward -- safe because every use within one event is read-immediately-into-
-    /// `line`-then-cleared before the next use, never overlapping in time.
+    /// `sanitize_3164_token`, once each for hostname/app-name/msgid), for `sanitize_msg`'s output
+    /// afterward, and for rendering one STRUCTURED-DATA PARAM-VALUE before escaping -- safe
+    /// because every use within one event is read-immediately-into-`line`-then-cleared before the
+    /// next use, never overlapping in time.
     scratch: String,
+    /// [`sanitize_msg_bytes`]'s output for a `Value::Bytes` message -- the byte-oriented twin of
+    /// `scratch`'s use for a `Value::Str` message, so a non-UTF-8 payload never goes through
+    /// lossy conversion. Cleared, never reallocated, at the top of each `Value::Bytes` message.
+    byte_scratch: Vec<u8>,
+    /// The final composed message (header bytes + separator + `byte_scratch`) for a
+    /// `Value::Bytes` message, reused across calls the same way `line` is.
+    line_bytes: Vec<u8>,
+    /// Set by [`SyslogEncoder::with_structured_data`] -- see the module doc's "STRUCTURED-DATA"
+    /// section.
+    structured_data: Option<StructuredDataConfig>,
 }
 
 impl SyslogEncoder {
@@ -175,6 +284,9 @@ impl SyslogEncoder {
             line: String::new(),
             raw_msg: String::new(),
             scratch: String::new(),
+            byte_scratch: Vec::new(),
+            line_bytes: Vec::new(),
+            structured_data: None,
         }
     }
 
@@ -193,6 +305,33 @@ impl SyslogEncoder {
         self
     }
 
+    /// Opts into the extra, operator-configured STRUCTURED-DATA element -- see the module doc's
+    /// "STRUCTURED-DATA" section. Validates `sd_id` as an `SD-NAME` ([`is_valid_sd_name`])
+    /// containing exactly one `@` (a private-enterprise-number-qualified id, e.g.
+    /// `"myapp@12345"`); **no default PEN is shipped** -- RFC 5424's own `32473` example is
+    /// documentation only, and picking a real one (registering with IANA, or an operator
+    /// supplying their own) is a decision for whoever turns this on, not something to default
+    /// silently. The wiring surfaces this as a config-time error (`crates/logit-cli/src/
+    /// pipeline.rs`'s `SyslogOut` arm).
+    pub fn with_structured_data(mut self, sd_id: impl Into<String>) -> anyhow::Result<Self> {
+        let sd_id = sd_id.into();
+        if !is_valid_sd_name(&sd_id) {
+            anyhow::bail!(
+                "syslog_out structured_data.sd_id {sd_id:?} is not a valid SD-NAME (1-32 \
+                 PRINTUSASCII characters excluding '=', SP, ']', '\"')"
+            );
+        }
+        if sd_id.matches('@').count() != 1 {
+            anyhow::bail!(
+                "syslog_out structured_data.sd_id {sd_id:?} must contain exactly one '@' (a \
+                 private-enterprise-number-qualified id, e.g. \"myapp@12345\"); no default PEN \
+                 is shipped -- see the module doc's \"STRUCTURED-DATA\" section"
+            );
+        }
+        self.structured_data = Some(StructuredDataConfig { sd_id });
+        Ok(self)
+    }
+
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
         self
@@ -207,19 +346,19 @@ impl SyslogEncoder {
         let mut stats = EncodeStats::default();
         for event in &batch.events {
             self.line.clear();
-            if self.encode_event(event, &mut stats) {
-                out.push(&self.line);
-            }
+            self.encode_event(event, &mut stats, out);
         }
         stats
     }
 
-    /// Encodes one event into `self.line` (already cleared by the caller), returning whether it
-    /// produced a message at all.
-    fn encode_event(&mut self, event: &Event, stats: &mut EncodeStats) -> bool {
+    /// Encodes one event's header into `self.line` (already cleared by the caller), then its
+    /// message -- pushed into `out` as raw bytes ([`MessageBuf::push_bytes`]) for a
+    /// `Value::Bytes` message (module doc's "Message body" section), or as `self.line` itself
+    /// (via [`MessageBuf::push`]) otherwise. A skipped or dropped event pushes nothing.
+    fn encode_event(&mut self, event: &Event, stats: &mut EncodeStats, out: &mut MessageBuf) {
         let Some(log) = &event.log else {
             stats.skipped_no_log += 1;
-            return false;
+            return;
         };
 
         let attrs = &event.attributes;
@@ -236,16 +375,21 @@ impl SyslogEncoder {
                 &mut self.line,
                 &mut self.scratch,
                 pri,
+                attrs,
                 event.timestamp,
                 hostname,
                 app_name,
                 pid,
                 msgid,
+                self.structured_data.as_ref(),
+                stats,
+                &mut self.diag,
             ),
             Format::Rfc3164 => write_rfc3164_header(
                 &mut self.line,
                 &mut self.scratch,
                 pri,
+                attrs,
                 event.timestamp,
                 hostname,
                 app_name,
@@ -255,6 +399,8 @@ impl SyslogEncoder {
 
         // Header alone exceeds the bound: drop the message entirely rather than truncate a
         // header field and emit something a receiver would misparse (module doc's "Sizing").
+        // STRUCTURED-DATA is part of the header for this accounting -- it was already appended
+        // to `self.line` by `write_rfc5424_header` above.
         if self.line.len() > self.max_message_bytes {
             self.line.clear();
             stats.dropped_oversize_header += 1;
@@ -265,12 +411,9 @@ impl SyslogEncoder {
                     self.max_message_bytes
                 ),
             );
-            return false;
+            return;
         }
 
-        self.raw_msg.clear();
-        render_message(&mut self.raw_msg, &log.message);
-        sanitize_msg(&mut self.scratch, &self.raw_msg);
         // **No RFC 5424 §6.4 BOM.** An earlier version emitted one (the symmetric choice to
         // `syslog_in` stripping one on the way in), on the assumption that Alloy's receiver
         // would tolerate it. Verified against the real demo stack that it does not: Loki's
@@ -278,11 +421,28 @@ impl SyslogEncoder {
         // so every relayed line silently failed to parse as JSON and every `| json`-filtered
         // dashboard panel came back empty despite lines actually landing in Loki. Confirmed
         // by re-running the same query with the BOM removed. See `docs/adr/syslog-output.md`.
+        match &log.message {
+            // Raw bytes, sanitized at the byte level so a non-UTF-8 MSG is never forced through
+            // lossy UTF-8 conversion -- module doc's "Message body" section.
+            Value::Bytes(raw) => {
+                self.byte_scratch.clear();
+                sanitize_msg_bytes(&mut self.byte_scratch, raw);
+                self.push_message_bytes(stats, out);
+            }
+            other => {
+                self.raw_msg.clear();
+                render_message(&mut self.raw_msg, other);
+                sanitize_msg(&mut self.scratch, &self.raw_msg);
+                self.push_message_str(stats, out);
+            }
+        }
+    }
+
+    /// Finishes a `Value::Str`-shaped (or any non-`Bytes`) message: `self.scratch` already holds
+    /// the sanitized text. Truncates on a UTF-8 character boundary. Always pushes -- the header
+    /// alone, if the message is empty or there was no room left for it.
+    fn push_message_str(&mut self, stats: &mut EncodeStats, out: &mut MessageBuf) {
         if !self.scratch.is_empty() {
-            // The separator itself counts against `max_message_bytes` -- pushing it
-            // unconditionally, then only clearing the message on overflow, left the separator on
-            // the wire even when there was no room for it at all, one byte over the configured
-            // cap when the header alone exactly filled the budget. Only push it when there's room.
             if self.line.len() >= self.max_message_bytes {
                 stats.truncated += 1;
                 self.diag.warn_throttled(
@@ -309,7 +469,47 @@ impl SyslogEncoder {
                 self.line.push_str(&self.scratch);
             }
         }
-        true
+        out.push(&self.line);
+    }
+
+    /// The `Value::Bytes` twin of [`SyslogEncoder::push_message_str`]: `self.byte_scratch` already
+    /// holds the sanitized message bytes. Truncates on a plain byte boundary (arbitrary bytes have
+    /// no "character" to respect). Composes the final message into `self.line_bytes` (header,
+    /// which is always ASCII/`PRINTUSASCII`, plus a separator, plus the message bytes) and pushes
+    /// that -- `self.line` alone whenever there's no message content to append.
+    fn push_message_bytes(&mut self, stats: &mut EncodeStats, out: &mut MessageBuf) {
+        if !self.byte_scratch.is_empty() {
+            if self.line.len() >= self.max_message_bytes {
+                stats.truncated += 1;
+                self.diag.warn_throttled(
+                    "message_truncated",
+                    format_args!(
+                        "syslog_out: no room left for a message after the header ({} bytes); \
+                         message dropped",
+                        self.max_message_bytes
+                    ),
+                );
+            } else {
+                self.line.push(' ');
+                let budget = self.max_message_bytes - self.line.len();
+                if truncate_bytes(&mut self.byte_scratch, budget) {
+                    stats.truncated += 1;
+                    self.diag.warn_throttled(
+                        "message_truncated",
+                        format_args!(
+                            "syslog_out: message exceeded max_message_bytes ({}); truncated",
+                            self.max_message_bytes
+                        ),
+                    );
+                }
+                self.line_bytes.clear();
+                self.line_bytes.extend_from_slice(self.line.as_bytes());
+                self.line_bytes.extend_from_slice(&self.byte_scratch);
+                out.push_bytes(&self.line_bytes);
+                return;
+            }
+        }
+        out.push(&self.line);
     }
 }
 
@@ -359,45 +559,70 @@ fn resolve_str<'a>(attrs: &'a AttrMap, key: &str) -> Option<&'a str> {
     attrs.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
 }
 
-fn resolve_pid(attrs: &AttrMap) -> Option<u64> {
+/// `syslog.pid` as either shape the decoder may have left it in -- see the module doc's "PROCID"
+/// note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pid<'a> {
+    U64(u64),
+    Str(&'a str),
+}
+
+fn resolve_pid(attrs: &AttrMap) -> Option<Pid<'_>> {
     match attrs.get("syslog.pid") {
-        Some(Value::U64(n)) => Some(*n),
+        Some(Value::U64(n)) => Some(Pid::U64(*n)),
+        Some(Value::Str(_)) => resolve_str(attrs, "syslog.pid").map(Pid::Str),
         _ => None,
     }
 }
 
 /// `HEADER SP STRUCTURED-DATA` (no `[SP MSG]` yet -- `encode_event` appends that only if MSG is
-/// non-empty, per the grammar). STRUCTURED-DATA is always the NILVALUE `-`: this sink doesn't
-/// generate SD-ELEMENTs (`docs/known-gaps.md`), the same "not invented without a consumer"
-/// reasoning `syslog_in` gives for not parsing them on the way in.
+/// non-empty, per the grammar). STRUCTURED-DATA is rendered from `syslog.sd` and the opt-in
+/// `structured_data` element -- see the module doc's "STRUCTURED-DATA" section and
+/// [`write_structured_data`].
 #[allow(clippy::too_many_arguments)]
 fn write_rfc5424_header(
     out: &mut String,
     scratch: &mut String,
     pri: u8,
-    timestamp: i64,
+    attrs: &AttrMap,
+    event_timestamp: i64,
     hostname: Option<&str>,
     app_name: Option<&str>,
-    pid: Option<u64>,
+    pid: Option<Pid<'_>>,
     msgid: Option<&str>,
+    structured_data: Option<&StructuredDataConfig>,
+    stats: &mut EncodeStats,
+    diag: &mut Diagnostics,
 ) {
     let _ = write!(out, "<{pri}>1 ");
-    push_rfc5424_timestamp(out, timestamp);
+    write_5424_timestamp(out, attrs, event_timestamp);
     out.push(' ');
     push_5424_field(out, scratch, hostname, 255);
     out.push(' ');
     push_5424_field(out, scratch, app_name, 48);
     out.push(' ');
     match pid {
-        Some(p) => {
+        Some(Pid::U64(p)) => {
             let _ = write!(out, "{p}");
         }
+        Some(Pid::Str(s)) => push_5424_field(out, scratch, Some(s), 128),
         None => out.push('-'),
     }
     out.push(' ');
     push_5424_field(out, scratch, msgid, 32);
     out.push(' ');
-    out.push('-'); // STRUCTURED-DATA NILVALUE
+    write_structured_data(out, scratch, attrs, structured_data, stats, diag);
+}
+
+/// Per-event RFC 5424 TIMESTAMP, following the precedence in the module doc's "Timestamp
+/// semantics" section: a resolved `syslog.timestamp` renders directly or as the NILVALUE `-`;
+/// anything unresolvable (a raw 3164 token, an absent attribute) falls through to receipt time.
+fn write_5424_timestamp(out: &mut String, attrs: &AttrMap, event_timestamp: i64) {
+    match attrs.get("syslog.timestamp") {
+        Some(Value::Timestamp(t)) => push_rfc5424_timestamp(out, *t),
+        Some(Value::Null) => out.push('-'),
+        _ => push_rfc5424_timestamp(out, event_timestamp),
+    }
 }
 
 /// Sanitizes `value` into `scratch` (a reused buffer -- see [`SyslogEncoder::scratch`]'s doc
@@ -441,13 +666,14 @@ fn write_rfc3164_header(
     out: &mut String,
     scratch: &mut String,
     pri: u8,
-    timestamp: i64,
+    attrs: &AttrMap,
+    event_timestamp: i64,
     hostname: Option<&str>,
     tag: Option<&str>,
-    pid: Option<u64>,
+    pid: Option<Pid<'_>>,
 ) {
     let _ = write!(out, "<{pri}>");
-    push_rfc3164_timestamp(out, timestamp);
+    write_3164_timestamp(out, attrs, event_timestamp);
     if let Some(h) = hostname {
         sanitize_3164_token(scratch, h, 255);
         if !scratch.is_empty() {
@@ -461,11 +687,69 @@ fn write_rfc3164_header(
             out.push(' ');
             out.push_str(scratch);
             if let Some(p) = pid {
-                let _ = write!(out, "[{p}]");
+                out.push('[');
+                match p {
+                    Pid::U64(n) => {
+                        let _ = write!(out, "{n}");
+                    }
+                    Pid::Str(s) => {
+                        sanitize_3164_token(scratch, s, 128);
+                        out.push_str(scratch);
+                    }
+                }
+                out.push(']');
             }
             out.push(':');
         }
     }
+}
+
+/// Per-event RFC 3164 TIMESTAMP, following the same precedence [`write_5424_timestamp`] does,
+/// with 3164's own two differences: a resolved `Value::Timestamp` renders in 3164's own
+/// `Mmm dd hh:mm:ss` shape (not RFC 3339), and there is no NILVALUE concept for TIMESTAMP at all
+/// (a `Value::Null` falls straight through to receipt time, unlike 5424's `-`).
+fn write_3164_timestamp(out: &mut String, attrs: &AttrMap, event_timestamp: i64) {
+    match attrs.get("syslog.timestamp") {
+        Some(Value::Timestamp(t)) => push_rfc3164_timestamp(out, *t),
+        Some(Value::Str(raw)) => {
+            // `Value::Str` is constructed only from valid UTF-8 (see its own doc comment).
+            let raw = std::str::from_utf8(raw).expect("Value::Str is always valid UTF-8");
+            if is_rfc3164_timestamp_shape(raw) {
+                out.push_str(raw);
+            } else {
+                push_rfc3164_timestamp(out, event_timestamp);
+            }
+        }
+        _ => push_rfc3164_timestamp(out, event_timestamp),
+    }
+}
+
+/// True if `s` is exactly the 15-byte RFC 3164 `Mmm dd hh:mm:ss` shape
+/// ([`push_rfc3164_timestamp`]'s own output format) -- the only shape [`write_3164_timestamp`]
+/// will emit verbatim from a raw `syslog.timestamp` `Value::Str`. Anything else (a
+/// differently-formatted string, a truncated token) falls through to receipt time instead of
+/// risking a malformed TIMESTAMP field reaching the wire. Works on bytes throughout so an
+/// adversarial non-ASCII string can never panic on a `str` char-boundary slice.
+fn is_rfc3164_timestamp_shape(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 15 {
+        return false;
+    }
+    let month_ok = MONTH_ABBR.iter().any(|m| m.as_bytes() == &b[0..3]);
+    let digit = |i: usize| b[i].is_ascii_digit();
+    month_ok
+        && b[3] == b' '
+        && (b[4] == b' ' || digit(4))
+        && digit(5)
+        && b[6] == b' '
+        && digit(7)
+        && digit(8)
+        && b[9] == b':'
+        && digit(10)
+        && digit(11)
+        && b[12] == b':'
+        && digit(13)
+        && digit(14)
 }
 
 /// Like [`sanitize_5424_field`], plus `:`/`[`/`]` also become `_` -- matching `syslog_in`'s own
@@ -486,6 +770,247 @@ fn sanitize_3164_token(scratch: &mut String, s: &str, max_len: usize) {
 
 fn is_printusascii(c: char) -> bool {
     matches!(c, '\u{21}'..='\u{7e}')
+}
+
+/// RFC 5424 section 6.3.2's `SD-NAME`: 1 to 32 `PRINTUSASCII` characters, excluding `=`, `]`,
+/// `"` (SP is already excluded by `PRINTUSASCII`'s own range). Used for both SD-ID and
+/// PARAM-NAME, and for the opt-in `structured_data.sd_id`. Iterates bytes rather than `char`s --
+/// a non-ASCII byte is never `PRINTUSASCII` regardless, so this can't misclassify a multi-byte
+/// character's continuation bytes as valid, and it can't panic on one either (byte slicing, unlike
+/// `str` slicing, never has a char-boundary precondition).
+fn is_valid_sd_name(s: &str) -> bool {
+    (1..=32).contains(&s.len())
+        && s.bytes().all(|b| {
+            let c = b as char;
+            is_printusascii(c) && !matches!(c, '=' | ']' | '"')
+        })
+}
+
+/// Renders a STRUCTURED-DATA PARAM-VALUE's `Value` into `out`, before [`push_sd_escaped`]'s
+/// escaping pass -- the SD-specific analogue of [`render_message`]. `Str` is rendered verbatim;
+/// numbers/bools via `Display`; `Timestamp` as RFC 3339; `Bytes`/`Map`/`Array` (a shape that
+/// doesn't fit one PARAM-VALUE on its own) fall back to [`render_value`]'s container rendering,
+/// same as `render_message`'s own container fallback.
+fn render_sd_value(out: &mut String, value: &Value) {
+    match value {
+        Value::Null => {}
+        Value::Bool(b) => {
+            let _ = write!(out, "{b}");
+        }
+        Value::I64(i) => {
+            let _ = write!(out, "{i}");
+        }
+        Value::U64(u) => {
+            let _ = write!(out, "{u}");
+        }
+        Value::F64(f) => {
+            let _ = write!(out, "{f}");
+        }
+        Value::Timestamp(ns) => out.push_str(&format_rfc3339_utc(*ns)),
+        Value::Str(s) => {
+            // `Value::Str` is constructed only from valid UTF-8 (see its own doc comment).
+            let text = std::str::from_utf8(s).expect("Value::Str is always valid UTF-8");
+            out.push_str(text);
+        }
+        Value::Bytes(_) | Value::Map(_) | Value::Array(_) => render_value(out, value),
+    }
+}
+
+/// Escapes a rendered PARAM-VALUE per RFC 5424 section 6.3.3 (`"` -> `\"`, `\` -> `\\`, `]` ->
+/// `\]` -- the exact inverse of the decoder's unescaping; any other backslash sequence is left as
+/// a literal two characters on decode, so this never produces one on its own), **plus** every C0
+/// control character and DEL, using [`sanitize_msg`]'s own mnemonics (`\n`, `\r`, `\0`, `\xNN`)
+/// with the mnemonic's own backslash then escaped by the rule above -- so a literal newline
+/// becomes the three wire bytes `\`, `\`, `n`, which `parse_param_value` unescapes back to the
+/// two-character text `\n`, never a real newline. See the module doc's "Injection safety"
+/// section: this is the same one-way sanitizer normalization `sanitize_msg` applies to the
+/// message body, applied here so an embedded control character in a `syslog.sd` value or an
+/// opt-in `structured_data` attribute can't forge a second message either.
+fn push_sd_escaped(out: &mut String, value: &str) {
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            ']' => out.push_str("\\]"),
+            '\n' => out.push_str("\\\\n"),
+            '\r' => out.push_str("\\\\r"),
+            '\0' => out.push_str("\\\\0"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                let _ = write!(out, "\\\\x{:02x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// Renders the RFC 5424 STRUCTURED-DATA field: every `syslog.sd` element (the decoder's own
+/// nested `Value::Map` shape) followed by the opt-in `structured_data` element built from the
+/// event's own non-`syslog.*` attributes, if configured -- see the module doc's
+/// "STRUCTURED-DATA" section. `-` (NILVALUE) when neither produces anything. **SD-ID order is
+/// canonicalized by name** (sorted by name bytes before writing -- [`write_sd_element`] does the
+/// same for PARAM-NAMEs) -- `AttrMap` iteration order is process-global intern order, not wire
+/// order, so writing it straight through would make a relay's element order depend on interning
+/// history rather than being a pure function of the data.
+#[allow(clippy::too_many_arguments)]
+fn write_structured_data(
+    out: &mut String,
+    scratch: &mut String,
+    attrs: &AttrMap,
+    structured_data: Option<&StructuredDataConfig>,
+    stats: &mut EncodeStats,
+    diag: &mut Diagnostics,
+) {
+    let start = out.len();
+    if let Some(Value::Map(sd)) = attrs.get("syslog.sd") {
+        let mut elements: Vec<(&str, &Value)> =
+            sd.iter().map(|(id_sym, id_value)| (interner::resolve(id_sym), id_value)).collect();
+        elements.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
+        for (id, id_value) in elements {
+            match id_value {
+                Value::Map(params) => {
+                    write_sd_element(
+                        out,
+                        scratch,
+                        id,
+                        params.iter().map(|(sym, v)| (interner::resolve(sym), v)),
+                        stats,
+                        diag,
+                    );
+                }
+                _ => {
+                    stats.dropped_invalid_sd += 1;
+                    diag.warn_throttled(
+                        "invalid_structured_data",
+                        format_args!(
+                            "syslog_out: dropping syslog.sd element {id:?}: expected a nested \
+                             map of PARAM-NAME -> value"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(cfg) = structured_data {
+        // Nothing would be emitted for an event whose only attributes are `syslog.*` ones --
+        // compute that *before* checking for a collision, so an event that would never have
+        // produced the opt-in element in the first place doesn't get counted/reported as if one
+        // had been dropped.
+        let has_extra_attrs =
+            attrs.iter().any(|(sym, _)| !interner::resolve(sym).starts_with("syslog."));
+        if has_extra_attrs {
+            // The decoder rejects a message whose STRUCTURED-DATA repeats an SD-ID
+            // (`syslog_in`'s `parse_structured_data`) -- so if the opt-in element's own `sd_id`
+            // already names a key of `syslog.sd`, emitting both would produce exactly the
+            // duplicate a `syslog_in -> syslog_out -> syslog_in` relay must never fail on. Skip
+            // the opt-in element in that case (the origin's own `syslog.sd` element wins) rather
+            // than emit a line the far end would reject outright.
+            let collides = matches!(
+                attrs.get("syslog.sd"),
+                Some(Value::Map(sd)) if sd.get(&cfg.sd_id).is_some()
+            );
+            if collides {
+                stats.dropped_invalid_sd += 1;
+                diag.warn_throttled(
+                    "invalid_structured_data",
+                    format_args!(
+                        "syslog_out: dropping opt-in structured_data SD-ELEMENT {:?}: collides with \
+                         an existing syslog.sd element of the same SD-ID",
+                        cfg.sd_id
+                    ),
+                );
+            } else {
+                write_sd_element(
+                    out,
+                    scratch,
+                    &cfg.sd_id,
+                    attrs
+                        .iter()
+                        .filter(|(sym, _)| !interner::resolve(*sym).starts_with("syslog."))
+                        .map(|(sym, v)| (interner::resolve(sym), v)),
+                    stats,
+                    diag,
+                );
+            }
+        }
+    }
+    if out.len() == start {
+        out.push('-');
+    }
+}
+
+/// One SD-ELEMENT: `[SD-ID PARAM-NAME="value" ...]`. Skips the whole element (counting
+/// [`EncodeStats::dropped_invalid_sd`] and a throttled `invalid_structured_data` diagnostic) when
+/// `sd_id` itself isn't a valid `SD-NAME`; an individual invalid PARAM-NAME only skips that one
+/// param ([`write_sd_param`]). **PARAM-NAME order is canonicalized by name** (sorted by name
+/// bytes before writing) -- the caller passes params in `AttrMap`/attribute iteration order
+/// (process-global intern order), and a repeated PARAM-NAME's occurrences are already grouped
+/// under one `Value::Array` by the decoder, so sorting the (already-unique) names is enough to
+/// make the whole element's order a pure function of its data; a wire `a b a` interleaving is
+/// therefore re-emitted grouped (`a a b`), not preserved -- see `docs/known-gaps.md`.
+fn write_sd_element<'a>(
+    out: &mut String,
+    scratch: &mut String,
+    sd_id: &str,
+    params: impl Iterator<Item = (&'a str, &'a Value)>,
+    stats: &mut EncodeStats,
+    diag: &mut Diagnostics,
+) {
+    if !is_valid_sd_name(sd_id) {
+        stats.dropped_invalid_sd += 1;
+        diag.warn_throttled(
+            "invalid_structured_data",
+            format_args!("syslog_out: dropping SD-ELEMENT with invalid SD-ID {sd_id:?}"),
+        );
+        return;
+    }
+    let mut params: Vec<(&str, &Value)> = params.collect();
+    params.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
+    out.push('[');
+    out.push_str(sd_id);
+    for (name, value) in params {
+        write_sd_param(out, scratch, name, value, stats, diag);
+    }
+    out.push(']');
+}
+
+/// One SD-PARAM (or, for an `Array` value, one per element under the same PARAM-NAME -- the
+/// decoder's own repeated-PARAM-NAME convention). Skips (counting the same stats/diagnostic as
+/// [`write_sd_element`]) when `name` isn't a valid `SD-NAME`.
+fn write_sd_param(
+    out: &mut String,
+    scratch: &mut String,
+    name: &str,
+    value: &Value,
+    stats: &mut EncodeStats,
+    diag: &mut Diagnostics,
+) {
+    if !is_valid_sd_name(name) {
+        stats.dropped_invalid_sd += 1;
+        diag.warn_throttled(
+            "invalid_structured_data",
+            format_args!("syslog_out: dropping SD-PARAM with invalid name {name:?}"),
+        );
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                push_one_sd_param(out, scratch, name, item);
+            }
+        }
+        other => push_one_sd_param(out, scratch, name, other),
+    }
+}
+
+/// ` PARAM-NAME="escaped-value"` for one PARAM-VALUE.
+fn push_one_sd_param(out: &mut String, scratch: &mut String, name: &str, value: &Value) {
+    scratch.clear();
+    render_sd_value(scratch, value);
+    out.push(' ');
+    out.push_str(name);
+    out.push_str("=\"");
+    push_sd_escaped(out, scratch);
+    out.push('"');
 }
 
 /// RFC 3339 with microsecond precision (`2026-09-02T14:03:11.123456Z`) -- RFC 5424 section
@@ -591,6 +1116,27 @@ fn sanitize_msg(out: &mut String, msg: &str) {
     }
 }
 
+/// Byte-level twin of [`sanitize_msg`] for a `Value::Bytes` message -- same escapes (`\n`/`\r`/
+/// NUL/other C0/DEL), applied to raw bytes instead of `char`s, so a non-UTF-8 payload never goes
+/// through lossy UTF-8 conversion. Writes into `out` (cleared first).
+fn sanitize_msg_bytes(out: &mut Vec<u8>, msg: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.clear();
+    for &b in msg {
+        match b {
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            0 => out.extend_from_slice(b"\\0"),
+            b if b < 0x20 || b == 0x7f => {
+                out.extend_from_slice(b"\\x");
+                out.push(HEX[(b >> 4) as usize]);
+                out.push(HEX[(b & 0xf) as usize]);
+            }
+            b => out.push(b),
+        }
+    }
+}
+
 /// Truncates `s` in place to at most `budget` bytes, on a UTF-8 character boundary. Returns
 /// whether truncation actually happened.
 fn truncate_on_char_boundary(s: &mut String, budget: usize) -> bool {
@@ -602,6 +1148,17 @@ fn truncate_on_char_boundary(s: &mut String, budget: usize) -> bool {
         cut -= 1;
     }
     s.truncate(cut);
+    true
+}
+
+/// Byte-level twin of [`truncate_on_char_boundary`] -- arbitrary bytes have no "character
+/// boundary" concept, so this simply truncates to `budget` bytes. Returns whether truncation
+/// actually happened.
+fn truncate_bytes(buf: &mut Vec<u8>, budget: usize) -> bool {
+    if buf.len() <= budget {
+        return false;
+    }
+    buf.truncate(budget);
     true
 }
 
@@ -707,6 +1264,11 @@ impl Output for SyslogOutput {
             "logit.output.messages.dropped",
             stats.dropped_oversize_header as f64,
             &[("reason", "oversize_header")],
+        );
+        self.telemetry.count(
+            "logit.output.structured_data.dropped",
+            stats.dropped_invalid_sd as f64,
+            &[("reason", "invalid_sd_name")],
         );
         if self.messages.is_empty() {
             // Every event in this batch was skipped or dropped -- nothing to write. Matches
@@ -954,7 +1516,7 @@ fn is_message_too_large(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, Resource};
+    use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, Registry, Resource};
     use logit_inputs::syslog::SyslogDecoder;
     use logit_proto::Decoder;
     use std::net::SocketAddr;
@@ -1003,6 +1565,53 @@ mod tests {
         let stats = encoder.encode_into(&batch_with(events), &mut out);
         let msgs = out.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect();
         (msgs, stats)
+    }
+
+    /// Like [`encode_with`], but returns raw bytes instead of lossy-UTF-8 strings -- needed for
+    /// any test whose message is genuinely non-UTF-8 (`Value::Bytes`).
+    fn encode_with_bytes(
+        encoder: &mut SyslogEncoder,
+        events: Vec<Event>,
+    ) -> (Vec<Vec<u8>>, EncodeStats) {
+        let mut out = MessageBuf::default();
+        let stats = encoder.encode_into(&batch_with(events), &mut out);
+        let msgs = out.iter().map(|b| b.to_vec()).collect();
+        (msgs, stats)
+    }
+
+    fn log_event_with_attrs(
+        ts: i64,
+        message: Value,
+        severity: Option<Severity>,
+        attrs: AttrMap,
+    ) -> Event {
+        Event::log(
+            ts,
+            attrs,
+            LogRecord {
+                message,
+                severity,
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        )
+    }
+
+    /// Builds a `syslog.sd`-shaped `Value::Map { "<SD-ID>" -> Value::Map { "<PARAM-NAME>" ->
+    /// value } }` from a plain list, for tests that don't want to hand-build `AttrMap`s.
+    fn sd_value(elements: Vec<(&str, Vec<(&str, Value)>)>) -> Value {
+        let mut outer = AttrMap::new();
+        for (id, params) in elements {
+            let mut inner = AttrMap::new();
+            for (name, value) in params {
+                inner.insert(name, value);
+            }
+            outer.insert(id, Value::Map(Box::new(inner)));
+        }
+        Value::Map(Box::new(outer))
     }
 
     // -- Encoder: RFC 5424 --------------------------------------------------------------------
@@ -1518,5 +2127,749 @@ mod tests {
         let got = received.lock().unwrap();
         assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("first")));
         assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("second")));
+    }
+
+    // -- Timestamp precedence (module doc's "Timestamp semantics") --------------------------
+
+    #[test]
+    fn a_resolved_timestamp_attribute_renders_directly_on_5424() {
+        let mut attrs = AttrMap::new();
+        // 2026-09-02T14:03:11Z, distinct from the event's own timestamp (0) so the test can't
+        // pass by coincidence.
+        attrs.insert("syslog.timestamp", Value::Timestamp(1_788_357_791_000_000_000));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, _) = encode(vec![event]);
+        assert!(
+            msgs[0].starts_with("<134>1 2026-09-02T14:03:11"),
+            "expected the syslog.timestamp attribute, not event.timestamp (epoch): {}",
+            msgs[0]
+        );
+    }
+
+    #[test]
+    fn a_resolved_timestamp_attribute_renders_in_3164_shape_on_3164() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("syslog.timestamp", Value::Timestamp(1_788_357_791_000_000_000));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut encoder = SyslogEncoder::new(Format::Rfc3164, 16);
+        let (msgs, _) = encode_with(&mut encoder, vec![event]);
+        assert!(
+            msgs[0].contains("Sep  2 14:03:11"),
+            "expected syslog.timestamp rendered in 3164 shape, not receipt time: {}",
+            msgs[0]
+        );
+    }
+
+    #[test]
+    fn a_raw_3164_timestamp_token_is_written_verbatim_when_output_is_also_3164() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("syslog.timestamp", Value::str("Mar 15 02:03:04"));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut encoder = SyslogEncoder::new(Format::Rfc3164, 16);
+        let (msgs, _) = encode_with(&mut encoder, vec![event]);
+        assert!(
+            msgs[0].starts_with("<134>Mar 15 02:03:04"),
+            "expected the raw token verbatim: {}",
+            msgs[0]
+        );
+    }
+
+    #[test]
+    fn a_raw_3164_timestamp_token_falls_through_to_event_timestamp_when_output_is_5424() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("syslog.timestamp", Value::str("Mar 15 02:03:04"));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, _) = encode(vec![event]);
+        assert!(
+            msgs[0].starts_with("<134>1 1970-01-01T00:00:00"),
+            "5424 has no year/timezone to build from a raw 3164 token -- must fall through to \
+             event.timestamp: {}",
+            msgs[0]
+        );
+    }
+
+    #[test]
+    fn a_malformed_timestamp_token_falls_through_to_event_timestamp_on_3164() {
+        let mut attrs = AttrMap::new();
+        // Not the 15-byte `Mmm dd hh:mm:ss` shape.
+        attrs.insert("syslog.timestamp", Value::str("not-a-timestamp"));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut encoder = SyslogEncoder::new(Format::Rfc3164, 16);
+        let (msgs, _) = encode_with(&mut encoder, vec![event]);
+        assert!(
+            msgs[0].starts_with("<134>Jan  1 00:00:00"),
+            "a malformed token must fall through to receipt time, not be written verbatim: {}",
+            msgs[0]
+        );
+    }
+
+    #[test]
+    fn a_nil_timestamp_renders_the_nilvalue_on_5424() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("syslog.timestamp", Value::Null);
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, _) = encode(vec![event]);
+        assert!(msgs[0].starts_with("<134>1 - "), "expected NILVALUE `-`: {}", msgs[0]);
+    }
+
+    #[test]
+    fn a_nil_timestamp_falls_through_to_event_timestamp_on_3164() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("syslog.timestamp", Value::Null);
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut encoder = SyslogEncoder::new(Format::Rfc3164, 16);
+        let (msgs, _) = encode_with(&mut encoder, vec![event]);
+        assert!(
+            msgs[0].starts_with("<134>Jan  1 00:00:00"),
+            "RFC 3164 has no NILVALUE concept for TIMESTAMP: {}",
+            msgs[0]
+        );
+    }
+
+    #[test]
+    fn an_absent_timestamp_attribute_uses_event_timestamp_on_5424() {
+        let (msgs, _) = encode(vec![log_event(0, "x", None)]);
+        assert!(msgs[0].starts_with("<134>1 1970-01-01T00:00:00"));
+    }
+
+    #[test]
+    fn an_absent_timestamp_attribute_uses_event_timestamp_on_3164() {
+        let mut encoder = SyslogEncoder::new(Format::Rfc3164, 16);
+        let (msgs, _) = encode_with(&mut encoder, vec![log_event(0, "x", None)]);
+        assert!(msgs[0].starts_with("<134>Jan  1 00:00:00"));
+    }
+
+    // -- PROCID (module doc's "PROCID" note) --------------------------------------------------
+
+    #[test]
+    fn a_non_numeric_pid_is_sanitized_and_rendered_on_5424() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("syslog.pid", Value::str("worker-1"));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, _) = encode(vec![event]);
+        let pid_field = msgs[0].split(' ').nth(4).unwrap();
+        assert_eq!(pid_field, "worker-1");
+    }
+
+    #[test]
+    fn a_non_numeric_pid_renders_as_tag_pid_on_3164() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("syslog.hostname", Value::str("h"));
+        attrs.insert("syslog.tag", Value::str("app"));
+        attrs.insert("syslog.pid", Value::str("worker-1"));
+        let event = log_event_with_attrs(0, Value::str("hi"), None, attrs);
+        let mut encoder = SyslogEncoder::new(Format::Rfc3164, 16);
+        let (msgs, _) = encode_with(&mut encoder, vec![event]);
+        assert_eq!(msgs[0], "<134>Jan  1 00:00:00 h app[worker-1]: hi");
+    }
+
+    // -- STRUCTURED-DATA (module doc's "STRUCTURED-DATA" section) ----------------------------
+
+    #[test]
+    fn a_single_sd_element_with_one_param_renders() {
+        let mut attrs = AttrMap::new();
+        attrs.insert(
+            "syslog.sd",
+            sd_value(vec![("exampleSDID@32473", vec![("iut", Value::str("3"))])]),
+        );
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, _) = encode(vec![event]);
+        assert!(msgs[0].contains(r#"[exampleSDID@32473 iut="3"]"#), "got: {}", msgs[0]);
+    }
+
+    #[test]
+    fn two_sd_elements_concatenate_with_no_separator() {
+        let mut attrs = AttrMap::new();
+        attrs.insert(
+            "syslog.sd",
+            sd_value(vec![
+                ("a@1", vec![("k", Value::str("v"))]),
+                ("b@2", vec![("k2", Value::str("v2"))]),
+            ]),
+        );
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, _) = encode(vec![event]);
+        assert!(
+            msgs[0].contains(r#"[a@1 k="v"][b@2 k2="v2"]"#),
+            "elements must be concatenated with no space between them: {}",
+            msgs[0]
+        );
+    }
+
+    #[test]
+    fn sd_param_value_escapes_quote_backslash_and_close_bracket() {
+        let mut attrs = AttrMap::new();
+        attrs.insert(
+            "syslog.sd",
+            sd_value(vec![(
+                "a@1",
+                vec![("k", Value::str(r#"has "quote", \back, and ] bracket"#))],
+            )]),
+        );
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, _) = encode(vec![event]);
+        assert!(
+            msgs[0].contains(r#"k="has \"quote\", \\back, and \] bracket""#),
+            "got: {}",
+            msgs[0]
+        );
+    }
+
+    #[test]
+    fn an_array_param_emits_one_param_per_element_in_order() {
+        let mut attrs = AttrMap::new();
+        attrs.insert(
+            "syslog.sd",
+            sd_value(vec![(
+                "a@1",
+                vec![("tag", Value::Array(vec![Value::str("one"), Value::str("two")]))],
+            )]),
+        );
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, _) = encode(vec![event]);
+        assert!(msgs[0].contains(r#"[a@1 tag="one" tag="two"]"#), "got: {}", msgs[0]);
+    }
+
+    #[test]
+    fn an_invalid_sd_id_skips_the_whole_element_and_is_counted() {
+        let mut attrs = AttrMap::new();
+        // Contains a space, which PRINTUSASCII (and so SD-NAME) forbids.
+        attrs.insert("syslog.sd", sd_value(vec![("bad id", vec![("k", Value::str("v"))])]));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, stats) = encode(vec![event]);
+        assert!(!msgs[0].contains("bad id"), "invalid SD-ID must not reach the wire: {}", msgs[0]);
+        assert_eq!(stats.dropped_invalid_sd, 1);
+        // No valid element survived -> NILVALUE, exactly like the absent case.
+        assert!(msgs[0].ends_with("- - x"), "got: {}", msgs[0]);
+    }
+
+    #[test]
+    fn an_invalid_param_name_skips_only_that_param_and_is_counted() {
+        let mut attrs = AttrMap::new();
+        attrs.insert(
+            "syslog.sd",
+            sd_value(vec![("a@1", vec![("bad name", Value::str("x")), ("good", Value::str("y"))])]),
+        );
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, stats) = encode(vec![event]);
+        assert!(msgs[0].contains(r#"[a@1 good="y"]"#), "got: {}", msgs[0]);
+        assert!(!msgs[0].contains("bad name"));
+        assert_eq!(stats.dropped_invalid_sd, 1);
+    }
+
+    #[test]
+    fn absent_syslog_sd_renders_the_nilvalue() {
+        let (msgs, _) = encode(vec![log_event(0, "x", None)]);
+        // MSGID field then STRUCTURED-DATA: "... - - x" (msgid nil, sd nil, then message).
+        assert!(msgs[0].ends_with("- - x"), "got: {}", msgs[0]);
+    }
+
+    #[test]
+    fn rfc3164_output_never_emits_structured_data() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("syslog.sd", sd_value(vec![("a@1", vec![("k", Value::str("v"))])]));
+        let event = log_event_with_attrs(0, Value::str("hi"), None, attrs);
+        let mut encoder = SyslogEncoder::new(Format::Rfc3164, 16);
+        let (msgs, _) = encode_with(&mut encoder, vec![event]);
+        assert!(!msgs[0].contains("a@1"), "3164 has no STRUCTURED-DATA field: {}", msgs[0]);
+        assert!(!msgs[0].contains('['));
+    }
+
+    // -- STRUCTURED-DATA: injection safety (module doc's "Injection safety" section) --------
+
+    #[test]
+    fn an_embedded_newline_in_an_sd_value_cannot_forge_a_second_message() {
+        let mut attrs = AttrMap::new();
+        attrs.insert(
+            "syslog.sd",
+            sd_value(vec![(
+                "a@1",
+                vec![("k", Value::str("line one\n<0>Jan 1 00:00:00 evil: forged"))],
+            )]),
+        );
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, _) = encode(vec![event]);
+        assert_eq!(msgs.len(), 1, "one event must always encode to exactly one message");
+        assert!(!msgs[0].as_bytes().contains(&b'\n'), "no raw newline byte may appear on the wire");
+        assert!(
+            msgs[0].contains(r#"k="line one\\n<0>Jan 1 00:00:00 evil: forged""#),
+            "got: {}",
+            msgs[0]
+        );
+    }
+
+    #[test]
+    fn an_embedded_newline_in_an_opt_in_attribute_cannot_forge_a_second_message() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("evil", Value::str("line one\n<0>Jan 1 00:00:00 evil: forged"));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut encoder =
+            SyslogEncoder::new(Format::Rfc5424, 16).with_structured_data("myapp@12345").unwrap();
+        let (msgs, _) = encode_with(&mut encoder, vec![event]);
+        assert_eq!(msgs.len(), 1, "one event must always encode to exactly one message");
+        assert!(!msgs[0].as_bytes().contains(&b'\n'), "no raw newline byte may appear on the wire");
+        assert!(
+            msgs[0].contains(r#"evil="line one\\n<0>Jan 1 00:00:00 evil: forged""#),
+            "got: {}",
+            msgs[0]
+        );
+    }
+
+    #[test]
+    fn sd_value_carriage_return_nul_and_esc_are_escaped() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("syslog.sd", sd_value(vec![("a@1", vec![("k", Value::str("a\rb\0c\x1bd"))])]));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, _) = encode(vec![event]);
+        assert!(msgs[0].contains(r#"k="a\\rb\\0c\\x1bd""#), "got: {}", msgs[0]);
+        assert!(!msgs[0].as_bytes().contains(&b'\r'));
+        assert!(!msgs[0].as_bytes().contains(&0u8));
+        assert!(!msgs[0].as_bytes().contains(&0x1bu8));
+    }
+
+    /// The decoder must invert the escaped control character back to the literal *text* form
+    /// (`\n`, i.e. the two characters backslash and `n`) rather than a real newline -- same
+    /// one-way normalization `sanitize_msg` applies to the message body.
+    #[test]
+    fn an_escaped_sd_control_char_round_trips_to_the_literal_text_form() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("syslog.sd", sd_value(vec![("a@1", vec![("k", Value::str("line\ntwo"))])]));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, _) = encode(vec![event]);
+
+        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
+        let batch = decoder
+            .decode(bytes::Bytes::from(format!("{}\n", msgs[0])))
+            .expect("the escaped output must decode");
+        assert_eq!(batch.events.len(), 1);
+        let sd = match batch.events[0].attributes.get("syslog.sd") {
+            Some(Value::Map(sd)) => sd,
+            other => panic!("expected syslog.sd to be a map, got {other:?}"),
+        };
+        let elem = match sd.get("a@1") {
+            Some(Value::Map(p)) => p,
+            other => panic!("expected element a@1 to be a map, got {other:?}"),
+        };
+        assert_eq!(
+            elem.get("k").and_then(Value::as_str),
+            Some("line\\ntwo"),
+            "decoder must yield the literal text `\\n`, not a real newline"
+        );
+    }
+
+    // -- SD-ELEMENT/PARAM order canonicalization (module doc's "STRUCTURED-DATA" section) ----
+
+    /// Regression test for a review finding: `AttrMap`/attribute iteration order is process-global
+    /// intern order, not wire order, so encoding used to reproduce whatever order the SD-ID/
+    /// PARAM-NAME strings happened to be interned in rather than a canonical one. Interns `zz`
+    /// before `aa` here specifically so a naive (non-canonicalized) implementation would emit
+    /// `zz` before `aa` -- the bug this test guards against.
+    #[test]
+    fn sd_param_order_is_canonicalized_independent_of_intern_order() {
+        interner::intern("zz");
+        let mut attrs = AttrMap::new();
+        attrs.insert(
+            "syslog.sd",
+            sd_value(vec![("x@1", vec![("zz", Value::str("1")), ("aa", Value::str("2"))])]),
+        );
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let (msgs, _) = encode(vec![event]);
+        let aa_pos = msgs[0].find("aa=").expect("aa param should be present");
+        let zz_pos = msgs[0].find("zz=").expect("zz param should be present");
+        assert!(aa_pos < zz_pos, "aa must precede zz regardless of intern order: {}", msgs[0]);
+    }
+
+    // -- Permitted normalization: bare-backslash canonicalization (RFC 5424 section 6.3.3) ---
+
+    /// RFC 5424 section 6.3.3 declares only `\"`, `\\`, `\]` as escapes -- a backslash before
+    /// any other byte is a literal backslash followed by that byte, not an escape. `syslog_in`
+    /// keeps it literally; `syslog_out` then re-emits that literal backslash in canonical escaped
+    /// form (`\` -> `\\`), so `p="a\xb"` relays as `p="a\\xb"` -- the same PARAM-VALUE, per
+    /// the RFC's own equivalence, just spelled the canonical way.
+    #[test]
+    fn a_bare_backslash_param_value_is_re_emitted_in_canonical_escaped_form() {
+        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
+        let line = "<134>1 - - - - - [a@1 p=\"a\\xb\"] msg\n";
+        let batch = decoder.decode(bytes::Bytes::from(line)).expect("should decode");
+        let mut encoder = SyslogEncoder::new(Format::Rfc5424, 0);
+        let mut out = MessageBuf::default();
+        encoder.encode_into(&batch, &mut out);
+        let msg = String::from_utf8_lossy(out.iter().next().unwrap()).into_owned();
+        assert!(
+            msg.contains(r#"p="a\\xb""#),
+            "a non-escape backslash must round-trip to the canonical escaped form: {msg}"
+        );
+    }
+
+    // -- Opt-in `structured_data` (module doc's "Opt-in `structured_data`" note) -------------
+
+    #[test]
+    fn structured_data_emits_non_syslog_attributes_as_one_sd_element() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("env", Value::str("prod"));
+        attrs.insert("retries", Value::U64(3));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut encoder =
+            SyslogEncoder::new(Format::Rfc5424, 16).with_structured_data("myapp@12345").unwrap();
+        let (msgs, _) = encode_with(&mut encoder, vec![event]);
+        assert!(msgs[0].contains(r#"env="prod""#), "got: {}", msgs[0]);
+        assert!(msgs[0].contains(r#"retries="3""#), "got: {}", msgs[0]);
+        assert!(msgs[0].contains("myapp@12345"));
+    }
+
+    #[test]
+    fn structured_data_excludes_syslog_prefixed_keys() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("syslog.hostname", Value::str("h"));
+        attrs.insert("env", Value::str("prod"));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut encoder =
+            SyslogEncoder::new(Format::Rfc5424, 16).with_structured_data("myapp@12345").unwrap();
+        let (msgs, _) = encode_with(&mut encoder, vec![event]);
+        assert!(msgs[0].contains(r#"env="prod""#));
+        assert!(!msgs[0].contains("syslog.hostname"));
+    }
+
+    #[test]
+    fn structured_data_skips_invalid_attribute_keys_and_counts_them() {
+        // A key over 32 PRINTUSASCII characters is not a valid SD-NAME.
+        let long_key = "a".repeat(33);
+        let mut attrs = AttrMap::new();
+        attrs.insert(&long_key, Value::str("x"));
+        attrs.insert("ok", Value::str("y"));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut encoder =
+            SyslogEncoder::new(Format::Rfc5424, 16).with_structured_data("myapp@12345").unwrap();
+        let (msgs, stats) = encode_with(&mut encoder, vec![event]);
+        assert!(msgs[0].contains(r#"ok="y""#));
+        assert!(!msgs[0].contains(&long_key));
+        assert_eq!(stats.dropped_invalid_sd, 1);
+    }
+
+    #[test]
+    fn structured_data_emits_no_element_when_no_attribute_qualifies() {
+        let event = log_event(0, "x", None);
+        let mut encoder =
+            SyslogEncoder::new(Format::Rfc5424, 16).with_structured_data("myapp@12345").unwrap();
+        let (msgs, _) = encode_with(&mut encoder, vec![event]);
+        assert!(msgs[0].ends_with("- - x"), "no attributes qualify -> NILVALUE: {}", msgs[0]);
+    }
+
+    /// The guard `write_structured_data` needs: `syslog_in`'s `parse_structured_data` rejects a
+    /// message whose STRUCTURED-DATA repeats an SD-ID, so a `syslog_in -> syslog_out -> syslog_in`
+    /// relay must never emit the opt-in element under an id an origin `syslog.sd` element already
+    /// uses -- the origin's element must win, and the opt-in one is dropped and counted instead.
+    #[test]
+    fn structured_data_skips_the_opt_in_element_when_its_sd_id_collides_with_an_existing_one() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("syslog.sd", sd_value(vec![("myapp@12345", vec![("orig", Value::str("1"))])]));
+        attrs.insert("env", Value::str("prod"));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut encoder =
+            SyslogEncoder::new(Format::Rfc5424, 16).with_structured_data("myapp@12345").unwrap();
+        let (msgs, stats) = encode_with(&mut encoder, vec![event]);
+        assert!(msgs[0].contains(r#"[myapp@12345 orig="1"]"#), "got: {}", msgs[0]);
+        assert!(!msgs[0].contains(r#"env="prod""#), "opt-in element must be dropped: {}", msgs[0]);
+        assert_eq!(
+            msgs[0].matches("myapp@12345").count(),
+            1,
+            "the SD-ID must appear exactly once, not twice: {}",
+            msgs[0]
+        );
+        assert_eq!(stats.dropped_invalid_sd, 1);
+    }
+
+    /// Regression test for a review finding: the collision counter/warning used to fire even for
+    /// an event with only `syslog.*` attributes (nothing the opt-in element would ever emit),
+    /// making every message on a colliding-PEN flow report a spurious drop. `has_extra_attrs` is
+    /// now checked first, so a collision that would never have produced anything isn't counted.
+    #[test]
+    fn collision_is_not_counted_when_no_extra_attributes_would_be_emitted() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_out", "syslog", "output");
+        let diag = Diagnostics::new("syslog_out").with_telemetry(telemetry);
+        let mut attrs = AttrMap::new();
+        attrs.insert("syslog.sd", sd_value(vec![("myapp@12345", vec![("orig", Value::str("1"))])]));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut encoder = SyslogEncoder::new(Format::Rfc5424, 16)
+            .with_structured_data("myapp@12345")
+            .unwrap()
+            .with_diagnostics(diag);
+        let (msgs, stats) = encode_with(&mut encoder, vec![event]);
+        assert!(msgs[0].contains(r#"[myapp@12345 orig="1"]"#), "got: {}", msgs[0]);
+        assert_eq!(
+            stats.dropped_invalid_sd, 0,
+            "nothing would have been emitted, so no drop should be counted"
+        );
+        let events = registry.drain(0);
+        assert!(
+            !events.iter().any(|e| e.attributes.get("key").and_then(|v| v.as_str())
+                == Some("invalid_structured_data")),
+            "no diagnostic should fire when nothing would have been emitted"
+        );
+    }
+
+    #[test]
+    fn with_structured_data_rejects_an_sd_id_without_an_at_sign() {
+        let result = SyslogEncoder::new(Format::Rfc5424, 16).with_structured_data("myapp");
+        let err = match result {
+            Ok(_) => panic!("expected an error for an sd_id with no '@'"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains('@'), "error should mention the missing '@': {err}");
+    }
+
+    #[test]
+    fn with_structured_data_rejects_an_invalid_sd_name() {
+        // Contains a space, forbidden by SD-NAME/PRINTUSASCII.
+        let result = SyslogEncoder::new(Format::Rfc5424, 16).with_structured_data("my app@123");
+        let err = match result {
+            Ok(_) => panic!("expected an error for an invalid SD-NAME"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("SD-NAME"), "got: {err}");
+    }
+
+    // -- `Value::Bytes` message (module doc's "Message body" section) ------------------------
+
+    #[test]
+    fn a_bytes_message_is_written_raw_with_control_bytes_escaped() {
+        let event = log_event_with_attrs(
+            0,
+            Value::Bytes(bytes::Bytes::from_static(b"line one\nctrl\x01byte")),
+            None,
+            AttrMap::new(),
+        );
+        let mut encoder = SyslogEncoder::new(Format::Rfc5424, 16);
+        let (msgs, stats) = encode_with_bytes(&mut encoder, vec![event]);
+        assert_eq!(stats, EncodeStats::default());
+        let msg = String::from_utf8(msgs[0].clone()).expect("escaped output must be valid UTF-8");
+        assert!(msg.ends_with("line one\\nctrl\\x01byte"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_non_utf8_bytes_message_survives_unmangled_apart_from_escaping() {
+        // 0xff is not valid UTF-8 on its own -- `from_utf8_lossy` would replace it with U+FFFD.
+        let mut raw = b"before-".to_vec();
+        raw.push(0xff);
+        raw.extend_from_slice(b"-after");
+        let event = log_event_with_attrs(
+            0,
+            Value::Bytes(bytes::Bytes::from(raw.clone())),
+            None,
+            AttrMap::new(),
+        );
+        let mut encoder = SyslogEncoder::new(Format::Rfc5424, 16);
+        let (msgs, _) = encode_with_bytes(&mut encoder, vec![event]);
+        // 0xff is >= 0x20 and not DEL, so it is not one of `sanitize_msg_bytes`'s escaped bytes --
+        // it passes through as the literal byte 0xff, proving no lossy UTF-8 conversion happened.
+        assert!(
+            msgs[0].windows(3).any(|w| w == [b'-', 0xffu8, b'-']),
+            "raw byte 0xff must survive: {:?}",
+            msgs[0]
+        );
+    }
+
+    // -- Pure-codec fixed point (W5's `docs/plans/lossless-transit.md` "Tests" bullet) ----------
+    //
+    // A small RFC 5424 grammar generator, independent of any hand-picked fixture, feeding
+    // `decode -> encode -> decode -> encode` through the real decoder (`logit-inputs`, already a
+    // dev-dependency for `a_decoded_nginx_syslog_line_relays_with_facility_and_hostname_preserved`
+    // above) and the real encoder in this file. Two properties, for every generated line:
+    // `decode(encode(decode(line))) == decode(line)` (whole `EventBatch`, receipt-time
+    // `timestamp` fields normalized -- the one field a real clock, not this codec, controls), and
+    // `encode(decode(line))` is a fixed point of `encode . decode` (re-running the same
+    // decode-then-encode pass on its own output reproduces it exactly, byte for byte). Neither
+    // property depends on the generated line's own formatting surviving verbatim -- see
+    // `crates/logit-cli/tests/syslog_round_trip.rs`'s fixture corpus for the byte-for-byte-against-
+    // real-input half of this plan bullet.
+    mod fixed_point {
+        use super::*;
+        use logit_inputs::syslog::SyslogDecoder;
+        use logit_proto::Decoder;
+        use proptest::prelude::*;
+        use std::collections::HashSet;
+
+        /// A HOSTNAME/APP-NAME/PROCID/MSGID candidate: `[A-Za-z0-9.-]{1,16}`, or nil (`-`) --
+        /// every character in the non-nil case is already `PRINTUSASCII` and untouched by
+        /// `sanitize_5424_field`, so a round trip can never change it.
+        fn opt_token() -> impl Strategy<Value = Option<String>> {
+            prop_oneof![Just(None), "[A-Za-z0-9.-]{1,16}".prop_map(Some)]
+        }
+
+        /// An RFC 3339 TIMESTAMP (`Z` or a numeric offset, 0-6 fractional digits) or nil (`-`).
+        /// The rendered digit count/offset needn't match `push_rfc5424_timestamp`'s own canonical
+        /// 6-digit-`Z` output -- the fixed-point property only requires that *encoding* a
+        /// generated line's own decode, then decoding and re-encoding that, reproduces the same
+        /// bytes the second time around, which holds regardless of the first line's own shape.
+        fn opt_timestamp() -> impl Strategy<Value = Option<String>> {
+            prop_oneof![
+                Just(None),
+                (
+                    1970i32..2100,
+                    1u32..=12,
+                    1u32..=28,
+                    0u32..24,
+                    0u32..60,
+                    0u32..60,
+                    0u32..1_000_000u32,
+                    any::<bool>(),
+                )
+                    .prop_map(|(y, mo, d, h, mi, s, frac, use_offset)| {
+                        let base = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{frac:06}");
+                        Some(if use_offset { format!("{base}+02:00") } else { format!("{base}Z") })
+                    }),
+            ]
+        }
+
+        /// A `PARAM-VALUE`'s unescaped content: printable ASCII (which includes all three
+        /// escape-triggering characters `"`, `\`, `]`) plus a few printable non-ASCII characters,
+        /// so the generator exercises both `push_sd_escaped` and plain multi-byte UTF-8.
+        fn printable_utf8(max_len: usize) -> impl Strategy<Value = String> {
+            prop::collection::vec(
+                prop_oneof![
+                    3 => proptest::char::range('\u{20}', '\u{7e}'),
+                    1 => prop_oneof![Just('é'), Just('—'), Just('✓'), Just('日')],
+                ],
+                0..max_len,
+            )
+            .prop_map(|chars| chars.into_iter().collect())
+        }
+
+        fn sd_param() -> impl Strategy<Value = (String, String)> {
+            ("[a-zA-Z]{1,8}", printable_utf8(8))
+        }
+
+        fn sd_element() -> impl Strategy<Value = (String, Vec<(String, String)>)> {
+            ("[a-z]{1,8}", prop::collection::vec(sd_param(), 0..=3))
+                .prop_map(|(id, params)| (format!("{id}@32473"), params))
+        }
+
+        /// 0-3 SD-ELEMENTs with distinct SD-IDs -- the decoder rejects a repeated one
+        /// (`syslog_in`'s own `structured_data_duplicate_sd_id_is_rejected`), and that rejection
+        /// path is covered there, not by this generator of valid lines. A collision (rare, given
+        /// the `[a-z]{1,8}` id alphabet) is resolved by dropping the later duplicate rather than
+        /// discarding the whole case.
+        fn sd_elements() -> impl Strategy<Value = Vec<(String, Vec<(String, String)>)>> {
+            prop::collection::vec(sd_element(), 0..=3).prop_map(|elements| {
+                let mut seen = HashSet::new();
+                elements.into_iter().filter(|(id, _)| seen.insert(id.clone())).collect()
+            })
+        }
+
+        fn escape_param_value(v: &str) -> String {
+            let mut out = String::new();
+            for c in v.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    ']' => out.push_str("\\]"),
+                    c => out.push(c),
+                }
+            }
+            out
+        }
+
+        /// Renders one syntactically valid RFC 5424 line from the generated pieces -- the
+        /// generator's own encoder, deliberately independent of `SyslogEncoder` (the thing under
+        /// test), so this isn't just `SyslogEncoder` agreeing with itself.
+        #[allow(clippy::too_many_arguments)]
+        fn render_line(
+            pri: u8,
+            ts: &Option<String>,
+            host: &Option<String>,
+            app: &Option<String>,
+            procid: &Option<String>,
+            msgid: &Option<String>,
+            sd: &[(String, Vec<(String, String)>)],
+            msg: &str,
+        ) -> String {
+            let field = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".to_string());
+            let sd_text = if sd.is_empty() {
+                "-".to_string()
+            } else {
+                sd.iter()
+                    .map(|(id, params)| {
+                        let mut s = format!("[{id}");
+                        for (name, value) in params {
+                            s.push_str(&format!(" {name}=\"{}\"", escape_param_value(value)));
+                        }
+                        s.push(']');
+                        s
+                    })
+                    .collect::<String>()
+            };
+            let mut line = format!(
+                "<{pri}>1 {} {} {} {} {} {}",
+                field(ts),
+                field(host),
+                field(app),
+                field(procid),
+                field(msgid),
+                sd_text,
+            );
+            if !msg.is_empty() {
+                line.push(' ');
+                line.push_str(msg);
+            }
+            line
+        }
+
+        fn normalize_receipt_time(batch: &mut EventBatch) {
+            for event in &mut batch.events {
+                event.timestamp = 0;
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(200))]
+
+            #[test]
+            fn decode_encode_decode_is_a_fixed_point(
+                pri in 0u8..=191,
+                ts in opt_timestamp(),
+                host in opt_token(),
+                app in opt_token(),
+                procid in opt_token(),
+                msgid in opt_token(),
+                sd in sd_elements(),
+                msg in printable_utf8(24),
+            ) {
+                let line = render_line(pri, &ts, &host, &app, &procid, &msgid, &sd, &msg);
+
+                let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
+                let mut d1 = decoder
+                    .decode(bytes::Bytes::from(line.clone()))
+                    .unwrap_or_else(|e| panic!("generated line {line:?} should decode: {e}"));
+                prop_assert_eq!(d1.events.len(), 1, "one line should decode to one event: {:?}", line);
+
+                let mut encoder = SyslogEncoder::new(Format::Rfc5424, 16);
+                let mut out1 = MessageBuf::default();
+                encoder.encode_into(&d1, &mut out1);
+                prop_assert_eq!(out1.iter().count(), 1);
+                let e1 = out1.iter().next().unwrap().to_vec();
+
+                let mut d2 = decoder
+                    .decode(bytes::Bytes::from(e1.clone()))
+                    .unwrap_or_else(|e| panic!("re-encoded line {e1:?} should decode: {e}"));
+
+                normalize_receipt_time(&mut d1);
+                normalize_receipt_time(&mut d2);
+                prop_assert_eq!(
+                    &d1, &d2,
+                    "decode(encode(decode(line))) must equal decode(line) for {:?}",
+                    line
+                );
+
+                let mut out2 = MessageBuf::default();
+                encoder.encode_into(&d2, &mut out2);
+                let e2 = out2.iter().next().unwrap().to_vec();
+                prop_assert_eq!(
+                    e1, e2,
+                    "encode(decode(line)) must be a fixed point of encode . decode for {:?}",
+                    line
+                );
+            }
+        }
     }
 }
