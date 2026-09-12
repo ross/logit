@@ -112,7 +112,7 @@ can't carry natively:
 
 | Model | Wire |
 |---|---|
-| `Sum{Cumulative, monotonic}` | `counter`; sample name = `<name>_total`, appended if the model name lacked it, in **both** dialects. Text 0.0.4 has no family/sample split: `# TYPE`/`# HELP`/`# UNIT` name that same full sample name (`# TYPE http_requests_total counter` / `http_requests_total 5`). OM strips the trailing `_total` for `# TYPE`/`# HELP`/`# UNIT` (`# TYPE http_requests counter`) while the sample line keeps it (`http_requests_total 5`); `_created` from `start_timestamp` when non-zero |
+| `Sum{Cumulative, monotonic}` | `counter`; sample name = `<name>_total`, appended if the model name lacked it, in **both** dialects. Text 0.0.4 has no family/sample split: `# TYPE`/`# HELP` name that same full sample name (`# TYPE http_requests_total counter` / `http_requests_total 5`). OM strips the trailing `_total` for `# TYPE`/`# HELP`/`# UNIT` (`# TYPE http_requests counter`) while the sample line keeps it (`http_requests_total 5`); `_created` (OM only, on the family name: `http_requests_created`) from `start_timestamp` when non-zero |
 | `Sum{Cumulative, !monotonic}` | `gauge` (Prometheus has no non-monotonic counter) — counted `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"}` |
 | `Sum{Delta}` / `Histogram{Delta}` | **skipped**, `logit.output.metrics.skipped{metric_kind="delta_sum"\|"delta_histogram"}` + `warn_throttled("delta_temporality_unresolved")` naming `aggregate`'s `temporality: cumulative` |
 | `Gauge` | `gauge`; `prometheus.type` attr (consumed) overrides the family type to `untyped`/`unknown`/`info`/`stateset` — see "Cross-dialect family types" below for what each becomes when the output dialect lacks that wire type |
@@ -249,9 +249,10 @@ equality modulo:
   downstream transform wins over it (`honor_labels` semantics).
 - **A counter sample name gains a `_total` suffix if it lacked one**, in either dialect — see the
   "Model mapping" encode table above; every client library does this normalization on the way out
-  regardless of which dialect it's writing. In text 0.0.4, the `# TYPE`/`# HELP`/`# UNIT` lines
-  name that same full (`_total`-suffixed) sample name, since text has no separate family name; in
-  OpenMetrics they name the family (`_total` stripped) instead, per the format's own split.
+  regardless of which dialect it's writing. In text 0.0.4, the `# TYPE`/`# HELP` lines (text has no
+  `# UNIT` line at all) name that same full (`_total`-suffixed) sample name, since text has no
+  separate family name; in OpenMetrics `# TYPE`/`# HELP`/`# UNIT` name the family (`_total`
+  stripped) instead, per the format's own split.
 - **A cross-dialect family-type substitution** per "Cross-dialect family types" above
   (`untyped`↔`unknown`, `info`/`stateset`/`gaugehistogram` down-converted on text egress, `_info`
   re-appended on OM egress) when the output dialect lacks the wire type the model attribute names.
