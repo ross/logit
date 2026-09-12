@@ -579,23 +579,37 @@ already built that have a known, accepted rough edge.
   every timer/set metric** — the kinds still dropped above only ever exist *after* some stage has
   already summarized, and a merged `DdSketch`/`HyperLogLog` has no lossless statsd rendering (see
   `docs/adr/statsd-output.md`'s original Decision section for why that mapping still deserves its
-  own design, not a guess made in passing). Tracked as debt against
+  own design, not a guess made in passing). **The `samples`/`members` config keeps a window's raw
+  shape only while every sample landing in it shares one sample rate and the window stays under
+  `max_samples_per_series`/`max_set_members_per_series`** — once either limit is crossed,
+  `aggregate` falls back to a sketch/estimate for that window regardless of the config, and this
+  sink has no lossless rendering for that fallback either; it drops and counts it exactly like the
+  default-summarized case (`docs/adr/statsd-output.md`'s amendment). Tracked as debt against
   [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 - **`statsd_out` has no `unit` and no metric renaming/prefixing; egress timestamp is now carried,
   but only on a `|T`-marked line.** **Narrowed by W3** — DogStatsD's own `|T<unix-seconds>` segment
   (`format: dogstatsd` only) now round-trips: `statsd_in` sets `Event::timestamp` from an incoming
-  `|T<secs>` and stamps a `statsd.timestamp: true` per-line marker (`docs/adr/statsd-output.md`'s
-  amendment), and `statsd_out` re-emits `|T<secs>` only when that marker is set — a receipt-time
-  timestamp is never mistaken for a wire-supplied one. The classic grammar still has no timestamp
-  segment at all (`format: statsd` drops `|T` and counts it, `dropped_dialect_fields`), and any
-  event with no marker set — everything that isn't a relayed `|T`-carrying line — is still stamped
-  with the receiver's own receipt time, exactly like `syslog_out`'s receipt-time entry above.
-  `MetricRecord::unit` still has no statsd wire representation and is dropped the same way. There
-  is also still no way to rename or namespace a metric on egress anywhere in the pipeline today
-  (`docs/design/lua-api.md` notes a metric's value/fields are unexposed to Lua) — a sink-side
-  `prefix` field was considered and rejected for `statsd_out` specifically
-  (`docs/adr/statsd-output.md`'s Alternatives) in favor of a future general metric-rename
-  transform, which doesn't exist yet either. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+  `|T<secs>` and stamps a `statsd.timestamp: Value::U64(secs)` per-line carrier holding the raw
+  wire value itself, not just a marker bit (`docs/adr/statsd-output.md`'s amendment), and
+  `statsd_out` re-emits `|T<secs>` from that carrier's own value — never derived from
+  `Event::timestamp`, so a stage that rebuilds `Event::timestamp` after decode (`aggregate`'s
+  flush, notably) can't fabricate or collapse a `|T` on the way back out. The classic grammar still
+  has no timestamp segment at all (`format: statsd` drops `|T` and counts it,
+  `dropped_dialect_fields`), and any event with no `U64` carrier set — everything that isn't a
+  relayed `|T`-carrying line — is still stamped with the receiver's own receipt time, exactly like
+  `syslog_out`'s receipt-time entry above. `MetricRecord::unit` still has no statsd wire
+  representation and is dropped the same way. There is also still no way to rename or namespace a
+  metric on egress anywhere in the pipeline today (`docs/design/lua-api.md` notes a metric's
+  value/fields are unexposed to Lua) — a sink-side `prefix` field was considered and rejected for
+  `statsd_out` specifically (`docs/adr/statsd-output.md`'s Alternatives) in favor of a future
+  general metric-rename transform, which doesn't exist yet either. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+- **A repeated DogStatsD tag key collapses to its last value.** `#team:a,team:b` is legal
+  DogStatsD, but `AttrMap` is a map, not a multiset, so `statsd_in` overwrites the first `team:a`
+  with `team:b` while building the event's attributes, before any sink ever sees the line —
+  `x:1|c|#team:a,team:b` relays through `statsd_out` as `x:1|c|#team:b`, silently dropping the
+  first value rather than the whole tag. This is a model gap (`AttrMap` itself, not a decoder or
+  sink bug), tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see
+  [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 - **`statsd_out` has no TLS/DTLS** — plaintext UDP/TCP only, same gap as `syslog_out`'s above, and
   the same `TlsClientConfig`/`TlsServerConfig` pair would be the config-plumbing exercise if it
   lands.

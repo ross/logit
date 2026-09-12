@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-09-11
+updated: 2026-09-12
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract

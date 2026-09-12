@@ -42,18 +42,25 @@
 //!    (`write!("{v}")`), not whatever the origin wrote: `0.500` decodes and relays as `0.5`, since
 //!    only the numeric value round-trips, not its textual spelling. Exercised by
 //!    `number-formatting-trailing-zeros`.
-//! 5. **Sanitizer substitutions required for injection safety.** A metric name, tag key, tag
-//!    value, or `SetMembers` member containing a byte the statsd grammar itself uses as a
-//!    delimiter (`:`/`|`/`@`/`#`/`,`/`\n` depending on position -- see
-//!    `logit_outputs::statsd`'s "Sanitization" section) is substituted with `_`, not dropped, so
-//!    distinct inputs stay distinct. **A real `statsd_in` decode can never produce a name/tag/
-//!    member carrying one of these bytes in the first place** -- the decoder's own grammar splits
-//!    on exactly those characters, so a byte that would need sanitizing on the way out could never
-//!    have survived decode on the way in. This makes the normalization real (a cross-protocol
-//!    relay, or a Lua-authored attribute, can absolutely introduce one) but unreachable from a
-//!    like-to-like `statsd_in -> statsd_out` fixture -- exercised instead by
-//!    `sanitizer_substitution_in_a_set_member_is_sanitized_and_counted` below, against a
-//!    hand-built `EventBatch` rather than a decoded fixture.
+//! 5. **Sanitizer substitutions for injection safety.** A metric name or tag key containing any of
+//!    `: | @ # , \n \r \0`, another ASCII control character, or whitespace is substituted with
+//!    `_`; a tag value forbids the same set except `:` (deliberately preserved, since only a tag's
+//!    first colon is ever significant); a `SetMembers` member forbids only `:`, `|`, and control
+//!    characters -- its own, narrower rule, since `@`/`#`/`,`/whitespace are none of them
+//!    delimiter-sensitive in a member's own wire position and must survive untouched or distinct
+//!    members would collide. **Most of this is reachable from a real decode, not hypothetical**:
+//!    `statsd_in`'s decoder only trims a line's leading/trailing whitespace
+//!    (`line.trim_end_matches('\r').trim()`) -- it never strips or rejects an embedded delimiter
+//!    byte mid-line, so an embedded space, `@`, `#`, or `,` inside a name survives decode unchanged
+//!    (`a#b:1|c` decodes to the name `"a#b"`, not an error), and the same bytes inside a member
+//!    survive decode *and* this sink's own encode, unsubstituted. Exercised by
+//!    `sanitizer-name-hash` (`a#b:1|c` -> `a_b:1|c`), `sanitizer-tag-value-at`
+//!    (`x:1|c|#k:a@b` -> `x:1|c|#k:a_b`), and `sanitizer-member-space`
+//!    (`users:a b|s` -> `users:a b|s`, [`SAME_AS_INPUT`]) for the preserved case. The one byte that
+//!    genuinely can't reach a member through a real decode is `|` itself -- statsd's own grammar
+//!    treats it as a new segment before the decoder ever gets far enough to hand it to a member --
+//!    so that case alone is still exercised against a hand-built `EventBatch` rather than a decoded
+//!    fixture, by `sanitizer_substitution_in_a_set_member_is_sanitized_and_counted` below.
 //! 6. **`format: statsd` (the classic dialect) drops what only DogStatsD's grammar can express.**
 //!    Selected by the operator on the sink, so this is the "sink-configured dialect change"
 //!    normalization by name, not loss:
@@ -79,6 +86,13 @@
 //!    (`(6)`'s second bullet is the same normalization on decode's own multi-value `ms`/`h`/`d`
 //!    form). Exercised by `dogstatsd-set` (single member, so trivially one line) and by the
 //!    `statsd_in -> aggregate -> statsd_out` test below (two distinct members, two lines).
+//! 8. **A repeated tag key collapses to its last value.** `#team:a,team:b` is legal DogStatsD, but
+//!    `AttrMap` is a map, not a multiset, so `statsd_in` overwrites `team:a` with `team:b` while
+//!    building the event's attributes, before this sink ever sees the line -- this is a model gap
+//!    (`docs/known-gaps.md`), not a normalization this sink chooses, but it's recorded here because
+//!    it's the same "one wire input, fewer bits of information out" shape as (7)'s decode-side
+//!    collapse. Exercised by `repeated-tag-key-collapses-to-last-value`
+//!    (`x:1|c|#team:a,team:b` -> `x:1|c|#team:b`).
 //!
 //! Everything else -- the raw kinds a lossless relay must carry (`Samples`/`SetMembers`), `|c:`/
 //! `|T` round-tripping under DogStatsD, relative-gauge deltas, and the negative-absolute-gauge
@@ -125,19 +139,19 @@ fn expected_bytes(name: &str, input: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Zeroes an event's receipt-time `timestamp` **unless** it carries `statsd.timestamp ==
-/// Value::Bool(true)` -- the per-line marker `logit_inputs::statsd` stamps when `Event::timestamp`
-/// came from a wire `|T<secs>` segment rather than receipt time (that module's own doc comment).
-/// The two independent decodes a round-trip test compares (the direct one, and the one a live
-/// `statsd_in` produces after a real send) can only legitimately differ in *receipt*-time
-/// timestamps -- this process's wall clock at the moment each decode ran -- never in a wire-
-/// supplied one, which is the same concrete instant either way. Mirrors
+/// Zeroes an event's receipt-time `timestamp` **unless** it carries a `statsd.timestamp ==
+/// Value::U64(_)` carrier -- the raw wire seconds `logit_inputs::statsd` stamps when
+/// `Event::timestamp` came from a wire `|T<secs>` segment rather than receipt time (that module's
+/// own doc comment). The two independent decodes a round-trip test compares (the direct one, and
+/// the one a live `statsd_in` produces after a real send) can only legitimately differ in
+/// *receipt*-time timestamps -- this process's wall clock at the moment each decode ran -- never
+/// in a wire-supplied one, which is the same concrete instant either way. Mirrors
 /// `syslog_round_trip.rs`'s `normalize_receipt_time`, narrowed to the one case statsd actually has
 /// where "timestamp" isn't always receipt-time-dependent.
 fn normalize_receipt_time(batch: &mut EventBatch) {
     for event in &mut batch.events {
         let has_wire_timestamp =
-            matches!(event.attributes.get("statsd.timestamp"), Some(Value::Bool(true)));
+            matches!(event.attributes.get("statsd.timestamp"), Some(Value::U64(_)));
         if !has_wire_timestamp {
             event.timestamp = 0;
         }
@@ -316,6 +330,50 @@ async fn explicit_normalizations_round_trip_byte_for_byte() {
     }
 }
 
+/// Module doc normalization (5): sanitizer substitutions reachable from a real decode -- a name
+/// containing `#` and a tag value containing `@` both genuinely change (the substituted byte is
+/// gone for good, unlike normalizations (1)-(4) which only re-spell the same information), so
+/// these two are asserted against their `.expected` wire bytes only, the same way the one-way-lossy
+/// dialect cases (6) are -- no decoded-batch equality claim is made for them.
+#[tokio::test]
+async fn sanitizer_substitutions_reachable_from_a_real_decode_produce_the_expected_wire_bytes() {
+    let mut harness = Harness::new().await;
+    for fixture in ["sanitizer-name-hash", "sanitizer-tag-value-at"] {
+        let raw = read_fixture(fixture, "in");
+        let batch = direct_batch(&raw);
+        let expected = read_fixture(fixture, "expected");
+        let captured = harness.capture_only(&batch, StatsdEncoder::new(Format::DogStatsd)).await;
+        assert_eq!(
+            captured, expected,
+            "{fixture}: format: dogstatsd output should match .expected (module doc (5))"
+        );
+    }
+}
+
+/// The contrasting case: a member's own space survives untouched rather than being substituted
+/// (unlike the name/tag-key rule above), so this one *is* a full byte-for-byte, decode-equality
+/// round trip -- nothing about the data changed.
+#[tokio::test]
+async fn a_member_with_a_space_round_trips_byte_for_byte() {
+    let mut harness = Harness::new().await;
+    assert_byte_for_byte(&mut harness, "sanitizer-member-space", || {
+        StatsdEncoder::new(Format::DogStatsd)
+    })
+    .await;
+}
+
+/// Module doc normalization (8): a repeated tag key collapses to its last value at decode time
+/// (`AttrMap` is a map, not a multiset) -- the round trip is still exact from that point on, since
+/// both the direct decode and the live `statsd_in` decode see the same collapsed attribute map.
+#[tokio::test]
+async fn repeated_tag_key_collapses_to_its_last_value() {
+    let mut harness = Harness::new().await;
+    assert_byte_for_byte(&mut harness, "repeated-tag-key-collapses-to-last-value", || {
+        StatsdEncoder::new(Format::DogStatsd)
+    })
+    .await;
+}
+
 // ---- Relative gauges (opt-in `relative_gauges: true`) -------------------------------------------
 
 /// The documented negative-absolute-gauge idiom (`logit_outputs::statsd`'s "Negative absolute
@@ -487,4 +545,85 @@ async fn statsd_in_aggregate_statsd_out_relay_is_exact() {
         "the sink should emit one multi-value ms line with every timer value (rate preserved, \
          here the default 1.0) and one |s line per distinct member"
     );
+}
+
+// ---- `|T` carrier survives `aggregate`'s flush-time rebuild --------------------------------------
+
+/// The `|T` carrier round-trips through `aggregate` even though `aggregate` rebuilds
+/// `Event::timestamp` to the flush clock at flush time: `statsd.timestamp` rides on the series key
+/// like any other attribute, so the sink reads the carrier's own `Value::U64`, never the
+/// flush-time `Event::timestamp` -- this is the regression for the bug the carrier fix closes
+/// (a `Value::Bool(true)` marker plus `event.timestamp` would have re-emitted the *flush* second
+/// here, not the original wire value).
+#[tokio::test]
+async fn statsd_in_aggregate_statsd_out_relay_preserves_the_wire_timestamp() {
+    let mut harness = Harness::new().await;
+
+    let batch = harness.send_raw_and_decode(b"hits:1|c|T1700000000").await;
+    assert_eq!(batch.events.len(), 1);
+
+    let mut aggregator = Aggregator::new(Duration::from_secs(10));
+    let resource = batch.resource.clone();
+    let mut forwarded = Vec::new();
+    for event in batch.events {
+        if let Some(event) = aggregator.process(&resource, event) {
+            forwarded.push(event);
+        }
+    }
+    assert!(forwarded.is_empty(), "a delta Counter is always absorbed by aggregate");
+
+    // Deliberately a different second from the wire value -- if the sink ever read
+    // `Event::timestamp` instead of the `statsd.timestamp` carrier, this would catch it emitting
+    // the flush second (1_800_000_000) instead of the wire one (1_700_000_000).
+    let mut flushed = aggregator.flush(1_800_000_000_000_000_000);
+    assert_eq!(flushed.len(), 1, "one (resource, scope) group");
+    let (flush_resource, flush_scope, events) = flushed.remove(0);
+    let out_batch = EventBatch {
+        resource: flush_resource,
+        scope: flush_scope,
+        events: events.into_iter().map(|(event, _links)| event).collect(),
+    };
+    assert_eq!(out_batch.events.len(), 1);
+
+    let captured = harness.capture_only(&out_batch, StatsdEncoder::new(Format::DogStatsd)).await;
+    assert_eq!(std::str::from_utf8(&captured).expect("ascii output"), "hits:1|c|T1700000000");
+}
+
+/// Two lines differing only in their `|T` value are distinct series by construction (the carrier
+/// rides on the series key, which is the event's whole attribute map), so they flush as two
+/// separate lines, never merged into one counter.
+#[tokio::test]
+async fn statsd_in_aggregate_statsd_out_relay_keeps_distinct_timestamps_as_distinct_series() {
+    let mut harness = Harness::new().await;
+
+    let raw = b"hits:1|c|T1700000000\nhits:1|c|T1700000100";
+    let batch = harness.send_raw_and_decode(raw).await;
+    assert_eq!(batch.events.len(), 2, "one event per line");
+
+    let mut aggregator = Aggregator::new(Duration::from_secs(10));
+    let resource = batch.resource.clone();
+    for event in batch.events {
+        assert!(
+            aggregator.process(&resource, event).is_none(),
+            "a delta Counter is always absorbed by aggregate"
+        );
+    }
+
+    let mut flushed = aggregator.flush(1_800_000_000_000_000_000);
+    assert_eq!(flushed.len(), 1, "one (resource, scope) group");
+    let (flush_resource, flush_scope, events) = flushed.remove(0);
+    let out_batch = EventBatch {
+        resource: flush_resource,
+        scope: flush_scope,
+        events: events.into_iter().map(|(event, _links)| event).collect(),
+    };
+    assert_eq!(out_batch.events.len(), 2, "distinct |T values must stay distinct series");
+
+    let captured = harness.capture_only(&out_batch, StatsdEncoder::new(Format::DogStatsd)).await;
+    let mut lines: Vec<&str> =
+        std::str::from_utf8(&captured).expect("ascii output").split('\n').collect();
+    lines.sort_unstable();
+    let mut expected = vec!["hits:1|c|T1700000000", "hits:1|c|T1700000100"];
+    expected.sort_unstable();
+    assert_eq!(lines, expected, "both |T values must survive the flush as separate lines");
 }

@@ -16,11 +16,13 @@
 //!
 //! ## Grammar and round-trip contract
 //!
-//! `<name>:<value>|<type>[|#<tag>[:<value>],...]` -- the same grammar `logit_inputs::statsd`
-//! parses, minus the two segments this sink never emits (see "No sample rate, no timestamp"
-//! below). Every sanitization rule exists because of a specific way `StatsdDecoder::parse_line`
-//! would otherwise misparse the result; see that module's grammar doc comment for the decoder side
-//! of each rule cited here.
+//! `<name>:<value>|<type>[|@<sample-rate>][|#<tag>[:<value>],...][|c:<container-id>][|T<unix-seconds>]`
+//! -- the same grammar `logit_inputs::statsd` parses. `@<sample-rate>` and `|T<unix-seconds>` are
+//! both real segments this sink emits, not omitted unconditionally -- see "Sample rate: never for
+//! a counter, real for `Samples`" and "`\|c:<container-id>` and `\|T<timestamp>`" below for
+//! exactly when each appears. Every sanitization rule exists because of a specific way
+//! `StatsdDecoder::parse_line` would otherwise misparse the result; see that module's grammar doc
+//! comment for the decoder side of each rule cited here.
 //!
 //! ## Dialects
 //!
@@ -42,8 +44,12 @@
 //! replaced with `_` (substitution, not deletion, so distinct names stay distinct -- following
 //! `syslog.rs::sanitize_5424_field`'s approach). Each forbidden character earns its place against
 //! the decoder's own grammar: `:` splits name from values, `|` splits segments, `@`/`#` open the
-//! sample-rate/tag segments, `,` separates tags, `\n` separates lines; whitespace is stripped
-//! because the decoder trims every line before parsing it.
+//! sample-rate/tag segments, `,` separates tags, `\n` separates lines. Whitespace is substituted
+//! defensively, not because `decode_into` needs it to be gone: that function only trims a line's
+//! leading/trailing whitespace (`line.trim_end_matches('\r').trim()`), so an embedded space or tab
+//! inside a name survives a real decode unchanged (`my metric:1|c` decodes to the name
+//! `"my metric"`, not an error) and is a real, reachable byte this sink still has to sanitize --
+//! see `crates/logit-cli/tests/statsd_round_trip.rs`'s normalization (5) for the fixture.
 //!
 //! Tag *keys* forbid the same set as a name, plus nothing extra -- **and forbid `:`** for a
 //! different reason than the name does: `parse_line` splits a tag on its *first* colon
@@ -53,15 +59,21 @@
 //! `env`, value `a:b` -- an asymmetry between key and value sanitization that is easy to get
 //! backwards, so it has its own test.
 //!
-//! A `SetMembers` member is rendered through the *name*/tag-key sanitizer (lossy UTF-8 first,
-//! since a member is arbitrary bytes off the wire, then the same forbidden-character
-//! substitution) -- **not** the tag-value rule, even though a member is a bare value rather than
-//! a name or a tag key: a member sits in `name:<member>|s`'s colon-separated *value* position,
-//! the same position `parse_line` splits on to find several values sharing one line
-//! (`name:v1:v2|c`), so an embedded `:` has to be forbidden here or it would silently re-decode a
-//! single member as two. A member that comes out different from its raw bytes, either because the
-//! bytes weren't valid UTF-8 or because a forbidden character was substituted, is counted
-//! (`EncodeStats::members_sanitized`).
+//! A `SetMembers` member is rendered through its own, narrower rule
+//! ([`is_forbidden_in_set_member`]: lossy UTF-8 first, since a member is arbitrary bytes off the
+//! wire, then that rule's substitution) -- **neither** the name/tag-key rule **nor** the tag-value
+//! rule, even though a member is a bare value: a member sits in `name:<member>|s`'s colon-
+//! separated *value* position, the same position `parse_line` splits on to find several values
+//! sharing one line (`name:v1:v2|c`), so `:` has to be forbidden here or it would silently
+//! re-decode a single member as two, and `|` would open a new segment. Nothing else about that
+//! position is delimiter-sensitive, though: `values_part` is only ever split on `:`, and the line
+//! only on `|`/newline, so `@`, `#`, `,`, and interior whitespace all survive a real decode intact
+//! -- forbidding them here (the name/tag-key rule's reason for forbidding them is that *they* open
+//! or separate segments, a role a member never plays) would sanitize bytes that never needed it
+//! and let distinct members collide. Control bytes (`\n`/`\r`/`\0` included) stay forbidden, since
+//! any of them would corrupt line/datagram framing regardless of position. A member that comes out
+//! different from its raw bytes, either because the bytes weren't valid UTF-8 or because a
+//! forbidden character was substituted, is counted (`EncodeStats::members_sanitized`).
 //!
 //! ## Metric-kind coverage: raw kinds in, sketches still deferred
 //!
@@ -148,17 +160,27 @@
 //! Both are DogStatsD-only line extensions this sink now round-trips: `statsd.container_id`
 //! (a `Value::Str` attribute `statsd_in` stamps from an incoming `|c:<id>` segment) renders as
 //! `|c:<id>` (sanitized like a tag value, so an embedded `:` survives); `statsd.timestamp ==
-//! Value::Bool(true)` (the per-line marker `statsd_in` stamps alongside moving the value into
-//! `Event::timestamp`) renders as `|T<secs>`, `secs = event.timestamp / 1_000_000_000`. Both are
-//! appended after the tag segment, to every line this sink emits for that event -- see
-//! `append_dialect_extras`. Under `Format::Statsd` neither has anywhere to go (the classic grammar
-//! has no equivalent segment), so both are dropped and counted
-//! (`EncodeStats::dropped_dialect_fields`) rather than silently disappearing.
+//! Value::U64(secs)` (the raw wire seconds `statsd_in` stamps alongside moving the value onto
+//! `Event::timestamp`) renders as `|T<secs>` **using that carrier's own value, never
+//! `event.timestamp`** -- a stage that rebuilds `Event::timestamp` after decode (`aggregate`'s
+//! flush, notably) can't fabricate or collapse a `|T` this way, since the carrier rides on the
+//! series key exactly like any other attribute; a `statsd.timestamp` present but not a
+//! `Value::U64` (never produced by `statsd_in` itself, but reachable from a cross-protocol relay
+//! or a Lua-authored attribute) is simply not emitted. Both segments are appended after the tag
+//! segment, to every line this sink emits for that event -- see `append_dialect_extras`. Under
+//! `Format::Statsd` neither has anywhere to go (the classic grammar has no equivalent segment), so
+//! both are dropped and counted (`EncodeStats::dropped_dialect_fields`) rather than silently
+//! disappearing.
 //!
 //! `statsd.*` attributes (`statsd.type`, `statsd.container_id`, `statsd.timestamp`) are
 //! protocol-namespaced carriers for exactly this information, not ordinary tags -- they are never
 //! emitted through the `|#k:v,...` tag segment (`build_tag_suffix` filters the prefix), the same
 //! way `syslog_out` never re-emits its own `syslog.*` attributes as generic SD-ELEMENT fields.
+//! `build_tag_suffix`'s merged resource⊕event walk (the same one that filters them out of the tag
+//! segment) is also where all three carriers are captured, into [`EncodeCtx`]'s own fields, so a
+//! carrier set only on the resource (a `set` transform's `resource:` block, say) is honored the
+//! same way an event-level one already is -- `append_dialect_extras`/`statsd_wire_type` read
+//! `EncodeCtx`, never `event.attributes`, directly, keeping the filter and the read symmetric.
 
 use crate::influxdb::{push_float, tag_value};
 use crate::msgbuf::MessageBuf;
@@ -231,8 +253,9 @@ pub struct EncodeStats {
     /// line (so a negative-absolute-gauge's two-line pair, or a multi-member `SetMembers` record,
     /// counts once per physical line, matching "every emitted line" in the module doc).
     pub dropped_dialect_fields: usize,
-    /// A `SetMembers` member came out different from its raw bytes after lossy UTF-8 plus tag-
-    /// value sanitization -- see the module doc's "Sanitization" section.
+    /// A `SetMembers` member came out different from its raw bytes after lossy UTF-8 plus
+    /// [`is_forbidden_in_set_member`]'s own, member-specific substitution -- see the module doc's
+    /// "Sanitization" section.
     pub members_sanitized: usize,
 }
 
@@ -304,6 +327,7 @@ impl StatsdEncoder {
                 stats.skipped_no_metrics += 1;
                 continue;
             }
+            let mut carriers = Carriers::default();
             build_tag_suffix(
                 &mut self.tag_suffix,
                 &mut self.scratch,
@@ -311,10 +335,14 @@ impl StatsdEncoder {
                 &batch.resource,
                 event,
                 &mut stats,
+                &mut carriers,
             );
             let mut ctx = EncodeCtx {
                 format: self.format,
                 tag_suffix: &self.tag_suffix,
+                statsd_type: carriers.statsd_type,
+                container_id: carriers.container_id,
+                timestamp_secs: carriers.timestamp_secs,
                 max_packet_bytes,
                 stats: &mut stats,
                 diag: &mut self.diag,
@@ -326,7 +354,6 @@ impl StatsdEncoder {
                     &mut self.name,
                     &mut self.member,
                     self.relative_gauges,
-                    event,
                     metric,
                     &mut ctx,
                 );
@@ -340,13 +367,33 @@ impl StatsdEncoder {
 /// don't own -- one mutable borrow of this instead of six-plus loose parameters on every function
 /// in the call chain. `out`/`stats`/`diag` are threaded through as `&mut` since every line
 /// rendered writes into all three (a pushed line, an updated counter, a throttled diagnostic).
+/// `statsd_type`/`container_id`/`timestamp_secs` are the three `statsd.*` carriers
+/// [`build_tag_suffix`]'s merged resource⊕event walk captures (the event's value winning over the
+/// resource's, same as every other attribute) -- [`append_dialect_extras`]/[`statsd_wire_type`]
+/// read them from here, never from `event.attributes` directly, so a carrier set only on the
+/// resource is honored the same way an event-level one already is.
 struct EncodeCtx<'a> {
     format: Format,
     tag_suffix: &'a str,
+    statsd_type: Option<&'a str>,
+    container_id: Option<&'a str>,
+    timestamp_secs: Option<u64>,
     max_packet_bytes: usize,
     stats: &'a mut EncodeStats,
     diag: &'a mut Diagnostics,
     out: &'a mut MessageBuf,
+}
+
+/// Out-parameter for [`build_tag_suffix`]'s merged walk: the three `statsd.*` carriers, captured
+/// as they're skipped out of the generic tag segment rather than re-read from `event.attributes`
+/// afterward -- one pass does both jobs, and stays symmetric with what it filters out. Built
+/// separately from [`EncodeCtx`] because `EncodeCtx::tag_suffix` borrows the very `String`
+/// `build_tag_suffix` still needs `&mut` access to at the point these carriers are captured.
+#[derive(Debug, Default, Clone, Copy)]
+struct Carriers<'a> {
+    statsd_type: Option<&'a str>,
+    container_id: Option<&'a str>,
+    timestamp_secs: Option<u64>,
 }
 
 /// Builds this event's DogStatsD tag segment into `suffix` (cleared first, **no** leading `|#` --
@@ -354,24 +401,45 @@ struct EncodeCtx<'a> {
 /// attributes first, event attributes overriding on key collision, merge-joined via
 /// [`crate::attrs::merged`]. Under [`Format::Statsd`] this always leaves `suffix` empty and counts
 /// every attribute that would otherwise have become a tag into `stats.tags_dropped_dialect`.
-fn build_tag_suffix(
+///
+/// The same merged walk also captures the three `statsd.*` carriers into `carriers` -- see
+/// [`Carriers`]'s doc comment for why that happens here rather than as a second, separate read of
+/// `event.attributes` later.
+fn build_tag_suffix<'a>(
     suffix: &mut String,
     scratch: &mut String,
     format: Format,
-    resource: &Resource,
-    event: &Event,
+    resource: &'a Resource,
+    event: &'a Event,
     stats: &mut EncodeStats,
+    carriers: &mut Carriers<'a>,
 ) {
     suffix.clear();
     for (key, value) in crate::attrs::merged(resource, event) {
         let key_str = logit_core::interner::resolve(key);
         // `statsd.*` attributes are protocol carriers this decoder stamped from a line's own
         // `|c:`/`|T`/wire-type segments (`statsd.container_id`/`statsd.timestamp`/`statsd.type`),
-        // not ordinary tags -- `render_metric`/`append_dialect_extras` read them directly and emit
-        // their own dedicated segments, so they must never also round-trip through the generic tag
-        // segment. Not counted: this is a carrier being read for its real purpose, not data being
-        // dropped (`syslog_out`'s identical `syslog.*` filter is the precedent).
+        // not ordinary tags -- `append_dialect_extras`/`statsd_wire_type` read them (via `carriers`
+        // then `EncodeCtx`) and emit their own dedicated segments, so they must never also
+        // round-trip through the generic tag segment. Not counted: this is a carrier being read
+        // for its real purpose, not data being dropped (`syslog_out`'s identical `syslog.*` filter
+        // is the precedent).
         if key_str.starts_with("statsd.") {
+            match (key_str, value) {
+                ("statsd.type", Value::Str(s)) => {
+                    carriers.statsd_type = std::str::from_utf8(s).ok();
+                }
+                ("statsd.container_id", Value::Str(s)) => {
+                    carriers.container_id = std::str::from_utf8(s).ok();
+                }
+                ("statsd.timestamp", Value::U64(secs)) => {
+                    carriers.timestamp_secs = Some(*secs);
+                }
+                // Anything else (an absent/wrong-typed carrier, or a `statsd.*` key this sink
+                // doesn't know about) is ignored here the same way it's ignored as a tag --
+                // forward-compatible, not a hard error.
+                _ => {}
+            }
             continue;
         }
 
@@ -424,47 +492,34 @@ fn append_tags(line: &mut String, tag_suffix: &str) {
     }
 }
 
-/// Appends `event`'s `|c:<container-id>`/`|T<timestamp>` segments under [`Format::DogStatsd`] --
+/// Appends `ctx`'s `|c:<container-id>`/`|T<timestamp>` segments under [`Format::DogStatsd`] --
 /// see the module doc's "`|c:<container-id>` and `|T<timestamp>`" section. Called once per
 /// physical line [`render_metric`] (or its `Samples`/`SetMembers` helpers) emits, *after*
 /// [`append_tags`], so a negative-absolute-gauge's two-line pair or a multi-line `Samples`/
 /// `SetMembers` record gets it on every line -- each is, on the wire, its own statsd line that
-/// genuinely carried (or would carry) its own `|c:`/`|T` segment. Under [`Format::Statsd`] neither
-/// field has anywhere to go, so both are dropped and counted (`EncodeStats::dropped_dialect_fields`)
-/// rather than silently omitted.
-fn append_dialect_extras(
-    line: &mut String,
-    format: Format,
-    event: &Event,
-    stats: &mut EncodeStats,
-) {
-    let container_id = match event.attributes.get("statsd.container_id") {
-        Some(Value::Str(id)) => std::str::from_utf8(id).ok(),
-        _ => None,
-    };
-    let has_timestamp_marker =
-        matches!(event.attributes.get("statsd.timestamp"), Some(Value::Bool(true)));
-
-    match format {
+/// genuinely carried (or would carry) its own `|c:`/`|T` segment. Reads `ctx.container_id`/
+/// `ctx.timestamp_secs` -- captured by `build_tag_suffix`'s merged walk, not re-read from
+/// `event.attributes` here -- so `|T` always emits exactly the wire seconds the carrier holds,
+/// never a value derived from `event.timestamp` (which a summarizing stage can rebuild at flush
+/// time). Under [`Format::Statsd`] neither field has anywhere to go, so both are dropped and
+/// counted (`EncodeStats::dropped_dialect_fields`) rather than silently omitted.
+fn append_dialect_extras(line: &mut String, ctx: &mut EncodeCtx) {
+    match ctx.format {
         Format::DogStatsd => {
-            if let Some(id) = container_id {
+            if let Some(id) = ctx.container_id {
                 line.push_str("|c:");
                 sanitize_into(line, id, is_forbidden_in_tag_value_only);
             }
-            // A negative timestamp can't have come from a real `|T<secs>` segment (statsd's own
-            // grammar has no sign there) -- silently skip rather than emit a segment no decoder
-            // produced, the same defensive posture `Gauge`'s finite-value guards take elsewhere.
-            if has_timestamp_marker && event.timestamp >= 0 {
-                let secs = event.timestamp / 1_000_000_000;
+            if let Some(secs) = ctx.timestamp_secs {
                 let _ = write!(line, "|T{secs}");
             }
         }
         Format::Statsd => {
-            if container_id.is_some() {
-                stats.dropped_dialect_fields += 1;
+            if ctx.container_id.is_some() {
+                ctx.stats.dropped_dialect_fields += 1;
             }
-            if has_timestamp_marker {
-                stats.dropped_dialect_fields += 1;
+            if ctx.timestamp_secs.is_some() {
+                ctx.stats.dropped_dialect_fields += 1;
             }
         }
     }
@@ -506,7 +561,6 @@ fn render_metric(
     name: &mut String,
     member: &mut String,
     relative_gauges: bool,
-    event: &Event,
     metric: &MetricRecord,
     ctx: &mut EncodeCtx,
 ) {
@@ -555,7 +609,7 @@ fn render_metric(
             push_float(line, s.value);
             line.push_str("|c");
             append_tags(line, ctx.tag_suffix);
-            append_dialect_extras(line, ctx.format, event, ctx.stats);
+            append_dialect_extras(line, ctx);
             push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
         }
         MetricKind::Sum(s) => {
@@ -589,11 +643,11 @@ fn render_metric(
             if v.is_sign_negative() {
                 // No wire syntax for a negative absolute gauge -- emit the documented two-line
                 // idiom as one indivisible entry (module doc's "Negative absolute gauges").
-                write_gauge_line(line, name, 0.0, event, ctx);
+                write_gauge_line(line, name, 0.0, ctx);
                 line.push('\n');
-                write_gauge_line(line, name, v, event, ctx);
+                write_gauge_line(line, name, v, ctx);
             } else {
-                write_gauge_line(line, name, v, event, ctx);
+                write_gauge_line(line, name, v, ctx);
             }
             push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
         }
@@ -624,7 +678,7 @@ fn render_metric(
             push_float(line, *v);
             line.push_str("|g");
             append_tags(line, ctx.tag_suffix);
-            append_dialect_extras(line, ctx.format, event, ctx.stats);
+            append_dialect_extras(line, ctx);
             push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
         }
         MetricKind::Distribution(_) => dropped_unsupported_kind(
@@ -658,9 +712,9 @@ fn render_metric(
         }
         // Raw, unsummarized data (statsd's own `ms`/`h`/`d`/`s` shapes, decoded losslessly by
         // `statsd_in` -- `docs/adr/lossless-transit.md`) -- real encoding, not a drop.
-        MetricKind::Samples(samples) => render_samples(line, name.as_str(), event, samples, ctx),
+        MetricKind::Samples(samples) => render_samples(line, name.as_str(), samples, ctx),
         MetricKind::SetMembers(members) => {
-            render_set_members(line, member, name.as_str(), event, members, ctx)
+            render_set_members(line, member, name.as_str(), members, ctx)
         }
     }
 }
@@ -700,26 +754,24 @@ fn dropped_unsupported_kind(
 
 /// Renders one `name:v|g` (or `name:+v|g`/`name:-v|g`) line into `line`, including the tag segment
 /// and, under `Format::DogStatsd`, `|c:`/`|T` -- shared by `Gauge`'s plain and negative-pair cases.
-fn write_gauge_line(line: &mut String, name: &str, v: f64, event: &Event, ctx: &mut EncodeCtx) {
+fn write_gauge_line(line: &mut String, name: &str, v: f64, ctx: &mut EncodeCtx) {
     line.push_str(name);
     line.push(':');
     push_float(line, v);
     line.push_str("|g");
     append_tags(line, ctx.tag_suffix);
-    append_dialect_extras(line, ctx.format, event, ctx.stats);
+    append_dialect_extras(line, ctx);
 }
 
-/// `statsd.type`'s value when it's a `Str` naming one of the timer wire types, else the default
-/// `"ms"` -- see the module doc's "`|c:<container-id>` and `|T<timestamp>`" section for the
-/// sibling attributes this one is read alongside.
-fn statsd_wire_type(event: &Event) -> &'static str {
-    match event.attributes.get("statsd.type") {
-        Some(Value::Str(s)) => match std::str::from_utf8(s) {
-            Ok("ms") => "ms",
-            Ok("h") => "h",
-            Ok("d") => "d",
-            _ => "ms",
-        },
+/// `ctx.statsd_type`'s value when it names one of the timer wire types, else the default `"ms"` --
+/// see the module doc's "`|c:<container-id>` and `|T<timestamp>`" section for the sibling carriers
+/// this one is captured alongside. Reads `EncodeCtx`, not `event.attributes`, for the same reason
+/// [`append_dialect_extras`] does.
+fn statsd_wire_type(ctx: &EncodeCtx) -> &'static str {
+    match ctx.statsd_type {
+        Some("ms") => "ms",
+        Some("h") => "h",
+        Some("d") => "d",
         _ => "ms",
     }
 }
@@ -736,7 +788,6 @@ fn statsd_wire_type(event: &Event) -> &'static str {
 fn render_samples(
     line: &mut String,
     name: &str,
-    event: &Event,
     samples: &logit_core::Samples,
     ctx: &mut EncodeCtx,
 ) {
@@ -749,7 +800,7 @@ fn render_samples(
         return;
     }
 
-    let wire_type = statsd_wire_type(event);
+    let wire_type = statsd_wire_type(ctx);
     let (encode_type, normalized) = match ctx.format {
         Format::Statsd if wire_type != "ms" => ("ms", true),
         _ => (wire_type, false),
@@ -802,7 +853,7 @@ fn render_samples(
                 push_float(line, rate);
             }
             append_tags(line, ctx.tag_suffix);
-            append_dialect_extras(line, ctx.format, event, ctx.stats);
+            append_dialect_extras(line, ctx);
             push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
         }
         Format::Statsd => {
@@ -828,7 +879,7 @@ fn render_samples(
                 // `ctx.tag_suffix` is already empty under `Format::Statsd` (`build_tag_suffix`),
                 // so this is a no-op -- kept for symmetry with the `DogStatsd` arm above.
                 append_tags(line, ctx.tag_suffix);
-                append_dialect_extras(line, ctx.format, event, ctx.stats);
+                append_dialect_extras(line, ctx);
                 push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
             }
         }
@@ -843,7 +894,6 @@ fn render_set_members(
     line: &mut String,
     member: &mut String,
     name: &str,
-    event: &Event,
     members: &[bytes::Bytes],
     ctx: &mut EncodeCtx,
 ) {
@@ -859,12 +909,14 @@ fn render_set_members(
     for raw in members {
         let lossy = String::from_utf8_lossy(raw);
         member.clear();
-        // `is_forbidden_in_name`, not the tag-value rule -- a member sits in `name:<member>|s`'s
-        // colon-separated *value* position, the same position `parse_line` splits on to find
-        // several values on one line (`name:v1:v2|c`). The tag-value rule deliberately allows
-        // `:` (safe there, since a tag value is never itself colon-split); here it would let a
-        // member containing `:` silently re-decode as two members instead of one.
-        sanitize_into(member, &lossy, is_forbidden_in_name);
+        // `is_forbidden_in_set_member`, not the name/tag-key or tag-value rule -- a member sits in
+        // `name:<member>|s`'s colon-separated *value* position, the same position `parse_line`
+        // splits on to find several values on one line (`name:v1:v2|c`), so `:` must still be
+        // forbidden here (unlike the tag-value rule, which allows it) or a member containing `:`
+        // would silently re-decode as two members instead of one. Unlike the name/tag-key rule,
+        // `@`/`#`/`,`/whitespace are all preserved: none of them is delimiter-sensitive in this
+        // position, so sanitizing them would only make distinct members collide.
+        sanitize_into(member, &lossy, is_forbidden_in_set_member);
         if std::str::from_utf8(raw) != Ok(member.as_str()) {
             ctx.stats.members_sanitized += 1;
         }
@@ -875,7 +927,7 @@ fn render_set_members(
         line.push_str(member.as_str());
         line.push_str("|s");
         append_tags(line, ctx.tag_suffix);
-        append_dialect_extras(line, ctx.format, event, ctx.stats);
+        append_dialect_extras(line, ctx);
         push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
     }
 }
@@ -910,6 +962,21 @@ fn is_forbidden_in_tag_key(c: char) -> bool {
 /// `a:b`.
 fn is_forbidden_in_tag_value_only(c: char) -> bool {
     c != ':' && is_forbidden_in_name(c)
+}
+
+/// Forbidden in a `SetMembers` member -- its own, narrower rule, sharing nothing with
+/// [`is_forbidden_in_name`]/[`is_forbidden_in_tag_value_only`] beyond the two characters that
+/// genuinely matter here. A member sits in `name:<member>|s`'s colon-separated *value* position,
+/// the same position `parse_line` splits on to find several values sharing one line
+/// (`name:v1:v2|c`), so `:` has to be forbidden or it would silently re-decode a single member as
+/// two; `|` would open a new segment instead of staying part of the value. Control bytes
+/// (`\n`/`\r`/`\0` included, via `char::is_control`) are forbidden too, since any of them would
+/// corrupt line/datagram framing regardless of position. Nothing else is: `@`, `#`, `,`, and
+/// whitespace are only delimiter-sensitive at the *start* of a segment, a role a member never
+/// plays, so forbidding them here would sanitize bytes a real decode can hand back unchanged and
+/// let distinct members collide (module doc's "Sanitization" section).
+fn is_forbidden_in_set_member(c: char) -> bool {
+    matches!(c, ':' | '|') || c.is_control()
 }
 
 /// The live half of a `statsd_out` sink: `Udp` binds eagerly (a bad local bind is a config error);
@@ -1837,6 +1904,54 @@ mod tests {
         );
     }
 
+    /// Bytes the name/tag-key rule would substitute but a member's own, narrower rule preserves --
+    /// `@`, `#`, `,`, and a space are none of them delimiter-sensitive in a member's colon-
+    /// separated *value* position (`values_part` only ever splits on `:`; the line only on
+    /// `|`/newline), so a real decode hands each straight through and this sink must round-trip
+    /// it byte for byte, not substitute it the way it would in a name or tag key.
+    #[test]
+    fn members_with_at_hash_comma_or_a_space_round_trip_byte_for_byte() {
+        for line in ["users:a@b|s", "users:a,b|s", "users:a b|s"] {
+            let original = decode_one(line);
+            let (msgs, stats) = encode(original.clone());
+            assert_eq!(msgs, vec![line], "expected {line:?} to round-trip byte for byte");
+            assert_eq!(
+                stats.members_sanitized, 0,
+                "no substitution should have happened for {line:?}"
+            );
+            let relayed = decode_one(&msgs[0]);
+            // Compares metrics only, not the whole `Event`: both decodes carry a real receipt-time
+            // `Event::timestamp` (no `|T` on this line), which two independent `decode_one` calls
+            // never agree on down to the nanosecond -- `statsd_round_trip.rs`'s own
+            // `normalize_receipt_time` exists for exactly this reason.
+            assert_eq!(
+                relayed[0].metrics, original[0].metrics,
+                "decode(encode(decode(line))) should equal decode(line) for {line:?}"
+            );
+        }
+    }
+
+    /// `:` is still forbidden in a member (unlike in a tag value): a real `users:a:b|s` decode
+    /// produces *two* members (`a`, `b`), and each one still re-encodes as its own untouched line
+    /// -- the colon is what changes structure here, not any per-member sanitization.
+    #[test]
+    fn a_member_split_by_a_real_colon_decodes_as_two_members_each_re_encoding_untouched() {
+        let events = decode_one("users:a:b|s");
+        assert_eq!(events.len(), 1, "one SetMembers event for the whole line");
+        match &events[0].metrics[0].kind {
+            MetricKind::SetMembers(m) => {
+                assert_eq!(
+                    m,
+                    &vec![bytes::Bytes::from_static(b"a"), bytes::Bytes::from_static(b"b")]
+                )
+            }
+            other => panic!("expected SetMembers, got {other:?}"),
+        }
+        let (msgs, stats) = encode(events);
+        assert_eq!(msgs, vec!["users:a|s", "users:b|s"]);
+        assert_eq!(stats.members_sanitized, 0);
+    }
+
     #[test]
     fn an_empty_set_members_list_emits_nothing_and_is_counted() {
         let (msgs, stats) = encode(vec![metric_event("tags", MetricKind::SetMembers(vec![]), &[])]);
@@ -1856,36 +1971,61 @@ mod tests {
         assert_eq!(msgs, vec!["hits:1|c|c:abcd1234"]);
     }
 
+    /// The resource-level counterpart: `build_tag_suffix`'s merged walk captures a `statsd.*`
+    /// carrier from *either* side of the resource⊕event merge, event winning on collision (same
+    /// as every other attribute) -- so a carrier a `set` transform's `resource:` block stamped
+    /// reaches the wire exactly like one `statsd_in` stamped directly on the event.
+    #[test]
+    fn a_container_id_on_the_resource_is_emitted_as_pipe_c_under_dogstatsd() {
+        let mut resource_attrs = AttrMap::new();
+        resource_attrs.insert("statsd.container_id", Value::str("res-id"));
+        let resource = Arc::new(Resource { attributes: resource_attrs, ..Default::default() });
+        let batch = EventBatch {
+            resource,
+            scope: None,
+            events: vec![metric_event("hits", MetricKind::counter(1.0), &[])],
+        };
+        let mut encoder = StatsdEncoder::new(Format::DogStatsd);
+        let mut out = MessageBuf::default();
+        encoder.encode_into(&batch, usize::MAX, &mut out);
+        let msgs: Vec<String> =
+            out.iter().map(|b| std::str::from_utf8(b).unwrap().to_string()).collect();
+        assert_eq!(msgs, vec!["hits:1|c|c:res-id"]);
+    }
+
     #[test]
     fn a_timestamp_marker_appends_pipe_t_seconds_under_dogstatsd() {
-        let (msgs, _) = encode(vec![metric_event_at(
-            5_000_000_000,
+        let (msgs, _) = encode(vec![metric_event(
             "hits",
             MetricKind::counter(1.0),
-            &[("statsd.timestamp", true.into())],
+            &[("statsd.timestamp", Value::U64(5))],
         )]);
         assert_eq!(msgs, vec!["hits:1|c|T5"]);
     }
 
     #[test]
     fn container_id_and_timestamp_come_after_the_tag_segment() {
-        let (msgs, _) = encode(vec![metric_event_at(
-            5_000_000_000,
+        let (msgs, _) = encode(vec![metric_event(
             "hits",
             MetricKind::counter(1.0),
             &[
                 ("env", "prod".into()),
                 ("statsd.container_id", Value::str("abcd1234")),
-                ("statsd.timestamp", true.into()),
+                ("statsd.timestamp", Value::U64(5)),
             ],
         )]);
         assert_eq!(msgs, vec!["hits:1|c|#env:prod|c:abcd1234|T5"]);
     }
 
+    /// `statsd.timestamp` present but not a `Value::U64` -- never produced by `statsd_in` itself,
+    /// but reachable from a cross-protocol relay or a Lua-authored attribute -- is simply not
+    /// emitted, since `EncodeCtx::timestamp_secs` only ever gets set from the `U64` arm of
+    /// `build_tag_suffix`'s merged walk. This is also the regression for the old
+    /// `Value::Bool(true)` marker representation this carrier used before it held the wire value
+    /// itself: it must not be misread as a timestamp of any kind.
     #[test]
-    fn a_negative_timestamp_never_reaches_the_wire() {
-        let (msgs, _) = encode(vec![metric_event_at(
-            -1,
+    fn a_non_u64_statsd_timestamp_value_is_not_emitted() {
+        let (msgs, _) = encode(vec![metric_event(
             "hits",
             MetricKind::counter(1.0),
             &[("statsd.timestamp", true.into())],
@@ -1896,13 +2036,12 @@ mod tests {
     #[test]
     fn container_id_and_timestamp_are_dropped_and_counted_under_plain_statsd() {
         let (msgs, stats) = encode_with_format(
-            vec![metric_event_at(
-                5_000_000_000,
+            vec![metric_event(
                 "hits",
                 MetricKind::counter(1.0),
                 &[
                     ("statsd.container_id", Value::str("abcd1234")),
-                    ("statsd.timestamp", true.into()),
+                    ("statsd.timestamp", Value::U64(5)),
                 ],
             )],
             Format::Statsd,
@@ -1919,7 +2058,7 @@ mod tests {
             &[
                 ("statsd.type", Value::str("ms")),
                 ("statsd.container_id", Value::str("abcd1234")),
-                ("statsd.timestamp", true.into()),
+                ("statsd.timestamp", Value::U64(0)),
                 ("env", "prod".into()),
             ],
         )]);
@@ -2354,7 +2493,7 @@ mod tests {
             relayed[0].attributes.get("statsd.container_id").and_then(|v| v.as_str()),
             Some("abcd1234")
         );
-        assert!(matches!(relayed[0].attributes.get("statsd.timestamp"), Some(Value::Bool(true))));
+        assert_eq!(relayed[0].attributes.get("statsd.timestamp"), Some(&Value::U64(1_700_000_000)));
     }
 
     // -- Fixed-point property: decode/encode agree with each other -----------------------------
@@ -2373,20 +2512,23 @@ mod tests {
         }
 
         /// 1-3 values -- for `c`/`ms`/`h`/`d`, plain decimal numbers; for `g`, a leading `-`/`+`
-        /// exercises the delta path too; for `s`, short alphanumeric member tokens with no `:`
-        /// (or any other forbidden character) in them, so every generated line already has its
+        /// exercises the delta path too; for `s`, short member tokens with no `:`/`|` (or any
+        /// other genuinely forbidden character) in them, so every generated line already has its
         /// values unambiguously delimited at the *grammar* level -- a member sanitized because it
-        /// embedded a delimiter is the dedicated `a_member_containing_a_colon_is_sanitized_and_
+        /// embedded one of those is the dedicated `a_member_containing_a_colon_is_sanitized_and_
         /// counted`/`..._re_decodes_as_one_member_not_two` unit tests' job, not this generic
-        /// property's. Paired with its own wire-type letter via `prop_flat_map` below so the
-        /// shape always matches the type (a top-level proptest parameter can't depend on another
-        /// one).
+        /// property's. `@`/`#`/`,`/a space are deliberately included, though: none of them is
+        /// delimiter-sensitive in a member's own wire position (`is_forbidden_in_set_member`
+        /// preserves all four), so a real decode can hand any of them back unchanged and this
+        /// property should cover that, not just the alphanumeric case. Paired with its own
+        /// wire-type letter via `prop_flat_map` below so the shape always matches the type (a
+        /// top-level proptest parameter can't depend on another one).
         fn values_for(kind: &'static str) -> impl Strategy<Value = Vec<String>> {
             let count = 1usize..=3;
             match kind {
-                "s" => {
-                    count.prop_flat_map(|n| prop::collection::vec("[a-z][a-z0-9]{0,5}", n)).boxed()
-                }
+                "s" => count
+                    .prop_flat_map(|n| prop::collection::vec("[a-z][a-z0-9 @#,]{0,5}", n))
+                    .boxed(),
                 "g" => count
                     .prop_flat_map(|n| {
                         prop::collection::vec(

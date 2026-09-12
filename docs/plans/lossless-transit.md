@@ -53,19 +53,24 @@ zero-copy `Bytes` slice of the datagram, mirroring `ms`/`h`/`d`. `statsd_in`'s o
 `MAX_SAMPLE_WEIGHT`/`sample_rate_clamped` clamp (moved to `aggregate` by W2, kept here until this
 workstream) is deleted — `aggregate` is now the only place that diagnostic fires. `|c:<id>` stamps
 `statsd.container_id`; `|T<secs>` sets `Event::timestamp` and stamps the per-line
-`statsd.timestamp: true` marker, distinguishing a wire-supplied timestamp from a receipt-time one;
-a malformed `|T` rejects only that line. DogStatsD events and service checks still fail to parse as
-ordinary lines (W6). `unit` is still always `None`.
+`statsd.timestamp: Value::U64(secs)` carrier -- the raw wire seconds themselves, not just a marker
+bit, so a stage that rebuilds `Event::timestamp` after decode can't fabricate or collapse a `|T` on
+the way back out; a malformed `|T` rejects only that line. DogStatsD events and service checks
+still fail to parse as ordinary lines (W6). `unit` is still always `None`.
 
 Encode (`crates/logit-outputs/src/statsd.rs`): `Samples` renders as one multi-value
 `name:v1:v2|<type>|@rate` line under `format: dogstatsd` (`<type>` from `statsd.type`, defaulting
 to `ms`; `@rate` omitted at `1.0`), or one `name:v|ms[|@rate]` line per value under `format: statsd`
 (no multi-value grammar there; `h`/`d` normalize to `ms`, counted `type_normalized_dialect`).
-`SetMembers` renders one `name:<member>|s` line per member, in both dialects (sanitized like a tag
-value, counted `members_sanitized` when altered). `|c:`/`|T` round-trip under `format: dogstatsd`
-only (`append_dialect_extras`); dropped and counted (`dropped_dialect_fields`) under `format:
-statsd`, which has no equivalent segment. `statsd.*` attributes are filtered out of the generic
-`|#k:v` tag segment (`build_tag_suffix`), never re-emitted as tags. `Distribution`/`Set`/
+`SetMembers` renders one `name:<member>|s` line per member, in both dialects (a member-specific
+rule: `:`, `|`, and control bytes are substituted; everything else, including `@`, `#`, `,` and
+spaces, is preserved -- counted `members_sanitized` when altered). `|c:`/`|T` round-trip under
+`format: dogstatsd` only (`append_dialect_extras`), reading their carriers off `EncodeCtx` --
+captured by `build_tag_suffix`'s merged resource⊕event walk, the same one that filters `statsd.*`
+out of the generic tag segment, so a carrier set only on the resource is honored too; dropped and
+counted (`dropped_dialect_fields`) under `format: statsd`, which has no equivalent segment.
+`statsd.*` attributes are filtered out of the generic `|#k:v` tag segment (`build_tag_suffix`),
+never re-emitted as tags. `Distribution`/`Set`/
 `Histogram`/`ExponentialHistogram`/`Summary`/a cumulative or non-monotonic `Sum` remain dropped and
 counted (`unsupported_metric_kind`) — reachable now only once `aggregate` has explicitly summarized
 (its defaults, `distributions: sketch`/`sets: estimate`), exactly the "opt-in summarization"

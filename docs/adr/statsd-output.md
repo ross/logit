@@ -260,35 +260,45 @@ multi-value statsd line" and "sink-configured dialect change" normalizations
 `MetricKind::SetMembers` (`render_set_members`) renders one `name:<member>|s` line per member, in
 **both** dialects — the classic grammar has no multi-value extension for sets the way DogStatsD's
 timers get, so there is no dialect-conditional form here at all. Each member is rendered through
-the same tag-*value* sanitizer a tag value gets (lossy UTF-8 first, since a member is arbitrary
-bytes off the wire), and a member that comes out different from its raw bytes is counted
+a member-specific rule (lossy UTF-8 first, since a member is arbitrary bytes off the wire): `:`,
+`|`, and control bytes are substituted; everything else, including `@`, `#`, `,` and spaces, is
+preserved. A member that comes out different from its raw bytes is counted
 (`EncodeStats::members_sanitized`).
 
 ### `|c:`/`|T` carriage: dogstatsd only, dropped and counted under `format: statsd`
 
 `statsd.container_id` renders as `|c:<id>` and the per-line `statsd.timestamp ==
-Value::Bool(true)` marker renders as `|T<secs>` (`secs = event.timestamp / 1_000_000_000`) — both
+Value::U64(secs)` carrier renders as `|T<secs>`, using that carrier's own value verbatim — both
 only under `Format::DogStatsd` (`append_dialect_extras`), appended after the tag segment to
 **every** physical line an event produces, so a negative-absolute-gauge's two-line pair or a
 multi-line `Samples`/`SetMembers` record carries them on each line. `|T` renders **only** when the
-per-line marker attribute is set, not merely because `Event::timestamp` is non-zero — a
-receipt-time stamp is not a wire-supplied timestamp, and re-emitting it as one would fabricate a
-`|T` segment no `|T` segment ever produced. A negative `event.timestamp` never reaches the wire
-even with the marker set: statsd's own grammar has no sign there, so a negative value can't have
-come from a real `|T<secs>` segment, and this sink skips rather than emit a segment no decoder
-produces (`a_negative_timestamp_never_reaches_the_wire`). Under `format: statsd`, neither field has
-anywhere to go — both are dropped and counted once per field per emitted physical line
-(`EncodeStats::dropped_dialect_fields`,
+carrier is present and holds a `Value::U64` (a wire `|T<secs>` segment always produces exactly
+that), never derived from `Event::timestamp` — a receipt-time stamp is not a wire-supplied
+timestamp, and a stage that rebuilds `Event::timestamp` after decode (`aggregate`'s flush,
+notably) can't fabricate or collapse a `|T` this way, since the carrier rides on the series key
+like any other attribute. A `statsd.timestamp` present but not a `Value::U64` (never produced by
+`statsd_in` itself, but reachable from a cross-protocol relay or a Lua-authored attribute) is
+simply not emitted (`a_non_u64_statsd_timestamp_value_is_not_emitted`). Under `format: statsd`,
+neither field has anywhere to go — both are dropped and counted once per field per emitted
+physical line (`EncodeStats::dropped_dialect_fields`,
 `container_id_and_timestamp_are_dropped_and_counted_under_plain_statsd`).
 
-### `statsd.*` is never emitted as a tag
+### `statsd.*` is never emitted as a tag, and is read off the merged resource⊕event view
 
 `statsd.type`/`statsd.container_id`/`statsd.timestamp` are protocol-namespaced carriers this
 decoder stamped from a line's own wire-type/`|c:`/`|T` segments, not ordinary attributes —
 `build_tag_suffix` filters every key starting with `statsd.` out of the generic `|#k:v,...`
 segment before it's ever considered as a tag, uncounted (a carrier being read for its real
 purpose, not data being dropped), the same way `syslog_out` never re-emits its own `syslog.*`
-attributes as a generic SD-ELEMENT field.
+attributes as a generic SD-ELEMENT field. That same merged walk (resource attributes first, event
+attributes overriding on collision, `crate::attrs::merged`) is also where all three carriers are
+captured, into `EncodeCtx`'s own fields, rather than a second, separate read of `event.attributes`
+afterward — `append_dialect_extras`/`statsd_wire_type` read `EncodeCtx`, never `event.attributes`,
+directly. This means a carrier set only on the **resource** (a `set` transform's `resource:`
+block, say) is honored exactly like one an event carries directly
+(`a_container_id_on_the_resource_is_emitted_as_pipe_c_under_dogstatsd`) — filtering a key out of
+the tag segment and reading it for its dedicated segment are now symmetric, where before only the
+event's own attributes were ever read back.
 
 ### What's still deferred, and why that's now the "opt-in summarization" carve-out
 
@@ -302,12 +312,23 @@ aggregate -> statsd_out` relay using those defaults still drops every timer/set 
 it did before this amendment — but that is now an operator's explicit choice, not the only path
 available. Configuring that `aggregate` with `distributions: samples`/`sets: members`
 (`docs/adr/aggregation-window-semantics.md`'s amendment) keeps the raw shapes flowing through
-instead, and a relay with no `aggregate` at all already only ever saw the raw shapes. This is
-[ADR `lossless-transit`](lossless-transit.md)'s "summarization is opt-in and named" rule made
-concrete on the egress side: the sink itself never guessed at a sketch-to-lines mapping (still
-deserving its own design, per the original Decision section above, should a concrete consumer ever
-need one), and the kinds it can't encode are now exactly the kinds *only* an explicit `aggregate`
-choice can produce.
+instead, and a relay with no `aggregate` at all already only ever saw the raw shapes. **This stays
+true only while every sample landing in a window shares one sample rate and the window stays under
+`max_samples_per_series`/`max_set_members_per_series`**; once either limit is crossed, `aggregate`
+falls back to a sketch/estimate for that window regardless of the `samples`/`members` config, and
+this sink has no lossless rendering for that fallback either — it drops and counts it exactly like
+the default-summarized case (`docs/known-gaps.md`). This is [ADR `lossless-transit`](lossless-transit.md)'s
+"summarization is opt-in and named" rule made concrete on the egress side: the sink itself never
+guessed at a sketch-to-lines mapping (still deserving its own design, per the original Decision
+section above, should a concrete consumer ever need one), and the kinds it can't encode are now
+exactly the kinds *only* an explicit `aggregate` choice, or a config limit, can produce.
+
+**A repeated tag key is a separate, model-level gap, not a `statsd_out` one.** `#team:a,team:b` is
+legal DogStatsD (a repeated tag key), but `AttrMap` is a map, not a multiset, so the second
+`team:b` silently overwrites the first inside `statsd_in` itself, before this sink ever sees the
+event — `x:1|c|#team:a,team:b` relays as `x:1|c|#team:b`. Tracked as debt against
+[ADR `lossless-transit`](lossless-transit.md) in `docs/known-gaps.md`, not something this
+amendment's carrier/sanitizer fixes touch.
 
 ### Permitted normalizations, restated for the raw shapes
 
@@ -334,12 +355,15 @@ both new segments: `a_single_value_samples_metric_encodes_as_name_colon_value_pi
 `an_empty_samples_list_emits_nothing_and_is_counted` for `Samples`;
 `a_single_member_set_members_metric_encodes_as_name_colon_member_pipe_s`,
 `a_multi_member_set_members_metric_encodes_as_one_line_per_member_in_both_formats`,
-`a_non_utf8_set_member_is_lossily_sanitized_and_counted`, and
+`a_non_utf8_set_member_is_lossily_sanitized_and_counted`,
+`members_with_at_hash_comma_or_a_space_round_trip_byte_for_byte`,
+`a_member_split_by_a_real_colon_decodes_as_two_members_each_re_encoding_untouched`, and
 `an_empty_set_members_list_emits_nothing_and_is_counted` for `SetMembers`;
 `a_container_id_attribute_appends_pipe_c_under_dogstatsd`,
+`a_container_id_on_the_resource_is_emitted_as_pipe_c_under_dogstatsd`,
 `a_timestamp_marker_appends_pipe_t_seconds_under_dogstatsd`,
 `container_id_and_timestamp_come_after_the_tag_segment`,
-`a_negative_timestamp_never_reaches_the_wire`, and
+`a_non_u64_statsd_timestamp_value_is_not_emitted`, and
 `container_id_and_timestamp_are_dropped_and_counted_under_plain_statsd` for `|c:`/`|T`; plus
 `a_container_id_and_timestamp_line_round_trips_through_the_real_statsd_decoder` and a `proptest`
 fixed point (`mod fixed_point::decode_encode_decode_is_a_fixed_point`, 200 generated cases over

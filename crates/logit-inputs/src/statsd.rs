@@ -51,13 +51,16 @@
 //! `|T<secs>` sets [`Event::timestamp`] to `secs * 1_000_000_000` (checked -- a non-digit or
 //! overflowing value rejects *only that line*, as a `CodecError::Malformed`, leaving the rest of
 //! the datagram unaffected) instead of the receipt-time timestamp `decode_into`'s `received_at`
-//! would otherwise stamp, and marks `statsd.timestamp: Value::Bool(true)` so a consumer can tell
-//! a wire-supplied timestamp from a receipt-time one. Both attributes are rule-(b)
-//! protocol-namespaced carriers (`docs/adr/lossless-transit.md`) for a concept this model has no
-//! normalized field for at all. Every other unrecognized `|` segment (DogStatsD events/service
-//! checks use different leading sigils entirely) is accepted and silently ignored --
-//! forward-compatible with segment kinds this decoder doesn't know about yet, rather than a hard
-//! error on something benign.
+//! would otherwise stamp, and stamps `statsd.timestamp: Value::U64(secs)` -- the raw parsed
+//! seconds, not just a marker bit -- so a consumer can both tell a wire-supplied timestamp from a
+//! receipt-time one *and* read back the exact wire value, independent of whatever
+//! `Event::timestamp` becomes downstream (a summarizing stage like `aggregate` rebuilds
+//! `Event::timestamp` at flush time; the carrier attribute is what survives that rebuild
+//! unchanged). Both attributes are rule-(b) protocol-namespaced carriers
+//! (`docs/adr/lossless-transit.md`) for a concept this model has no normalized field for at all.
+//! Every other unrecognized `|` segment (DogStatsD events/service checks use different leading
+//! sigils entirely) is accepted and silently ignored -- forward-compatible with segment kinds
+//! this decoder doesn't know about yet, rather than a hard error on something benign.
 //!
 //! **DogStatsD tag values, `|c:<id>`, and `s`'s set members are all zero-copy slices of the
 //! datagram**, exactly like every field [`crate::syslog`] extracts: `slice_of` reconstructs each
@@ -301,7 +304,11 @@ fn parse_line(
                 .and_then(|n| i64::try_from(n).ok())
                 .ok_or_else(malformed)?;
             line_timestamp = nanos;
-            attributes.insert("statsd.timestamp", true);
+            // The carrier holds the parsed wire value itself, not just a marker bit -- so a
+            // stage downstream that rebuilds `Event::timestamp` (`aggregate`'s flush, notably)
+            // can't fabricate a `|T` value the wire never sent: `statsd_out` reads this attribute
+            // directly rather than trusting `event.timestamp`.
+            attributes.insert("statsd.timestamp", Value::U64(secs));
         }
         // Anything else (DogStatsD events/service checks use different leading sigils entirely)
         // is accepted and ignored -- forward-compatible with segment kinds this decoder doesn't
@@ -887,7 +894,7 @@ mod tests {
         let events = decode("hits:1|c|T1700000000");
         let event = &events[0];
         assert_eq!(event.timestamp, 1_700_000_000 * 1_000_000_000);
-        assert!(matches!(event.attributes.get("statsd.timestamp"), Some(Value::Bool(true))));
+        assert_eq!(event.attributes.get("statsd.timestamp"), Some(&Value::U64(1_700_000_000)));
     }
 
     #[test]
@@ -930,8 +937,9 @@ mod tests {
                 Some("prod"),
                 "line: {line:?}"
             );
-            assert!(
-                matches!(event.attributes.get("statsd.timestamp"), Some(Value::Bool(true))),
+            assert_eq!(
+                event.attributes.get("statsd.timestamp"),
+                Some(&Value::U64(1_700_000_000)),
                 "line: {line:?}"
             );
             match &event.metrics[0].kind {
