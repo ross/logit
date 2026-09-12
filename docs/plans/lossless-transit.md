@@ -546,8 +546,10 @@ Every loss the "Assessment: today's model and codecs against the survey" section
 against the three like-protocol pairs is closed:
 
 - **statsd_in -> statsd_out**: raw timers/histograms/distributions (`Samples`) and raw sets
-  (`SetMembers`) round-trip byte-for-byte, `|c:`/`|T` survive under `format: dogstatsd`, and
-  DogStatsD events/service checks decode and re-encode losslessly — see "statsd_in -> statsd_out
+  (`SetMembers`) round-trip byte-for-byte under `format: dogstatsd` (under `format: statsd`,
+  lossless modulo the ADR's permitted normalizations: multi-value lines split, `h`/`d` normalize to
+  `ms`), `|c:`/`|T` survive under `format: dogstatsd`, and DogStatsD events/service checks decode
+  and re-encode losslessly — see "statsd_in -> statsd_out
   (W3, landed)" and "DogStatsD events and service checks (W6, landed)" above.
 - **otlp_in -> otlp_out**: every metric field the original assessment named (start time,
   description, `Histogram`/`Summary` sum/min/max/count, `ExponentialHistogram` as its own 1:1
@@ -572,7 +574,7 @@ or transport in between; and the `proptest`-based fixed points in `crates/logit-
 `crates/logit-proto/src/otlp/metrics.rs` generate arbitrary records and assert
 `decode(encode(x)) == x` holds beyond any hand-picked fixture.
 
-What's left is exactly what the ADR's "cross-protocol egress stays best-effort" clause accepts,
+What's left is what the ADR's "cross-protocol egress stays best-effort" clause accepts,
 plus a short list of genuine model debt — both already tracked in `docs/known-gaps.md` rather than
 newly discovered here:
 
@@ -586,6 +588,12 @@ newly discovered here:
 - `logit_proto::Encoder`'s one-`Bytes`-per-batch contract still doesn't fit `syslog_out`'s/
   `statsd_out`'s per-message framing, so both bypass the trait entirely — unchanged by this plan
   (`docs/known-gaps.md`'s "`logit_proto::Encoder`'s single-`Bytes`-per-batch contract..." entry).
+- `statsd_out` still has no `unit` and no native metric rename/prefix, and only carries an egress
+  timestamp on a `|T`-marked line — everything else is stamped with the receiver's own receipt time
+  (`docs/known-gaps.md`'s "`statsd_out` has no `unit` and no metric renaming/prefixing..." entry).
+- syslog's `event.timestamp` stays receipt time, not the sender's, even though `syslog_out`'s wire
+  TIMESTAMP now follows [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md)'s
+  precedence table (`docs/known-gaps.md`'s "`event.timestamp` is still receipt time..." entry).
 - Cross-protocol egress (`P_in -> Q_out` for two different protocols) stays best-effort by design —
   a raw sample list has no OTLP wire type, a `DDSketch` has no statsd wire form — each such
   degradation is counted and documented per the ADR's own rule, in `docs/known-gaps.md`'s
@@ -612,6 +620,6 @@ Later workstreams (W1 onward) each verify against `cargo test`/`cargo clippy` pe
 plan calls out, plus the new round-trip test suites this plan adds. Concretely, W1 through W7 each
 ran a clean `script/cibuild` before landing, plus the round-trip/fixed-point suite its own
 workstream entry above names — `type_sizes.rs`/`allocations.rs` for W1, `statsd_round_trip.rs` and
-the `logit-outputs` `statsd`/`aggregate` proptests for W3, `otlp_round_trip.rs` and `logit-proto`'s
+the `logit-outputs` `statsd` proptests for W3, `otlp_round_trip.rs` and `logit-proto`'s
 `otlp_fixed_point.rs`/`proptest` suite for W4, `syslog_round_trip.rs` and the `logit-outputs`
 `syslog` proptest for W5, and `logit-script`'s own `#[cfg(test)]` coverage for W7.

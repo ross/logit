@@ -93,12 +93,12 @@ pub enum MetricKind {
     /// carries the running gauge value a delta needs to apply against. See
     /// `docs/adr/relative-gauge-adjustments.md`.
     GaugeDelta(f64),
-    /// Raw observations, as statsd `ms`/`h`/`d` values arrive -- no producer until W3
-    /// (`docs/plans/lossless-transit.md`).
+    /// Raw observations, as statsd `ms`/`h`/`d` values arrive -- `statsd_in` decodes `ms`/`h`/`d`
+    /// to it since W3 (`docs/plans/lossless-transit.md`).
     Samples(Samples),
     /// Produced only by `aggregate`, merging a run of [`MetricKind::Samples`].
     Distribution(DdSketch),
-    /// Raw set members, as statsd `s` arrives -- no producer until W3.
+    /// Raw set members, as statsd `s` arrives -- `statsd_in` decodes `s` to it since W3.
     SetMembers(Vec<bytes::Bytes>),
     /// Produced only by `aggregate`, merging a run of [`MetricKind::SetMembers`] into a real,
     /// mergeable cardinality estimate -- see [`HyperLogLog`].
@@ -242,7 +242,8 @@ pub struct Summary {
 
 /// A single sampled measurement backing a metric point -- OTLP's exemplar concept: the specific
 /// trace a particular observation happened under, plus whatever attributes were dropped from the
-/// point's own attribute set to reach it. No producer until W4 (`docs/plans/lossless-transit.md`).
+/// point's own attribute set to reach it. Produced by the OTLP codec since W4
+/// (`docs/plans/lossless-transit.md`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Exemplar {
     pub timestamp: i64,

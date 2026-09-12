@@ -667,8 +667,9 @@ fn separator(out: &mut String) {
 /// "NaN"/"inf" -- so that guard isn't theoretical.
 ///
 /// `write!` rather than `to_string()`: identical output (`to_string` is `format!("{}")`), no
-/// intermediate allocation. `pub(crate)`: `statsd_out` renders the same `Counter`/`Gauge` values
-/// and needs identical, non-locale-dependent float formatting.
+/// intermediate allocation. `pub(crate)`: `statsd_out` renders the same `Sum`/`Gauge` values (a
+/// delta, monotonic `MetricKind::counter` for the `Sum`) and needs identical, non-locale-dependent
+/// float formatting.
 pub(crate) fn push_float(out: &mut String, v: f64) {
     debug_assert!(v.is_finite(), "callers must reject non-finite values before formatting");
     let _ = write!(out, "{v}");

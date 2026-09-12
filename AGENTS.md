@@ -86,9 +86,11 @@ DogStatsD tags round-tripped through the real decoder,
 [ADR `statsd-output`](docs/adr/statsd-output.md)) is also implemented and tested now -- it encodes
 `Sum` (delta, monotonic), `Gauge`/`GaugeDelta`, `Samples`, `SetMembers`, and DogStatsD
 events/service checks; a `statsd_in -> statsd_out` relay with no `aggregate` in between, or one
-configured `distributions: samples`/`sets: members`, round-trips timers and sets byte-for-byte --
-only post-sketch kinds (`Distribution`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary`, and a
-cumulative `Sum`) are dropped and counted (`docs/known-gaps.md`). Not
+configured `distributions: samples`/`sets: members`, round-trips timers and sets byte-for-byte under
+`format: dogstatsd` (under `format: statsd`, lossless modulo the ADR's permitted normalizations:
+multi-value lines split, `h`/`d` normalize to `ms`) -- only post-sketch kinds
+(`Distribution`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary`, and a cumulative or
+non-monotonic `Sum`) are dropped and counted (`docs/known-gaps.md`). Not
 yet built: credit-based flow control beyond one frame in flight, and QUIC (`docs/known-gaps.md`).
 Config is a flat graph of named components (ADR `component-graph-configuration`,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
@@ -157,12 +159,14 @@ goal — a lossless relay for each like-protocol pair (`statsd_in`/`statsd_out`,
 `NO_RECORDED_VALUE` point round-tripped flagged, `event_name`/`observed_timestamp`, span
 `flags`/`trace_state`/a real status-message field, dropped-attribute counts), syslog (structured
 data as `syslog.sd`, timestamp precedence, bytes MSG, opt-in structured-data emission), statsd (raw
-timers/sets, `|c:`/`|T`, events/service checks), `aggregate`'s raw-retention modes backed by a real
-HyperLogLog, and the Lua surface (`event.metrics`, `event.span`, `scope`, the new log/resource
-fields) have all landed. [`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md) has the
+timers/sets, `|c:`/`|T`, events/service checks), `aggregate`'s raw-retention modes (which keep exact
+values, with a real HyperLogLog backing `sets: estimate` and the overflow fallback), and the Lua
+surface (`event.metrics`, `event.span`, `scope`, the new log/resource fields) have all landed. [`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md) has the
 closing assessment; residual debt (post-sketch metric kinds at `statsd_out`, a repeated DogStatsD
 tag key collapsing to its last value, `Encoder`'s per-batch-`Bytes` shape not fitting per-message
-framing) lives in `docs/known-gaps.md`.
+framing, `statsd_out` carrying no `unit` and no native rename/prefix and stamping an egress
+timestamp only on a `|T`-marked line, and syslog's `event.timestamp` staying receipt time while the
+wire TIMESTAMP follows the precedence table) lives in `docs/known-gaps.md`.
 
 ## Environment
 
@@ -242,8 +246,8 @@ not a style preference:
   (`DDSketch`, not a naive percentile), `Set` needs a real union (`HyperLogLog`) — this is what
   makes the split-collection topology in `docs/OVERVIEW.md` correct rather than approximate.
   `logit-core::metric::DdSketch` is a real wrapper with a working `merge` (`crates/logit-transforms`'
-  `aggregate` is its first caller); `HyperLogLog` is still a stub pending a real crate — don't fill
-  it with a non-mergeable implementation to get `Set` aggregation working faster.
+  `aggregate` is its first caller); `HyperLogLog` has wrapped the `cardinality-estimator` crate since
+  W2, also a real, mergeable sketch — don't replace either with a non-mergeable shortcut.
 - **`statsd_in -> statsd_out`, `otlp_in -> otlp_out`, and `syslog_in -> syslog_out` must each be a
   lossless relay**, modulo a named list of permitted normalizations (batching, tag reordering, a
   sink-configured dialect change) — [ADR `lossless-transit`](docs/adr/lossless-transit.md). A
