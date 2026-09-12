@@ -65,9 +65,25 @@
 //! ## DogStatsD events and service checks
 //!
 //! Two more line shapes, picked out by their leading sigil rather than the `<name>:<value>|<type>`
-//! grammar above at all: `_e{...}:...` (an **event**) and `_sc|...` (a **service check**). Any
-//! other line starting with `_` is rejected outright as malformed, rather than falling into the
-//! generic "unknown metric type" path.
+//! grammar above at all: `_e{...}:...` (an **event**) and `_sc|...` (a **service check**). The
+//! dispatch checks for exactly those two prefixes, `_e{` and `_sc|` -- nothing else about a line
+//! starting with `_` is special. A line that merely starts with `_` without matching either
+//! (including one whose name is legitimately `_`-prefixed, like `_total.count:1|c`) falls through
+//! unchanged into the generic `<name>:<value>|<type>` grammar below, exactly as it did before this
+//! section existed: `_` is an ordinary, legal name byte in statsd, and Datadog's own DogStatsD
+//! parser special-cases only these same two sigils, nothing broader.
+//!
+//! **Trailing whitespace is real payload on both shapes, so `decode_into` never trims it off
+//! them.** Every line has `\r` and *leading* whitespace trimmed unconditionally (packet padding, a
+//! proxy's added indentation, and the like); trailing whitespace is trimmed too, for every line
+//! *except* one starting with `_e{` or `_sc|`. `_e{TITLE_LEN,TEXT_LEN}`'s lengths are authoritative
+//! for splitting `TITLE`/`TEXT` -- trimming trailing whitespace first would either shrink the line
+//! out from under a correct length (rejecting an otherwise-legal event as malformed) or, if the
+//! trimmed byte was itself part of `TEXT`, silently change what `TEXT` is. `_sc|`'s `m:` field
+//! consumes the rest of the line verbatim, trailing spaces included -- trimming would silently drop
+//! them from the decoded message with no error to signal it. See
+//! `event_text_ending_in_whitespace_is_kept`/`service_check_message_trailing_whitespace_is_kept`
+//! below.
 //!
 //! **Event** -- `_e{<TITLE_LEN>,<TEXT_LEN>}:<TITLE>|<TEXT>|d:<secs>|h:<hostname>|p:<normal|low>|
 //! t:<info|success|warning|error>|k:<aggregation_key>|s:<source_type_name>|#<tags>|
@@ -242,7 +258,17 @@ impl Decoder for StatsdDecoder {
         let text = std::str::from_utf8(&bytes)
             .map_err(|e| CodecError::Malformed(format!("invalid utf-8: {e}")))?;
         for line in text.split('\n') {
-            let line = line.trim_end_matches('\r').trim();
+            // `\r` and leading whitespace are trimmed off every line unconditionally; trailing
+            // whitespace is trimmed too, *except* on an `_e{`/`_sc|` line, where it can be real
+            // payload -- see the module doc's "DogStatsD events and service checks" section for
+            // why trimming it there would corrupt a length-delimited or `m:`-terminated field
+            // instead of just removing packet padding.
+            let line = line.trim_end_matches('\r').trim_start();
+            let line = if line.starts_with("_e{") || line.starts_with("_sc|") {
+                line
+            } else {
+                line.trim_end()
+            };
             if line.is_empty() {
                 continue;
             }
@@ -332,17 +358,14 @@ fn parse_line(
 ) -> Result<Vec<Event>, CodecError> {
     // DogStatsD events and service checks are picked out by their leading sigil, before any of
     // the `<name>:<value>|<type>` grammar below applies at all -- see the module doc's "DogStatsD
-    // events and service checks" section.
-    if line.starts_with('_') {
-        if line.starts_with("_e{") {
-            return parse_event(bytes, text, line, timestamp).map(|event| vec![event]);
-        }
-        if line.starts_with("_sc|") {
-            return parse_service_check(bytes, text, line, timestamp).map(|event| vec![event]);
-        }
-        return Err(CodecError::Malformed(format!(
-            "unknown dogstatsd special line (expected '_e{{' or '_sc|'): {line:?}"
-        )));
+    // events and service checks" section. Exactly these two prefixes are special; any other line
+    // -- including one that merely starts with `_` without matching either, like a legal
+    // `_`-prefixed metric name -- falls through unchanged into the generic grammar below.
+    if line.starts_with("_e{") {
+        return parse_event(bytes, text, line, timestamp).map(|event| vec![event]);
+    }
+    if line.starts_with("_sc|") {
+        return parse_service_check(bytes, text, line, timestamp).map(|event| vec![event]);
     }
 
     let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
@@ -1344,6 +1367,22 @@ mod tests {
         assert!(message.contains('\n'), "expected a real newline byte in the decoded message");
     }
 
+    /// `decode_into` must not trim trailing whitespace off an `_e{` line -- `TEXT_LEN` is
+    /// authoritative for where `TEXT` ends, not a trim (module doc's "Trailing whitespace is real
+    /// payload" note). Covers both a trailing space and a trailing tab.
+    #[test]
+    fn event_text_ending_in_whitespace_is_kept() {
+        let events = decode("_e{1,2}:a|b ");
+        let event = only_log_event(events);
+        let message = event.log.as_ref().unwrap().message.as_str().expect("message should be str");
+        assert_eq!(message, "b ", "the trailing space is real TEXT, not packet padding");
+
+        let events = decode("_e{1,2}:a|b\t");
+        let event = only_log_event(events);
+        let message = event.log.as_ref().unwrap().message.as_str().expect("message should be str");
+        assert_eq!(message, "b\t", "a trailing tab is kept the same way");
+    }
+
     #[test]
     fn event_title_length_running_past_the_line_is_rejected() {
         assert!(matches!(parse_err("_e{100,4}:title|text"), CodecError::Malformed(_)));
@@ -1414,6 +1453,18 @@ mod tests {
         );
     }
 
+    /// `decode_into` must not trim a trailing space off an `_sc|` line either -- `m:` consumes the
+    /// rest of the line verbatim, so a trailing space is real message content (module doc's
+    /// "Trailing whitespace is real payload" note).
+    #[test]
+    fn service_check_message_trailing_whitespace_is_kept() {
+        let events = decode("_sc|check|0|m:disk almost full ");
+        assert_eq!(
+            events[0].attributes.get("statsd.service_check.message").and_then(|v| v.as_str()),
+            Some("disk almost full ")
+        );
+    }
+
     #[test]
     fn service_check_out_of_range_or_non_numeric_status_is_rejected() {
         for status in ["4", "-1", "abc"] {
@@ -1430,9 +1481,25 @@ mod tests {
         assert!(matches!(parse_err("_sc||0"), CodecError::Malformed(_)));
     }
 
+    /// Only `_e{`/`_sc|` are special-cased sigils -- any other `_`-prefixed line falls through to
+    /// the generic `<name>:<value>|<type>` grammar unchanged, matching pre-W6 behavior and
+    /// Datadog's own DogStatsD parser (which reserves exactly these two prefixes, nothing
+    /// broader). `_total.count` is a legal statsd name that merely happens to start with `_`.
     #[test]
-    fn a_bare_underscore_line_with_an_unknown_sigil_is_rejected() {
-        assert!(matches!(parse_err("_x|whatever"), CodecError::Malformed(_)));
+    fn an_underscore_prefixed_metric_name_still_decodes_as_a_metric() {
+        let metric = only_metric(decode("_total.count:1|c"));
+        assert_eq!(intern("_total.count"), metric.name);
+        assert!(
+            matches!(metric.kind, MetricKind::Sum(logit_core::Sum { value, .. }) if value == 1.0)
+        );
+    }
+
+    /// `_x|1` isn't `_e{`/`_sc|`, so it falls through to the generic grammar the same as any other
+    /// `_`-prefixed line -- and is rejected there, same as any other line with no `:`, not because
+    /// of its leading sigil.
+    #[test]
+    fn an_underscore_prefixed_line_without_a_colon_is_rejected_for_missing_colon() {
+        assert!(matches!(parse_err("_x|1"), CodecError::Malformed(_)));
     }
 
     /// A datagram mixing a counter, an event, and a service check decodes all three, in wire

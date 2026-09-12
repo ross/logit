@@ -329,9 +329,11 @@ pub struct EncodeStats {
     /// out-of-range `Samples.sample_rate` (finite, `@rate` omitted rather than written), an
     /// entirely empty `Samples`/`SetMembers` record -- see [`render_metric`]'s `Samples`/
     /// `SetMembers` arms -- and, new in this workstream: an event whose log `message` isn't a
-    /// `Value::Str` (or isn't valid UTF-8), which drops the whole event ([`render_event`]). The
-    /// shared name follows this file's existing "one bucket per kind of unencodable input"
-    /// convention rather than adding a near-duplicate counter. An out-of-the-fixed-set
+    /// `Value::Str` (or isn't valid UTF-8), or whose `statsd.event.title` itself isn't valid UTF-8
+    /// (accepted by [`is_dogstatsd_event`] as any `Value::Str`, but with no `carriers.event_title`
+    /// to render), either of which drops the whole event ([`render_event`]). The shared name
+    /// follows this file's existing "one bucket per kind of unencodable input" convention rather
+    /// than adding a near-duplicate counter. An out-of-the-fixed-set
     /// `statsd.event.priority`/`statsd.event.alert_type` is a *different* shape of problem --
     /// the line still gets emitted, just without that one field -- so it's counted separately, in
     /// [`Self::dropped_invalid_event_fields`], not here.
@@ -824,8 +826,11 @@ fn append_container_id(line: &mut String, ctx: &EncodeCtx) {
 
 /// Renders one `_e{tlen,xlen}:title|text[...]` line for an event straight into `line`, or renders
 /// nothing (dropping and counting `EncodeStats::dropped_unencodable_value`) if the log `message`
-/// isn't valid UTF-8 text. `title_buf`/`text_buf` are reused scratch (never live at the same time
-/// as `render_metric`'s `name`/`member` -- an event line and an ordinary metric line are never
+/// isn't valid UTF-8 text, or if `statsd.event.title` itself isn't -- [`is_dogstatsd_event`]
+/// accepts any `Value::Str` title, UTF-8 or not, so `carriers.event_title` (populated only when
+/// `from_utf8` succeeds) can legitimately be `None` here even though this function was correctly
+/// called. `title_buf`/`text_buf` are reused scratch (never live at the same time as
+/// `render_metric`'s `name`/`member` -- an event line and an ordinary metric line are never
 /// rendered from the same call). See the module doc's "DogStatsD events and service checks"
 /// section for the full field order and sanitization rules.
 fn render_event(
@@ -836,7 +841,14 @@ fn render_event(
     event: &Event,
     ctx: &mut EncodeCtx,
 ) {
-    let title = carriers.event_title.expect("caller only calls this when event_title is Some");
+    let Some(title) = carriers.event_title else {
+        ctx.stats.dropped_unencodable_value += 1;
+        ctx.diag.warn_throttled(
+            "unencodable_value",
+            format_args!("statsd_out: event has a non-UTF-8 title; dropping"),
+        );
+        return;
+    };
     let log = event.log.as_ref().expect("caller only calls this when event.log is Some");
 
     let Value::Str(raw) = &log.message else {
@@ -926,8 +938,11 @@ fn render_event(
 /// the event's first metric, already confirmed by the caller ([`StatsdEncoder::encode_into`]) to
 /// be a `MetricKind::Gauge`. Renders nothing (dropping and counting
 /// `EncodeStats::dropped_invalid_service_check`) if no valid `0..=3` status can be found on
-/// either the `statsd.service_check.status` carrier or the gauge's own value. See the module
-/// doc's "DogStatsD events and service checks" section.
+/// either the `statsd.service_check.status` carrier or the gauge's own value, or (dropping and
+/// counting `EncodeStats::dropped_empty_name`, mirroring [`render_metric`]'s identical guard) if
+/// the sanitized name is empty -- `_sc||0` is not a legal service check any more than an empty
+/// metric name is a legal metric line. See the module doc's "DogStatsD events and service checks"
+/// section.
 fn render_service_check(
     line: &mut String,
     carriers: &Carriers,
@@ -966,7 +981,16 @@ fn render_service_check(
 
     line.clear();
     line.push_str("_sc|");
+    let name_start = line.len();
     sanitize_into(line, name, is_forbidden_in_extended_field);
+    if line.len() == name_start {
+        ctx.stats.dropped_empty_name += 1;
+        ctx.diag.warn_throttled(
+            "empty_metric_name",
+            format_args!("statsd_out: service check name {name:?} sanitizes to nothing; dropping"),
+        );
+        return;
+    }
     let _ = write!(line, "|{status}");
 
     if let Some(secs) = ctx.timestamp_secs {
@@ -2733,6 +2757,32 @@ mod tests {
         assert_eq!(stats.dropped_unencodable_value, 1);
     }
 
+    /// [`is_dogstatsd_event`] accepts any `Value::Str` title, UTF-8 or not -- `Value::Str` doesn't
+    /// enforce its own "UTF-8 text" invariant at construction, only by convention -- so
+    /// `render_event` must handle a non-UTF-8 title as a dropped, counted event rather than
+    /// `expect`-panicking the whole sink (the bug this test pins).
+    #[test]
+    fn an_event_with_a_non_utf8_title_is_dropped_and_counted_rather_than_panicking() {
+        let mut attributes = AttrMap::new();
+        attributes.insert("statsd.event.title", Value::Str(bytes::Bytes::from_static(b"\xff")));
+        let event = Event::log(
+            0,
+            attributes,
+            LogRecord {
+                message: Value::str("x"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        let (msgs, stats) = encode(vec![event]);
+        assert!(msgs.is_empty());
+        assert_eq!(stats.dropped_unencodable_value, 1);
+    }
+
     #[test]
     fn event_carriers_never_appear_as_tags() {
         let event = event_line_event(
@@ -2849,6 +2899,17 @@ mod tests {
         let (msgs, stats) = encode(vec![event]);
         assert!(msgs.is_empty());
         assert_eq!(stats.dropped_invalid_service_check, 1);
+    }
+
+    /// An empty (or sanitizes-to-empty) `statsd.service_check.name` must drop the whole event
+    /// rather than render `_sc||0` -- mirrors [`render_metric`]'s identical
+    /// sanitizes-to-nothing guard for an ordinary metric name.
+    #[test]
+    fn a_service_check_with_an_empty_name_is_dropped_and_counted() {
+        let event = service_check_event("", MetricKind::Gauge(0.0), &[]);
+        let (msgs, stats) = encode(vec![event]);
+        assert!(msgs.is_empty());
+        assert_eq!(stats.dropped_empty_name, 1);
     }
 
     #[test]
@@ -3799,8 +3860,30 @@ mod tests {
                                               // decoder rejects (e.g. an out-of-range value) --
                                               // not what this property tests.
                 };
-                if d1.events.is_empty() {
-                    return Ok(());
+                match &generated {
+                    // A generated ordinary metric line can legitimately decode to zero events for
+                    // reasons unrelated to what this property tests (e.g. a `parse_line` edge case
+                    // this generator doesn't otherwise filter out) -- keep the early-out here.
+                    GeneratedLine::Metric { .. } => {
+                        if d1.events.is_empty() {
+                            return Ok(());
+                        }
+                    }
+                    // An `_e{`/`_sc|` line is never blank-line-skipped and either the whole line
+                    // decodes to exactly one event or `decoder.decode` above already returned
+                    // early on `Err`. Asserting this (rather than silently early-returning on
+                    // empty, the way the metric arm does) is what catches a decode bug that
+                    // corrupts the line into something `parse_line` silently drops zero events
+                    // for instead of rejecting outright -- exactly the bug trailing whitespace on
+                    // these two shapes used to cause before `decode_into` stopped trimming it.
+                    GeneratedLine::Event { .. } | GeneratedLine::ServiceCheck { .. } => {
+                        prop_assert_eq!(
+                            d1.events.len(),
+                            1,
+                            "expected exactly one decoded event for {:?}",
+                            line
+                        );
+                    }
                 }
 
                 // `relative_gauges: true` -- otherwise every generated `g` line with a leading

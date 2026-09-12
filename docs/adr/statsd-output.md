@@ -496,8 +496,14 @@ ordinary lines, right after the `_sc` line — only the first metric is claimed 
 `service_check_container_id_becomes_an_attribute`,
 `service_check_message_containing_pipe_decodes_verbatim`,
 `service_check_out_of_range_or_non_numeric_status_is_rejected`,
-`service_check_empty_name_is_rejected`, `a_bare_underscore_line_with_an_unknown_sigil_is_rejected`,
-and
+`service_check_empty_name_is_rejected`,
+`an_underscore_prefixed_metric_name_still_decodes_as_a_metric` (only `_e{`/`_sc|` are
+special-cased sigils; any other `_`-prefixed line, like a legal `_`-prefixed metric name, falls
+through to the generic grammar unchanged),
+`an_underscore_prefixed_line_without_a_colon_is_rejected_for_missing_colon`,
+`event_text_ending_in_whitespace_is_kept`/`service_check_message_trailing_whitespace_is_kept`
+(`decode_into` trims trailing whitespace off every line except an `_e{`/`_sc|` one, where it can be
+real payload), and
 `a_packed_datagram_mixing_a_counter_an_event_and_a_service_check_decodes_all_three_in_order`.
 `crates/logit-outputs/src/statsd.rs` gained the matching encode-side coverage:
 `an_event_with_every_field_renders_the_canonical_line_with_byte_lengths`,
@@ -506,6 +512,7 @@ and
 `an_invalid_event_priority_is_omitted_and_counted`,
 `an_invalid_event_alert_type_is_omitted_and_counted`,
 `an_event_with_a_non_string_log_message_is_dropped_and_counted`,
+`an_event_with_a_non_utf8_title_is_dropped_and_counted_rather_than_panicking`,
 `event_carriers_never_appear_as_tags`, `event_carriers_set_on_the_resource_are_honored`,
 `an_oversize_event_line_is_dropped_via_the_existing_oversize_path`,
 `a_service_check_renders_the_canonical_line`,
@@ -513,6 +520,7 @@ and
 `service_check_status_attribute_wins_over_the_gauge_value`,
 `service_check_status_falls_back_to_the_rounded_gauge_value`,
 `an_out_of_range_service_check_status_is_dropped_and_counted`,
+`a_service_check_with_an_empty_name_is_dropped_and_counted`,
 `a_non_gauge_first_metric_on_a_service_check_event_is_dropped_and_counted`,
 `a_second_metric_on_a_service_check_event_renders_as_a_normal_line_after_it`,
 `service_check_carriers_never_appear_as_tags`,
@@ -522,8 +530,9 @@ and
 DogStatsD docs' own event/service-check examples (`dogstatsd-event`/`dogstatsd-service-check`)
 join the byte-for-byte corpus; `dogstatsd-event-all-fields`/`service-check-all-fields`,
 `event-text-with-pipe-and-escaped-newline`, `event-multibyte-title-lengths`,
-`event-title-contains-pipe`, `service-check-no-message`, and
-`packed-datagram-counter-event-service-check` exercise the grammar corners;
+`event-title-contains-pipe`, `service-check-no-message`,
+`packed-datagram-counter-event-service-check`, `event-text-trailing-space`, and
+`service-check-message-trailing-space` exercise the grammar corners;
 `event-fields-reordered-canonicalized` pins the canonical-order normalization;
 `events_and_service_checks_produce_no_output_and_are_counted_under_plain_statsd` pins the
 `format: statsd` whole-event drop (calling `StatsdEncoder::encode_into` directly, since a

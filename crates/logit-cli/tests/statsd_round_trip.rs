@@ -20,8 +20,11 @@
 //! `\n` escape), `event-multibyte-title-lengths` (a multi-byte UTF-8 title, pinning that
 //! `_e{TITLE_LEN,...}` counts bytes, not chars), `event-title-contains-pipe` (a title containing a
 //! literal `|`, which the length prefix -- not a `|` scan -- delimits), `service-check-no-message`
-//! (no `m:` field), and `packed-datagram-counter-event-service-check` (an ordinary metric, an
-//! event, and a service check sharing one datagram).
+//! (no `m:` field), `packed-datagram-counter-event-service-check` (an ordinary metric, an
+//! event, and a service check sharing one datagram), `event-text-trailing-space` (`TEXT`'s last
+//! byte is a space, immediately followed by the `.in` file's own trailing `\n` -- pins that
+//! `decode_into` doesn't trim it off), and `service-check-message-trailing-space` (same pin for
+//! an `m:` message, which consumes the rest of the line verbatim).
 //!
 //! ## Permitted normalizations (recorded here, per [`docs/adr/lossless-transit.md`])
 //!
@@ -352,6 +355,8 @@ async fn hand_written_dogstatsd_fixtures_round_trip_byte_for_byte() {
         "service-check-all-fields",
         "service-check-no-message",
         "packed-datagram-counter-event-service-check",
+        "event-text-trailing-space",
+        "service-check-message-trailing-space",
     ];
     for name in cases {
         assert_byte_for_byte(&mut harness, name, || StatsdEncoder::new(Format::DogStatsd)).await;
