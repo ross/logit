@@ -1966,6 +1966,48 @@ mod tests {
         assert_eq!(events.len(), 2, "different tag values should be different series");
     }
 
+    /// W9: a repeated DogStatsD tag key decodes to a `Value::Array` attribute
+    /// (`crates/logit-inputs/src/statsd.rs`'s `insert_tags`) -- two events carrying the identical
+    /// array fold into one series, through `SeriesKey`'s `value_key_eq`/`hash_value` recursing
+    /// element-wise into `Array` the same way they already do for `Map`.
+    #[test]
+    fn identical_multi_valued_array_tags_fold_into_one_series() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        let team = Value::Array(vec![Value::str("a"), Value::str("b")]);
+        let mut first = metric_event("hits", MetricKind::counter(1.0), 0);
+        first.attributes.insert("team", team.clone());
+        agg.process(&resource, first);
+        let mut second = metric_event("hits", MetricKind::counter(1.0), 0);
+        second.attributes.insert("team", team);
+        agg.process(&resource, second);
+
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
+        assert_eq!(events.len(), 1, "the identical array tag should be one series");
+        assert_eq!(counter_value(kind_of(&events[0])), 2.0, "the two counters should have merged");
+    }
+
+    /// Same array *contents* in a different element order is a different tag list on the wire
+    /// (wire order is meaningful, not merely a set) -- so it must stay two series, not collide the
+    /// way `same_tags_in_different_insertion_order_collide_into_one_series` collides two *keys* in
+    /// a different order.
+    #[test]
+    fn multi_valued_array_tags_differing_only_in_element_order_stay_two_series() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        let mut first = metric_event("hits", MetricKind::counter(1.0), 0);
+        first.attributes.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
+        agg.process(&resource, first);
+        let mut second = metric_event("hits", MetricKind::counter(1.0), 0);
+        second.attributes.insert("team", Value::Array(vec![Value::str("b"), Value::str("a")]));
+        agg.process(&resource, second);
+
+        let flushed = flush_events(&mut agg, 100);
+        let (_, events) = &flushed[0];
+        assert_eq!(events.len(), 2, "array element order should be part of the series identity");
+    }
+
     #[test]
     fn same_tags_in_different_insertion_order_collide_into_one_series() {
         let mut agg = Aggregator::new(Duration::from_secs(10));

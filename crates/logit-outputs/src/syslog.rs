@@ -87,7 +87,10 @@
 //! validation/skip/count rule as above; the element itself is omitted entirely when no attribute
 //! qualifies). This is what closes the `syslog_in -> json -> syslog_out` gap -- an attribute a
 //! transform added along the way, not part of the original `syslog.sd`, still reaches the wire
-//! when an operator opts in. **No default private enterprise number is shipped.** `sd_id` must
+//! when an operator opts in. A relayed multi-valued statsd tag (`team: Value::Array[Str("a"),
+//! Str("b")]`) is exactly such an attribute -- it goes through [`write_sd_param`]'s existing
+//! `Array` arm like any other, so it emits repeated PARAM-NAMEs under that SD-ID, `team="a"
+//! team="b"`. **No default private enterprise number is shipped.** `sd_id` must
 //! contain exactly one `@` (a PEN-qualified id, e.g. `myapp@12345`), validated at
 //! `with_structured_data` construction time; RFC 5424's own `32473` example PEN is documentation
 //! only, never a shipped default -- registering a real one (or an operator supplying their own) is
@@ -2521,6 +2524,24 @@ mod tests {
         assert!(msgs[0].contains(r#"env="prod""#), "got: {}", msgs[0]);
         assert!(msgs[0].contains(r#"retries="3""#), "got: {}", msgs[0]);
         assert!(msgs[0].contains("myapp@12345"));
+    }
+
+    /// W9: a relayed multi-valued statsd tag (`team: Array[Str("a"), Str("b")]`) emits repeated
+    /// PARAM-NAMEs under the opt-in SD-ID, in array order -- see module doc's "Opt-in
+    /// `structured_data`" section.
+    #[test]
+    fn structured_data_emits_repeated_param_name_for_a_multi_valued_array_attribute() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
+        let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
+        let mut encoder =
+            SyslogEncoder::new(Format::Rfc5424, 16).with_structured_data("myapp@12345").unwrap();
+        let (msgs, _) = encode_with(&mut encoder, vec![event]);
+        assert!(
+            msgs[0].contains(r#"team="a" team="b""#),
+            "expected two repeated PARAM-NAMEs in array order, got: {}",
+            msgs[0]
+        );
     }
 
     #[test]

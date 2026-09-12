@@ -54,6 +54,21 @@ pub const NGINX_SYSLOG_LINE: &str = concat!(
 /// (`docs/design/memory.md`'s interner section).
 pub const STATSD_LINE: &str = "page.views:1|c|@0.5|#env:prod,region:us-east-1,service:web";
 
+/// The same shape as [`STATSD_LINE`], except one tag key (`team`) repeats -- the wire shape
+/// `insert_tags` folds into a `Value::Array` in wire order
+/// (`crates/logit-inputs/src/statsd.rs`'s "DogStatsD tags" section) rather than the last-token-wins
+/// collapse it used to be. Keeping the plain `env:prod` tag alongside the repeated one means the
+/// allocation this is measured against is the repeated key's own cost on top of an otherwise
+/// ordinary tagged counter, not a worst case with nothing else going on.
+pub const STATSD_REPEATED_TAG_LINE: &str = "page.views:1|c|#env:prod,team:a,team:b";
+
+/// [`STATSD_REPEATED_TAG_LINE`]'s same repeated tag key, on a multi-value counter line
+/// (`name:v1:v2:v3|c`): `parse_line` decodes this to three `Event`s sharing one `AttrMap`, and
+/// `build_event` clones that map once per value (`crates/logit-inputs/src/statsd.rs`'s
+/// `build_event` doc) -- so the repeated tag's `Value::Array`, a real `Vec` spine rather than a
+/// refcounted slice of the datagram, is deep-cloned once per value event, not once total.
+pub const STATSD_MULTI_VALUE_REPEATED_TAG_LINE: &str = "page.views:1:2:3|c|#env:prod,team:a,team:b";
+
 /// A statsd distribution (`ms`) line at the default, unsampled rate -- the baseline
 /// [`STATSD_SAMPLED_DISTRIBUTION_LINE`]'s allocation count is measured against. Decodes straight
 /// to a raw `MetricKind::Samples` now (`docs/adr/lossless-transit.md`'s W3,
@@ -115,6 +130,16 @@ pub fn nginx_syslog_datagram(count: usize) -> Bytes {
 /// `count` copies of [`STATSD_LINE`], newline-separated.
 pub fn statsd_datagram(count: usize) -> Bytes {
     join_lines(STATSD_LINE, count)
+}
+
+/// `count` copies of [`STATSD_REPEATED_TAG_LINE`], newline-separated.
+pub fn statsd_repeated_tag_datagram(count: usize) -> Bytes {
+    join_lines(STATSD_REPEATED_TAG_LINE, count)
+}
+
+/// `count` copies of [`STATSD_MULTI_VALUE_REPEATED_TAG_LINE`], newline-separated.
+pub fn statsd_multi_value_repeated_tag_datagram(count: usize) -> Bytes {
+    join_lines(STATSD_MULTI_VALUE_REPEATED_TAG_LINE, count)
 }
 
 /// `count` copies of [`STATSD_DISTRIBUTION_LINE`], newline-separated.

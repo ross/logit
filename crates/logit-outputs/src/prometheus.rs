@@ -87,7 +87,14 @@
 //! | `logit.output.metrics.type_conflict` | see above |
 //!
 //! plus everything the codec counts on the [`PrometheusEncoder`] this sink hands it:
-//! `logit.output.metrics.{skipped,degraded}` and `logit.output.labels.dropped`. A delta `Sum`
+//! `logit.output.metrics.{skipped,degraded}`, `logit.output.labels.dropped`, and
+//! `logit.output.labels.normalized{reason="multi_value"}` -- a `Value::Array` attribute (a repeated
+//! DogStatsD tag key relayed in from `statsd_in`) collapsed to its last representable element,
+//! since a Prometheus label set is a map and has no multi-value label. Unlike every other
+//! `*.normalized` reason in `docs/design/internal-telemetry.md`, which report a
+//! lossless-but-different rendering of the same information, that one is **lossy**: the non-last
+//! elements are discarded, not re-spelled. It reads as `normalized` rather than `dropped` because
+//! the label itself survives and the series still exposes. A delta `Sum`
 //! reaching this sink is the common one -- skipped, counted
 //! `logit.output.metrics.skipped{metric_kind="delta_sum"}`, with a throttled
 //! `delta_temporality_unresolved` diagnostic naming the fix (an `aggregate` with
