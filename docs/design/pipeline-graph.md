@@ -364,9 +364,14 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 38. A `statsd_out` `max_packet_bytes: 0` is rejected, the same shape as rule 15's
     `buffer.max_batches`/`max_bytes: 0` — an impossible bound (every metric line would overflow it
     and be dropped whole), not a small one (`docs/adr/statsd-output.md`).
-40. (Number 39 is reserved by a parallel, not-yet-merged workstream — left out here rather than
-    renumbered, so each PR's own rule number stays correct once every branch lands.) A
-    `prometheus_in` `targets` must name at least one absolute `http://`/`https://` scrape URL with
+39. An `aggregate` with `temporality: cumulative` requires `series_retention >= 1` (a count of
+    windows, not a duration) and `max_retained_series >= 1` — those two bounds are what keeps a running total alive
+    across the window boundary, so with either at `0` no accumulator survives a flush and every
+    window would emit its own increment labelled as a cumulative total, a silently wrong number for
+    the consumer that mode exists for. `series_retention: 0` stays legal under the default
+    `temporality: delta`, where it is the documented opt-out from gauge retention
+    (`docs/adr/aggregation-window-semantics.md`'s cumulative amendment).
+40. A `prometheus_in` `targets` must name at least one absolute `http://`/`https://` scrape URL with
     a non-empty authority — `logit-pipeline` doesn't depend on `reqwest`/`url` (this document's own
     "Crate layout" section), so this is a small hand-rolled scheme/authority check, not a full URL
     parse. `timeout: 0s` is rejected, the same "0 is impossible" reasoning as rule 9's `interval`

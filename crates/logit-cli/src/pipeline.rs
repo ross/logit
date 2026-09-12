@@ -39,14 +39,15 @@ use logit_pipeline::{
 };
 use logit_proto::frame::Compression as NativeCompression;
 use logit_transforms::{
-    Aggregator, CsvParser, Distributions as TransformDistributions,
-    DropAttributes as DropAttributesTransform, DropProvenance as DropProvenanceTransform,
-    DropSignals as DropSignalsTransform, HasAttributes as HasAttributesTransform,
-    HasProvenance as HasProvenanceTransform, HasSignal as HasSignalTransform, JsonParser,
-    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, Kv as KvTransform,
-    KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
-    RegexParser, Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform,
-    Sets as TransformSets, SignalSet, SpanLift, TraceContext as TraceContextTransform,
+    AggregateTemporality as TransformTemporality, Aggregator, CsvParser,
+    Distributions as TransformDistributions, DropAttributes as DropAttributesTransform,
+    DropProvenance as DropProvenanceTransform, DropSignals as DropSignalsTransform,
+    HasAttributes as HasAttributesTransform, HasProvenance as HasProvenanceTransform,
+    HasSignal as HasSignalTransform, JsonParser, Keep as KeepTransform,
+    KeepSignals as KeepSignalsTransform, Kv as KvTransform, KvMetrics as KvMetricsTransform,
+    Logfmt as LogfmtTransform, MatchMode as TransformMatchMode, RegexParser,
+    Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets,
+    SignalSet, SpanLift, TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -411,15 +412,17 @@ fn build_spec(
         }
         Aggregate {
             interval,
-            gauge_retention,
-            max_retained_gauge_series,
+            temporality,
+            series_retention,
+            max_retained_series,
             distributions,
             max_samples_per_series,
             sets,
             max_set_members_per_series,
         } => NodeSpec::Transform(Box::new(
             Aggregator::new(*interval)
-                .with_gauge_retention(*gauge_retention, *max_retained_gauge_series)
+                .with_temporality(to_temporality(*temporality))
+                .with_series_retention(*series_retention, *max_retained_series)
                 .with_distributions(to_distributions(*distributions), *max_samples_per_series)
                 .with_sets(to_sets(*sets), *max_set_members_per_series)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -965,6 +968,15 @@ fn to_sets(mode: logit_config::Sets) -> TransformSets {
     }
 }
 
+/// `logit_config::AggregateTemporality` -> `logit_transforms::AggregateTemporality` -- see
+/// [`to_distributions`]'s doc comment for why this mapping exists at all.
+fn to_temporality(mode: logit_config::AggregateTemporality) -> TransformTemporality {
+    match mode {
+        logit_config::AggregateTemporality::Delta => TransformTemporality::Delta,
+        logit_config::AggregateTemporality::Cumulative => TransformTemporality::Cumulative,
+    }
+}
+
 /// Converts config's `OtlpPaths` (`logit-config`, which `logit-outputs` deliberately doesn't
 /// depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the output crate's own
 /// identically-shaped `SignalPaths`.
@@ -1240,8 +1252,9 @@ mod tests {
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Aggregate {
                 interval: Duration::from_secs(10),
-                gauge_retention: 5,
-                max_retained_gauge_series: 10_000,
+                temporality: logit_config::AggregateTemporality::default(),
+                series_retention: 5,
+                max_retained_series: 10_000,
                 distributions: logit_config::Distributions::default(),
                 max_samples_per_series: 1000,
                 sets: logit_config::Sets::default(),

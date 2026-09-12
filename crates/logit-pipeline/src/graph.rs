@@ -1381,6 +1381,30 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 39: an `aggregate` in `temporality: cumulative` needs both retention bounds non-zero.
+    // Either one at `0` means no series can survive a flush, so every window's emitted `Sum`/
+    // `Histogram` would be that window's own increment wearing a `Cumulative` label -- a silently
+    // wrong number for the consumer that mode exists for (`prometheus_out`, which reads a
+    // cumulative record as a running total). The same "an impossible bound is a config error, not a
+    // small one" shape rules 15/18/38 use.
+    for (id, component) in &components {
+        if let ComponentKind::Aggregate {
+            temporality, series_retention, max_retained_series, ..
+        } = &component.kind
+        {
+            if *temporality == logit_config::AggregateTemporality::Cumulative
+                && (*series_retention == 0 || *max_retained_series == 0)
+            {
+                anyhow::bail!(
+                    "component '{id}': temporality: cumulative requires series_retention >= 1 \
+                     (a count of windows) and max_retained_series >= 1 -- with either at 0 no \
+                     series survives a flush, so every window would emit its own increment \
+                     labelled as a cumulative total"
+                );
+            }
+        }
+    }
+
     // Rule 40: `prometheus_in`'s `targets`/`timeout`/`tls`/`headers` -- see this module's own doc
     // comment for the full rule text.
     for (id, component) in &components {
@@ -1996,8 +2020,9 @@ mod tests {
                 vec!["in"],
                 ComponentKind::Aggregate {
                     interval: Duration::ZERO,
-                    gauge_retention: 5,
-                    max_retained_gauge_series: 10_000,
+                    temporality: logit_config::AggregateTemporality::default(),
+                    series_retention: 5,
+                    max_retained_series: 10_000,
                     distributions: logit_config::Distributions::default(),
                     max_samples_per_series: 1000,
                     sets: logit_config::Sets::default(),
@@ -3383,8 +3408,9 @@ mod tests {
                 vec!["in"],
                 ComponentKind::Aggregate {
                     interval: Duration::from_secs(10),
-                    gauge_retention: 5,
-                    max_retained_gauge_series: 10_000,
+                    temporality: logit_config::AggregateTemporality::default(),
+                    series_retention: 5,
+                    max_retained_series: 10_000,
                     distributions: logit_config::Distributions::default(),
                     max_samples_per_series: 1000,
                     sets: logit_config::Sets::default(),
@@ -3465,8 +3491,9 @@ mod tests {
                 vec!["in"],
                 ComponentKind::Aggregate {
                     interval: Duration::from_secs(10),
-                    gauge_retention: 5,
-                    max_retained_gauge_series: 10_000,
+                    temporality: logit_config::AggregateTemporality::default(),
+                    series_retention: 5,
+                    max_retained_series: 10_000,
                     distributions: logit_config::Distributions::default(),
                     max_samples_per_series: 1000,
                     sets: logit_config::Sets::default(),
@@ -4449,5 +4476,81 @@ mod tests {
             err.contains("'receive' is only meaningful on a datagram or tail listener"),
             "got: {err}"
         );
+    }
+
+    /// An `aggregate` with the given temporality and retention bounds -- rule 39's fixture.
+    fn aggregate(
+        temporality: logit_config::AggregateTemporality,
+        series_retention: u32,
+        max_retained_series: usize,
+    ) -> ComponentKind {
+        ComponentKind::Aggregate {
+            interval: Duration::from_secs(10),
+            temporality,
+            series_retention,
+            max_retained_series,
+            distributions: logit_config::Distributions::default(),
+            max_samples_per_series: 1000,
+            sets: logit_config::Sets::default(),
+            max_set_members_per_series: 1000,
+        }
+    }
+
+    /// Rule 39: `temporality: cumulative` with no retention can only ever emit each window's own
+    /// increment labelled as a running total -- an impossible combination, not a tuning choice
+    /// (`docs/adr/aggregation-window-semantics.md`'s cumulative amendment).
+    #[test]
+    fn a_cumulative_aggregate_with_zero_series_retention_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "agg",
+                vec!["in"],
+                aggregate(logit_config::AggregateTemporality::Cumulative, 0, 10_000),
+            ),
+            ("out", vec!["agg"], sink()),
+        ]));
+        assert!(err.contains("'agg'") && err.contains("temporality: cumulative"), "got: {err}");
+    }
+
+    /// The cap half of rule 39: a zero `max_retained_series` evicts every survivor immediately,
+    /// which is the same failure as never retaining at all.
+    #[test]
+    fn a_cumulative_aggregate_with_a_zero_retained_series_cap_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("agg", vec!["in"], aggregate(logit_config::AggregateTemporality::Cumulative, 5, 0)),
+            ("out", vec!["agg"], sink()),
+        ]));
+        assert!(err.contains("max_retained_series"), "got: {err}");
+    }
+
+    /// Rule 39 is scoped to `cumulative`: `series_retention: 0` stays legal in `delta` mode, where
+    /// it is the documented opt-out reproducing the strictly-tumbling behavior every config had
+    /// before retention existed.
+    #[test]
+    fn a_delta_aggregate_with_zero_series_retention_is_accepted() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("agg", vec!["in"], aggregate(logit_config::AggregateTemporality::Delta, 0, 0)),
+            ("out", vec!["agg"], sink()),
+        ]))
+        .expect("delta mode without retention is the pre-existing default behavior");
+    }
+
+    /// A well-formed cumulative `aggregate` resolves fine -- the positive case rule 39's two
+    /// rejection tests are the complement of.
+    #[test]
+    fn a_cumulative_aggregate_with_both_bounds_set_resolves() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "agg",
+                vec!["in"],
+                aggregate(logit_config::AggregateTemporality::Cumulative, 5, 10_000),
+            ),
+            ("out", vec!["agg"], sink()),
+        ]))
+        .expect("cumulative with both retention bounds set should resolve");
     }
 }

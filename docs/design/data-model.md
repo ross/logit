@@ -337,17 +337,27 @@ temporality and monotonicity on `Sum`, sum/count/min/max on `Histogram`/`Exponen
   see [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment for
   the full design, including the fallback rule each raw mode's cap (or, for `distributions: samples`,
   a `sample_rate` mismatch) triggers.
-- `Sum`/`Gauge` merge trivially (sum / last-write-wins by timestamp) for the delta-monotonic case
-  `MetricKind::counter` produces; a cumulative or non-monotonic `Sum` has no merge rule defined
-  here and passes through unmerged, the same as `Histogram`/`ExponentialHistogram`/`Summary`.
+- `Sum`/`Gauge` merge trivially (sum / last-write-wins by timestamp) for a **delta** `Sum`
+  (monotonic or not — `monotonic` is carried, not merged on) and a `Gauge`; an *incoming* cumulative
+  `Sum` has no merge rule defined here and passes through unmerged, the same as
+  `ExponentialHistogram`/`Summary`. What a *flushed* `Sum` is labelled is a separate question,
+  answered by `aggregate`'s `temporality:` mode rather than by this table: `delta` (the default)
+  emits each window's own increment, while `temporality: cumulative` keeps the accumulator alive
+  across flushes and emits the running total as `Sum { temporality: Cumulative }` with
+  `start_timestamp` set to the series' first-seen time — the reset signal OTLP and Prometheus
+  consumers need. A delta `Histogram` merges per bucket under that same mode (and passes through
+  under `delta`); see [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s
+  cumulative amendment.
 - `GaugeDelta` is not mergeable on its own terms — it's statsd/DogStatsD's relative gauge
   adjustment (a leading `+`/`-`), decoded by `statsd_in` but left explicitly **unresolved**: it
   must never reach a sink. Only `aggregate` resolves it, applying it to a `Gauge`'s running value
   in arrival order (never touching the value's last-write-wins timestamp, asymmetric on purpose —
   see [ADR `relative-gauge-adjustments`](../adr/relative-gauge-adjustments.md)). This is the one metric kind whose
-  aggregation state genuinely needs to survive a flush to be correct — see
-  [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment for why that's true for
-  gauges specifically and not for a delta-monotonic `Sum`.
+  aggregation state *always* needs to survive a flush to be correct, regardless of how `aggregate`
+  is configured — see
+  [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s gauge-retention
+  amendment for why that's true for gauges specifically and only opt-in (`temporality: cumulative`)
+  for a delta `Sum`.
 
 A `Distribution`'s `count()` becomes a **population estimate**, not a count of received
 datagrams, wherever sample-rate extrapolation is in play: `statsd_in`'s `ms`/`h`/`d` decoding
