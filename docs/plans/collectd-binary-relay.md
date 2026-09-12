@@ -224,9 +224,12 @@ path only ever emits stock single-DS types, so nothing needs it.
 - **W2/W3**: `build_spec` wiring tests pass; allocation-count constants and their
   `docs/design/memory.md` rows are updated together in the same commit, never relaxed to an
   inequality; `crates/logit-core/tests/type_sizes.rs` stays untouched by this pair.
-- **W4**: the socket round-trip corpus passes byte-exact modulo the ADR's permitted normalizations;
-  recorded interop captures decode to the expected plugin/type shapes with the fixture's configured
-  hostname. A manual smoke test (not automated): a real `collectd` daemon pointed at
+- **W4**: the socket round-trip corpus passes byte-exact modulo the ADR's permitted normalizations
+  — one of which, normalization 11 (elided `TimeHR`/`IntervalHR` parts restored per list), that
+  corpus is what surfaced: #144 added it to the ADR and to
+  `crates/logit-proto/src/collectd/mod.rs`'s list, because the encoder had always behaved that way
+  and no entry named it. Recorded interop captures decode to the expected plugin/type shapes with
+  the fixture's configured hostname. A manual smoke test (not automated): a real `collectd` daemon pointed at
   `examples/collectd-to-influxdb.yaml` shows its metrics landing in InfluxDB; `collectd-relay.yaml`
   forwards into a second collectd instance's own listener.
 - **W5**: notification fixtures round-trip; the `threshold`-plugin capture decodes to a `LogRecord`

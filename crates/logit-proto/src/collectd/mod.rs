@@ -152,7 +152,13 @@
 //! 7. a list that arrived with no Time part at all leaves carrying `TimeHR = received_at`;
 //! 8. `/` and NUL become `_`, and an identity field longer than 127 bytes is truncated (both
 //!    counted);
-//! 9. an absent interval leaves as `IntervalHR 0`.
+//! 9. an absent interval leaves as `IntervalHR 0`;
+//! 10. `TimeHR`/`IntervalHR` are written for **every** value list ([`encode`]'s `write_list`), so a
+//!     sender's elided (unchanged) time or interval part is restored -- information-preserving (the
+//!     restored part carries what the receiver's sticky state already held) but not free: a packed
+//!     datagram grows and may split across `max_packet_bytes`. Only (3)'s *string* parts are
+//!     elided on egress. Added by the ADR's "an eleventh normalization" amendment, where the same
+//!     entry is numbered 11 because that list splits (3) in two.
 //!
 //! Everything else is an error or a counted drop, never a silent reinterpretation.
 

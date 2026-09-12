@@ -51,17 +51,20 @@
 //! 7. A list that arrived with no `Time` part at all leaves carrying `TimeHR = received_at`.
 //! 8. `/` and NUL become `_`, and an identity field longer than 127 bytes is truncated.
 //! 9. An absent interval leaves as `IntervalHR 0`.
+//! 10. `TimeHR`/`IntervalHR` are written for **every** value list, so a sender's elided (unchanged)
+//!     time or interval part is restored.
 //!
-//! **One thing the list deliberately does not cover, and which this corpus is built around.**
-//! `collectd_out` writes `TimeHR` and `IntervalHR` for *every* value list and never elides an
-//! unchanged one (`logit_proto::collectd::encode`'s `write_list` doc comment), while a sender is
-//! free to elide them the way it elides the five identity strings -- and (3) is about *string*-part
-//! elision only. A fixture whose `.in` elided an unchanged time part would therefore differ from
-//! its own output by two re-stated parts per list: information-preserving, but not on the list
-//! above. So every multi-list `.in` here re-states `TimeHR`/`IntervalHR` per list, which is exactly
-//! what another `logit` relay -- or a collectd whose lists are dispatched at distinct instants --
-//! puts on the wire. Sticky `Time`/`Interval` inheritance across lists is exercised by the codec's
-//! own unit tests (`crates/logit-proto/src/collectd/decode.rs`) instead.
+//! **(10) is worth spelling out, because it is the one that costs bytes.** `collectd_out` re-states
+//! both numeric parts on every list and never elides an unchanged one
+//! (`logit_proto::collectd::encode`'s `write_list`), where a real collectd sender does elide
+//! them -- the committed capture `testdata/interop/collectd/collectd-000.raw` carries 26 value
+//! lists behind 17 `TimeHR` parts and a single `IntervalHR`. Restoring them is
+//! information-preserving (a restored part carries exactly what the receiver's sticky state already
+//! held), but a relayed datagram grows and may split: that 1296-byte capture re-encodes to 1717
+//! bytes in two datagrams. [`elided_time_and_interval_parts_are_restored_per_list`] pins the
+//! byte-level shape on the `elided-time-interval` fixture, and
+//! [`a_real_collectd_capture_grows_when_its_elided_time_parts_are_restored`] pins those numbers
+//! against the real capture.
 //!
 //! ## Per-fixture normalizations
 //!
@@ -76,12 +79,27 @@
 //! | `if-octets-derive` | none ([`SAME_AS_INPUT`]) | a negative DERIVE (`i64`, big-endian) survives the `f64` model round trip |
 //! | `counter-and-absolute` | none ([`SAME_AS_INPUT`]) | `u64::MAX` COUNTER -- the value that only round-trips because `as_u64`'s bound is inclusive and the cast saturates -- beside an ABSOLUTE |
 //! | `elided-identity` | **3** | three lists differing only in `TypeInstance`; the sender's elision and this encoder's recomputed elision agree exactly, so it stays [`SAME_AS_INPUT`] |
+//! | `elided-time-interval` | **10** | two lists stating `TimeHR`/`IntervalHR` once, the way a real sender writes them; the `.expected` re-states both on the second list, +24 B |
 //! | `empty-instances` | **3** | explicit *empty* `PluginInstance`/`TypeInstance` parts (a sender clearing an instance) decode to absent attributes and leave elided entirely -- elision recomputed, in the removing direction |
+//! | `no-interval` | **9** | two lists with no `Interval`/`IntervalHR` part at all; the `.expected` gains an explicit `IntervalHR 0` -- collectd's own "unspecified" -- on each, +24 B |
 //! | `non-utf8-host` | none ([`SAME_AS_INPUT`]) | a `0xFF` in `Host` decodes to `Value::Bytes` and is re-emitted byte-verbatim, never lossily replaced |
 //! | `unknown-and-signature-parts` | **5** | a `0x00FF` part from a future collectd and a `0x0200` Signature part, both between two lists: skipped by length, dropped on egress, and the list behind them still decodes |
 //! | `nan-gauge` | **6** | a non-canonical NaN payload (`0xFFF8_0000_0000_0001`) decodes to a `NO_RECORDED_VALUE`-flagged `Gauge(0.0)` and leaves as this platform's canonical `f64::NAN` |
 //! | `sub-second-time` | **2** | a `cdtime_t` with live sub-second bits, chosen because it genuinely *does* move: the first hop shifts it by one 2⁻³⁰ s tick, the second is byte-identical to the first (both asserted, neither assumed) |
-//! | `repacked-at-1024` | **3** | 30 lists in one 1412-byte input, re-packed by a sink capped at 1024: structural only (≥2 datagrams, none over the cap, whole-batch equality) -- no `.expected`, since datagram boundaries are exactly what this case lets move |
+//!
+//! One case asserts its `.expected` wire bytes **only**, with no decoded-equality claim, because it
+//! is genuinely one-way lossy -- the substituted byte is gone for good. (`statsd_round_trip.rs`'s
+//! `sanitizer-*` cases are the same shape, for the same reason.)
+//!
+//! | Fixture | Normalizations | What it pins |
+//! |---|---|---|
+//! | `slash-in-plugin` | **8** | a `Plugin` of `mount/data` and a `TypeInstance` of `/var/log` leave as `mount_data` and `_var_log` (collectd's own `escape_slashes`, which its receiver would otherwise apply itself), counted `logit.output.identity.sanitized{reason="substituted"}` |
+//!
+//! One structural case, where the whole point is that bytes are *allowed* to move:
+//!
+//! | Fixture | Normalizations | What it pins |
+//! |---|---|---|
+//! | `repacked-at-1024` | **3**, **9** | 30 lists in one 1412-byte input carrying no interval part, re-packed by a sink capped at 1024: ≥2 datagrams, none over the cap, whole-batch equality. No `.expected` -- datagram boundaries are exactly what this case lets move, which is also why the `IntervalHR 0` it gains per list is pinned byte-for-byte by `no-interval` above rather than here |
 //!
 //! Decode-only cases, replayed through the live `collectd_in` and asserted on the delivered events
 //! plus the throttled-diagnostic counters a [`Registry`] collects:
@@ -92,6 +110,23 @@
 //! | `no-time` | none | normalization **7** from the decode side: no `Time`/`TimeHR` part at all stamps `received_at` |
 //! | `truncated-values` | `bad_part` | a `Values` header declaring more bytes than the datagram holds abandons the rest and keeps what was already decoded |
 //! | `incomplete-identity` | `incomplete_identity` | an empty `Host` part clears the sticky host, and the list behind it is skipped exactly as collectd's own receiver rejects it |
+//!
+//! ## What this corpus does *not* cover
+//!
+//! ADR `lossless-transit` reads "no fixture" as "not covered", so the two remaining items are named
+//! rather than left to inference:
+//!
+//! - **Normalization 4 (list reordering within a batch)** has no fixture here and needs none: it is
+//!   a *permission* this pair never exercises. `CollectdEncoder::encode_into` walks
+//!   `EventBatch::events` in order and emits one list per record in `MetricList` order, and
+//!   `crates/logit-proto/tests/collectd_fixed_point.rs` pins that -- its `decode(encode(b)) == b`
+//!   compares an ordered `Vec<Event>`, so any reordering the encoder introduced would fail it. The
+//!   entry exists to license a *downstream* reorder (a `Fanout`, a buffered sink retry), not one
+//!   this codec performs.
+//! - **Notifications** (`Message` 0x0100 / `Severity` 0x0101) are the one wire feature this pair
+//!   does not carry yet: they are skipped by length on decode and never emitted on encode. W5 of
+//!   `docs/plans/collectd-binary-relay.md` adds them, and its own corpus fixtures with them; until
+//!   it lands, `collectd_in -> collectd_out` is a fixed point for *value lists* only.
 //!
 //! ## Cross-protocol
 //!
@@ -147,12 +182,15 @@ const TYPE_ENCRYPTION: u16 = 0x0210;
 /// A part type no collectd defines -- normalization 5's "unknown part types are skipped by length."
 const TYPE_FROM_THE_FUTURE: u16 = 0x00FF;
 
+/// Bytes of a numeric part: the four-byte header plus one `u64` BE.
+const NUMBER_PART_LEN: usize = 12;
+
 const DS_COUNTER: u8 = 0;
 const DS_GAUGE: u8 = 1;
 const DS_DERIVE: u8 = 2;
 const DS_ABSOLUTE: u8 = 3;
 
-/// `2026-11-14T22:13:20Z` in whole seconds, the instant every fixture in this corpus is stamped
+/// `2023-11-14T22:13:20Z` in whole seconds, the instant every fixture in this corpus is stamped
 /// with -- far enough from "now" that a receipt-time fallback (normalization 7) is unmistakable.
 const TIME_SECONDS: u64 = 1_700_000_000;
 /// [`TIME_SECONDS`] as a `cdtime_t`.
@@ -339,6 +377,22 @@ fn build_in(name: &str) -> Vec<u8> {
             .values(&[derive(900)])
             .build(),
 
+        // The elision a real collectd actually performs, and the one `collectd_out` does not
+        // reproduce: `TimeHR`/`IntervalHR` stated once, inherited by the second list. Normalization
+        // 10 -- the `.expected` re-states both, 24 bytes larger than what arrived.
+        "elided-time-interval" => PacketBuilder::new()
+            .string(TYPE_HOST, b"web-1")
+            .number(TYPE_TIME_HR, TIME_HR)
+            .number(TYPE_INTERVAL_HR, INTERVAL_HR)
+            .string(TYPE_PLUGIN, b"cpu")
+            .string(TYPE_PLUGIN_INSTANCE, b"0")
+            .string(TYPE_TYPE, b"cpu")
+            .string(TYPE_TYPE_INSTANCE, b"user")
+            .values(&[derive(100)])
+            .string(TYPE_TYPE_INSTANCE, b"system")
+            .values(&[derive(50)])
+            .build(),
+
         // Two five-byte string parts carrying nothing but their NUL: how a sender *clears* a
         // sticky instance it set earlier in the same datagram.
         "empty-instances" => PacketBuilder::new()
@@ -350,6 +404,38 @@ fn build_in(name: &str) -> Vec<u8> {
             .string(TYPE_TYPE, b"df_complex")
             .string(TYPE_TYPE_INSTANCE, b"")
             .values(&[gauge(1024.0)])
+            .build(),
+
+        // No Interval part of either resolution -- collectd's `network` plugin omits one when the
+        // value list's own interval matches the daemon's global default. Normalization 9: the
+        // `.expected` gains an explicit `IntervalHR 0`, collectd's own "unspecified", on each list.
+        // `TimeHR` is deliberately re-stated on the second list so the *only* difference between
+        // `.in` and `.expected` is normalization 9, not 10 as well.
+        "no-interval" => PacketBuilder::new()
+            .string(TYPE_HOST, b"web-1")
+            .number(TYPE_TIME_HR, TIME_HR)
+            .string(TYPE_PLUGIN, b"memory")
+            .string(TYPE_TYPE, b"memory")
+            .string(TYPE_TYPE_INSTANCE, b"used")
+            .values(&[gauge(1.5)])
+            .number(TYPE_TIME_HR, TIME_HR)
+            .string(TYPE_TYPE_INSTANCE, b"free")
+            .values(&[gauge(2.5)])
+            .build(),
+
+        // Normalization 8's substitution half, reachable from a real decode: collectd's own
+        // receiver runs `escape_slashes` over an identity it accepts, so a sender that writes a
+        // raw path -- a `df` plugin instance, a mount point -- is writing something every receiver
+        // rewrites. This codec does the rewriting on egress instead, and counts it. Genuinely
+        // one-way: the `/` is gone, so this fixture asserts wire bytes only.
+        "slash-in-plugin" => PacketBuilder::new()
+            .string(TYPE_HOST, b"web-1")
+            .number(TYPE_TIME_HR, TIME_HR)
+            .number(TYPE_INTERVAL_HR, INTERVAL_HR)
+            .string(TYPE_PLUGIN, b"mount/data")
+            .string(TYPE_TYPE, b"df_complex")
+            .string(TYPE_TYPE_INSTANCE, b"/var/log")
+            .values(&[gauge(7.0)])
             .build(),
 
         // collectd's strings are bytes, not text: a host name from a non-UTF-8 locale is a real
@@ -485,30 +571,72 @@ fn build_in(name: &str) -> Vec<u8> {
     }
 }
 
-/// Every `.in` file this corpus commits, in the order the module doc's tables list them.
-const IN_FIXTURES: &[&str] = &[
+/// The byte-for-byte cases: a `.in` and a `.expected` each, both halves asserted (captured
+/// datagram == `.expected`, and `decode(sink output)` == the original decode as a whole
+/// `EventBatch`). In the order the module doc's first table lists them.
+const BYTE_FOR_BYTE: &[&str] = &[
     "single-gauge",
     "legacy-time-interval",
     "multi-value-load",
     "if-octets-derive",
     "counter-and-absolute",
     "elided-identity",
+    "elided-time-interval",
     "empty-instances",
+    "no-interval",
     "non-utf8-host",
     "unknown-and-signature-parts",
     "nan-gauge",
     "sub-second-time",
-    "repacked-at-1024",
-    "encrypted",
-    "no-time",
-    "truncated-values",
-    "incomplete-identity",
 ];
+
+/// The one-way-lossy case: its `.expected` wire bytes are asserted, the decoded batch deliberately
+/// is not (the substituted byte is gone for good). See the module doc's second table.
+const ONE_WAY: &[&str] = &["slash-in-plugin"];
+
+/// The structural case: an `.in` and no `.expected`, since the datagram boundaries are exactly what
+/// it lets move.
+const STRUCTURAL: &[&str] = &["repacked-at-1024"];
+
+/// The decode-only cases: an `.in` each, replayed through the live listener and asserted on
+/// delivered events and diagnostics rather than on any sink output.
+const DECODE_ONLY: &[&str] = &["encrypted", "no-time", "truncated-values", "incomplete-identity"];
+
+/// Every `.in` file this corpus commits.
+fn in_fixtures() -> impl Iterator<Item = &'static str> {
+    BYTE_FOR_BYTE.iter().chain(ONE_WAY).chain(STRUCTURAL).chain(DECODE_ONLY).copied()
+}
 
 // -- corpus files ---------------------------------------------------------------------------------
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/collectd")
+}
+
+/// The recorded-capture directory, read in place rather than copied into this corpus -- see
+/// [`a_real_collectd_capture_grows_when_its_elided_time_parts_are_restored`], and
+/// `syslog_round_trip.rs`'s identical helper.
+fn testdata_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/interop/collectd")
+}
+
+/// How many parts of type `part_type` a datagram carries, walking it by the `len` in each header
+/// the way any receiver does. Deliberately re-derived here rather than counting byte patterns: a
+/// `0x0008` can appear inside a Values payload, and only the framing walk knows the difference.
+fn count_parts(datagram: &[u8], part_type: u16) -> usize {
+    let mut at = 0usize;
+    let mut count = 0usize;
+    while at + 4 <= datagram.len() {
+        let this = u16::from_be_bytes([datagram[at], datagram[at + 1]]);
+        let len = u16::from_be_bytes([datagram[at + 2], datagram[at + 3]]) as usize;
+        assert!(len >= 4 && at + len <= datagram.len(), "malformed part at {at}");
+        if this == part_type {
+            count += 1;
+        }
+        at += len;
+    }
+    assert_eq!(at, datagram.len(), "the datagram should end on a part boundary");
+    count
 }
 
 fn read(path: &Path) -> Vec<u8> {
@@ -534,7 +662,7 @@ fn expected_bytes(name: &str, input: &[u8]) -> Vec<u8> {
 /// module doc. This is that pin: every `.in` file is exactly what [`build_in`] says it is.
 #[test]
 fn every_committed_in_file_matches_its_builder() {
-    for name in IN_FIXTURES {
+    for name in in_fixtures() {
         assert_eq!(
             read_fixture(name, "in"),
             build_in(name),
@@ -635,8 +763,9 @@ impl Harness {
         self.round_trip_with(batch, |sink| sink).await
     }
 
-    /// Sends `batch` at the capture socket only, returning every datagram it received -- used by
-    /// [`Harness::round_trip_with`] and directly by the cases that make no decoded-equality claim.
+    /// Sends `batch` at the capture socket only, returning every datagram it received. Split out
+    /// of [`Harness::round_trip_with`], its one caller, so the two legs of a round trip read as the
+    /// two separate sends they are.
     async fn capture_only(
         &mut self,
         batch: &EventBatch,
@@ -755,9 +884,110 @@ async fn assert_byte_for_byte(harness: &mut Harness, fixture: &str) {
 #[tokio::test]
 async fn the_corpus_round_trips_byte_for_byte() {
     let mut harness = Harness::new().await;
-    for fixture in &IN_FIXTURES[..11] {
+    for fixture in BYTE_FOR_BYTE {
         assert_byte_for_byte(&mut harness, fixture).await;
     }
+}
+
+/// Normalization 8's substitution half ([`ONE_WAY`]): a `/` in an identity field is replaced with
+/// `_` and counted, which is the one kind of change in this corpus that genuinely loses something
+/// -- so the wire bytes are asserted against `.expected` and no decoded-equality claim is made, the
+/// same shape `statsd_round_trip.rs`'s `sanitizer-*` cases have. The substituted identity is what
+/// comes back on the far end, and the record name follows it.
+#[tokio::test]
+async fn a_slash_in_an_identity_field_is_substituted_counted_and_not_a_round_trip() {
+    let raw = read_fixture("slash-in-plugin", "in");
+    let batch = direct_batch(&raw);
+    assert_eq!(
+        attr(&batch.events[0], ATTR_PLUGIN),
+        Some(Value::from("mount/data")),
+        "the fixture's premise: the raw `/` survives decode untouched"
+    );
+
+    let registry = Registry::new();
+    let telemetry = registry.telemetry_for("out", "collectd_out", "sink");
+    let mut harness = Harness::new().await;
+    let (captured, decoded) =
+        harness.round_trip_with(&batch, |sink| sink.with_telemetry(telemetry.clone())).await;
+
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0], read_fixture("slash-in-plugin", "expected"));
+    assert_ne!(captured[0], raw, "this fixture is one-way: the `/` does not survive");
+    assert_eq!(attr(&decoded.events[0], ATTR_PLUGIN), Some(Value::from("mount_data")));
+    assert_eq!(attr(&decoded.events[0], ATTR_TYPE_INSTANCE), Some(Value::from("_var_log")));
+    assert_eq!(name_of(&decoded.events[0].metrics[0]), "mount_data.df_complex");
+
+    // Three substituted fields -- `mount/data` once, `/var/log` twice -- but the counter is per
+    // *field*, not per byte, and both sinks this case sends through count their own copy.
+    let events = registry.drain(0);
+    assert_eq!(
+        metric_sum(&events, "logit.output.identity.sanitized", ("reason", "substituted")),
+        4.0,
+        "plugin and type_instance are each counted once per sink, over two sinks"
+    );
+}
+
+/// Normalization 10, spelt out on the fixture built for it: a sender that states `TimeHR`/
+/// `IntervalHR` once and lets the second list inherit them gets both parts back on every list.
+/// Information-preserving -- the restored parts carry exactly what the receiver's sticky state
+/// already held, which is why the decoded batches still compare equal -- but 24 bytes larger.
+#[tokio::test]
+async fn elided_time_and_interval_parts_are_restored_per_list() {
+    let raw = read_fixture("elided-time-interval", "in");
+    let expected = read_fixture("elided-time-interval", "expected");
+    assert_eq!(
+        expected.len(),
+        raw.len() + 2 * NUMBER_PART_LEN,
+        "one restored TimeHR and one restored IntervalHR, both 12-byte numeric parts"
+    );
+    assert_eq!(count_parts(&raw, TYPE_TIME_HR), 1);
+    assert_eq!(count_parts(&raw, TYPE_INTERVAL_HR), 1);
+    assert_eq!(count_parts(&expected, TYPE_TIME_HR), 2, "one per value list on egress");
+    assert_eq!(count_parts(&expected, TYPE_INTERVAL_HR), 2);
+
+    // Still asserted end to end by `the_corpus_round_trips_byte_for_byte`; repeated here so this
+    // test stands alone as the account of normalization 10.
+    let mut harness = Harness::new().await;
+    assert_byte_for_byte(&mut harness, "elided-time-interval").await;
+}
+
+/// Normalization 10 against traffic nobody wrote for a test: the recorded capture in
+/// `testdata/interop/collectd/` is a real Debian `collectd`'s own output, and it elides both
+/// numeric parts aggressively -- 26 value lists behind 17 `TimeHR` parts and **one** `IntervalHR`.
+/// Relaying it restores the missing 35, which is what turns one 1296-byte datagram into 1717 bytes
+/// across two. These are the numbers `docs/adr/collectd-binary-relay.md`'s amendment and
+/// `docs/deploying.md` quote at an operator, so they are pinned rather than described.
+///
+/// The capture is read where it lives, never copied into this corpus -- that directory's own README
+/// asks for exactly that, and `crates/logit-inputs/src/collectd.rs`'s `interop_fixture_*` tests
+/// already cover what it decodes to.
+#[tokio::test]
+async fn a_real_collectd_capture_grows_when_its_elided_time_parts_are_restored() {
+    let raw = read(&testdata_dir().join("collectd-000.raw"));
+    assert_eq!(raw.len(), 1296);
+    assert_eq!(count_parts(&raw, TYPE_VALUES), 26, "26 value lists");
+    assert_eq!(count_parts(&raw, TYPE_TIME_HR), 17, "...behind 17 TimeHR parts");
+    assert_eq!(count_parts(&raw, TYPE_INTERVAL_HR), 1, "...and a single IntervalHR");
+
+    let batch = direct_batch(&raw);
+    assert_eq!(batch.events.len(), 26);
+
+    let mut harness = Harness::new().await;
+    let (captured, decoded) = harness.round_trip(&batch).await;
+    let total: usize = captured.iter().map(Vec::len).sum();
+    assert_eq!(captured.len(), 2, "the restored parts push it past the 1452-byte default cap");
+    assert_eq!(total, 1717, "1296 bytes in, 1717 out -- about 30% more, per normalization 10");
+    for datagram in &captured {
+        assert!(datagram.len() <= DEFAULT_MAX_PACKET_BYTES, "each datagram still fits the cap");
+        assert_eq!(
+            count_parts(datagram, TYPE_TIME_HR),
+            count_parts(datagram, TYPE_VALUES),
+            "one TimeHR per value list, which is the whole point"
+        );
+    }
+
+    // Bytes grew; information did not change. That is what makes this a normalization.
+    assert_eq!(decoded, batch, "every one of the 26 lists survives the relay unchanged");
 }
 
 /// Spelt out beside the corpus loop because the claim is finer than "the bytes match": a

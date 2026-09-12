@@ -12,12 +12,19 @@
 # survives as a NaN; a non-UTF-8 host name is relayed byte-verbatim. The relay is a fixed point
 # modulo exactly the normalization list in docs/adr/collectd-binary-relay.md -- legacy
 # second-resolution Time/Interval parts re-emit as their high-resolution equivalents, string-part
-# elision and datagram boundaries are recomputed by this sink's own max_packet_bytes, unknown and
-# Signature parts are dropped, and a NaN's payload bits canonicalize. Nothing else changes silently:
+# elision and datagram boundaries are recomputed by this sink's own max_packet_bytes, elided
+# (unchanged) time and interval parts are restated on every list, unknown and Signature parts are
+# dropped, and a NaN's payload bits canonicalize. Nothing else changes silently:
 # anything this pair cannot carry is a counted drop (logit.output.metrics.skipped) with a throttled
 # diagnostic, never a quiet reinterpretation. Encrypted packets (collectd's `SecurityLevel Encrypt`)
 # are the one input this codec cannot read at all: the datagram's tail is dropped and counted
 # (docs/known-gaps.md).
+#
+# One consequence of that restating worth sizing for: a relay emits more bytes than it received.
+# collectd elides an unchanged time or interval part and this sink does not, so the recorded capture
+# in testdata/interop/collectd/ -- 26 value lists behind 17 TimeHR parts and one IntervalHR, 1296
+# bytes in a single datagram -- leaves here as 1717 bytes across two. Budget roughly a third more
+# egress bytes and packets than the sending fleet produces.
 #
 # **No `aggregate` here, unlike examples/statsd-relay.yaml.** That is the one real difference
 # between the two relay topologies, and it is deliberate: statsd is a firehose of individual samples
