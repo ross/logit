@@ -280,7 +280,10 @@ pub enum ComponentKind {
     /// address is a **multicast group** (collectd's defaults are `239.192.74.66` and
     /// `ff18::efc0:4a42`), the shared UDP listener sets `SO_REUSEADDR`, binds the unspecified
     /// address on that port and joins the group on the default interface. There is deliberately no
-    /// `multicast:` field: the address already says it.
+    /// `multicast:` field: the address already says it. Because the socket is bound to the
+    /// unspecified address rather than to the group, such a listener **also** accepts ordinary
+    /// unicast datagrams sent to that port from any source -- joining a group is additive, not a
+    /// filter that narrows what else the port receives.
     ///
     /// `types_db` names zero or more collectd `types.db` files (relative paths resolve against the
     /// config file's directory), read at startup and merged in order -- a later file overrides an

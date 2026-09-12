@@ -36,9 +36,10 @@ pub struct CollectdDecoder {
     /// The six attribute keys, interned once at construction so the per-list hot path uses
     /// [`AttrMap::insert_sym`] instead of re-hashing the same six strings per value list.
     keys: AttrKeys,
-    /// The operator-supplied `types.db`, if `collectd_in`'s `types_db:` named one. Shared (`Arc`)
-    /// because one file serves every listener in a config; `None` -- the default -- means index
-    /// naming, which is what a `types.db`-less deployment gets. See
+    /// The operator-supplied `types.db`, if `collectd_in`'s `types_db:` named one -- one load per
+    /// component (`logit-cli::pipeline`'s `build_spec`), shared with that component's decoder as an
+    /// `Arc` rather than moved, so the caller keeps its own handle. `None` -- the default -- means
+    /// index naming, which is what a `types.db`-less deployment gets. See
     /// [`super::types_db`] for what this changes and, more importantly, what it does not.
     types_db: Option<Arc<TypesDb>>,
 }
@@ -99,10 +100,13 @@ impl CollectdDecoder {
         self
     }
 
-    /// Test-only: confirms a builder chain (`CollectdInput::with_diagnostics` in W2) actually
-    /// reached this decoder's own `diag`, not only the listener's.
-    #[cfg(test)]
-    pub(crate) fn diag(&self) -> &Diagnostics {
+    /// This decoder's own diagnostics handle. Public, unlike `StatsdDecoder`/`SyslogDecoder`'s
+    /// `#[cfg(test)] pub(crate)` equivalents, for one reason: `collectd_in` lives in
+    /// `logit-inputs` while this decoder lives here, so the regression test both sibling inputs
+    /// carry -- that `CollectdInput::with_diagnostics`'s `map_decoder` half actually reached the
+    /// decoder, and did not silently leave every decoder-side diagnostic reporting under no
+    /// component id -- cannot reach a crate-private accessor.
+    pub fn diag(&self) -> &Diagnostics {
         &self.diag
     }
 }

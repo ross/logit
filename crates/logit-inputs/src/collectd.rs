@@ -30,6 +30,12 @@
 //! because the address already says everything there is to say. A failed join fails startup rather
 //! than warning -- see [`crate::udp`]'s `bind_one`. The `bound` info line names the group.
 //!
+//! One consequence worth stating outright, since the config line does not: because the socket is
+//! bound to the **unspecified** address rather than to the group, a `bind: 239.192.74.66:25826`
+//! listener also accepts ordinary *unicast* datagrams sent to that port from any source, and
+//! [`CollectdInput::local_addr`] reports `0.0.0.0:<port>` rather than the group. Joining a group is
+//! additive -- it is not a filter that narrows what else the port receives.
+//!
 //! ## `types_db`
 //!
 //! Zero or more paths to collectd `types.db` files (relative ones resolve against the config
@@ -66,8 +72,8 @@
 //! ## Telemetry
 //!
 //! All of it comes from the shared UDP listener driver, identically to `statsd_in`/`syslog_in`:
-//! `logit.input.datagrams`/`logit.input.bytes` (what actually arrived on the wire, which the
-//! `Fanout`-level `events.sent` cannot tell apart from one busy sender), the
+//! `logit.input.datagrams`/`logit.input.datagram.bytes` (what actually arrived on the wire, which
+//! the `Fanout`-level `events.sent` cannot tell apart from one busy sender), the
 //! `logit.component.receive.*` receive-queue gauges, and `logit.input.receive_buffer.bytes`.
 //! This component adds none of its own.
 
@@ -120,9 +126,11 @@ impl CollectdInput {
         self
     }
 
-    /// Gives the wrapped decoder an already-loaded `types.db` -- see this module's doc. Shared
-    /// (`Arc`) because one file serves every `collectd_in` in a config, loaded once by
-    /// `logit-cli::pipeline`'s `build_spec` rather than once per listener.
+    /// Gives the wrapped decoder an already-loaded `types.db` -- see this module's doc. An `Arc`
+    /// because the decoder holds it for the process's lifetime while the caller keeps its own
+    /// handle; `logit-cli::pipeline`'s `build_spec` does one `TypesDb::load` per `collectd_in`
+    /// component and shares that one map with that component's decoder (two listeners naming the
+    /// same file each parse it, into two independent maps).
     pub fn with_types_db(mut self, types_db: Arc<TypesDb>) -> Self {
         self.inner = self.inner.map_decoder(|d| d.with_types_db(types_db));
         self
@@ -293,6 +301,17 @@ mod tests {
         assert_eq!(names, vec!["load.load.shortterm", "load.load.midterm", "load.load.longterm"]);
 
         handle.abort();
+    }
+
+    /// The guard both sibling inputs carry (`statsd.rs`/`syslog.rs`'s own
+    /// `with_diagnostics_reaches_the_wrapped_decoder_too`): dropping `with_diagnostics`'s
+    /// `.map_decoder(..)` half compiles fine and silently leaves every decoder-side diagnostic
+    /// (`bad_part`, `incomplete_identity`, `encrypted_packet_dropped`, `types_db_mismatch`)
+    /// reporting under no component id and with telemetry disabled.
+    #[test]
+    fn with_diagnostics_reaches_the_wrapped_decoder_too() {
+        let input = CollectdInput::new("127.0.0.1:0").with_diagnostics(Diagnostics::new("my-id"));
+        assert_eq!(input.inner.decoder().diag().component_id(), "my-id");
     }
 
     #[tokio::test]

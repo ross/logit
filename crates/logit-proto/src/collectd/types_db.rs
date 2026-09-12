@@ -28,11 +28,17 @@
 //! if_octets   rx:DERIVE:0:U, tx:DERIVE:0:U
 //! ```
 //!
-//! One type per line: the type name, then whitespace, then one or more comma-separated data-source
-//! definitions, each exactly `<name>:<KIND>:<min>:<max>`. `<KIND>` is `COUNTER`, `GAUGE`, `DERIVE`
-//! or `ABSOLUTE` (matched case-insensitively, as collectd's own `parse_ds` does); `<min>`/`<max>`
-//! are numbers or `U` for unbounded -- parsed and validated, then discarded, since nothing in this
-//! codec range-checks a value (collectd itself only uses the bounds inside its RRD writer).
+//! One type per line: the type name, then one or more data-source definitions, each exactly
+//! `<name>:<KIND>:<min>:<max>`. **Fields are separated by whitespace, and a trailing `,` on a field
+//! is decoration** -- collectd's own `types_list.c` splits the whole line with `strsplit` and its
+//! `parse_ds` strips one trailing comma off each field, so `rx:DERIVE:0:U, tx:DERIVE:0:U`,
+//! `rx:DERIVE:0:U tx:DERIVE:0:U` and a line ending in a stray `,` are all the same file to
+//! collectd, and all the same file here. `<KIND>` is `COUNTER`, `GAUGE`, `DERIVE` or `ABSOLUTE`
+//! and `<min>`/`<max>` are numbers or `U` for unbounded, all four matched case-insensitively
+//! (`parse_ds` uses `strcasecmp` throughout). The bounds are parsed for validation and then
+//! discarded, since nothing in this codec range-checks a value (collectd itself only uses them
+//! inside its RRD writer).
+//!
 //! Blank lines and lines whose first non-whitespace character is `#` are skipped. An inline `#` is
 //! **not** a comment, exactly as in collectd's own parser (`types_list.c`), so a `#` inside a
 //! definition is a parse error rather than a silently truncated line.
@@ -127,14 +133,15 @@ impl TypesDb {
             let Some((type_name, rest)) = split_once_whitespace(trimmed) else {
                 return Err(TypesDbError::NoDataSources { line, type_name: trimmed.to_string() });
             };
+            // Whitespace-separated fields, each allowed one decorative trailing comma -- collectd's
+            // own `strsplit` + `parse_ds` pair, not a comma-separated list (see this module's
+            // "File format"). A field that is *only* a comma leaves nothing behind and is skipped,
+            // the way an empty `strsplit` field would be.
             let mut sources = Vec::new();
-            for spec in rest.split(',') {
-                let spec = spec.trim();
+            for field in rest.split_whitespace() {
+                let spec = field.strip_suffix(',').unwrap_or(field);
                 if spec.is_empty() {
-                    return Err(TypesDbError::EmptyDataSource {
-                        line,
-                        type_name: type_name.to_string(),
-                    });
+                    continue;
                 }
                 sources.push(parse_data_source(line, spec)?);
             }
@@ -223,7 +230,7 @@ fn parse_data_source(line: usize, spec: &str) -> Result<DataSource, TypesDbError
     // the format it claims to be, and accepting it would mean accepting an arbitrary line as a
     // type definition.
     for (bound, value) in [("min", fields[2]), ("max", fields[3])] {
-        if value != "U" && value.parse::<f64>().is_err() {
+        if !value.eq_ignore_ascii_case("U") && value.parse::<f64>().is_err() {
             return Err(TypesDbError::BadBound {
                 line,
                 name: name.to_string(),
@@ -241,8 +248,6 @@ fn parse_data_source(line: usize, spec: &str) -> Result<DataSource, TypesDbError
 pub enum TypesDbError {
     #[error("line {line}: type '{type_name}' has no data-source definitions")]
     NoDataSources { line: usize, type_name: String },
-    #[error("line {line}: type '{type_name}' has an empty data-source definition")]
-    EmptyDataSource { line: usize, type_name: String },
     #[error(
         "line {line}: data source '{spec}' has {fields} colon-separated field(s), expected 4 \
          (<name>:<KIND>:<min>:<max>)"
@@ -263,7 +268,6 @@ impl TypesDbError {
     pub fn line(&self) -> usize {
         match self {
             TypesDbError::NoDataSources { line, .. }
-            | TypesDbError::EmptyDataSource { line, .. }
             | TypesDbError::BadDataSource { line, .. }
             | TypesDbError::UnnamedDataSource { line, .. }
             | TypesDbError::UnknownKind { line, .. }
@@ -361,6 +365,46 @@ mod tests {
         assert_eq!(db.get("tabbed").unwrap()[0].name, "value");
     }
 
+    /// The comma in `rx:DERIVE:0:U, tx:DERIVE:0:U` is **decoration on a whitespace-separated
+    /// field**, not the separator: collectd's `types_list.c` splits the line with `strsplit` and
+    /// `parse_ds` strips one trailing `,`. So the stock file's `, ` style, a comma-free line, and a
+    /// line ending in a stray comma all have to parse to the same two data sources -- a hand-written
+    /// override file written in any of these styles must not refuse to start the process.
+    ///
+    /// Two definitions run together with **no** whitespace (`rx:DERIVE:0:U,tx:DERIVE:0:U`) are one
+    /// field with too many colon fields, and stay an error: that is what collectd's own parser does
+    /// with them too (see `every_malformed_line_shape_is_an_error_naming_its_line`).
+    #[test]
+    fn data_sources_are_whitespace_separated_with_an_optional_trailing_comma() {
+        for text in [
+            "if_octets\trx:DERIVE:0:U, tx:DERIVE:0:U\n",
+            "if_octets\trx:DERIVE:0:U tx:DERIVE:0:U\n",
+            "if_octets\trx:DERIVE:0:U, tx:DERIVE:0:U,\n",
+            "if_octets\trx:DERIVE:0:U ,  tx:DERIVE:0:U ,\n",
+        ] {
+            let db = TypesDb::parse(text).unwrap_or_else(|e| panic!("{text:?} must parse: {e}"));
+            let sources = db.get("if_octets").expect("if_octets is defined");
+            assert_eq!(
+                sources,
+                &[
+                    DataSource { name: "rx".into(), kind: DsKind::Derive },
+                    DataSource { name: "tx".into(), kind: DsKind::Derive },
+                ],
+                "{text:?}"
+            );
+        }
+    }
+
+    /// collectd's `parse_ds` compares the bounds with `strcasecmp` too, not just the kind -- so a
+    /// lower-case `u` is unbounded, and must not be a startup failure.
+    #[test]
+    fn an_unbounded_bound_is_matched_case_insensitively() {
+        for text in ["t value:GAUGE:U:U\n", "t value:GAUGE:u:u\n", "t value:GAUGE:u:U\n"] {
+            let db = TypesDb::parse(text).unwrap_or_else(|e| panic!("{text:?} must parse: {e}"));
+            assert_eq!(db.get("t").unwrap()[0].name, "value");
+        }
+    }
+
     /// Both halves of the override rule: within one text, and across a [`TypesDb::merge`].
     #[test]
     fn a_later_definition_of_a_type_replaces_an_earlier_one() {
@@ -383,7 +427,9 @@ mod tests {
             ("an unknown kind", "load shortterm:FLOAT:0:5000\n"),
             ("a nameless data source", "load :GAUGE:0:5000\n"),
             ("a non-numeric bound", "load shortterm:GAUGE:zero:5000\n"),
-            ("an empty data source between commas", "load a:GAUGE:U:U,,b:GAUGE:U:U\n"),
+            // Only *one* trailing comma is decoration, so this is a single field with six colon
+            // fields, not two data sources -- collectd's own `parse_ds` rejects it too.
+            ("two definitions run together by a doubled comma", "load a:GAUGE:U:U,,b:GAUGE:U:U\n"),
             ("an inline '#', which collectd does not treat as a comment", "load a:GAUGE:U:U # x\n"),
         ];
         for (label, text) in cases {

@@ -33,7 +33,7 @@
 //! 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` -- a config error, not
 //!     something to clamp silently.
 //! 17. A non-default `receive:` block is rejected on any kind that is not a datagram listener
-//!     (today `statsd_in`/`syslog_in`) or a tail listener (`tail_in`/`docker_in`) --
+//!     (today `statsd_in`/`collectd_in`/`syslog_in`) or a tail listener (`tail_in`/`docker_in`) --
 //!     `receive:` (`docs/adr/decoupled-listener-io.md`) configures a listener's receive-side
 //!     batch assembly, and a datagram listener's socket-side receive queue on top of that. A
 //!     tail listener has no such queue (the tailed file is its own durable buffer), so it may

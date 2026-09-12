@@ -376,7 +376,10 @@ deployment conventions:
   field — the address says it. A failed join **fails startup** rather than warning, since a
   listener that bound but never joined would look healthy and receive nothing; in a container this
   usually means the network has no route for `224.0.0.0/4`, and a unicast `bind` with `Server
-  "<host>" "25826"` on the sender side is the simpler deployment.
+  "<host>" "25826"` on the sender side is the simpler deployment. Note that a group `bind` is not a
+  filter: the socket is bound to the unspecified address on that port, so the listener also accepts
+  ordinary unicast datagrams sent to that port from any source, and reports its address as
+  `0.0.0.0:<port>` rather than the group.
 - **`types_db:` is optional and only affects names.** Point it at the `types.db` your collectd
   installation already ships (conventionally `/usr/share/collectd/types.db`; `logit` does not ship
   one, as collectd's is GPL-licensed) and a multi-data-source list is named after its data sources
