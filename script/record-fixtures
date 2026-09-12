@@ -1,6 +1,6 @@
 #!/bin/bash
 # Usage: script/record-fixtures [producer ...]
-#   Producers: logger, python-syslog-handler, rsyslog, otlp
+#   Producers: logger, python-syslog-handler, rsyslog, collectd, otlp
 #   With no arguments, records every producer in `all` below.
 #
 # Captures real wire traffic from real third-party producers (syslog senders, OTel SDKs) into
@@ -139,6 +139,31 @@ record_rsyslog() {
     finish_capture
 }
 
+# collectd, sending its own binary `network`-plugin protocol to raw_capture.py over UDP. Same
+# no-official-image situation as rsyslog above: the collectd project's Docker Hub namespace holds
+# exactly one repository, `collectd/ci` (verified) -- a *build-environment* image, one tag per
+# distro, carrying the dependencies needed to compile collectd, not a runnable collectd daemon. So
+# this installs the real Debian-packaged `collectd-core` fresh into a plain `debian:bookworm-slim`
+# at record time, the actual upstream-built binary Debian ships, one apt layer slower to start than
+# the pre-baked producers. `collectd-core`, not `collectd`: the metapackage pulls in a long tail of
+# plugin dependencies this fixture has no use for.
+#
+# Three datagrams rather than one: collectd's `network` plugin does not send one datagram per read
+# cycle -- it packs value lists into a 1452-byte buffer and flushes when the buffer fills (or at
+# shutdown), eliding identity parts that repeat within a packet. Three captures that packing, that
+# elision, and the smaller shutdown flush. The 90s timeout matches record_rsyslog's, for the same
+# reason: an apt-get install has to finish first.
+record_collectd() {
+    echo "== recording: collectd (network plugin, debian:bookworm-slim) =="
+    local out="${OUT_ROOT}/collectd"
+    start_capture udp 25826 "${out}" collectd 3 90
+    ${DOCKER} run --rm --network "${NET}" \
+        -v "${TOOLS_DIR}/collectd.conf:/etc/collectd-fixture.conf:ro,z" \
+        -v "${TOOLS_DIR}/collectd-entrypoint.sh:/entrypoint.sh:ro,z" \
+        debian:bookworm-slim bash /entrypoint.sh
+    finish_capture
+}
+
 # OTLP, via the OpenTelemetry Collector's own `file` exporter -- see
 # tools/record-fixtures/otel-collector-config.yaml for why that's the fixture rather than a raw
 # byte capture -- fed by `telemetrygen`, the OpenTelemetry project's own load-generation tool (a
@@ -177,7 +202,7 @@ record_otlp() {
 
 # ---- entry point ----------------------------------------------------------------------------------
 
-all=(logger python-syslog-handler rsyslog otlp)
+all=(logger python-syslog-handler rsyslog collectd otlp)
 
 producers=("$@")
 if [ "${#producers[@]}" -eq 0 ]; then
@@ -192,6 +217,7 @@ for p in "${producers[@]}"; do
     logger) record_logger ;;
     python-syslog-handler) record_python_syslog_handler ;;
     rsyslog) record_rsyslog ;;
+    collectd) record_collectd ;;
     otlp) record_otlp ;;
     *)
         echo "record-fixtures: unknown producer '${p}'" >&2
