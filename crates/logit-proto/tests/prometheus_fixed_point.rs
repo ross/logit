@@ -116,12 +116,12 @@ const TEXT_CANONICAL: &str = concat!(
 /// `_created`, exemplars (on a `_total` and on a `_bucket`, with and without a trace reference and a
 /// timestamp), fractional-second timestamps, and `# EOF`.
 const OPENMETRICS_FIXTURE: &str = concat!(
-    "# TYPE requests counter\n",
-    "# UNIT requests requests\n",
-    "# HELP requests Total requests.\n",
-    "requests_total{code=\"200\"} 1027 1395066363.5\n",
-    "requests_created{code=\"200\"} 1605281325.123\n",
-    "requests_total{code=\"500\"} 3 # {trace_id=\"0123456789abcdef0123456789abcdef\",\
+    "# TYPE request_duration_seconds counter\n",
+    "# UNIT request_duration_seconds seconds\n",
+    "# HELP request_duration_seconds Total request duration.\n",
+    "request_duration_seconds_total{code=\"200\"} 1027 1395066363.5\n",
+    "request_duration_seconds_created{code=\"200\"} 1605281325.123\n",
+    "request_duration_seconds_total{code=\"500\"} 3 # {trace_id=\"0123456789abcdef0123456789abcdef\",\
      span_id=\"fedcba9876543210\"} 0.5 1605281325.5\n",
     "# TYPE temperature_celsius gauge\n",
     "temperature_celsius{room=\"kitchen\"} 21.5\n",
@@ -166,12 +166,12 @@ const OPENMETRICS_CANONICAL: &str = concat!(
     "latency_seconds_sum 2.5\n",
     "latency_seconds_count 4\n",
     "latency_seconds_created 1605281325\n",
-    "# TYPE requests counter\n",
-    "# UNIT requests requests\n",
-    "# HELP requests Total requests.\n",
-    "requests_total{code=\"200\"} 1027 1395066363.5\n",
-    "requests_created{code=\"200\"} 1605281325.123\n",
-    "requests_total{code=\"500\"} 3 # {span_id=\"fedcba9876543210\",\
+    "# TYPE request_duration_seconds counter\n",
+    "# UNIT request_duration_seconds seconds\n",
+    "# HELP request_duration_seconds Total request duration.\n",
+    "request_duration_seconds_total{code=\"200\"} 1027 1395066363.5\n",
+    "request_duration_seconds_created{code=\"200\"} 1605281325.123\n",
+    "request_duration_seconds_total{code=\"500\"} 3 # {span_id=\"fedcba9876543210\",\
      trace_id=\"0123456789abcdef0123456789abcdef\"} 0.5 1605281325.5\n",
     "# TYPE rpc_seconds summary\n",
     "rpc_seconds{quantile=\"0.5\"} 0.2\n",
@@ -492,11 +492,18 @@ fn family(dialect: Dialect) -> BoxedStrategy<MetricFamily> {
 fn family_set(dialect: Dialect) -> impl Strategy<Value = Vec<MetricFamily>> {
     proptest::collection::vec(family(dialect), 1..4).prop_map(|mut families| {
         for (i, family) in families.iter_mut().enumerate() {
+            // OpenMetrics requires `_<unit>` to suffix the family name and Prometheus fails the
+            // whole scrape when it doesn't, so a unit the writer would have to drop isn't a round
+            // trip either -- the generated name carries the generated unit.
+            let stem = match &family.unit {
+                Some(unit) => format!("m{i}_{unit}"),
+                None => format!("m{i}"),
+            };
             family.name = match family.kind {
                 // A counter's value sample always carries `_total`, so a name that lacks it would
                 // gain it on the way out -- a named normalization, not a round trip.
-                FamilyType::Counter => format!("m{i}_total"),
-                _ => format!("m{i}"),
+                FamilyType::Counter => format!("{stem}_total"),
+                _ => stem,
             };
         }
         families.sort_by(|a, b| a.name.cmp(&b.name));
