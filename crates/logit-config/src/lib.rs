@@ -419,6 +419,38 @@ pub enum ComponentKind {
         /// once exceeded.
         #[serde(default = "default_max_retained_gauge_series")]
         max_retained_gauge_series: usize,
+        /// Whether a raw `Samples` series (statsd `ms`/`h`/`d`, no producer until W3) absorbs into
+        /// this window as a sketch (the default -- exact, error-bounded quantiles, no raw values
+        /// retained past the window) or keeps its raw observations for the whole window, only
+        /// falling back to a sketch when `max_samples_per_series` is exceeded or an incoming
+        /// record's `sample_rate` disagrees with the series' first one (that fallback is counted,
+        /// see `docs/adr/aggregation-window-semantics.md`'s amendment). Raw retention is the
+        /// lossless-transit option (`docs/adr/lossless-transit.md`): a downstream `logit`
+        /// re-sketching the same samples with a different accuracy target, or a sink that wants the
+        /// individual values, only has that choice available when this is `samples`.
+        #[serde(default)]
+        distributions: Distributions,
+        /// A hard cap on how many raw values one `Samples` series may retain in one window before
+        /// `distributions: samples` falls back to sketching what it already holds -- a DoS/memory
+        /// guard, not a tuning knob, the same role `max_retained_gauge_series` plays for gauges.
+        /// Meaningless when `distributions` is `sketch` (the default), since nothing raw is ever
+        /// retained in that mode.
+        #[serde(default = "default_max_samples_per_series")]
+        max_samples_per_series: usize,
+        /// Whether a raw `SetMembers` series (statsd `s`, no producer until W3) absorbs into this
+        /// window as a `HyperLogLog` cardinality estimate (the default) or keeps its exact,
+        /// deduplicated member set for the whole window, only falling back to an estimate when
+        /// `max_set_members_per_series` is exceeded (counted, see the amendment). Exact retention
+        /// is the lossless-transit option: an exact member count/list only survives the window
+        /// when this is `members`.
+        #[serde(default)]
+        sets: Sets,
+        /// A hard cap on how many distinct members one `SetMembers` series may retain in one
+        /// window before `sets: members` falls back to a `HyperLogLog` estimate -- a DoS/memory
+        /// guard, the same role `max_samples_per_series` plays for raw samples. Meaningless when
+        /// `sets` is `estimate` (the default).
+        #[serde(default = "default_max_set_members_per_series")]
+        max_set_members_per_series: usize,
     },
     /// Parses a log record's message as JSON, merging the resulting key/values into the event's
     /// attributes. See `docs/adr/json-parsing-into-attributes.md`.
@@ -1008,6 +1040,37 @@ fn default_csv_delimiter() -> char {
     ','
 }
 
+/// [`ComponentKind::Aggregate`]'s `distributions` field -- whether a raw `Samples` series
+/// (statsd `ms`/`h`/`d`) absorbs as a sketch or keeps its raw values for the window. See that
+/// field's own doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Distributions {
+    /// Sketch every value on absorb (`DdSketch::add_weighted`) -- no raw samples survive past the
+    /// window. The right default: bounded memory regardless of how many samples a series sees.
+    #[default]
+    Sketch,
+    /// Keep raw values for the whole window (bounded by `max_samples_per_series`), only sketching
+    /// on overflow or a sample-rate mismatch.
+    Samples,
+}
+
+/// [`ComponentKind::Aggregate`]'s `sets` field -- whether a raw `SetMembers` series (statsd `s`)
+/// absorbs as a `HyperLogLog` estimate or keeps its exact member set for the window. See that
+/// field's own doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Sets {
+    /// Insert every member into a `HyperLogLog` on absorb -- no exact member set survives past the
+    /// window. The right default: bounded memory regardless of how many distinct members a series
+    /// sees.
+    #[default]
+    Estimate,
+    /// Keep the exact, deduplicated member set for the whole window (bounded by
+    /// `max_set_members_per_series`), only falling back to an estimate on overflow.
+    Members,
+}
+
 /// `Aggregate::gauge_retention`'s default: retention is on by default, at a modest depth --
 /// `0` (the pre-existing, always-tumbling behavior) is an explicit opt-out, not the default,
 /// since a relative gauge adjustment silently resolving against 0.0 every time (what `0` means)
@@ -1020,6 +1083,20 @@ fn default_gauge_retention() -> u32 {
 /// knob (see the field's own doc comment).
 fn default_max_retained_gauge_series() -> usize {
     10_000
+}
+
+/// `Aggregate::max_samples_per_series`'s default -- a DoS/memory guard, not a tuning knob (see the
+/// field's own doc comment). Matches `logit_core::Samples::MAX_WEIGHT`'s order of magnitude: both
+/// exist to bound how much one series can cost regardless of what a hostile or misconfigured
+/// producer sends.
+fn default_max_samples_per_series() -> usize {
+    1000
+}
+
+/// `Aggregate::max_set_members_per_series`'s default -- same DoS/memory-guard role as
+/// [`default_max_samples_per_series`], for exact set-member retention instead of raw samples.
+fn default_max_set_members_per_series() -> usize {
+    1000
 }
 
 /// Mirrors `logit_outputs::syslog::DEFAULT_CONNECT_TIMEOUT` -- can't reference it directly
@@ -1911,13 +1988,25 @@ mod tests {
             serde_json::from_str(r#"{"type": "aggregate", "sources": ["in"], "interval": "10s"}"#)
                 .unwrap();
         match component.kind {
-            ComponentKind::Aggregate { interval, gauge_retention, max_retained_gauge_series } => {
+            ComponentKind::Aggregate {
+                interval,
+                gauge_retention,
+                max_retained_gauge_series,
+                distributions,
+                max_samples_per_series,
+                sets,
+                max_set_members_per_series,
+            } => {
                 assert_eq!(interval, Duration::from_secs(10));
-                // Additive fields: an existing config with no `gauge_retention`/
-                // `max_retained_gauge_series` at all still deserializes, defaulting to both
-                // (proves the config change is additive, per script/validate over demo/examples).
+                // Additive fields: an existing config with none of these at all still
+                // deserializes, defaulting all of them (proves the config change is additive, per
+                // script/validate over demo/examples).
                 assert_eq!(gauge_retention, 5);
                 assert_eq!(max_retained_gauge_series, 10_000);
+                assert_eq!(distributions, Distributions::Sketch);
+                assert_eq!(max_samples_per_series, 1000);
+                assert_eq!(sets, Sets::Estimate);
+                assert_eq!(max_set_members_per_series, 1000);
             }
             other => panic!("expected Aggregate, got {other:?}"),
         }
@@ -1933,6 +2022,62 @@ mod tests {
             ComponentKind::Aggregate { gauge_retention, max_retained_gauge_series, .. } => {
                 assert_eq!(gauge_retention, 0);
                 assert_eq!(max_retained_gauge_series, 100);
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    /// Same defaults assertion as `aggregate_component_with_interval_deserializes`, isolated to
+    /// just the four W2 fields so a future change to the gauge-retention fields can't mask a
+    /// regression here (or vice versa).
+    #[test]
+    fn aggregate_component_defaults_to_sketch_and_estimate_with_1000_caps() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "aggregate", "sources": ["in"], "interval": "10s"}"#)
+                .unwrap();
+        match component.kind {
+            ComponentKind::Aggregate {
+                distributions,
+                max_samples_per_series,
+                sets,
+                max_set_members_per_series,
+                ..
+            } => {
+                assert_eq!(distributions, Distributions::Sketch);
+                assert_eq!(max_samples_per_series, 1000);
+                assert_eq!(sets, Sets::Estimate);
+                assert_eq!(max_set_members_per_series, 1000);
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_component_parses_all_four_w2_fields() {
+        let component: Component = serde_json::from_str(
+            r#"{
+                "type": "aggregate",
+                "sources": ["in"],
+                "interval": "10s",
+                "distributions": "samples",
+                "max_samples_per_series": 42,
+                "sets": "members",
+                "max_set_members_per_series": 7
+            }"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Aggregate {
+                distributions,
+                max_samples_per_series,
+                sets,
+                max_set_members_per_series,
+                ..
+            } => {
+                assert_eq!(distributions, Distributions::Samples);
+                assert_eq!(max_samples_per_series, 42);
+                assert_eq!(sets, Sets::Members);
+                assert_eq!(max_set_members_per_series, 7);
             }
             other => panic!("expected Aggregate, got {other:?}"),
         }

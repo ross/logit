@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-09-02
+updated: 2026-09-11
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -249,3 +249,136 @@ regression test; a counter never surviving its window even with retention enable
 resource group disappearing from `groups`; the cardinality cap evicting and firing
 `series.evicted{reason="cardinality"}`; contexts never carrying across a flush even for a retained
 series; and `flush` never emitting an empty `(resource, events)` pair.
+
+## Amendment: raw samples and set members are absorbed
+
+[ADR `metrics-model-v2`](metrics-model-v2.md) added `MetricKind::Samples`/`SetMembers` as the raw
+half of `Distribution`/`Set`'s raw-vs-summarized pairs, but left them with no producer and no
+merge rule — "`aggregate` and the sinks treat `Samples`/`SetMembers`/`ExponentialHistogram`/a
+non-delta-monotonic `Sum` as pass-through or explicitly unsupported, not as a real feature, until
+W2/W3/W4" (that ADR's Consequences). [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s
+W2 is the workstream that closes the `aggregate` half of that gap. This ADR's original "Decision"
+section, above, declared: "`Set` has no merge implemented here because `HyperLogLog`
+(`crates/logit-core/src/metric.rs`) is still a method-less stub — a design gap, not a decision this
+ADR is re-litigating," and its "Pass through, never drop" rule named "any metric kind with no
+defined merge rule here (`Set`, `Histogram`, `Summary`)" as forwarded untouched. `Samples`/
+`SetMembers` didn't exist yet when that was written, but inherited the same fate the moment
+`metrics-model-v2` added them: no merge rule, pass through.
+
+**`Samples`, `SetMembers`, and `Set` now all have real merge rules — a `HyperLogLog` (wrapping
+`cardinality-estimator`) is real state, not a stub, and only `Histogram`/`ExponentialHistogram`/
+`Summary`/a cumulative `Sum` remain pass-through.**
+
+### Two modes per raw/summarized pair, and their caps
+
+`ComponentKind::Aggregate` gains two independent mode switches, mirroring each other:
+`distributions: sketch | samples` (default `sketch`) for the `Samples`/`Distribution` pair, and
+`sets: estimate | members` (default `estimate`) for the `SetMembers`/`Set` pair
+(`crates/logit-config/src/lib.rs`). Each mode picks the accumulator a fresh series opens with
+(`Accumulator::new_for`), not what merges into it once open — an incoming record's own kind still
+drives the merge match in `process` regardless of mode.
+
+- **`distributions: sketch`** (the default): every `Samples` value sketches directly into the
+  series' `DdSketch` via `Samples::sketch`'s weighting rule (`add_weighted(v, weight)`, `weight =
+  round(1/sample_rate)` clamped to `[1, Samples::MAX_WEIGHT]`) — no raw values ever survive past
+  the absorb. `weight == Samples::MAX_WEIGHT` counts
+  `logit.transform.samples.weight_clamped` and throttle-warns `sample_rate_clamped`, the same
+  diagnostic `statsd_in` reports today (both fire on a `statsd_in -> aggregate` pipeline until W3
+  deletes `statsd_in`'s own copy).
+- **`distributions: samples`**: a series opens as `Accumulator::Samples`, seeded with the
+  *first* record's `sample_rate`, and an incoming `Samples` record concatenates its values
+  (`held.values.extend(..)`) — raw retention, bounded by `max_samples_per_series` (default `1000`).
+  Two things force an immediate, one-time conversion to `Accumulator::Distribution` (sketching
+  everything held plus the incoming record, both weighted) instead of concatenating: the incoming
+  record's `sample_rate` disagreeing with the series' first one (`logit.transform.samples.fallback
+  {reason="rate_mismatch"}`, diagnostic `samples_rate_mismatch`), or the concatenation growing past
+  `max_samples_per_series` (`logit.transform.samples.fallback{reason="cap"}`, diagnostic
+  `samples_cap_exceeded`). Either fallback is counted and diagnosed exactly once per triggering
+  record — the fallback-and-count rule this amendment applies uniformly. A `samples`-mode series
+  that meets an already-summarized incoming `Distribution` (a relay hop past an upstream `aggregate`)
+  converts the same way, unconditionally, with no fallback counter of its own — there's nothing to
+  fall back *from* raw retention when the incoming record was never raw to begin with.
+- **`sets: estimate`** (the default): every `SetMembers` member inserts directly into the series'
+  `HyperLogLog` (`insert`, idempotent per member) — no exact membership survives past the absorb.
+- **`sets: members`**: a series opens as `Accumulator::SetMembers`, and an incoming `SetMembers`
+  record unions in, deduplicated, preserving insertion order (linear `contains` scan — bounded by
+  the cap, so this stays cheap), bounded by `max_set_members_per_series` (default `1000`). Growing
+  past the cap converts to a fresh `HyperLogLog` (inserting every held-plus-incoming member, so the
+  union stays correct across the conversion) and counts
+  `logit.transform.set_members.fallback{reason="cap"}`, diagnostic `set_members_cap_exceeded` — the
+  same fallback-and-count rule as the `samples` cap case, with no rate-mismatch analog (a set
+  member has no sample rate to disagree about). A `members`-mode series meeting an already-
+  summarized incoming `Set` converts the same unconditional way `samples`-mode does for an incoming
+  `Distribution`.
+
+### Why a mismatched `sample_rate` forces a sketch
+
+`Samples` carries one `sample_rate` for its whole batch of raw values (statsd's own shape: one
+`@rate` suffix per line). A `samples`-mode accumulator has to pick *one* rate to report if it never
+falls back — its `into_kind` emits a single `MetricKind::Samples { sample_rate, .. }` — and there is
+no correct single rate to report for two merged batches sampled at different rates: reporting
+either one misrepresents the other's contribution, and averaging the two rates doesn't correspond
+to any real extrapolation a consumer could apply uniformly across the concatenated values. Sketching
+immediately sidesteps the question entirely: `Samples::sketch`'s per-value weighting already applies
+each batch's own rate before the values are folded together, so the *sketch* — unlike a raw
+`Samples` accumulator — has no single-rate representation to be wrong about.
+
+### Why `Samples`/`SetMembers`/`Set` series tumble regardless of `gauge_retention`
+
+Gauge retention exists for one reason, named in this ADR's earlier amendment: a gauge is
+*semantically sticky* — a single logical value a sender updates over time and expects to persist —
+so a relative adjustment arriving in a later window has to resolve against the value retention kept
+alive. Nothing about that reasoning applies to `Samples`, `SetMembers`, or `Set`: each window's raw
+samples, raw members, or cardinality estimate is that window's own self-contained observation, with
+no "current value" a later window's data is relative to (the same "a counter has no current value
+between windows" reasoning this ADR's gauge-retention amendment already used to explain why
+retention applies to gauges and not counters). `flush` never places a `Samples`/`SetMembers`/`Set`
+accumulator into `survivors` — only `is_gauge && self.gauge_retention > 0` does — so every one of
+these series drains on every flush exactly like a counter does, even with `gauge_retention` set to a
+large value.
+
+### The `(resource, scope)` group key, and `FlushOutput` carrying scope
+
+`ResourceGroup` now keys `group_for` on `(resource value, scope value)`, not resource value alone —
+`Aggregator::observe_scope` (a `Transform` trait method, alongside the existing
+`observe_batch_context`) records the incoming batch's scope once per batch, the same per-batch-not-
+per-event shape `observe_batch_context` already uses, and every metric absorbed from that batch
+groups under it. `Transform::flush`'s return type, `FlushOutput`, grew a matching field: it was
+`Vec<(Arc<Resource>, Vec<FlushedEvent>)>`, stamping every flushed batch's scope `None` regardless of
+what scope actually fed it (`crates/logit-pipeline/src/runtime.rs`'s `run_flush` had nowhere to get
+one from); it is now `Vec<(Arc<Resource>, Option<Arc<Scope>>, Vec<FlushedEvent>)>`, one entry per
+`(resource, scope)` group, each carrying the scope every series in it shares. This closes the
+`otlp_in -> aggregate -> otlp_out` scope-loss gap `docs/plans/lossless-transit.md`'s W2 tracked:
+before this, an `aggregate` stage between two OTLP legs silently dropped which instrumentation scope
+a metric came from, even though nothing about tumbling-window aggregation requires losing it. Two
+batches sharing a resource but carrying different scopes now flush as two distinct groups, each
+tagged with its own scope, rather than folding together or losing scope identity to `None`.
+
+### The remaining pass-through set
+
+After this amendment, exactly four metric kinds still have no defined merge rule and pass through
+`process` untouched: a cumulative `Sum` (only a *delta* `Sum` merges — the same distinction this
+ADR's original "Per-kind merge" rule already drew for `Counter`), `Histogram`,
+`ExponentialHistogram`, and `Summary`. `process`'s pass-through `matches!` and
+`Accumulator::new_for`'s `unreachable!` arm are kept in sync by comment, deliberately, the same
+"kept in sync... a mismatch between the two is a runtime panic, not a compile error" shape this
+codebase already uses elsewhere for exactly this kind of paired exhaustiveness.
+
+See `crates/logit-transforms/src/aggregate.rs`'s `process`/`flush`/`Accumulator` for the
+implementation, and its test module for the shapes this amendment adds coverage for:
+`remaining_pass_through_kinds_survive_process_untouched` (the four kinds above, split out now that
+`Samples`/`SetMembers`/`Set` no longer belong in the same test) and its three siblings
+`samples_is_not_in_the_pass_through_matches`/`set_members_is_not_in_the_pass_through_matches`/
+`set_is_not_in_the_pass_through_matches`; `samples_sketch_mode_merges_weighted_values_and_counts_weight_clamp`,
+`samples_mode_concatenates_values_and_into_kind_emits_samples`,
+`samples_mode_rate_mismatch_falls_back_to_distribution_and_counts`,
+`samples_mode_cap_exceeded_falls_back_to_distribution_and_counts`, and
+`samples_accumulator_converts_to_distribution_on_an_incoming_distribution` for the `distributions`
+modes and their fallbacks; `set_estimate_mode_merges_hyperloglogs_and_estimates_distinct_members`,
+`set_merge_of_two_series_is_a_union`, `set_members_mode_dedups_preserving_insertion_order`,
+`set_members_mode_cap_exceeded_falls_back_to_set_and_counts`, and
+`set_members_accumulator_converts_to_set_on_an_incoming_set` for the `sets` modes and their
+fallback; `a_samples_series_never_survives_a_flush_even_with_gauge_retention_enabled` and
+`a_set_members_series_never_survives_a_flush_even_with_gauge_retention_enabled` for tumbling
+regardless of retention; and `same_resource_different_scope_flush_as_two_groups_carrying_their_scope`
+for the `(resource, scope)` group key.

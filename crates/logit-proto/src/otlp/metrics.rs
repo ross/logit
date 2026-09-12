@@ -33,17 +33,18 @@
 //! |   |   | module's choice. A `Samples`/`Distribution` degrading into a `Summary` below loses its
 //! |   |   | exemplars for the same reason. |
 //! | `Samples(s)` | `Summary` of 5 fixed quantiles (p50/p75/p90/p95/p99) | **Lossy, deliberately**
-//! |   |   | -- sketched into a temporary `DdSketch` first (`add_weighted` per value, weighted by
+//! |   |   | -- sketched into a temporary `DdSketch` first ([`Samples::sketch`], weighted by
 //! |   |   | `(1/sample_rate).round()` clamped to `[1, 1000]`), then takes the same degraded path
 //! |   |   | `Distribution` does. Counted via `logit.output.metrics.degraded{metric_kind="samples"}`. |
 //! | `Distribution(sketch)` | `Summary` of 5 fixed quantiles (p50/p75/p90/p95/p99) | **Lossy,
 //! |   |   | deliberately** -- see the module doc's "Lossy metric kinds" note below. Counted via
 //! |   |   | `logit.output.metrics.degraded{metric_kind="distribution"}`. |
-//! | `SetMembers(members)` | **skipped** | No cardinality to compute from raw members without a
-//! |   |   | real HLL wired up -- same shape as `Set`'s skip. Counted via
+//! | `SetMembers(members)` | **skipped** | OTLP has no cardinality-estimate wire type to encode a
+//! |   |   | set into at all -- same reason `Set` skips below, not a "no real HLL" limitation
+//! |   |   | (`HyperLogLog` is real, `docs/plans/lossless-transit.md`'s W2). Counted via
 //! |   |   | `logit.output.metrics.skipped{metric_kind="set_members"}`. |
-//! | `Set(hll)` | **skipped** | No cardinality to read (`HyperLogLog` is still a stub) -- same
-//! |   |   | precedent `crates/logit-outputs/src/influxdb.rs` already sets for the same kind.
+//! | `Set(hll)` | **skipped** | Same reason -- OTLP has no cardinality-estimate concept on the
+//! |   |   | wire, so there's nowhere to put `hll.estimate()` even though it's a real number now.
 //! |   |   | Counted via `logit.output.metrics.skipped{metric_kind="set"}`, throttled-warned. |
 //!
 //! `Samples`/`Distribution`/`SetMembers`/`Set` are the qualification [ADR `committed-pregenerated-otlp-protobuf`](../../../../docs/adr/committed-pregenerated-otlp-protobuf.md)
@@ -302,14 +303,10 @@ pub(crate) fn encode_metric(
         MetricKind::Samples(s) => {
             telemetry.count("logit.output.metrics.degraded", 1.0, &[("metric_kind", "samples")]);
             // Sketch first, then take the same degraded path `Distribution` does -- see the
-            // module doc. `Samples::weight` extrapolates a sampled statsd timing/histogram line
-            // the same way `crates/logit-inputs/src/statsd.rs` does for its own sketch, bounded
-            // and NaN-safe against a hostile or malformed rate.
-            let weight = s.weight();
-            let mut sketch = DdSketch::new();
-            for v in &s.values {
-                sketch.add_weighted(*v, weight);
-            }
+            // module doc. `Samples::sketch` weights each value by `Samples::weight`, the same
+            // bounded, NaN-safe extrapolation `crates/logit-inputs/src/statsd.rs` applies for its
+            // own sketch.
+            let sketch = s.sketch();
             pb::metric::Data::Summary(pb::Summary {
                 data_points: vec![distribution_summary_point(
                     attributes,

@@ -24,7 +24,7 @@ mod trace_context;
 
 use logit_core::Value;
 
-pub use aggregate::Aggregator;
+pub use aggregate::{Aggregator, Distributions, Sets};
 pub use attributes::{DropAttributes, HasAttributes};
 pub use csv::CsvParser;
 pub use json::JsonParser;
@@ -321,7 +321,7 @@ mod chained_pipeline_test {
 
         let flushed = agg.flush(1_000_000_000);
         assert_eq!(flushed.len(), 1, "one resource group");
-        let (_, events) = &flushed[0];
+        let (_, _, events) = &flushed[0];
         assert_eq!(events.len(), 3, "three distinct series -- nothing else");
 
         for (series_event, _links) in events {
@@ -430,7 +430,7 @@ mod chained_pipeline_test {
 
         let flushed = agg.flush(1_000_000_000);
         assert_eq!(flushed.len(), 1, "one resource group");
-        let (_, events) = &flushed[0];
+        let (_, _, events) = &flushed[0];
         assert_eq!(events.len(), 3, "three distinct series -- nothing else");
 
         for (series_event, _links) in events {
@@ -598,7 +598,7 @@ mod chained_pipeline_test {
 
         let flushed = agg.flush(1_000_000_000);
         assert_eq!(flushed.len(), 1, "one resource group");
-        let (_, events) = &flushed[0];
+        let (_, _, events) = &flushed[0];
         assert_eq!(events.len(), 2, "two distinct series");
         for (series_event, _links) in events {
             let tags: Vec<&str> = series_event.attributes.iter().map(|(k, _)| resolve(k)).collect();

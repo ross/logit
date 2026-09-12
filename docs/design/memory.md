@@ -236,6 +236,8 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `aggregate` absorb (no `keep`) | **4** | one per metric — the map no longer fits inline |
 | `aggregate` flush 4 series | **6** | +4 since flush-side trace linking landed (ADR `trace-context-propagation-on-delivered`) — one `Vec<SpanLink>` per series, see below |
 | `aggregate` flush 100 retained gauge series (spilled attrs) | **209** | `gauge_retention > 0` only — see below; the default (`0`) tumbling path above is unaffected |
+| `aggregate` absorb 1 `Samples` event (`distributions: sketch`, the default) | **0** | every value sketches directly into the series' `DdSketch` via `Samples::sketch`'s weighting -- no raw values are ever retained, so absorbing into an already-open sketch is as free as `distributions_merge_via_ddsketch` already is |
+| `aggregate` absorb 25 `Samples` values into one series (`distributions: samples`) | **1** | `SAMPLES_INLINE` is 19 -- a series already holding a few inline values that then absorbs 25 more in one record spills the accumulator's `SmallVec` on that call; the warm/still-inline case (a few values) pays nothing |
 | **full ingest chain, 1 line** | **5** | decode → aggregate; was 11 before `json`'s fix |
 | `Event::clone` (nginx shape) | **4** | what each extra fan-out branch costs |
 | `Event::clone` (statsd shape) | **0** | fits entirely inline |
@@ -954,8 +956,10 @@ estimate close to zero despite genuinely holding hundreds of bytes per event. On
 batch's attribute keys/values, log bodies, span-owned data (name, every `SpanEvent`/`SpanLink`'s own
 backing storage and attributes, and -- since ADR `metrics-model-v2` -- a boxed `SpanExt`'s own
 size), and metric records (name/unit/description symbols, exemplars, a spilled `Samples`'s heap
-capacity, `SetMembers`'s own member byte lengths, and `Histogram`/`ExponentialHistogram`'s bucket
-`Vec`s), plus its `Resource`'s and, if present, its `Scope`'s attributes, each counted once per
+capacity, a `Set`'s `HyperLogLog::heap_bytes()` -- real state now, not the zero-sized stub it used
+to be (`docs/plans/lossless-transit.md`'s W2) -- `SetMembers`'s own member byte lengths, and
+`Histogram`/`ExponentialHistogram`'s bucket `Vec`s), plus its `Resource`'s and, if present, its
+`Scope`'s attributes, each counted once per
 batch rather than once per event (both are `Arc`-shared across the batch, not copied per event). It
 is an admission-control estimate, not an allocator-accounting figure — unlike §1's numbers, it is
 *not* asserted exactly anywhere, and is deliberately exempt from `type_sizes.rs`/`allocations.rs`'s

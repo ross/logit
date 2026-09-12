@@ -27,13 +27,34 @@ already built that have a known, accepted rough edge.
   that shape natively. Sampling, throttling, dedup, and anything needing an actual operator
   (`>=`, `contains`, cross-attribute comparison) remain Lua-only; the gap above still applies to
   them unchanged.
-- **`HyperLogLog` is a stub** (`crates/logit-core/src/metric.rs`) — no methods, just a placeholder
-  pending a real crate (`cardinality-estimator` is the candidate). Consequences: statsd's `s` (set)
-  metric type is a clear decode error rather than silently losing data
-  (`crates/logit-inputs/src/statsd.rs`); `logit-transforms::Aggregator` passes `MetricKind::Set`
-  through unaggregated rather than fake-merging it
-  ([ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)); `logit-outputs::influxdb` errors on it
-  rather than writing a wrong encoding. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+- **`HyperLogLog` is real now; statsd still has no producer for it.** [`docs/plans/lossless-transit.md`](plans/lossless-transit.md)'s
+  W2 gave `HyperLogLog` (`crates/logit-core/src/metric.rs`) a real implementation wrapping the
+  `cardinality-estimator` crate — merge (union), `estimate()`, and a canonical `to_bytes`/`from_bytes`
+  pinned to that crate's version, no longer a method-less placeholder. `logit-transforms::Aggregator`
+  now really merges `MetricKind::SetMembers` into a `Set` (`sets: estimate`, the default) or retains
+  an exact deduplicated member set (`sets: members`, bounded by `max_set_members_per_series`, falling
+  back to an estimate on overflow) — see [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s
+  amendment for the full design; `logit-outputs::influxdb` renders a `Set`'s estimate as a `value=`
+  field instead of erroring, and `logit-outputs::stdio` renders `set=<estimate>`. What's still open:
+  statsd's `s` (set) metric type is still a clear decode error, not silently losing data
+  (`crates/logit-inputs/src/statsd.rs`) — no *producer* for `SetMembers`/`Set` until W3 wires up `s`
+  the same way `ms`/`h`/`d` already produce `Samples`/`Distribution`. Tracked as debt against
+  [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+- **`HyperLogLog::from_bytes` (`crates/logit-core/src/metric.rs`) works around an upstream
+  allocation-layout bug in `cardinality-estimator` 1.0.3, not just a byte-shape mismatch.** That
+  crate's `Array::from_vec` rounds a deserialized `Vec<u32>`'s length up to the next power of two,
+  `resize`s to it, then later frees the representation with a `Box::from_raw` sized to that rounded
+  length -- if the `Vec` handed in carries more spare capacity than the rounded length (routine when
+  serde's blanket `Vec<T>` deserializer allocates with the *unrounded* element count as its
+  `Vec::with_capacity` hint), the eventual dealloc uses the wrong `Layout`: undefined behavior,
+  reachable through ordinary native `METRIC_SET` decoding, not just a crafted blob. `HllBytesReader`
+  fixes this on our side by reporting the already-rounded capacity as `serde::de::SeqAccess::size_hint`
+  for the members list (so the initial allocation is already the size the crate will settle on) and
+  by bounding the claimed member count before allocating at all. See `HyperLogLog`'s own doc comment
+  and `HllBytesReader`'s (same file) for the full mechanism, and
+  `hyperloglog_round_trips_non_power_of_two_member_counts` for the pinning test. Pinned to
+  `cardinality-estimator` 1.0.3; the upstream fix would be `into_boxed_slice`/`shrink_to_fit` in
+  `Array::from_vec` so the freed layout always matches the `Vec`'s own capacity by construction.
 - **Native wire protocol: the format and the transport are both done; credit-based flow control,
   QUIC, and an OTLP passthrough codec aren't.** `crates/logit-proto/src/frame.rs`/`src/native/`
   (the codec, [ADR `native-wire-format-encoding`](adr/native-wire-format-encoding.md)) and
@@ -889,7 +910,7 @@ already built that have a known, accepted rough edge.
   | Direction | Mapping | Counter | Why |
   |---|---|---|---|
   | encode | `MetricKind::Distribution` (a `DDSketch`) → OTLP `Summary` of 5 fixed quantiles (p50/p75/p90/p95/p99) | `logit.output.metrics.degraded{metric_kind="distribution"}` | OTLP has no mergeable-sketch metric type; `ExponentialHistogram` is the nearest shape, but `DDSketch` exposes no bin iteration to convert from (`crates/logit-core/src/metric.rs`), and fabricating one would repeat the "non-mergeable HyperLogLog" mistake AGENTS.md already warns against (`crates/logit-proto/src/otlp/metrics.rs`'s module doc). |
-  | encode | `MetricKind::Set` (a `HyperLogLog`) → skipped entirely | `logit.output.metrics.skipped{metric_kind="set"}` | `HyperLogLog` is still a stub with no cardinality to read (this file's own first entry) — matches `crates/logit-outputs/src/influxdb.rs`'s existing precedent for the same kind. |
+  | encode | `MetricKind::Set` (a `HyperLogLog`) → skipped entirely | `logit.output.metrics.skipped{metric_kind="set"}` | OTLP has no cardinality-estimate wire type to encode a `HyperLogLog` into (`HyperLogLog` is real now, this file's own first entry — the gap is OTLP's, not this crate's); `crates/logit-outputs/src/influxdb.rs` no longer shares this precedent, since it now renders a `Set`'s estimate as a `value=` field instead of erroring. |
   | encode | `Value::U64` above `i64::MAX` → OTLP `AnyValue.DoubleValue` | none (numeric, not a metric point) | OTLP's only integer type is signed 64-bit; exact up to `f64`'s 2^53 range, approximate above it. Any `Value::U64` (even in range) also loses the "this was unsigned" fact on decode, coming back as `Value::I64` — `otlp/common.rs`'s module doc has the full case list. |
   | encode | `Value::Timestamp` → OTLP `AnyValue.IntValue` | none | OTLP's `AnyValue` has no timestamp variant at all; decodes back as `Value::I64`, indistinguishable from a value that was always an integer. |
   | encode | `MetricKind::Samples` (raw statsd `ms`/`h`/`d` observations) → OTLP `Summary` of 5 fixed quantiles (p50/p75/p90/p95/p99), sketched into a temporary `DdSketch` first | `logit.output.metrics.degraded{metric_kind="samples"}` | Same shape as the `Distribution` row above — OTLP has no raw-sample-list metric type either, so `otlp_out` sketches first (`add_weighted` per value, weighted by `(1/sample_rate).round()` clamped to `[1, 1000]`) and takes the same degraded path ([ADR `metrics-model-v2`](adr/metrics-model-v2.md)). |
@@ -914,7 +935,7 @@ already built that have a known, accepted rough edge.
   Both `Distribution`→`Summary` and `Set`→skip are a real, if narrow, qualification of
   [ADR `native-wire-format-with-otlp-bridge`](adr/native-wire-format-with-otlp-bridge.md)'s claim that the internal model "must
   be a superset of what OTLP can express, or the OTLP codec becomes lossy": here it's `logit`'s own
-  model — a mergeable sketch, a cardinality stub — that can't be losslessly re-expressed *as* OTLP,
+  model — a mergeable sketch, a mergeable cardinality estimator — that can't be losslessly re-expressed *as* OTLP,
   the direction ADR `native-wire-format-with-otlp-bridge` didn't anticipate. See
   [ADR `committed-pregenerated-otlp-protobuf`](adr/committed-pregenerated-otlp-protobuf.md)'s Consequences section for that
   qualification stated plainly, and `crates/logit-proto/src/otlp/metrics.rs`'s module doc for the

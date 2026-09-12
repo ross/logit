@@ -38,7 +38,7 @@ fn statsd_gauge_then_delta_resolves_through_aggregate() {
 
     let flushed = agg.flush(1_000_000_000);
     assert_eq!(flushed.len(), 1);
-    let (_, events) = &flushed[0];
+    let (_, _, events) = &flushed[0];
     assert_eq!(events.len(), 1);
     let (event, _links) = &events[0];
     match event.metrics[0].kind {

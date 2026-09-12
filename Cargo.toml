@@ -64,6 +64,14 @@ base64 = "0.22.1"
 clap = { version = "4", features = ["derive", "env"] }
 serde_norway = "0.9"
 sketches-ddsketch = "0.4"
+# `logit-core::metric::HyperLogLog` (docs/plans/lossless-transit.md's W2) -- a real, mergeable
+# cardinality estimator for `MetricKind::Set`, replacing the stub. Apache-2.0, in `deny.toml`'s
+# allowlist. Its `CardinalityEstimator` has no `as_bytes`/`to_bytes` of its own -- only a
+# tuple-shaped `serde::Serialize`/`Deserialize` impl behind the `with_serde` feature -- so
+# `HyperLogLog::to_bytes`/`from_bytes` drive that impl through a small hand-rolled `serde`
+# `Serializer`/`Deserializer` pair in `metric.rs` rather than pulling in a second new crate (a
+# data-format crate like `postcard`/`serde_json`) just to get bytes out.
+cardinality-estimator = { version = "1.0.3", features = ["with_serde"] }
 # rustls, not the default native-tls/OpenSSL backend -- keeps "no host toolchain needed"
 # (ADR `containerized-development`) intact, since rustls has no system OpenSSL to link against.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

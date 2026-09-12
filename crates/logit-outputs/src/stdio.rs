@@ -82,8 +82,10 @@ impl EventDump {
 
     /// Renders `batch` as one readable block per event, in batch order. Never fails and never
     /// panics -- a debug sink's whole job is staying up when everything else is falling over, so
-    /// even a `Set` metric (no real encoding yet, see `logit_core::HyperLogLog`) or a
-    /// non-finite/absurd numeric value renders *something* rather than erroring.
+    /// even a non-finite/absurd numeric value renders *something* rather than erroring. `Set`
+    /// renders its `HyperLogLog` estimate (`docs/plans/lossless-transit.md`'s W2 -- real now,
+    /// no longer a stub); `SetMembers`/`ExponentialHistogram` still have no rendering asked for
+    /// here beyond what their own match arms already do.
     ///
     /// Deliberately still `&self`, with no scratch buffers held on [`EventDump`] the way
     /// `InfluxLineEncoder` holds `line`/`fields`/`tag_suffix`/`scratch` (`docs/design/memory.md`).
@@ -430,12 +432,12 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
             }
             let _ = write!(out, " count={} sum={}", s.count, s.sum);
         }
-        MetricKind::Set(_) => {
-            // `HyperLogLog` is still a stub (`logit_core::metric::HyperLogLog`,
-            // `docs/known-gaps.md`) -- there's no real value to print. A debug sink must never be
-            // the thing that fails on that, unlike `logit-outputs::influxdb`, which can afford to
-            // reject the metric outright and let the rest of the batch through.
-            out.push_str("set=<unrepresentable>");
+        MetricKind::Set(hll) => {
+            // `HyperLogLog` is real now (`logit_core::metric::HyperLogLog`, `docs/plans/
+            // lossless-transit.md`'s W2) -- render its estimate, the same "one representative
+            // number" shape `Distribution`'s own `count=` leads with.
+            out.push_str("set=");
+            let _ = write!(out, "{}", hll.estimate());
         }
     }
     if let Some(unit) = metric.unit {
@@ -1192,10 +1194,13 @@ mod tests {
     }
 
     #[test]
-    fn set_renders_unrepresentably_rather_than_erroring() {
-        let out =
-            encode(vec![metric_event(0, "unique.users", MetricKind::Set(HyperLogLog::default()))]);
-        assert!(out.contains("unique.users set=<unrepresentable>"), "got: {out}");
+    fn set_renders_its_hyperloglog_estimate() {
+        let mut hll = HyperLogLog::default();
+        hll.insert(b"a");
+        hll.insert(b"b");
+        hll.insert(b"a"); // idempotent -- must not inflate the estimate
+        let out = encode(vec![metric_event(0, "unique.users", MetricKind::Set(hll))]);
+        assert!(out.contains("unique.users set=2"), "got: {out}");
     }
 
     /// A debug sink never drops (unlike `influxdb_out`/`statsd_out`, which skip and count a

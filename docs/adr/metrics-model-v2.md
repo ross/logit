@@ -235,3 +235,31 @@ just enough room inside the existing 176-byte envelope for `MetricKind`'s discri
   `otel.status_message` exactly as the bullet above promised: `EventBatch.scope` and
   `SpanExt.status_message` are real producers on both sides of the OTLP codec now, and neither
   attribute is stamped or read anywhere in the codec any more.
+- **(2026-09-11) W2 landed, closing this ADR's own "pass-through... until W2/W3/W4" qualification
+  for `HyperLogLog`/`Set`.** [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W2
+  gave `HyperLogLog` (`crates/logit-core/src/metric.rs`) a real implementation, wrapping
+  `cardinality_estimator::CardinalityEstimator<[u8]>` (the `cardinality-estimator` crate, pinned at
+  `1.0.3`, permitted by `deny.toml`'s license allowlist) instead of the "still a unit-payload stub"
+  this ADR's Decision section described above. `HyperLogLog::to_bytes`/`from_bytes` hand-roll a
+  small byte codec around the wrapped type's own `serde` impl (enabled via its `with_serde`
+  feature) — the only shape that impl ever writes, a `(data: u64, members: Option<Vec<u32>>)` pair
+  — and `to_bytes` canonicalizes the leading `data` word (masking every bit but the low 2
+  representation-tag bits whenever a `members` list follows) so two estimators holding the same
+  members serialize identically regardless of allocation address; this makes `to_bytes` the pinned
+  wire/disk representation the native codec's `METRIC_SET` payload now carries
+  (`crates/logit-proto/src/native/record.rs`), replacing the previous empty (0-byte) `Set` payload.
+  These bytes are **pinned to this crate's `cardinality-estimator` dependency version**, with no
+  cross-version compatibility guarantee — acceptable pre-release, unlike `DdSketch::to_java_bytes`,
+  which was always meant as a portable interchange format. `PartialEq` (no longer a trivial derive
+  on a unit payload) compares via `to_bytes`, the same "compare via the canonical byte form"
+  precedent `DdSketch`'s own `PartialEq` already set via `to_java_bytes` — with the same caveat that
+  precedent carries: both the "small" `data` encoding and the "array"/"HyperLogLog" `members`
+  ordering are insertion-order-dependent, not canonical, so two estimators holding the same members
+  inserted in a different order can compare unequal here even though `estimate()` would agree; every
+  equality-checking test in `metric.rs` controls insertion order for exactly this reason.
+  `logit_core::Samples::sketch(&self) -> DdSketch` (weighting each value by `Samples::weight`,
+  itself moved here from three separate call sites' ad hoc duplication) is the analogous real method
+  on the `Distribution`/`Samples` pair's raw side, now used by `otlp/metrics.rs`, `outputs/
+  influxdb.rs`, and `aggregate`'s own sketch-mode absorb alike. See `docs/adr/
+  aggregation-window-semantics.md`'s own amendment for `aggregate`'s side of W2 (the `distributions`/
+  `sets` modes, their caps, and the fallback-and-count rule).
