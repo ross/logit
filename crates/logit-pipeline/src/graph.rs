@@ -4542,11 +4542,9 @@ mod tests {
 
     #[test]
     fn a_collectd_in_resolves_as_an_implemented_listener() {
-        let graph = resolve(cfg(vec![
-            ("in", vec![], collectd_in(vec![])),
-            ("out", vec!["in"], sink()),
-        ]))
-        .expect("a collectd_in should resolve");
+        let graph =
+            resolve(cfg(vec![("in", vec![], collectd_in(vec![])), ("out", vec!["in"], sink())]))
+                .expect("a collectd_in should resolve");
         assert_eq!(graph.components["in"].role(), Role::Listener);
         assert_eq!(graph.components["in"].kind_name(), "collectd_in");
     }

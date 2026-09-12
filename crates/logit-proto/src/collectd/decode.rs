@@ -1137,8 +1137,11 @@ pub(crate) mod tests {
         let mut decoder = decoder.with_types_db(types_db());
         let mut out = Vec::new();
         decoder.decode_into(bytes, RECEIVED_AT, &mut out).expect("decode must succeed");
-        let names =
-            out[0].metrics.iter().map(|record| resolve(record.name).to_string()).collect::<Vec<_>>();
+        let names = out[0]
+            .metrics
+            .iter()
+            .map(|record| resolve(record.name).to_string())
+            .collect::<Vec<_>>();
         (names, registry)
     }
 

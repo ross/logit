@@ -448,7 +448,11 @@ fn types_db_names_do_not_affect_the_fixed_point() {
     named.decode_into(packet, RECEIVED_AT, &mut named_events).expect("must decode");
 
     let names = |events: &[Event]| -> Vec<String> {
-        events[0].metrics.iter().map(|r| logit_core::interner::resolve(r.name).to_string()).collect()
+        events[0]
+            .metrics
+            .iter()
+            .map(|r| logit_core::interner::resolve(r.name).to_string())
+            .collect()
     };
     assert_eq!(names(&plain_events), vec!["load.load.0", "load.load.1", "load.load.2"]);
     assert_eq!(
@@ -466,9 +470,26 @@ fn types_db_names_do_not_affect_the_fixed_point() {
         );
     }
 
-    // And each is a fixed point in its own right -- a name that survives its own round trip.
+    // The `types.db`-named batch is a fixed point too -- against a decoder holding the same file,
+    // which is what a real `collectd_in` with `types_db:` configured is. (It is deliberately *not*
+    // checked through `assert_fixed_point`, whose decoder has no `types.db`: that round trip comes
+    // back index-named, which is the display-only property this test is about rather than a
+    // fidelity break -- the bytes above are identical either way.)
+    let named_batch = batch(named_events.clone());
+    for cap in CAPS {
+        let mut decoder = CollectdDecoder::new(resource.clone())
+            .with_types_db(Arc::new(TypesDb::parse(TEST_TYPES_DB).expect("parses")));
+        let mut decoded = Vec::new();
+        for packet in encode_at(&named_batch, cap) {
+            decoder
+                .decode_into(Bytes::from(packet), RECEIVED_AT, &mut decoded)
+                .expect("every datagram this encoder writes must decode");
+        }
+        assert_eq!(decoded, named_events, "cap {cap}: decode(encode(b)) must equal b");
+    }
+
+    // The index-named batch is one against an ordinary decoder, as every other fixture here is.
     assert_fixed_point(batch(plain_events));
-    assert_fixed_point(batch(named_events));
 }
 
 // -- the generated grammar -------------------------------------------------------------------

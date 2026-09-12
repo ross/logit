@@ -346,8 +346,7 @@ fn bind_first_available(
     for &addr in addrs {
         match bind_one(addr, receive_buffer_bytes) {
             Ok(bound) => {
-                let socket =
-                    finish_bind(bound.socket, receive_buffer_bytes, telemetry, diag)?;
+                let socket = finish_bind(bound.socket, receive_buffer_bytes, telemetry, diag)?;
                 return Ok((socket, bound.multicast_group));
             }
             Err(err) => last_err = Some(err),
@@ -404,9 +403,7 @@ fn bind_one(
         return Ok(Bound { socket, multicast_group: None });
     }
 
-    socket
-        .set_reuse_address(true)
-        .context("setting SO_REUSEADDR, which a multicast bind needs")?;
+    socket.set_reuse_address(true).context("setting SO_REUSEADDR, which a multicast bind needs")?;
     let local: SocketAddr = match group {
         IpAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, addr.port()).into(),
         IpAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, addr.port()).into(),
@@ -1070,11 +1067,10 @@ mod tests {
         }
 
         let mut buf = [0u8; 64];
-        let (len, _from) =
-            tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
-                .await
-                .expect("a datagram sent to a joined group must arrive")
-                .expect("recv_from should succeed");
+        let (len, _from) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+            .await
+            .expect("a datagram sent to a joined group must arrive")
+            .expect("recv_from should succeed");
         assert_eq!(&buf[..len], b"hello group");
     }
 

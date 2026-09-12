@@ -252,7 +252,9 @@ pub enum TypesDbError {
     UnnamedDataSource { line: usize, spec: String },
     #[error("line {line}: unknown data-source kind '{kind}', expected COUNTER, GAUGE, DERIVE or ABSOLUTE")]
     UnknownKind { line: usize, kind: String },
-    #[error("line {line}: data source '{name}' has a {bound} of '{value}', expected a number or 'U'")]
+    #[error(
+        "line {line}: data source '{name}' has a {bound} of '{value}', expected a number or 'U'"
+    )]
     BadBound { line: usize, name: String, bound: &'static str, value: String },
 }
 
