@@ -924,6 +924,32 @@ pub enum ComponentKind {
         #[schemars(with = "String")]
         connect_timeout: Duration,
     },
+    /// collectd binary-protocol (`network` plugin) egress -- the mirror of `collectd_in`, and a
+    /// real relay: identity, values, and kinds round-trip through the real decoder on the other
+    /// end. See `docs/adr/collectd-binary-relay.md`. **UDP only** -- collectd's own `network`
+    /// plugin has no TCP mode to relay onto, unlike `statsd_out`/`syslog_out`.
+    CollectdOut {
+        /// `host:port`. Resolved at send time, never at config-load time -- the same
+        /// `statsd_out`/`syslog_out` precedent.
+        endpoint: String,
+        /// Bounds one UDP datagram's worth of packed value lists -- not a single list's length.
+        /// Defaults to `"1452"`, collectd's own `MaxPacketSize` default (a 1500-byte Ethernet MTU
+        /// minus the IPv4 and UDP headers minus a little headroom). A string via [`human_bytes`],
+        /// exactly like `StatsdOut::max_packet_bytes`.
+        #[serde(default = "default_collectd_max_packet_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_packet_bytes: u64,
+        /// Used only when an event carries neither `collectd.host` nor `host.name` -- e.g. an
+        /// event that never passed through `collectd_in`. Omitted entirely (rather than an
+        /// OS-hostname read or a literal `"logit"` placeholder) so a relayed list's origin is
+        /// never silently overwritten with something that looks like a config mistake -- the same
+        /// reasoning `SyslogOut::hostname` gives for its own field. With nothing configured and
+        /// nothing on the event, such a list is dropped and counted (`logit.output.metrics.
+        /// skipped{reason="no_host"}`): collectd's receiver rejects an empty host outright, and
+        /// there is no honest substitute for one.
+        #[serde(default)]
+        hostname: Option<String>,
+    },
     /// Scrapes Prometheus `/metrics` endpoints on `interval`, the way Prometheus's own server
     /// does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each
     /// target's response declares via its own `Content-Type`. Always synthesizes `up`,
@@ -1241,6 +1267,12 @@ fn default_statsd_max_packet_bytes() -> u64 {
 /// reason as [`default_syslog_connect_timeout`].
 fn default_statsd_connect_timeout() -> Duration {
     Duration::from_secs(5)
+}
+
+/// Mirrors `logit_proto::collectd::DEFAULT_MAX_PACKET_BYTES` -- can't reference it directly, same
+/// reason as [`default_syslog_connect_timeout`]; kept in sync by hand.
+fn default_collectd_max_packet_bytes() -> u64 {
+    1452
 }
 
 /// `PrometheusIn::interval`'s default -- Prometheus's own server ships the same 15s default scrape
@@ -2914,6 +2946,54 @@ mod tests {
                 assert_eq!(max_packet_bytes, 8 * 1024);
             }
             other => panic!("expected StatsdOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collectd_out_needs_only_an_endpoint_and_defaults_max_packet_bytes_and_hostname() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "collectd_out", "sources": ["in"], "endpoint": "127.0.0.1:25826"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::CollectdOut { endpoint, max_packet_bytes, hostname } => {
+                assert_eq!(endpoint, "127.0.0.1:25826");
+                assert_eq!(max_packet_bytes, 1452, "collectd's own MaxPacketSize default");
+                assert_eq!(hostname, None);
+            }
+            other => panic!("expected CollectdOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collectd_out_max_packet_bytes_accepts_a_human_byte_string() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "collectd_out", "sources": ["in"], "endpoint": "127.0.0.1:25826",
+                "max_packet_bytes": "8KiB"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::CollectdOut { max_packet_bytes, .. } => {
+                assert_eq!(max_packet_bytes, 8 * 1024);
+            }
+            other => panic!("expected CollectdOut, got {other:?}"),
+        }
+    }
+
+    /// `hostname:` is optional and config-supplied, the same shape as `SyslogOut::hostname` --
+    /// **not** an OS-hostname read and **not** a literal `"logit"` placeholder either.
+    #[test]
+    fn collectd_out_hostname_is_optional_and_config_supplied() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "collectd_out", "sources": ["in"], "endpoint": "127.0.0.1:25826",
+                "hostname": "logit-relay"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::CollectdOut { hostname, .. } => {
+                assert_eq!(hostname, Some("logit-relay".to_string()));
+            }
+            other => panic!("expected CollectdOut, got {other:?}"),
         }
     }
 
