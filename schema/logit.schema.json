@@ -1450,6 +1450,39 @@
           }
         },
         {
+          "description": "collectd binary-protocol (`network` plugin) egress -- the mirror of `collectd_in`, and a real relay: identity, values, and kinds round-trip through the real decoder on the other end. See `docs/adr/collectd-binary-relay.md`. **UDP only** -- collectd's own `network` plugin has no TCP mode to relay onto, unlike `statsd_out`/`syslog_out`.",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "type"
+          ],
+          "properties": {
+            "endpoint": {
+              "description": "`host:port`. Resolved at send time, never at config-load time -- the same `statsd_out`/`syslog_out` precedent.",
+              "type": "string"
+            },
+            "hostname": {
+              "description": "Used only when an event carries neither `collectd.host` nor `host.name` -- e.g. an event that never passed through `collectd_in`. Omitted entirely (rather than an OS-hostname read or a literal `\"logit\"` placeholder) so a relayed list's origin is never silently overwritten with something that looks like a config mistake -- the same reasoning `SyslogOut::hostname` gives for its own field. With nothing configured and nothing on the event, such a list is dropped and counted (`logit.output.metrics. skipped{reason=\"no_host\"}`): collectd's receiver rejects an empty host outright, and there is no honest substitute for one.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max_packet_bytes": {
+              "description": "Bounds one UDP datagram's worth of packed value lists -- not a single list's length. Defaults to `\"1452\"`, collectd's own `MaxPacketSize` default (a 1500-byte Ethernet MTU minus the IPv4 and UDP headers minus a little headroom). A string via [`human_bytes`], exactly like `StatsdOut::max_packet_bytes`. Rule 38 (`docs/design/pipeline-graph.md`) rejects anything outside `1024..=65535` -- collectd's own `MaxPacketSize` range: above it, no UDP datagram can actually carry the result, so every send would fail `EMSGSIZE` silently (counted as a per-datagram drop, not a `Fault`), and below it is narrower than collectd itself allows.",
+              "default": "1452",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "collectd_out"
+              ]
+            }
+          }
+        },
+        {
           "description": "Scrapes Prometheus `/metrics` endpoints on `interval`, the way Prometheus's own server does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each target's response declares via its own `Content-Type`. Always synthesizes `up`, `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. See `docs/adr/prometheus-scrape-and-exposition.md`. A future `bind:` field on this same variant (a remote-write receiver) is planned as an additive, non-breaking change -- \"exactly one of `targets`/`bind`\" would become a graph rule once it lands, not a new kind.",
           "type": "object",
           "required": [

@@ -2280,13 +2280,13 @@ fn syslog_encode_into_100_events() {
 
 /// The one generic consumer of `logit_proto::FramedEncoder` in the tree (ADR `framed-encoder`):
 /// one warm-up call (the encoder's own struct-held scratch buffers and `out`'s backing `Vec`s
-/// reach their working capacity), then the measured call, on the same `out`. Both framed rows
-/// go through this so a third framed sink's row is one more call, not a fourth copy of the
-/// warm-then-measure pattern.
-fn measure_framed<E: FramedEncoder<Meta = ()>>(
+/// reach their working capacity), then the measured call, on the same `out`. Generic over `Meta`
+/// (not just `Meta = ()`) so `collectd_out`'s `MessageBuf<usize>` row below goes through this too --
+/// every framed sink's row is one more call, not a copy of the warm-then-measure pattern.
+fn measure_framed<M, E: FramedEncoder<Meta = M>>(
     encoder: &mut E,
     batch: &EventBatch,
-    out: &mut MessageBuf,
+    out: &mut MessageBuf<M>,
 ) -> (E::Stats, Stats) {
     let _ = encoder.encode_into(batch, out);
     measure(|| encoder.encode_into(batch, out))
@@ -2309,6 +2309,27 @@ fn statsd_encode_into_100_events() {
     assert_eq!(out.len(), 100);
     assert_eq!(stats_out, logit_outputs::statsd::EncodeStats::default());
     expect_allocs("statsd_out: encode_into 100 events", stats, 0);
+}
+
+/// Zero, fixed (was 300, ~3/event): `CollectdEncoder` already held its own reused `packet`/`list`/
+/// `values` scratch, but `pack_list`'s `last.clone_from(cur)` (`Identity`, the sticky previous-list
+/// state) fell through to `Clone`'s *default* `clone_from` -- `#[derive(Clone)]` only generates
+/// `clone()`, and the trait's own default `clone_from` is `*self = source.clone()`, which allocates
+/// a fresh `Vec` per non-empty identity field and drops `last`'s old one, every single list. A
+/// hand-written override that clears and `extend_from_slice`s each field in place instead is what
+/// brought this to 0 -- see `docs/design/memory.md`. `MessageBuf<usize>` (the per-datagram
+/// value-list count is its `Meta`) was already warm after `measure_framed`'s own warm-up call.
+#[test]
+fn collectd_encode_into_100_events() {
+    let mut encoder = fixtures::collectd_encoder()
+        .with_max_packet_bytes(logit_proto::collectd::DEFAULT_MAX_PACKET_BYTES);
+    let batch = fixtures::collectd_batch(100);
+    let mut out = MessageBuf::<usize>::default();
+
+    let (stats, alloc_stats) = measure_framed(&mut encoder, &batch, &mut out);
+    assert!(!out.is_empty());
+    assert_eq!(stats, logit_proto::collectd::EncodeStats::default());
+    expect_allocs("collectd_out: encode_into 100 events", alloc_stats, 0);
 }
 
 /// `prometheus_out`'s encode path, like `prometheus_in`'s, is two plain functions rather than a

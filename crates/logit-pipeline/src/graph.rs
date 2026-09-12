@@ -217,6 +217,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | FileOut { .. }
         | SyslogOut { .. }
         | StatsdOut { .. }
+        | CollectdOut { .. }
         | PrometheusOut { .. } => Role::Sink,
     }
 }
@@ -268,6 +269,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         FileOut { .. } => "file_out",
         SyslogOut { .. } => "syslog_out",
         StatsdOut { .. } => "statsd_out",
+        CollectdOut { .. } => "collectd_out",
         PrometheusOut { .. } => "prometheus_out",
     }
 }
@@ -315,6 +317,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::LogitIn { .. }
             | ComponentKind::LogitOut { .. }
             | ComponentKind::StatsdOut { .. }
+            | ComponentKind::CollectdOut { .. }
             | ComponentKind::PrometheusOut { .. }
     )
 }
@@ -1391,15 +1394,37 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 38: `statsd_out`'s `max_packet_bytes: 0` is rejected the same way rule 15's
-    // `max_batches`/`max_bytes: 0` is -- an impossible bound (every line would overflow it and be
-    // dropped whole), not a small one.
+    // Rule 38: `statsd_out`'s/`collectd_out`'s `max_packet_bytes: 0` is rejected the same way rule
+    // 15's `max_batches`/`max_bytes: 0` is -- an impossible bound (every line/value list would
+    // overflow it and be dropped whole), not a small one. `collectd_out` additionally rejects
+    // anything outside `1024..=65535` -- collectd's own `MaxPacketSize` range
+    // (`docs/adr/collectd-binary-relay.md`) -- because unlike `statsd_out` (which just starts a
+    // new datagram at the cap) a `collectd_out` value above the real UDP payload ceiling (65507)
+    // packs datagrams the socket can never actually send: every one fails `EMSGSIZE` at `send_to`,
+    // which `collectd_out` counts as a per-datagram drop rather than a `Fault` -- so the component
+    // would silently report `requests{class="ok"}` while delivering nothing at all. `statsd_out`
+    // makes no such range claim in its own ADR, so it keeps only the zero check above.
     for (id, component) in &components {
-        if let ComponentKind::StatsdOut { max_packet_bytes: 0, .. } = &component.kind {
+        if matches!(
+            &component.kind,
+            ComponentKind::StatsdOut { max_packet_bytes: 0, .. }
+                | ComponentKind::CollectdOut { max_packet_bytes: 0, .. }
+        ) {
             anyhow::bail!(
                 "component '{id}': max_packet_bytes: 0 would drop every metric line -- use a \
                  positive byte size"
             );
+        }
+        if let ComponentKind::CollectdOut { max_packet_bytes, .. } = &component.kind {
+            if !(1024..=65535).contains(max_packet_bytes) {
+                anyhow::bail!(
+                    "component '{id}': max_packet_bytes: {max_packet_bytes} is outside \
+                     1024..=65535 -- collectd's own MaxPacketSize range; a value above 65535 \
+                     packs datagrams no UDP socket can send (every send would fail EMSGSIZE, \
+                     silently reported as requests{{class=\"ok\"}}) and a value below 1024 is \
+                     narrower than collectd itself allows"
+                );
+            }
         }
     }
 
@@ -1790,6 +1815,14 @@ mod tests {
             relative_gauges: false,
             max_packet_bytes,
             connect_timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn collectd_out(max_packet_bytes: u64) -> ComponentKind {
+        ComponentKind::CollectdOut {
+            endpoint: "127.0.0.1:25826".to_string(),
+            max_packet_bytes,
+            hostname: None,
         }
     }
 
@@ -4233,6 +4266,65 @@ mod tests {
         let err =
             expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], statsd_out(0))]));
         assert!(err.contains("'out'") && err.contains("max_packet_bytes: 0"), "got: {err}");
+    }
+
+    #[test]
+    fn collectd_out_is_a_sink_and_is_implemented() {
+        let kind = collectd_out(1452);
+        assert_eq!(kind_name(&kind), "collectd_out");
+        assert_eq!(role(&kind), Role::Sink);
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], collectd_out(1452))]))
+            .expect("a well-formed collectd_out should resolve fine");
+    }
+
+    #[test]
+    fn a_collectd_out_with_no_sources_is_rejected() {
+        let err = expect_err(cfg(vec![("out", vec![], collectd_out(1452))]));
+        assert!(err.contains("'out'") && err.contains("sink"), "got: {err}");
+    }
+
+    /// Rule 38 (extended): `collectd_out`'s `max_packet_bytes: 0` is the same impossible bound as
+    /// `statsd_out`'s own.
+    #[test]
+    fn a_zero_max_packet_bytes_is_rejected_for_collectd_out_too() {
+        let err =
+            expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], collectd_out(0))]));
+        assert!(err.contains("'out'") && err.contains("max_packet_bytes: 0"), "got: {err}");
+    }
+
+    /// Rule 38's `collectd_out`-only range check: below collectd's own `MaxPacketSize` minimum.
+    #[test]
+    fn a_max_packet_bytes_below_1024_is_rejected_for_collectd_out() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], collectd_out(1023)),
+        ]));
+        assert!(err.contains("'out'") && err.contains("1024..=65535"), "got: {err}");
+    }
+
+    /// Rule 38's `collectd_out`-only range check: above `u16::MAX`, which no UDP datagram can
+    /// ever actually carry (every send would fail `EMSGSIZE`, silently reported as a successful
+    /// request -- the finding this range check exists to close).
+    #[test]
+    fn a_max_packet_bytes_above_65535_is_rejected_for_collectd_out() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], collectd_out(65536)),
+        ]));
+        assert!(err.contains("'out'") && err.contains("1024..=65535"), "got: {err}");
+    }
+
+    /// Both ends of `1024..=65535` are legal -- an off-by-one in the range check would reject one
+    /// of these.
+    #[test]
+    fn max_packet_bytes_at_either_bound_is_accepted_for_collectd_out() {
+        for bound in [1024u64, 65535] {
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("out", vec!["in"], collectd_out(bound)),
+            ]))
+            .unwrap_or_else(|err| panic!("bound {bound} should resolve fine, got: {err}"));
+        }
     }
 
     /// An `aggregate` with the given temporality and retention bounds -- rule 39's fixture.

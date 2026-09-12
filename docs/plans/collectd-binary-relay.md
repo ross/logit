@@ -69,12 +69,15 @@ part.rs    TYPE_*/DS_* consts, PartHeader, read_part, write_string_part/write_nu
            write_values_part
 decode.rs  CollectdDecoder { resource: Arc<Resource>, diag, name scratch }, impl
            logit_proto::Decoder
-encode.rs  CollectdEncoder, EncodeStats, Packets; sanitization; packing
+encode.rs  CollectdEncoder, EncodeStats; sanitization; packing; implements FramedEncoder
 ```
 
-`Packets` mirrors `MessageBuf`'s shape (bytes + ranges) plus a per-datagram value-list count for
-`oversize_datagram` accounting; it is its own type rather than a reuse of `MessageBuf`, which is
-private to `logit-outputs` and can't be reached from `logit-proto`.
+As landed (W3, post [ADR `framed-encoder`](../adr/framed-encoder.md)): `CollectdEncoder` implements
+`logit_proto::FramedEncoder` over `logit_proto::MessageBuf<usize>` rather than the bespoke `Packets`
+type this plan originally called for -- the per-datagram `usize` meta is exactly the value-list
+count `oversize_datagram` accounting needs, and `MessageBuf` moved into `logit-proto` (from its
+original home private to `logit-outputs`) as part of that same ADR, so there was no longer a reuse
+barrier to work around.
 
 **Decoder state machine.** State resets per datagram: sticky `{host, plugin, plugin_instance, type,
 type_instance, time_ns, interval_cdtime}`. String parts decode zero-copy (byte-offset slices of the

@@ -176,7 +176,7 @@ the tag's literal argument string instead of failing.
 |---|---|---|
 | Listener (`statsd_in`, `collectd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
-| Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `prometheus_out`) | ≥1 required | must not be |
+| Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `prometheus_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
 considered and rejected (ADR `component-graph-configuration`): a typo'd source reference would silently turn a real sink into
@@ -361,9 +361,15 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     configured id names a component present in this graph — `origin`/`previous` are exactly as
     likely to name a component in a different process's graph, relayed unchanged across
     `logit_out`/`logit_in`.
-38. A `statsd_out` `max_packet_bytes: 0` is rejected, the same shape as rule 15's
-    `buffer.max_batches`/`max_bytes: 0` — an impossible bound (every metric line would overflow it
-    and be dropped whole), not a small one (`docs/adr/statsd-output.md`).
+38. A `statsd_out` or `collectd_out` `max_packet_bytes: 0` is rejected, the same shape as rule 15's
+    `buffer.max_batches`/`max_bytes: 0` — an impossible bound (every metric line/value list would
+    overflow it and be dropped whole), not a small one (`docs/adr/statsd-output.md`,
+    `docs/adr/collectd-binary-relay.md`). `collectd_out` additionally rejects any value outside
+    `1024..=65535` — collectd's own `MaxPacketSize` range (`docs/adr/collectd-binary-relay.md`):
+    above it, every datagram fails `EMSGSIZE` at the socket (no UDP payload is that large), which
+    `collectd_out` counts as a per-datagram drop rather than surfacing as a `Fault` — so an
+    unbounded value would silently report `requests{class="ok"}` while delivering nothing.
+    `statsd_out` makes no such range claim in its own ADR, so it keeps only the zero check.
 39. An `aggregate` with `temporality: cumulative` requires `series_retention >= 1` (a count of
     windows, not a duration) and `max_retained_series >= 1` — those two bounds are what keeps a running total alive
     across the window boundary, so with either at `0` no accumulator survives a flush and every

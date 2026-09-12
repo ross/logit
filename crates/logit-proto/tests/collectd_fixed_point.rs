@@ -50,10 +50,10 @@ use logit_core::{
 };
 use logit_proto::collectd::types_db::TEST_TYPES_DB;
 use logit_proto::collectd::{
-    CollectdDecoder, CollectdEncoder, Packets, TypesDb, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN,
+    CollectdDecoder, CollectdEncoder, TypesDb, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN,
     ATTR_PLUGIN_INSTANCE, ATTR_TYPE, ATTR_TYPE_INSTANCE, DEFAULT_MAX_PACKET_BYTES,
 };
-use logit_proto::Decoder;
+use logit_proto::{Decoder, FramedEncoder, MessageBuf};
 use proptest::prelude::*;
 use std::sync::Arc;
 
@@ -132,10 +132,10 @@ impl PacketBuilder {
 // -- the two properties --------------------------------------------------------------------------
 
 fn encode_at(batch: &EventBatch, cap: usize) -> Vec<Vec<u8>> {
-    let mut encoder = CollectdEncoder::new();
-    let mut packets = Packets::default();
-    encoder.encode_into(batch, cap, &mut packets);
-    packets.iter().map(|(bytes, _)| bytes.to_vec()).collect()
+    let mut encoder = CollectdEncoder::new().with_max_packet_bytes(cap);
+    let mut packets = MessageBuf::default();
+    encoder.encode_into(batch, &mut packets);
+    packets.iter().map(|bytes| bytes.to_vec()).collect()
 }
 
 /// Decodes every datagram in order through one decoder, exactly as `collectd_in` would.

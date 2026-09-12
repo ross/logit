@@ -6,6 +6,7 @@
 //! comment for the same reasoning.
 
 mod attrs;
+pub mod collectd;
 pub mod file;
 pub mod influxdb;
 pub mod logit;

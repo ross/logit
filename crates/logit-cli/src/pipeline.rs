@@ -22,6 +22,7 @@ use logit_inputs::prometheus::PrometheusInput;
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_inputs::tail::TailInput;
+use logit_outputs::collectd::CollectdOutput;
 use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::logit::LogitOutput;
@@ -38,7 +39,7 @@ use logit_pipeline::{
     DiskQueueConfig, InputRuntimeConfig, NodeSpec, Readiness, RetryConfig, RunError,
     SinkQueueConfig, SinkStoreConfig, WriteLoopConfig,
 };
-use logit_proto::collectd::TypesDb;
+use logit_proto::collectd::{CollectdEncoder, TypesDb};
 use logit_proto::frame::Compression as NativeCompression;
 use logit_transforms::{
     AggregateTemporality as TransformTemporality, Aggregator, CsvParser,
@@ -691,6 +692,27 @@ fn build_spec(
             )
         }
 
+        CollectdOut { endpoint, max_packet_bytes, hostname } => {
+            // Eager UDP bind, same reasoning as `StatsdOut`/`SyslogOut` above -- collectd's
+            // `network` plugin has no TCP mode to relay onto, so there's no lazy-connect branch
+            // to mirror here.
+            let output = CollectdOutput::udp(endpoint.clone())?;
+            let mut encoder = CollectdEncoder::new();
+            if let Some(hostname) = hostname {
+                encoder = encoder.with_hostname(hostname.clone());
+            }
+            let output = output
+                .with_encoder(encoder)
+                .with_max_packet_bytes(*max_packet_bytes as usize)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
+
         PrometheusOut { bind, path, expire_after, max_series } => {
             // Nothing is bound here: `PrometheusOutput::bind` opens the listening socket in the
             // runtime's pre-spawn pass (`logit_pipeline::Output::bind`), which is what turns an
@@ -1302,6 +1324,28 @@ mod tests {
                 org: "org".to_string(),
                 bucket: "bucket".to_string(),
                 token: "test-token".to_string(),
+            },
+        };
+        assert!(matches!(
+            build_spec("out", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    /// `#[tokio::test]`, unlike its sibling sink tests above/below: `CollectdOutput::udp` binds an
+    /// ephemeral local UDP socket eagerly (`StatsdOutput::udp`'s own precedent), which needs an
+    /// active tokio runtime to register with.
+    #[tokio::test]
+    async fn build_spec_builds_a_collectd_sink_and_wires_a_configured_hostname_into_its_encoder() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::CollectdOut {
+                endpoint: "127.0.0.1:25826".to_string(),
+                max_packet_bytes: 1452,
+                hostname: Some("logit-relay".to_string()),
             },
         };
         assert!(matches!(

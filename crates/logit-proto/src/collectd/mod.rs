@@ -8,17 +8,17 @@
 //! is the decision record; [`docs/plans/collectd-binary-relay.md`](../../../../docs/plans/collectd-binary-relay.md)
 //! is the workstream plan.
 //!
-//! **No [`crate::Encoder`]/[`crate::Decoder`] pair, only [`crate::Decoder`]**, for the reason
-//! `statsd_out`/`syslog_out`/`prometheus_out` have no `Encoder` either
-//! (`crates/logit-outputs/src/statsd.rs`'s module doc, ADR `statsd-output` §"No
-//! `logit_proto::Encoder`"): that trait is `fn encode(&mut self, &EventBatch) -> Result<Bytes, _>`
-//! -- one opaque buffer per batch, with no framing metadata -- and collectd egress genuinely needs
-//! per-*datagram* boundaries, since the receiver resets its sticky identity state at every datagram
-//! edge and a `max_packet_bytes` cap decides where those edges fall. [`CollectdEncoder::encode_into`]
-//! fills a [`Packets`] instead: one contiguous buffer, one range per datagram, plus the value-list
-//! count each datagram carries (what `collectd_out` needs to attribute an `EMSGSIZE` drop to the
-//! right number of metrics). The decode direction has no such problem -- one datagram in, N events
-//! out -- so [`CollectdDecoder`] is an ordinary [`crate::Decoder`].
+//! [`CollectdEncoder`] **implements [`crate::FramedEncoder`], not [`crate::Encoder`]** (ADR
+//! `framed-encoder`), for the reason `statsd_out`/`syslog_out`/`prometheus_out`'s encoders do too
+//! (`crates/logit-outputs/src/statsd.rs`'s module doc): `Encoder` is `fn encode(&mut self,
+//! &EventBatch) -> Result<Bytes, _>` -- one opaque buffer per batch, with no framing metadata --
+//! and collectd egress genuinely needs per-*datagram* boundaries, since the receiver resets its
+//! sticky identity state at every datagram edge and a `max_packet_bytes` cap decides where those
+//! edges fall. [`CollectdEncoder::encode_into`] fills a [`crate::MessageBuf`]`<usize>` instead: one
+//! entry per datagram, whose `usize` meta is the value-list count that datagram carries (what
+//! `collectd_out` needs to attribute an `EMSGSIZE` drop to the right number of metrics). The
+//! decode direction has no such problem -- one datagram in, N events out -- so [`CollectdDecoder`]
+//! is an ordinary [`crate::Decoder`].
 //!
 //! ## Wire shape, in one paragraph
 //!
@@ -162,7 +162,7 @@ pub mod part;
 pub mod types_db;
 
 pub use decode::CollectdDecoder;
-pub use encode::{CollectdEncoder, EncodeStats, Packets};
+pub use encode::{CollectdEncoder, EncodeStats};
 pub use types_db::{DataSource, DsKind, TypesDb, TypesDbError};
 
 /// collectd's own default `network` plugin port, for both the listener and the sink.

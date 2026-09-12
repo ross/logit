@@ -337,6 +337,19 @@ to `max_packet_bytes`, and flushing at a boundary, is exactly the kind of decisi
 `with_telemetry`/`with_diagnostics` builders, the same shape `PrometheusEncoder`/`PrometheusDecoder`
 already established.
 
+**Amendment (2026-09-12): `CollectdEncoder` implements `FramedEncoder`.** `encode_into` is the
+implementation of [ADR `framed-encoder`](framed-encoder.md)'s `logit_proto::FramedEncoder` (`type
+Meta = usize; type Stats = EncodeStats;`), over `logit_proto::MessageBuf<usize>` — the per-datagram
+`usize` meta is the value-list count that datagram carries, exactly what `collectd_out` needs to
+attribute an `EMSGSIZE` drop to the right number of metrics (what a bespoke `Packets` type existed
+to carry before this landed). One signature change, the same shape `statsd_output`'s amendment
+made: the per-call `max_packet_bytes` argument became encoder state
+(`CollectdEncoder::with_max_packet_bytes`, default uncapped), and `CollectdOutput` applies its own
+`max_packet_bytes:` config value once at build time rather than on every `send` — collectd has no
+TCP transport to leave uncapped, so unlike `StatsdOutput` there is no per-transport branch here at
+all. The cap in effect, the packing/elision logic, the wire bytes, and `EncodeStats` are all
+unchanged.
+
 ## Alternatives considered
 
 - **A per-host `Resource` instead of event attributes for identity.** Rejected: `BatchAccumulator`

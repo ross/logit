@@ -574,10 +574,11 @@ already built that have a known, accepted rough edge.
   and `SignalEncoder` (one blob per signal): N framed messages per batch into a shared, generic
   `logit_proto::MessageBuf<M>`, never failing, a per-sink `Stats` for drop accounting -- which
   `syslog_out` and `statsd_out` now implement (statsd's per-call datagram cap became encoder
-  state set once per transport). Follow-up, not done here: the collectd codec
-  (`crates/logit-proto/src/collectd/encode.rs`) adopting it in place of its own `Packets` buffer,
-  before `collectd_out` is built on `Packets`. `prometheus_out` stays outside all three traits by
-  design.
+  state set once per transport). The collectd codec (`crates/logit-proto/src/collectd/encode.rs`)
+  adopted it too, in `collectd_out`'s own PR (W3): its `Packets` buffer is gone, replaced by
+  `MessageBuf<usize>` -- the per-datagram `usize` meta is the value-list count `EMSGSIZE`
+  accounting needs, which is exactly what `Packets` existed to carry. `prometheus_out` stays
+  outside all three traits by design.
 - **`statsd_out` drops post-sketch metric kinds — `Distribution`/`Set`/`Histogram`/
   `ExponentialHistogram`/`Summary`/a cumulative or non-monotonic `Sum`, counted
   (`unsupported_metric_kind`).** **Narrowed by W3** — the original v1 deferral covered every
