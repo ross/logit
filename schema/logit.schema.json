@@ -39,6 +39,25 @@
       },
       "additionalProperties": false
     },
+    "AggregateTemporality": {
+      "description": "[`ComponentKind::Aggregate`]'s `temporality` field -- what a flushed `Sum`/`Histogram` means. See that field's own doc comment and the `docs/adr/aggregation-window-semantics.md` \"cumulative temporality as an opt-in mode\" amendment.",
+      "oneOf": [
+        {
+          "description": "Every window's emitted `Sum`/`Histogram` is that window's own increment, and the accumulator resets at each flush -- strictly tumbling, the behavior every config had before this field existed, and what an InfluxDB/statsd-shaped consumer expects.",
+          "type": "string",
+          "enum": [
+            "delta"
+          ]
+        },
+        {
+          "description": "A `Sum`/`Histogram` series' accumulator survives the flush and keeps summing, so every window emits the running total since the series was first seen, stamped with that first-seen time as `start_timestamp` -- the reset signal OTLP and Prometheus use. Required by `prometheus_out`, which skips delta records (`docs/adr/prometheus-scrape-and-exposition.md`). Bounded by `series_retention` / `max_retained_series`, exactly as gauge retention is.",
+          "type": "string",
+          "enum": [
+            "cumulative"
+          ]
+        }
+      ]
+    },
     "BufferConfig": {
       "description": "Per-sink delivery buffer (`docs/adr/buffered-sink-delivery.md`). Meaningful only on a sink; graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on any other kind. Every field defaults, so an omitted `buffer:` block is exactly today's behavior.",
       "type": "object",
@@ -467,25 +486,18 @@
                 }
               ]
             },
-            "gauge_retention": {
-              "description": "How many consecutive windows a gauge series with no new data is retained past its last update, so a relative gauge adjustment (`docs/adr/relative-gauge-adjustments.md`) arriving in a later window can still resolve against the value it last held. `0` disables retention entirely -- every gauge series is drained every window exactly like a counter, matching this field's absence before it existed. See the `docs/adr/aggregation-window-semantics.md` amendment for the full design.",
-              "default": 5,
-              "type": "integer",
-              "format": "uint32",
-              "minimum": 0.0
-            },
             "interval": {
               "type": "string"
             },
-            "max_retained_gauge_series": {
-              "description": "A hard cap on how many gauge series may be retained across this component's whole window at once -- a DoS/cardinality guard, not a tuning knob. `gauge_retention` alone bounds only how long one series survives; without this, a sustained stream of never-repeating series names would hold unboundedly many retained series regardless of how short the retention window is. Least-recently-updated series are evicted first once exceeded.",
+            "max_retained_series": {
+              "description": "A hard cap on how many series may be retained across this component's whole window at once -- a DoS/cardinality guard, not a tuning knob. `series_retention` alone bounds only how long one series survives; without this, a sustained stream of never-repeating series names would hold unboundedly many retained series regardless of how short the retention window is. Least-recently-updated series are evicted first once exceeded.",
               "default": 10000,
               "type": "integer",
               "format": "uint",
               "minimum": 0.0
             },
             "max_samples_per_series": {
-              "description": "A hard cap on how many raw values one `Samples` series may retain in one window before `distributions: samples` falls back to sketching what it already holds -- a DoS/memory guard, not a tuning knob, the same role `max_retained_gauge_series` plays for gauges. Meaningless when `distributions` is `sketch` (the default), since nothing raw is ever retained in that mode.",
+              "description": "A hard cap on how many raw values one `Samples` series may retain in one window before `distributions: samples` falls back to sketching what it already holds -- a DoS/memory guard, not a tuning knob, the same role `max_retained_series` plays for retention. Meaningless when `distributions` is `sketch` (the default), since nothing raw is ever retained in that mode.",
               "default": 1000,
               "type": "integer",
               "format": "uint",
@@ -498,12 +510,28 @@
               "format": "uint",
               "minimum": 0.0
             },
+            "series_retention": {
+              "description": "How many consecutive windows a series with no new data is retained past its last update. For a gauge that's so a relative gauge adjustment (`docs/adr/relative-gauge-adjustments.md`) arriving in a later window can still resolve against the value it last held; under `temporality: cumulative` it is also what keeps a `Sum`/`Histogram`'s running total alive across the window boundary. `0` disables retention entirely -- every series is drained every window, matching this field's absence before it existed -- and is therefore rejected at graph-validation time alongside `temporality: cumulative`, which would otherwise emit each window's delta labelled as a cumulative total. See the `docs/adr/aggregation-window-semantics.md` amendments for the full design.",
+              "default": 5,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
             "sets": {
               "description": "Whether a raw `SetMembers` series (statsd `s`) absorbs into this window as a `HyperLogLog` cardinality estimate (the default) or keeps its exact, deduplicated member set for the whole window, only falling back to an estimate when `max_set_members_per_series` is exceeded (counted, see the amendment). Exact retention is the lossless-transit option: an exact member count/list only survives the window when this is `members`.",
               "default": "estimate",
               "allOf": [
                 {
                   "$ref": "#/definitions/Sets"
+                }
+              ]
+            },
+            "temporality": {
+              "description": "Whether each window's emitted `Sum`/`Histogram` is that window's own increment (`delta`, the default -- strictly tumbling, self-contained) or a running total since the series was first seen (`cumulative`, what OTLP and Prometheus scrapes carry). See [`AggregateTemporality`] and the `docs/adr/aggregation-window-semantics.md` \"cumulative temporality as an opt-in mode\" amendment.",
+              "default": "delta",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/AggregateTemporality"
                 }
               ]
             },

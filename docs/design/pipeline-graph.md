@@ -364,6 +364,13 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 38. A `statsd_out` `max_packet_bytes: 0` is rejected, the same shape as rule 15's
     `buffer.max_batches`/`max_bytes: 0` — an impossible bound (every metric line would overflow it
     and be dropped whole), not a small one (`docs/adr/statsd-output.md`).
+39. An `aggregate` with `temporality: cumulative` requires `series_retention >= 1` (a count of
+    windows, not a duration) and `max_retained_series >= 1` — those two bounds are what keeps a running total alive
+    across the window boundary, so with either at `0` no accumulator survives a flush and every
+    window would emit its own increment labelled as a cumulative total, a silently wrong number for
+    the consumer that mode exists for. `series_retention: 0` stays legal under the default
+    `temporality: delta`, where it is the documented opt-out from gauge retention
+    (`docs/adr/aggregation-window-semantics.md`'s cumulative amendment).
 41. A `prometheus_out` `path:` must start with `/`, and `max_series` must be ≥ 1
     (`docs/adr/prometheus-scrape-and-exposition.md`). A request URI's path is always absolute, so a
     relative or empty `path:` could never match one — every scrape would 404 against an endpoint

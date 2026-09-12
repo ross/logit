@@ -489,16 +489,19 @@ Worked examples, one per shipped component:
 - `aggregate` (`crates/logit-transforms/src/aggregate.rs`): `logit.transform.series.active` and
   `logit.transform.resource.groups`, sampled at the top of `flush` before it touches its own state
   — the peak-of-window series count, which is the visible signal for the cardinality blow-up
-  `crate::keep`'s own module doc already warns `aggregate` is exposed to. Gauge retention across
-  the window boundary (`docs/adr/aggregation-window-semantics.md`'s amendment) adds three
+  `crate::keep`'s own module doc already warns `aggregate` is exposed to. Series retention across
+  the window boundary (`docs/adr/aggregation-window-semantics.md`'s gauge-retention amendment, and
+  its cumulative amendment, which reuses the identical two bounds and the identical counters for a
+  `temporality: cumulative` `Sum`/`Histogram`) adds three
   more: `logit.transform.series.retained` (gauge — the idle-but-carried population; `.active`
   itself keeps its original "series updated this window" meaning, not silently widened to include
   these), `logit.transform.series.evicted{reason="idle"|"cardinality"}` (count — a TTL expiry vs.
-  the hard `max_retained_gauge_series` cap; a non-zero `cardinality` count means a later delta is
-  about to resolve against 0.0), and `logit.transform.gauge.delta.unseeded` (count — a
+  the hard `max_retained_series` cap; a non-zero `cardinality` count means a later delta is
+  about to resolve against 0.0, or a cumulative series is about to restart from zero with a new
+  `start_timestamp`), and `logit.transform.gauge.delta.unseeded` (count — a
   `GaugeDelta` opened a brand-new series and resolved against 0.0, statsd's own rule for an
   unseeded gauge, but indistinguishable from a real 0.0 without this). The last two also each fire
-  a throttled `logit.component.diagnostics{key="gauge_retention_full"|"gauge_delta_unseeded"}`
+  a throttled `logit.component.diagnostics{key="series_retention_full"|"gauge_delta_unseeded"}`
   point via the `Diagnostics` bridge. Absorbing raw kinds (`docs/adr/aggregation-window-semantics.md`'s
   "raw samples and set members" amendment) adds `logit.transform.samples.fallback{reason="rate_mismatch"|"cap"}`
   and `logit.transform.set_members.fallback{reason="cap"}` (count -- a `samples`/`members`-mode

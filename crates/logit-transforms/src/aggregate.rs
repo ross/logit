@@ -10,13 +10,41 @@
 //! into a `Set` (`HyperLogLog`, the default) or a raw `SetMembers` accumulator (`sets: members`) --
 //! both raw accumulators fall back to their summarized counterpart on overflow or (`Samples` only)
 //! a sample-rate mismatch, see `process`'s merge match and `docs/adr/aggregation-window-semantics.md`'s
-//! amendment for the full design. A cumulative `Sum`, `Histogram`, `ExponentialHistogram`, and
-//! `Summary` have no defined merge rule here and pass through untouched rather than being dropped --
+//! amendment for the full design. A cumulative `Sum`, `ExponentialHistogram`, and `Summary` have no
+//! defined merge rule here and pass through untouched rather than being dropped --
 //! this project's consistent stance on data it doesn't know how to handle correctly. Since an event
 //! can now carry a log and/or a span alongside its metrics (docs/adr/multi-payload-events.md),
 //! pass-through is per *metric*, not per *event*: this stage absorbs every mergeable metric off an
 //! event and forwards whatever's left -- the unmergeable metrics, plus any log/span -- rather than
 //! treating "can't merge one metric" as a reason to forward the whole event untouched.
+//!
+//! # Temporality: what a flushed `Sum`/`Histogram` means
+//!
+//! `temporality: delta` ([`AggregateTemporality::Delta`], the default) is strictly tumbling: every
+//! window's emitted `Sum` is that window's own increment, the accumulator resets at flush, and a
+//! `Histogram` -- of *either* temporality -- is pass-through, exactly as it always has been. That
+//! last point is a deliberate non-change: a delta `Histogram` has no merge rule in `delta` mode, so
+//! it stays on the event, unchanged from before this mode existed
+//! (`docs/adr/aggregation-window-semantics.md`'s cumulative amendment says why widening it would be
+//! a separate decision).
+//!
+//! `temporality: cumulative` instead keeps a delta `Sum`'s and a delta `Histogram`'s accumulator
+//! alive across the flush -- the same retention machinery, the same two bounds
+//! (`series_retention`/`max_retained_series`) a retained gauge already uses -- and emits the running
+//! total every window as `Sum { temporality: Cumulative, .. }` / `Histogram { temporality:
+//! Cumulative, .. }` stamped with `MetricRecord::start_timestamp` = the series' first-seen event
+//! timestamp. A histogram's per-bucket counts add with `saturating_add`, not `+`: they are
+//! wire-supplied `u64`s, so a hostile or broken producer sending `u64::MAX` twice on one series
+//! pins the affected bucket at `u64::MAX` -- visibly wrong and still monotonic -- rather than
+//! panicking the transform task or wrapping the running total backwards while `start_timestamp`
+//! still claims the series never restarted. (`Sum`'s `f64` needs no such guard; it saturates to
+//! `inf`.) That stamp is the restart/reset signal OTLP and Prometheus consumers detect a counter
+//! reset with: it never changes while the series lives, and a series that is evicted (TTL or
+//! cardinality cap) and later re-created gets a new one. An incoming *cumulative* `Sum` is still
+//! pass-through in both modes -- `aggregate` re-summing an already-running total would double-count
+//! it. See `docs/adr/aggregation-window-semantics.md`'s "cumulative temporality as an opt-in mode"
+//! amendment, and `docs/adr/prometheus-scrape-and-exposition.md` for the consumer that needs it
+//! (`prometheus_out` skips delta records).
 
 use bytes::Bytes;
 use logit_core::interner::Symbol;
@@ -46,6 +74,22 @@ pub enum Distributions {
     /// Keep raw values for the whole window (bounded by `max_samples_per_series`), only sketching
     /// on overflow or a sample-rate mismatch.
     Samples,
+}
+
+/// This transform's own copy of `logit_config::AggregateTemporality` -- see [`Distributions`]'s doc
+/// comment for why a local twin exists at all. Distinct from `logit_core::Temporality`, which is
+/// the *per-record* field on the wire: this is the stage's configured mode, which decides what a
+/// *flushed* record's `temporality` is set to and whether a series' accumulator survives the flush.
+/// See [`Aggregator::with_temporality`] and this module's own "Temporality" doc section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AggregateTemporality {
+    /// Tumbling: each window's emitted `Sum` is that window's own increment, and a `Histogram` is
+    /// pass-through. Byte-for-byte the behavior every config had before this mode existed.
+    #[default]
+    Delta,
+    /// A delta `Sum`/`Histogram` series' accumulator survives the flush and keeps summing; every
+    /// window emits the running total as `Cumulative`, stamped with the series' first-seen time.
+    Cumulative,
 }
 
 /// This transform's own copy of `logit_config::Sets` -- see [`Distributions`]'s doc comment for
@@ -124,11 +168,14 @@ impl ContributingContexts {
 }
 
 /// One tumbling-window aggregator, owned by one pipeline stage. `process` accumulates what it can
-/// and passes everything else straight through; `flush` drains every non-gauge accumulator and
-/// every gauge series past its retention window, resetting each to empty -- state does not carry
-/// across flushes for those. **A gauge series is the one exception**, per `gauge_retention`: see
-/// `docs/adr/aggregation-window-semantics.md`'s "gauge series carry across the window
-/// boundary" amendment for the full design and why gauges specifically (not counters) get this.
+/// and passes everything else straight through; `flush` drains every non-retainable accumulator and
+/// every retained series past its retention window, resetting each to empty -- state does not carry
+/// across flushes for those. **A gauge series is the one exception under `temporality: delta`**, per
+/// `series_retention`: see `docs/adr/aggregation-window-semantics.md`'s "gauge series carry across
+/// the window boundary" amendment for the full design and why gauges specifically (not counters) get
+/// this. Under `temporality: cumulative` a `Sum`/`Histogram` series is retained the same way, by the
+/// same two bounds -- see that ADR's "cumulative temporality as an opt-in mode" amendment and this
+/// module's own "Temporality" doc section.
 pub struct Aggregator {
     interval: Duration,
     groups: Vec<ResourceGroup>,
@@ -138,19 +185,25 @@ pub struct Aggregator {
     /// reset by `flush` (it isn't part of any one window). Mirrors `run_lua`'s `last_resource`
     /// precedent (`crates/logit-pipeline/src/runtime.rs`): default until the first batch arrives.
     current_batch_context: TraceContext,
-    /// How many consecutive *idle* windows (no update at all) a gauge series is retained past its
-    /// last update, so a delta in window N+1 can still resolve against window N's final absolute
-    /// value. `0` (the default, matching `Aggregator::new`) reproduces today's strictly-tumbling
-    /// behavior exactly -- no gauge series ever survives a flush. Set via
-    /// [`Aggregator::with_gauge_retention`]. See the ADR `aggregation-window-semantics` amendment.
-    gauge_retention: u32,
-    /// Hard cap on how many gauge series may be retained across all resource groups at once -- a
-    /// DoS/cardinality guard, not a tuning knob. `gauge_retention` alone bounds only the *tail*
+    /// How many consecutive *idle* windows (no update at all) a retainable series is kept past its
+    /// last update, so a gauge delta in window N+1 can still resolve against window N's final
+    /// absolute value -- and, under [`AggregateTemporality::Cumulative`], so a `Sum`/`Histogram`'s
+    /// running total survives the window boundary at all. `0` (the default, matching
+    /// `Aggregator::new`) reproduces today's strictly-tumbling behavior exactly -- no series ever
+    /// survives a flush. Set via [`Aggregator::with_series_retention`]. See the ADR
+    /// `aggregation-window-semantics` amendments.
+    series_retention: u32,
+    /// Hard cap on how many series may be retained across all resource groups at once -- a
+    /// DoS/cardinality guard, not a tuning knob. `series_retention` alone bounds only the *tail*
     /// (how long one series survives); this bounds the *peak* (how many can exist retained at
     /// once), which a sustained stream of never-repeating series names would otherwise blow past
     /// regardless of how short the retention window is. Least-recently-updated series are evicted
-    /// first once this is exceeded. Meaningless while `gauge_retention` is `0`.
-    max_retained_gauge_series: usize,
+    /// first once this is exceeded. Meaningless while `series_retention` is `0`.
+    max_retained_series: usize,
+    /// Whether a flushed `Sum`/`Histogram` is this window's increment (the default) or a running
+    /// total that survives the flush. Set via [`Aggregator::with_temporality`]; see
+    /// [`AggregateTemporality`] and this module's "Temporality" doc section.
+    temporality: AggregateTemporality,
     /// Whether an absorbed `Samples` series sketches on arrival (the default) or retains raw
     /// values for the window. Set via [`Aggregator::with_distributions`].
     distributions: Distributions,
@@ -194,10 +247,23 @@ struct SeriesState {
     accumulator: Accumulator,
     contexts: ContributingContexts,
     /// Consecutive flushes this series has survived with **no** update at all -- reset to 0 the
-    /// moment any event touches it again. Only ever incremented for a retained (gauge,
-    /// `gauge_retention > 0`) series; a non-gauge series never survives a flush to have this
-    /// matter. Compared against `Aggregator::gauge_retention` at flush to decide eviction.
+    /// moment any event touches it again. Only ever incremented for a retained series (a gauge, or
+    /// a cumulative-mode `Sum`/`Histogram`, with `series_retention > 0`); a series that can't be
+    /// retained never survives a flush to have this matter. Compared against
+    /// `Aggregator::series_retention` at flush to decide eviction.
     idle_windows: u32,
+    /// The timestamp of the first event ever absorbed into this series, in unix nanos -- emitted as
+    /// `MetricRecord::start_timestamp` on every cumulative-mode `Sum`/`Histogram` flush, unchanged
+    /// for as long as the series lives, which is exactly what makes it the reset signal an OTLP or
+    /// Prometheus consumer detects a counter restart with. Captured from `event.timestamp` (the
+    /// source's own clock, the only unix-nanos value `process` has and the one an operator can
+    /// reason about) rather than a `SystemTime::now()` read, which would put a syscall on the
+    /// open-a-series path and make this untestable. A series evicted and later re-created gets a
+    /// fresh `SeriesState`, hence a fresh value here -- the restart signal, by construction.
+    /// Recorded for every series, not just cumulative ones: it costs 8 bytes on an already
+    /// heap-allocated struct, and branching on the mode to decide whether to fill it in would make
+    /// the field mean two different things depending on config.
+    first_seen: i64,
     /// Whether any event touched this series since the last flush. An explicit field, not derived
     /// from `contexts.seen` being non-empty -- that happens to correlate (`observe` fires on
     /// exactly the successful merges that also flip this), but coupling this to a set built for a
@@ -210,13 +276,25 @@ struct SeriesState {
 enum Accumulator {
     /// A delta `Sum` merges the way `Counter` used to: the accumulator sums `value` and carries
     /// the *first* record's `monotonic` flag (later merges don't overwrite it, even if a
-    /// well-behaved producer would never send mismatched flags under one series identity).
-    /// `temporality` is always `Delta` here -- a cumulative `Sum` never reaches an accumulator at
-    /// all, see `process`'s pass-through `matches!`.
+    /// well-behaved producer would never send mismatched flags under one series identity). Only a
+    /// *delta* `Sum` ever reaches an accumulator -- an incoming cumulative one passes through
+    /// (`process`'s pass-through predicate) -- so the emitted `temporality` is decided by the
+    /// stage's own mode, not by the records that fed it: `Delta` per window under
+    /// [`AggregateTemporality::Delta`], `Cumulative` (a running total, retained across flushes)
+    /// under [`AggregateTemporality::Cumulative`]. See `into_kind`.
     Sum {
         total: f64,
         monotonic: bool,
     },
+    /// Per-bucket running totals for a fixed-bucket histogram -- **only reachable under
+    /// [`AggregateTemporality::Cumulative`]**, where a delta `Histogram` gains a merge rule
+    /// (`new_for`); in `delta` mode a `Histogram` of either temporality is still pass-through, so
+    /// this variant is never constructed. Held as a whole `logit_core::Histogram` (already stamped
+    /// `Cumulative`, since that's the only shape it is ever emitted as) so `into_kind` is a move
+    /// rather than a rebuild. `buckets` carries the *bounds* of the first record that opened the
+    /// series: a later record whose bounds differ has no correct merge and is passed through, see
+    /// `process`'s `Histogram` merge arm.
+    Histogram(logit_core::Histogram),
     /// `at` is the source event's timestamp, used to pick the last-write-wins value -- not the
     /// window's timestamp, which doesn't exist until flush.
     Gauge {
@@ -237,6 +315,52 @@ enum Accumulator {
     SetMembers(Vec<Bytes>),
 }
 
+/// Whether `kind` has no defined merge rule in this stage and must be forwarded untouched -- a free
+/// function, not an inline `matches!`, because the answer now depends on the configured
+/// `temporality` and the same question is asked in two places that must agree exactly (`process`,
+/// and `Accumulator::new_for`'s `unreachable!` arm -- see both).
+///
+/// Mode-dependent for one kind only: a `Histogram` whose own temporality is `Delta` merges under
+/// [`AggregateTemporality::Cumulative`] (that mode's whole point) and passes through under
+/// `Delta`, where it always has. An already-`Cumulative` `Histogram` passes through in both modes,
+/// for the same reason a cumulative `Sum` does -- re-accumulating a running total double-counts it.
+fn passes_through(kind: &MetricKind, temporality: AggregateTemporality) -> bool {
+    match kind {
+        MetricKind::Sum(Sum { temporality: Temporality::Cumulative, .. })
+        | MetricKind::ExponentialHistogram(_)
+        | MetricKind::Summary(_) => true,
+        MetricKind::Histogram(h) => {
+            h.temporality == Temporality::Cumulative || temporality == AggregateTemporality::Delta
+        }
+        _ => false,
+    }
+}
+
+/// Whether two histograms describe the same bucket layout, and so can be added bucket-by-bucket.
+/// Compared bitwise (`to_bits`), the same rule `SeriesKey`'s own `PartialEq` uses for an `f64`
+/// attribute value and for the same reason: a bound is an *identity* here, not a measurement, so
+/// `NaN` (which a `+Inf`-adjacent producer can emit) must compare equal to itself rather than
+/// forcing a spurious mismatch on every single record.
+fn bucket_bounds_match(held: &[(f64, u64)], incoming: &[(f64, u64)]) -> bool {
+    held.len() == incoming.len()
+        && held.iter().zip(incoming).all(|((a, _), (b, _))| a.to_bits() == b.to_bits())
+}
+
+/// Folds an optional `min`/`max` across a merge: whichever side has a value wins when only one
+/// does, `pick` decides when both do. See the `Histogram` merge arm for why this is deliberately
+/// more forgiving than the `sum` rule beside it.
+fn fold_extreme(
+    held: Option<f64>,
+    incoming: Option<f64>,
+    pick: fn(f64, f64) -> f64,
+) -> Option<f64> {
+    match (held, incoming) {
+        (Some(held), Some(incoming)) => Some(pick(held, incoming)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
 impl Aggregator {
     pub fn new(interval: Duration) -> Self {
         Self {
@@ -245,8 +369,9 @@ impl Aggregator {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             current_batch_context: TraceContext::default(),
-            gauge_retention: 0,
-            max_retained_gauge_series: 0,
+            series_retention: 0,
+            max_retained_series: 0,
+            temporality: AggregateTemporality::default(),
             distributions: Distributions::default(),
             max_samples_per_series: 1000,
             sets: Sets::default(),
@@ -255,20 +380,34 @@ impl Aggregator {
         }
     }
 
-    /// Enables cross-flush gauge retention -- see the `gauge_retention`/`max_retained_gauge_series`
-    /// field doc comments and the ADR `aggregation-window-semantics` amendment. Matches the existing
+    /// Enables cross-flush series retention -- see the `series_retention`/`max_retained_series`
+    /// field doc comments and the ADR `aggregation-window-semantics` amendments. Matches the existing
     /// `with_diagnostics`/`with_telemetry` builder shape, so `Aggregator::new(interval)`'s
     /// signature stays unchanged and every existing caller (including `crates/logit-bench`'s
     /// fixture) compiles unchanged, defaulting to `0` -- strictly tumbling, exactly today's
     /// behavior.
-    pub fn with_gauge_retention(mut self, retention: u32, max_retained: usize) -> Self {
-        self.gauge_retention = retention;
-        self.max_retained_gauge_series = max_retained;
+    pub fn with_series_retention(mut self, retention: u32, max_retained: usize) -> Self {
+        self.series_retention = retention;
+        self.max_retained_series = max_retained;
+        self
+    }
+
+    /// Selects what a flushed `Sum`/`Histogram` means -- see [`AggregateTemporality`] and this
+    /// module's "Temporality" doc section. Same builder shape as [`Self::with_series_retention`],
+    /// defaulting to `Delta`: byte-for-byte today's behavior for every caller that doesn't set it.
+    ///
+    /// `Cumulative` only does anything useful alongside `with_series_retention(r, m)` with both
+    /// bounds non-zero -- a running total that can't survive a flush is just this window's delta
+    /// wearing a `Cumulative` label -- which is why `logit_config`'s pair of fields is rejected in
+    /// that combination at graph-validation time (`crates/logit-pipeline/src/graph.rs`, rule 39)
+    /// rather than being silently accepted here.
+    pub fn with_temporality(mut self, temporality: AggregateTemporality) -> Self {
+        self.temporality = temporality;
         self
     }
 
     /// Configures how an absorbed `Samples` series is retained -- see [`Distributions`]'s own doc
-    /// comment. Same builder shape as `with_gauge_retention`: `Aggregator::new`'s signature stays
+    /// comment. Same builder shape as `with_series_retention`: `Aggregator::new`'s signature stays
     /// unchanged, defaulting to `Distributions::Sketch` with a `1000`-value cap (mirroring
     /// `logit_config`'s own defaults, though this crate doesn't depend on that one to read them
     /// directly -- see [`Distributions`]'s doc comment).
@@ -344,6 +483,7 @@ impl Aggregator {
         // read them without holding a second borrow of `self` alongside `state`).
         let ctx = self.current_batch_context;
         let scope = self.current_scope.clone();
+        let temporality = self.temporality;
         let distributions = self.distributions;
         let max_samples_per_series = self.max_samples_per_series;
         let sets = self.sets;
@@ -375,19 +515,15 @@ impl Aggregator {
             // event rather than absorbing or dropping them. `GaugeDelta`/`Samples`/`SetMembers`/
             // `Set` are *not* here -- they all have a real resolution below
             // (docs/adr/relative-gauge-adjustments.md, docs/adr/aggregation-window-semantics.md's
-            // amendment). A cumulative `Sum` is also pass-through -- only a *delta* `Sum` merges
-            // (below), the same way `Counter` used to.
+            // amendment). A cumulative `Sum` is also pass-through in *both* modes -- only a *delta*
+            // `Sum` merges (below), the same way `Counter` used to; re-summing a running total
+            // would double-count it.
             //
             // Kept in sync with `Accumulator::new_for`'s `unreachable!` arm *deliberately* -- a
             // kind listed as pass-through here must also be listed there, and vice versa; a
-            // mismatch between the two is a runtime panic, not a compile error.
-            if matches!(
-                record.kind,
-                MetricKind::Sum(Sum { temporality: Temporality::Cumulative, .. })
-                    | MetricKind::Histogram(_)
-                    | MetricKind::ExponentialHistogram(_)
-                    | MetricKind::Summary(_)
-            ) {
+            // mismatch between the two is a runtime panic, not a compile error. Both are
+            // mode-dependent for `Histogram` alone, and in the same direction.
+            if passes_through(&record.kind, temporality) {
                 event.metrics.push(record);
                 continue;
             }
@@ -407,9 +543,12 @@ impl Aggregator {
             // wanted.
             let was_vacant = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
             let state = entry.or_insert_with(|| SeriesState {
-                accumulator: Accumulator::new_for(&record.kind, distributions, sets),
+                accumulator: Accumulator::new_for(&record.kind, distributions, sets, temporality),
                 contexts: ContributingContexts::default(),
                 idle_windows: 0,
+                // This record's own timestamp: the series starts accumulating where its first
+                // observation says it does -- see the field's own doc comment.
+                first_seen: event.timestamp,
                 updated_this_window: false,
             });
 
@@ -421,6 +560,7 @@ impl Aggregator {
             let mut samples_weight_clamped = false;
             let mut samples_fallback_reason: Option<&'static str> = None;
             let mut set_members_fallback = false;
+            let mut histogram_bounds_mismatch = false;
 
             let accumulated = match &record.kind {
                 MetricKind::Sum(Sum { temporality: Temporality::Delta, value, .. }) => {
@@ -432,6 +572,58 @@ impl Aggregator {
                         _ => false,
                     }
                 }
+                // Only reachable under `temporality: cumulative` with a *delta* incoming histogram
+                // (`passes_through` filters every other shape out above): add per bucket into the
+                // running total, exactly the way the `Sum` arm adds a scalar.
+                MetricKind::Histogram(incoming) => match &mut state.accumulator {
+                    Accumulator::Histogram(held) => {
+                        if !bucket_bounds_match(&held.buckets, &incoming.buckets) {
+                            // Two histograms of the same series with different bucket layouts have
+                            // no correct merge -- adding bucket *i* of one to bucket *i* of the
+                            // other would silently attribute counts to bounds they were never
+                            // observed under. Same treatment as a kind conflict: this one record
+                            // stays on the event, the accumulator is untouched (its own
+                            // diagnostic key below, since the *kind* does match here).
+                            histogram_bounds_mismatch = true;
+                            false
+                        } else {
+                            for (held_bucket, incoming_bucket) in
+                                held.buckets.iter_mut().zip(incoming.buckets.iter())
+                            {
+                                // `saturating_add`, not `+`: these counts arrive from the wire
+                                // (`otlp_in` copies `bucket_counts` verbatim, no clamp) and this
+                                // is the only place this stage sums *integers* rather than
+                                // `f64`s, which saturate to `inf` on their own. Unchecked, two
+                                // delta points carrying `u64::MAX` on one series would panic the
+                                // transform task under `overflow-checks` and wrap the running
+                                // total *backwards* without them -- while `start_timestamp` stays
+                                // pinned, i.e. the one thing the reset protocol promises a
+                                // consumer cannot happen. Saturating matches this crate's posture
+                                // on untrusted numbers elsewhere (`trace_context.rs`'s
+                                // `checked_mul`/`checked_add`, `scale.rs`'s overflow guard): a
+                                // pinned `u64::MAX` is visibly wrong and monotonic, where a
+                                // wrapped total is invisibly wrong.
+                                held_bucket.1 = held_bucket.1.saturating_add(incoming_bucket.1);
+                            }
+                            // `sum` adds only when *both* sides have one: a running total missing
+                            // one window's contribution understates the series outright, which is
+                            // worse than reporting no sum at all (a consumer can tell `None` from
+                            // a wrong number). `min`/`max` fold across whichever sides have one --
+                            // unlike a sum, an extreme observed over a subset of the windows is
+                            // still a genuine observation, just possibly not the true extreme.
+                            held.sum = match (held.sum, incoming.sum) {
+                                (Some(held_sum), Some(incoming_sum)) => {
+                                    Some(held_sum + incoming_sum)
+                                }
+                                _ => None,
+                            };
+                            held.min = fold_extreme(held.min, incoming.min, f64::min);
+                            held.max = fold_extreme(held.max, incoming.max, f64::max);
+                            true
+                        }
+                    }
+                    _ => false,
+                },
                 MetricKind::Gauge(v) => match &mut state.accumulator {
                     Accumulator::Gauge { value, at } => {
                         // Last-write-wins by timestamp (docs/design/data-model.md): a
@@ -691,13 +883,28 @@ impl Aggregator {
                 }
             }
             if !accumulated {
-                self.diag.warn_throttled(
-                    "kind_conflict",
-                    format_args!(
-                        "metric '{}' has a kind that conflicts with an already-accumulating                          series under the same name/unit/tags -- forwarding it untouched",
-                        logit_core::interner::resolve(record.name)
-                    ),
-                );
+                if histogram_bounds_mismatch {
+                    // Its own key, not `kind_conflict`'s: the *kind* matches here, only the bucket
+                    // layout differs, and an operator chasing this needs to know it's the bounds
+                    // (a producer that re-bucketed mid-run) rather than two kinds colliding.
+                    self.diag.warn_throttled(
+                        "histogram_bounds_mismatch",
+                        format_args!(
+                            "histogram '{}' arrived with bucket bounds that differ from the \
+                             already-accumulating series under the same name/unit/tags -- \
+                             forwarding it untouched",
+                            logit_core::interner::resolve(record.name)
+                        ),
+                    );
+                } else {
+                    self.diag.warn_throttled(
+                        "kind_conflict",
+                        format_args!(
+                            "metric '{}' has a kind that conflicts with an already-accumulating                          series under the same name/unit/tags -- forwarding it untouched",
+                            logit_core::interner::resolve(record.name)
+                        ),
+                    );
+                }
                 event.metrics.push(record);
             }
         }
@@ -731,14 +938,14 @@ impl Aggregator {
     }
 
     /// One window's worth of series becomes one emitted event each, stamped with `now` and paired
-    /// with the `SpanLink`s `ContributingContexts::into_links` built for it. **Every non-gauge
-    /// accumulator is still removed unconditionally** -- tumbling, exactly as before this method
-    /// gained retention. A gauge series with `gauge_retention > 0` instead survives into the next
-    /// window, subject to `max_retained_gauge_series`: see the `gauge_retention`/
-    /// `max_retained_gauge_series` field doc comments and
-    /// `docs/adr/aggregation-window-semantics.md`'s amendment for the full design.
-    /// `current_batch_context` is *not* reset here -- it isn't part of any one window (see its own
-    /// field doc comment).
+    /// with the `SpanLink`s `ContributingContexts::into_links` built for it. **Every
+    /// non-retainable accumulator is still removed unconditionally** -- tumbling, exactly as before
+    /// this method gained retention. A *retainable* series with `series_retention > 0` instead
+    /// survives into the next window, subject to `max_retained_series`: a gauge in either mode, and
+    /// a `Sum`/`Histogram` under `temporality: cumulative`. See the `series_retention`/
+    /// `max_retained_series` field doc comments and `docs/adr/aggregation-window-semantics.md`'s
+    /// two retention amendments for the full design. `current_batch_context` is *not* reset here --
+    /// it isn't part of any one window (see its own field doc comment).
     pub fn flush(&mut self, now: i64) -> FlushOutput {
         // Sampled before any series is touched below -- the peak-of-window value, at the one
         // point this aggregator already visits every series it holds. `aggregate`'s own
@@ -766,7 +973,7 @@ impl Aggregator {
         self.telemetry.gauge("logit.transform.series.retained", retained_series as f64, &[]);
         self.telemetry.gauge("logit.transform.resource.groups", self.groups.len() as f64, &[]);
 
-        // Every gauge series this flush decided to keep, not yet placed back into its group --
+        // Every series this flush decided to keep, not yet placed back into its group --
         // the cardinality cap below needs to see the *global* candidate set (across every
         // resource group) before any of them are final, since the cap is a whole-`Aggregator`
         // bound, not a per-group one. Each group's own `series` map is emptied via `mem::take`
@@ -774,7 +981,7 @@ impl Aggregator {
         // re-inserted straight back into their original group afterward, with no need to also
         // rebuild a parallel `resources`/`events_per_group` Vec pair just to remember which
         // group each one came from -- that would cost three extra allocations on the always-taken
-        // default (`gauge_retention: 0`) path for no benefit, since nothing in that path ever
+        // default (`series_retention: 0`) path for no benefit, since nothing in that path ever
         // populates `survivors` at all.
         let mut survivors: Vec<(usize, SeriesKey, SeriesState)> = Vec::new();
         let mut total_dropped_links: u64 = 0;
@@ -784,31 +991,51 @@ impl Aggregator {
         for (gi, group) in self.groups.iter_mut().enumerate() {
             let series = std::mem::take(&mut group.series);
             // `series.len()` upper-bounds `events.len()` -- every series either emits (tumbling,
-            // or a freshly-retained gauge) or doesn't (a still-idle retained gauge), never more
+            // or a freshly-retained one) or doesn't (a still-idle retained one), never more
             // than one event each -- so this preallocates for the always-taken default
-            // (`gauge_retention: 0`) path exactly as the pre-retention code did, avoiding the
+            // (`series_retention: 0`) path exactly as the pre-retention code did, avoiding the
             // Vec's own amortized-growth reallocations that pushing into an unsized `Vec::new()`
             // would otherwise pay on every flush.
             let mut events = Vec::with_capacity(series.len());
             for (key, mut state) in series {
-                let is_gauge = matches!(state.accumulator, Accumulator::Gauge { .. });
+                // Which series survive this flush: a gauge (its value is sticky by protocol, the
+                // original retention amendment) in either mode, and a `Sum`/`Histogram` under
+                // `temporality: cumulative`, where the running total *is* what the mode emits. A
+                // `Distribution`/`Samples`/`Set`/`SetMembers` series never survives, in either
+                // mode -- each window's summary is self-contained, see the ADR.
+                let retain = self.series_retention > 0
+                    && match &state.accumulator {
+                        Accumulator::Gauge { .. } => true,
+                        Accumulator::Sum { .. } | Accumulator::Histogram(_) => {
+                            self.temporality == AggregateTemporality::Cumulative
+                        }
+                        _ => false,
+                    };
                 if state.updated_this_window {
                     let (links, dropped) = std::mem::take(&mut state.contexts).into_links();
                     total_dropped_links += dropped;
 
-                    if is_gauge && self.gauge_retention > 0 {
+                    if retain {
                         // Retained: read the current value without consuming the accumulator
-                        // (`Gauge`'s fields are plain `Copy` types, so this is free) rather than
+                        // (free for `Gauge`/`Sum`, whose fields are plain `Copy` types; one
+                        // bucket-`Vec` clone for a cumulative `Histogram`) rather than
                         // `into_kind()`, which would require cloning the whole accumulator just
                         // to keep a copy of it around afterward. `key.attributes` is cloned here
                         // -- and *only* here, not on the tumbling path below -- because `key`
                         // itself has to survive to become this series' map key again.
-                        let value = match state.accumulator {
-                            Accumulator::Gauge { value, .. } => value,
-                            _ => unreachable!("is_gauge guards this"),
-                        };
-                        let mut record = MetricRecord::new(key.name, MetricKind::Gauge(value));
+                        let mut record = MetricRecord::new(
+                            key.name,
+                            state.accumulator.kind_for_retained(self.temporality),
+                        );
                         record.unit = key.unit;
+                        // The series' first-seen time, unchanged for as long as it lives -- the
+                        // reset signal a cumulative consumer needs (`SeriesState::first_seen`).
+                        // Only for the kinds that carry a running total: a `Gauge` has no start
+                        // time to report, so it keeps `MetricRecord::new`'s `0` ("unknown", OTLP's
+                        // own convention) exactly as it did before this mode existed.
+                        if matches!(record.kind, MetricKind::Sum(_) | MetricKind::Histogram(_)) {
+                            record.start_timestamp = state.first_seen;
+                        }
                         // Explicit, not just `MetricRecord::new`'s implicit `0` default: an
                         // accumulated value is by construction never a `NO_RECORDED_VALUE` point
                         // (a flagged record short-circuits into `process`'s pass-through instead
@@ -820,7 +1047,9 @@ impl Aggregator {
                         // within-window tiebreak, and retention must not promote it to a
                         // cross-window ordering guarantee -- an ordinary absolute gauge in the
                         // next window with an earlier source timestamp than this window's winner
-                        // must still be accepted, not silently dropped by a stale `at`.
+                        // must still be accepted, not silently dropped by a stale `at`. Nothing
+                        // equivalent applies to a retained `Sum`/`Histogram`: they accumulate in
+                        // arrival order and have no timestamp tiebreak to stale out.
                         if let Accumulator::Gauge { at, .. } = &mut state.accumulator {
                             *at = i64::MIN;
                         }
@@ -831,24 +1060,27 @@ impl Aggregator {
                         // Not retained: consume the accumulator directly, exactly as before
                         // retention existed -- zero-cost for `Distribution` (the sketch's backing
                         // `Vec`s move rather than being cloned).
-                        let kind = state.accumulator.into_kind();
+                        let kind = state.accumulator.into_kind(self.temporality);
                         let mut record = MetricRecord::new(key.name, kind);
                         record.unit = key.unit;
-                        // See the retained-gauge arm above: an accumulated value is never a
+                        // See the retained arm above: an accumulated value is never a
                         // `NO_RECORDED_VALUE` point, made explicit rather than relying on
                         // `MetricRecord::new`'s implicit `0` default.
                         record.flags = 0;
                         events.push((Event::metric(now, key.attributes, record), links));
                     }
                 } else {
-                    // A previously-retained, still-idle gauge series (only reachable when
-                    // `gauge_retention > 0` -- nothing else survives to see an unupdated flush).
+                    // A previously-retained, still-idle series (only reachable when
+                    // `series_retention > 0` -- nothing else survives to see an unupdated flush).
                     // Emits nothing this window -- not a repeat of last window's value, not a
                     // zero -- which is the whole point of retention: silence, not noise, for a
-                    // gauge nobody touched.
+                    // series nobody touched. A cumulative `Sum`/`Histogram` is deliberately no
+                    // exception: re-emitting an unchanged running total every idle window would
+                    // multiply this stage's output by its retention depth, and a cumulative
+                    // consumer already treats the last value it saw as standing until replaced.
                     state.contexts = ContributingContexts::default(); // never carried, even empty
                     state.idle_windows += 1;
-                    if state.idle_windows < self.gauge_retention {
+                    if state.idle_windows < self.series_retention {
                         survivors.push((gi, key, state));
                     } else {
                         evicted_idle += 1;
@@ -864,14 +1096,14 @@ impl Aggregator {
             }
         }
 
-        // Cardinality cap: a hard bound on *all* retained gauge series at once, evicting the
-        // least-recently-updated (highest `idle_windows`) first once exceeded. `gauge_retention`
+        // Cardinality cap: a hard bound on *all* retained series at once, evicting the
+        // least-recently-updated (highest `idle_windows`) first once exceeded. `series_retention`
         // alone bounds only how long one series survives; without this, a stream of C
-        // never-repeating series names per window would hold C * gauge_retention series forever,
+        // never-repeating series names per window would hold C * series_retention series forever,
         // regardless of how short the retention window is.
         let mut evicted_cardinality: u64 = 0;
-        if survivors.len() > self.max_retained_gauge_series {
-            let excess = survivors.len() - self.max_retained_gauge_series;
+        if survivors.len() > self.max_retained_series {
+            let excess = survivors.len() - self.max_retained_series;
             // Stable sort: ties (e.g. several series retained fresh this same flush, all at
             // `idle_windows == 0`) keep their relative order rather than picking an eviction
             // victim nondeterministically among equally-idle series.
@@ -881,10 +1113,10 @@ impl Aggregator {
         }
 
         // Re-insert the survivors into their original group's now-empty `series` map, then drop
-        // any group left with none: every non-gauge series was always removed above; every gauge
-        // series was either not retained, idle-evicted, or just cardinality-evicted -- a
-        // counters-only resource group disappears from `self.groups` exactly as it always has,
-        // tumbling or not.
+        // any group left with none: every non-retainable series was always removed above; every
+        // retainable one was either not retained, idle-evicted, or just cardinality-evicted -- a
+        // delta-mode counters-only resource group disappears from `self.groups` exactly as it
+        // always has, tumbling or not.
         for (gi, key, state) in survivors {
             self.groups[gi].series.insert(key, state);
         }
@@ -910,16 +1142,18 @@ impl Aggregator {
                 evicted_cardinality as f64,
                 &[("reason", "cardinality")],
             );
-            // Never silent: hitting the cap means a later delta against an evicted series
-            // resolves against 0.0 and produces a wrong-looking number, same as an unseeded
-            // delta's own diagnostic just below it in spirit.
+            // Never silent: hitting the cap means a later gauge delta against an evicted series
+            // resolves against 0.0 and produces a wrong-looking number, and a cumulative series
+            // restarts from zero with a new `start_timestamp` -- correct per the reset protocol,
+            // but not something an operator should have to infer.
             self.diag.warn_throttled(
-                "gauge_retention_full",
+                "series_retention_full",
                 format_args!(
-                    "gauge retention cap ({}) exceeded; evicted {evicted_cardinality} least-\
-                     recently-updated series -- a later delta against an evicted series will \
-                     resolve against 0.0",
-                    self.max_retained_gauge_series
+                    "series retention cap ({}) exceeded; evicted {evicted_cardinality} least-\
+                     recently-updated series -- a later gauge delta against an evicted series \
+                     will resolve against 0.0, and an evicted cumulative series restarts from \
+                     zero",
+                    self.max_retained_series
                 ),
             );
         }
@@ -954,9 +1188,9 @@ impl Transform for Aggregator {
 }
 
 impl Accumulator {
-    /// Kept in sync with `process`'s pass-through `matches!` *deliberately* -- see that
-    /// `matches!`'s own doc comment. A kind reaching this function that `matches!` should have
-    /// already filtered out is a runtime panic here, not a compile error.
+    /// Kept in sync with [`passes_through`] *deliberately* -- see that function's own doc comment.
+    /// A kind reaching this function that `passes_through` should have already filtered out is a
+    /// runtime panic here, not a compile error.
     ///
     /// `distributions`/`sets` decide the *opened* shape for `Samples`/`SetMembers` --
     /// `Distribution`/`Set` regardless of mode (nothing raw to retain -- there's nothing mode-
@@ -966,7 +1200,12 @@ impl Accumulator {
     /// unconditionally right after -- `new_for` only decides the empty starting shape, never
     /// contains data itself (the same "create empty, `process` immediately merges into it"
     /// pattern `Distribution`'s own arm already follows).
-    fn new_for(kind: &MetricKind, distributions: Distributions, sets: Sets) -> Self {
+    fn new_for(
+        kind: &MetricKind,
+        distributions: Distributions,
+        sets: Sets,
+        temporality: AggregateTemporality,
+    ) -> Self {
         match kind {
             MetricKind::Sum(Sum { temporality: Temporality::Delta, monotonic, .. }) => {
                 Accumulator::Sum { total: 0.0, monotonic: *monotonic }
@@ -1000,6 +1239,24 @@ impl Accumulator {
                 Sets::Estimate => Accumulator::Set(logit_core::HyperLogLog::new()),
                 Sets::Members => Accumulator::SetMembers(Vec::new()),
             },
+            // A delta `Histogram` only reaches here under `temporality: cumulative`
+            // ([`passes_through`]). The opened shape is this record's own bucket *bounds* with zero
+            // counts -- the identity element for this series' layout, which `process`'s merge arm
+            // immediately adds the record's real counts into, the same "create empty, merge right
+            // after" pattern every other arm here follows. `sum` is seeded `Some(0.0)` exactly when
+            // this first record has one, so the strict "adds only when both sides have a sum" merge
+            // rule doesn't discard a perfectly good sum on the very first merge; `min`/`max` start
+            // `None` and fold in. Already stamped `Cumulative`: a retained histogram is only ever
+            // emitted as a running total (see `kind_for_retained`/`into_kind`).
+            MetricKind::Histogram(h) if temporality == AggregateTemporality::Cumulative => {
+                Accumulator::Histogram(logit_core::Histogram {
+                    buckets: h.buckets.iter().map(|(bound, _)| (*bound, 0)).collect(),
+                    temporality: Temporality::Cumulative,
+                    sum: h.sum.map(|_| 0.0),
+                    min: None,
+                    max: None,
+                })
+            }
             MetricKind::Sum(Sum { temporality: Temporality::Cumulative, .. })
             | MetricKind::Histogram(_)
             | MetricKind::ExponentialHistogram(_)
@@ -1009,17 +1266,57 @@ impl Accumulator {
         }
     }
 
-    fn into_kind(self) -> MetricKind {
+    /// Consumes this accumulator into the `MetricKind` a *tumbling* flush emits. `temporality`
+    /// decides what a `Sum` is labelled: the stage's configured mode, not the records that fed it
+    /// (only delta records ever reach an accumulator at all -- see [`passes_through`]).
+    fn into_kind(self, temporality: AggregateTemporality) -> MetricKind {
         match self {
-            Accumulator::Sum { total, monotonic } => {
-                MetricKind::Sum(Sum { value: total, temporality: Temporality::Delta, monotonic })
-            }
+            Accumulator::Sum { total, monotonic } => MetricKind::Sum(Sum {
+                value: total,
+                temporality: record_temporality(temporality),
+                monotonic,
+            }),
             Accumulator::Gauge { value, .. } => MetricKind::Gauge(value),
+            Accumulator::Histogram(histogram) => MetricKind::Histogram(histogram),
             Accumulator::Distribution(sketch) => MetricKind::Distribution(sketch),
             Accumulator::Samples(samples) => MetricKind::Samples(samples),
             Accumulator::Set(hll) => MetricKind::Set(hll),
             Accumulator::SetMembers(members) => MetricKind::SetMembers(members),
         }
+    }
+
+    /// [`Accumulator::into_kind`]'s non-consuming twin, for a series that must survive this flush:
+    /// the emitted record is a *copy* of the running value, the accumulator keeps accumulating.
+    /// Free for `Gauge`/`Sum` (`Copy` fields); one bucket-`Vec` clone for a cumulative `Histogram`,
+    /// the unavoidable cost of emitting a snapshot of state that has to persist.
+    fn kind_for_retained(&self, temporality: AggregateTemporality) -> MetricKind {
+        match self {
+            Accumulator::Gauge { value, .. } => MetricKind::Gauge(*value),
+            Accumulator::Sum { total, monotonic } => MetricKind::Sum(Sum {
+                value: *total,
+                temporality: record_temporality(temporality),
+                monotonic: *monotonic,
+            }),
+            Accumulator::Histogram(histogram) => MetricKind::Histogram(histogram.clone()),
+            // Kept in sync with `flush`'s `retain` predicate *deliberately*, the same paired-
+            // exhaustiveness shape `new_for`/`passes_through` use: nothing else is ever retained.
+            Accumulator::Distribution(_)
+            | Accumulator::Samples(_)
+            | Accumulator::Set(_)
+            | Accumulator::SetMembers(_) => {
+                unreachable!("flush() only ever retains a Gauge, or a cumulative Sum/Histogram")
+            }
+        }
+    }
+}
+
+/// The `logit_core::Temporality` a flushed record carries under a given stage mode -- the one place
+/// the config-level mode becomes a per-record wire field, so `into_kind` and `kind_for_retained`
+/// can't disagree about it.
+fn record_temporality(temporality: AggregateTemporality) -> Temporality {
+    match temporality {
+        AggregateTemporality::Delta => Temporality::Delta,
+        AggregateTemporality::Cumulative => Temporality::Cumulative,
     }
 }
 
@@ -2015,6 +2312,32 @@ mod tests {
         })
     }
 
+    /// `logit.transform.series.evicted{reason}`'s value out of already-drained telemetry events --
+    /// the shape three eviction tests below each need, factored out rather than re-inlined.
+    fn evicted_count(events: &[Event], reason: &str) -> Option<f64> {
+        counter_with_tag(events, "logit.transform.series.evicted", "reason", reason)
+    }
+
+    /// `logit.component.diagnostics{key}`'s value -- how a `warn_throttled` call is asserted
+    /// (`crates/logit-core/src/diag.rs` counts every occurrence, throttled log or not).
+    fn diagnostic_count(events: &[Event], key: &str) -> Option<f64> {
+        counter_with_tag(events, "logit.component.diagnostics", "key", key)
+    }
+
+    fn counter_with_tag(events: &[Event], name: &str, tag: &str, tag_value: &str) -> Option<f64> {
+        events.iter().find_map(|e| {
+            if e.attributes.get(tag).and_then(|v| v.as_str()) != Some(tag_value) {
+                return None;
+            }
+            e.metrics.iter().find_map(|m| match &m.kind {
+                MetricKind::Sum(sum) if logit_core::interner::resolve(m.name) == name => {
+                    Some(sum.value)
+                }
+                _ => None,
+            })
+        })
+    }
+
     #[test]
     fn flush_records_active_series_and_resource_group_counts() {
         let registry = logit_core::Registry::new();
@@ -2074,7 +2397,7 @@ mod tests {
 
     #[test]
     fn a_delta_in_the_next_window_resolves_against_the_previous_windows_final_value() {
-        let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(5, 100);
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
         agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
         let flushed = flush_events(&mut agg, 100);
@@ -2097,7 +2420,7 @@ mod tests {
 
     #[test]
     fn a_retained_idle_gauge_emits_nothing_that_window() {
-        let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(5, 100);
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
         agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
         assert_eq!(flush_events(&mut agg, 100).len(), 1, "window 1 emits the gauge");
@@ -2108,12 +2431,12 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_gauge_is_evicted_after_gauge_retention_windows_and_a_later_delta_resolves_against_zero(
+    fn an_idle_gauge_is_evicted_after_series_retention_windows_and_a_later_delta_resolves_against_zero(
     ) {
         let registry = logit_core::Registry::new();
         let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
         let mut agg = Aggregator::new(Duration::from_secs(10))
-            .with_gauge_retention(2, 100)
+            .with_series_retention(2, 100)
             .with_telemetry(telemetry);
         let resource = default_resource();
         agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
@@ -2144,12 +2467,12 @@ mod tests {
         assert_eq!(unseeded, Some(1.0), "the post-eviction delta should count as unseeded");
     }
 
-    /// `gauge_retention: 0` must reproduce today's exact tumbling behavior byte-for-byte -- the
+    /// `series_retention: 0` must reproduce today's exact tumbling behavior byte-for-byte -- the
     /// migration story for anyone not opting into retention (which is every existing config,
     /// since it's the field's default).
     #[test]
-    fn gauge_retention_zero_reproduces_the_strictly_tumbling_output() {
-        let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(0, 0);
+    fn series_retention_zero_reproduces_the_strictly_tumbling_output() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(0, 0);
         let resource = default_resource();
         agg.process(&resource, metric_event("temp", MetricKind::Gauge(5.0), 50));
         agg.process(&resource, metric_event("temp", MetricKind::Gauge(1.0), 10));
@@ -2165,7 +2488,7 @@ mod tests {
 
         assert!(
             agg.flush(200).is_empty(),
-            "gauge_retention: 0 must not retain anything across flushes, exactly like today"
+            "series_retention: 0 must not retain anything across flushes, exactly like today"
         );
     }
 
@@ -2177,7 +2500,7 @@ mod tests {
     /// tiebreak, and retention must not promote it to a cross-window ordering guarantee.
     #[test]
     fn an_absolute_gauge_in_the_next_window_with_an_earlier_timestamp_is_still_accepted() {
-        let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(5, 100);
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
         // Window 1's winner is stamped at t=500.
         agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 500));
@@ -2197,15 +2520,19 @@ mod tests {
         }
     }
 
+    /// Retention alone never keeps a counter alive: only `temporality: cumulative` does, and this
+    /// aggregator is in the default `delta` mode (see
+    /// `cumulative_mode_sums_accumulate_across_flushes_with_a_stable_start_timestamp` for the
+    /// other half).
     #[test]
-    fn a_counter_series_does_not_survive_its_window_even_with_gauge_retention_enabled() {
-        let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(5, 100);
+    fn a_delta_mode_counter_series_does_not_survive_its_window_even_with_series_retention() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
         agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
         assert_eq!(flush_events(&mut agg, 100).len(), 1);
         assert!(
             agg.flush(200).is_empty(),
-            "a counter series must never survive a flush, retention enabled or not"
+            "a delta-mode counter series must never survive a flush, retention enabled or not"
         );
     }
 
@@ -2214,7 +2541,7 @@ mod tests {
         let registry = logit_core::Registry::new();
         let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
         let mut agg = Aggregator::new(Duration::from_secs(10))
-            .with_gauge_retention(5, 100)
+            .with_series_retention(5, 100)
             .with_telemetry(telemetry);
         let resource = default_resource();
         agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
@@ -2236,7 +2563,7 @@ mod tests {
         let registry = logit_core::Registry::new();
         let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
         let mut agg = Aggregator::new(Duration::from_secs(10))
-            .with_gauge_retention(5, 2)
+            .with_series_retention(5, 2)
             .with_telemetry(telemetry);
         let resource = default_resource();
         for i in 0..3 {
@@ -2268,7 +2595,7 @@ mod tests {
     /// rejected. `mem::take`n every flush unconditionally, retained or not.
     #[test]
     fn contexts_are_never_carried_across_a_flush_even_for_a_retained_gauge() {
-        let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(5, 100);
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
         let ctx_a = TraceContext::new_root();
         agg.observe_batch_context(ctx_a);
@@ -2300,7 +2627,7 @@ mod tests {
     /// empty `(resource, events)` batch downstream for it.
     #[test]
     fn flush_emits_no_empty_resource_events_group() {
-        let mut agg = Aggregator::new(Duration::from_secs(10)).with_gauge_retention(5, 100);
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
         agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
         agg.flush(100); // retains "conns", idle from here on
@@ -2697,12 +3024,12 @@ mod tests {
         }
     }
 
-    /// A `Samples` series must tumble every window regardless of `gauge_retention` -- it's not a
+    /// A `Samples` series must tumble every window regardless of `series_retention` -- it's not a
     /// `Gauge`, so nothing about retention applies to it.
     #[test]
-    fn a_samples_series_never_survives_a_flush_even_with_gauge_retention_enabled() {
+    fn a_samples_series_never_survives_a_flush_even_with_series_retention_enabled() {
         let mut agg = Aggregator::new(Duration::from_secs(10))
-            .with_gauge_retention(5, 100)
+            .with_series_retention(5, 100)
             .with_distributions(Distributions::Samples, 1000);
         let resource = default_resource();
         agg.process(
@@ -2713,12 +3040,12 @@ mod tests {
         assert!(agg.flush(200).is_empty(), "a Samples series must tumble, never retain");
     }
 
-    /// Same as `a_samples_series_never_survives_a_flush_even_with_gauge_retention_enabled`, for a
+    /// Same as `a_samples_series_never_survives_a_flush_even_with_series_retention_enabled`, for a
     /// `SetMembers` series.
     #[test]
-    fn a_set_members_series_never_survives_a_flush_even_with_gauge_retention_enabled() {
+    fn a_set_members_series_never_survives_a_flush_even_with_series_retention_enabled() {
         let mut agg = Aggregator::new(Duration::from_secs(10))
-            .with_gauge_retention(5, 100)
+            .with_series_retention(5, 100)
             .with_sets(Sets::Members, 1000);
         let resource = default_resource();
         agg.process(
@@ -2800,5 +3127,414 @@ mod tests {
         let (_, events) = &flushed[0];
         assert_eq!(events.len(), 1);
         assert_eq!(counter_value(kind_of(&events[0])), 2.0);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // `temporality: cumulative` (docs/adr/aggregation-window-semantics.md's "cumulative
+    // temporality as an opt-in mode" amendment)
+    // -----------------------------------------------------------------------------------------
+
+    /// An aggregator in `cumulative` mode with both retention bounds set -- the only combination
+    /// `logit_config` allows for that mode (graph rule 39), so every test below uses it.
+    fn cumulative_agg() -> Aggregator {
+        Aggregator::new(Duration::from_secs(10))
+            .with_temporality(AggregateTemporality::Cumulative)
+            .with_series_retention(5, 100)
+    }
+
+    fn sum_of(event: &Event) -> &Sum {
+        match kind_of(event) {
+            MetricKind::Sum(sum) => sum,
+            other => panic!("expected Sum, got {other:?}"),
+        }
+    }
+
+    fn start_timestamp_of(event: &Event) -> i64 {
+        event.metrics.first().expect("a metric on the event").start_timestamp
+    }
+
+    fn histogram_of(event: &Event) -> &logit_core::Histogram {
+        match kind_of(event) {
+            MetricKind::Histogram(h) => h,
+            other => panic!("expected Histogram, got {other:?}"),
+        }
+    }
+
+    /// A delta histogram event, the shape a scrape/OTLP delta producer hands over: per-bucket
+    /// counts, an optional `sum`, and optional `min`/`max`.
+    fn delta_histogram_event(
+        name: &str,
+        buckets: &[(f64, u64)],
+        sum: Option<f64>,
+        min: Option<f64>,
+        max: Option<f64>,
+        timestamp: i64,
+    ) -> Event {
+        metric_event(
+            name,
+            MetricKind::Histogram(logit_core::Histogram {
+                buckets: buckets.to_vec(),
+                temporality: Temporality::Delta,
+                sum,
+                min,
+                max,
+            }),
+            timestamp,
+        )
+    }
+
+    /// The headline test for this mode: a delta `Sum` series' accumulator survives every flush,
+    /// each window emits the *running total* labelled `Cumulative`, and `start_timestamp` is the
+    /// series' first-seen event timestamp -- identical across flushes, which is exactly what makes
+    /// it a reset signal rather than a per-window timestamp.
+    #[test]
+    fn cumulative_mode_sums_accumulate_across_flushes_with_a_stable_start_timestamp() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+
+        agg.process(&resource, metric_event("hits", MetricKind::counter(2.0), 1_000));
+        agg.process(&resource, metric_event("hits", MetricKind::counter(3.0), 1_500));
+        let flushed = flush_events(&mut agg, 100_000);
+        let first = &flushed[0].1[0];
+        assert_eq!(sum_of(first).value, 5.0, "window 1's own increments");
+        assert_eq!(sum_of(first).temporality, Temporality::Cumulative);
+        assert!(sum_of(first).monotonic, "MetricKind::counter is monotonic, and that carries");
+        assert_eq!(
+            start_timestamp_of(first),
+            1_000,
+            "the first event's timestamp opened this series"
+        );
+
+        // Window 2: a further increment adds to the running total rather than starting over.
+        agg.process(&resource, metric_event("hits", MetricKind::counter(4.0), 110_000));
+        let flushed = flush_events(&mut agg, 200_000);
+        let second = &flushed[0].1[0];
+        assert_eq!(sum_of(second).value, 9.0, "5 carried forward plus 4 this window");
+        assert_eq!(sum_of(second).temporality, Temporality::Cumulative);
+        assert_eq!(
+            start_timestamp_of(second),
+            1_000,
+            "start_timestamp must not move while the series lives"
+        );
+    }
+
+    /// A non-monotonic delta `Sum` (an OTLP up-down counter) keeps its flag through cumulative
+    /// accumulation -- the emitted temporality comes from the stage's mode, the `monotonic` flag
+    /// from the data, and the two are independent.
+    #[test]
+    fn cumulative_mode_keeps_the_accumulated_monotonic_flag() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+        let up_down = |v: f64| {
+            MetricKind::Sum(Sum { value: v, temporality: Temporality::Delta, monotonic: false })
+        };
+        agg.process(&resource, metric_event("queue.depth", up_down(5.0), 10));
+        agg.process(&resource, metric_event("queue.depth", up_down(-2.0), 20));
+
+        let flushed = flush_events(&mut agg, 100);
+        let emitted = sum_of(&flushed[0].1[0]);
+        assert_eq!(emitted.value, 3.0);
+        assert_eq!(emitted.temporality, Temporality::Cumulative);
+        assert!(!emitted.monotonic, "a non-monotonic sum stays non-monotonic");
+    }
+
+    /// A retained cumulative series that goes idle emits nothing that window (the same silence a
+    /// retained gauge keeps) and then resumes from its running total, not from zero.
+    #[test]
+    fn an_idle_cumulative_series_emits_nothing_then_resumes_from_its_running_total() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+        agg.process(&resource, metric_event("hits", MetricKind::counter(7.0), 100));
+        assert_eq!(flush_events(&mut agg, 1_000).len(), 1, "window 1 emits the total");
+
+        assert!(agg.flush(2_000).is_empty(), "an idle cumulative series emits nothing");
+
+        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 2_500));
+        let flushed = flush_events(&mut agg, 3_000);
+        assert_eq!(sum_of(&flushed[0].1[0]).value, 8.0, "the idle window didn't reset the total");
+        assert_eq!(start_timestamp_of(&flushed[0].1[0]), 100, "still the original start");
+    }
+
+    /// A delta `Histogram` merges per bucket in `cumulative` mode: bucket counts add, `sum` adds
+    /// (both sides have one), `min`/`max` fold, and every flush emits the running total as
+    /// `Cumulative` with the series' `start_timestamp`.
+    #[test]
+    fn cumulative_mode_histograms_accumulate_per_bucket() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+        let buckets = [(1.0, 1u64), (5.0, 2), (f64::INFINITY, 3)];
+        assert!(
+            agg.process(
+                &resource,
+                delta_histogram_event("sizes", &buckets, Some(30.0), Some(0.5), Some(9.0), 500)
+            )
+            .is_none(),
+            "a delta histogram must be absorbed in cumulative mode, not forwarded"
+        );
+
+        let flushed = flush_events(&mut agg, 10_000);
+        let first = &flushed[0].1[0];
+        assert_eq!(histogram_of(first).buckets, buckets.to_vec());
+        assert_eq!(histogram_of(first).temporality, Temporality::Cumulative);
+        assert_eq!(histogram_of(first).sum, Some(30.0));
+        assert_eq!(start_timestamp_of(first), 500);
+
+        // Window 2: another delta histogram over the same bounds, with a lower min and higher max.
+        agg.process(
+            &resource,
+            delta_histogram_event(
+                "sizes",
+                &[(1.0, 10), (5.0, 20), (f64::INFINITY, 30)],
+                Some(4.0),
+                Some(0.1),
+                Some(11.0),
+                11_000,
+            ),
+        );
+        let flushed = flush_events(&mut agg, 20_000);
+        let second = &flushed[0].1[0];
+        assert_eq!(
+            histogram_of(second).buckets,
+            vec![(1.0, 11), (5.0, 22), (f64::INFINITY, 33)],
+            "bucket counts add bucket-for-bucket across windows"
+        );
+        assert_eq!(histogram_of(second).sum, Some(34.0), "sums add when both sides have one");
+        assert_eq!(histogram_of(second).min, Some(0.1), "min folds to the lower of the two");
+        assert_eq!(histogram_of(second).max, Some(11.0), "max folds to the higher of the two");
+        assert_eq!(start_timestamp_of(second), 500, "start_timestamp is still the first-seen time");
+    }
+
+    /// `sum` is strict where `min`/`max` are forgiving: a window whose histogram reports no `sum`
+    /// makes the running total's `sum` `None` (a partial total would understate the series
+    /// outright), while its absent `min`/`max` leave the folded extremes standing.
+    #[test]
+    fn a_histogram_window_without_a_sum_drops_the_running_sum_but_keeps_min_and_max() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+        let bounds = [(1.0, 1u64), (f64::INFINITY, 1)];
+        agg.process(
+            &resource,
+            delta_histogram_event("sizes", &bounds, Some(3.0), Some(0.5), Some(2.0), 0),
+        );
+        agg.process(&resource, delta_histogram_event("sizes", &bounds, None, None, None, 1));
+
+        let flushed = flush_events(&mut agg, 100);
+        let emitted = histogram_of(&flushed[0].1[0]);
+        assert_eq!(emitted.buckets, vec![(1.0, 2), (f64::INFINITY, 2)]);
+        assert_eq!(emitted.sum, None, "a sum missing one window's contribution is no sum at all");
+        assert_eq!(emitted.min, Some(0.5), "the extremes observed so far still stand");
+        assert_eq!(emitted.max, Some(2.0));
+    }
+
+    /// Bucket counts are wire-supplied `u64`s (`otlp_in` copies `bucket_counts` verbatim, with no
+    /// clamp), and this is the only place the stage sums integers rather than `f64`s. Two delta
+    /// points carrying `u64::MAX` on one series must saturate: unchecked, this panics the transform
+    /// task under `overflow-checks` and wraps the running total backwards without them -- while
+    /// `start_timestamp` stays pinned, which is exactly the "the series did not restart" promise a
+    /// cumulative consumer relies on. Asserting `u64::MAX` (not just "no panic") is what pins the
+    /// saturation rather than any other recovery.
+    #[test]
+    fn cumulative_histogram_bucket_counts_saturate_instead_of_overflowing() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+        let maxed = [(1.0, u64::MAX), (f64::INFINITY, u64::MAX)];
+        assert!(agg
+            .process(&resource, delta_histogram_event("sizes", &maxed, None, None, None, 0))
+            .is_none());
+        assert!(agg
+            .process(&resource, delta_histogram_event("sizes", &maxed, None, None, None, 1))
+            .is_none());
+
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(
+            histogram_of(&flushed[0].1[0]).buckets,
+            vec![(1.0, u64::MAX), (f64::INFINITY, u64::MAX)],
+            "a saturated bucket pins at u64::MAX -- never wraps back around"
+        );
+        assert_eq!(
+            start_timestamp_of(&flushed[0].1[0]),
+            0,
+            "and the series is still the same series, which is why wrapping would be so wrong"
+        );
+    }
+
+    /// Two histograms of one series with different bucket *bounds* have no correct merge -- adding
+    /// bucket i of one to bucket i of the other would attribute counts to bounds they were never
+    /// observed under. Same treatment as a kind conflict: the offending record stays on the event,
+    /// the accumulator is untouched, and its own diagnostic fires.
+    #[test]
+    fn a_histogram_with_mismatched_bucket_bounds_is_passed_through() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = cumulative_agg()
+            .with_diagnostics(Diagnostics::default().with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry);
+        let resource = default_resource();
+
+        agg.process(
+            &resource,
+            delta_histogram_event("sizes", &[(1.0, 1), (f64::INFINITY, 1)], None, None, None, 0),
+        );
+        let mismatched = delta_histogram_event(
+            "sizes",
+            &[(2.0, 5), (f64::INFINITY, 5)], // different bound: 2.0, not 1.0
+            None,
+            None,
+            None,
+            1,
+        );
+        let passed = agg.process(&resource, mismatched);
+        let passed = passed.expect("the mismatched histogram must be forwarded, not absorbed");
+        assert_eq!(passed.metrics.len(), 1);
+        assert!(matches!(passed.metrics[0].kind, MetricKind::Histogram(_)));
+
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(
+            histogram_of(&flushed[0].1[0]).buckets,
+            vec![(1.0, 1), (f64::INFINITY, 1)],
+            "the accumulating series must be untouched by the mismatched record"
+        );
+
+        let drained = registry.drain(0);
+        assert_eq!(
+            diagnostic_count(&drained, "histogram_bounds_mismatch"),
+            Some(1.0),
+            "the bounds mismatch should be diagnosed under its own key"
+        );
+    }
+
+    /// An idle cumulative series ages out after `series_retention` windows, fires
+    /// `series.evicted{reason="idle"}`, and a later increment opens a **new** series -- restarting
+    /// the total from that increment alone with a fresh `start_timestamp`. That new start time is
+    /// precisely the restart signal a cumulative consumer detects a reset with.
+    #[test]
+    fn an_evicted_cumulative_series_restarts_with_a_new_start_timestamp() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_temporality(AggregateTemporality::Cumulative)
+            .with_series_retention(2, 100)
+            .with_telemetry(telemetry);
+        let resource = default_resource();
+
+        agg.process(&resource, metric_event("hits", MetricKind::counter(5.0), 100));
+        assert_eq!(agg.flush(1_000).len(), 1, "window 1: emits 5, idle_windows resets to 0");
+        assert!(agg.flush(2_000).is_empty(), "window 2: idle_windows -> 1, still under retention");
+        assert!(agg.flush(3_000).is_empty(), "window 3: idle_windows -> 2, now evicted");
+
+        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 3_500));
+        let flushed = flush_events(&mut agg, 4_000);
+        let restarted = &flushed[0].1[0];
+        assert_eq!(sum_of(restarted).value, 1.0, "an evicted series restarts from zero");
+        assert_eq!(
+            start_timestamp_of(restarted),
+            3_500,
+            "the re-created series carries a new start_timestamp -- the reset signal"
+        );
+
+        let drained = registry.drain(0);
+        assert_eq!(
+            evicted_count(&drained, "idle"),
+            Some(1.0),
+            "TTL eviction of a cumulative series fires series.evicted with reason=idle"
+        );
+    }
+
+    /// The cardinality cap bounds cumulative series exactly as it bounds retained gauges: the
+    /// least-recently-updated survivors are evicted, counted under `reason="cardinality"`, and the
+    /// `series_retention_full` diagnostic fires -- never silent, because an evicted cumulative
+    /// series restarts from zero.
+    #[test]
+    fn the_cardinality_cap_evicts_cumulative_series_and_fires_series_retention_full() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_temporality(AggregateTemporality::Cumulative)
+            .with_series_retention(5, 2)
+            .with_diagnostics(Diagnostics::default().with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry);
+        let resource = default_resource();
+        for i in 0..3 {
+            agg.process(&resource, metric_event(&format!("c{i}"), MetricKind::counter(1.0), 0));
+        }
+        agg.flush(100);
+
+        let drained = registry.drain(0);
+        assert_eq!(
+            evicted_count(&drained, "cardinality"),
+            Some(1.0),
+            "exactly one of the three cumulative series should exceed the cap of 2"
+        );
+        assert_eq!(
+            diagnostic_count(&drained, "series_retention_full"),
+            Some(1.0),
+            "hitting the cap must not be silent"
+        );
+    }
+
+    /// An incoming *cumulative* `Sum` is pass-through in `cumulative` mode too -- `aggregate` must
+    /// never re-sum an already-running total, which would double-count it. The complement of
+    /// `a_cumulative_sum_never_merges_into_an_existing_delta_sum_series`, which pins the same rule
+    /// in `delta` mode.
+    #[test]
+    fn a_cumulative_sum_input_still_passes_through_in_cumulative_mode() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+        let incoming = metric_event(
+            "m",
+            MetricKind::Sum(Sum {
+                value: 42.0,
+                temporality: Temporality::Cumulative,
+                monotonic: true,
+            }),
+            0,
+        );
+        let passed = agg.process(&resource, incoming);
+        assert!(passed.is_some(), "an already-cumulative Sum must pass through untouched");
+        assert!(agg.flush(100).is_empty(), "and must not have opened a series");
+    }
+
+    /// `delta` mode is unchanged by this amendment, stated directly: a delta `Sum` tumbles, and its
+    /// emitted record is labelled `Delta` with no `start_timestamp`.
+    #[test]
+    fn delta_mode_sums_tumble_and_emit_delta_temporality_with_no_start_timestamp() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
+        let resource = default_resource();
+        agg.process(&resource, metric_event("hits", MetricKind::counter(4.0), 1_000));
+
+        let flushed = flush_events(&mut agg, 10_000);
+        let emitted = &flushed[0].1[0];
+        assert_eq!(sum_of(emitted).value, 4.0);
+        assert_eq!(sum_of(emitted).temporality, Temporality::Delta);
+        assert_eq!(start_timestamp_of(emitted), 0, "delta records carry no start time");
+        assert!(agg.flush(20_000).is_empty(), "and the series tumbles, retention or not");
+    }
+
+    /// The mode-dependent half of [`passes_through`], pinned directly: a delta `Histogram` is
+    /// pass-through in `delta` mode, exactly as it was before this amendment existed. Widening that
+    /// is a separate decision, not a side effect of adding a cumulative mode.
+    #[test]
+    fn a_delta_histogram_still_passes_through_in_delta_mode() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
+        let resource = default_resource();
+        let event = delta_histogram_event("sizes", &[(1.0, 1)], Some(1.0), None, None, 0);
+        let passed = agg.process(&resource, event);
+        assert!(passed.is_some(), "a delta histogram must still pass through in delta mode");
+        assert!(agg.flush(100).is_empty(), "and must not have opened a series");
+    }
+
+    /// A `Distribution` series tumbles in `cumulative` mode too: only `Sum`/`Histogram` gained a
+    /// running total, and a sketch of one window's observations is self-contained (the same
+    /// reasoning `a_samples_series_never_survives_a_flush_even_with_series_retention_enabled`
+    /// pins for retention).
+    #[test]
+    fn a_distribution_series_still_tumbles_in_cumulative_mode() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+        let mut sketch = logit_core::DdSketch::new();
+        sketch.add(1.0);
+        agg.process(&resource, metric_event("latency", MetricKind::Distribution(sketch), 0));
+        assert_eq!(agg.flush(100).len(), 1, "the first flush emits the sketch");
+        assert!(agg.flush(200).is_empty(), "a Distribution series must tumble in either mode");
     }
 }

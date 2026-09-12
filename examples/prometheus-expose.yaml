@@ -3,15 +3,17 @@
 # exists for (docs/adr/prometheus-scrape-and-exposition.md). The scraping client picks the dialect
 # with its own `Accept` header; both are served off the one endpoint.
 #
-# NOTE ON TEMPORALITY. Prometheus counters are cumulative, and `prometheus_out` deliberately does
-# *not* accumulate deltas itself (that is summarization, and ADR `lossless-transit` reserves it for
-# a named stage). A delta `Sum`/`Histogram` reaching this sink is skipped and counted
+# NOTE ON TEMPORALITY -- why the `aggregate` stage is not optional here. Prometheus counters are
+# cumulative, and `prometheus_out` deliberately does *not* accumulate deltas itself: that is
+# summarization, which ADR `lossless-transit` reserves for a stage named in the config rather than
+# something a sink does silently on the way out. statsd counters arrive as delta `Sum`s, and a delta
+# `Sum`/`Histogram` reaching this sink is skipped and counted
 # (`logit.output.metrics.skipped{metric_kind="delta_sum"}`) with a throttled
-# `delta_temporality_unresolved` diagnostic. The named stage that fixes it is `aggregate`'s
-# `temporality: cumulative` mode, which is landing separately -- so **as this tree stands**, the
-# pipeline below exposes statsd gauges (and timers, as summaries) while statsd counters are skipped
-# and counted. Once `temporality: cumulative` is available, uncomment the line under `windowed:` and
-# counters survive too.
+# `delta_temporality_unresolved` diagnostic naming the fix. `aggregate`'s `temporality: cumulative`
+# is that named stage -- it keeps a per-series running total alive across window boundaries and emits
+# `Sum{Cumulative}` with `start_timestamp` set, which is exactly what a scraper needs to detect a
+# restart (`docs/adr/aggregation-window-semantics.md`'s cumulative amendment). Drop it from this
+# pipeline and the gauges still work while every counter silently stops being exposed.
 #
 # Config is a flat graph of components (docs/design/pipeline-graph.md,
 # docs/adr/component-graph-configuration.md): each names its own `sources`, rather than sitting in
@@ -25,8 +27,11 @@ components:
     type: aggregate
     sources: [statsd_in]
     interval: 10s
-    # temporality: cumulative  # see the NOTE above -- what makes counters and histograms survive
-    #                          # the trip to a Prometheus exposition
+    temporality: cumulative
+    # `series_retention` and `max_retained_series` both default to a non-zero value, which
+    # `temporality: cumulative` requires (graph rule 39): they are what keeps a running total alive
+    # across the window boundary, so at 0 every window would emit its own increment labelled as a
+    # cumulative total.
 
   metrics:
     type: prometheus_out
