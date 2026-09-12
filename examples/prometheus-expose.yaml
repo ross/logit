@@ -1,32 +1,40 @@
-# Expose a `/metrics` endpoint for Prometheus to scrape: receive statsd on one edge, aggregate,
-# and serve the result as Prometheus text 0.0.4 / OpenMetrics 1.0 -- the topology `prometheus_out`
-# exists for (docs/adr/prometheus-scrape-and-exposition.md). The scraping client picks the dialect
-# with its own `Accept` header; both are served off the one endpoint.
+# Expose a `/metrics` endpoint for Prometheus to scrape: drain logit's own self-telemetry,
+# aggregate it into cumulative counters/histograms, and serve the result as Prometheus text 0.0.4 /
+# OpenMetrics 1.0 -- the topology `prometheus_out` exists for
+# (docs/adr/prometheus-scrape-and-exposition.md). The scraping client picks the dialect with its
+# own `Accept` header; both are served off the one endpoint.
+#
+# `internal -> aggregate -> prometheus_out` rather than a statsd/OTLP source, so this example runs
+# standalone with nothing external to feed it: `self` below drains logit's own
+# `logit.component.*`/`logit.internal.*`/`logit.process.*` points
+# (docs/design/internal-telemetry.md) and exposes them the same way any other metrics source would.
 #
 # NOTE ON TEMPORALITY. Prometheus counters are cumulative, and `prometheus_out` deliberately does
 # *not* accumulate deltas itself (that is summarization, and ADR `lossless-transit` reserves it for
 # a named stage). A delta `Sum`/`Histogram` reaching this sink is skipped and counted
 # (`logit.output.metrics.skipped{metric_kind="delta_sum"}`) with a throttled
-# `delta_temporality_unresolved` diagnostic. The named stage that fixes it is `aggregate`'s
-# `temporality: cumulative` mode, which is landing separately -- so **as this tree stands**, the
-# pipeline below exposes statsd gauges (and timers, as summaries) while statsd counters are skipped
-# and counted. Once `temporality: cumulative` is available, uncomment the line under `windowed:` and
-# counters survive too.
+# `delta_temporality_unresolved` diagnostic. `windowed`'s `temporality: cumulative` below is the
+# named stage that fixes it: a delta accumulator survives each flush and keeps summing, so every
+# `logit.component.*` counter this pipeline exposes is a real running total rather than being
+# skipped. `series_retention`/`max_retained_series` bound how long (and how many) accumulators the
+# cumulative mode keeps alive across flushes -- see docs/adr/aggregation-window-semantics.md's
+# cumulative amendment.
 #
 # Config is a flat graph of components (docs/design/pipeline-graph.md,
 # docs/adr/component-graph-configuration.md): each names its own `sources`, rather than sitting in
 # a fixed inputs/transforms/outputs pipeline.
 components:
-  statsd_in:
-    type: statsd_in
-    bind: 127.0.0.1:8125
+  self:
+    type: internal
+    interval: 10s
 
   windowed:
     type: aggregate
-    sources: [statsd_in]
+    sources: [self]
     interval: 10s
-    # temporality: cumulative  # see the NOTE above -- what makes counters and histograms survive
-    #                          # the trip to a Prometheus exposition
+    temporality: cumulative # a delta Sum/Histogram's accumulator survives the flush and keeps
+    #                         summing, so prometheus_out below sees a real cumulative counter
+    #                         instead of skipping it (see the NOTE above)
 
   metrics:
     type: prometheus_out

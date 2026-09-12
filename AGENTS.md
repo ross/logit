@@ -150,7 +150,23 @@ ready (`2`). `internal`'s own `logs:` setting (`warn` by default, `error`, or `o
 now states an explicit goal — a lossless relay for each like-protocol pair
 (`statsd_in`/`statsd_out`, `otlp_in`/`otlp_out`, `syslog_in`/`syslog_out`) — that today's model and
 codecs don't yet meet; [`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md) has the
-assessment and the ordered workstreams closing that gap.
+assessment and the ordered workstreams closing that gap. `prometheus_in`/`prometheus_out`
+(`crates/logit-inputs`/`crates/logit-outputs`, `crates/logit-proto`'s `prometheus` codec) are the
+fourth like-protocol pair under that ADR, and the first one built lossless against the model from
+its first PR rather than retrofitted: `prometheus_in` scrapes `/metrics` targets on an interval,
+`prometheus_out` serves one back, both dialects (Prometheus text 0.0.4 and OpenMetrics 1.0)
+negotiated on `Accept`/`Content-Type`, so `prometheus_in -> prometheus_out` is a fixed point modulo
+a short, named list of normalizations
+([ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md),
+[examples/prometheus-relay.yaml](examples/prometheus-relay.yaml)). `aggregate` gained a
+`temporality: cumulative` mode alongside them: a delta `Sum`/`Histogram` accumulator survives each
+flush and keeps summing instead of resetting, which is what lets `statsd_in -> aggregate ->
+prometheus_out` and `internal -> aggregate -> prometheus_out` expose real running counters
+(`prometheus_out` itself never accumulates a delta — that summarization stays `aggregate`'s job,
+per `lossless-transit`'s "summarization is opt-in and named" rule) — see that same ADR's
+"Temporality is `aggregate`'s job" section and the
+[ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md) cumulative
+amendment.
 
 ## Environment
 
