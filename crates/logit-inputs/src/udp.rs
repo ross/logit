@@ -10,6 +10,12 @@
 //! `docs/design/pipeline-graph.md`'s crate-layout rule ("`logit-inputs`... hold only impls") --
 //! `socket2` is therefore a `logit-inputs` dependency only, never `logit-pipeline`'s.
 //!
+//! **Multicast comes free with the driver.** A `bind:` whose address is a multicast group makes
+//! [`bind_one`] set `SO_REUSEADDR`, bind the unspecified address on that port and join the group,
+//! rather than binding the group address directly -- so `collectd_in` (whose protocol has a
+//! standard group, `239.192.74.66`), `statsd_in` and `syslog_in` all get it without a field of
+//! their own. See that function's doc for why each of the three steps is needed.
+//!
 //! **Not used by [`crate::internal::InternalInput`].** `internal` has no socket, no datagram, and
 //! no `receive:` block -- it keeps `Input::run_until_shutdown`'s default (cancel-by-drop,
 //! unchanged from ADR `service-lifecycle-and-output-retry`). Don't generalize this module toward it.
@@ -211,14 +217,23 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
         if self.socket.is_some() {
             return Ok(()); // idempotent, per `Input::bind`'s contract
         }
-        let socket = bind_socket(
+        let (socket, multicast_group) = bind_socket(
             &self.bind,
             self.config.receive_buffer_bytes,
             &self.telemetry,
             &mut self.diag,
         )
         .await?;
-        self.diag.info("bound", format_args!("listening on {}", self.bind));
+        match multicast_group {
+            Some(group) => self.diag.info(
+                "bound",
+                format_args!(
+                    "listening on {} -- joined multicast group {group} on the default interface",
+                    self.bind
+                ),
+            ),
+            None => self.diag.info("bound", format_args!("listening on {}", self.bind)),
+        }
         self.socket = Some(socket);
         Ok(())
     }
@@ -285,6 +300,8 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
 }
 
 /// Resolves `bind` and binds a UDP socket to it, applying `receive_buffer_bytes` if given.
+/// Returns the socket and, when `bind` named a multicast group, the group that was joined (for
+/// the `bound` info line -- see [`bind_one`] for what a multicast bind actually does differently).
 ///
 /// Two properties this must have, both regressions an earlier version of this function had
 /// relative to the `tokio::net::UdpSocket::bind` it replaced:
@@ -304,7 +321,7 @@ async fn bind_socket(
     receive_buffer_bytes: Option<u64>,
     telemetry: &Telemetry,
     diag: &mut Diagnostics,
-) -> anyhow::Result<tokio::net::UdpSocket> {
+) -> anyhow::Result<(tokio::net::UdpSocket, Option<std::net::IpAddr>)> {
     use anyhow::Context;
 
     let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(bind)
@@ -324,11 +341,15 @@ fn bind_first_available(
     receive_buffer_bytes: Option<u64>,
     telemetry: &Telemetry,
     diag: &mut Diagnostics,
-) -> anyhow::Result<tokio::net::UdpSocket> {
+) -> anyhow::Result<(tokio::net::UdpSocket, Option<std::net::IpAddr>)> {
     let mut last_err: Option<anyhow::Error> = None;
     for &addr in addrs {
         match bind_one(addr, receive_buffer_bytes) {
-            Ok(socket) => return finish_bind(socket, receive_buffer_bytes, telemetry, diag),
+            Ok(bound) => {
+                let socket =
+                    finish_bind(bound.socket, receive_buffer_bytes, telemetry, diag)?;
+                return Ok((socket, bound.multicast_group));
+            }
             Err(err) => last_err = Some(err),
         }
     }
@@ -338,14 +359,34 @@ fn bind_first_available(
     }
 }
 
+/// One bound socket, plus the multicast group it joined if its address was one.
+struct Bound {
+    socket: socket2::Socket,
+    multicast_group: Option<std::net::IpAddr>,
+}
+
 /// Creates and binds one UDP socket to `addr` -- the per-candidate half of `bind_socket`'s
 /// try-every-resolved-address loop. Synchronous and cheap (socket syscalls only, no I/O wait),
 /// unlike the DNS resolution `bind_socket` itself awaits before ever calling this.
+///
+/// **A multicast `addr` is bound differently.** A group address (`224.0.0.0/4`, `ff00::/8` --
+/// collectd's own defaults are `239.192.74.66` and `ff18::efc0:4a42`, and statsd/syslog senders use
+/// groups too) is not an address any interface owns, so receiving on one takes three steps rather
+/// than one: `SO_REUSEADDR`, so several processes on the host can subscribe to the same group and
+/// port; a bind to the *unspecified* address on that port, since the group itself is not bindable
+/// everywhere and binding it would still not subscribe to anything; and an explicit
+/// `IP_ADD_MEMBERSHIP`/`IPV6_JOIN_GROUP` on the default interface (`INADDR_ANY` / interface index
+/// `0` -- the kernel's own multicast routing decides which interface that is, rather than this
+/// listener guessing at one). A failed join is a hard error, not a warning: a listener that bound
+/// but never joined would sit there looking healthy and receive nothing forever.
+///
+/// A unicast `addr` binds exactly as it always has.
 fn bind_one(
     addr: std::net::SocketAddr,
     receive_buffer_bytes: Option<u64>,
-) -> anyhow::Result<socket2::Socket> {
+) -> anyhow::Result<Bound> {
     use anyhow::Context;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     let domain = if addr.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
@@ -356,8 +397,30 @@ fn bind_one(
             .with_context(|| format!("setting SO_RCVBUF to {requested} bytes"))?;
     }
     socket.set_nonblocking(true).context("setting the socket non-blocking")?;
-    socket.bind(&addr.into())?;
-    Ok(socket)
+
+    let group = addr.ip();
+    if !group.is_multicast() {
+        socket.bind(&addr.into())?;
+        return Ok(Bound { socket, multicast_group: None });
+    }
+
+    socket
+        .set_reuse_address(true)
+        .context("setting SO_REUSEADDR, which a multicast bind needs")?;
+    let local: SocketAddr = match group {
+        IpAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, addr.port()).into(),
+        IpAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, addr.port()).into(),
+    };
+    socket.bind(&local.into())?;
+    match group {
+        IpAddr::V4(group) => socket
+            .join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
+            .with_context(|| format!("joining the multicast group {group}")),
+        IpAddr::V6(group) => socket
+            .join_multicast_v6(&group, 0)
+            .with_context(|| format!("joining the multicast group {group}")),
+    }?;
+    Ok(Bound { socket, multicast_group: Some(group) })
 }
 
 /// The granted-`SO_RCVBUF` gauging/warning and the final conversion to a tokio socket, run only
@@ -941,15 +1004,89 @@ mod tests {
 
         let telemetry = Telemetry::default();
         let mut diag = Diagnostics::default();
-        let socket = bind_first_available(&[occupied_addr, free_addr], None, &telemetry, &mut diag)
-            .expect("should fall through to the second, unoccupied candidate");
+        let (socket, group) =
+            bind_first_available(&[occupied_addr, free_addr], None, &telemetry, &mut diag)
+                .expect("should fall through to the second, unoccupied candidate");
 
         assert_ne!(
             socket.local_addr().unwrap(),
             occupied_addr,
             "must not have somehow bound the already-occupied address"
         );
+        assert_eq!(group, None, "a unicast bind joins no group");
         drop(occupied); // keep alive until here, so the port stays genuinely occupied throughout
+    }
+
+    /// The multicast path of [`bind_one`]: a group address binds the unspecified address on that
+    /// port with `SO_REUSEADDR` and joins the group, and a datagram sent to the group from an
+    /// ordinary socket arrives.
+    ///
+    /// **Skips rather than fails when the environment has no multicast route** -- a container with
+    /// only a bridged `eth0` and no `224.0.0.0/4` route makes the join itself fail, which says
+    /// nothing about this code. Production deliberately does *not* skip: `bind_one` returns the
+    /// error and startup fails loudly, because a collectd listener that silently joined nothing
+    /// would receive nothing forever.
+    ///
+    /// Port 0 is not usable here (a multicast bind must name the port senders use, and an
+    /// OS-assigned one is not knowable to a sender), so the port comes from binding and dropping an
+    /// ordinary socket first -- a small race with anything else on the host claiming it in between,
+    /// and the reason `SO_REUSEADDR` is set rather than the reason it is.
+    #[tokio::test]
+    async fn a_multicast_bind_joins_the_group_and_receives_a_datagram_sent_to_it() {
+        // collectd's own default IPv4 group (`network` plugin), which is also what
+        // `docs/plans/collectd-binary-relay.md` names.
+        const GROUP: &str = "239.192.74.66";
+        let port = {
+            let probe = UdpSocket::bind("0.0.0.0:0").await.expect("should bind an ephemeral port");
+            probe.local_addr().unwrap().port()
+        };
+        let addr: std::net::SocketAddr = format!("{GROUP}:{port}").parse().unwrap();
+
+        let telemetry = Telemetry::default();
+        let mut diag = Diagnostics::default();
+        let (socket, group) = match bind_first_available(&[addr], None, &telemetry, &mut diag) {
+            Ok(bound) => bound,
+            Err(err) if is_no_multicast_route(&err) => {
+                println!("skipping: this environment has no multicast route ({err:#})");
+                return;
+            }
+            Err(err) => panic!("binding the multicast group failed: {err:#}"),
+        };
+        assert_eq!(group, Some(addr.ip()), "the joined group is reported for the `bound` line");
+        assert_eq!(
+            socket.local_addr().unwrap(),
+            format!("0.0.0.0:{port}").parse::<std::net::SocketAddr>().unwrap(),
+            "a multicast listener binds the unspecified address, not the group itself"
+        );
+
+        // Bound to the unspecified address, not `127.0.0.1`: the source address a sender binds
+        // picks the interface a multicast datagram leaves by, and one pinned to loopback would
+        // never reach a group joined on the default (routed) interface.
+        let sender = UdpSocket::bind("0.0.0.0:0").await.expect("should bind an ephemeral port");
+        if let Err(err) = sender.send_to(b"hello group", addr).await {
+            // The same missing route, surfacing at send time instead of join time.
+            println!("skipping: cannot send to a multicast group here ({err})");
+            return;
+        }
+
+        let mut buf = [0u8; 64];
+        let (len, _from) =
+            tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+                .await
+                .expect("a datagram sent to a joined group must arrive")
+                .expect("recv_from should succeed");
+        assert_eq!(&buf[..len], b"hello group");
+    }
+
+    /// Whether `err` is the "this host has no multicast route" family the test above skips on.
+    /// Linux errno numbers (`ENODEV`, `EADDRNOTAVAIL`, `ENETUNREACH`, `EPERM`) -- CI and the dev
+    /// container are both Linux, and a non-Linux host simply gets the stricter behaviour of
+    /// failing the test rather than skipping it.
+    fn is_no_multicast_route(err: &anyhow::Error) -> bool {
+        const SKIP_ERRNOS: [i32; 4] = [1, 19, 99, 101];
+        err.chain()
+            .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .any(|io| io.raw_os_error().is_some_and(|code| SKIP_ERRNOS.contains(&code)))
     }
 
     #[tokio::test]
