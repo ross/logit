@@ -469,10 +469,13 @@ Worked examples, one per shipped component:
   was salvaged), `bad_part` (a malformed part behind at least one decoded value list — the earlier
   lists are kept and the rest of the datagram abandoned), `incomplete_identity` (a value list with
   an empty host, plugin or type, which collectd's own receiver rejects too),
-  `encrypted_packet_dropped` (a `SecurityLevel Encrypt` datagram — this codec holds no keys), and
+  `encrypted_packet_dropped` (a `SecurityLevel Encrypt` datagram — this codec holds no keys),
   `types_db_mismatch` (the configured `types_db` defines the list's type with a different
-  data-source count or kinds than arrived, so its records fall back to index naming). A type simply
-  *missing* from `types_db` is deliberately not reported: that is routine, not a misconfiguration.
+  data-source count or kinds than arrived, so its records fall back to index naming), and
+  `notification_dropped` (a `0x0100`/`0x0101` notification with an out-of-set severity, an empty
+  message, or no host set — the same shape `incomplete_identity` reports for a value list). A type
+  simply *missing* from `types_db` is deliberately not reported: that is routine, not a
+  misconfiguration.
 - `tail_in`/`docker_in` (`crates/logit-inputs/src/tail/driver.rs`, `docker.rs` — one shared
   `Tailer<D, F>` driver, [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)):
   `logit.input.lines` / `.line.bytes` — the read-side parity with `statsd_in`'s per-datagram pair,
@@ -653,7 +656,8 @@ Worked examples, one per shipped component:
 - `collectd_out` (`crates/logit-outputs/src/collectd.rs`, `docs/adr/collectd-binary-relay.md`):
   **the codec emits its own counters and diagnostics directly** (`logit_proto::collectd`'s module
   doc has the full mapping-to-counter table: `logit.output.metrics.skipped{metric_kind|reason}`,
-  `logit.output.tags.dropped{reason}`, `logit.output.identity.sanitized{reason}`), fed by this
+  `logit.output.tags.dropped{reason}`, `logit.output.identity.sanitized{reason}`,
+  `logit.output.messages.truncated` (an over-long notification message)), fed by this
   sink's `with_telemetry`/`with_diagnostics` -- unlike `statsd_out`, whose encoder returns an
   `EncodeStats` for the sink itself to turn into telemetry, `CollectdEncoder` holds the same
   `Telemetry`/`Diagnostics` handles this sink does and reports through them itself, so both halves
@@ -667,7 +671,11 @@ Worked examples, one per shipped component:
   onto at all. `logit.output.messages.dropped{reason="oversize_datagram"}` plus a throttled
   `oversize_datagram` diagnostic cover `EMSGSIZE` on one already-packed datagram, mirroring
   `statsd_out`'s identical case (`StatsdOutput::flush_datagram`) -- the datagram's own lists are
-  dropped, not the whole batch, and sending continues with the next datagram. Retry stays a
+  dropped, not the whole batch, and sending continues with the next datagram. A `log`-only event
+  carrying a `collectd.severity` attribute is a notification, and the codec's own diagnostic
+  vocabulary grows the mirror of `collectd_in`'s: `notification_dropped` (severity absent-despite-
+  being-attempted or out of `{1, 2, 4}`), `empty_message`, `oversize_notification`, and
+  `message_truncated` (an over-255-byte message). Retry stays a
   Layer 2 metric here too.
 - `logit_out` (`crates/logit-outputs/src/logit.rs`, [ADR
   `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md)):
