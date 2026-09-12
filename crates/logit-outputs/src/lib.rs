@@ -11,6 +11,7 @@ pub mod influxdb;
 pub mod logit;
 mod msgbuf;
 pub mod otlp;
+pub mod prometheus;
 pub mod statsd;
 pub mod stdio;
 pub mod syslog;

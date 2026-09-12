@@ -30,6 +30,30 @@ use logit_core::EventBatch;
 /// `InfluxDbOutput` used to have one; it doesn't any more.
 #[async_trait::async_trait]
 pub trait Output {
+    /// Opens whatever this sink has to open *before* it can serve or deliver anything -- a
+    /// listening socket, in practice. Called by `crate::runtime::run_with_telemetry` for **every**
+    /// output, in sorted id order, in the same pre-spawn pass that already binds every input
+    /// ([`crate::Input::bind`]) -- so a `bind:` address already in use, or a privileged port
+    /// without the capability for it, fails startup with nothing else running yet rather than
+    /// surfacing as the first `JoinSet` error once every sibling is already live.
+    ///
+    /// The default is a no-op, and that is what almost every sink wants: a sink that only ever
+    /// *connects outward* (`influxdb_out`, `otlp_out`, `statsd_out`, `logit_out`) has no socket to
+    /// open at startup, and `write_loop`'s retry already owns the "destination isn't up yet" case.
+    /// `prometheus_out` is the one implementer today -- the first sink that *listens*, and so the
+    /// first with an input's startup failure mode rather than a sink's
+    /// (`docs/adr/prometheus-scrape-and-exposition.md`, "`Output::bind`").
+    ///
+    /// Two obligations on an override, identical to [`crate::Input::bind`]'s:
+    /// - **Idempotent.** A second call must be harmless (return `Ok(())` without re-opening).
+    /// - **`send`/`flush` must still work if nobody called this first.** `run_output`
+    ///   (`crate::runtime`) calls `bind` itself before opening the sink's store, so a caller
+    ///   outside the node runtime (a direct unit test, `logit-outputs`' own) still gets "one call
+    ///   and it works."
+    async fn bind(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()>;
 
     /// Called once per batch, immediately before each delivery attempt in `write_loop`

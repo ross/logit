@@ -99,7 +99,8 @@ admin:
   bind: 0.0.0.0:9600
 ```
 
-`GET /readyz` returns `200 ok` once every listener is bound and every node task is running, `503
+`GET /readyz` returns `200 ok` once every listener and every listening sink is bound and every node
+task is running, `503
 starting` before that, `503 draining` after a shutdown signal, and `503 degraded` if any node has
 exited with an error while the process is still draining. `GET /healthz` returns `200 ok`
 whenever the admin task itself can still answer, regardless of the pipeline's own state. Add
@@ -137,8 +138,8 @@ connection error instead.
   merely that a sink is retrying — see [Sink delivery buffering](#sink-delivery-buffering)'s own
   failure semantics for what does and doesn't trip that.
 - An orchestrator that never sees `/readyz` return `200` within its own startup timeout has a
-  listener that can't bind (check the `starting`/`bound`/`ready` lifecycle log lines below) or a
-  Lua script that fails to load.
+  listener — or a listening sink like `prometheus_out` — that can't bind (check the
+  `starting`/`bound`/`ready` lifecycle log lines below) or a Lua script that fails to load.
 
 ## Self-logging
 
@@ -167,7 +168,7 @@ alert on directly:
 | Event | Level | When |
 |---|---|---|
 | `starting` | info | Config loaded, before graph resolution — named even if the config goes on to fail. |
-| `bound` | info | One socket listener's socket opened, during the pre-bind pass (`syslog_in`/`statsd_in`/`otlp_in`; `tail_in`/`docker_in` emit none). |
+| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`otlp_in`; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped mid-drain. |

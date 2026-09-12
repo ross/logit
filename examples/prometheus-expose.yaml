@@ -1,0 +1,57 @@
+# Expose a `/metrics` endpoint for Prometheus to scrape: receive statsd on one edge, aggregate,
+# and serve the result as Prometheus text 0.0.4 / OpenMetrics 1.0 -- the topology `prometheus_out`
+# exists for (docs/adr/prometheus-scrape-and-exposition.md). The scraping client picks the dialect
+# with its own `Accept` header; both are served off the one endpoint.
+#
+# NOTE ON TEMPORALITY -- why the `aggregate` stage is not optional here. Prometheus counters are
+# cumulative, and `prometheus_out` deliberately does *not* accumulate deltas itself: that is
+# summarization, which ADR `lossless-transit` reserves for a stage named in the config rather than
+# something a sink does silently on the way out. statsd counters arrive as delta `Sum`s, and a delta
+# `Sum`/`Histogram` reaching this sink is skipped and counted
+# (`logit.output.metrics.skipped{metric_kind="delta_sum"}`) with a throttled
+# `delta_temporality_unresolved` diagnostic naming the fix. `aggregate`'s `temporality: cumulative`
+# is that named stage -- it keeps a per-series running total alive across window boundaries and emits
+# `Sum{Cumulative}` with `start_timestamp` set, which is exactly what a scraper needs to detect a
+# restart (`docs/adr/aggregation-window-semantics.md`'s cumulative amendment). Drop it from this
+# pipeline and the gauges still work while every counter silently stops being exposed.
+#
+# Config is a flat graph of components (docs/design/pipeline-graph.md,
+# docs/adr/component-graph-configuration.md): each names its own `sources`, rather than sitting in
+# a fixed inputs/transforms/outputs pipeline.
+components:
+  statsd_in:
+    type: statsd_in
+    bind: 127.0.0.1:8125
+
+  windowed:
+    type: aggregate
+    sources: [statsd_in]
+    interval: 10s
+    temporality: cumulative
+    # `series_retention` and `max_retained_series` both default to a non-zero value, which
+    # `temporality: cumulative` requires (graph rule 39): they are what keeps a running total alive
+    # across the window boundary, so at 0 every window would emit its own increment labelled as a
+    # cumulative total.
+
+  metrics:
+    type: prometheus_out
+    sources: [windowed]
+    # 127.0.0.1, not 0.0.0.0, deliberately: this endpoint has no TLS and no auth in v1, and it
+    # serves every label of every series it holds to anything that connects
+    # (docs/adr/prometheus-scrape-and-exposition.md's "Security posture", docs/known-gaps.md).
+    # Bind loopback or pod-local and let something that does have TLS and auth front it; reaching
+    # off-host is a choice to make deliberately, not one to inherit from this file.
+    bind: 127.0.0.1:9464
+    # Every field below defaults -- an omitted field is exactly the value shown here, commented
+    # out purely as a reference for tuning a real deployment.
+    # path: /metrics             # any other path is a 404; any other method on this path is a 405
+    # expire_after: 5m           # a series not updated within this window stops being exposed --
+    #                            # Prometheus's own staleness horizon; 0s disables expiry entirely
+    # max_series: 100000         # hard cap on distinct series held; over it the least-recently-
+    #                            # updated is evicted first, counted
+    #                            # logit.output.series.evicted{reason="cardinality"}
+    # buffer: (all defaults, see docs/adr/buffered-sink-delivery.md -- max_batches 1024,
+    #          max_bytes "64MiB", overflow block, retry_budget 60s, retry_max_delay 10s,
+    #          shutdown_grace 5s, plus an optional `disk:` sub-block for durable buffering).
+    #          `send` here only ever replaces in-memory registry state and never fails, so this
+    #          sink's queue exists for uniformity rather than because a delivery can back up.
