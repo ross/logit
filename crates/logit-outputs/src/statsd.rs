@@ -6,13 +6,16 @@
 //! every grammar/sanitization/packing test runs against it directly) plus the thin
 //! [`StatsdOutput`] that owns the socket.
 //!
-//! **This does not implement `logit_proto::Encoder`.** That trait is `fn encode(&mut self,
-//! &EventBatch) -> Result<Bytes, CodecError>` -- one opaque buffer per batch, with no framing
-//! metadata -- and this sink genuinely needs per-message boundaries (one line per metric, packed
-//! into datagrams up to a size cap on UDP). [`crate::syslog::SyslogEncoder`] is the in-tree
-//! precedent for a sink whose encoder sidesteps the trait for the same class of reason. See
-//! `docs/known-gaps.md` for this recorded as an open gap in `logit_proto::Encoder`'s shape, not a
-//! defect in this module.
+//! **This implements [`logit_proto::FramedEncoder`], not `logit_proto::Encoder`.** The latter is
+//! `fn encode(&mut self, &EventBatch) -> Result<Bytes, CodecError>` -- one opaque buffer per
+//! batch, with no framing metadata -- and this sink genuinely needs per-message boundaries (one
+//! line per metric, packed into datagrams up to a size cap on UDP), which is exactly the shape
+//! `FramedEncoder` exists for: [`StatsdEncoder::encode_into`] fills one [`MessageBuf`] entry per
+//! line and reports every drop through [`EncodeStats`] instead of failing (ADR
+//! `framed-encoder`). [`crate::syslog::SyslogEncoder`] is the other implementor. The datagram
+//! size cap the encoder enforces per line is encoder state ([`StatsdEncoder::with_max_packet_bytes`],
+//! set once by [`StatsdOutput`] for its transport), not a per-call argument, so the trait's one
+//! `encode_into` signature fits both sinks.
 //!
 //! ## Grammar and round-trip contract
 //!
@@ -276,7 +279,6 @@
 //! a tag on any line, event/service-check or otherwise.
 
 use crate::influxdb::{push_float, tag_value};
-use crate::msgbuf::MessageBuf;
 use crate::Output;
 use anyhow::Context;
 use logit_core::{
@@ -284,6 +286,7 @@ use logit_core::{
     Value,
 };
 use logit_pipeline::Fault;
+use logit_proto::{FramedEncoder, MessageBuf};
 use std::fmt::Write as _;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -312,8 +315,9 @@ pub enum Format {
     Statsd,
 }
 
-/// Per-batch outcome counts from [`StatsdEncoder::encode_into`] -- what `StatsdOutput::send` turns
-/// into `logit.output.*` telemetry (`docs/design/internal-telemetry.md`).
+/// Per-batch outcome counts from [`StatsdEncoder::encode_into`] -- this sink's
+/// [`FramedEncoder::Stats`], what `StatsdOutput::send` turns into `logit.output.*` telemetry
+/// (`docs/design/internal-telemetry.md`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeStats {
     /// Events with no metrics (a log-only or span-only event, legal under
@@ -380,6 +384,13 @@ pub struct EncodeStats {
 pub struct StatsdEncoder {
     format: Format,
     relative_gauges: bool,
+    /// The longest single line this encoder will emit: a line longer than this is dropped whole
+    /// (`EncodeStats::dropped_oversize_line`), never truncated, since the UDP packer
+    /// (`StatsdOutput::send_udp`) could never fit it in a datagram of that size. `usize::MAX`
+    /// (the default) is "uncapped" -- what TCP wants, having no datagram to overflow. Encoder
+    /// state rather than a per-call argument so `encode_into` has `FramedEncoder`'s one
+    /// signature; `StatsdOutput` sets it once for its transport at build time.
+    max_packet_bytes: usize,
     diag: Diagnostics,
     /// The `|#k:v,k:v` tag segment for the event currently being encoded -- built once per event,
     /// shared across that event's metrics (`influxdb.rs::render_tag_suffix`'s same split).
@@ -414,6 +425,7 @@ impl StatsdEncoder {
         Self {
             format,
             relative_gauges: false,
+            max_packet_bytes: usize::MAX,
             diag: Diagnostics::default(),
             tag_suffix: String::new(),
             line: String::new(),
@@ -430,23 +442,32 @@ impl StatsdEncoder {
         self
     }
 
+    /// Caps the longest single line this encoder emits -- see the field's doc comment.
+    /// `usize::MAX` means uncapped.
+    pub fn with_max_packet_bytes(mut self, max_packet_bytes: usize) -> Self {
+        self.max_packet_bytes = max_packet_bytes;
+        self
+    }
+
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
         self
     }
+}
+
+impl FramedEncoder for StatsdEncoder {
+    /// A statsd line is self-describing; the UDP packer only needs each entry's bytes (a
+    /// negative-absolute-gauge pair is one entry with an embedded `\n`, module doc), so there is
+    /// nothing to carry per message beyond them.
+    type Meta = ();
+    type Stats = EncodeStats;
 
     /// Encodes every event in `batch` into `out` (cleared first). Never fails -- a per-metric
     /// problem (an unsupported kind, an unresolved delta, a non-finite value, an oversize line) is
     /// a drop counted in the returned [`EncodeStats`], not an error; there is nothing for a caller
-    /// to react to beyond what the stats already report. `max_packet_bytes` bounds a UDP
-    /// datagram's worth of packed lines; pass `usize::MAX` for TCP, which has no such cap (the
-    /// per-line oversize drop still applies).
-    pub fn encode_into(
-        &mut self,
-        batch: &EventBatch,
-        max_packet_bytes: usize,
-        out: &mut MessageBuf,
-    ) -> EncodeStats {
+    /// to react to beyond what the stats already report. A line longer than
+    /// [`StatsdEncoder::with_max_packet_bytes`]'s cap is dropped whole.
+    fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf) -> EncodeStats {
         out.clear();
         let mut stats = EncodeStats::default();
         for event in &batch.events {
@@ -488,7 +509,7 @@ impl StatsdEncoder {
                     statsd_type: carriers.statsd_type,
                     container_id: carriers.container_id,
                     timestamp_secs: carriers.timestamp_secs,
-                    max_packet_bytes,
+                    max_packet_bytes: self.max_packet_bytes,
                     stats: &mut stats,
                     diag: &mut self.diag,
                     out: &mut *out,
@@ -532,7 +553,7 @@ impl StatsdEncoder {
                 statsd_type: carriers.statsd_type,
                 container_id: carriers.container_id,
                 timestamp_secs: carriers.timestamp_secs,
-                max_packet_bytes,
+                max_packet_bytes: self.max_packet_bytes,
                 stats: &mut stats,
                 diag: &mut self.diag,
                 out: &mut *out,
@@ -1566,15 +1587,35 @@ impl StatsdOutput {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
         }
+        .with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES)
     }
 
+    /// The per-line cap the encoder enforces for this transport: the configured datagram size on
+    /// UDP, none on TCP (no datagram to overflow -- only the per-line oversize drop applies
+    /// there, and a cap of `usize::MAX` never triggers it). Decided here, once, whenever the
+    /// transport or `max_packet_bytes` is decided, so `send` never mutates the encoder per call.
+    fn encoder_cap(&self) -> usize {
+        if matches!(self.conn, Conn::Udp(_)) {
+            self.max_packet_bytes
+        } else {
+            usize::MAX
+        }
+    }
+
+    /// Installs `encoder`, with this sink's transport-appropriate line cap applied on top of it
+    /// -- the cap is the sink's decision, not the encoder's caller's, whichever builder order the
+    /// caller uses.
     pub fn with_encoder(mut self, encoder: StatsdEncoder) -> Self {
-        self.encoder = encoder;
+        self.encoder = encoder.with_max_packet_bytes(self.encoder_cap());
         self
     }
 
+    /// Bounds one UDP **datagram** (several packed lines), and therefore one line; ignored by
+    /// the encoder on TCP (see [`StatsdOutput::encoder_cap`]).
     pub fn with_max_packet_bytes(mut self, max_packet_bytes: usize) -> Self {
         self.max_packet_bytes = max_packet_bytes;
+        let cap = self.encoder_cap();
+        self.encoder = self.encoder.with_max_packet_bytes(cap);
         self
     }
 
@@ -1593,10 +1634,9 @@ impl StatsdOutput {
 #[async_trait::async_trait]
 impl Output for StatsdOutput {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        // TCP has no datagram to overflow -- only the per-line oversize drop applies there.
-        let cap =
-            if matches!(self.conn, Conn::Udp(_)) { self.max_packet_bytes } else { usize::MAX };
-        let stats = self.encoder.encode_into(batch, cap, &mut self.lines);
+        // The encoder already carries this transport's line cap (`encoder_cap`, applied at build
+        // time), so nothing here varies per call.
+        let stats = self.encoder.encode_into(batch, &mut self.lines);
         self.telemetry.count("logit.output.events.skipped", stats.skipped_no_metrics as f64, &[]);
         self.telemetry.count(
             "logit.output.messages.dropped",
@@ -1960,14 +2000,14 @@ mod tests {
     fn encode_with_format(events: Vec<Event>, format: Format) -> (Vec<String>, EncodeStats) {
         let mut encoder = StatsdEncoder::new(format);
         let mut out = MessageBuf::default();
-        let stats = encoder.encode_into(&batch_with(events), usize::MAX, &mut out);
+        let stats = encoder.encode_into(&batch_with(events), &mut out);
         let msgs = out.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect();
         (msgs, stats)
     }
 
     fn encode_with(encoder: &mut StatsdEncoder, events: Vec<Event>) -> (Vec<String>, EncodeStats) {
         let mut out = MessageBuf::default();
-        let stats = encoder.encode_into(&batch_with(events), usize::MAX, &mut out);
+        let stats = encoder.encode_into(&batch_with(events), &mut out);
         let msgs = out.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect();
         (msgs, stats)
     }
@@ -2570,7 +2610,7 @@ mod tests {
         };
         let mut encoder = StatsdEncoder::new(Format::DogStatsd);
         let mut out = MessageBuf::default();
-        encoder.encode_into(&batch, usize::MAX, &mut out);
+        encoder.encode_into(&batch, &mut out);
         let msgs: Vec<String> =
             out.iter().map(|b| std::str::from_utf8(b).unwrap().to_string()).collect();
         assert_eq!(msgs, vec!["hits:1|c|c:res-id"]);
@@ -2817,7 +2857,7 @@ mod tests {
         let batch = EventBatch { resource, scope: None, events: vec![event] };
         let mut encoder = StatsdEncoder::new(Format::DogStatsd);
         let mut out = MessageBuf::default();
-        encoder.encode_into(&batch, usize::MAX, &mut out);
+        encoder.encode_into(&batch, &mut out);
         let msgs: Vec<String> =
             out.iter().map(|b| std::str::from_utf8(b).unwrap().to_string()).collect();
         assert_eq!(msgs, vec!["_e{13,1}:from-resource|x"]);
@@ -2826,10 +2866,10 @@ mod tests {
     #[test]
     fn an_oversize_event_line_is_dropped_via_the_existing_oversize_path() {
         let event = event_line_event("t", "x", &[]);
-        let mut encoder = StatsdEncoder::new(Format::DogStatsd);
-        let mut out = MessageBuf::default();
         // "_e{1,1}:t|x" is 11 bytes, longer than this cap.
-        let stats = encoder.encode_into(&batch_with(vec![event]), 5, &mut out);
+        let mut encoder = StatsdEncoder::new(Format::DogStatsd).with_max_packet_bytes(5);
+        let mut out = MessageBuf::default();
+        let stats = encoder.encode_into(&batch_with(vec![event]), &mut out);
         assert!(out.is_empty());
         assert_eq!(stats.dropped_oversize_line, 1);
     }
@@ -3021,15 +3061,59 @@ mod tests {
 
     #[test]
     fn a_single_line_longer_than_max_packet_bytes_is_dropped_whole() {
-        let mut encoder = StatsdEncoder::new(Format::DogStatsd);
+        // "hits:1|c" is longer than this cap.
+        let mut encoder = StatsdEncoder::new(Format::DogStatsd).with_max_packet_bytes(3);
         let mut out = MessageBuf::default();
         let stats = encoder.encode_into(
             &batch_with(vec![metric_event("hits", MetricKind::counter(1.0), &[])]),
-            3, // "hits:1|c" is longer than this
             &mut out,
         );
         assert!(out.is_empty());
         assert_eq!(stats.dropped_oversize_line, 1);
+    }
+
+    /// The cap is encoder state set once by the sink for its transport (ADR `framed-encoder`),
+    /// so the two halves have to be pinned together: a UDP sink's encoder carries the configured
+    /// `max_packet_bytes` and drops a line longer than it, a TCP sink's encoder is uncapped and
+    /// emits the same line -- whichever order `with_encoder`/`with_max_packet_bytes` were called
+    /// in, since `logit-cli` happens to call them encoder-first.
+    #[tokio::test]
+    async fn the_encoder_line_cap_follows_the_transport_at_build_time() {
+        let oversize = || batch_with(vec![metric_event("hits", MetricKind::counter(1.0), &[])]);
+
+        // UDP: capped at the configured datagram size, in either builder order.
+        let udp_encoder_first = StatsdOutput::udp("127.0.0.1:1")
+            .unwrap()
+            .with_encoder(StatsdEncoder::new(Format::DogStatsd))
+            .with_max_packet_bytes(3);
+        let udp_cap_first = StatsdOutput::udp("127.0.0.1:1")
+            .unwrap()
+            .with_max_packet_bytes(3)
+            .with_encoder(StatsdEncoder::new(Format::DogStatsd));
+        for mut output in [udp_encoder_first, udp_cap_first] {
+            assert_eq!(output.encoder.max_packet_bytes, 3);
+            // "hits:1|c" (8 bytes) is dropped whole: nothing encoded, so nothing sent.
+            output.send(&oversize()).await.expect("an all-dropped batch performs no I/O");
+            assert!(output.lines.is_empty());
+        }
+        // ...and the default cap, with no builder called at all.
+        let udp_default = StatsdOutput::udp("127.0.0.1:1").unwrap();
+        assert_eq!(udp_default.encoder.max_packet_bytes, DEFAULT_MAX_PACKET_BYTES);
+
+        // TCP: the same configured value caps only the packer, never the encoder -- the line
+        // reaches the wire.
+        let (addr, received, _) = tcp_collector().await;
+        let mut tcp = StatsdOutput::tcp(addr.to_string(), Duration::from_secs(2))
+            .with_encoder(StatsdEncoder::new(Format::DogStatsd))
+            .with_max_packet_bytes(3);
+        assert_eq!(tcp.encoder.max_packet_bytes, usize::MAX);
+        assert_eq!(tcp.max_packet_bytes, 3);
+        tcp.send(&oversize()).await.expect("send should succeed");
+        assert_eq!(tcp.lines.len(), 1);
+        drop(tcp);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let got = received.lock().unwrap();
+        assert_eq!(String::from_utf8_lossy(&got[0]), "hits:1|c\n");
     }
 
     #[test]
@@ -3041,7 +3125,6 @@ mod tests {
         let mut out = MessageBuf::default();
         let stats = encoder.encode_into(
             &batch_with(vec![metric_event("free", MetricKind::Gauge(-5.0), &[])]),
-            usize::MAX,
             &mut out,
         );
         assert_eq!(out.len(), 1);
@@ -3273,7 +3356,6 @@ mod tests {
                 metric_event("a", MetricKind::counter(1.0), &[]),
                 metric_event("b", MetricKind::counter(2.0), &[]),
             ]),
-            usize::MAX,
             &mut out,
         );
         let packed: Vec<&str> = out.iter().map(|b| std::str::from_utf8(b).unwrap()).collect();
@@ -3894,7 +3976,7 @@ mod tests {
                 // property tests.
                 let mut encoder = StatsdEncoder::new(Format::DogStatsd).with_relative_gauges(true);
                 let mut out1 = MessageBuf::default();
-                encoder.encode_into(&d1, usize::MAX, &mut out1);
+                encoder.encode_into(&d1, &mut out1);
 
                 let mut d2_events = Vec::new();
                 for msg in out1.iter() {
@@ -3941,7 +4023,7 @@ mod tests {
                 }
 
                 let mut out2 = MessageBuf::default();
-                encoder.encode_into(&d2, usize::MAX, &mut out2);
+                encoder.encode_into(&d2, &mut out2);
                 let e1: Vec<Vec<u8>> = out1.iter().map(|b| b.to_vec()).collect();
                 let e2: Vec<Vec<u8>> = out2.iter().map(|b| b.to_vec()).collect();
                 prop_assert_eq!(

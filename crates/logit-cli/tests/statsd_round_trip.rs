@@ -136,13 +136,8 @@ use bytes::Bytes;
 use logit_core::{Event, EventBatch, Value};
 use logit_inputs::statsd::{StatsdDecoder, StatsdInput};
 use logit_outputs::statsd::{Format, StatsdEncoder, StatsdOutput};
-// `MessageBuf` lives in `logit-outputs`'s private `msgbuf` module; `syslog.rs` is the one that
-// re-exports it under a stable public path (`docs/adr/statsd-output.md`'s Consequences section),
-// which is why this is `syslog::MessageBuf`, not `statsd::MessageBuf` -- `crates/logit-bench`
-// names it the same way.
-use logit_outputs::syslog::MessageBuf;
 use logit_pipeline::{Delivered, Fanout, Input, Output};
-use logit_proto::Decoder;
+use logit_proto::{Decoder, FramedEncoder, MessageBuf};
 use logit_transforms::{Aggregator, Distributions, Sets};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -506,7 +501,7 @@ async fn events_and_service_checks_produce_no_output_and_are_counted_under_plain
         let batch = direct_batch(&raw);
         let mut encoder = StatsdEncoder::new(Format::Statsd);
         let mut out = MessageBuf::default();
-        let stats = encoder.encode_into(&batch, usize::MAX, &mut out);
+        let stats = encoder.encode_into(&batch, &mut out);
         assert!(out.is_empty(), "{fixture}: format: statsd should emit no lines for this event");
         assert_eq!(
             stats.dropped_dialect_events, 1,

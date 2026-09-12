@@ -163,8 +163,7 @@ timers/sets, `|c:`/`|T`, events/service checks), `aggregate`'s raw-retention mod
 values, with a real HyperLogLog backing `sets: estimate` and the overflow fallback), and the Lua
 surface (`event.metrics`, `event.span`, `scope`, the new log/resource fields) have all landed. [`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md) has the
 closing assessment; residual debt (post-sketch metric kinds at `statsd_out`, a repeated DogStatsD
-tag key collapsing to its last value, `Encoder`'s per-batch-`Bytes` shape not fitting per-message
-framing, `statsd_out` carrying no `unit` and no native rename/prefix and stamping an egress
+tag key collapsing to its last value, `statsd_out` carrying no `unit` and no native rename/prefix and stamping an egress
 timestamp only on a `|T`-marked line, and syslog's `event.timestamp` staying receipt time while the
 wire TIMESTAMP follows the precedence table) lives in `docs/known-gaps.md`. `prometheus_in`/`prometheus_out`
 (`crates/logit-inputs`/`crates/logit-outputs`, `crates/logit-proto`'s `prometheus` codec) are the
@@ -322,7 +321,12 @@ crates/
 `logit-inputs`/`logit-outputs`/`logit-transforms` depend on `logit-pipeline` for their trait, not
 the other way around (`docs/design/pipeline-graph.md`'s "Crate layout" section) -- this is what
 keeps the pipeline runtime from having to know about any concrete protocol or transform. A new
-protocol (listener or sink) implements `logit_proto::Decoder`/`Encoder` plus
-`logit_pipeline::Input` or `logit_pipeline::Output`, and gets a variant in `logit_config`'s
-`ComponentKind` — follow the `statsd`/`influxdb` stubs as the template. A new native transform
-implements `logit_pipeline::Transform`, following `logit-transforms::Aggregator`.
+protocol implements `logit_proto::Decoder` on the listener side and, on the sink side, whichever
+of the three encoder shapes its wire format is: `logit_proto::Encoder` (one opaque blob per
+batch — `influxdb` is the template), `logit_proto::FramedEncoder` (one framed message per
+record into a `logit_proto::MessageBuf`, with per-message drop accounting — `syslog`/`statsd`,
+[ADR `framed-encoder`](docs/adr/framed-encoder.md)), or `logit_proto::SignalEncoder` (one
+payload per signal — `otlp`); plus `logit_pipeline::Input` or `logit_pipeline::Output`, and a
+variant in `logit_config`'s `ComponentKind`. (`prometheus` is the one pair outside all of these,
+by design — its ADR says why.) A new native transform implements `logit_pipeline::Transform`,
+following `logit-transforms::Aggregator`.

@@ -563,15 +563,21 @@ already built that have a known, accepted rough edge.
   `TlsClientConfig`/`TlsServerConfig` pair in `logit-config` designed to be reusable by any other
   protocol — `syslog_out`'s own TLS support, if it lands, is a config-plumbing exercise against
   those same types, not a design decision to redo.
-- **`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
-  per-message framing** — `syslog_out` needs one UDP datagram or one octet-counted TCP frame per
-  *message*, and `statsd_out` needs one statsd line per metric packed up to a datagram size cap,
-  neither of which one opaque `Bytes` per *batch* can express, so both bypass the trait entirely
-  (`crates/logit-outputs/src/syslog.rs`/`statsd.rs`'s module docs have the full reasoning). Two
-  sinks now independently need this shape, which is exactly the signal that was being waited for —
-  generalizing the trait (an associated framing type, or a sink-driven push interface) is still
-  deferred, but no longer for lack of a second caller to design against; it's simply not yet been
-  done.
+- ~~**`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
+  per-message framing**~~ — **closed as of 2026-09-12.** `syslog_out` needs one UDP datagram or
+  one octet-counted TCP frame per *message*, and `statsd_out` needs one statsd line per metric
+  packed up to a datagram size cap, neither of which one opaque `Bytes` per *batch* can express,
+  so both used to bypass the trait entirely with a bespoke `encode_into`. Two sinks independently
+  needing the shape was the signal being waited for; a third codec (collectd) re-copying the
+  buffer was what ended the deferral. [ADR `framed-encoder`](adr/framed-encoder.md) adds
+  `logit_proto::FramedEncoder` -- the third encoder shape beside `Encoder` (one blob per batch)
+  and `SignalEncoder` (one blob per signal): N framed messages per batch into a shared, generic
+  `logit_proto::MessageBuf<M>`, never failing, a per-sink `Stats` for drop accounting -- which
+  `syslog_out` and `statsd_out` now implement (statsd's per-call datagram cap became encoder
+  state set once per transport). Follow-up, not done here: the collectd codec
+  (`crates/logit-proto/src/collectd/encode.rs`) adopting it in place of its own `Packets` buffer,
+  before `collectd_out` is built on `Packets`. `prometheus_out` stays outside all three traits by
+  design.
 - **`statsd_out` drops post-sketch metric kinds — `Distribution`/`Set`/`Histogram`/
   `ExponentialHistogram`/`Summary`/a cumulative or non-monotonic `Sum`, counted
   (`unsupported_metric_kind`).** **Narrowed by W3** — the original v1 deferral covered every
