@@ -217,12 +217,19 @@ pub async fn run_with_telemetry(
     // nothing else running yet, rather than surfacing as the first `JoinSet` error once every
     // sibling is already listening. Sequential, in the same sorted order: a bind is a syscall,
     // there are single digits of them, and "which one failed" must not depend on a join order.
+    //
+    // Sinks go through the same pass, for the same reason and in the same single sorted sweep
+    // (`docs/adr/prometheus-scrape-and-exposition.md`, "`Output::bind`"): `prometheus_out` opens a
+    // listening socket, which has an input's startup failure mode (address in use, privileged
+    // port), not a sink's "destination isn't up yet" one that `write_loop`'s retry already owns.
+    // `Output::bind` defaults to a no-op, so every outward-connecting sink is untouched by this.
     for id in &ids {
-        let Some(NodeSpec::Input(input, _)) = specs.get_mut(id) else { continue };
-        input
-            .bind()
-            .await
-            .map_err(|err| RunError::Startup(err.context(format!("component '{id}'"))))?;
+        let bound = match specs.get_mut(id) {
+            Some(NodeSpec::Input(input, _)) => input.bind().await,
+            Some(NodeSpec::Output(output, _, _)) => output.bind().await,
+            _ => continue,
+        };
+        bound.map_err(|err| RunError::Startup(err.context(format!("component '{id}'"))))?;
         readiness.set_node(id, NodeState::Bound);
     }
 
@@ -477,6 +484,11 @@ async fn run_output(
     shutdown_dropped_batches: Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<()> {
     let diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
+    // Lazily, the same way `run_input`/`run_until_shutdown` call `Input::bind` when nobody did:
+    // `run_with_telemetry`'s pre-spawn pass has already bound every sink it built, so this is an
+    // idempotent no-op there (`Output::bind`'s own contract), and it is what makes a caller
+    // outside that pass -- a direct unit test spawning `run_output` -- work with one call.
+    output.bind().await.with_context(|| format!("component '{id}'"))?;
     // A `Disk` store's `SinkStore::open` does real I/O (opening or recovering a spool directory)
     // and can fail -- a bad path, a permissions error, another process already holding the lock
     // (`crate::disk_queue::DiskQueue`'s own doc comment) -- which is a startup error for this
@@ -5164,6 +5176,69 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "the sink must never have been spawned -- nothing should have reached it"
+        );
+    }
+
+    /// The sink mirror of [`FailingBindInput`]: proves the pre-spawn pass covers `NodeSpec::Output`
+    /// too, so a `prometheus_out` whose `bind:` address is taken fails startup rather than
+    /// answering nothing once the first scrape arrives
+    /// (`docs/adr/prometheus-scrape-and-exposition.md`, "`Output::bind`").
+    struct FailingBindOutput {
+        tx: std::sync::mpsc::Sender<EventBatch>,
+    }
+
+    #[async_trait::async_trait]
+    impl Output for FailingBindOutput {
+        async fn bind(&mut self) -> anyhow::Result<()> {
+            anyhow::bail!("cannot bind")
+        }
+        async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+            let _ = self.tx.send(batch.clone());
+            unreachable!("bind() fails first; send() must never be called")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_output_bind_returns_startup_and_spawns_nothing() {
+        let mut components = Map::new();
+        components.insert("a_in".to_string(), plain_component(vec![], statsd_in()));
+        components
+            .insert("out".to_string(), plain_component(vec!["a_in".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "a_in".to_string(),
+            NodeSpec::Input(Box::new(ForeverInput), InputRuntimeConfig::default()),
+        );
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(FailingBindOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let err = run_with_telemetry(
+            g,
+            specs,
+            HashMap::new(),
+            Readiness::disabled(),
+            std::future::pending(),
+        )
+        .await
+        .expect_err("a sink bind failure must fail the whole run");
+        assert!(matches!(err, RunError::Startup(_)), "a bind failure is a startup failure");
+        assert!(
+            err.to_string().contains("out"),
+            "the error should name the failing component: {err}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing should have been spawned -- the sink must never have seen a batch"
         );
     }
 

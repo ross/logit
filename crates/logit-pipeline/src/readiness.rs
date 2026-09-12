@@ -51,8 +51,12 @@ impl Phase {
 pub enum NodeState {
     /// In the graph; not yet bound or spawned.
     Pending,
-    /// [`crate::Input::bind`] returned `Ok`. Listeners only -- a transform, sink, or Lua node is
-    /// never `Bound`, it goes straight from `Pending` to `Running`.
+    /// [`crate::Input::bind`] or [`crate::Output::bind`] returned `Ok` -- listeners and sinks
+    /// alike, since both go through `run_with_telemetry`'s one pre-spawn bind pass
+    /// (`docs/adr/prometheus-scrape-and-exposition.md`, "`Output::bind`"). A transform or Lua node
+    /// is never `Bound`, it goes straight from `Pending` to `Running`. A sink whose `bind` is the
+    /// default no-op (every sink that only connects outward) still reaches `Bound`: the state
+    /// records that the pre-spawn pass cleared that node, not that it opened a socket.
     Bound,
     /// Its task (or, for a Lua node, its thread) exists and hasn't returned.
     Running,

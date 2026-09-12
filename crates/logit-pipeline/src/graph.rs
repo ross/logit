@@ -135,6 +135,10 @@
 //!     `content-length`, `te`, `transfer-encoding`, `connection`, an empty name, or an HTTP/2
 //!     pseudo-header starting with `:`), checked case-insensitively, and no two entries may
 //!     collide once case is ignored -- the same shape rule 22 already checks for `otlp_out`.
+//! 41. A `prometheus_out` `path:` must start with `/` (a request URI's path is always absolute,
+//!     so anything else could never be scraped), and `max_series` must be >= 1 -- rule 38's
+//!     impossible-bound shape again: `0` would evict every series the instant it arrived
+//!     (`docs/adr/prometheus-scrape-and-exposition.md`).
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -211,7 +215,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | StdioOut { .. }
         | FileOut { .. }
         | SyslogOut { .. }
-        | StatsdOut { .. } => Role::Sink,
+        | StatsdOut { .. }
+        | PrometheusOut { .. } => Role::Sink,
     }
 }
 
@@ -261,6 +266,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         FileOut { .. } => "file_out",
         SyslogOut { .. } => "syslog_out",
         StatsdOut { .. } => "statsd_out",
+        PrometheusOut { .. } => "prometheus_out",
     }
 }
 
@@ -306,6 +312,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::LogitIn { .. }
             | ComponentKind::LogitOut { .. }
             | ComponentKind::StatsdOut { .. }
+            | ComponentKind::PrometheusOut { .. }
     )
 }
 
@@ -1488,6 +1495,29 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     );
                 }
             }
+        }
+    }
+
+    // Rule 41: a `prometheus_out` `path:` must be a non-empty absolute path, and `max_series` must
+    // admit at least one series. A relative or empty `path` could never match a request URI's own
+    // path (always absolute), so every scrape would 404 against an endpoint that looks configured;
+    // `max_series: 0` is rule 38's impossible bound in another shape -- every series would be
+    // evicted the instant it arrived, exposing nothing.
+    for (id, component) in &components {
+        let ComponentKind::PrometheusOut { path, max_series, .. } = &component.kind else {
+            continue;
+        };
+        if !path.starts_with('/') {
+            anyhow::bail!(
+                "component '{id}': prometheus_out path '{path}' must start with '/' -- a request \
+                 URI's path always does, so this one could never be scraped"
+            );
+        }
+        if *max_series == 0 {
+            anyhow::bail!(
+                "component '{id}': max_series: 0 would evict every series as soon as it arrived \
+                 -- use a positive count"
+            );
         }
     }
 
@@ -4490,5 +4520,57 @@ mod tests {
             err.contains("'receive' is only meaningful on a datagram or tail listener"),
             "got: {err}"
         );
+    }
+
+    // ---- rule 41: prometheus_out --------------------------------------------------------------
+
+    fn prometheus_out(path: &str, max_series: usize) -> ComponentKind {
+        ComponentKind::PrometheusOut {
+            bind: "127.0.0.1:9464".to_string(),
+            path: path.to_string(),
+            expire_after: Duration::from_secs(300),
+            max_series,
+        }
+    }
+
+    #[test]
+    fn prometheus_out_is_a_sink_and_is_implemented() {
+        let kind = prometheus_out("/metrics", 100_000);
+        assert_eq!(kind_name(&kind), "prometheus_out");
+        assert_eq!(role(&kind), Role::Sink);
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], prometheus_out("/metrics", 100_000)),
+        ]))
+        .expect("a well-formed prometheus_out should resolve fine");
+    }
+
+    #[test]
+    fn a_prometheus_out_with_no_sources_is_rejected() {
+        let err = expect_err(cfg(vec![("out", vec![], prometheus_out("/metrics", 100_000))]));
+        assert!(err.contains("'out'") && err.contains("sink"), "got: {err}");
+    }
+
+    /// Rule 41: a request URI's path is always absolute, so a relative or empty `path:` could never
+    /// be scraped -- every request would 404 against an endpoint that looks configured.
+    #[test]
+    fn a_prometheus_out_path_that_does_not_start_with_a_slash_is_rejected() {
+        for path in ["metrics", ""] {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                ("out", vec!["in"], prometheus_out(path, 100_000)),
+            ]));
+            assert!(err.contains("'out'") && err.contains("must start with '/'"), "got: {err}");
+        }
+    }
+
+    /// Rule 41: `max_series: 0` is rule 38's impossible bound in another shape.
+    #[test]
+    fn a_zero_prometheus_out_max_series_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], prometheus_out("/metrics", 0)),
+        ]));
+        assert!(err.contains("'out'") && err.contains("max_series: 0"), "got: {err}");
     }
 }
