@@ -95,7 +95,11 @@ use logit_core::{
     MetricRecord, Sum, Summary, Telemetry, Temporality, TraceRef,
 };
 
-const DISTRIBUTION_QUANTILES: [f64; 5] = [0.5, 0.75, 0.90, 0.95, 0.99];
+/// The five quantiles every sketch-to-quantiles degradation in this crate reports -- shared with
+/// `crate::prometheus`, whose `Distribution`/`Samples` → `summary` path must degrade to the same
+/// five, or the same metric would come out of `otlp_out` and `prometheus_out` describing itself
+/// differently.
+pub(crate) const DISTRIBUTION_QUANTILES: [f64; 5] = [0.5, 0.75, 0.90, 0.95, 0.99];
 
 fn temporality_to_pb(t: Temporality) -> i32 {
     match t {

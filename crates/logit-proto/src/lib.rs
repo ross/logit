@@ -5,6 +5,7 @@ pub mod buffer;
 pub mod frame;
 pub mod native;
 pub mod otlp;
+pub mod prometheus;
 
 use logit_core::{Event, EventBatch, Resource, Scope};
 use std::sync::Arc;
