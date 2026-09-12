@@ -389,7 +389,7 @@ fn parse_line(
             let parsed: f64 = rate.parse().map_err(|_| malformed())?;
             // A sample rate is a probability: it must be finite and in (0, 1]. `f64::parse`
             // happily accepts "NaN"/"inf"/negative/zero/>1 text, any of which would turn into a
-            // non-finite or negative Counter (or a divide-by-zero) below -- reject them here
+            // non-finite or negative counter value (or a divide-by-zero) below -- reject them here
             // rather than let bad input poison a value that later gets merged and shipped.
             if !parsed.is_finite() || parsed <= 0.0 || parsed > 1.0 {
                 return Err(malformed());
@@ -727,7 +727,8 @@ fn build_event(
 }
 
 /// Parses a metric value and rejects it unless finite. `f64::parse` accepts the literal text
-/// "NaN"/"inf"/"-inf", which would otherwise become `Counter(NaN)`, `Gauge(inf)`, or -- worse --
+/// "NaN"/"inf"/"-inf", which would otherwise become a non-finite `Sum` (`MetricKind::counter`),
+/// `Gauge(inf)`, or -- worse --
 /// get inserted into a `DdSketch`, where a NaN sample corrupts the sketch's summary state rather
 /// than just producing one bad data point. Shared by the counter/gauge/timing-histogram-
 /// distribution branches in `build_event`, which differ only in the value's name for the error.
@@ -832,7 +833,7 @@ mod tests {
     fn invalid_sample_rates_are_rejected() {
         // Zero would divide-by-zero into an infinite counter; negative and >1 aren't valid
         // probabilities; NaN/inf parse successfully as f64 but aren't finite. Any of these would
-        // otherwise poison a Counter value that later gets merged and shipped downstream.
+        // otherwise poison a counter's `Sum` value that later gets merged and shipped downstream.
         for rate in ["0", "-0.5", "1.5", "NaN", "inf", "-inf"] {
             let line = format!("hits:1|c|@{rate}");
             assert!(
@@ -845,7 +846,8 @@ mod tests {
     #[test]
     fn non_finite_counter_values_are_rejected() {
         // `f64::parse` accepts the literal text "NaN"/"inf"/"-inf" -- unguarded, these would
-        // become Counter(NaN) or Counter(inf) rather than being caught at decode time.
+        // become a non-finite `Sum` (`MetricKind::counter`) rather than being caught at decode
+        // time.
         for value in ["NaN", "inf", "-inf"] {
             let line = format!("hits:{value}|c");
             assert!(
@@ -868,8 +870,8 @@ mod tests {
 
     #[test]
     fn non_finite_distribution_values_are_rejected() {
-        // Worse than a bad Counter/Gauge: a NaN sample inserted into a DdSketch corrupts the
-        // sketch's summary state rather than just producing one bad data point.
+        // Worse than a bad counter/`Gauge` value: a NaN sample inserted into a DdSketch corrupts
+        // the sketch's summary state rather than just producing one bad data point.
         for value in ["NaN", "inf", "-inf"] {
             let line = format!("latency:{value}|ms");
             assert!(

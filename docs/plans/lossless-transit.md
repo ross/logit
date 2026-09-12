@@ -348,6 +348,11 @@ pub struct Scope {
 // Resource += dropped_attributes_count: u32, schema_url: Option<Bytes>
 ```
 
+`MetricRecord.flags: u32` (OTLP `DataPointFlags`, bit 0 `FLAG_NO_RECORDED_VALUE`) was added on top
+of this shape by W4, filling the 4 bytes of padding already following `name`/`unit`/`description`
+so `MetricRecord` stays exactly 224 bytes — see [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)'s
+W4 amendment.
+
 Expected sizes (confirm against `crates/logit-core/tests/type_sizes.rs` when implementing):
 `MetricKind` stays 176 bytes (every new variant fits under `Distribution`'s existing footprint);
 `MetricRecord` grows to roughly 224; `Event` to roughly 856. `ExponentialHistogram` is kept as its
@@ -530,10 +535,72 @@ metric-kind fields, not just presence.
 | W5 | **Landed.** syslog pair: structured-data parse and emit, timestamp precedence and the nil case, `Value::Bytes` MSG, `Value::Str` PROCID, opt-in PEN-qualified structured-data element; `crates/logit-cli/tests/syslog_round_trip.rs` over real UDP sockets with a fixture corpus plus a `proptest` fixed point; new ADR `syslog-structured-data-convention`; amends `syslog-output` | M | W0 (parallel with W1) |
 | W6 | **Landed.** DogStatsD events and service checks, in and out: `_e{...}`/`_sc\|...` decode to `Event::log`/`Event::metric` (`event_name: None` deliberately), `statsd.event.*`/`statsd.service_check.*` carriers, canonical field order and `d:` (not `\|T`) on egress, `format: statsd` whole-event drop, first-metric-is-the-check rule; amends `statsd-output` | S | W3 |
 | W7 | **Landed.** Lua proxy: `event.log` gains `event_name`/`observed_timestamp` (read/write) and `dropped_attributes_count` (read-only); new `event.metrics` (array-like, every field readable, `value` writable on `sum`/`gauge`, `temporality`/`monotonic` writable on `sum`, everything else on every other kind read-only) and `event.span` (new, entirely read-only); `resource`/`scope` gain `schema_url` (read/write) and `dropped_attributes_count` (read-only), `scope` itself new, mirroring `resource`'s copy-on-write shape; extends `docs/design/lua-api.md`, no ADR (extension of the existing proxy design, not a new one) | M | W1 |
-| W8 | Closeout: rewrite or remove the `docs/known-gaps.md` entries each workstream closes, rewrite `docs/design/data-model.md`'s metric-kinds section for the new shapes, update `AGENTS.md`'s current-state paragraph | S | all |
+| W8 | **Landed.** Closeout: `AGENTS.md`'s `statsd_out` and current-state paragraphs rewritten for the landed model, the stale `HyperLogLog` doc comment (`crates/logit-core/src/metric.rs`) and internal-telemetry's raw-sample claims (`docs/design/internal-telemetry.md`, an amendment on ADR `internal-telemetry-as-pipeline-events`) corrected, this plan's closing assessment added, and ADR `lossless-transit`'s Status marked realized — `docs/known-gaps.md`, `docs/design/data-model.md`, and the other docs a prior scoping pass verified already in sync were left alone | S | all |
 
 Landing order: W0 → W1 → (W2, W4, W5 in parallel) → W3 → W6 → W7 → W8. Each workstream is its own
 PR.
+
+## Closing assessment
+
+Every loss the "Assessment: today's model and codecs against the survey" section above named
+against the three like-protocol pairs is closed:
+
+- **statsd_in -> statsd_out**: raw timers/histograms/distributions (`Samples`) and raw sets
+  (`SetMembers`) round-trip byte-for-byte under `format: dogstatsd` (under `format: statsd`,
+  lossless modulo the ADR's permitted normalizations: multi-value lines split, `h`/`d` normalize to
+  `ms`), `|c:`/`|T` survive under `format: dogstatsd`, and DogStatsD events/service checks decode
+  and re-encode losslessly — see "statsd_in -> statsd_out
+  (W3, landed)" and "DogStatsD events and service checks (W6, landed)" above.
+- **otlp_in -> otlp_out**: every metric field the original assessment named (start time,
+  description, `Histogram`/`Summary` sum/min/max/count, `ExponentialHistogram` as its own 1:1
+  variant instead of materialized buckets, exemplars, a `NO_RECORDED_VALUE` point round-tripped
+  flagged, real batch-level scope grouping with `schema_url`/`dropped_attributes_count`), every log
+  field (`event_name`, `observed_timestamp` preserved rather than re-stamped, `otel.severity_*`
+  outranking the normalized `Severity`), and every span field (`trace_state`/`flags` on
+  `Span`/`Span.Link`, every `dropped_*_count`, a real status-message field) are closed — see "W4
+  outcome: every named loss above is closed, not just narrowed" above.
+- **syslog_in -> syslog_out**: RFC 5424 STRUCTURED-DATA parses and re-emits through `syslog.sd`, a
+  non-numeric PROCID survives as `Value::Str`, a non-UTF-8 MSG decodes to `Value::Bytes`, and
+  `syslog_out`'s TIMESTAMP follows [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md)'s
+  precedence table instead of always being receipt time — see "W5 outcome" above.
+
+Each fixed point is proven by a real test suite, not just the workstream narrative above:
+`crates/logit-cli/tests/statsd_round_trip.rs`, `crates/logit-cli/tests/syslog_round_trip.rs`, and
+`crates/logit-cli/tests/otlp_round_trip.rs` each exercise their pair over real sockets/transports
+with per-field equality assertions; `crates/logit-proto/tests/otlp_fixed_point.rs` checks
+`decode_signal(encode_signals(b)) == vec![b]` at the pure-codec level with no pipeline, transform,
+or transport in between; and the `proptest`-based fixed points in `crates/logit-outputs/src/statsd.rs`
+(`mod fixed_point`), `crates/logit-outputs/src/syslog.rs` (`mod fixed_point`), and
+`crates/logit-proto/src/otlp/metrics.rs` generate arbitrary records and assert
+`decode(encode(x)) == x` holds beyond any hand-picked fixture.
+
+What's left is what the ADR's "cross-protocol egress stays best-effort" clause accepts,
+plus a short list of genuine model debt — both already tracked in `docs/known-gaps.md` rather than
+newly discovered here:
+
+- `statsd_out` still drops post-sketch metric kinds (`Distribution`/`Set`/`Histogram`/
+  `ExponentialHistogram`/`Summary`/a cumulative or non-monotonic `Sum`) — reachable only once
+  `aggregate` has explicitly summarized, which is the ADR's own opt-in-summarization carve-out, not
+  a like-to-like loss (`docs/known-gaps.md`'s "`statsd_out` drops post-sketch metric kinds" entry).
+- A repeated DogStatsD tag key (`#team:a,team:b`) collapses to its last value, because `AttrMap` is
+  a map, not a multiset — a model gap, not a codec bug (`docs/known-gaps.md`'s "A repeated DogStatsD
+  tag key collapses to its last value" entry).
+- `logit_proto::Encoder`'s one-`Bytes`-per-batch contract still doesn't fit `syslog_out`'s/
+  `statsd_out`'s per-message framing, so both bypass the trait entirely — unchanged by this plan
+  (`docs/known-gaps.md`'s "`logit_proto::Encoder`'s single-`Bytes`-per-batch contract..." entry).
+- `statsd_out` still has no `unit` and no native metric rename/prefix, and only carries an egress
+  timestamp on a `|T`-marked line — everything else is stamped with the receiver's own receipt time
+  (`docs/known-gaps.md`'s "`statsd_out` has no `unit` and no metric renaming/prefixing..." entry).
+- syslog's `event.timestamp` stays receipt time, not the sender's, even though `syslog_out`'s wire
+  TIMESTAMP now follows [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md)'s
+  precedence table (`docs/known-gaps.md`'s "`event.timestamp` is still receipt time..." entry).
+- Cross-protocol egress (`P_in -> Q_out` for two different protocols) stays best-effort by design —
+  a raw sample list has no OTLP wire type, a `DDSketch` has no statsd wire form — each such
+  degradation is counted and documented per the ADR's own rule, in `docs/known-gaps.md`'s
+  "Cross-protocol semantic gaps" table.
+
+`docs/adr/lossless-transit.md`'s Status now records this closing assessment as the realization of
+its Decision.
 
 ## Verification
 
@@ -550,4 +617,9 @@ This PR (W0) is documentation only:
 
 Later workstreams (W1 onward) each verify against `cargo test`/`cargo clippy` per
 [`AGENTS.md`](../../AGENTS.md)'s workflow, plus the exact-size and allocation-count assertions this
-plan calls out, plus the new round-trip test suites this plan adds.
+plan calls out, plus the new round-trip test suites this plan adds. Concretely, W1 through W7 each
+ran a clean `script/cibuild` before landing, plus the round-trip/fixed-point suite its own
+workstream entry above names — `type_sizes.rs`/`allocations.rs` for W1, `statsd_round_trip.rs` and
+the `logit-outputs` `statsd` proptests for W3, `otlp_round_trip.rs` and `logit-proto`'s
+`otlp_fixed_point.rs`/`proptest` suite for W4, `syslog_round_trip.rs` and the `logit-outputs`
+`syslog` proptest for W5, and `logit-script`'s own `#[cfg(test)]` coverage for W7.

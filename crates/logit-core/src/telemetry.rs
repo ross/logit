@@ -15,11 +15,11 @@
 //! for counts, last-write-wins for gauges, sketch merge for timings). That's what lets a real
 //! `aggregate` component attached downstream extend this to any actual time window *correctly*,
 //! because the merges compose -- this module deliberately doesn't take statsd clients'
-//! "batch raw samples, let the server aggregate" option for timings: `MetricKind` does now carry a
-//! raw-sample representation ([`crate::MetricKind::Samples`], with no producer yet -- a later
-//! workstream wires `statsd_in` to it), but self-telemetry's own points are always merged eagerly
-//! here rather than buffered raw, since there is no later `aggregate` stage guaranteed to run over
-//! internal telemetry the way one might over real events.
+//! "batch raw samples, let the server aggregate" option for timings: `MetricKind` does carry a
+//! raw-sample representation ([`crate::MetricKind::Samples`], which `statsd_in` has produced since
+//! W3), but self-telemetry's own points are still merged eagerly into one sketch per drain here, on
+//! purpose, since there is no later `aggregate` stage guaranteed to run over internal telemetry the
+//! way one might over real events.
 
 use crate::interner::intern;
 use crate::{

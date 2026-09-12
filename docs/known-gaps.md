@@ -590,7 +590,7 @@ already built that have a known, accepted rough edge.
   `aggregate` falls back to a sketch/estimate for that window regardless of the config, and this
   sink has no lossless rendering for that fallback either; it drops and counts it exactly like the
   default-summarized case (`docs/adr/statsd-output.md`'s amendment). Tracked as debt against
-  [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+  [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing assessment's residual-debt list.
 - **`statsd_out` has no `unit` and no metric renaming/prefixing; egress timestamp is now carried,
   but only on a `|T`-marked line.** **Narrowed by W3** — DogStatsD's own `|T<unix-seconds>` segment
   (`format: dogstatsd` only) now round-trips: `statsd_in` sets `Event::timestamp` from an incoming
@@ -613,14 +613,14 @@ already built that have a known, accepted rough edge.
   `docs/design/lua-api.md`'s "Reading and writing `event.metrics`") — a sink-side `prefix` field
   was considered and rejected for `statsd_out` specifically (`docs/adr/statsd-output.md`'s
   Alternatives) in favor of a future general metric-rename *transform* (a native component, not
-  Lua), which still doesn't exist. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+  Lua), which still doesn't exist. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing assessment's residual-debt list.
 - **A repeated DogStatsD tag key collapses to its last value.** `#team:a,team:b` is legal
   DogStatsD, but `AttrMap` is a map, not a multiset, so `statsd_in` overwrites the first `team:a`
   with `team:b` while building the event's attributes, before any sink ever sees the line —
   `x:1|c|#team:a,team:b` relays through `statsd_out` as `x:1|c|#team:b`, silently dropping the
   first value rather than the whole tag. This is a model gap (`AttrMap` itself, not a decoder or
   sink bug), tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see
-  [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+  [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing assessment's residual-debt list.
 - **`statsd_out` has no TLS/DTLS** — plaintext UDP/TCP only, same gap as `syslog_out`'s above, and
   the same `TlsClientConfig`/`TlsServerConfig` pair would be the config-plumbing exercise if it
   lands.
@@ -700,7 +700,7 @@ already built that have a known, accepted rough edge.
   *has* changed: `syslog_out`'s own emitted TIMESTAMP field now follows the precedence rule in
   [ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md), so a
   `syslog_in -> syslog_out` relay's *wire* timestamp can reflect the origin again even though
-  `event.timestamp` itself does not. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+  `event.timestamp` itself does not. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing assessment's residual-debt list.
 
   Deriving `event.timestamp` from the sender instead was considered and deliberately not done here:
   RFC 3164's timestamp carries no year and no timezone, so resolving it to an instant means guessing
@@ -985,7 +985,7 @@ already built that have a known, accepted rough edge.
   what a peer protocol expects" shows up as more than a one-line doc-comment footnote. Filed as its
   own entry, meant to grow as more codecs and more of OTLP's own surface (profiles, ...) get real
   mappings, rather than re-discovered by grepping doc comments across encoders each time. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md);
-  see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream. Every
+  see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing assessment's residual-debt list. Every
   mapping below is deliberate, counted, and documented at its own call site — this entry exists so
   the list is in one place too:
 

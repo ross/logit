@@ -1614,8 +1614,9 @@ mod tests {
         }
     }
 
-    /// A `GaugeDelta` against an already-accumulating `Counter` series is a real kind conflict --
-    /// the same `_ => false` / `kind_conflict` path a `Gauge` vs. `Counter` conflict always took.
+    /// A `GaugeDelta` against an already-accumulating counter (`Sum`) series is a real kind
+    /// conflict -- the same `_ => false` / `kind_conflict` path a `Gauge` vs. counter conflict
+    /// always took.
     #[test]
     fn gauge_delta_against_a_counter_series_is_a_kind_conflict_and_is_forwarded() {
         let mut agg = Aggregator::new(Duration::from_secs(10));

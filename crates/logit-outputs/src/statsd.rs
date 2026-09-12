@@ -77,14 +77,15 @@
 //!
 //! ## Metric-kind coverage: raw kinds in, sketches still deferred
 //!
-//! `Counter` (`|c`), `Gauge`/`GaugeDelta` (`|g`), `Samples` (`|ms`/`|h`/`|d`), and `SetMembers`
-//! (`|s`) are all encoded -- `Samples`/`SetMembers` are the raw, unsummarized shapes
-//! `statsd_in` decodes losslessly (`docs/adr/lossless-transit.md`'s "summarization is opt-in and
-//! named"), so a `statsd_in -> statsd_out` relay with no `aggregate` in between round-trips a
-//! timer or set line intact. `Distribution`, `Set`, `Histogram`, `ExponentialHistogram`,
-//! `Summary`, and a cumulative or non-monotonic `Sum` -- everything that only exists *after* some
-//! stage has already summarized -- are dropped with a clear "not implemented yet" message
-//! (`EncodeStats::dropped_unsupported_kind`) -- recorded in `docs/known-gaps.md`.
+//! A delta, monotonic `Sum` (`MetricKind::counter`, `|c`), `Gauge`/`GaugeDelta` (`|g`), `Samples`
+//! (`|ms`/`|h`/`|d`), and `SetMembers` (`|s`) are all encoded -- `Samples`/`SetMembers` are the
+//! raw, unsummarized shapes `statsd_in` decodes losslessly (`docs/adr/lossless-transit.md`'s
+//! "summarization is opt-in and named"), so a `statsd_in -> statsd_out` relay with no `aggregate`
+//! in between round-trips a timer or set line intact. `Distribution`, `Set`, `Histogram`,
+//! `ExponentialHistogram`, `Summary`, and a cumulative or non-monotonic `Sum` -- everything that
+//! only exists *after* some stage has already summarized -- are dropped with a clear "not
+//! implemented yet" message (`EncodeStats::dropped_unsupported_kind`) -- recorded in
+//! `docs/known-gaps.md`.
 //!
 //! **This means a `statsd_in -> aggregate -> statsd_out` relay still drops every timer/set metric
 //! whose window used `aggregate`'s default summarizing config.** `aggregate`'s default turns
@@ -147,13 +148,14 @@
 //!
 //! ## Sample rate: never for a counter, real for `Samples`
 //!
-//! A `Counter`'s value already has its sample rate divided out at decode time, so this sink never
-//! emits `@<rate>` for `|c` -- doing so would double-extrapolate downstream. `Samples` is
-//! different: `statsd_in` no longer extrapolates timer/histogram samples at all (raw values are
-//! kept, unlike a counter's single scalar), so `Samples.sample_rate` is real, un-applied
-//! information that must reach the wire for a lossless relay -- `@<rate>` is emitted whenever it
-//! isn't `1.0` (see [`render_metric`]'s `Samples` arm). `MetricRecord::unit` still has no statsd
-//! wire representation and is dropped the same way it always was.
+//! A delta, monotonic `Sum`'s value (`MetricKind::counter`) already has its sample rate divided
+//! out at decode time, so this sink never emits `@<rate>` for `|c` -- doing so would
+//! double-extrapolate downstream. `Samples` is different: `statsd_in` no longer extrapolates
+//! timer/histogram samples at all (raw values are kept, unlike a counter's single scalar), so
+//! `Samples.sample_rate` is real, un-applied information that must reach the wire for a lossless
+//! relay -- `@<rate>` is emitted whenever it isn't `1.0` (see [`render_metric`]'s `Samples` arm).
+//! `MetricRecord::unit` still has no statsd wire representation and is dropped the same way it
+//! always was.
 //!
 //! ## `|c:<container-id>` and `|T<timestamp>`
 //!
