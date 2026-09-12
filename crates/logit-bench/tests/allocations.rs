@@ -2140,6 +2140,27 @@ fn syslog_encode_into_100_events() {
     expect_allocs("syslog_out: encode_into 100 events", stats, 100);
 }
 
+/// Zero, warm: unlike `syslog_out`'s encoder, `CollectdEncoder` was built holding its own reused
+/// scratch (`packet`/`list`/`values`, plus the previous/current `Identity`) from day one
+/// (`crates/logit-proto/src/collectd/encode.rs`), so there was never a per-event `String`/`Vec` to
+/// fix here -- this row exists to pin that property, not to record a fix. `Packets` (the output
+/// buffer) is the same shape: `bytes`/`ranges`/`lists` are plain `Vec`s that already hold this
+/// batch's capacity after the warm-up call below, so a second `encode_into` over the identical
+/// batch only writes into already-allocated storage.
+#[test]
+fn collectd_encode_into_100_events() {
+    let mut encoder = fixtures::collectd_encoder();
+    let batch = fixtures::collectd_batch(100);
+    let mut out = logit_proto::collectd::Packets::default();
+    let _ = encoder.encode_into(&batch, logit_proto::collectd::DEFAULT_MAX_PACKET_BYTES, &mut out); // warm-up
+
+    let (stats, alloc_stats) =
+        measure(|| encoder.encode_into(&batch, logit_proto::collectd::DEFAULT_MAX_PACKET_BYTES, &mut out));
+    assert!(!out.is_empty());
+    assert_eq!(stats, logit_proto::collectd::EncodeStats::default());
+    expect_allocs("collectd_out: encode_into 100 events", alloc_stats, 0);
+}
+
 /// `prometheus_out`'s encode path, like `prometheus_in`'s, is two plain functions rather than a
 /// `Decoder`/`Encoder` trait call (`docs/adr/prometheus-scrape-and-exposition.md`'s "No
 /// `logit_proto::Encoder`" section): `events_to_families` (a stateful sink's `send`) then

@@ -1061,3 +1061,33 @@ pub fn prometheus_gauge_events(count: usize) -> Vec<Event> {
         })
         .collect()
 }
+
+/// A collectd-shaped like-relay event: `collectd.host`/`collectd.plugin`/`collectd.type`/
+/// `collectd.interval` present, one gauge record -- the shape `collectd_in` produces and
+/// `collectd_out`'s encoder fast-paths straight into one Values part
+/// (`logit_proto::collectd`'s module doc's "like-relay" row), rather than the slower per-record
+/// fallback path a plain metric event without `collectd.type` would take.
+pub fn collectd_event() -> Event {
+    let mut attributes = AttrMap::new();
+    attributes.insert(logit_proto::collectd::ATTR_HOST, Value::str("fixture-host"));
+    attributes.insert(logit_proto::collectd::ATTR_PLUGIN, Value::str("load"));
+    attributes.insert(logit_proto::collectd::ATTR_TYPE, Value::str("load"));
+    attributes.insert(logit_proto::collectd::ATTR_INTERVAL, Value::F64(10.0));
+    let mut event = Event::empty(0, attributes);
+    event.metrics.push(MetricRecord::new(
+        logit_core::interner::intern("load.load"),
+        MetricKind::Gauge(0.5),
+    ));
+    event
+}
+
+/// `count` copies of [`collectd_event`] in one batch, for measuring `collectd_out`'s encoder
+/// (`collectd_out: encode_into 100 events`, `tests/allocations.rs`).
+pub fn collectd_batch(count: usize) -> EventBatch {
+    let event = collectd_event();
+    EventBatch { resource: resource(), scope: None, events: (0..count).map(|_| event.clone()).collect() }
+}
+
+pub fn collectd_encoder() -> logit_proto::collectd::CollectdEncoder {
+    logit_proto::collectd::CollectdEncoder::new()
+}

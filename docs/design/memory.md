@@ -257,6 +257,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR `decoupled-listener-io` -- see below |
 | `syslog_out` encode_into 100 events | **100** | ~1/event -- reused struct-held scratch buffers, was 401, see below |
 | `prometheus_out` encode 100 series (1 gauge family) | **414** | `events_to_families` + `text::write`, no `Encoder` trait (same ADR as the decode row above) -- ~4.1/series: one `String` label key/value pair, one `MetricFamily`/`Series` entry, and the rendered text line's own buffer growth per series; not yet optimized, tracked as follow-up work alongside the decode row above |
+| `collectd_out` encode_into 100 events, warm | **0** | never had a per-event allocation to begin with -- `CollectdEncoder` (`crates/logit-proto/src/collectd/encode.rs`) was built holding its own reused `packet`/`list`/`values`/`Identity` scratch from the start, and `Packets` (the output buffer) is three plain `Vec`s that keep this batch's capacity warm across calls; see below |
 
 And the corresponding times:
 
