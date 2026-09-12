@@ -240,8 +240,9 @@ fn deeply_nested_batch(depth: usize) -> EventBatch {
 }
 
 /// A complete, realistic collectd datagram: two value lists sharing one host/plugin/type, the
-/// second eliding everything but its own TypeInstance -- so a truncation or a bit flip can land in a
-/// part header, an identity string, a sticky-state boundary, or a value vector.
+/// second eliding everything but its own TypeInstance, plus a trailing notification -- so a
+/// truncation or a bit flip can land in a part header, an identity string, a sticky-state
+/// boundary, a value vector, or the Message/Severity parts a notification adds.
 fn sample_collectd_packet() -> Vec<u8> {
     /// Appends one part: `type u16 BE, len u16 BE` (the length *includes* the header), payload.
     /// Hand-written rather than reusing `logit_proto::collectd::part`'s writers, so a bug in those
@@ -282,6 +283,8 @@ fn sample_collectd_packet() -> Vec<u8> {
     values(&mut out, &[(2, 1234i64.to_be_bytes())]); // one DERIVE
     string(&mut out, 0x0005, b"system");
     values(&mut out, &[(1, 0.5f64.to_le_bytes()), (0, 7u64.to_be_bytes())]); // GAUGE + COUNTER
+    number(&mut out, 0x0101, 2); // Severity: WARNING
+    string(&mut out, 0x0100, b"cpu usage notification"); // Message
     out
 }
 

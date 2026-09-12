@@ -44,7 +44,8 @@
 //! `endpoint` is resolved once per batch (a non-numeric host must not be re-resolved once per
 //! datagram); a resolution failure is [`Fault::Clean`]. `EMSGSIZE` (raw OS error 90, or
 //! `ErrorKind::InvalidInput` on a platform where the `send_to` shim never reaches the syscall) on
-//! one datagram counts that datagram's value-list count under
+//! one datagram counts that datagram's message count (value lists or, for a notification's own
+//! datagram, the single `1`) under
 //! `logit.output.messages.dropped{reason="oversize_datagram"}` plus a throttled diagnostic, and
 //! sending continues with the next datagram -- one oversize datagram must not sink an otherwise
 //! deliverable batch. Any other send error is [`Fault::Clean`] if no datagram in this batch has
@@ -55,8 +56,9 @@
 //! `logit.output.batch.bytes` (total bytes across every datagram in the batch, emitted only when
 //! there is something to send), `logit.output.request.duration` (one timer per `send` call that
 //! actually touches the socket), `logit.output.requests{class="ok"|"error"}`,
-//! `logit.output.messages` (value lists actually sent -- the per-datagram list count each
-//! [`logit_proto::MessageBuf`] entry's `usize` meta carries, summed), `logit.output.datagrams`
+//! `logit.output.messages` (value lists *or notifications* actually sent -- the per-datagram
+//! message count each [`logit_proto::MessageBuf`] entry's `usize` meta carries, summed; a
+//! notification's own datagram always contributes `1`), `logit.output.datagrams`
 //! (datagrams actually sent), and `logit.output.messages.dropped{reason="oversize_datagram"}` plus
 //! a throttled `oversize_datagram` diagnostic for the `EMSGSIZE` case above.
 //!
@@ -84,7 +86,8 @@ pub struct CollectdOutput {
     /// to a replacement encoder regardless of builder order -- see that method's doc comment.
     max_packet_bytes: usize,
     /// Reused across `send` calls: the codec's own packing buffer, one entry per datagram, whose
-    /// `usize` meta is that datagram's value-list count.
+    /// `usize` meta is that datagram's message count (value lists, or `1` for a notification's own
+    /// datagram).
     buf: MessageBuf<usize>,
     diag: Diagnostics,
     telemetry: Telemetry,
@@ -211,8 +214,8 @@ impl Output for CollectdOutput {
 impl CollectdOutput {
     /// Sends every already-packed datagram in `buf`, one `send_to` per datagram -- no packing
     /// decision left to make here, unlike `StatsdOutput::send_udp`: `CollectdEncoder::encode_into`
-    /// already chose every datagram boundary against its own `max_packet_bytes`. Returns `(value
-    /// lists sent, datagrams sent)`.
+    /// already chose every datagram boundary against its own `max_packet_bytes`. Returns
+    /// `(messages sent -- value lists or notifications, datagrams sent)`.
     async fn send_udp(
         socket: &UdpSocket,
         endpoint: &str,

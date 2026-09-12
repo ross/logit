@@ -68,6 +68,7 @@
 //! | `incomplete_identity` | a value list arrived with an empty host, plugin or type; skipped, exactly as collectd's own receiver rejects it |
 //! | `encrypted_packet_dropped` | a `SecurityLevel Encrypt` datagram: this codec holds no keys, so the rest of the datagram is dropped (`docs/known-gaps.md`) |
 //! | `types_db_mismatch` | the configured `types_db` defines this list's type with a different data-source count or kinds than arrived; index naming is used instead |
+//! | `notification_dropped` | a notification (`0x0100`/`0x0101`) arrived with an out-of-set severity, an empty message, or no host set; skipped, exactly as collectd's own receiver rejects the same notification |
 //!
 //! ## Telemetry
 //!
@@ -181,7 +182,7 @@ mod tests {
     use super::*;
     use logit_core::interner::resolve;
     use logit_core::telemetry::Registry;
-    use logit_core::{Event, MetricKind, Temporality, Value};
+    use logit_core::{Event, MetricKind, Severity, Temporality, Value};
     use logit_pipeline::unwrap_batch;
     use logit_proto::collectd::part;
     use logit_proto::Decoder as _;
@@ -600,5 +601,45 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
             "the interface plugin puts the interface name in plugin_instance"
         );
         assert_eq!(if_octets.attributes.get("collectd.type_instance"), None);
+    }
+
+    /// The `threshold`-plugin capture (W5 of `docs/plans/collectd-binary-relay.md`): a single
+    /// datagram carrying one notification, no value lists at all -- `tools/record-fixtures/
+    /// collectd.conf`'s `<Plugin threshold>` block sets both `WarningMax` and `FailureMax` to
+    /// `0.0` on `load`'s `shortterm` data source, so the very first read (a real load average is
+    /// essentially never exactly zero) breaches both and collectd's threshold plugin reports the
+    /// more severe one -- FAILURE, not WARNING.
+    #[test]
+    fn interop_fixture_notification_decodes_to_a_log_record() {
+        let (events, registry) = decode_interop("collectd-notification-000.raw", None);
+        assert_eq!(
+            diagnostic_keys(&registry),
+            Vec::<String>::new(),
+            "a real collectd notification must decode with no notification_dropped diagnostic"
+        );
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert!(event.metrics.is_empty(), "a notification carries no metrics");
+        assert_eq!(attr_str(event, "collectd.host"), Some("logit-fixture"));
+        assert_eq!(attr_str(event, "collectd.plugin"), Some("load"));
+        assert_eq!(attr_str(event, "collectd.type"), Some("load"));
+        assert_eq!(
+            event.attributes.get("collectd.severity"),
+            Some(&Value::U64(1)),
+            "both WarningMax and FailureMax are breached; collectd reports the more severe"
+        );
+        let log = event.log.as_ref().expect("a Message part must decode to a log record");
+        assert_eq!(log.severity, Some(Severity::Error));
+        let message = log.message.as_str().expect("collectd's own message is valid UTF-8");
+        assert!(!message.is_empty());
+        assert!(
+            message.contains("shortterm"),
+            "the real message names the breached data source: {message:?}"
+        );
+        assert!(
+            (CAPTURED_ON_OR_AFTER..CAPTURED_BEFORE).contains(&event.timestamp),
+            "the TimeHR part off the wire, not RECEIVED_AT -- got {}",
+            event.timestamp
+        );
     }
 }
