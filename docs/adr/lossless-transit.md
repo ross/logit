@@ -1,12 +1,15 @@
 ---
 created: 2026-09-10
-updated: 2026-09-10
+updated: 2026-09-12
 ---
 
 # Lossless like-protocol transit: the internal model is a superset of every supported wire protocol
 
 ## Status
 Accepted
+
+Realized as of 2026-09-12: W1-W7 closed every named loss this ADR requires closed for like-to-like
+transit; see [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s closing assessment.
 
 ## Context
 

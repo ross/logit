@@ -83,9 +83,12 @@ acknowledged before the next is sent
 ([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md)).
 `statsd_out` (`crates/logit-outputs/src/statsd.rs`, the mirror of `statsd_in`, UDP or TCP,
 DogStatsD tags round-tripped through the real decoder,
-[ADR `statsd-output`](docs/adr/statsd-output.md)) is also implemented and tested now -- v1 only
-encodes `Counter`/`Gauge`/`GaugeDelta`, so a `statsd_in -> aggregate -> statsd_out` relay still
-drops every timer metric (`docs/known-gaps.md`). Not
+[ADR `statsd-output`](docs/adr/statsd-output.md)) is also implemented and tested now -- it encodes
+`Sum` (delta, monotonic), `Gauge`/`GaugeDelta`, `Samples`, `SetMembers`, and DogStatsD
+events/service checks; a `statsd_in -> statsd_out` relay with no `aggregate` in between, or one
+configured `distributions: samples`/`sets: members`, round-trips timers and sets byte-for-byte --
+only post-sketch kinds (`Distribution`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary`, and a
+cumulative `Sum`) are dropped and counted (`docs/known-gaps.md`). Not
 yet built: credit-based flow control beyond one frame in flight, and QUIC (`docs/known-gaps.md`).
 Config is a flat graph of named components (ADR `component-graph-configuration`,
 [pipeline-graph.md](docs/design/pipeline-graph.md)) resolved and validated by
@@ -146,11 +149,20 @@ ready (`2`). `internal`'s own `logs:` setting (`warn` by default, `error`, or `o
 `logit`'s own `warn`-and-above self-diagnostics into the pipeline as ordinary log events through
 `logit_core::telemetry::TelemetryLayer`, alongside its existing points and spans -- see
 `internal-telemetry.md`'s "Logs" section. `docs/deploying.md`'s "Probes and exit codes" and
-"Self-logging" sections are the operator-facing account of all of it. [ADR `lossless-transit`](docs/adr/lossless-transit.md)
-now states an explicit goal — a lossless relay for each like-protocol pair
-(`statsd_in`/`statsd_out`, `otlp_in`/`otlp_out`, `syslog_in`/`syslog_out`) — that today's model and
-codecs don't yet meet; [`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md) has the
-assessment and the ordered workstreams closing that gap.
+"Self-logging" sections are the operator-facing account of all of it. [ADR `lossless-transit`](docs/adr/lossless-transit.md)'s
+goal — a lossless relay for each like-protocol pair (`statsd_in`/`statsd_out`, `otlp_in`/`otlp_out`,
+`syslog_in`/`syslog_out`) — is met for like-protocol transit as of 2026-09-12: model v2
+(`Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level `Scope`,
+`MetricRecord.flags`), OTLP (scope grouping, start time, description, exemplars, a
+`NO_RECORDED_VALUE` point round-tripped flagged, `event_name`/`observed_timestamp`, span
+`flags`/`trace_state`/a real status-message field, dropped-attribute counts), syslog (structured
+data as `syslog.sd`, timestamp precedence, bytes MSG, opt-in structured-data emission), statsd (raw
+timers/sets, `|c:`/`|T`, events/service checks), `aggregate`'s raw-retention modes backed by a real
+HyperLogLog, and the Lua surface (`event.metrics`, `event.span`, `scope`, the new log/resource
+fields) have all landed. [`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md) has the
+closing assessment; residual debt (post-sketch metric kinds at `statsd_out`, a repeated DogStatsD
+tag key collapsing to its last value, `Encoder`'s per-batch-`Bytes` shape not fitting per-message
+framing) lives in `docs/known-gaps.md`.
 
 ## Environment
 

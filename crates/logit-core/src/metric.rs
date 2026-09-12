@@ -346,9 +346,9 @@ impl Default for DdSketch {
 /// [`DdSketch`] needs a real error bound: the split-collection topology (`docs/OVERVIEW.md`) means
 /// two edge nodes' `Set` aggregates may need combining downstream, and a union of two independently
 /// built HyperLogLogs is the algorithm's whole point, not an approximation layered on top of one.
-/// See `docs/design/data-model.md`. Still no *producer* until W3 wires up statsd's `s` (set) metric
-/// type -- `crates/logit-inputs/src/statsd.rs` still returns a decode error for it -- but `aggregate`
-/// (W2) can now merge [`MetricKind::SetMembers`] into a real [`MetricKind::Set`].
+/// See `docs/design/data-model.md`. Since W3, `crates/logit-inputs/src/statsd.rs` decodes statsd's
+/// `s` (set) metric type straight to [`MetricKind::SetMembers`], and `aggregate` (W2) merges it
+/// into a real [`MetricKind::Set`].
 ///
 /// **`from_bytes` depends on a capacity invariant, not just a byte layout.** `cardinality-estimator`
 /// 1.0.3's `Array::from_vec` (its `src/array.rs`) reconstitutes the wrapped crate's own heap

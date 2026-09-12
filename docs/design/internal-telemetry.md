@@ -119,18 +119,20 @@ same key merges into the pending point rather than queueing a second one:
 
 | Kind | Coalesced by | Emitted as |
 |---|---|---|
-| count | sum | `MetricKind::Counter` |
+| count | sum | `MetricKind::Sum` (produced via `MetricKind::counter(v)`) |
 | gauge | last write wins | `MetricKind::Gauge` |
 | timing | samples merged into one sketch | `MetricKind::Distribution(DdSketch)` |
 
 These are exactly `logit-transforms::Aggregator`'s own merge rules
-(`Accumulator::Counter` sums, `Gauge` is last-write-wins, `Distribution` merges sketches). That
+(`Accumulator::Sum` sums, `Gauge` is last-write-wins, `Distribution` merges sketches). That
 identity is load-bearing, not incidental: it's what makes attaching a real `aggregate` component
 downstream of `internal` extend this to any actual time window *correctly* — the merges compose,
 because they're the same merges. The buffer itself has no notion of a time window; it holds
-whatever has accumulated since the last drain and nothing more. See ADR `internal-telemetry-as-pipeline-events` for why this can't
-take DogStatsD's "pack raw samples, let the server aggregate" option for timings —
-`logit_core::MetricKind` has no raw-sample representation, only mergeable ones.
+whatever has accumulated since the last drain and nothing more. `MetricKind::Samples` exists now
+(`docs/plans/lossless-transit.md`'s W1/W3), but this buffer deliberately keeps sketching timings
+into one running `DdSketch` between drains rather than retaining raw per-timing values — see ADR
+`internal-telemetry-as-pipeline-events` for why a mergeable running sketch, not raw retention, is
+still the right shape for internally generated points.
 
 **Cardinality is capped, not unbounded.** A component's buffer holds at most 1024 distinct
 `(name, tags)` keys (`telemetry::MAX_KEYS_PER_COMPONENT`); a new key beyond the cap is dropped and
