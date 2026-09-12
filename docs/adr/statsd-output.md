@@ -384,3 +384,152 @@ fixed point (`mod fixed_point::decode_encode_decode_is_a_fixed_point`, 200 gener
 `crates/logit-cli/tests/statsd_round_trip.rs` (mirroring `syslog_round_trip.rs`'s real-UDP-socket
 harness, landing alongside this amendment per `docs/plans/lossless-transit.md`'s W3 phase B)
 extends the same coverage end to end through real sockets.
+
+## Amendment: DogStatsD events and service checks relay
+
+[`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W6 closes the last gap this
+ADR's original Decision section left unaddressed: DogStatsD's two non-metric line shapes,
+`_e{tlen,xlen}:title|text|...` (an **event**) and `_sc|name|status|...` (a **service check**),
+which `statsd_in` used to reject outright as malformed (any line starting with `_` fell into the
+generic "unknown metric type" error path). Both now decode and re-encode losslessly, the same
+"raw shape in, raw shape back out" relay this ADR's previous amendment gave `Samples`/`SetMembers`.
+
+### Decoded shapes and carriers
+
+An event decodes to one [`Event::log`](../design/data-model.md): `message` is `TEXT` with its `\n`
+(backslash, `n`) two-byte escape unescaped to a real newline (zero-copy when there's nothing to
+unescape); `severity` maps `t:error`/`t:warning`/`t:success`/`t:info` to
+`Error`/`Warn`/`Info`/`Info`, `None` when `t:` is absent; `body_format` is `Raw`. Every field
+`_e{...}` can carry becomes a `statsd.event.*` attribute (rule (b),
+[ADR `lossless-transit`](lossless-transit.md): a protocol-namespaced carrier for a concept this
+model has no normalized field for) rather than a `LogRecord` field: `statsd.event.title` (always),
+`statsd.event.priority`/`statsd.event.alert_type` (only when sent, raw wire value),
+`statsd.event.aggregation_key`, `statsd.event.source_type`, `statsd.event.host` — plus the same
+`statsd.timestamp`/`statsd.container_id`/`#tags` handling every metric line already gets, with
+`d:<secs>` (not `|T<secs>`) playing the timestamp segment's role here.
+
+A service check decodes to one `Event::metric`, `MetricKind::Gauge(status as f64)` under the
+check's own (interned) name — deliberately the same metric shape a plain `name:v|g` line produces,
+so every consumer already built for a `Gauge` (retention, relay, `influxdb_out`/`stdio_out`
+rendering) handles a service check with no special-casing. `statsd.service_check.name` (always —
+`MetricRecord`'s own name has nowhere to carry the raw wire spelling, rule (b) again),
+`statsd.service_check.status` (always, `Value::U64`), `statsd.service_check.message` (`m:`, only
+if present, verbatim including any `|` it contains — `m:` is always the *last* field on the wire,
+so it can consume the rest of the line), `statsd.service_check.host` (`h:`, only if present),
+`statsd.timestamp`/`statsd.container_id`/`#tags` round out the carrier set.
+
+**`event_name` stays `None`, deliberately.** An event title is free text an operator or their
+application chose at send time — not a fixed, bounded vocabulary the way a metric or tag name is —
+so interning it the way `event_name` interning works elsewhere would grow the global interner
+without bound for something that was never meant to be a repeated, low-cardinality identifier. This
+is a deliberate design decision, not a gap: `statsd.event.title` (a zero-copy `Value::Str` slice of
+the datagram, not interned) already carries the exact same information losslessly, so nothing is
+lost by leaving `event_name` unset.
+
+### Canonical field order, and `d:` never `|T`
+
+`statsd_out` re-emits both shapes in one fixed field order regardless of the order their fields
+arrived in on the wire — `_e{tlen,xlen}:title|text|d:|h:|p:|t:|k:|s:|#tags|c:` for an event,
+`_sc|name|status|d:|h:|#tags|c:|m:` for a service check (`m:` last, unconditionally, since it
+consumes the rest of the line on decode) — the same "tags in `AttrMap` order, not wire order"
+normalization this ADR's previous amendment already permits by name for an ordinary metric line's
+segments, applied to these two grammars' own named fields instead of a generic `|` segment order.
+`d:<secs>` (never `|T<secs>`) renders from the `statsd.timestamp` carrier's own `U64` value on
+both shapes — an event/service-check line's timestamp is a *named* field of its own grammar, not
+the generic `|T` extension `append_dialect_extras` emits on an ordinary metric line, so it gets its
+own dedicated field rather than borrowing that path. Severity is never re-derived from
+`LogRecord.severity` to synthesize a `t:` field when `statsd.event.alert_type` is absent: the raw
+carrier outranks the normalized field on this protocol's own egress (rule (b) again), so an absent
+carrier means an absent wire field, never an invented one.
+
+### Sanitization
+
+One rule per field, all substitution, never deletion (this file's existing convention): event
+title — control bytes only substituted (a bare `|` is fine, since the `_e{TITLE_LEN,...}` byte
+length delimits the field, not a `|` scan); event text — a real newline becomes the two-byte `\n`
+escape, any other control byte substituted (`statsd_in`'s `unescape_event_text` is this rule's
+decode-side mirror); event host/aggregation-key/source-type and service-check name/host — `|` and
+control bytes substituted (each sits in a `|letter:value` field a real decode splits on the *next*
+`|`, the same reason a tag value's own colon-preserving rule doesn't apply here — none of these
+fields has a tag value's colon-splitting ambiguity); service-check message — control bytes
+(including a real newline) substituted, `|` left alone, since `m:` is always the line's last field.
+Event priority/alert-type are never sanitized at all: either the value exactly matches its fixed
+allowed set (`normal`/`low`; `info`/`success`/`warning`/`error`) and is written verbatim, or it
+doesn't and the one field is omitted — there is no substituted spelling of an out-of-set priority
+that would still mean the same thing. That omission is counted
+`EncodeStats::dropped_invalid_event_fields` (`logit.output.messages.dropped{reason=
+"invalid_event_field"}`), deliberately its own counter rather than `dropped_unencodable_value`:
+the rest of the line still renders and is still emitted, so this is a dropped *field*, not a
+dropped *message*, and conflating the two would misreport a partial line as a fully lost one.
+
+### `format: statsd` drop, and the first-metric-is-the-check rule
+
+Neither shape has a wire form under the classic grammar at all — no `_e`/`_sc` sigil exists there
+— so under `format: statsd` the whole event is dropped before anything else about it is even
+inspected, counted `EncodeStats::dropped_dialect_events`
+(`logit.output.messages.dropped{reason="dialect_event"}`). A service check's gauge is not emitted
+as an ordinary `name:v|g` line either: the point being made is the check, not a value that happens
+to coincide with one, so there is no fallback rendering, only a full drop.
+
+A service check is only ever read off an event's **first** metric — `statsd_in`'s own decode never
+produces more than one, but a cross-protocol relay or a Lua-authored event could — and that metric
+must be a `Gauge`; anything else drops the whole event and counts
+`EncodeStats::dropped_invalid_service_check` (`logit.output.messages.dropped{reason=
+"invalid_service_check"}`) rather than silently falling through to an ordinary metric line for a
+value that was never meant to be one. `status` comes from `statsd.service_check.status` when it's
+a `U64` in `0..=3`; otherwise the gauge's own value, if finite and rounding into `0..=3`; otherwise
+the same drop-and-count applies — DogStatsD's own decoder would reject an out-of-range status, so
+this sink never writes one. Any metrics *after* the first on a service-check event still render as
+ordinary lines, right after the `_sc` line — only the first metric is claimed by the check.
+
+### Closing test enumeration
+
+`crates/logit-inputs/src/statsd.rs` gained: `dogstatsd_docs_example_event_decodes`,
+`dogstatsd_docs_example_service_check_decodes`, `event_with_every_optional_field_decodes`,
+`event_text_containing_pipe_colon_and_an_escaped_newline_decodes`,
+`event_title_length_running_past_the_line_is_rejected`,
+`event_missing_pipe_after_title_is_rejected`,
+`event_title_length_landing_mid_char_boundary_is_rejected`,
+`event_unknown_priority_or_alert_type_is_rejected`,
+`event_d_field_sets_the_timestamp_and_the_carrier`, `event_container_id_becomes_an_attribute`,
+`service_check_d_field_sets_the_timestamp_and_the_carrier`,
+`service_check_container_id_becomes_an_attribute`,
+`service_check_message_containing_pipe_decodes_verbatim`,
+`service_check_out_of_range_or_non_numeric_status_is_rejected`,
+`service_check_empty_name_is_rejected`, `a_bare_underscore_line_with_an_unknown_sigil_is_rejected`,
+and
+`a_packed_datagram_mixing_a_counter_an_event_and_a_service_check_decodes_all_three_in_order`.
+`crates/logit-outputs/src/statsd.rs` gained the matching encode-side coverage:
+`an_event_with_every_field_renders_the_canonical_line_with_byte_lengths`,
+`event_text_with_a_real_newline_is_escaped_and_the_length_counts_the_escape`,
+`absent_event_carriers_produce_no_optional_fields`,
+`an_invalid_event_priority_is_omitted_and_counted`,
+`an_invalid_event_alert_type_is_omitted_and_counted`,
+`an_event_with_a_non_string_log_message_is_dropped_and_counted`,
+`event_carriers_never_appear_as_tags`, `event_carriers_set_on_the_resource_are_honored`,
+`an_oversize_event_line_is_dropped_via_the_existing_oversize_path`,
+`a_service_check_renders_the_canonical_line`,
+`a_service_check_message_containing_a_pipe_is_kept_since_m_is_last`,
+`service_check_status_attribute_wins_over_the_gauge_value`,
+`service_check_status_falls_back_to_the_rounded_gauge_value`,
+`an_out_of_range_service_check_status_is_dropped_and_counted`,
+`a_non_gauge_first_metric_on_a_service_check_event_is_dropped_and_counted`,
+`a_second_metric_on_a_service_check_event_renders_as_a_normal_line_after_it`,
+`service_check_carriers_never_appear_as_tags`,
+`events_and_service_checks_are_dropped_under_plain_statsd`, and
+`a_real_event_dropped_under_statsd_also_tallies_its_tags_into_tags_dropped_dialect`.
+`crates/logit-cli/tests/statsd_round_trip.rs` extends the same coverage through real sockets: the
+DogStatsD docs' own event/service-check examples (`dogstatsd-event`/`dogstatsd-service-check`)
+join the byte-for-byte corpus; `dogstatsd-event-all-fields`/`service-check-all-fields`,
+`event-text-with-pipe-and-escaped-newline`, `event-multibyte-title-lengths`,
+`event-title-contains-pipe`, `service-check-no-message`, and
+`packed-datagram-counter-event-service-check` exercise the grammar corners;
+`event-fields-reordered-canonicalized` pins the canonical-order normalization;
+`events_and_service_checks_produce_no_output_and_are_counted_under_plain_statsd` pins the
+`format: statsd` whole-event drop (calling `StatsdEncoder::encode_into` directly, since a
+wholly-dropped batch never sends a datagram for the UDP harness to capture); and
+`statsd_in_aggregate_statsd_out_relay_is_exact_for_a_service_check` pins a service check surviving
+a real `aggregate` window intact, `d:`/`m:` included — `aggregate` absorbs it exactly like an
+ordinary gauge (its `MetricKind::Gauge` shape, "last write wins"), with every `statsd.service_check.*`
+carrier riding on the series key alongside the value, the same guarantee this ADR's previous
+amendment already pins for `|T` on an ordinary counter.

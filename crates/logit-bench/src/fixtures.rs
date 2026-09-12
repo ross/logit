@@ -67,6 +67,26 @@ pub const STATSD_SAMPLED_DISTRIBUTION_LINE: &str = "request.latency:120|ms|@0.1"
 /// single zero-copy member slice of the datagram.
 pub const STATSD_SET_LINE: &str = "unique.users:abc123|s";
 
+/// A DogStatsD event (`_e{tlen,xlen}:title|text|...`) line whose `TEXT` has nothing to unescape --
+/// the docs' own canonical event example (`crates/logit-inputs/src/statsd.rs`'s
+/// `dogstatsd_docs_example_event_decodes`) -- so `parse_event`'s `unescape_event_text` takes its
+/// zero-copy path, the same `slice_of`-backed slicing every other statsd field here gets.
+pub const STATSD_EVENT_LINE: &str =
+    "_e{21,36}:An exception occurred|Cannot parse CSV file from 10.0.0.17|t:warning|#err_type:bad_file";
+
+/// The same shape as [`STATSD_EVENT_LINE`], except `TEXT` contains one `\n` (backslash, `n`)
+/// escape -- the one case `unescape_event_text` can't slice, since the decoded message needs a
+/// real newline byte the wire text doesn't have. Isolates that one extra allocation
+/// (`Bytes::from(raw.replace(...))`) from the zero-copy baseline [`STATSD_EVENT_LINE`] measures.
+pub const STATSD_EVENT_LINE_WITH_ESCAPED_NEWLINE: &str = "_e{5,12}:title|line1\\nline2";
+
+/// A DogStatsD service check (`_sc|name|status|...`) line -- the docs' own canonical example
+/// (`crates/logit-inputs/src/statsd.rs`'s `dogstatsd_docs_example_service_check_decodes`).
+/// Decodes to one [`logit_core::MetricKind::Gauge`] event carrying the
+/// `statsd.service_check.*` carriers alongside it.
+pub const STATSD_SERVICE_CHECK_LINE: &str =
+    "_sc|Redis connection|2|#env:dev|m:Redis connection timed out after 10s";
+
 /// A logfmt-shaped log line (go-kit style), used to exercise the quoted-value scan path.
 pub const LOGFMT_LINE: &str = "level=info ts=2026-09-07T06:52:01Z caller=metrics.go:159 \
     component=frontend org_id=fake latency=fast duration=12.3ms status=200 \
@@ -107,6 +127,21 @@ pub fn statsd_sampled_distribution_datagram(count: usize) -> Bytes {
 /// `count` copies of [`STATSD_SET_LINE`], newline-separated.
 pub fn statsd_set_datagram(count: usize) -> Bytes {
     join_lines(STATSD_SET_LINE, count)
+}
+
+/// `count` copies of [`STATSD_EVENT_LINE`], newline-separated.
+pub fn statsd_event_datagram(count: usize) -> Bytes {
+    join_lines(STATSD_EVENT_LINE, count)
+}
+
+/// `count` copies of [`STATSD_EVENT_LINE_WITH_ESCAPED_NEWLINE`], newline-separated.
+pub fn statsd_event_with_escaped_newline_datagram(count: usize) -> Bytes {
+    join_lines(STATSD_EVENT_LINE_WITH_ESCAPED_NEWLINE, count)
+}
+
+/// `count` copies of [`STATSD_SERVICE_CHECK_LINE`], newline-separated.
+pub fn statsd_service_check_datagram(count: usize) -> Bytes {
+    join_lines(STATSD_SERVICE_CHECK_LINE, count)
 }
 
 fn join_lines(line: &str, count: usize) -> Bytes {

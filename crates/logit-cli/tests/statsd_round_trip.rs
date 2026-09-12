@@ -12,8 +12,16 @@
 //! decode, or the literal marker [`SAME_AS_INPUT`] when the sink's own canonicalization happens to
 //! reproduce the input verbatim) -- the same convention `syslog_round_trip.rs`'s corpus uses. The
 //! DogStatsD-docs cases (`dogstatsd-*`) are the worked examples from Datadog's own DogStatsD
-//! protocol reference; everything else is hand-written to exercise a specific grammar corner or
-//! normalization.
+//! protocol reference (`dogstatsd-event`/`dogstatsd-service-check` included -- the docs' own event
+//! and service check examples); everything else is hand-written to exercise a specific grammar
+//! corner or normalization, including the DogStatsD events/service checks W6 adds:
+//! `dogstatsd-event-all-fields`/`service-check-all-fields` (every optional field, already in
+//! canonical order), `event-text-with-pipe-and-escaped-newline` (`TEXT` containing `|`, `:`, and a
+//! `\n` escape), `event-multibyte-title-lengths` (a multi-byte UTF-8 title, pinning that
+//! `_e{TITLE_LEN,...}` counts bytes, not chars), `event-title-contains-pipe` (a title containing a
+//! literal `|`, which the length prefix -- not a `|` scan -- delimits), `service-check-no-message`
+//! (no `m:` field), and `packed-datagram-counter-event-service-check` (an ordinary metric, an
+//! event, and a service check sharing one datagram).
 //!
 //! ## Permitted normalizations (recorded here, per [`docs/adr/lossless-transit.md`])
 //!
@@ -72,12 +80,20 @@
 //!      on every split line.
 //!    - A timer's own wire-type letter collapses from `h`/`d` to the classic grammar's `ms`.
 //!    - `|c:<container-id>`/`|T<timestamp>` have no plain-statsd equivalent at all and are dropped.
+//!    - A DogStatsD event or service check has no `_e`/`_sc` wire form at all under the classic
+//!      grammar, so the whole event is dropped -- not normalized into anything -- and counted
+//!      `EncodeStats::dropped_dialect_events`.
 //!
 //!    Exercised by `statsd-dialect-multi-value-timer-split`, `statsd-dialect-h-normalizes-to-ms`,
-//!    `statsd-dialect-drops-container-and-timestamp`, and `statsd-dialect-drops-tags`. These are
-//!    **one-way lossy by design** (the whole point of (6) is that the classic dialect can't
-//!    express what was dropped), so unlike every other case in this file they are asserted against
-//!    their `.expected` wire bytes only -- no decoded-batch equality claim is made for them.
+//!    `statsd-dialect-drops-container-and-timestamp`, `statsd-dialect-drops-tags`, and
+//!    `events_and_service_checks_produce_no_output_and_are_counted_under_plain_statsd` (the last
+//!    one bypasses the UDP harness, calling [`logit_outputs::statsd::StatsdEncoder::encode_into`]
+//!    directly, since a wholly-dropped batch never sends a datagram for `capture_only` to receive
+//!    -- see that test). These are **one-way lossy by design** (the whole point of (6) is that the
+//!    classic dialect can't express what was dropped), so unlike every other case in this file they
+//!    are asserted against their `.expected` wire bytes (or, for the events/service-checks case,
+//!    the returned [`logit_outputs::statsd::EncodeStats`]) only -- no decoded-batch equality claim
+//!    is made for them.
 //! 7. **`SetMembers` always splits one member per line, in both dialects.** The classic grammar has
 //!    no multi-value extension for sets the way DogStatsD's timers get, so `statsd_in`'s own
 //!    multi-value `s` decode (`name:m1:m2|s`, one event) never has a matching multi-value encode:
@@ -93,16 +109,35 @@
 //!    it's the same "one wire input, fewer bits of information out" shape as (7)'s decode-side
 //!    collapse. Exercised by `repeated-tag-key-collapses-to-last-value`
 //!    (`x:1|c|#team:a,team:b` -> `x:1|c|#team:b`).
+//! 9. **A DogStatsD event/service check's fields re-emit in canonical order, regardless of the
+//!    order they arrived in on the wire, and an event `TEXT`'s `\n` escape re-emits the same way it
+//!    decoded.** `_e{tlen,xlen}:title|text` canonical order is `d:`/`h:`/`p:`/`t:`/`k:`/`s:`/`#tags`/
+//!    `c:`; `_sc|name|status` canonical order is `d:`/`h:`/`#tags`/`c:`/`m:` (`m:` always last,
+//!    since it consumes the rest of the line on decode). Nothing else about either shape
+//!    normalizes: a title/text/name/host/aggregation-key/source-type/message survives verbatim
+//!    (including an embedded `|`, which the byte-length prefix -- not a `|` scan -- delimits, so it
+//!    never needs sanitizing out of a title/text at all), and a multi-byte UTF-8 title's `TITLE_LEN`
+//!    is its byte length, not its char count. Exercised by `event-fields-reordered-canonicalized`
+//!    (order only) and, for the "nothing else changes" half,
+//!    `dogstatsd-event-all-fields`/`service-check-all-fields` (every optional field, already
+//!    canonical -- [`SAME_AS_INPUT`]), `event-text-with-pipe-and-escaped-newline`,
+//!    `event-multibyte-title-lengths`, and `event-title-contains-pipe`.
 //!
 //! Everything else -- the raw kinds a lossless relay must carry (`Samples`/`SetMembers`), `|c:`/
-//! `|T` round-tripping under DogStatsD, relative-gauge deltas, and the negative-absolute-gauge
-//! two-line idiom -- is not a normalization at all: it relays byte-for-byte (modulo (3)/(4) above)
-//! because nothing about it needs to change.
+//! `|T` round-tripping under DogStatsD, relative-gauge deltas, the negative-absolute-gauge
+//! two-line idiom, and a DogStatsD event/service check with no reordering to canonicalize -- is not
+//! a normalization at all: it relays byte-for-byte (modulo (3)/(4)/(9) above) because nothing about
+//! it needs to change.
 
 use bytes::Bytes;
 use logit_core::{Event, EventBatch, Value};
 use logit_inputs::statsd::{StatsdDecoder, StatsdInput};
 use logit_outputs::statsd::{Format, StatsdEncoder, StatsdOutput};
+// `MessageBuf` lives in `logit-outputs`'s private `msgbuf` module; `syslog.rs` is the one that
+// re-exports it under a stable public path (`docs/adr/statsd-output.md`'s Consequences section),
+// which is why this is `syslog::MessageBuf`, not `statsd::MessageBuf` -- `crates/logit-bench`
+// names it the same way.
+use logit_outputs::syslog::MessageBuf;
 use logit_pipeline::{Delivered, Fanout, Input, Output};
 use logit_proto::Decoder;
 use logit_transforms::{Aggregator, Distributions, Sets};
@@ -290,6 +325,8 @@ async fn dogstatsd_docs_examples_round_trip_byte_for_byte() {
         "dogstatsd-distribution-tag",
         "dogstatsd-gauge-timestamp",
         "dogstatsd-counter-container-id",
+        "dogstatsd-event",
+        "dogstatsd-service-check",
     ];
     for name in cases {
         assert_byte_for_byte(&mut harness, name, || StatsdEncoder::new(Format::DogStatsd)).await;
@@ -308,6 +345,13 @@ async fn hand_written_dogstatsd_fixtures_round_trip_byte_for_byte() {
         "packed-multi-line-datagram",
         "all-segments-together",
         "multi-tag-preserves-wire-order",
+        "dogstatsd-event-all-fields",
+        "event-text-with-pipe-and-escaped-newline",
+        "event-multibyte-title-lengths",
+        "event-title-contains-pipe",
+        "service-check-all-fields",
+        "service-check-no-message",
+        "packed-datagram-counter-event-service-check",
     ];
     for name in cases {
         assert_byte_for_byte(&mut harness, name, || StatsdEncoder::new(Format::DogStatsd)).await;
@@ -324,6 +368,7 @@ async fn explicit_normalizations_round_trip_byte_for_byte() {
         "sampled-counter-rate-folded",
         "explicit-rate-one-omitted",
         "number-formatting-trailing-zeros",
+        "event-fields-reordered-canonicalized",
     ];
     for name in cases {
         assert_byte_for_byte(&mut harness, name, || StatsdEncoder::new(Format::DogStatsd)).await;
@@ -438,6 +483,31 @@ async fn statsd_dialect_drops_container_id_and_timestamp() {
 async fn statsd_dialect_drops_the_tag_segment_entirely() {
     let mut harness = Harness::new().await;
     assert_dialect_output(&mut harness, "statsd-dialect-drops-tags").await;
+}
+
+/// Module doc (6)'s events/service-checks bullet: neither shape has a `format: statsd` wire form
+/// at all, so the whole event is dropped -- not normalized -- and counted
+/// `EncodeStats::dropped_dialect_events`. This can't go through `Harness`/`assert_dialect_output`
+/// the way every other dialect case above does: a batch that drops to *no* lines never sends a
+/// datagram at all (`StatsdOutput::send` returns early on an empty `MessageBuf`), so
+/// `capture_only`'s `recv_from` would simply time out waiting for one. `StatsdEncoder::encode_into`
+/// is called directly instead -- the same pure, socket-free path `logit_outputs::statsd`'s own unit
+/// tests use -- so both halves of the drop are observable: the rendered `MessageBuf` is empty, and
+/// the returned `EncodeStats` counts it.
+#[tokio::test]
+async fn events_and_service_checks_produce_no_output_and_are_counted_under_plain_statsd() {
+    for fixture in ["dogstatsd-event", "dogstatsd-service-check"] {
+        let raw = read_fixture(fixture, "in");
+        let batch = direct_batch(&raw);
+        let mut encoder = StatsdEncoder::new(Format::Statsd);
+        let mut out = MessageBuf::default();
+        let stats = encoder.encode_into(&batch, usize::MAX, &mut out);
+        assert!(out.is_empty(), "{fixture}: format: statsd should emit no lines for this event");
+        assert_eq!(
+            stats.dropped_dialect_events, 1,
+            "{fixture}: the drop should be counted, not silent"
+        );
+    }
 }
 
 // ---- Sanitizer substitution (module doc (5)) -----------------------------------------------------
@@ -626,4 +696,51 @@ async fn statsd_in_aggregate_statsd_out_relay_keeps_distinct_timestamps_as_disti
     let mut expected = vec!["hits:1|c|T1700000000", "hits:1|c|T1700000100"];
     expected.sort_unstable();
     assert_eq!(lines, expected, "both |T values must survive the flush as separate lines");
+}
+
+// ---- `statsd_in -> aggregate -> statsd_out`, a service check -------------------------------------
+
+/// A service check is a `MetricKind::Gauge`, so `aggregate` absorbs it exactly like an ordinary
+/// gauge ("last write wins" on the series' latest source timestamp,
+/// `docs/adr/aggregation-window-semantics.md`) rather than passing it through unmerged -- there is
+/// only one write here, so the flushed value is unchanged, but the point of this test is that the
+/// flush round trip doesn't lose any of the `statsd.service_check.*` carriers (or `statsd.timestamp`
+/// / `statsd.container_id`) riding on the series key alongside the gauge value: `_sc|name|status`
+/// plus its `d:`/`m:` fields survive a real `aggregate` window exactly, the same guarantee the two
+/// `|T`-carrier tests above pin for an ordinary counter.
+#[tokio::test]
+async fn statsd_in_aggregate_statsd_out_relay_is_exact_for_a_service_check() {
+    let mut harness = Harness::new().await;
+
+    let raw =
+        b"_sc|Redis connection|2|d:1700000000|#env:dev|m:Redis connection timed out after 10s";
+    let batch = harness.send_raw_and_decode(raw).await;
+    assert_eq!(batch.events.len(), 1);
+
+    let mut aggregator = Aggregator::new(Duration::from_secs(10));
+    let resource = batch.resource.clone();
+    let mut forwarded = Vec::new();
+    for event in batch.events {
+        if let Some(event) = aggregator.process(&resource, event) {
+            forwarded.push(event);
+        }
+    }
+    assert!(forwarded.is_empty(), "a Gauge (the service check's own shape) is always absorbed");
+
+    let mut flushed = aggregator.flush(1_800_000_000_000_000_000);
+    assert_eq!(flushed.len(), 1, "one (resource, scope) group");
+    let (flush_resource, flush_scope, events) = flushed.remove(0);
+    let out_batch = EventBatch {
+        resource: flush_resource,
+        scope: flush_scope,
+        events: events.into_iter().map(|(event, _links)| event).collect(),
+    };
+    assert_eq!(out_batch.events.len(), 1, "one flushed event for the one series");
+
+    let captured = harness.capture_only(&out_batch, StatsdEncoder::new(Format::DogStatsd)).await;
+    assert_eq!(
+        std::str::from_utf8(&captured).expect("ascii output"),
+        "_sc|Redis connection|2|d:1700000000|#env:dev|m:Redis connection timed out after 10s",
+        "the _sc line should survive the window exactly, d: and m: included"
+    );
 }

@@ -1,6 +1,12 @@
 //! InfluxDB 2.x line-protocol output -- the output side of the v0.1 vertical slice
 //! (`docs/OVERVIEW.md`), writing to `/api/v2/write` with org/bucket query params and a
 //! `Token` auth header. Matches the `influxdb` service seeded in `compose.yaml` for local testing.
+//!
+//! [`render_tag_suffix`] never emits a `statsd.`-prefixed attribute as a tag -- those are
+//! protocol-namespaced carriers `statsd_in` stamps for `statsd_out`'s own dedicated wire segments
+//! (`statsd.type`/`statsd.container_id`/`statsd.timestamp`/`statsd.event.*`/
+//! `statsd.service_check.*`, rule (b) of `docs/adr/lossless-transit.md`), not ordinary tags --
+//! mirroring `statsd_out`'s identical filter in `crates/logit-outputs/src/statsd.rs`.
 
 use crate::Output;
 use anyhow::Context;
@@ -328,6 +334,16 @@ impl Encoder for InfluxLineEncoder {
 /// one with an embedded newline -- line protocol has no escape for that at all) is dropped
 /// individually rather than escalated to a whole-point error.
 ///
+/// Every attribute whose key starts with `statsd.` is skipped outright, uncounted -- mirroring
+/// `statsd_out`'s own `build_tag_suffix` filter (`crates/logit-outputs/src/statsd.rs`) and its
+/// reasoning: `statsd.type`/`statsd.container_id`/`statsd.timestamp`/`statsd.event.*`/
+/// `statsd.service_check.*` are protocol-namespaced carriers `statsd_in` stamps for its own
+/// dedicated wire segments (rule (b), `docs/adr/lossless-transit.md`), not ordinary tags. Without
+/// this filter, `statsd.service_check.message` or `statsd.event.title` -- either of which can
+/// legitimately be long, free-form text -- would round-trip into InfluxDB as a `,key=value` tag,
+/// which InfluxDB indexes and where a high-cardinality/free-text value is a real cost, not merely
+/// a cosmetic one.
+///
 /// The two attribute maps are **merge-joined** ([`crate::attrs::merged`]) rather than combined by
 /// cloning the resource's map and inserting the event's over the top -- no copy of an `AttrMap`
 /// per event, and no `resolve` -> `intern` round trip that re-inserting every key would cost.
@@ -340,6 +356,9 @@ fn render_tag_suffix(
     suffix.clear();
     for (key, value) in crate::attrs::merged(resource, event) {
         let key = resolve(key);
+        if key.starts_with("statsd.") {
+            continue;
+        }
         let Some(value) = tag_value(scratch, value) else {
             continue;
         };
@@ -909,6 +928,27 @@ mod tests {
         ]);
         assert!(!out.contains("resp.size"), "got: {out}");
         assert!(out.contains("page.views value=1"), "got: {out}");
+    }
+
+    /// `statsd.*` attributes -- `statsd_in`'s protocol-namespaced carriers for `statsd_out`'s own
+    /// wire segments (`statsd.type`/`statsd.container_id`/`statsd.timestamp`/`statsd.event.*`/
+    /// `statsd.service_check.*`) -- must never round-trip into InfluxDB as a tag; a sibling
+    /// ordinary attribute still comes through.
+    #[test]
+    fn statsd_dot_attributes_never_become_tags() {
+        let out = encode(vec![metric_event(
+            "page.views",
+            MetricKind::counter(1.0),
+            &[
+                ("statsd.type", "c"),
+                ("statsd.container_id", "abcd1234"),
+                ("statsd.event.title", "deploy"),
+                ("statsd.service_check.message", "a|b"),
+                ("env", "prod"),
+            ],
+        )]);
+        assert!(!out.contains("statsd"), "got: {out}");
+        assert!(out.contains("env=prod"), "got: {out}");
     }
 
     #[test]

@@ -55,8 +55,8 @@ workstream) is deleted — `aggregate` is now the only place that diagnostic fir
 `statsd.container_id`; `|T<secs>` sets `Event::timestamp` and stamps the per-line
 `statsd.timestamp: Value::U64(secs)` carrier -- the raw wire seconds themselves, not just a marker
 bit, so a stage that rebuilds `Event::timestamp` after decode can't fabricate or collapse a `|T` on
-the way back out; a malformed `|T` rejects only that line. DogStatsD events and service checks
-still fail to parse as ordinary lines (W6). `unit` is still always `None`.
+the way back out; a malformed `|T` rejects only that line. DogStatsD events and service checks now
+decode and re-encode losslessly too (W6, below). `unit` is still always `None`.
 
 Encode (`crates/logit-outputs/src/statsd.rs`): `Samples` renders as one multi-value
 `name:v1:v2|<type>|@rate` line under `format: dogstatsd` (`<type>` from `statsd.type`, defaulting
@@ -88,6 +88,29 @@ decision for timers and `|T`-marked lines. `crates/logit-outputs/src/statsd.rs` 
 segments, plus a `proptest` fixed point (`mod fixed_point::decode_encode_decode_is_a_fixed_point`);
 `crates/logit-cli/tests/statsd_round_trip.rs` (mirroring `syslog_round_trip.rs`'s real-UDP-socket
 harness) extends the same coverage end to end through real sockets.
+
+### DogStatsD events and service checks (W6, landed)
+
+Decode: `_e{tlen,xlen}:title|text|...` and `_sc|name|status|...` lines -- previously rejected
+outright as malformed (any `_`-prefixed line fell into the generic "unknown metric type" error) --
+now decode to one `Event::log` (an event: `message` is `TEXT` with its `\n` escape unescaped,
+`severity` from `t:`, `body_format: Raw`, `event_name: None` on purpose, since a title is free
+text an operator chose at send time, not a bounded vocabulary worth interning) or one
+`Event::metric` (a service check: `MetricKind::Gauge(status as f64)` under the check's own
+interned name), respectively. Every field either grammar carries lands as a `statsd.event.*`/
+`statsd.service_check.*` attribute (rule (b), `docs/adr/lossless-transit.md`) rather than a model
+field, alongside the same `statsd.timestamp`/`statsd.container_id`/`#tags` handling every metric
+line already gets -- `d:<secs>` (not `|T<secs>`) plays the timestamp segment's role on these two
+shapes. Encode: `statsd_out` re-emits both in one fixed canonical field order regardless of the
+order they arrived in, `d:` from the `statsd.timestamp` carrier (never derived from
+`Event::timestamp`), and drops the whole event under `format: statsd` (no `_e`/`_sc` wire form
+there at all, counted `dropped_dialect_events`). A service check is read off the event's first
+metric, which must be a `Gauge` or the whole event drops (`dropped_invalid_service_check`); an
+out-of-set `p:`/`t:` value omits just that one field, counted separately
+(`dropped_invalid_event_fields`) since the rest of the line still renders. See
+`docs/adr/statsd-output.md`'s "DogStatsD events and service checks" amendment for the full field
+order, carrier list, and sanitization rules, and its closing test enumeration for the coverage
+landed on both the decode and encode sides plus `crates/logit-cli/tests/statsd_round_trip.rs`.
 
 ### otlp_in -> otlp_out
 
@@ -469,7 +492,7 @@ metric-kind fields, not just presence.
 | W3 | **Landed.** statsd pair: `Samples`/`SetMembers` in and out (`statsd_in`'s own `MAX_SAMPLE_WEIGHT`/`sample_rate_clamped` copy, kept alive since W2, deleted), `|c:`/`|T` both ways (dogstatsd only on egress), sample-rate carried verbatim on timers with no decode-time extrapolation, `statsd_round_trip.rs` plus a `proptest` fixed point, updated `allocations.rs` cases; amends `statsd-output` (v1 deferral narrowed to post-sketch kinds; "no sample rate/timestamp" reversed for timers/`|T`) | M | W1, W2 |
 | W4 | **Landed.** OTLP pair: start_time, description, exemplars, `NO_RECORDED_VALUE` round-tripped as a flagged point, batch-level scope grouping + `schema_url`, `event_name`, `observed_timestamp`, dropped-attribute counts, span fields, `otel.severity_*`; `otlp_round_trip.rs` rewritten to per-field assertions; new pure-codec `crates/logit-proto/tests/otlp_fixed_point.rs` plus a `proptest`-based `decode(encode(x)) == x` suite in `otlp/metrics.rs`; `internal` stamps a real `Scope` (`crates/logit-inputs/src/internal.rs`) now that `otlp_out` no longer invents one. New `MetricRecord.flags: u32`/`MR_FLAGS` native tag amends `metrics-model-v2`. (`Sum`/temporality/monotonic, `ExponentialHistogram`'s 1:1 mapping, and histogram sum/min/max + summary count/sum were pulled forward into W1 — see its "W1 outcome" note above.) | L | W1 |
 | W5 | **Landed.** syslog pair: structured-data parse and emit, timestamp precedence and the nil case, `Value::Bytes` MSG, `Value::Str` PROCID, opt-in PEN-qualified structured-data element; `crates/logit-cli/tests/syslog_round_trip.rs` over real UDP sockets with a fixture corpus plus a `proptest` fixed point; new ADR `syslog-structured-data-convention`; amends `syslog-output` | M | W0 (parallel with W1) |
-| W6 | DogStatsD events and service checks, in and out | S | W3 |
+| W6 | **Landed.** DogStatsD events and service checks, in and out: `_e{...}`/`_sc\|...` decode to `Event::log`/`Event::metric` (`event_name: None` deliberately), `statsd.event.*`/`statsd.service_check.*` carriers, canonical field order and `d:` (not `\|T`) on egress, `format: statsd` whole-event drop, first-metric-is-the-check rule; amends `statsd-output` | S | W3 |
 | W7 | Expose the new fields through the Lua proxy (`docs/design/lua-api.md`) — otherwise the model is lossless but the scripting surface can't see any of it | M | W1 |
 | W8 | Closeout: rewrite or remove the `docs/known-gaps.md` entries each workstream closes, rewrite `docs/design/data-model.md`'s metric-kinds section for the new shapes, update `AGENTS.md`'s current-state paragraph | S | all |
 

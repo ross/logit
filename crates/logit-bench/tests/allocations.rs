@@ -185,6 +185,61 @@ fn statsd_decode_one_set_line() {
     expect_allocs("statsd_in: decode 1 set line", stats, 3);
 }
 
+/// A DogStatsD event (`_e{tlen,xlen}:title|text|...`) whose `TEXT` has no `\n` escape to unescape
+/// -- `parse_event`'s `unescape_event_text` takes its zero-copy path (a `slice_of`-backed slice of
+/// the datagram, same as `statsd.event.title` and every other string-valued attribute this decoder
+/// stamps), so this costs nothing beyond the per-line/per-batch `Vec<Event>` pair
+/// [`statsd_decode_one_line`] already pins -- same count, same reasoning, just a different line
+/// shape.
+#[test]
+fn statsd_decode_one_event_line() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_event_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    assert!(batch.events[0].log.is_some(), "expected a log-only event");
+    expect_allocs("statsd_in: decode 1 event line", stats, 2);
+}
+
+/// The one case `unescape_event_text` can't slice: `TEXT` contains a `\n` (backslash, `n`)
+/// two-byte escape, so the decoded message needs a real newline byte the wire text doesn't have.
+/// **One** extra allocation beyond [`statsd_decode_one_event_line`]'s zero-copy baseline: the
+/// decoded length is known up front (each two-byte escape becomes one byte), so
+/// `unescape_event_text` sizes its `Vec` exactly and `bytes::Bytes::from(Vec<u8>)` takes its
+/// `len == capacity` promotion path -- no realloc while unescaping, and no second, eager
+/// `Shared`-control-block allocation of the kind a slack-capacity `String::replace` result would
+/// cost (compare [`logfmt_parse_escaped_value_event`], which `shrink_to_fit`s for the same reason).
+#[test]
+fn statsd_decode_one_event_line_with_an_escaped_newline() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_event_with_escaped_newline_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    let message = batch.events[0].log.as_ref().unwrap().message.as_str().expect("str message");
+    assert!(message.contains('\n'), "the escape should have become a real newline");
+    expect_allocs("statsd_in: decode 1 event line with an escaped newline", stats, 3);
+}
+
+/// A DogStatsD service check (`_sc|name|status|...`) -- decodes to one `MetricKind::Gauge` event
+/// carrying the `statsd.service_check.*` carriers as zero-copy datagram slices, same shape as an
+/// ordinary metric line: no allocation beyond the per-line/per-batch `Vec<Event>` pair
+/// [`statsd_decode_one_line`] already pins.
+#[test]
+fn statsd_decode_one_service_check_line() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_service_check_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.events[0].metrics.len(), 1, "expected one Gauge metric");
+    expect_allocs("statsd_in: decode 1 service check line", stats, 2);
+}
+
 /// The logs-only workload `docs/design/memory.md` §0 names as unmeasured: a plain-text syslog
 /// line with no JSON body anywhere in the pipeline (`fixtures::SSHD_SYSLOG_LINE`). Same zero-copy
 /// decode as [`syslog_decode_one_line`] -- one allocation for the `Vec<Event>`, nothing per

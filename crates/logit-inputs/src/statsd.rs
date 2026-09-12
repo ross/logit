@@ -58,9 +58,52 @@
 //! `Event::timestamp` at flush time; the carrier attribute is what survives that rebuild
 //! unchanged). Both attributes are rule-(b) protocol-namespaced carriers
 //! (`docs/adr/lossless-transit.md`) for a concept this model has no normalized field for at all.
-//! Every other unrecognized `|` segment (DogStatsD events/service checks use different leading
-//! sigils entirely) is accepted and silently ignored -- forward-compatible with segment kinds
-//! this decoder doesn't know about yet, rather than a hard error on something benign.
+//! Every other unrecognized `|` segment is accepted and silently ignored -- forward-compatible
+//! with segment kinds this decoder doesn't know about yet, rather than a hard error on something
+//! benign.
+//!
+//! ## DogStatsD events and service checks
+//!
+//! Two more line shapes, picked out by their leading sigil rather than the `<name>:<value>|<type>`
+//! grammar above at all: `_e{...}:...` (an **event**) and `_sc|...` (a **service check**). Any
+//! other line starting with `_` is rejected outright as malformed, rather than falling into the
+//! generic "unknown metric type" path.
+//!
+//! **Event** -- `_e{<TITLE_LEN>,<TEXT_LEN>}:<TITLE>|<TEXT>|d:<secs>|h:<hostname>|p:<normal|low>|
+//! t:<info|success|warning|error>|k:<aggregation_key>|s:<source_type_name>|#<tags>|
+//! c:<container_id>`. `TITLE_LEN`/`TEXT_LEN` are the exact *byte* lengths of `TITLE`/`TEXT` as they
+//! sit on the wire and are authoritative for splitting -- not naive `|`-splitting, since `TEXT` may
+//! itself contain `|` and `:` -- so a length that runs past the line, a missing `|` right after the
+//! title, a length that lands mid-UTF-8-char (checked via `str::get`, never an indexing panic that
+//! could), or a malformed `{a,b}` header rejects the line. Decodes to one [`Event::log`]: `message`
+//! is `TEXT` with its `\n` (backslash, `n`) two-byte escape unescaped to a real newline (zero-copy
+//! when there's nothing to unescape, same stance as everywhere else in this module); `severity`
+//! maps `t:error`/`t:warning`/`t:success`/`t:info` to `Error`/`Warn`/`Info`/`Info`, `None` when
+//! `t:` is absent, and an unrecognized `t:`/`p:` value rejects the line. `event_name` stays `None`
+//! on purpose: an event title is free text an operator or their application chose at send time, not
+//! a fixed, bounded vocabulary the way a metric or tag name is -- interning it would grow the
+//! global interner without bound. Attributes (all `Value::Str`, zero-copy slices of the datagram
+//! where possible): `statsd.event.title` (always), `statsd.event.priority` (`p:`, only if
+//! present, raw `normal`/`low`), `statsd.event.alert_type` (`t:`, only if present, raw value),
+//! `statsd.event.aggregation_key` (`k:`), `statsd.event.source_type` (`s:`),
+//! `statsd.event.host` (`h:`), plus the same `statsd.timestamp`/`statsd.container_id`/`#tags`
+//! handling as metric lines below -- `d:<secs>` plays `|T<secs>`'s role here: the same
+//! checked-seconds-to-nanoseconds parse, setting both the event's own timestamp and the
+//! `statsd.timestamp` carrier. `|T` itself is not part of this grammar; like any other unrecognized
+//! field here, it's accepted and ignored, the same forward-compatible stance metric lines take
+//! toward an unrecognized `|` segment.
+//!
+//! **Service check** -- `_sc|<NAME>|<STATUS>|d:<secs>|h:<hostname>|#<tags>|c:<container_id>|
+//! m:<message>`. `NAME` must be non-empty; `STATUS` an integer `0..=3` (OK/WARNING/CRITICAL/
+//! UNKNOWN) -- anything else rejects the line. `m:`, when present, is always the *last* field and
+//! consumes the rest of the line verbatim, so a message may itself contain `|`; every other field
+//! may come in any order before it. Decodes to one [`Event::metric`], `MetricKind::Gauge(status as
+//! f64)` under the check's own name (`intern`ed, like a metric name). Attributes:
+//! `statsd.service_check.name` (always, `Value::Str` -- the raw carrier, rule (b): a service
+//! check's name has nowhere else on `MetricRecord` to land), `statsd.service_check.status`
+//! (always, `Value::U64`), `statsd.service_check.message` (`m:`, only if present, verbatim
+//! including any `|`), `statsd.service_check.host` (`h:`, only if present), plus the same
+//! `statsd.timestamp`/`statsd.container_id`/`#tags` handling as events and metric lines.
 //!
 //! **DogStatsD tag values, `|c:<id>`, and `s`'s set members are all zero-copy slices of the
 //! datagram**, exactly like every field [`crate::syslog`] extracts: `slice_of` reconstructs each
@@ -74,8 +117,8 @@ use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use bytes::Bytes;
 use logit_core::{
-    interner::intern, AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, Samples,
-    Scope, Telemetry, Value,
+    interner::intern, AttrMap, BodyFormat, Diagnostics, Event, LogRecord, MetricKind, MetricRecord,
+    Resource, Samples, Scope, Severity, Telemetry, Value,
 };
 use logit_pipeline::Fanout;
 use logit_proto::{CodecError, Decoder};
@@ -235,6 +278,48 @@ fn slice_of(bytes: &Bytes, text: &str, sub: &str) -> Bytes {
     bytes.slice(start..start + sub.len())
 }
 
+/// Parses a comma-separated `#<tag>[:<value>],...` segment (the text after the `#`, for a metric
+/// line, an event, or a service check alike) and inserts each tag into `attributes`. A `key:value`
+/// tag's value is a zero-copy [`slice_of`] `text`/`bytes`; a valueless tag (`#urgent`) marks
+/// presence as `Value::Bool(true)` instead, since there's nothing to slice. Shared verbatim across
+/// every line shape that carries `#tags` -- factored out of `parse_line`'s original inline loop
+/// once events and service checks needed the identical behaviour.
+fn insert_tags(attributes: &mut AttrMap, bytes: &Bytes, text: &str, tags: &str) {
+    for tag in tags.split(',').filter(|t| !t.is_empty()) {
+        match tag.split_once(':') {
+            // `v` is a genuine `&str` slice of `text`, so `slice_of` shares the datagram's
+            // allocation instead of `Value::from(&str)`'s `Bytes::from(String)` copy.
+            Some((k, v)) => attributes.insert(k, Value::Str(slice_of(bytes, text, v))),
+            None => attributes.insert(tag, true),
+        }
+    }
+}
+
+/// Stamps `statsd.container_id` (rule (b), `docs/adr/lossless-transit.md`: a protocol-namespaced
+/// carrier for a concept this model has no normalized field for) as a zero-copy datagram slice.
+/// Shared by metric lines' `|c:`, events' `c:`, and service checks' `c:` alike.
+fn insert_container_id(attributes: &mut AttrMap, bytes: &Bytes, text: &str, container_id: &str) {
+    attributes.insert("statsd.container_id", Value::Str(slice_of(bytes, text, container_id)));
+}
+
+/// Parses a `|T<unix-seconds>`/`d:<unix-seconds>` value shared by metric lines, events, and
+/// service checks alike: a non-digit or a value whose seconds-to-nanoseconds conversion overflows
+/// `i64` rejects only the line it's on, per `docs/adr/lossless-transit.md`'s per-line isolation
+/// stance, rather than silently falling back to receipt time. Returns `(nanos, secs)` -- `nanos`
+/// for `Event::timestamp`, `secs` (the raw parsed wire value, not just a marker bit) for the
+/// `statsd.timestamp` carrier every caller also stamps, so a stage downstream that rebuilds
+/// `Event::timestamp` (`aggregate`'s flush, notably) can't fabricate a wire timestamp that was
+/// never sent.
+fn parse_wire_seconds(secs: &str, line: &str) -> Result<(i64, u64), CodecError> {
+    let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
+    let secs: u64 = secs.parse().map_err(|_| malformed())?;
+    let nanos = secs
+        .checked_mul(1_000_000_000)
+        .and_then(|n| i64::try_from(n).ok())
+        .ok_or_else(malformed)?;
+    Ok((nanos, secs))
+}
+
 /// `bytes`/`text` are the *whole datagram* -- the same `Bytes` (and its `&str` view) passed into
 /// [`StatsdDecoder::decode`] -- threaded down so [`slice_of`] can reconstruct each tag value as a
 /// zero-copy slice of it. `line` is one line of that datagram (already isolated by `decode`, and
@@ -245,6 +330,21 @@ fn parse_line(
     line: &str,
     timestamp: i64,
 ) -> Result<Vec<Event>, CodecError> {
+    // DogStatsD events and service checks are picked out by their leading sigil, before any of
+    // the `<name>:<value>|<type>` grammar below applies at all -- see the module doc's "DogStatsD
+    // events and service checks" section.
+    if line.starts_with('_') {
+        if line.starts_with("_e{") {
+            return parse_event(bytes, text, line, timestamp).map(|event| vec![event]);
+        }
+        if line.starts_with("_sc|") {
+            return parse_service_check(bytes, text, line, timestamp).map(|event| vec![event]);
+        }
+        return Err(CodecError::Malformed(format!(
+            "unknown dogstatsd special line (expected '_e{{' or '_sc|'): {line:?}"
+        )));
+    }
+
     let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
 
     let (name, rest) = line.split_once(':').ok_or_else(malformed)?;
@@ -273,17 +373,7 @@ fn parse_line(
             }
             sample_rate = parsed;
         } else if let Some(tags) = extra.strip_prefix('#') {
-            for tag in tags.split(',').filter(|t| !t.is_empty()) {
-                match tag.split_once(':') {
-                    // `v` is a genuine `&str` slice of `text` (`split_once` on `tags`, itself
-                    // sliced out of `line`/`text`), so `slice_of` shares the datagram's
-                    // allocation instead of `Value::from(&str)`'s `Bytes::from(String)` copy.
-                    Some((k, v)) => attributes.insert(k, Value::Str(slice_of(bytes, text, v))),
-                    // A valueless tag (`#urgent`) marks presence, not a key/value pair -- not a
-                    // string value, so there's nothing to slice.
-                    None => attributes.insert(tag, true),
-                }
-            }
+            insert_tags(&mut attributes, bytes, text, tags);
         } else if let Some(container_id) = extra.strip_prefix("c:") {
             // DogStatsD container id (`|c:<id>`, v1.2+; v1.4+'s `ci-`/`in-`-prefixed variants
             // land in the same slot verbatim -- this decoder carries whatever follows `c:`
@@ -291,18 +381,13 @@ fn parse_line(
             // type here, not only `c`/`g` as the spec restricts it to -- see the module doc's
             // forward-compatibility note. Rule (b) (`docs/adr/lossless-transit.md`): a
             // protocol-namespaced carrier for a concept this model has no normalized field for.
-            attributes
-                .insert("statsd.container_id", Value::Str(slice_of(bytes, text, container_id)));
+            insert_container_id(&mut attributes, bytes, text, container_id);
         } else if let Some(secs) = extra.strip_prefix('T') {
             // DogStatsD point timestamp (`|T<unix-seconds>`, v1.3+, spec-restricted to `c`/`g`
             // but accepted here on every type -- see the module doc). A non-digit or
             // seconds-to-nanoseconds-overflowing value rejects only this line, rather than
             // silently falling back to receipt time.
-            let secs: u64 = secs.parse().map_err(|_| malformed())?;
-            let nanos = secs
-                .checked_mul(1_000_000_000)
-                .and_then(|n| i64::try_from(n).ok())
-                .ok_or_else(malformed)?;
+            let (nanos, secs) = parse_wire_seconds(secs, line)?;
             line_timestamp = nanos;
             // The carrier holds the parsed wire value itself, not just a marker bit -- so a
             // stage downstream that rebuilds `Event::timestamp` (`aggregate`'s flush, notably)
@@ -310,9 +395,11 @@ fn parse_line(
             // directly rather than trusting `event.timestamp`.
             attributes.insert("statsd.timestamp", Value::U64(secs));
         }
-        // Anything else (DogStatsD events/service checks use different leading sigils entirely)
-        // is accepted and ignored -- forward-compatible with segment kinds this decoder doesn't
-        // know about yet, rather than a hard error on something benign.
+        // Anything else is accepted and ignored -- forward-compatible with segment kinds this
+        // decoder doesn't know about yet, rather than a hard error on something benign.
+        // (DogStatsD events and service checks are dispatched to their own parsers above, via
+        // the `_e{`/`_sc|` leading sigils, before this per-segment loop is ever reached for
+        // those lines.)
     }
 
     match type_part {
@@ -366,6 +453,198 @@ fn parse_line(
         }
         other => Err(CodecError::Malformed(format!("unknown metric type '{other}': {line:?}"))),
     }
+}
+
+/// Parses a DogStatsD event line (`_e{<TITLE_LEN>,<TEXT_LEN>}:<TITLE>|<TEXT>|...`) -- see the
+/// module doc's "DogStatsD events and service checks" section for the full grammar and decoded
+/// shape. `line` is already known to start with `"_e{"` (checked by `parse_line`'s dispatch).
+fn parse_event(bytes: &Bytes, text: &str, line: &str, timestamp: i64) -> Result<Event, CodecError> {
+    let malformed = || CodecError::Malformed(format!("malformed dogstatsd event: {line:?}"));
+
+    let header_rest = line.strip_prefix("_e{").ok_or_else(malformed)?;
+    let (header, after_header) = header_rest.split_once('}').ok_or_else(malformed)?;
+    let (title_len, text_len) = header.split_once(',').ok_or_else(malformed)?;
+    let title_len: usize = title_len.parse().map_err(|_| malformed())?;
+    let text_len: usize = text_len.parse().map_err(|_| malformed())?;
+    let after_header = after_header.strip_prefix(':').ok_or_else(malformed)?;
+
+    // `TITLE_LEN`/`TEXT_LEN` are authoritative, *byte* lengths -- not naive `|`-splitting, since
+    // `TEXT` may itself contain `|`/`:`. `str::get` on a byte range returns `None` for both an
+    // out-of-bounds length and one that doesn't land on a UTF-8 char boundary, so this rejects
+    // both cases without ever indexing in a way that could panic.
+    let title = after_header.get(..title_len).ok_or_else(malformed)?;
+    let after_title = after_header[title_len..].strip_prefix('|').ok_or_else(malformed)?;
+    let raw_text = after_title.get(..text_len).ok_or_else(malformed)?;
+    let after_text = &after_title[text_len..];
+
+    let mut attributes = AttrMap::new();
+    attributes.insert("statsd.event.title", Value::Str(slice_of(bytes, text, title)));
+
+    let mut line_timestamp = timestamp;
+    let mut severity = None;
+
+    if !after_text.is_empty() {
+        let fields = after_text.strip_prefix('|').ok_or_else(malformed)?;
+        for field in fields.split('|') {
+            if let Some(tags) = field.strip_prefix('#') {
+                insert_tags(&mut attributes, bytes, text, tags);
+            } else if let Some(container_id) = field.strip_prefix("c:") {
+                insert_container_id(&mut attributes, bytes, text, container_id);
+            } else if let Some(secs) = field.strip_prefix("d:") {
+                let (nanos, secs) = parse_wire_seconds(secs, line)?;
+                line_timestamp = nanos;
+                attributes.insert("statsd.timestamp", Value::U64(secs));
+            } else if let Some(host) = field.strip_prefix("h:") {
+                attributes.insert("statsd.event.host", Value::Str(slice_of(bytes, text, host)));
+            } else if let Some(priority) = field.strip_prefix("p:") {
+                if priority != "normal" && priority != "low" {
+                    return Err(malformed());
+                }
+                attributes
+                    .insert("statsd.event.priority", Value::Str(slice_of(bytes, text, priority)));
+            } else if let Some(alert_type) = field.strip_prefix("t:") {
+                severity = Some(match alert_type {
+                    "error" => Severity::Error,
+                    "warning" => Severity::Warn,
+                    "success" | "info" => Severity::Info,
+                    _ => return Err(malformed()),
+                });
+                attributes.insert(
+                    "statsd.event.alert_type",
+                    Value::Str(slice_of(bytes, text, alert_type)),
+                );
+            } else if let Some(key) = field.strip_prefix("k:") {
+                attributes
+                    .insert("statsd.event.aggregation_key", Value::Str(slice_of(bytes, text, key)));
+            } else if let Some(source) = field.strip_prefix("s:") {
+                attributes
+                    .insert("statsd.event.source_type", Value::Str(slice_of(bytes, text, source)));
+            }
+            // Anything else (including `|T`, which is not part of this grammar) is accepted and
+            // ignored -- same forward-compatible stance as an unrecognized segment on a metric
+            // line.
+        }
+    }
+
+    Ok(Event::log(
+        line_timestamp,
+        attributes,
+        LogRecord {
+            message: unescape_event_text(bytes, text, raw_text),
+            severity,
+            body_format: BodyFormat::Raw,
+            trace: None,
+            // Deliberately `None`, not `intern`ed: an event title is free text an operator or
+            // their application chose at send time, not a fixed, bounded vocabulary the way a
+            // metric/tag name is -- interning every one would grow the global interner without
+            // bound.
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        },
+    ))
+}
+
+/// The wire `TEXT` of a DogStatsD event, unescaped: DogStatsD's own `\n` (backslash, `n`)
+/// two-byte escape means a real newline in the decoded message. Zero-copy (a [`slice_of`] the
+/// datagram) in the common case where there's nothing to unescape; only allocates when `raw`
+/// actually contains the escape sequence -- and then exactly once: the output length is known up
+/// front (every two-byte escape shrinks to one byte), so the buffer is sized exactly and
+/// `Bytes::from(Vec)` takes its no-copy `len == capacity` path instead of paying a second
+/// allocation for a slack-capacity `String::replace` result. The title is never unescaped --
+/// only `TEXT`.
+fn unescape_event_text(bytes: &Bytes, text: &str, raw: &str) -> Value {
+    let escapes = raw.matches("\\n").count();
+    if escapes == 0 {
+        return Value::Str(slice_of(bytes, text, raw));
+    }
+    let mut out = Vec::with_capacity(raw.len() - escapes);
+    let mut rest = raw;
+    while let Some(at) = rest.find("\\n") {
+        out.extend_from_slice(&rest.as_bytes()[..at]);
+        out.push(b'\n');
+        rest = &rest[at + 2..];
+    }
+    out.extend_from_slice(rest.as_bytes());
+    debug_assert_eq!(out.len(), out.capacity());
+    Value::Str(Bytes::from(out))
+}
+
+/// Parses a DogStatsD service check line (`_sc|<NAME>|<STATUS>|...`) -- see the module doc's
+/// "DogStatsD events and service checks" section for the full grammar and decoded shape. `line`
+/// is already known to start with `"_sc|"` (checked by `parse_line`'s dispatch).
+fn parse_service_check(
+    bytes: &Bytes,
+    text: &str,
+    line: &str,
+    timestamp: i64,
+) -> Result<Event, CodecError> {
+    let malformed =
+        || CodecError::Malformed(format!("malformed dogstatsd service check: {line:?}"));
+
+    let rest = line.strip_prefix("_sc|").ok_or_else(malformed)?;
+    // `m:`, when present, is always the *last* field and consumes the rest of the line verbatim
+    // (a message may itself contain `|`) -- so this only ever needs to split the line into at
+    // most three pieces: NAME, STATUS, and "everything else" (handled field-by-field below).
+    let mut parts = rest.splitn(3, '|');
+    let name = parts.next().ok_or_else(malformed)?;
+    if name.is_empty() {
+        return Err(malformed());
+    }
+    let status: u8 = parts.next().ok_or_else(malformed)?.parse().map_err(|_| malformed())?;
+    if status > 3 {
+        return Err(malformed());
+    }
+
+    let mut attributes = AttrMap::new();
+    // Rule (b) (`docs/adr/lossless-transit.md`): the raw carrier -- `MetricRecord` has nowhere
+    // else for a service check's name to land, so it's stamped unconditionally, not just on
+    // mismatch.
+    attributes.insert("statsd.service_check.name", Value::Str(slice_of(bytes, text, name)));
+    attributes.insert("statsd.service_check.status", Value::U64(status as u64));
+
+    let mut line_timestamp = timestamp;
+
+    if let Some(mut cursor) = parts.next() {
+        loop {
+            if let Some(message) = cursor.strip_prefix("m:") {
+                attributes.insert(
+                    "statsd.service_check.message",
+                    Value::Str(slice_of(bytes, text, message)),
+                );
+                break;
+            }
+            let (field, rest) = match cursor.split_once('|') {
+                Some((field, rest)) => (field, Some(rest)),
+                None => (cursor, None),
+            };
+            if let Some(tags) = field.strip_prefix('#') {
+                insert_tags(&mut attributes, bytes, text, tags);
+            } else if let Some(container_id) = field.strip_prefix("c:") {
+                insert_container_id(&mut attributes, bytes, text, container_id);
+            } else if let Some(secs) = field.strip_prefix("d:") {
+                let (nanos, secs) = parse_wire_seconds(secs, line)?;
+                line_timestamp = nanos;
+                attributes.insert("statsd.timestamp", Value::U64(secs));
+            } else if let Some(host) = field.strip_prefix("h:") {
+                attributes
+                    .insert("statsd.service_check.host", Value::Str(slice_of(bytes, text, host)));
+            }
+            // Anything else (including `|T`) is accepted and ignored, same forward-compatible
+            // stance as everywhere else in this decoder.
+
+            match rest {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+    }
+
+    Ok(Event::metric(
+        line_timestamp,
+        attributes,
+        MetricRecord::new(intern(name), MetricKind::Gauge(status as f64)),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -949,6 +1228,226 @@ mod tests {
                 other => panic!("expected Samples, got {other:?}"),
             }
         }
+    }
+
+    /// Companion to `only_metric`/`only_metric_event`: asserts an event batch decoded to exactly
+    /// one log-only `Event` (no metrics, no span) and hands it back whole, so a test can inspect
+    /// its attributes and timestamp alongside the log record.
+    fn only_log_event(events: Vec<Event>) -> Event {
+        assert_eq!(events.len(), 1, "expected exactly one event");
+        let event = events.into_iter().next().unwrap();
+        assert!(
+            event.metrics.is_empty() && event.span.is_none(),
+            "expected a log-only event, got {event:?}"
+        );
+        assert!(event.log.is_some(), "expected a log body");
+        event
+    }
+
+    /// The DogStatsD docs' own canonical event example.
+    #[test]
+    fn dogstatsd_docs_example_event_decodes() {
+        let events = decode(
+            "_e{21,36}:An exception occurred|Cannot parse CSV file from 10.0.0.17|t:warning|#err_type:bad_file",
+        );
+        let event = only_log_event(events);
+        let log = event.log.as_ref().unwrap();
+        assert_eq!(log.message.as_str(), Some("Cannot parse CSV file from 10.0.0.17"));
+        assert_eq!(log.severity, Some(Severity::Warn));
+        assert_eq!(log.body_format, BodyFormat::Raw);
+        assert_eq!(log.event_name, None);
+        assert_eq!(
+            event.attributes.get("statsd.event.title").and_then(|v| v.as_str()),
+            Some("An exception occurred")
+        );
+        assert_eq!(
+            event.attributes.get("statsd.event.alert_type").and_then(|v| v.as_str()),
+            Some("warning")
+        );
+        assert_eq!(event.attributes.get("err_type").and_then(|v| v.as_str()), Some("bad_file"));
+    }
+
+    /// The DogStatsD docs' own canonical service check example.
+    #[test]
+    fn dogstatsd_docs_example_service_check_decodes() {
+        let events =
+            decode("_sc|Redis connection|2|#env:dev|m:Redis connection timed out after 10s");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert!(event.log.is_none() && event.span.is_none());
+        assert_eq!(event.metrics.len(), 1);
+        assert_eq!(intern("Redis connection"), event.metrics[0].name);
+        assert!(matches!(event.metrics[0].kind, MetricKind::Gauge(v) if v == 2.0));
+        assert_eq!(
+            event.attributes.get("statsd.service_check.name").and_then(|v| v.as_str()),
+            Some("Redis connection")
+        );
+        assert_eq!(event.attributes.get("statsd.service_check.status"), Some(&Value::U64(2)));
+        assert_eq!(
+            event.attributes.get("statsd.service_check.message").and_then(|v| v.as_str()),
+            Some("Redis connection timed out after 10s")
+        );
+        assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("dev"));
+    }
+
+    #[test]
+    fn event_with_every_optional_field_decodes() {
+        let events =
+            decode("_e{5,4}:title|text|d:1700000000|h:host1|p:low|t:success|k:agg1|s:src1|#env:prod|c:cid1");
+        let event = only_log_event(events);
+        assert_eq!(event.timestamp, 1_700_000_000 * 1_000_000_000);
+        let log = event.log.as_ref().unwrap();
+        assert_eq!(log.message.as_str(), Some("text"));
+        // `t:success` maps to `Severity::Info`, same as `t:info`.
+        assert_eq!(log.severity, Some(Severity::Info));
+        assert_eq!(
+            event.attributes.get("statsd.event.title").and_then(|v| v.as_str()),
+            Some("title")
+        );
+        assert_eq!(
+            event.attributes.get("statsd.event.priority").and_then(|v| v.as_str()),
+            Some("low")
+        );
+        assert_eq!(
+            event.attributes.get("statsd.event.alert_type").and_then(|v| v.as_str()),
+            Some("success")
+        );
+        assert_eq!(
+            event.attributes.get("statsd.event.aggregation_key").and_then(|v| v.as_str()),
+            Some("agg1")
+        );
+        assert_eq!(
+            event.attributes.get("statsd.event.source_type").and_then(|v| v.as_str()),
+            Some("src1")
+        );
+        assert_eq!(
+            event.attributes.get("statsd.event.host").and_then(|v| v.as_str()),
+            Some("host1")
+        );
+        assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+        assert_eq!(
+            event.attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+            Some("cid1")
+        );
+        assert_eq!(event.attributes.get("statsd.timestamp"), Some(&Value::U64(1_700_000_000)));
+    }
+
+    /// TEXT may itself contain `|` and `:` (only the byte length decides where it ends), and its
+    /// `\n` (backslash, `n`) escape unescapes to a real newline; the title is never unescaped.
+    #[test]
+    fn event_text_containing_pipe_colon_and_an_escaped_newline_decodes() {
+        // Wire bytes: `a|b:c\nd` where `\n` is the two-byte escape sequence -- 8 bytes total.
+        let events = decode("_e{1,8}:T|a|b:c\\nd");
+        let event = only_log_event(events);
+        let message = event.log.as_ref().unwrap().message.as_str().expect("message should be str");
+        assert_eq!(message, "a|b:c\nd", "the escape sequence should become a real newline");
+        assert!(message.contains('\n'), "expected a real newline byte in the decoded message");
+    }
+
+    #[test]
+    fn event_title_length_running_past_the_line_is_rejected() {
+        assert!(matches!(parse_err("_e{100,4}:title|text"), CodecError::Malformed(_)));
+    }
+
+    #[test]
+    fn event_missing_pipe_after_title_is_rejected() {
+        // TITLE_LEN=5 correctly covers "title", but nothing separates it from "text".
+        assert!(matches!(parse_err("_e{5,4}:titletext"), CodecError::Malformed(_)));
+    }
+
+    #[test]
+    fn event_title_length_landing_mid_char_boundary_is_rejected() {
+        // 'é' is 2 UTF-8 bytes; TITLE_LEN=1 lands inside it, not on a char boundary.
+        assert!(matches!(parse_err("_e{1,4}:\u{e9}|text"), CodecError::Malformed(_)));
+    }
+
+    #[test]
+    fn event_unknown_priority_or_alert_type_is_rejected() {
+        assert!(matches!(parse_err("_e{5,4}:title|text|p:bogus"), CodecError::Malformed(_)));
+        assert!(matches!(parse_err("_e{5,4}:title|text|t:bogus"), CodecError::Malformed(_)));
+    }
+
+    #[test]
+    fn event_d_field_sets_the_timestamp_and_the_carrier() {
+        let events = decode("_e{5,4}:title|text|d:1700000000");
+        let event = only_log_event(events);
+        assert_eq!(event.timestamp, 1_700_000_000 * 1_000_000_000);
+        assert_eq!(event.attributes.get("statsd.timestamp"), Some(&Value::U64(1_700_000_000)));
+    }
+
+    #[test]
+    fn event_container_id_becomes_an_attribute() {
+        let events = decode("_e{5,4}:title|text|c:cid1");
+        let event = only_log_event(events);
+        assert_eq!(
+            event.attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+            Some("cid1")
+        );
+    }
+
+    #[test]
+    fn service_check_d_field_sets_the_timestamp_and_the_carrier() {
+        let events = decode("_sc|check|0|d:1700000000");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.timestamp, 1_700_000_000 * 1_000_000_000);
+        assert_eq!(event.attributes.get("statsd.timestamp"), Some(&Value::U64(1_700_000_000)));
+    }
+
+    #[test]
+    fn service_check_container_id_becomes_an_attribute() {
+        let events = decode("_sc|check|0|c:cid2");
+        assert_eq!(
+            events[0].attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+            Some("cid2")
+        );
+    }
+
+    /// `m:` is always the last field and consumes the rest of the line verbatim, so a message may
+    /// itself contain `|`.
+    #[test]
+    fn service_check_message_containing_pipe_decodes_verbatim() {
+        let events = decode("_sc|check|0|m:a|b|c");
+        assert_eq!(
+            events[0].attributes.get("statsd.service_check.message").and_then(|v| v.as_str()),
+            Some("a|b|c")
+        );
+    }
+
+    #[test]
+    fn service_check_out_of_range_or_non_numeric_status_is_rejected() {
+        for status in ["4", "-1", "abc"] {
+            let line = format!("_sc|check|{status}");
+            assert!(
+                matches!(parse_err(&line), CodecError::Malformed(_)),
+                "expected status {status:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn service_check_empty_name_is_rejected() {
+        assert!(matches!(parse_err("_sc||0"), CodecError::Malformed(_)));
+    }
+
+    #[test]
+    fn a_bare_underscore_line_with_an_unknown_sigil_is_rejected() {
+        assert!(matches!(parse_err("_x|whatever"), CodecError::Malformed(_)));
+    }
+
+    /// A datagram mixing a counter, an event, and a service check decodes all three, in wire
+    /// order -- `parse_line`'s dispatch on the leading sigil doesn't disturb line ordering.
+    #[test]
+    fn a_packed_datagram_mixing_a_counter_an_event_and_a_service_check_decodes_all_three_in_order()
+    {
+        let events = decode("hits:1|c\n_e{5,4}:title|text\n_sc|check|0");
+        assert_eq!(events.len(), 3);
+        assert!(events[0].metrics.len() == 1 && events[0].log.is_none(), "expected the counter");
+        assert!(events[1].log.is_some(), "expected the event");
+        assert!(
+            events[2].metrics.len() == 1 && events[2].log.is_none(),
+            "expected the service check"
+        );
     }
 
     /// Mirrors `syslog.rs`'s own `local_addr`-after-`bind` property (`crates/logit-inputs/src/

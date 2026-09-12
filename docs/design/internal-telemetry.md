@@ -604,8 +604,14 @@ Worked examples, one per shipped component:
   `max_packet_bytes` needs that a line count alone can't show, since `statsd_out` (unlike
   `syslog_out`) packs several lines per datagram. `logit.output.messages.dropped{reason=
   "unresolved_gauge_delta"|"unsupported_kind"|"unencodable_value"|"empty_name"|"oversize_line"|
-  "oversize_datagram"|"dialect_field"}` (the last, **new**, for a `|c:`/`|T` field with nowhere to
-  go under `format: statsd`) and `logit.output.tags.dropped{reason="dialect"|
+  "oversize_datagram"|"dialect_field"|"dialect_event"|"invalid_service_check"|
+  "invalid_event_field"}` (`dialect_field`, for a `|c:`/`|T` field with nowhere to go under
+  `format: statsd`; `dialect_event`, **new**, a whole DogStatsD event or service check dropped
+  under `format: statsd`, which has no `_e`/`_sc` wire form at all; `invalid_service_check`,
+  **new**, a service check whose first metric isn't a `Gauge` or has no status resolving into
+  `0..=3`; `invalid_event_field`, **new**, an event's `p:`/`t:` field alone omitted for an
+  out-of-set value -- its own counter, not `unencodable_value`, since the rest of that line still
+  renders) and `logit.output.tags.dropped{reason="dialect"|
   "unrepresentable"}` for `format: statsd` dropping the whole tag segment or an individual
   unrepresentable tag. **New**, `logit.output.messages.normalized{reason="dialect"|
   "member_sanitized"}` counts a lossless-but-different rendering rather than a drop: a timer's

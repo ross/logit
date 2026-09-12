@@ -214,6 +214,9 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `statsd_in` decode 1 distribution line (`ms`/`h`/`d`, unsampled) | **2** | same as `statsd_in` decode 1 line -- `ms`/`h`/`d` decode straight to `MetricKind::Samples` now (ADR `lossless-transit`'s W3), one value fits inline in `Samples`'s own `SmallVec`; no `DdSketch`/`bins` Vec is built at decode time any more |
 | `statsd_in` decode 1 sampled distribution line (`@0.1`) | **2** | same as unsampled -- the raw `sample_rate` now rides verbatim on the decoded `Samples`, with no decode-time extrapolation to allocate for |
 | `statsd_in` decode 1 set line (`s`) | **3** | 2 as above + 1 `Vec<Bytes>` for `MetricKind::SetMembers`'s members -- unlike `Samples`'s inline `SmallVec`, `SetMembers` has no small-size optimization |
+| `statsd_in` decode 1 DogStatsD event line (`_e{...}`, `TEXT` with nothing to unescape) | **2** | same as `statsd_in` decode 1 line -- `parse_event`'s `unescape_event_text` takes its zero-copy `slice_of` path, so an event costs nothing beyond the per-line/per-batch `Vec<Event>` pair every statsd line pays |
+| `statsd_in` decode 1 DogStatsD event line (`TEXT` with one `\n` escape) | **3** | 2 as above + 1 -- the decoded length is known up front (each two-byte escape becomes one byte), so `unescape_event_text` sizes its `Vec` exactly and `Bytes::from(Vec<u8>)` takes its `len == capacity` promotion path: one allocation, no realloc, no second eager control-block alloc of the kind a slack-capacity `String::replace` result would cost |
+| `statsd_in` decode 1 DogStatsD service check line (`_sc\|...`) | **2** | same as `statsd_in` decode 1 line -- every `statsd.service_check.*` carrier is a zero-copy datagram slice, same shape as an ordinary metric line's tags |
 | `json` parse + merge (nginx shape) | **1** | fixed -- see below, was 7 |
 | `json` parse + merge (wide-JSON, 28 keys) | **1** | same fix, confirmed to generalize past a small field count |
 | `logfmt` parse + merge (go-kit-style, 9 fields) | **1** | hand-rolled scanner, zero-copy by construction -- see `docs/adr/logfmt-and-kv-parsing.md`; the one allocation is `event.attributes` spilling its inline capacity, same shape as `json`'s |
@@ -284,7 +287,10 @@ And the corresponding times:
 > `statsd_decode_one_set_line` pin. (Pre-W3, the first two rows existed to pin decode-time
 > sample-rate extrapolation into a `DdSketch`; ADR `lossless-transit`'s W3 moved that step to
 > `aggregate` entirely, so `statsd_in` decode now costs the same regardless of sample rate -- see
-> §2's own notes on each row.)
+> §2's own notes on each row.) The `statsd_in` DogStatsD event/service-check rows (W6) are the same
+> kind of exception, for the same reason -- their counts are what `statsd_decode_one_event_line`/
+> `statsd_decode_one_event_line_with_an_escaped_newline`/`statsd_decode_one_service_check_line`
+> pin.
 
 ### Listener I/O decoupling: the `decode_into` buffer-reuse win (ADR `decoupled-listener-io`)
 
