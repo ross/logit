@@ -72,10 +72,12 @@ buffer should end up as a zero-copy slice of that buffer, not a fresh allocation
 cheaply `Clone`-able (refcounted) and cheaply sliced, which both the parsing path and the Lua proxy
 depend on.
 
-Measured, `syslog_in` and `json` keep that promise (decoding a line costs one allocation regardless
-of how many fields it yields) and `statsd_in` does not (it copies each tag value out of the
-datagram instead of slicing it). See [memory.md](memory.md)'s zero-copy section — both facts are
-pinned by tests, not left to inspection.
+Measured, `syslog_in`, `json`, and `statsd_in` all keep that promise now: decoding a line costs one
+allocation (`statsd_in`: two, split across a per-line and a per-batch `Vec<Event>` by its
+multi-value grammar) regardless of how many fields, tag values, or set members it yields.
+`statsd_in`'s tag values, `|c:<id>`, and a `SetMembers` line's members are all zero-copy slices of
+the datagram, the same pointer-arithmetic reconstruction (`slice_of`) `syslog_in`'s own fields use.
+See [memory.md](memory.md)'s zero-copy section — pinned by tests, not left to inspection.
 
 ## Attributes: interned keys, small-map storage
 
@@ -138,6 +140,9 @@ source:
 | `span.duration_s` | decimal seconds (number or `Str`) | nginx's `$request_time`. |
 | `span.{start,end}_rfc3339` | RFC 3339 string | Parsed by `logit_core::parse_rfc3339_to_nanos`, up to 9 fractional digits. |
 | `syslog.sd` | `Value::Map { "<SD-ID>" -> Value::Map { "<PARAM-NAME>" -> Value::Str \| Value::Array<Value::Str> } }` | `syslog_in`'s parsed RFC 5424 STRUCTURED-DATA (absent when the wire carried the nil `-`); a repeated PARAM-NAME within one SD-ELEMENT becomes the `Array` form, in order. `syslog_out` re-emits every element, escaped per RFC 5424 §6.3.3; see [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md). |
+| `statsd.type` | `Value::Str`: `ms`\|`h`\|`d` | `statsd_in`'s wire-type letter for a timer/histogram/distribution line, stamped on the `MetricKind::Samples` record it decodes to since all three land on the same shape; `statsd_out` reads it to pick the wire-type letter it re-emits, defaulting to `ms` when absent or unrecognized. See [ADR `statsd-output`](../adr/statsd-output.md)'s amendment. |
+| `statsd.container_id` | `Value::Str` | `statsd_in`'s `\|c:<container-id>` segment (DogStatsD v1.2+, accepted here on every metric type, not only `c`/`g`), round-tripped by `statsd_out` under `format: dogstatsd` only. |
+| `statsd.timestamp` | `Value::U64` | The raw seconds off an incoming `\|T<unix-seconds>` segment, stamped by `statsd_in` alongside moving the same value onto `Event::timestamp` (as `secs * 1_000_000_000`) -- carrying the wire value itself, not just a marker bit, so a stage that rebuilds `Event::timestamp` after decode (`aggregate`'s flush, notably) can't fabricate or collapse a `\|T` on the way back out; `statsd_out` re-emits `\|T<secs>` from this attribute's own `U64` value (never from `Event::timestamp`) under `format: dogstatsd` only, and not at all when the attribute is absent or not a `U64`. |
 
 Rules that apply across the whole table (the trace/span rows above; `syslog.sd`'s own rules are the
 linked ADR's, not these): `""`, `"-"`, and `Null` all count as absent — how nginx's
@@ -202,9 +207,9 @@ pub enum MetricKind {
     Sum(Sum),                             // replaces Counter; MetricKind::counter(v) for delta+monotonic
     Gauge(f64),
     GaugeDelta(f64),   // unresolved relative adjustment; resolved into Gauge by `aggregate` only
-    Samples(Samples),                     // raw observations, e.g. statsd ms/h/d -- no producer until W3
+    Samples(Samples),                     // raw observations -- statsd_in's ms/h/d decode straight to this
     Distribution(DdSketch),               // produced only by `aggregate`, merging a run of Samples
-    SetMembers(Vec<bytes::Bytes>),        // raw set members, e.g. statsd s -- no producer until W3
+    SetMembers(Vec<bytes::Bytes>),        // raw set members -- statsd_in's s decodes straight to this
     Set(HyperLogLog),                     // produced only by `aggregate`, merging a run of SetMembers
     Histogram(Histogram),                 // fixed, explicit bucket bounds
     ExponentialHistogram(ExpHistogram),   // OTLP/Prometheus base-2 exponential bucketing, kept
@@ -310,18 +315,20 @@ temporality and monotonicity on `Sum`, sum/count/min/max on `Histogram`/`Exponen
   error bound. Plain reservoir sampling or naive percentile-of-percentiles does not merge correctly
   — merging two nodes' p99s is not the p99 of the merged data — so DDSketch is load-bearing for the
   whole distributed-aggregation story, not a nice-to-have. `Samples` (raw statsd `ms`/`h`/`d`
-  observations) is what `aggregate` sketches into a `Distribution` — no *producer* until W3, but a
-  real absorb rule since W2 (above).
+  observations, `statsd_in`'s own decode target since W3) is what `aggregate` sketches into a
+  `Distribution` by default, or retains raw under `distributions: samples` (a real absorb rule
+  since W2, above).
 - `Set` uses a **HyperLogLog** (wrapping the `cardinality-estimator` crate), which merges (union)
-  exactly by construction. `SetMembers` (raw statsd `s` members) is `Set`'s own raw counterpart,
-  same relationship as `Samples`/`Distribution` — no *producer* until W3 (`statsd_in` still decodes
-  straight to `Distribution`/errors on `s`), but `aggregate` (W2) now really absorbs both raw pairs:
-  a `Samples` series sketches into a `Distribution` by default (or retains raw values under
-  `distributions: samples`, bounded by a cap), and a `SetMembers` series estimates into a `Set` by
-  default (or retains an exact deduplicated member set under `sets: members`, bounded by a cap) —
-  see [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment for
-  the full design, including the fallback rule each raw mode's cap (or, for `distributions: samples`,
-  a `sample_rate` mismatch) triggers.
+  exactly by construction. `SetMembers` (raw statsd `s` members, `statsd_in`'s own decode target
+  since W3) is `Set`'s own raw counterpart, same relationship as `Samples`/`Distribution`.
+  `aggregate` (W2) absorbs both raw pairs: a `Samples` series sketches into a `Distribution` by
+  default (or retains raw values under `distributions: samples`, bounded by a cap), and a
+  `SetMembers` series estimates into a `Set` by default (or retains an exact deduplicated member
+  set under `sets: members`, bounded by a cap) — see
+  [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment for the
+  full design, including the fallback rule each raw mode's cap (or, for `distributions: samples`,
+  a `sample_rate` mismatch) triggers, and [ADR `statsd-output`](../adr/statsd-output.md)'s amendment
+  for `statsd_in`/`statsd_out`'s own side of the raw pair.
 - `Sum`/`Gauge` merge trivially (sum / last-write-wins by timestamp) for the delta-monotonic case
   `MetricKind::counter` produces; a cumulative or non-monotonic `Sum` has no merge rule defined
   here and passes through unmerged, the same as `Histogram`/`ExponentialHistogram`/`Summary`.
@@ -334,13 +341,18 @@ temporality and monotonicity on `Sum`, sum/count/min/max on `Histogram`/`Exponen
   [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment for why that's true for
   gauges specifically and not for a delta-monotonic `Sum`.
 
-A `Distribution`'s `count()` becomes a **population estimate**, not a count of received
-datagrams, wherever sample-rate extrapolation is in play: `statsd_in`'s `ms`/`h`/`d` decoding
-(`crates/logit-inputs/src/statsd.rs`) inserts `(1.0 / sample_rate).round()` weighted samples per
-line via `DdSketch::add_weighted`, so a sketch fed by `100|ms|@0.1` reports `count() == 10` even
-though only one datagram arrived. This is the same relationship `MetricKind::counter(value / sample_rate)`
-already has for counters, made explicit for distributions too — `count` answers "how many events
-this represents," not "how many datagrams I received."
+A `Distribution`'s `count()` becomes a **population estimate**, not a count of raw observations
+retained, wherever sample-rate extrapolation is in play: `aggregate`'s default `distributions:
+sketch` mode inserts `(1.0 / sample_rate).round()` weighted samples per absorbed `Samples` record
+via `Samples::sketch`/`DdSketch::add_weighted` (`crates/logit-core/src/metric.rs`), so a sketch fed
+by the `Samples` record `statsd_in` decodes from `100|ms|@0.1` reports `count() == 10` even though
+that record itself held one raw value. This is the same relationship
+`MetricKind::counter(value / sample_rate)` already has for counters, made explicit for
+distributions too — `count` answers "how many events this represents," not "how many raw
+observations were retained." Since [ADR `lossless-transit`](../adr/lossless-transit.md)'s W3,
+`statsd_in` itself performs no such extrapolation at decode time at all: the raw `sample_rate`
+rides verbatim on the `Samples` record it decodes to, and only `aggregate` (or a sink encoding
+`Samples` directly) ever reads it.
 
 ## What lives outside `Event`
 

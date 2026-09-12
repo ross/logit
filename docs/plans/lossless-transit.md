@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-11
+updated: 2026-09-12
 ---
 
 # Closing plan: lossless like-protocol transit
@@ -42,30 +42,52 @@ beyond what statsd and a merged sketch need. `crates/logit-core/src/lib.rs`'s `L
 no `flags` or `trace_state`; status message rides an `otel.status_message` attribute instead of a
 field. `EventBatch` (`crates/logit-core/src/event.rs`) has a `resource: Arc<Resource>` but no scope.
 
-### statsd_in -> statsd_out
+### statsd_in -> statsd_out (W3, landed)
 
-Decode (`crates/logit-inputs/src/statsd.rs`, `build_event` ~L254-345): raw timer samples are
-sketched into a `DdSketch` immediately (`add_weighted`, ~L301-327, weight clamped at
-`MAX_SAMPLE_WEIGHT = 1000`) — a decoder pre-summarizing, which the ADR now forbids; `s` sets are a
-hard decode error (~L329-334 -- `HyperLogLog` itself is real since W2, but statsd gained no
-producer for it until W3, `docs/known-gaps.md`); `|c:`
-container id and `|T` timestamp are silently accepted and ignored by the generic segment fallthrough
-(~L229-231); DogStatsD events and service checks fail to parse as ordinary lines; `ms`/`h`/`d` all
-collapse into one `Distribution` kind, losing which wire type produced it; `unit` is always `None`.
+Decode (`crates/logit-inputs/src/statsd.rs`): `ms`/`h`/`d` lines decode straight to a raw
+`MetricKind::Samples` — one `Event` per line, every colon-separated value in `Samples`'s own inline
+`SmallVec`, `sample_rate` carried verbatim with no sketching or extrapolation at decode time at
+all. The wire type letter survives as `statsd.type` (`ms`/`h`/`d`) since all three land on the same
+`Samples` shape. `s` lines decode to `MetricKind::SetMembers`, one event per line, every member a
+zero-copy `Bytes` slice of the datagram, mirroring `ms`/`h`/`d`. `statsd_in`'s own copy of the
+`MAX_SAMPLE_WEIGHT`/`sample_rate_clamped` clamp (moved to `aggregate` by W2, kept here until this
+workstream) is deleted — `aggregate` is now the only place that diagnostic fires. `|c:<id>` stamps
+`statsd.container_id`; `|T<secs>` sets `Event::timestamp` and stamps the per-line
+`statsd.timestamp: Value::U64(secs)` carrier -- the raw wire seconds themselves, not just a marker
+bit, so a stage that rebuilds `Event::timestamp` after decode can't fabricate or collapse a `|T` on
+the way back out; a malformed `|T` rejects only that line. DogStatsD events and service checks
+still fail to parse as ordinary lines (W6). `unit` is still always `None`.
 
-Encode (`crates/logit-outputs/src/statsd.rs`, `render_metric` ~L350): only `Counter` and
-`Gauge`/`GaugeDelta` are emitted; `Distribution`/`Set`/`Histogram`/`Summary` are dropped whole and
-counted (`unsupported_metric_kind`, ~L445-464) — this is the v1 deferral [ADR `statsd-output`](../adr/statsd-output.md)
-named explicitly and left for "its own ADR once there's a concrete consumer." `GaugeDelta` is only
-emitted under the opt-in `relative_gauges: true` — correct as-is, since the default guards against a
-misconfigured pipeline missing `aggregate`, and the opt-in *is* the lossless path (kept unchanged by
-this plan). No `@rate`, no `|T`, no unit, ever emitted.
+Encode (`crates/logit-outputs/src/statsd.rs`): `Samples` renders as one multi-value
+`name:v1:v2|<type>|@rate` line under `format: dogstatsd` (`<type>` from `statsd.type`, defaulting
+to `ms`; `@rate` omitted at `1.0`), or one `name:v|ms[|@rate]` line per value under `format: statsd`
+(no multi-value grammar there; `h`/`d` normalize to `ms`, counted `type_normalized_dialect`).
+`SetMembers` renders one `name:<member>|s` line per member, in both dialects (a member-specific
+rule: `:`, `|`, and control bytes are substituted; everything else, including `@`, `#`, `,` and
+spaces, is preserved -- counted `members_sanitized` when altered). `|c:`/`|T` round-trip under
+`format: dogstatsd` only (`append_dialect_extras`), reading their carriers off `EncodeCtx` --
+captured by `build_tag_suffix`'s merged resource⊕event walk, the same one that filters `statsd.*`
+out of the generic tag segment, so a carrier set only on the resource is honored too; dropped and
+counted (`dropped_dialect_fields`) under `format: statsd`, which has no equivalent segment.
+`statsd.*` attributes are filtered out of the generic `|#k:v` tag segment (`build_tag_suffix`),
+never re-emitted as tags. `Distribution`/`Set`/
+`Histogram`/`ExponentialHistogram`/`Summary`/a cumulative or non-monotonic `Sum` remain dropped and
+counted (`unsupported_metric_kind`) — reachable now only once `aggregate` has explicitly summarized
+(its defaults, `distributions: sketch`/`sets: estimate`), exactly the "opt-in summarization"
+carve-out the ADR names. `GaugeDelta` is still only emitted under the opt-in
+`relative_gauges: true`, unchanged by this workstream.
 
-Preserved end to end today: metric names, counters (sample-rate-extrapolated — a permitted
-normalization), absolute gauges including negative values via the documented two-line `0|g`/`-n|g`
-idiom, tags including bare valueless tags, and relative gauges when opted in. Seven real-decoder
-relay tests already exist (`crates/logit-outputs/src/statsd.rs` ~L1400-1500); none exercise timers,
-sets, `|T`, or `|c:`, because none of those currently survive to test.
+Preserved end to end now: metric names, counters (sample-rate-extrapolated, unchanged), absolute
+gauges (including negative values via the documented two-line `0|g`/`-n|g` idiom) and relative
+gauges when opted in (both unchanged), tags including bare valueless tags, raw
+timers/histograms/distributions (`Samples`, including sample rate), raw sets (`SetMembers`), and
+`|c:`/`|T` under `format: dogstatsd`. `docs/adr/statsd-output.md` gained an amendment narrowing the
+v1 metric-kind deferral to post-sketch kinds and reversing the "no sample rate, no timestamp"
+decision for timers and `|T`-marked lines. `crates/logit-outputs/src/statsd.rs` and
+`crates/logit-inputs/src/statsd.rs` both gained real-decoder relay tests for the new kinds and
+segments, plus a `proptest` fixed point (`mod fixed_point::decode_encode_decode_is_a_fixed_point`);
+`crates/logit-cli/tests/statsd_round_trip.rs` (mirroring `syslog_round_trip.rs`'s real-UDP-socket
+harness) extends the same coverage end to end through real sockets.
 
 ### otlp_in -> otlp_out
 
@@ -385,13 +407,13 @@ by default (`distributions: sketch`), an absorbed `Samples` record sketches ever
 into the series' `DdSketch` via `logit_core::Samples::sketch`'s weighting rule
 (`add_weighted(v, weight)`, `weight = round(1/sample_rate)` clamped to `[1, Samples::MAX_WEIGHT]`) —
 the clamp and its diagnostic (`sample_rate_clamped`) moved here from
-`crates/logit-inputs/src/statsd.rs`, which keeps its own copy until W3 deletes it. A new
+`crates/logit-inputs/src/statsd.rs`, which kept its own copy until W3 deleted it (below). A new
 `distributions: sketch | samples` config (default `sketch`) lets an operator keep raw samples
 through the aggregation window instead (concatenated, bounded by a `max_samples_per_series` cap;
 overflow, or an incoming record's `sample_rate` disagreeing with the series' first one, falls back
 to sketching and counts it via `logit.transform.samples.fallback{reason="cap"|"rate_mismatch"}`) —
-this is what will let a `statsd_in -> aggregate -> statsd_out` relay stay exact once W3 adds the
-sink side, rather than only when `aggregate` is entirely absent. `SetMembers` merges as an exact,
+this is what lets a `statsd_in -> aggregate -> statsd_out` relay stay exact now that W3 has added
+the sink side, rather than only when `aggregate` is entirely absent. `SetMembers` merges as an exact,
 capped, deduplicated union (`sets: members`, `max_set_members_per_series`, overflow falls back to a
 `HyperLogLog` estimate and counts `logit.transform.set_members.fallback{reason="cap"}`) or, by
 default (`sets: estimate`), into a real `HyperLogLog` — `crates/logit-core/src/metric.rs` now wraps
@@ -409,7 +431,7 @@ line per value under `format: statsd`, which has no multi-value grammar) and `Se
 `name:m|s`, one line per member. `Distribution`/`Set`/`Histogram`/`Summary`/`ExponentialHistogram`
 reaching `statsd_out` remain the deferred cross-kind question ADR `statsd-output` already named —
 now reachable only after an operator has explicitly asked `aggregate` to sketch, which is exactly
-the ADR's "opt-in summarization" carve-out; `statsd-output` gets an amendment narrowing its v1
+the ADR's "opt-in summarization" carve-out; `statsd-output` got an amendment (W3) narrowing its v1
 deferral to that case specifically. `otlp_out` encodes everything in the target model exactly
 except `Samples`, which it sketches first and counts as a degradation (the one new cross-protocol
 table row).
@@ -444,7 +466,7 @@ metric-kind fields, not just presence.
 | W0 | This PR: ADR, survey, and this plan | S | — |
 | W1 | **Landed (this PR).** Core model reshape (every type in "Target model" above), `PartialEq` derives, `type_sizes.rs` + `memory.md` §1, `estimated_heap_bytes`, and every exhaustive match site updated (`event.rs`, `outputs/{influxdb,stdio,statsd}.rs`, `proto/native/record.rs`, `proto/otlp/metrics.rs`, `transforms/aggregate.rs`, `bench/bakeoff/wire_mirror.rs`) — plus the native codec reshape in the same PR, since `record.rs` can't compile against the old model otherwise. New ADR `metrics-model-v2` (single `Sum`, raw-vs-sketch pairs for `Samples`/`SetMembers`, the `ExponentialHistogram` variant, boxed `SpanExt`, batch-level `Scope`); amends `relative-gauge-adjustments` (its recorded size-growth fallback is not triggered — `MetricKind` stays 176) | L | W0 |
 | W2 | **Landed.** `aggregate`: `Samples` sketching moved out of decode, `distributions: sketch \| samples`/`sets: estimate \| members` config with capped raw retention and a fallback-and-count rule, `SetMembers` union plus a real `HyperLogLog` (`cardinality-estimator`), `FlushOutput` scope, cumulative/`Histogram`/`ExponentialHistogram`/`Summary` pass-through unchanged; amends `aggregation-window-semantics` | M | W1 |
-| W3 | statsd pair: `Samples`/`SetMembers` in and out, `|c:`, `|T`, sample-rate retention on timers, `statsd_round_trip.rs`, updated `allocations.rs` cases; amends `statsd-output` (v1 deferral narrowed to post-sketch kinds; "no sample rate/timestamp" reversed) | M | W1, W2 |
+| W3 | **Landed.** statsd pair: `Samples`/`SetMembers` in and out (`statsd_in`'s own `MAX_SAMPLE_WEIGHT`/`sample_rate_clamped` copy, kept alive since W2, deleted), `|c:`/`|T` both ways (dogstatsd only on egress), sample-rate carried verbatim on timers with no decode-time extrapolation, `statsd_round_trip.rs` plus a `proptest` fixed point, updated `allocations.rs` cases; amends `statsd-output` (v1 deferral narrowed to post-sketch kinds; "no sample rate/timestamp" reversed for timers/`|T`) | M | W1, W2 |
 | W4 | **Landed.** OTLP pair: start_time, description, exemplars, `NO_RECORDED_VALUE` round-tripped as a flagged point, batch-level scope grouping + `schema_url`, `event_name`, `observed_timestamp`, dropped-attribute counts, span fields, `otel.severity_*`; `otlp_round_trip.rs` rewritten to per-field assertions; new pure-codec `crates/logit-proto/tests/otlp_fixed_point.rs` plus a `proptest`-based `decode(encode(x)) == x` suite in `otlp/metrics.rs`; `internal` stamps a real `Scope` (`crates/logit-inputs/src/internal.rs`) now that `otlp_out` no longer invents one. New `MetricRecord.flags: u32`/`MR_FLAGS` native tag amends `metrics-model-v2`. (`Sum`/temporality/monotonic, `ExponentialHistogram`'s 1:1 mapping, and histogram sum/min/max + summary count/sum were pulled forward into W1 — see its "W1 outcome" note above.) | L | W1 |
 | W5 | **Landed.** syslog pair: structured-data parse and emit, timestamp precedence and the nil case, `Value::Bytes` MSG, `Value::Str` PROCID, opt-in PEN-qualified structured-data element; `crates/logit-cli/tests/syslog_round_trip.rs` over real UDP sockets with a fixture corpus plus a `proptest` fixed point; new ADR `syslog-structured-data-convention`; amends `syslog-output` | M | W0 (parallel with W1) |
 | W6 | DogStatsD events and service checks, in and out | S | W3 |

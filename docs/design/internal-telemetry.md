@@ -604,11 +604,16 @@ Worked examples, one per shipped component:
   `max_packet_bytes` needs that a line count alone can't show, since `statsd_out` (unlike
   `syslog_out`) packs several lines per datagram. `logit.output.messages.dropped{reason=
   "unresolved_gauge_delta"|"unsupported_kind"|"unencodable_value"|"empty_name"|"oversize_line"|
-  "oversize_datagram"}` and, **new**, `logit.output.tags.dropped{reason="dialect"|
+  "oversize_datagram"|"dialect_field"}` (the last, **new**, for a `|c:`/`|T` field with nowhere to
+  go under `format: statsd`) and `logit.output.tags.dropped{reason="dialect"|
   "unrepresentable"}` for `format: statsd` dropping the whole tag segment or an individual
-  unrepresentable tag. A `MetricKind::GaugeDelta` reaching this encoder with `relative_gauges:
-  false` reports under `logit.component.diagnostics{key="gauge_delta_unresolved"}`, the identical
-  key `influxdb_out` uses, so one grep finds both sinks. Retry stays a Layer 2 metric here too.
+  unrepresentable tag. **New**, `logit.output.messages.normalized{reason="dialect"|
+  "member_sanitized"}` counts a lossless-but-different rendering rather than a drop: a timer's
+  `h`/`d` wire-type letter collapsing to `ms` under `format: statsd`, or a `SetMembers` member
+  changing after lossy UTF-8 plus sanitization. A `MetricKind::GaugeDelta` reaching this encoder
+  with `relative_gauges: false` reports under
+  `logit.component.diagnostics{key="gauge_delta_unresolved"}`, the identical key `influxdb_out`
+  uses, so one grep finds both sinks. Retry stays a Layer 2 metric here too.
 - `logit_out` (`crates/logit-outputs/src/logit.rs`, [ADR
   `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md)):
   `logit.proto.frames{direction="out",codec,compression}` and `logit.proto.frame.bytes` — the

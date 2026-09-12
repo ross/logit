@@ -114,11 +114,14 @@ fn statsd_decode_one_line() {
     expect_allocs("statsd_in: decode 1 line", stats, 2);
 }
 
-/// Pins the unsampled baseline that sample-rate extrapolation on the decode path
-/// (`DdSketch::add_weighted`, `crates/logit-core/src/metric.rs`) must add zero allocations over --
-/// which its delegation to `sketches_ddsketch::DDSketch::add_with_count` satisfies regardless of
-/// weight. [`statsd_decode_one_sampled_distribution_line`] pins the sampled case at the same
-/// count.
+/// `ms`/`h`/`d` now decode straight to a raw `MetricKind::Samples` (`docs/adr/lossless-transit.md`'s
+/// W3, `crates/logit-inputs/src/statsd.rs`) instead of sketching into a `DdSketch` at decode time
+/// -- one value fits inline in `Samples`'s `SmallVec` (`SAMPLES_INLINE = 19`,
+/// `crates/logit-core/src/metric.rs`), so building it costs nothing beyond the per-line/per-batch
+/// `Vec<Event>` allocations [`statsd_decode_one_line`] already pins; the `DdSketch` bin `Vec`
+/// this test used to also pay for is gone. [`statsd_decode_one_sampled_distribution_line`] pins
+/// the sampled case at the same count, since `sample_rate` now rides verbatim with no
+/// decode-time extrapolation to allocate for.
 #[test]
 fn statsd_decode_one_distribution_line() {
     let mut decoder = fixtures::statsd_decoder();
@@ -127,14 +130,22 @@ fn statsd_decode_one_distribution_line() {
 
     let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
     assert_eq!(batch.events.len(), 1);
-    expect_allocs("statsd_in: decode 1 distribution line", stats, 3);
+    match &batch.events[0].metrics[0].kind {
+        logit_core::MetricKind::Samples(samples) => {
+            assert_eq!(samples.values.as_slice(), &[120.0]);
+            assert_eq!(samples.sample_rate, 1.0);
+        }
+        other => panic!("expected Samples, got {other:?}"),
+    }
+    expect_allocs("statsd_in: decode 1 distribution line", stats, 2);
 }
 
-/// Same line as [`statsd_decode_one_distribution_line`], sampled at `@0.1` -- ten weighted
-/// `DdSketch::add_weighted` samples instead of one unweighted `add`. Must match that test's
-/// allocation count exactly: the bin `Vec` a `DdSketch` allocates on its first sample is the same
-/// single allocation whether that first sample carries a weight of one or ten, because
-/// `add_with_count` computes the bin index once and increments its stored count directly.
+/// Same line as [`statsd_decode_one_distribution_line`], sampled at `@0.1`. Pre-W3 this
+/// extrapolated to 10 weighted `DdSketch::add_weighted` samples at decode time; now the raw
+/// `sample_rate` rides verbatim on the decoded `Samples` (`docs/adr/lossless-transit.md`'s W3) --
+/// `aggregate` is the only component that still does the extrapolation, and only when it chooses
+/// to sketch. Same allocation count as the unsampled case: nothing here scales with the rate any
+/// more.
 #[test]
 fn statsd_decode_one_sampled_distribution_line() {
     let mut decoder = fixtures::statsd_decoder();
@@ -144,12 +155,34 @@ fn statsd_decode_one_sampled_distribution_line() {
     let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
     assert_eq!(batch.events.len(), 1);
     match &batch.events[0].metrics[0].kind {
-        logit_core::MetricKind::Distribution(sketch) => {
-            assert_eq!(sketch.count(), 10, "@0.1 should extrapolate to 10 weighted samples")
+        logit_core::MetricKind::Samples(samples) => {
+            assert_eq!(samples.values.as_slice(), &[120.0]);
+            assert_eq!(samples.sample_rate, 0.1, "the raw rate rides verbatim -- no extrapolation");
         }
-        other => panic!("expected Distribution, got {other:?}"),
+        other => panic!("expected Samples, got {other:?}"),
     }
-    expect_allocs("statsd_in: decode 1 sampled distribution line", stats, 3);
+    expect_allocs("statsd_in: decode 1 sampled distribution line", stats, 2);
+}
+
+/// `s` decodes to a raw `MetricKind::SetMembers` -- a `Vec<Bytes>` of zero-copy datagram slices,
+/// one per line (`docs/adr/lossless-transit.md`'s W3). The member `Vec` itself is a third
+/// allocation beyond the per-line/per-batch `Vec<Event>`s [`statsd_decode_one_line`] pins, since
+/// (unlike `Samples`'s inline `SmallVec`) `SetMembers` has no small-size optimization.
+#[test]
+fn statsd_decode_one_set_line() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_set_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    match &batch.events[0].metrics[0].kind {
+        logit_core::MetricKind::SetMembers(members) => {
+            assert_eq!(members, &vec![bytes::Bytes::from_static(b"abc123")]);
+        }
+        other => panic!("expected SetMembers, got {other:?}"),
+    }
+    expect_allocs("statsd_in: decode 1 set line", stats, 3);
 }
 
 /// The logs-only workload `docs/design/memory.md` §0 names as unmeasured: a plain-text syslog
