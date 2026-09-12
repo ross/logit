@@ -156,10 +156,32 @@ record_rsyslog() {
 # next one. All three are packed flushes: the capture stops on its own `--count 3`, a few seconds
 # in, so a shutdown flush is not in the corpus. The 90s timeout matches record_rsyslog's, for the
 # same reason: an apt-get install has to finish first.
+#
+# A second, separate capture follows for the `threshold` plugin's notification
+# (`docs/plans/collectd-binary-relay.md`'s W5): its own `start_capture`/`docker run`/
+# `finish_capture` cycle, under the fixture prefix `collectd-notification` rather than `collectd`,
+# so `crates/logit-inputs/src/collectd.rs`'s value-list interop tests keep reading exactly
+# `collectd-00{0,1,2}.raw` and this addition never perturbs them. The two captures are sequential,
+# not concurrent -- the first `finish_capture` tears down its listener container entirely before
+# the second `start_capture` stands up a new one on the same port -- so even though both `docker
+# run`s share one `collectd.conf` (the `threshold` plugin is loaded unconditionally, W5's own
+# amendment to that file), the first capture's `load`/`memory`/`interface` value lists are already
+# safely on disk as `collectd-00{0,1,2}.raw` before the second container -- and the notification it
+# emits -- ever starts. One datagram is enough: `WarningMax 0.0` fires on the very first read (see
+# `collectd.conf`'s own comment), so the notification's Message/Severity parts land in the capture
+# listener's very first datagram.
 record_collectd() {
     echo "== recording: collectd (network plugin, debian:bookworm-slim) =="
     local out="${OUT_ROOT}/collectd"
     start_capture udp 25826 "${out}" collectd 3 90
+    ${DOCKER} run --rm --network "${NET}" \
+        -v "${TOOLS_DIR}/collectd.conf:/etc/collectd-fixture.conf:ro,z" \
+        -v "${TOOLS_DIR}/collectd-entrypoint.sh:/entrypoint.sh:ro,z" \
+        debian:bookworm-slim bash /entrypoint.sh
+    finish_capture
+
+    echo "== recording: collectd threshold notification =="
+    start_capture udp 25826 "${out}" collectd-notification 1 90
     ${DOCKER} run --rm --network "${NET}" \
         -v "${TOOLS_DIR}/collectd.conf:/etc/collectd-fixture.conf:ro,z" \
         -v "${TOOLS_DIR}/collectd-entrypoint.sh:/entrypoint.sh:ro,z" \
