@@ -447,6 +447,42 @@ grew a `scope` field (`Aggregator` now groups by `(resource, scope)` value, not 
 closing the `otlp_in -> aggregate -> otlp_out` scope-loss gap this plan tracked. Full design in
 [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment.
 
+### Lua proxy (W7, landed)
+
+`crates/logit-script/src/proxy.rs` gained two new sub-proxies and widened two existing globals so
+every field the workstreams above added to the model is reachable from a script, not just present
+on the wire ([`docs/design/lua-api.md`](../design/lua-api.md)'s "Reading and writing
+`event.metrics`"/"Reading `event.span`"/"Reading and writing `scope`" sections have the full
+field-by-field contract; this entry is the shorter "what changed and why" account).
+
+`event.log` widens to `event_name`/`observed_timestamp` (both read/write — an interned string and
+a nanos-string respectively, mirroring `event.timestamp`'s own string-not-number rule) and
+`dropped_attributes_count` (read-only — a producer-supplied count a script can't meaningfully
+change). `event.metrics` is new: an indexable, array-like proxy (`#event.metrics`, 1-based
+`event.metrics[i]`) minting a small per-access `MetricProxy` rather than caching one, since a
+metric list is typically short and usually read once. Every field on every kind is readable;
+**only `sum`/`gauge`'s `value` and `sum`'s `temporality`/`monotonic` are writable** — every other
+field, on every kind, stays read-only, including on `distribution`/`set`'s merged state and
+`samples`/`set_members`'s raw collections — a script can adjust a counter or a gauge in place, or
+rename/retag/re-time any metric (`name`/`unit`/`description`/`start_timestamp` are writable
+regardless of kind), but can't mint a sketch or a cardinality estimate by hand, the same "metric
+kinds must stay mergeable" rule `AGENTS.md` states for the Rust side of this model. `event.span` is
+new too, and entirely read-only — there is still no script-visible way to construct or mutate a
+span, only to read one `trace_context`'s `span:` block already minted or a wire codec already
+decoded, including its `events`/`links` tables. `resource` and `scope` both gain `schema_url`
+(read/write) and `dropped_attributes_count` (read-only); `scope` itself is new, mirroring
+`resource`'s copy-on-write shape field for field, including the "a batch may carry none, so a
+write starts from `Scope::default()`" case `resource` doesn't need (a batch's resource is never
+absent). `crates/logit-pipeline/src/runtime.rs`'s `run_lua` re-stamps the outgoing batch from a
+`scope` write the same way it already does for `resource`, including the same flush-time
+staleness and script-side override (`docs/known-gaps.md`).
+
+Every new field and error path is covered directly in `crates/logit-script/src/proxy.rs`'s and
+`scope.rs`'s own `#[cfg(test)]` modules — no new integration-level suite, since nothing here
+changes wire behavior, only what a script already running mid-pipeline can see. No ADR: this
+extends the proxy design [`docs/design/lua-api.md`](../design/lua-api.md) already owns rather than
+introducing a new one.
+
 ### Sinks
 
 `statsd_out` encodes `Samples` as `name:v1:v2|ms|@rate` (multi-value under `format: dogstatsd`, one
@@ -493,7 +529,7 @@ metric-kind fields, not just presence.
 | W4 | **Landed.** OTLP pair: start_time, description, exemplars, `NO_RECORDED_VALUE` round-tripped as a flagged point, batch-level scope grouping + `schema_url`, `event_name`, `observed_timestamp`, dropped-attribute counts, span fields, `otel.severity_*`; `otlp_round_trip.rs` rewritten to per-field assertions; new pure-codec `crates/logit-proto/tests/otlp_fixed_point.rs` plus a `proptest`-based `decode(encode(x)) == x` suite in `otlp/metrics.rs`; `internal` stamps a real `Scope` (`crates/logit-inputs/src/internal.rs`) now that `otlp_out` no longer invents one. New `MetricRecord.flags: u32`/`MR_FLAGS` native tag amends `metrics-model-v2`. (`Sum`/temporality/monotonic, `ExponentialHistogram`'s 1:1 mapping, and histogram sum/min/max + summary count/sum were pulled forward into W1 — see its "W1 outcome" note above.) | L | W1 |
 | W5 | **Landed.** syslog pair: structured-data parse and emit, timestamp precedence and the nil case, `Value::Bytes` MSG, `Value::Str` PROCID, opt-in PEN-qualified structured-data element; `crates/logit-cli/tests/syslog_round_trip.rs` over real UDP sockets with a fixture corpus plus a `proptest` fixed point; new ADR `syslog-structured-data-convention`; amends `syslog-output` | M | W0 (parallel with W1) |
 | W6 | **Landed.** DogStatsD events and service checks, in and out: `_e{...}`/`_sc\|...` decode to `Event::log`/`Event::metric` (`event_name: None` deliberately), `statsd.event.*`/`statsd.service_check.*` carriers, canonical field order and `d:` (not `\|T`) on egress, `format: statsd` whole-event drop, first-metric-is-the-check rule; amends `statsd-output` | S | W3 |
-| W7 | Expose the new fields through the Lua proxy (`docs/design/lua-api.md`) — otherwise the model is lossless but the scripting surface can't see any of it | M | W1 |
+| W7 | **Landed.** Lua proxy: `event.log` gains `event_name`/`observed_timestamp` (read/write) and `dropped_attributes_count` (read-only); new `event.metrics` (array-like, every field readable, `value` writable on `sum`/`gauge`, `temporality`/`monotonic` writable on `sum`, everything else on every other kind read-only) and `event.span` (new, entirely read-only); `resource`/`scope` gain `schema_url` (read/write) and `dropped_attributes_count` (read-only), `scope` itself new, mirroring `resource`'s copy-on-write shape; extends `docs/design/lua-api.md`, no ADR (extension of the existing proxy design, not a new one) | M | W1 |
 | W8 | Closeout: rewrite or remove the `docs/known-gaps.md` entries each workstream closes, rewrite `docs/design/data-model.md`'s metric-kinds section for the new shapes, update `AGENTS.md`'s current-state paragraph | S | all |
 
 Landing order: W0 → W1 → (W2, W4, W5 in parallel) → W3 → W6 → W7 → W8. Each workstream is its own
