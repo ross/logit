@@ -25,10 +25,14 @@ use logit_core::{
 /// taking every unrelated list in it down too, so the encoder truncates rather than hoping.
 const MAX_IDENTITY_BYTES: usize = DATA_MAX_NAME_LEN - 1;
 
-/// Per-batch outcome counts from [`CollectdEncoder::encode_into`] -- what `collectd_out` (W3) turns
-/// into its own `logit.output.*` telemetry, and what this module's tests assert on. The codec also
-/// emits the per-drop counters itself, at each drop site (see [`Ctx`]); these are the aggregate a
-/// caller can compare exactly.
+/// Per-batch outcome counts from [`CollectdEncoder::encode_into`] -- the aggregate this module's
+/// own tests and `crates/logit-bench/tests/allocations.rs`'s allocation case assert on exactly.
+/// The codec emits every one of its own `logit.output.*` counters and diagnostics directly, at
+/// each drop site (see [`Ctx`]), through the `Telemetry`/`Diagnostics` handles
+/// [`CollectdEncoder::with_telemetry`]/[`CollectdEncoder::with_diagnostics`] install -- unlike
+/// `statsd_out`, whose sink turns its encoder's returned `EncodeStats` into telemetry itself,
+/// `collectd_out` (`crates/logit-outputs/src/collectd.rs`) discards this return value; it exists
+/// for tests and benches, not production telemetry.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeStats {
     /// Events carrying no metrics at all -- a log- or span-only event, legal under

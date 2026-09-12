@@ -666,9 +666,9 @@ Worked examples, one per shipped component:
   having no TCP mode to relay
   onto at all. `logit.output.messages.dropped{reason="oversize_datagram"}` plus a throttled
   `oversize_datagram` diagnostic cover `EMSGSIZE` on one already-packed datagram, mirroring
-  `statsd_out`'s identical case (`statsd.rs:826-836`) -- the datagram's own lists are dropped, not
-  the whole batch, and sending continues with the next datagram. Retry stays a Layer 2 metric here
-  too.
+  `statsd_out`'s identical case (`StatsdOutput::flush_datagram`) -- the datagram's own lists are
+  dropped, not the whole batch, and sending continues with the next datagram. Retry stays a
+  Layer 2 metric here too.
 - `logit_out` (`crates/logit-outputs/src/logit.rs`, [ADR
   `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md)):
   `logit.proto.frames{direction="out",codec,compression}` and `logit.proto.frame.bytes` — the

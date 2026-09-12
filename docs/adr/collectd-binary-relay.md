@@ -332,9 +332,10 @@ Same reasoning as [ADR `statsd-output`](statsd-output.md)'s "No `logit_proto::En
 that trait returns one opaque `Bytes` per batch with no framing metadata, which cannot express the
 per-datagram boundaries a UDP sink genuinely needs — packing several value lists into one datagram up
 to `max_packet_bytes`, and flushing at a boundary, is exactly the kind of decision a single
-`encode(&mut self, &EventBatch) -> Result<Bytes, _>` call has no way to make. `CollectdDecoder`
-instead exposes plain, directly-unit-testable methods with `with_telemetry`/`with_diagnostics`
-builders, the same shape `PrometheusDecoder` already established.
+`encode(&mut self, &EventBatch) -> Result<Bytes, _>` call has no way to make. `CollectdEncoder`/
+`CollectdDecoder` instead expose plain, directly-unit-testable methods with
+`with_telemetry`/`with_diagnostics` builders, the same shape `PrometheusEncoder`/`PrometheusDecoder`
+already established.
 
 **Amendment (2026-09-12): `CollectdEncoder` implements `FramedEncoder`.** `encode_into` is the
 implementation of [ADR `framed-encoder`](framed-encoder.md)'s `logit_proto::FramedEncoder` (`type

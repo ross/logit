@@ -963,7 +963,11 @@ pub enum ComponentKind {
         /// Bounds one UDP datagram's worth of packed value lists -- not a single list's length.
         /// Defaults to `"1452"`, collectd's own `MaxPacketSize` default (a 1500-byte Ethernet MTU
         /// minus the IPv4 and UDP headers minus a little headroom). A string via [`human_bytes`],
-        /// exactly like `StatsdOut::max_packet_bytes`.
+        /// exactly like `StatsdOut::max_packet_bytes`. Rule 38 (`docs/design/pipeline-graph.md`)
+        /// rejects anything outside `1024..=65535` -- collectd's own `MaxPacketSize` range: above
+        /// it, no UDP datagram can actually carry the result, so every send would fail `EMSGSIZE`
+        /// silently (counted as a per-datagram drop, not a `Fault`), and below it is narrower
+        /// than collectd itself allows.
         #[serde(default = "default_collectd_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,

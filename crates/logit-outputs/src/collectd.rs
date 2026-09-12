@@ -80,6 +80,9 @@ pub struct CollectdOutput {
     endpoint: String,
     socket: UdpSocket,
     encoder: CollectdEncoder,
+    /// Kept on the sink, not just the encoder, so [`CollectdOutput::with_encoder`] can re-apply it
+    /// to a replacement encoder regardless of builder order -- see that method's doc comment.
+    max_packet_bytes: usize,
     /// Reused across `send` calls: the codec's own packing buffer, one entry per datagram, whose
     /// `usize` meta is that datagram's value-list count.
     buf: MessageBuf<usize>,
@@ -104,23 +107,36 @@ impl CollectdOutput {
             // with a TCP transport that has no datagram to overflow), `collectd_out` has no TCP
             // branch at all, so its own default datagram cap applies unconditionally.
             encoder: CollectdEncoder::new().with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES),
+            max_packet_bytes: DEFAULT_MAX_PACKET_BYTES,
             buf: MessageBuf::default(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
         })
     }
 
+    /// Installs `encoder`, with this sink's own cap/diagnostics/telemetry re-applied on top of it
+    /// -- the same fix `StatsdOutput::with_encoder` makes, and for the identical reason: a plain
+    /// `self.encoder = encoder` would make every builder order-dependent. Without this,
+    /// `.with_encoder(CollectdEncoder::new())` after `.with_max_packet_bytes(n)` silently reverts
+    /// to `CollectdEncoder::new()`'s own uncapped `usize::MAX` default (every datagram then packs
+    /// past what any UDP socket can send, failing `EMSGSIZE` and reporting
+    /// `requests{class="ok"}` while delivering nothing -- rule 38's own finding, one layer in),
+    /// and `.with_diagnostics(d).with_telemetry(t).with_encoder(e)` would silently drop both
+    /// handles from the codec, killing every counter and diagnostic the codec itself emits.
     pub fn with_encoder(mut self, encoder: CollectdEncoder) -> Self {
-        self.encoder = encoder;
+        self.encoder = encoder
+            .with_max_packet_bytes(self.max_packet_bytes)
+            .with_diagnostics(self.diag.clone())
+            .with_telemetry(self.telemetry.clone());
         self
     }
 
-    /// Forwards straight to the encoder -- [`CollectdEncoder::with_max_packet_bytes`] is encoder
-    /// state now ([`FramedEncoder`]'s one `encode_into` signature has no room for a per-call cap),
-    /// so this sink has no cap of its own to keep in sync. Call after
-    /// [`CollectdOutput::with_encoder`] if both are used together, so the cap lands on the encoder
-    /// that is actually kept.
+    /// Kept on the sink (see the field's own doc comment) and forwarded to the encoder --
+    /// [`CollectdEncoder::with_max_packet_bytes`] is encoder state ([`FramedEncoder`]'s one
+    /// `encode_into` signature has no room for a per-call cap), but this sink still needs its own
+    /// copy so a later [`CollectdOutput::with_encoder`] can re-apply it, in either builder order.
     pub fn with_max_packet_bytes(mut self, max_packet_bytes: usize) -> Self {
+        self.max_packet_bytes = max_packet_bytes;
         self.encoder = self.encoder.with_max_packet_bytes(max_packet_bytes);
         self
     }
@@ -128,6 +144,7 @@ impl CollectdOutput {
     /// Kept on this sink for its own transport-level diagnostic (`oversize_datagram`), and also fed
     /// into the encoder -- the codec emits its own diagnostics (`no_host`, `unencodable_value`,
     /// ...) through this same handle, so both halves of one `send` report through one component id.
+    /// Order-independent with `with_encoder` (see that method's doc comment).
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag.clone();
         self.encoder = self.encoder.with_diagnostics(diag);
@@ -137,7 +154,8 @@ impl CollectdOutput {
     /// Kept on this sink for its own transport-level counters, and also fed into the encoder --
     /// unlike `StatsdOutput`, whose encoder returns an `EncodeStats` for the sink to turn into
     /// telemetry itself, `CollectdEncoder` emits its own `logit.output.*` counters directly (this
-    /// module's doc, "Telemetry"), so it needs the same handle this sink uses for the rest.
+    /// module's doc, "Telemetry"). Order-independent with `with_encoder` (see that method's doc
+    /// comment).
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry.clone();
         self.encoder = self.encoder.with_telemetry(telemetry);
@@ -283,7 +301,12 @@ mod tests {
     }
 
     /// A like-relay event: `collectd.*` identity present, one gauge record, so the encoder emits it
-    /// as a single Values part with no `hostname:` fallback needed.
+    /// as a single Values part with no `hostname:` fallback needed. Decode-shaped, deliberately, so
+    /// whole-`Event` equality against a real decode is a meaningful assertion rather than a
+    /// tautology: the record name is `<plugin>.<type>` (here `plugin == type`), a single-data-
+    /// source list's own naming rule (`crates/logit-proto/src/collectd/decode.rs`'s module doc) --
+    /// interning the bare `plugin` string instead would never match what `CollectdDecoder` names
+    /// the very list this event round-trips through.
     fn relay_event(host: &str, plugin: &str, value: f64) -> Event {
         let mut event = Event::empty(
             TS,
@@ -294,7 +317,10 @@ mod tests {
                 (ATTR_INTERVAL, Value::F64(10.0)),
             ]),
         );
-        event.metrics.push(MetricRecord::new(intern(plugin), MetricKind::Gauge(value)));
+        event.metrics.push(MetricRecord::new(
+            intern(&format!("{plugin}.{plugin}")),
+            MetricKind::Gauge(value),
+        ));
         event
     }
 
@@ -331,10 +357,6 @@ mod tests {
         )
     }
 
-    fn attr(event: &Event, key: &str) -> Option<Value> {
-        event.attributes.get(key).cloned()
-    }
-
     /// Whether `registry` recorded a point named `metric` carrying `tag`. Drains, so call once.
     fn counted(registry: &Registry, metric: &str, tag: (&str, &str)) -> bool {
         registry.drain(0).into_iter().any(|event| {
@@ -367,6 +389,11 @@ mod tests {
         (addr, Arc::new(socket))
     }
 
+    /// Whole-`Event` equality against the input, not a spot check of a couple of fields --
+    /// `relay_event`'s decode shape (positive timestamp, `collectd.host`/`plugin`/`type`,
+    /// `collectd.interval`) makes this a real fixed-point assertion: a bug that corrupted the
+    /// interval, the timestamp, or the record's kind/name would still pass a host-and-plugin-only
+    /// check but fails this one.
     #[tokio::test]
     async fn a_packed_datagram_round_trips_through_a_real_collector_and_decoder() {
         let (addr, collector) = udp_collector().await;
@@ -387,16 +414,19 @@ mod tests {
         decoder
             .decode_into(bytes::Bytes::from(received), TS, &mut events)
             .expect("the real decoder must accept what this sink sent");
-        assert_eq!(events.len(), 1);
-        assert_eq!(attr(&events[0], ATTR_HOST), Some(Value::from("web-1")));
-        assert_eq!(attr(&events[0], ATTR_PLUGIN), Some(Value::from("load")));
-        assert_eq!(events[0].metrics[0].kind, MetricKind::Gauge(0.5));
+        assert_eq!(events, batch.events, "decode(send(b)) must equal b, not just a few fields");
     }
 
+    /// Same whole-`Event` equality as the round-trip test above, plus a check the round-trip test
+    /// doesn't need: every datagram this sink actually put on the wire must itself fit the
+    /// configured cap -- a boundary bug that let one datagram's identity bleed into the next
+    /// (`pack_list`'s re-encode) could otherwise still decode to the right events while violating
+    /// the cap it was supposed to honor.
     #[tokio::test]
     async fn a_low_cap_packs_several_events_into_several_datagrams() {
         let (addr, collector) = udp_collector().await;
-        let mut output = CollectdOutput::udp(addr.to_string()).unwrap().with_max_packet_bytes(64);
+        const CAP: usize = 64;
+        let mut output = CollectdOutput::udp(addr.to_string()).unwrap().with_max_packet_bytes(CAP);
         let events: Vec<Event> =
             (0..10).map(|i| relay_event("web-1", &format!("p{i}"), i as f64)).collect();
         let batch = batch_with(events);
@@ -415,15 +445,22 @@ mod tests {
         output.send(&batch).await.expect("send should succeed");
         let datagrams = recv_task.await.unwrap();
         assert!(datagrams.len() > 1, "10 lists cannot fit one 64-byte datagram");
+        for datagram in &datagrams {
+            assert!(
+                datagram.len() <= CAP,
+                "a datagram of {} bytes exceeded the cap",
+                datagram.len()
+            );
+        }
 
         let mut decoder = CollectdDecoder::new(Arc::new(Resource::default()));
-        let mut events = Vec::new();
+        let mut decoded = Vec::new();
         for datagram in datagrams {
             decoder
-                .decode_into(bytes::Bytes::from(datagram), TS, &mut events)
+                .decode_into(bytes::Bytes::from(datagram), TS, &mut decoded)
                 .expect("every datagram must decode");
         }
-        assert_eq!(events.len(), 10);
+        assert_eq!(decoded, batch.events, "decode(send(b)) must equal b, not just a count");
     }
 
     #[tokio::test]
@@ -464,6 +501,52 @@ mod tests {
     async fn duplicate_safe_is_false() {
         let output = CollectdOutput::udp("127.0.0.1:0").unwrap();
         assert!(!output.duplicate_safe());
+    }
+
+    /// `with_encoder`/`with_max_packet_bytes` must be order-independent -- `StatsdOutput::
+    /// with_encoder`'s own precedent (`the_encoder_line_cap_follows_the_transport_at_build_time`).
+    /// A cap of 8 bytes is smaller than any real value list, so in either order the single event
+    /// below is dropped whole as oversize -- zero I/O either way -- rather than only when
+    /// `with_max_packet_bytes` happens to be called last.
+    #[tokio::test]
+    async fn the_encoder_cap_is_order_independent_with_with_encoder() {
+        let cap_then_encoder = CollectdOutput::udp("127.0.0.1:1")
+            .unwrap()
+            .with_max_packet_bytes(8)
+            .with_encoder(CollectdEncoder::new().with_hostname("fixture-host"));
+        let encoder_then_cap = CollectdOutput::udp("127.0.0.1:1")
+            .unwrap()
+            .with_encoder(CollectdEncoder::new().with_hostname("fixture-host"))
+            .with_max_packet_bytes(8);
+        for mut output in [cap_then_encoder, encoder_then_cap] {
+            let batch = batch_with(vec![relay_event("web-1", "load", 0.5)]);
+            output.send(&batch).await.expect("an all-dropped batch must not attempt any I/O");
+        }
+    }
+
+    /// `with_encoder` must not drop the diagnostics/telemetry handles a caller already installed
+    /// -- the other half of `StatsdOutput::with_encoder`'s precedent.
+    #[tokio::test]
+    async fn diagnostics_and_telemetry_survive_with_encoder_called_afterward() {
+        let registry = Registry::new();
+        let diag_registry = Registry::new();
+        let diag = Diagnostics::new("out").with_telemetry(diag_registry.telemetry_for(
+            "out/diag",
+            "collectd_out",
+            "sink",
+        ));
+        let mut output = CollectdOutput::udp("127.0.0.1:1")
+            .unwrap()
+            .with_telemetry(registry.telemetry_for("out", "collectd_out", "sink"))
+            .with_diagnostics(diag)
+            .with_encoder(CollectdEncoder::new());
+        // No `collectd.host`/`host.name`/configured `hostname:` -- dropped and counted through
+        // both handles, which only happens if `with_encoder` kept feeding them into the codec.
+        let batch = batch_with(vec![counter_event("hits", 1.0)]);
+        output.send(&batch).await.expect("nothing encodable means no I/O");
+
+        assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "no_host")));
+        assert!(counted(&diag_registry, "logit.component.diagnostics", ("key", "no_host")));
     }
 
     // -- Telemetry --------------------------------------------------------------------------
