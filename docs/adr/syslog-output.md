@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-02
+updated: 2026-09-11
 ---
 
 # Syslog egress: format, transport, and header-field precedence
@@ -204,3 +204,41 @@ for the same class of reason.
 - `docs/known-gaps.md`: new entries for no TLS, no RFC 5424 STRUCTURED-DATA emission, the
   backslash-escaping ambiguity, and the receipt-time-not-origin-time timestamp; the existing
   "syslog TCP and structured data" entry narrows to `syslog_in` staying UDP-only.
+
+## Amendment: TIMESTAMP, STRUCTURED-DATA, PROCID, and MSG are no longer always the fixed cases this ADR originally described
+
+[ADR `syslog-structured-data-convention`](syslog-structured-data-convention.md) lands the RFC 5424
+STRUCTURED-DATA convention `syslog.sd`, and with it, a set of related changes to `syslog_out` this
+ADR's original text stated more narrowly than they now hold. Nothing above is wrong for the case it
+was written against — an event whose `syslog.*` attributes carry only what the original decoder
+produced — but that decoder now produces more, and this sink now consults more of it.
+
+**TIMESTAMP is no longer always `event.timestamp` (receipt time).** The Decision section above says
+flatly: "A relayed message's TIMESTAMP is `event.timestamp`, never the `syslog.timestamp`
+attribute." That's superseded by a real precedence rule — see the new ADR's "Timestamp precedence"
+table: a resolved `syslog.timestamp` (`Value::Timestamp`, or a `Value::Str` verbatim on a 3164
+output) renders directly, and only an unresolvable or absent one falls through to `event.timestamp`
+as before. A `syslog_in -> syslog_out` relay of an RFC 5424 message now preserves the origin's own
+clock end to end; the receipt-time re-stamp this ADR originally accepted as unconditional now only
+happens for the cases the new ADR's table marks as falling through (chiefly a 3164-origin timestamp
+relayed onto a 5424 output, which still can't be resolved without guessing a year and timezone).
+
+**STRUCTURED-DATA is no longer always the NILVALUE `-`.** Every `syslog.sd` element an event
+carries — round-tripped from `syslog_in`, or attached by a transform reading the same attribute — is
+now rendered on a 5424 output, plus an opt-in extra element (`structured_data: { sd_id }`) built
+from an event's non-`syslog.*` attributes. `-` is now only what's written when neither produces
+anything, not the unconditional case this ADR's Decision section describes.
+
+**PROCID may be a string, not only a decimal number.** `syslog.pid` is `Value::U64` or `Value::Str`
+(RFC 5424's PROCID is free-form PRINTUSASCII, not necessarily numeric); `resolve_pid` and
+`write_rfc5424_header`/`write_rfc3164_header` render either shape — see the new ADR's `syslog.pid`
+section.
+
+**MSG may be raw bytes.** A non-UTF-8 `log.message` (`Value::Bytes`) is written raw, sanitized at
+the byte level, rather than requiring `Value::Str` as this ADR's "Message body" discussion (and
+`crates/logit_inputs::syslog`'s prior rejection of non-UTF-8 lines) implied.
+
+None of this changes this ADR's own decisions on format default, transport, delivery posture,
+injection safety, or sizing — see [ADR `syslog-structured-data-convention`](syslog-structured-data-convention.md)
+for the full STRUCTURED-DATA/timestamp/PROCID/MSG rules, and `docs/known-gaps.md` for which
+previously-accepted gaps this closes or narrows.

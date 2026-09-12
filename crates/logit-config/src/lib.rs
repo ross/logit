@@ -274,8 +274,10 @@ pub enum ComponentKind {
     /// RFC 3164 / RFC 5424 syslog over UDP. **Not** TCP, despite this doc comment's old claim --
     /// `crates/logit-inputs/src/syslog.rs`'s own module doc has always said UDP-only (nginx's
     /// `syslog:` writer is UDP-only, so a TCP accept loop would buy this listener nothing;
-    /// `docs/known-gaps.md`'s "syslog TCP and structured data" entry tracks it as future,
-    /// additive work). `syslog_out` (the egress side, `docs/adr/syslog-output.md`) supports
+    /// `docs/known-gaps.md`'s "`syslog_in` is UDP-only" entry tracks it as future, additive
+    /// work; RFC 5424 STRUCTURED-DATA is parsed into `syslog.sd`, see
+    /// `docs/adr/syslog-structured-data-convention.md`). `syslog_out` (the egress side,
+    /// `docs/adr/syslog-output.md`) supports
     /// both UDP and TCP -- that asymmetry is deliberate, not a sign this needs fixing to match.
     SyslogIn { bind: String },
     /// OpenTelemetry Protocol (logs, metrics, and/or traces).
@@ -834,6 +836,14 @@ pub enum ComponentKind {
         #[serde(default = "default_syslog_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
+        /// Opt-in RFC 5424 STRUCTURED-DATA element built from an event's own non-`syslog.*`
+        /// attributes -- absent (the default) means no such element is ever emitted; a
+        /// `syslog.sd` attribute (round-tripped from `syslog_in`) still renders regardless of
+        /// this setting. Ignored under `format: rfc3164` (RFC 3164 has no STRUCTURED-DATA field
+        /// at all). See `logit_outputs::syslog`'s module doc, "STRUCTURED-DATA" section, and
+        /// [`SyslogStructuredData`].
+        #[serde(default)]
+        structured_data: Option<SyslogStructuredData>,
     },
     /// statsd / DogStatsD egress over UDP or TCP -- the mirror of `StatsdIn`, and a real relay:
     /// names, values, and tags round-trip through the real decoder on the other end. See
@@ -1143,6 +1153,23 @@ pub enum SyslogFormat {
     Rfc3164,
     #[default]
     Rfc5424,
+}
+
+/// `syslog_out`'s opt-in extra RFC 5424 STRUCTURED-DATA element -- see `SyslogOut::
+/// structured_data`'s doc comment and `logit_outputs::syslog`'s module doc ("STRUCTURED-DATA"
+/// section) for the full semantics. `sd_id` must be a valid `SD-NAME` (RFC 5424 section 6.3.2: 1
+/// to 32 `PRINTUSASCII` characters excluding `=`, SP, `]`, `"`) containing exactly one `@` -- a
+/// private-enterprise-number-qualified id, e.g. `"myapp@12345"`. **No default PEN is shipped**:
+/// RFC 5424's own `32473` example (used throughout its spec text) is documentation only, never a
+/// real assignment -- registering a real PEN with IANA, or reusing one an operator already holds,
+/// is a decision for whoever turns this feature on, not something `logit` should default
+/// silently. `sd_id` is validated at pipeline-build time (`crates/logit-cli/src/pipeline.rs`'s
+/// `SyslogOut` arm, via `logit_outputs::syslog::SyslogEncoder::with_structured_data`), not by
+/// this type's own (de)serialization -- consistent with every other cross-field/format validation
+/// in this crate living in `logit-pipeline::graph` or the sink's own builder, not in `serde`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyslogStructuredData {
+    pub sd_id: String,
 }
 
 /// `statsd_out`'s transport. UDP (the default) matches classic statsd and DogStatsD clients;
@@ -1986,6 +2013,38 @@ mod tests {
         match component.kind {
             ComponentKind::Json { skip_to_brace } => assert!(skip_to_brace),
             other => panic!("expected Json, got {other:?}"),
+        }
+    }
+
+    /// `structured_data` is additive: an existing `syslog_out` config that predates this field
+    /// still deserializes, defaulting to `None` (no opt-in SD-ELEMENT emitted) rather than
+    /// failing or silently inventing an `sd_id`.
+    #[test]
+    fn syslog_out_without_structured_data_defaults_to_none() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "syslog_out", "endpoint": "127.0.0.1:514"}"#).unwrap();
+        match component.kind {
+            ComponentKind::SyslogOut { structured_data, .. } => {
+                assert_eq!(structured_data, None);
+            }
+            other => panic!("expected SyslogOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn syslog_out_structured_data_parses() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "syslog_out", "endpoint": "127.0.0.1:514", "structured_data": {"sd_id": "myapp@12345"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::SyslogOut { structured_data, .. } => {
+                assert_eq!(
+                    structured_data,
+                    Some(SyslogStructuredData { sd_id: "myapp@12345".to_string() })
+                );
+            }
+            other => panic!("expected SyslogOut, got {other:?}"),
         }
     }
 

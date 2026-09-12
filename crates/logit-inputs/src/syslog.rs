@@ -25,27 +25,64 @@
 //! unambiguous) would silently give two senders on one listener different timestamp semantics.
 //! The sender's own timestamp is not discarded -- it lands in the `syslog.timestamp` attribute
 //! (a [`Value::Timestamp`] for RFC 5424's RFC 3339 form, the raw [`Value::Str`] for RFC 3164's,
-//! which can't be resolved without guessing). See `docs/known-gaps.md` for the full writeup and
-//! the sketch of an opt-in `syslog_timestamp` transform that would make the guesswork explicit. A
+//! which can't be resolved without guessing). A nil RFC 5424 TIMESTAMP (`-`) now stamps
+//! `syslog.timestamp` as an explicit [`Value::Null`], rather than leaving the attribute simply
+//! absent -- `syslog_out` (and any Lua script) can then tell "the sender said no timestamp" apart
+//! from "this dialect never carries one at all" (RFC 3164's own timestamp-absent case, which still
+//! omits the attribute entirely, since there's no nil marker to distinguish "absent" from "not
+//! present in this grammar"). See `docs/known-gaps.md` for the full writeup and the sketch of an
+//! opt-in `syslog_timestamp` transform that would make the RFC 3164 guesswork explicit. A
 //! well-formed RFC 5424 TIMESTAMP that names an instant outside the representable `i64`-nanosecond
 //! range is kept as [`TimestampError::OutOfRange`] -- the event is emitted with `syslog.timestamp`
 //! omitted and a throttled diagnostic, not discarded ([`Malformed`](TimestampError::Malformed) is
 //! reserved for a TIMESTAMP that doesn't parse at all).
 //!
-//! **RFC 5424 STRUCTURED-DATA is parsed only enough to be skipped correctly** (balanced `[...]`
-//! honoring a backslash-escaped `]`) -- its contents are not merged into attributes. nginx emits
-//! none, and inventing a naming scheme for `[id@32473 k="v"]` without a consumer would be
-//! guesswork. Deliberate, marked gap; see `docs/known-gaps.md`.
+//! **RFC 5424 STRUCTURED-DATA is parsed into `syslog.sd`, not merely balanced-and-skipped.**
+//! [`parse_structured_data`] is a real, quote-aware RFC 5424 section 6.3 parser: the nil marker
+//! `-` produces no attribute at all; one or more `[SD-ID SP PARAM-NAME="PARAM-VALUE" ...]`
+//! SD-ELEMENTs produce `syslog.sd` = a [`Value::Map`] of `"<SD-ID>"` to a nested [`Value::Map`] of
+//! `"<PARAM-NAME>"` to [`Value::Str`] (or [`Value::Array`] of [`Value::Str`] for a PARAM-NAME
+//! repeated within one element) -- nested rather than flattened, because `SD-NAME` may itself
+//! contain `.`, which would make a flattened `syslog.sd.<id>.<param>` key ambiguous to reassemble;
+//! see the ADR at `../../../docs/adr/syslog-structured-data-convention.md` for the full rationale.
+//! `SD-NAME` (both `SD-ID` and `PARAM-NAME`) is 1..=32 bytes of PRINTUSASCII (`%d33-126`) excluding
+//! `=`, SP, `]`, and `"`; an `SD-ID` repeated within one message is a grammar violation (there's no
+//! defined merge for two elements sharing an id, so this project rejects rather than silently
+//! picking one), while a `PARAM-NAME` repeated *within one element* is legal and becomes the
+//! `Value::Array` above, in the order encountered. `PARAM-VALUE` is a quoted UTF-8 string in which
+//! exactly three sequences are escapes -- `\"`, `\\`, `\]` -- unescaped on decode; a backslash
+//! before any other byte is kept literally, along with that byte, rather than being treated as an
+//! unrecognized escape. Any STRUCTURED-DATA grammar violation rejects the whole line (a `bad_line`
+//! diagnostic naming what was violated and its byte offset), the same strictness every other
+//! malformed RFC 5424 field on this line already gets.
 //!
 //! **A leading RFC 5424 §6.4 UTF-8 BOM (`EF BB BF`) on MSG is stripped**, not left to leak into
-//! `log.message` as U+FEFF -- it's a `MSG-UTF8` signal, not payload. nginx never emits one.
+//! `log.message` as U+FEFF -- it's a `MSG-UTF8` signal, not payload. It's stripped only when the
+//! whole MSG (BOM included) is valid UTF-8, since the BOM's own bytes are themselves valid UTF-8
+//! and there is no `Value::Str` to strip a signal byte from otherwise (see the non-UTF-8 MSG case
+//! below). nginx never emits one.
 //!
-//! **Byte validity is checked per line, not per datagram.** [`SyslogDecoder::decode`] splits the
-//! raw datagram into lines on the `\n` byte *before* any UTF-8 validation, so one line containing
-//! an invalid UTF-8 byte -- most plausibly inside MSG-ANY, which RFC 5424 allows to hold arbitrary
-//! octets -- is skipped and diagnosed without dropping its sibling lines. A non-UTF-8 MSG on an
-//! otherwise well-formed line is still a malformed-line rejection rather than a `Value::Bytes`
-//! emission; see `docs/known-gaps.md`.
+//! **Header fields are parsed off raw bytes and validated individually; only MSG may hold
+//! non-UTF-8 bytes.** [`SyslogDecoder::decode_into`] splits the raw datagram into lines on the
+//! `\n` byte; no whole-line UTF-8 validation happens anywhere any more. PRI, the RFC 3164
+//! timestamp token, HOSTNAME, TAG/APP-NAME, PROCID, MSGID, and STRUCTURED-DATA are all
+//! PRINTUSASCII by grammar (a strict subset of UTF-8), and each is validated as such where it's
+//! extracted; a violation in an RFC 5424 field rejects the whole line exactly as before (RFC
+//! 3164's own header parse stays deliberately permissive and never itself fails, since the
+//! dialect-sniff fallback above depends on that -- an RFC 3164 HOSTNAME candidate that somehow
+//! isn't valid UTF-8 is simply not stamped as an attribute, rather than failing the line). MSG
+//! alone gets UTF-8-validated on its own, independent of every other field: valid UTF-8 decodes to
+//! [`Value::Str`] as always; invalid UTF-8 decodes to [`Value::Bytes`] instead of rejecting the
+//! line -- a non-UTF-8 payload (arbitrary binary MSG-ANY content RFC 5424 itself explicitly
+//! allows) is exactly the case this exists for.
+//!
+//! **`syslog.pid`** is [`Value::U64`] when PROCID (RFC 5424) or a `tag[pid]` bracket (RFC 3164)
+//! parses as one, and [`Value::Str`] of the raw token otherwise -- RFC 5424's PROCID is a
+//! free-form PRINTUSASCII string, not necessarily numeric, and this project now keeps it either
+//! way rather than dropping a non-numeric one. [`is_tag_shaped`] mirrors this for RFC 3164:
+//! bracket content that isn't all-digit still counts as TAG-shaped as long as it's PRINTUSASCII
+//! without `]` (so the bracket still unambiguously balances), rather than causing the whole token
+//! to be reclassified as "not TAG-shaped" and the `[...]` silently absorbed into the message body.
 //!
 //! ## The RFC 3164 header
 //!
@@ -64,13 +101,14 @@
 //!    `syslog.tag` attribute. **Bounding the search to two tokens is what makes this safe** -- an
 //!    unbounded "find the first `: `" scan would find one *inside* a JSON body on a tag-less
 //!    message and silently truncate the log line.
-//! 5. `tag[pid]:` splits into `syslog.tag` + `syslog.pid`.
+//! 5. `tag[pid]:` splits into `syslog.tag` + `syslog.pid` (`Value::U64` when the bracket content
+//!    parses as one, `Value::Str` otherwise -- see above).
 //!
 //! [`is_tag_shaped`] is deliberately stricter than "ends in `:` or `]:`" read literally: it also
 //! requires the token's body to look like a process name (letters, digits, `_`, `-`, `.`, `/`,
-//! optionally followed by `[<digits>]`). Without that restriction, a tag-less message whose first
-//! JSON key happens to have a space after its colon (`{"status": 200, ...}`) would see its very
-//! first whitespace-delimited token (`{"status":`) misclassified as TAG-shaped, since it does
+//! optionally followed by a bracketed PID). Without that restriction, a tag-less message whose
+//! first JSON key happens to have a space after its colon (`{"status": 200, ...}`) would see its
+//! very first whitespace-delimited token (`{"status":`) misclassified as TAG-shaped, since it does
 //! technically end in `:` -- silently eating part of the body as a fake tag. Restricting the
 //! character class rules that out: `{"status"` contains `{`/`"`, which no real tag ever does.
 
@@ -133,6 +171,14 @@ impl SyslogInput {
         self.inner = self.inner.with_config(config);
         self
     }
+
+    /// Passthrough to the wrapped [`UdpListener::local_addr`] -- lets a caller (`crates/
+    /// logit-cli/tests/syslog_round_trip.rs`) learn the real ephemeral port after `bind()`,
+    /// mirroring `otlp_round_trip.rs`'s own `Input::bind`-then-`local_addr` readiness pattern,
+    /// with no bind-drop race.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
 }
 
 #[async_trait::async_trait]
@@ -188,9 +234,9 @@ impl Decoder for SyslogDecoder {
     ) -> Result<(Arc<Resource>, Option<Arc<Scope>>), CodecError> {
         // Per line, not per datagram -- exactly `StatsdDecoder::decode_into`'s precedent. nginx's
         // `escape=json` guarantees no raw newline inside an access-log body, so this split is
-        // safe for the target workload. Splitting happens on the raw bytes, before any UTF-8
-        // validation, so one line with an invalid UTF-8 byte can't reject its siblings -- see the
-        // module doc's "Byte validity" note.
+        // safe for the target workload. Splitting happens on the raw bytes; there is no
+        // whole-line UTF-8 validation here any more -- `parse_line` validates each header field
+        // individually and only MSG is allowed to carry non-UTF-8 bytes (see the module doc).
         let mut start = 0usize;
         while start <= bytes.len() {
             let nl = bytes[start..].iter().position(|&b| b == b'\n');
@@ -202,18 +248,10 @@ impl Decoder for SyslogDecoder {
             // Only a truly empty record (a bare newline used as a separator) is skipped here --
             // *not* whitespace-only content, which is real MSG data, not framing.
             if !line.is_empty() {
-                match std::str::from_utf8(&line) {
-                    Ok(text) => match parse_line(&line, text, received_at, &mut self.diag) {
-                        Ok(event) => out.push(event),
-                        Err(err) => {
-                            self.diag.warn_throttled("bad_line", err);
-                        }
-                    },
-                    Err(e) => {
-                        self.diag.warn_throttled(
-                            "bad_line",
-                            CodecError::Malformed(format!("invalid utf-8: {e}")),
-                        );
+                match parse_line(&line, received_at, &mut self.diag) {
+                    Ok(event) => out.push(event),
+                    Err(err) => {
+                        self.diag.warn_throttled("bad_line", err);
                     }
                 }
             }
@@ -227,34 +265,27 @@ impl Decoder for SyslogDecoder {
     }
 }
 
-/// Reconstructs a `Bytes` sharing the line's underlying allocation for `sub`, a substring derived
-/// (through ordinary `&str` slicing -- `split`, indexing) from `text`, which in turn was parsed
-/// directly out of `bytes` via `str::from_utf8`. Because `sub` is always obtained by slicing
-/// `text` rather than by copying or reconstructing it, this pointer-arithmetic round-trip always
-/// lands inside `bytes`'s allocation -- unlike `logit-transforms::json::borrowed_str_bytes`, which
-/// guards against a non-subset because a serde_json-unescaped string can legitimately live outside
-/// the input buffer, there is no such case here, so no fallback copy is needed. See
-/// `docs/design/data-model.md`'s "`bytes::Bytes` everywhere strings and blobs appear" -- this is
-/// what keeps `message` (and every other extracted field) a zero-copy slice of the original
-/// datagram, since `bytes` (the line) is itself a zero-copy `Bytes::slice` of the datagram passed
-/// into [`SyslogDecoder::decode`].
-fn slice_of(bytes: &Bytes, text: &str, sub: &str) -> Bytes {
-    let text_start = text.as_ptr() as usize;
+/// Reconstructs a `Bytes` sharing `line`'s underlying allocation for `sub`, a byte slice derived
+/// from `line` through ordinary slicing (never copied or reconstructed) -- so `sub`'s pointer
+/// always lands inside `line`'s allocation, and the offset computed here is always non-negative
+/// and in-bounds. See `docs/design/data-model.md`'s "`bytes::Bytes` everywhere strings and blobs
+/// appear" -- this is what keeps every extracted field a zero-copy slice of the original
+/// datagram. Not used for anything derived by unescaping (RFC 5424 STRUCTURED-DATA's PARAM-VALUE)
+/// -- that content isn't a subslice of anything and is wrapped directly via `Bytes::from` instead.
+fn slice_of(line: &Bytes, sub: &[u8]) -> Bytes {
+    let line_start = line.as_ptr() as usize;
     let sub_start = sub.as_ptr() as usize;
-    let start = sub_start - text_start;
-    bytes.slice(start..start + sub.len())
+    let start = sub_start - line_start;
+    line.slice(start..start + sub.len())
 }
 
 /// Splits `s` at the first ASCII space, returning `(token, rest)` with the space itself consumed.
 /// `rest` is an empty slice positioned at the end of `s` when there is no more space in `s` (the
-/// whole of `s` becomes the token) -- deliberately `&s[s.len()..]` rather than the literal `""`,
-/// so `rest` is always a genuine substring of `s` with a pointer inside `s`'s allocation. Callers
-/// (`parse_3164`, `parse_5424`) feed tokens straight into [`slice_of`], whose pointer-arithmetic
-/// round-trip is only sound when its `sub` argument really is a slice of the buffer it came from;
-/// the static `""` literal used to violate that silently and take the listener down (see the
-/// regression tests below).
-fn split_first_token(s: &str) -> (&str, &str) {
-    match s.find(' ') {
+/// whole of `s` becomes the token) -- deliberately `&s[s.len()..]` rather than the literal `b""`,
+/// so `rest` is always a genuine subslice of `s` with a pointer inside `s`'s allocation, which
+/// [`slice_of`]'s precondition depends on.
+fn split_first_token(s: &[u8]) -> (&[u8], &[u8]) {
+    match s.iter().position(|&b| b == b' ') {
         Some(i) => (&s[..i], &s[i + 1..]),
         None => (s, &s[s.len()..]),
     }
@@ -274,41 +305,49 @@ fn map_severity(n: u32) -> Severity {
     }
 }
 
-/// Parses one non-empty line, already isolated as a valid-UTF-8 `Bytes` slice of the original
-/// datagram by [`SyslogDecoder::decode`]. `bytes`/`text` are that one line -- the same slice, as
-/// `Bytes` and as the `&str` view `str::from_utf8` produced from it -- passed through so every
-/// extracted field (`message`, `syslog.tag`, ...) can be sliced zero-copy out of `bytes` via
-/// [`slice_of`]. `diag` is threaded down to [`parse_5424`], which uses it to report a
-/// well-formed-but-unrepresentable TIMESTAMP without failing the whole line over it.
-fn parse_line(
-    bytes: &Bytes,
-    text: &str,
-    recv_ts: i64,
-    diag: &mut Diagnostics,
-) -> Result<Event, CodecError> {
-    let malformed = || CodecError::Malformed(format!("malformed syslog line: {text:?}"));
+/// `true` for every byte in RFC 5424's PRINTUSASCII class (`%d33-126`).
+fn is_printusascii_byte(b: u8) -> bool {
+    (33..=126).contains(&b)
+}
 
-    if !text.starts_with('<') {
+/// `true` when every byte of `b` is PRINTUSASCII -- the character class RFC 5424 uses for
+/// HOSTNAME, APP-NAME, PROCID, MSGID, and (further restricted below) `SD-NAME`.
+fn is_printusascii(b: &[u8]) -> bool {
+    b.iter().all(|&c| is_printusascii_byte(c))
+}
+
+/// Parses one non-empty line, already isolated as a `Bytes` slice of the original datagram by
+/// [`SyslogDecoder::decode_into`] -- not yet validated as UTF-8 anywhere; that validation now
+/// happens field-by-field below (PRINTUSASCII for every header field, UTF-8-or-`Bytes` for MSG
+/// alone). `diag` is threaded down to [`parse_5424`], which uses it to report a
+/// well-formed-but-unrepresentable TIMESTAMP without failing the whole line over it.
+fn parse_line(line: &Bytes, recv_ts: i64, diag: &mut Diagnostics) -> Result<Event, CodecError> {
+    let malformed = || {
+        CodecError::Malformed(format!("malformed syslog line: {:?}", String::from_utf8_lossy(line)))
+    };
+
+    if line.first() != Some(&b'<') {
         return Err(malformed());
     }
-    let after_lt = &text[1..];
-    let gt = after_lt.find('>').ok_or_else(malformed)?;
+    let after_lt = &line[1..];
+    let gt = after_lt.iter().position(|&b| b == b'>').ok_or_else(malformed)?;
     // 1-3 digits between '<' and '>'.
     if gt == 0 || gt > 3 {
         return Err(malformed());
     }
     let digits = &after_lt[..gt];
-    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if !digits.iter().all(|b| b.is_ascii_digit()) {
         return Err(malformed());
     }
     // RFC 3164 and RFC 5424 both define PRI as facility*8+severity in 0..=191, encoded with no
     // leading zero except the literal value `0`. `<013>` and `<192>..<999>` are therefore
     // malformed, not merely unusual: accepting them would attach an impossible facility/severity
     // (e.g. facility 124 for `<999>`) to the event.
-    if digits.len() > 1 && digits.starts_with('0') {
+    if digits.len() > 1 && digits[0] == b'0' {
         return Err(malformed());
     }
-    let pri: u32 = digits.parse().map_err(|_| malformed())?;
+    let pri: u32 =
+        std::str::from_utf8(digits).expect("digits are ASCII").parse().map_err(|_| malformed())?;
     if pri > 191 {
         return Err(malformed());
     }
@@ -320,24 +359,14 @@ fn parse_line(
 
     // Disambiguate: a leading version digit followed by a space means RFC 5424; anything else is
     // RFC 3164.
-    let mut chars = after_pri.char_indices();
-    let is_5424_after = match (chars.next(), chars.next()) {
-        (Some((_, c0)), Some((i1, ' '))) if c0.is_ascii_digit() => Some((c0, &after_pri[i1 + 1..])),
+    let is_5424_after = match (after_pri.first(), after_pri.get(1)) {
+        (Some(&c0), Some(&b' ')) if c0.is_ascii_digit() => Some((c0 as char, &after_pri[2..])),
         _ => None,
     };
 
     match is_5424_after {
         Some((version, after_version)) => {
-            match parse_5424(
-                bytes,
-                text,
-                after_version,
-                facility,
-                severity_num,
-                severity,
-                recv_ts,
-                diag,
-            ) {
+            match parse_5424(line, after_version, facility, severity_num, severity, recv_ts, diag) {
                 Ok(event) => Ok(event),
                 // The sniff above only checks "digit, then space" -- RFC 5424's VERSION is
                 // `NONZERO-DIGIT 0*2DIGIT`, so a tag-less RFC 3164 line whose MSG happens to start
@@ -364,19 +393,11 @@ fn parse_line(
                              ({err}); reparsing the line as RFC 3164"
                         ),
                     );
-                    Ok(parse_3164(
-                        bytes,
-                        text,
-                        after_pri,
-                        facility,
-                        severity_num,
-                        severity,
-                        recv_ts,
-                    ))
+                    Ok(parse_3164(line, after_pri, facility, severity_num, severity, recv_ts, diag))
                 }
             }
         }
-        None => Ok(parse_3164(bytes, text, after_pri, facility, severity_num, severity, recv_ts)),
+        None => Ok(parse_3164(line, after_pri, facility, severity_num, severity, recv_ts, diag)),
     }
 }
 
@@ -384,55 +405,61 @@ fn parse_line(
 /// a space- or zero-padded day, ' ', `hh:mm:ss`). Returns `(timestamp, rest)` with exactly one
 /// following space consumed from `rest` when present; `None` when absent -- tolerated, per
 /// nginx's occasional omission of fields RFC 3164 calls mandatory.
-fn parse_3164_timestamp(s: &str) -> Option<(&str, &str)> {
-    if !s.is_char_boundary(15) {
+fn parse_3164_timestamp(s: &[u8]) -> Option<(&[u8], &[u8])> {
+    if s.len() < 15 {
         return None;
     }
     let ts = &s[..15];
-    let b = ts.as_bytes();
-    let digit = |i: usize| b[i].is_ascii_digit();
-    let ok = b[0].is_ascii_alphabetic()
-        && b[1].is_ascii_alphabetic()
-        && b[2].is_ascii_alphabetic()
-        && b[3] == b' '
-        && (b[4] == b' ' || digit(4))
+    let digit = |i: usize| ts[i].is_ascii_digit();
+    let ok = ts[0].is_ascii_alphabetic()
+        && ts[1].is_ascii_alphabetic()
+        && ts[2].is_ascii_alphabetic()
+        && ts[3] == b' '
+        && (ts[4] == b' ' || digit(4))
         && digit(5)
-        && b[6] == b' '
+        && ts[6] == b' '
         && digit(7)
         && digit(8)
-        && b[9] == b':'
+        && ts[9] == b':'
         && digit(10)
         && digit(11)
-        && b[12] == b':'
+        && ts[12] == b':'
         && digit(13)
         && digit(14);
     if !ok {
         return None;
     }
     let after = &s[15..];
-    Some((ts, after.strip_prefix(' ').unwrap_or(after)))
+    Some((ts, after.strip_prefix(b" ").unwrap_or(after)))
 }
 
 /// A token qualifies as a syslog TAG if it ends in `:` (which includes `name[pid]:`, since that
 /// ends in `]:`... followed by `:`) *and* everything before that trailing colon looks like a
 /// process name -- see the module doc comment for why this is stricter than "ends in `:`" read
 /// literally.
-fn is_tag_shaped(token: &str) -> bool {
-    let Some(body) = token.strip_suffix(':') else { return false };
+fn is_tag_shaped(token: &[u8]) -> bool {
+    let Some(body) = token.strip_suffix(b":") else { return false };
     if body.is_empty() {
         return false;
     }
-    let name = if let Some(open) = body.rfind('[') {
-        if !body.ends_with(']') {
+    let name = if let Some(open) = body.iter().rposition(|&b| b == b'[') {
+        if body.last() != Some(&b']') {
             return false;
         }
         let pid = &body[open + 1..body.len() - 1];
-        // Must fit `u64` (what `syslog.pid` is stored as), not merely be all-digit -- an
-        // unauthenticated sender can otherwise put an arbitrarily long digit run in `[...]` and
-        // panic the listener at the `.parse().expect(...)` call site in `parse_3164`. A PID this
-        // large is never real, so falling through to "not TAG-shaped" (the whole token, and thus
-        // the rest of the line, is treated as an untagged message) is correct, not just safe.
-        if pid.is_empty() || pid.parse::<u64>().is_err() {
+        if pid.is_empty() {
+            return false;
+        }
+        // A numeric PID that fits `u64` (what `syslog.pid` stores it as when it parses) is the
+        // common case. RFC 5424's own PROCID grammar allows any PRINTUSASCII string though, and
+        // this project keeps a non-numeric PROCID as `Value::Str` rather than dropping it -- so a
+        // 3164 sender's non-numeric bracket content is accepted here too (as long as it's
+        // PRINTUSASCII without `]`, so the bracket still unambiguously balances), rather than
+        // causing the whole token to be reclassified as "not TAG-shaped" and the `[...]` silently
+        // absorbed into the message body. See the module doc's `syslog.pid` section.
+        let numeric_fits_u64 = pid.iter().all(|b| b.is_ascii_digit())
+            && std::str::from_utf8(pid).is_ok_and(|s| s.parse::<u64>().is_ok());
+        if !numeric_fits_u64 && !pid.iter().all(|&b| is_printusascii_byte(b) && b != b']') {
             return false;
         }
         &body[..open]
@@ -440,18 +467,17 @@ fn is_tag_shaped(token: &str) -> bool {
         body
     };
     !name.is_empty()
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
+        && name.iter().all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn parse_3164(
-    bytes: &Bytes,
-    text: &str,
-    after_pri: &str,
+    line: &Bytes,
+    after_pri: &[u8],
     facility: u32,
     severity_num: u32,
     severity: Severity,
     recv_ts: i64,
+    diag: &mut Diagnostics,
 ) -> Event {
     let (ts_token, after_ts) = match parse_3164_timestamp(after_pri) {
         Some((ts, rest)) => (Some(ts), rest),
@@ -476,30 +502,53 @@ fn parse_3164(
     attrs.insert("syslog.facility", Value::U64(facility as u64));
     attrs.insert("syslog.severity", Value::U64(severity_num as u64));
     if let Some(ts) = ts_token {
-        attrs.insert("syslog.timestamp", Value::Str(slice_of(bytes, text, ts)));
+        // ASCII by construction -- `parse_3164_timestamp` only accepts alphabetic/digit/space/
+        // colon bytes.
+        attrs.insert("syslog.timestamp", Value::Str(slice_of(line, ts)));
     }
     if let Some(host) = hostname {
         if !host.is_empty() {
-            attrs.insert("syslog.hostname", Value::Str(slice_of(bytes, text, host)));
+            // RFC 3164 parsing never fails outright (the version-sniff fallback in `parse_line`
+            // depends on that): a HOSTNAME candidate that somehow isn't valid UTF-8 is simply not
+            // stamped as an attribute, rather than rejecting the whole line or violating
+            // `Value::Str`'s "always valid UTF-8" invariant -- reported through a throttled
+            // `hostname_not_utf8` diagnostic instead, so the skip stays observable (before
+            // `syslog.sd` parsing existed, a non-UTF-8 line failed whole-line UTF-8 validation
+            // and was rejected with its own diagnostic; this keeps that observability for what is
+            // now a partial, per-field loss instead of a whole-line rejection).
+            if std::str::from_utf8(host).is_ok() {
+                attrs.insert("syslog.hostname", Value::Str(slice_of(line, host)));
+            } else {
+                diag.warn_throttled(
+                    "hostname_not_utf8",
+                    format_args!(
+                        "syslog_in: RFC 3164 HOSTNAME token {:?} is not valid UTF-8; skipping \
+                         the syslog.hostname attribute",
+                        String::from_utf8_lossy(host)
+                    ),
+                );
+            }
         }
     }
     if let Some(tag_token) = tag {
         let tag_body = &tag_token[..tag_token.len() - 1]; // strip the trailing ':'
-        if let Some(open) = tag_body.rfind('[') {
-            // `is_tag_shaped` already validated the `[<digits>]` shape.
+        if let Some(open) = tag_body.iter().rposition(|&b| b == b'[') {
+            // `is_tag_shaped` already validated the bracketed-PID shape.
             let name = &tag_body[..open];
-            let pid_str = &tag_body[open + 1..tag_body.len() - 1];
-            attrs.insert("syslog.tag", Value::Str(slice_of(bytes, text, name)));
-            attrs.insert(
-                "syslog.pid",
-                Value::U64(pid_str.parse().expect("is_tag_shaped validated the PID fits u64")),
-            );
+            let pid_bytes = &tag_body[open + 1..tag_body.len() - 1];
+            attrs.insert("syslog.tag", Value::Str(slice_of(line, name)));
+            match std::str::from_utf8(pid_bytes).ok().and_then(|s| s.parse::<u64>().ok()) {
+                Some(n) => attrs.insert("syslog.pid", Value::U64(n)),
+                // `is_tag_shaped` guarantees `pid_bytes` is PRINTUSASCII (hence valid UTF-8) when
+                // it isn't a `u64`, so this `Value::Str` construction can't violate its invariant.
+                None => attrs.insert("syslog.pid", Value::Str(slice_of(line, pid_bytes))),
+            }
         } else {
-            attrs.insert("syslog.tag", Value::Str(slice_of(bytes, text, tag_body)));
+            attrs.insert("syslog.tag", Value::Str(slice_of(line, tag_body)));
         }
     }
 
-    let message = Value::Str(slice_of(bytes, text, msg));
+    let message = message_value(line, msg, false);
     Event::log(
         recv_ts,
         attrs,
@@ -517,138 +566,326 @@ fn parse_3164(
 
 /// `-` (the RFC 5424 nil value) or an empty field both mean "absent" -- every nillable field
 /// (HOSTNAME, APP-NAME, PROCID, MSGID, TIMESTAMP) is treated identically.
-fn nil_or(field: &str) -> Option<&str> {
-    if field.is_empty() || field == "-" {
+fn nil_or(field: &[u8]) -> Option<&[u8]> {
+    if field.is_empty() || field == b"-" {
         None
     } else {
         Some(field)
     }
 }
 
-fn field_value(bytes: &Bytes, text: &str, field: &str) -> Option<Value> {
-    nil_or(field).map(|f| Value::Str(slice_of(bytes, text, f)))
+/// Validates and slices one non-nil RFC 5424 header field (HOSTNAME, APP-NAME, or MSGID -- PROCID
+/// is handled separately in [`parse_5424`] since it has a numeric/string split `syslog.pid`
+/// cares about). `label` names the field in the error message. A field that isn't PRINTUSASCII is
+/// a grammar violation, consistent with this dialect's strictness elsewhere.
+fn field_value(line: &Bytes, field: &[u8], label: &str) -> Result<Option<Value>, CodecError> {
+    match nil_or(field) {
+        None => Ok(None),
+        Some(f) => {
+            if !is_printusascii(f) {
+                return Err(CodecError::Malformed(format!(
+                    "malformed RFC 5424 syslog line: {label} {:?} is not PRINTUSASCII",
+                    String::from_utf8_lossy(f)
+                )));
+            }
+            Ok(Some(Value::Str(slice_of(line, f))))
+        }
+    }
 }
 
-/// Parses (and discards the contents of) RFC 5424 STRUCTURED-DATA: either the nil marker `-`, or
-/// one or more concatenated `[...]` SD-ELEMENTs. Honors a backslash-escaped `]` inside a
-/// parameter value (RFC 5424 section 6.3.3) so it can't terminate an element early. Returns the
-/// byte offset into `s` where MSG begins, having consumed exactly one following space when
-/// present. `None` means neither a nil marker nor a well-formed bracketed element was found (an
-/// unbalanced `[` runs off the end of `s`) -- a malformed line.
-fn skip_structured_data(s: &str) -> Option<usize> {
-    if let Some(rest) = s.strip_prefix('-') {
-        return Some(1 + if rest.starts_with(' ') { 1 } else { 0 });
+/// Builds the MSG [`Value`]: valid UTF-8 becomes [`Value::Str`] (stripping a leading BOM when
+/// `strip_bom` is set and the BOM is followed by more valid UTF-8 -- see the module doc); invalid
+/// UTF-8 becomes [`Value::Bytes`], raw, with no BOM handling (there is no `MSG-UTF8` signal to
+/// strip from bytes that were never `MSG-UTF8` to begin with).
+fn message_value(line: &Bytes, msg: &[u8], strip_bom: bool) -> Value {
+    match std::str::from_utf8(msg) {
+        Ok(s) => {
+            let s = if strip_bom { s.strip_prefix('\u{FEFF}').unwrap_or(s) } else { s };
+            Value::Str(slice_of(line, s.as_bytes()))
+        }
+        Err(_) => Value::Bytes(slice_of(line, msg)),
     }
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut any = false;
-    while bytes.get(i) == Some(&b'[') {
-        any = true;
-        i += 1;
-        let mut escaped = false;
-        loop {
-            match bytes.get(i) {
-                None => return None,
-                Some(b']') if !escaped => {
-                    i += 1;
-                    break;
+}
+
+/// One RFC 5424 STRUCTURED-DATA grammar violation, with a byte offset relative to the start of
+/// the slice [`parse_structured_data`] was called with -- the caller adds its own base offset
+/// within the line to produce an absolute position for its `bad_line` diagnostic.
+#[derive(Debug)]
+struct SdError {
+    offset: usize,
+    message: String,
+}
+
+impl SdError {
+    fn new(offset: usize, message: impl Into<String>) -> Self {
+        Self { offset, message: message.into() }
+    }
+}
+
+/// `true` for every byte RFC 5424's `SD-NAME` grammar allows: PRINTUSASCII excluding `=`, `]`,
+/// and `"` (space is already excluded by the PRINTUSASCII range itself).
+fn is_sd_name_byte(b: u8) -> bool {
+    is_printusascii_byte(b) && !matches!(b, b'=' | b']' | b'"')
+}
+
+/// Parses one `SD-NAME` (an `SD-ID` or `PARAM-NAME`): 1..=32 bytes of [`is_sd_name_byte`].
+/// Advances `*pos` past the name and returns its byte slice.
+fn parse_sd_name<'a>(s: &'a [u8], pos: &mut usize) -> Result<&'a [u8], SdError> {
+    let start = *pos;
+    while s.get(*pos).is_some_and(|&b| is_sd_name_byte(b)) {
+        *pos += 1;
+    }
+    let name = &s[start..*pos];
+    if name.is_empty() {
+        return Err(SdError::new(start, "expected an SD-NAME"));
+    }
+    if name.len() > 32 {
+        return Err(SdError::new(
+            start,
+            format!(
+                "SD-NAME {:?} is {} bytes, longer than RFC 5424's 32-byte limit",
+                String::from_utf8_lossy(name),
+                name.len()
+            ),
+        ));
+    }
+    Ok(name)
+}
+
+/// Parses one `PARAM-VALUE`'s content after the opening `"`, up to and consuming the closing `"`.
+/// Unescapes RFC 5424 section 6.3.3's three escapes (`\"`, `\\`, `\]`); a backslash before any
+/// other byte is kept literally, along with that byte, rather than treated as an error or a
+/// no-op. Returns the unescaped bytes; the caller validates them as UTF-8 (`PARAM-VALUE` is
+/// defined as `UTF-8-STRING`).
+fn parse_param_value(s: &[u8], pos: &mut usize) -> Result<Vec<u8>, SdError> {
+    let mut out = Vec::new();
+    loop {
+        match s.get(*pos) {
+            None => {
+                return Err(SdError::new(*pos, "unterminated PARAM-VALUE (missing closing '\"')"))
+            }
+            Some(b'"') => {
+                *pos += 1;
+                return Ok(out);
+            }
+            Some(b'\\') => {
+                *pos += 1;
+                match s.get(*pos) {
+                    Some(&b @ (b'"' | b'\\' | b']')) => {
+                        out.push(b);
+                        *pos += 1;
+                    }
+                    Some(&other) => {
+                        out.push(b'\\');
+                        out.push(other);
+                        *pos += 1;
+                    }
+                    None => {
+                        return Err(SdError::new(
+                            *pos,
+                            "unterminated PARAM-VALUE (trailing backslash)",
+                        ))
+                    }
                 }
-                Some(b'\\') if !escaped => {
-                    escaped = true;
-                    i += 1;
-                }
-                Some(_) => {
-                    escaped = false;
-                    i += 1;
-                }
+            }
+            Some(&b) => {
+                out.push(b);
+                *pos += 1;
             }
         }
     }
-    if !any {
-        return None;
+}
+
+/// Inserts one `PARAM-NAME`/value pair into `inner`. A repeated `PARAM-NAME` within the same
+/// SD-ELEMENT becomes a `Value::Array` of `Value::Str`, in the order encountered -- RFC 5424
+/// doesn't forbid repetition, and this project's `syslog.sd` convention keeps every occurrence
+/// rather than the last-write-wins an ordinary `AttrMap::insert` would give.
+fn insert_param(inner: &mut AttrMap, name: &str, value: Bytes) {
+    let value = Value::Str(value);
+    let merged = match inner.remove(name) {
+        None => value,
+        Some(Value::Array(mut arr)) => {
+            arr.push(value);
+            Value::Array(arr)
+        }
+        Some(existing) => Value::Array(vec![existing, value]),
+    };
+    inner.insert(name, merged);
+}
+
+/// Parses RFC 5424 STRUCTURED-DATA (section 6.3): the nil marker `-`, or one or more concatenated
+/// `[SD-ID SP PARAM-NAME="PARAM-VALUE" ...]` SD-ELEMENTs. Returns the parsed `syslog.sd` value
+/// (`None` for nil) and the byte offset into `s` where MSG begins, having consumed exactly one
+/// following space when present -- the same "consumed one following space" contract
+/// [`skip_structured_data`](self) (this function's predecessor) used. An `Err` names what grammar
+/// rule was violated and where, relative to the start of `s`.
+fn parse_structured_data(s: &[u8]) -> Result<(Option<Value>, usize), SdError> {
+    if let Some(rest) = s.strip_prefix(b"-") {
+        return Ok((None, 1 + usize::from(rest.first() == Some(&b' '))));
     }
-    if bytes.get(i) == Some(&b' ') {
-        i += 1;
+    if s.first() != Some(&b'[') {
+        return Err(SdError::new(0, "expected '-' (nil) or '[' (the start of an SD-ELEMENT)"));
     }
-    Some(i)
+
+    let mut pos = 0usize;
+    let mut sd = AttrMap::new();
+    while s.get(pos) == Some(&b'[') {
+        let elem_start = pos;
+        pos += 1;
+        let id_bytes = parse_sd_name(s, &mut pos)?;
+        let id = std::str::from_utf8(id_bytes)
+            .expect("parse_sd_name only accepts PRINTUSASCII, always valid UTF-8");
+        if sd.get(id).is_some() {
+            return Err(SdError::new(elem_start, format!("duplicate SD-ID {id:?}")));
+        }
+
+        let mut inner = AttrMap::new();
+        loop {
+            match s.get(pos) {
+                Some(b']') => {
+                    pos += 1;
+                    break;
+                }
+                Some(b' ') => {
+                    pos += 1;
+                    let name_bytes = parse_sd_name(s, &mut pos)?;
+                    let name = std::str::from_utf8(name_bytes)
+                        .expect("parse_sd_name only accepts PRINTUSASCII, always valid UTF-8");
+                    if s.get(pos) != Some(&b'=') {
+                        return Err(SdError::new(
+                            pos,
+                            format!("expected '=' after PARAM-NAME {name:?}"),
+                        ));
+                    }
+                    pos += 1;
+                    if s.get(pos) != Some(&b'"') {
+                        return Err(SdError::new(pos, "expected opening '\"' for PARAM-VALUE"));
+                    }
+                    pos += 1;
+                    let value_start = pos;
+                    let value_bytes = parse_param_value(s, &mut pos)?;
+                    let value = String::from_utf8(value_bytes).map_err(|_| {
+                        SdError::new(value_start, "PARAM-VALUE is not valid UTF-8 once unescaped")
+                    })?;
+                    insert_param(&mut inner, name, Bytes::from(value));
+                }
+                Some(_) => {
+                    return Err(SdError::new(pos, "expected SP or ']' inside SD-ELEMENT"));
+                }
+                None => {
+                    return Err(SdError::new(pos, "unterminated SD-ELEMENT (missing ']')"));
+                }
+            }
+        }
+        sd.insert(id, Value::Map(Box::new(inner)));
+    }
+
+    if s.get(pos) == Some(&b' ') {
+        pos += 1;
+    }
+    Ok((Some(Value::Map(Box::new(sd))), pos))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn parse_5424(
-    bytes: &Bytes,
-    text: &str,
-    after_version: &str,
+    line: &Bytes,
+    after_version: &[u8],
     facility: u32,
     severity_num: u32,
     severity: Severity,
     recv_ts: i64,
     diag: &mut Diagnostics,
 ) -> Result<Event, CodecError> {
-    let malformed = || CodecError::Malformed(format!("malformed RFC 5424 syslog line: {text:?}"));
+    let malformed =
+        |detail: String| CodecError::Malformed(format!("malformed RFC 5424 syslog line: {detail}"));
 
     let (ts_field, rest) = split_first_token(after_version);
     let (host_field, rest) = split_first_token(rest);
     let (app_field, rest) = split_first_token(rest);
     let (procid_field, rest) = split_first_token(rest);
     let (msgid_field, rest) = split_first_token(rest);
-    let sd_offset = skip_structured_data(rest).ok_or_else(malformed)?;
+    // Base offset of the STRUCTURED-DATA field within `line`, used only to translate an `SdError`
+    // (relative to `rest`) into an absolute byte offset for the `bad_line` diagnostic. `rest` is
+    // always a genuine subslice of `line` (built entirely through `split_first_token`), so this
+    // pointer subtraction is sound the same way `slice_of`'s is.
+    let sd_base = rest.as_ptr() as usize - line.as_ptr() as usize;
+    let (sd_value, sd_offset) = parse_structured_data(rest).map_err(|e| {
+        malformed(format!("STRUCTURED-DATA at byte {}: {}", sd_base + e.offset, e.message))
+    })?;
     let msg = &rest[sd_offset..];
 
     let mut attrs = AttrMap::new();
     attrs.insert("syslog.facility", Value::U64(facility as u64));
     attrs.insert("syslog.severity", Value::U64(severity_num as u64));
-    // A nil TIMESTAMP (`-`) means "absent", same as every other nillable field -- but a non-nil
-    // TIMESTAMP that fails to parse is not "absent", it's malformed input, and must take the same
-    // skip-and-continue path a bad PRI does rather than silently landing on the floor with no
-    // `syslog.timestamp` attribute and no diagnostic. A TIMESTAMP that *does* parse but names an
-    // instant outside the `i64` nanosecond range `Value::Timestamp` uses is a different condition
-    // from malformed, though: the line and every other field on it are still good, so it's kept,
-    // with `syslog.timestamp` omitted and a throttled diagnostic instead of the whole record
-    // being discarded over one unrepresentable field.
+    // A nil TIMESTAMP (`-`) now stamps an explicit `Value::Null` -- distinct from "this decoder
+    // never looked" -- but a non-nil TIMESTAMP that fails to parse is not "absent", it's
+    // malformed input, and must take the same skip-and-continue path a bad PRI does rather than
+    // silently landing on the floor with no `syslog.timestamp` attribute and no diagnostic. A
+    // TIMESTAMP that *does* parse but names an instant outside the `i64` nanosecond range
+    // `Value::Timestamp` uses is a different condition from malformed, though: the line and every
+    // other field on it are still good, so it's kept, with `syslog.timestamp` omitted and a
+    // throttled diagnostic instead of the whole record being discarded over one unrepresentable
+    // field.
     match nil_or(ts_field) {
-        None => {}
-        Some(ts) => match parse_rfc3339_to_nanos(ts) {
-            Ok(nanos) => {
-                attrs.insert("syslog.timestamp", Value::Timestamp(nanos));
+        None => {
+            attrs.insert("syslog.timestamp", Value::Null);
+        }
+        Some(ts) => {
+            let ts_str = std::str::from_utf8(ts)
+                .map_err(|_| malformed("TIMESTAMP is not valid UTF-8".to_string()))?;
+            match parse_rfc3339_to_nanos(ts_str) {
+                Ok(nanos) => {
+                    attrs.insert("syslog.timestamp", Value::Timestamp(nanos));
+                }
+                Err(TimestampError::OutOfRange) => {
+                    diag.warn_throttled(
+                        "timestamp_out_of_range",
+                        format_args!(
+                            "RFC 5424 TIMESTAMP {ts_str:?} is well-formed but names an instant \
+                             outside the representable range; keeping the event without \
+                             syslog.timestamp"
+                        ),
+                    );
+                }
+                Err(TimestampError::Malformed) => {
+                    return Err(malformed(format!("TIMESTAMP {ts_str:?} does not parse")));
+                }
             }
-            Err(TimestampError::OutOfRange) => {
-                diag.warn_throttled(
-                    "timestamp_out_of_range",
-                    format_args!(
-                        "RFC 5424 TIMESTAMP {ts:?} is well-formed but names an instant outside \
-                         the representable range; keeping the event without syslog.timestamp"
-                    ),
-                );
-            }
-            Err(TimestampError::Malformed) => return Err(malformed()),
-        },
+        }
     }
-    if let Some(v) = field_value(bytes, text, host_field) {
+    if let Some(v) = field_value(line, host_field, "HOSTNAME")? {
         attrs.insert("syslog.hostname", v);
     }
-    if let Some(v) = field_value(bytes, text, app_field) {
+    if let Some(v) = field_value(line, app_field, "APP-NAME")? {
         attrs.insert("syslog.tag", v);
     }
     if let Some(pid) = nil_or(procid_field) {
-        // PROCID is a free-form string per RFC 5424 (it need not be numeric), but `syslog.pid`
-        // is documented as `Value::U64` -- nginx always emits its numeric PID here, and a
-        // non-numeric PROCID (legal per the RFC, just not what this integration's sender does) is
-        // dropped rather than forced into the wrong type.
-        if let Ok(n) = pid.parse::<u64>() {
-            attrs.insert("syslog.pid", Value::U64(n));
+        // PROCID is a free-form PRINTUSASCII string per RFC 5424 (it need not be numeric).
+        // `syslog.pid` keeps it as `Value::U64` when it parses as one, `Value::Str` otherwise --
+        // see the module doc's `syslog.pid` section.
+        if !is_printusascii(pid) {
+            return Err(malformed(format!(
+                "PROCID {:?} is not PRINTUSASCII",
+                String::from_utf8_lossy(pid)
+            )));
+        }
+        match std::str::from_utf8(pid).expect("validated PRINTUSASCII above").parse::<u64>() {
+            Ok(n) => {
+                attrs.insert("syslog.pid", Value::U64(n));
+            }
+            Err(_) => {
+                attrs.insert("syslog.pid", Value::Str(slice_of(line, pid)));
+            }
         }
     }
-    if let Some(v) = field_value(bytes, text, msgid_field) {
+    if let Some(v) = field_value(line, msgid_field, "MSGID")? {
         attrs.insert("syslog.msgid", v);
     }
+    if let Some(sd) = sd_value {
+        attrs.insert("syslog.sd", sd);
+    }
 
-    // RFC 5424 section 6.4: MSG may open with a UTF-8 BOM (`EF BB BF`, i.e. U+FEFF) to signal
-    // `MSG-UTF8`. It's a signal, not payload, so it's stripped rather than left to leak into
-    // `log.message` as a leading U+FEFF. Still a genuine slice of `text` (`strip_prefix` on a
-    // `&str` returns a subslice, never a copy), so `slice_of`'s "always a subset" precondition
-    // holds.
-    let msg = msg.strip_prefix('\u{FEFF}').unwrap_or(msg);
-    let message = Value::Str(slice_of(bytes, text, msg));
+    let message = message_value(line, msg, true);
     Ok(Event::log(
         recv_ts,
         attrs,
@@ -671,6 +908,11 @@ mod tests {
     fn decode(datagram: &str) -> Vec<Event> {
         let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
         decoder.decode(Bytes::from(datagram.to_string())).expect("decode should succeed").events
+    }
+
+    fn decode_bytes(datagram: Vec<u8>) -> Vec<Event> {
+        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
+        decoder.decode(Bytes::from(datagram)).expect("decode should succeed").events
     }
 
     /// Regression: `SyslogInput::with_diagnostics` used to only set `UdpListener`'s own `diag`,
@@ -722,15 +964,18 @@ mod tests {
         events.into_iter().next().unwrap()
     }
 
+    fn message_val(event: &Event) -> &Value {
+        &event.log.as_ref().expect("event should carry a log").message
+    }
+
     fn message_str(event: &Event) -> &str {
-        event.log.as_ref().expect("event should carry a log").message.as_str().unwrap()
+        message_val(event).as_str().unwrap()
     }
 
     fn parse_err(line: &str) -> CodecError {
         let bytes = Bytes::from(line.to_string());
-        let text = std::str::from_utf8(&bytes).unwrap();
         let mut diag = Diagnostics::default();
-        parse_line(&bytes, text, 0, &mut diag).expect_err("expected this line to be rejected")
+        parse_line(&bytes, 0, &mut diag).expect_err("expected this line to be rejected")
     }
 
     #[test]
@@ -763,6 +1008,43 @@ mod tests {
         );
     }
 
+    /// Regression test for a review finding: before `syslog.sd` parsing existed, a whole
+    /// non-UTF-8 line failed whole-line UTF-8 validation and was rejected with its own
+    /// diagnostic; now that only MSG is allowed to carry non-UTF-8 bytes, a non-UTF-8 HOSTNAME
+    /// token is simply skipped -- this pins that the skip is still observable, through a
+    /// throttled `hostname_not_utf8` diagnostic mirrored into
+    /// `logit.component.diagnostics{key="hostname_not_utf8"}`.
+    #[test]
+    fn a_non_utf8_rfc3164_hostname_is_skipped_with_a_throttled_diagnostic() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog", "input");
+        let diag = Diagnostics::new("syslog_in").with_telemetry(telemetry);
+        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default())).with_diagnostics(diag);
+
+        let mut line = b"<134>Aug 30 10:00:00 ".to_vec();
+        line.push(0xff); // not valid UTF-8 on its own
+        line.extend_from_slice(b" nginx_access: hi");
+        let batch = decoder
+            .decode(Bytes::from(line))
+            .expect("RFC 3164 parsing never fails outright over a bad HOSTNAME");
+        assert_eq!(batch.events.len(), 1);
+        assert!(
+            batch.events[0].attributes.get("syslog.hostname").is_none(),
+            "a non-UTF-8 HOSTNAME token must not be stamped as an attribute"
+        );
+        assert_eq!(
+            batch.events[0].attributes.get("syslog.tag").and_then(Value::as_str),
+            Some("nginx_access"),
+            "the rest of the line must still parse"
+        );
+
+        let events = registry.drain(0);
+        let fired = events
+            .iter()
+            .any(|e| e.attributes.get("key").and_then(|v| v.as_str()) == Some("hostname_not_utf8"));
+        assert!(fired, "expected logit.component.diagnostics{{key=\"hostname_not_utf8\"}}");
+    }
+
     #[test]
     fn rfc3164_json_body_containing_colon_space_is_kept_whole() {
         // Regression guard for the two-token bound: a tag-less message whose JSON body has a
@@ -783,16 +1065,28 @@ mod tests {
     }
 
     #[test]
-    fn rfc3164_tag_with_a_pid_that_overflows_u64_does_not_panic() {
-        // Regression test for the blocker: a PID this long used to reach a bare
-        // `.parse().expect(...)` and panic the listener task on one crafted UDP packet.
+    fn rfc3164_tag_with_an_overflowing_numeric_pid_becomes_a_str_pid_not_a_panic() {
+        // Regression test for the original blocker: a PID this long used to reach a bare
+        // `.parse().expect(...)` and panic the listener task on one crafted UDP packet. Now
+        // `syslog.pid` becomes `Value::Str` for PROCID/bracketed-PID content that doesn't fit
+        // `u64` -- see the module doc's `syslog.pid` section -- rather than being dropped and
+        // the whole `tag[pid]:` token absorbed into the message.
         let line = "<13>tag[99999999999999999999]: hello";
         let event = only_event(decode(line));
-        // The oversized PID makes the whole token fail `is_tag_shaped`, so there's no tag/pid --
-        // the untouched remainder becomes the message, rather than the line being dropped.
-        assert!(event.attributes.get("syslog.tag").is_none());
-        assert!(event.attributes.get("syslog.pid").is_none());
-        assert_eq!(message_str(&event), "tag[99999999999999999999]: hello");
+        assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("tag"));
+        assert_eq!(
+            event.attributes.get("syslog.pid").and_then(Value::as_str),
+            Some("99999999999999999999")
+        );
+        assert_eq!(message_str(&event), "hello");
+    }
+
+    #[test]
+    fn rfc3164_non_numeric_bracketed_pid_becomes_a_str_pid() {
+        let event = only_event(decode("<13>tag[abc]: hello"));
+        assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("tag"));
+        assert_eq!(event.attributes.get("syslog.pid").and_then(Value::as_str), Some("abc"));
+        assert_eq!(message_str(&event), "hello");
     }
 
     #[test]
@@ -813,7 +1107,7 @@ mod tests {
     }
 
     #[test]
-    fn rfc5424_decodes_msgid_and_timestamp_and_omits_nil_fields() {
+    fn rfc5424_decodes_msgid_and_timestamp_and_stamps_null_for_a_nil_one() {
         let event = only_event(decode(
             "<134>1 2003-10-11T22:14:15.003Z myhost app 1234 ID47 - some message",
         ));
@@ -828,12 +1122,24 @@ mod tests {
         );
 
         let event = only_event(decode("<134>1 - - - - - - nil fields"));
-        assert!(event.attributes.get("syslog.timestamp").is_none());
+        assert_eq!(
+            event.attributes.get("syslog.timestamp"),
+            Some(&Value::Null),
+            "a nil (`-`) TIMESTAMP now stamps an explicit Value::Null rather than omitting the \
+             attribute entirely"
+        );
         assert!(event.attributes.get("syslog.hostname").is_none());
         assert!(event.attributes.get("syslog.tag").is_none());
         assert!(event.attributes.get("syslog.pid").is_none());
         assert!(event.attributes.get("syslog.msgid").is_none());
+        assert!(event.attributes.get("syslog.sd").is_none());
         assert_eq!(message_str(&event), "nil fields");
+    }
+
+    #[test]
+    fn rfc5424_non_numeric_procid_becomes_a_str_pid() {
+        let event = only_event(decode("<134>1 - - - notanumber - - msg"));
+        assert_eq!(event.attributes.get("syslog.pid").and_then(Value::as_str), Some("notanumber"));
     }
 
     #[test]
@@ -876,9 +1182,14 @@ mod tests {
     }
 
     #[test]
-    fn rfc5424_structured_data_is_skipped_including_an_escaped_bracket() {
+    fn rfc5424_structured_data_with_an_escaped_bracket_is_parsed_not_skipped() {
         let event = only_event(decode(r#"<134>1 - - - - - [id@32473 k="v\]"] the message"#));
         assert_eq!(message_str(&event), "the message");
+        let mut params = AttrMap::new();
+        params.insert("k", Value::str("v]"));
+        let mut sd = AttrMap::new();
+        sd.insert("id@32473", Value::Map(Box::new(params)));
+        assert_eq!(event.attributes.get("syslog.sd"), Some(&Value::Map(Box::new(sd))));
     }
 
     #[test]
@@ -960,17 +1271,53 @@ mod tests {
     #[test]
     fn multi_line_datagram_with_an_invalid_utf8_line_still_emits_the_good_ones() {
         // Regression test: a whole-datagram `str::from_utf8` used to reject every line in the
-        // packet as soon as any single byte anywhere was invalid UTF-8.
+        // packet as soon as any single byte anywhere was invalid UTF-8. There is no whole-line
+        // UTF-8 gate any more, but this line still fails to parse (it has no `<PRI>` at all), so
+        // the assertion -- the good sibling lines still decode -- still exercises the property.
         let mut datagram = Vec::new();
         datagram.extend_from_slice(b"<13>a\n");
         datagram.extend_from_slice(&[0xff, 0xfe]); // not valid UTF-8, no `<PRI>` either
         datagram.push(b'\n');
         datagram.extend_from_slice(b"<13>b");
-        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
-        let events = decoder.decode(Bytes::from(datagram)).expect("decode should succeed").events;
+        let events = decode_bytes(datagram);
         assert_eq!(events.len(), 2);
         assert_eq!(message_str(&events[0]), "a");
         assert_eq!(message_str(&events[1]), "b");
+    }
+
+    #[test]
+    fn rfc5424_non_utf8_message_becomes_bytes_with_header_fields_intact() {
+        let mut datagram = Vec::new();
+        datagram.extend_from_slice(b"<134>1 2003-10-11T22:14:15.003Z myhost app 123 - - ");
+        datagram.extend_from_slice(&[0xff, 0xfe, b'x']);
+        let event = only_event(decode_bytes(datagram));
+        assert_eq!(event.attributes.get("syslog.hostname").and_then(Value::as_str), Some("myhost"));
+        assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("app"));
+        assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(123)));
+        match message_val(&event) {
+            Value::Bytes(b) => assert_eq!(b.as_ref(), &[0xff, 0xfe, b'x']),
+            other => panic!("expected Value::Bytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rfc3164_non_utf8_message_becomes_bytes_with_header_fields_intact() {
+        let mut datagram = Vec::new();
+        datagram.extend_from_slice(b"<13>tag[1]: ");
+        datagram.extend_from_slice(&[0xff, 0xfe, b'x']);
+        let event = only_event(decode_bytes(datagram));
+        assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("tag"));
+        assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(1)));
+        match message_val(&event) {
+            Value::Bytes(b) => assert_eq!(b.as_ref(), &[0xff, 0xfe, b'x']),
+            other => panic!("expected Value::Bytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_utf8_message_is_still_a_str_not_bytes() {
+        let event = only_event(decode("<13>hello"));
+        assert!(matches!(message_val(&event), Value::Str(_)));
     }
 
     #[test]
@@ -1035,6 +1382,178 @@ mod tests {
         assert!(event.span.is_none(), "syslog_in emits log-only events");
     }
 
+    // ---- RFC 5424 section 6.5 examples ---------------------------------------------------------
+    //
+    // Transcribed from the author's own knowledge of the RFC 5424 text, not copy-pasted from a
+    // fetched copy -- flagged here explicitly so the docs/test worker verifies these word-for-word
+    // against the actual RFC before relying on them as a fidelity gate.
+
+    #[test]
+    fn rfc5424_section_6_5_example_1_nil_sd_with_bom_message() {
+        let line = "<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 - \
+                     \u{FEFF}'su root' failed for lonvick on /dev/pts/8";
+        let event = only_event(decode(line));
+        assert_eq!(message_str(&event), "'su root' failed for lonvick on /dev/pts/8");
+        assert_eq!(event.attributes.get("syslog.facility"), Some(&Value::U64(4)));
+        assert_eq!(event.attributes.get("syslog.severity"), Some(&Value::U64(2)));
+        assert_eq!(
+            event.attributes.get("syslog.hostname").and_then(Value::as_str),
+            Some("mymachine.example.com")
+        );
+        assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("su"));
+        assert!(event.attributes.get("syslog.pid").is_none());
+        assert_eq!(event.attributes.get("syslog.msgid").and_then(Value::as_str), Some("ID47"));
+        assert!(event.attributes.get("syslog.sd").is_none());
+        assert_eq!(
+            event.attributes.get("syslog.timestamp"),
+            Some(&Value::Timestamp(1_065_910_455_003_000_000))
+        );
+    }
+
+    #[test]
+    fn rfc5424_section_6_5_example_2_negative_offset_and_numeric_procid() {
+        let line = "<165>1 2003-08-24T05:14:15.000003-07:00 192.0.2.1 myproc 8710 - - \
+                     %% It's time to make the do-nuts.";
+        let event = only_event(decode(line));
+        assert_eq!(message_str(&event), "%% It's time to make the do-nuts.");
+        assert_eq!(event.attributes.get("syslog.facility"), Some(&Value::U64(20)));
+        assert_eq!(event.attributes.get("syslog.severity"), Some(&Value::U64(5)));
+        assert_eq!(
+            event.attributes.get("syslog.hostname").and_then(Value::as_str),
+            Some("192.0.2.1")
+        );
+        assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("myproc"));
+        assert_eq!(event.attributes.get("syslog.pid"), Some(&Value::U64(8710)));
+        assert!(event.attributes.get("syslog.msgid").is_none());
+        assert!(event.attributes.get("syslog.sd").is_none());
+        assert!(event.attributes.get("syslog.timestamp").is_some());
+    }
+
+    #[test]
+    fn rfc5424_section_6_5_example_3_one_sd_element_with_three_params() {
+        let line = "<165>1 2003-10-11T22:14:15.003Z mymachine.example.com evntslog - ID47 \
+                     [exampleSDID@32473 iut=\"3\" eventSource=\"Application\" eventID=\"1011\"] \
+                     \u{FEFF}An application event log entry...";
+        let event = only_event(decode(line));
+        assert_eq!(message_str(&event), "An application event log entry...");
+        assert_eq!(
+            event.attributes.get("syslog.hostname").and_then(Value::as_str),
+            Some("mymachine.example.com")
+        );
+        assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("evntslog"));
+        assert!(event.attributes.get("syslog.pid").is_none());
+        assert_eq!(event.attributes.get("syslog.msgid").and_then(Value::as_str), Some("ID47"));
+
+        let mut params = AttrMap::new();
+        params.insert("iut", Value::str("3"));
+        params.insert("eventSource", Value::str("Application"));
+        params.insert("eventID", Value::str("1011"));
+        let mut sd = AttrMap::new();
+        sd.insert("exampleSDID@32473", Value::Map(Box::new(params)));
+        assert_eq!(event.attributes.get("syslog.sd"), Some(&Value::Map(Box::new(sd))));
+    }
+
+    #[test]
+    fn rfc5424_section_6_5_example_4_two_sd_elements() {
+        let line = "<165>1 2003-10-11T22:14:15.003Z mymachine.example.com evntslog - ID47 \
+                     [exampleSDID@32473 iut=\"3\" eventSource=\"Application\" eventID=\"1011\"]\
+                     [examplePriority@32473 class=\"high\"] \
+                     \u{FEFF}An application event log entry...";
+        let event = only_event(decode(line));
+        assert_eq!(message_str(&event), "An application event log entry...");
+
+        let mut params1 = AttrMap::new();
+        params1.insert("iut", Value::str("3"));
+        params1.insert("eventSource", Value::str("Application"));
+        params1.insert("eventID", Value::str("1011"));
+        let mut params2 = AttrMap::new();
+        params2.insert("class", Value::str("high"));
+        let mut sd = AttrMap::new();
+        sd.insert("exampleSDID@32473", Value::Map(Box::new(params1)));
+        sd.insert("examplePriority@32473", Value::Map(Box::new(params2)));
+        assert_eq!(event.attributes.get("syslog.sd"), Some(&Value::Map(Box::new(sd))));
+    }
+
+    // ---- STRUCTURED-DATA grammar coverage beyond the RFC examples above -------------------------
+
+    #[test]
+    fn structured_data_unescapes_all_three_escape_sequences_in_one_param_value() {
+        let line = "<134>1 - - - - - [ex@32473 p=\"a\\\"b\\\\c\\]d\"] msg";
+        let event = only_event(decode(line));
+        let mut params = AttrMap::new();
+        params.insert("p", Value::str("a\"b\\c]d"));
+        let mut sd = AttrMap::new();
+        sd.insert("ex@32473", Value::Map(Box::new(params)));
+        assert_eq!(event.attributes.get("syslog.sd"), Some(&Value::Map(Box::new(sd))));
+        assert_eq!(message_str(&event), "msg");
+    }
+
+    #[test]
+    fn structured_data_keeps_a_literal_backslash_before_a_non_escape_character() {
+        let line = "<134>1 - - - - - [ex@32473 p=\"a\\qb\"] msg";
+        let event = only_event(decode(line));
+        let mut params = AttrMap::new();
+        params.insert("p", Value::str("a\\qb"));
+        let mut sd = AttrMap::new();
+        sd.insert("ex@32473", Value::Map(Box::new(params)));
+        assert_eq!(event.attributes.get("syslog.sd"), Some(&Value::Map(Box::new(sd))));
+    }
+
+    #[test]
+    fn structured_data_repeated_param_name_becomes_an_array_in_order() {
+        let line = r#"<134>1 - - - - - [ex@32473 p="1" p="2"] msg"#;
+        let event = only_event(decode(line));
+        let mut params = AttrMap::new();
+        params.insert("p", Value::Array(vec![Value::str("1"), Value::str("2")]));
+        let mut sd = AttrMap::new();
+        sd.insert("ex@32473", Value::Map(Box::new(params)));
+        assert_eq!(event.attributes.get("syslog.sd"), Some(&Value::Map(Box::new(sd))));
+    }
+
+    #[test]
+    fn structured_data_dotted_sd_id_is_accepted() {
+        let line = r#"<134>1 - - - - - [ex.mp@32473 k="v"] msg"#;
+        let event = only_event(decode(line));
+        let mut params = AttrMap::new();
+        params.insert("k", Value::str("v"));
+        let mut sd = AttrMap::new();
+        sd.insert("ex.mp@32473", Value::Map(Box::new(params)));
+        assert_eq!(event.attributes.get("syslog.sd"), Some(&Value::Map(Box::new(sd))));
+    }
+
+    #[test]
+    fn structured_data_33_char_sd_name_is_rejected() {
+        let id = "a".repeat(33);
+        let line = format!(r#"<134>1 - - - - - [{id} k="v"] msg"#);
+        assert!(
+            matches!(parse_err(&line), CodecError::Malformed(_)),
+            "a 33-byte SD-NAME exceeds RFC 5424's 32-byte limit and must be rejected"
+        );
+    }
+
+    #[test]
+    fn structured_data_duplicate_sd_id_is_rejected() {
+        let line = r#"<134>1 - - - - - [ex@32473 k="v"][ex@32473 j="w"] msg"#;
+        assert!(matches!(parse_err(line), CodecError::Malformed(_)));
+    }
+
+    #[test]
+    fn structured_data_unterminated_element_is_rejected() {
+        let line = r#"<134>1 - - - - - [ex@32473 k="v""#;
+        assert!(matches!(parse_err(line), CodecError::Malformed(_)));
+    }
+
+    #[test]
+    fn structured_data_unescaped_closing_bracket_inside_a_quoted_value_is_kept_literal() {
+        let line = r#"<134>1 - - - - - [ex@32473 k="a]b"] msg"#;
+        let event = only_event(decode(line));
+        let mut params = AttrMap::new();
+        params.insert("k", Value::str("a]b"));
+        let mut sd = AttrMap::new();
+        sd.insert("ex@32473", Value::Map(Box::new(params)));
+        assert_eq!(event.attributes.get("syslog.sd"), Some(&Value::Map(Box::new(sd))));
+    }
+
     // ---- recorded interop fixtures (testdata/interop/syslog/) ---------------------------------
     //
     // Real captured wire traffic from real senders (util-linux `logger(1)`, Python's
@@ -1077,10 +1596,10 @@ mod tests {
     }
 
     #[test]
-    fn interop_fixture_logger_rfc5424_basic_decodes_message_and_skips_structured_data() {
+    fn interop_fixture_logger_rfc5424_basic_decodes_message_and_structured_data() {
         // This capture's STRUCTURED-DATA (`[timeQuality tzKnown="1" ...]`, util-linux logger's own
-        // addition) is real, not hand-typed -- exercising the balanced-bracket skip the module doc
-        // describes, with PROCID/MSGID both nil ("-").
+        // addition) is real, not hand-typed -- exercising the real `parse_structured_data` path
+        // the module doc describes, with PROCID/MSGID both nil ("-").
         let event = only_event(decode(&interop_fixture("logger-rfc5424-basic-000.raw")));
         assert_eq!(
             message_str(&event),
@@ -1092,6 +1611,14 @@ mod tests {
         );
         assert!(event.attributes.get("syslog.pid").is_none());
         assert!(event.attributes.get("syslog.msgid").is_none());
+
+        let mut time_quality = AttrMap::new();
+        time_quality.insert("tzKnown", Value::str("1"));
+        time_quality.insert("isSynced", Value::str("1"));
+        time_quality.insert("syncAccuracy", Value::str("69277"));
+        let mut sd = AttrMap::new();
+        sd.insert("timeQuality", Value::Map(Box::new(time_quality)));
+        assert_eq!(event.attributes.get("syslog.sd"), Some(&Value::Map(Box::new(sd))));
     }
 
     #[test]

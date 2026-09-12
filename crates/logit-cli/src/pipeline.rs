@@ -582,6 +582,7 @@ fn build_spec(
             app_name,
             max_message_bytes,
             connect_timeout,
+            structured_data,
         } => {
             // Eager for UDP (a bad local bind is a config error, `StreamOutput::open_path`'s
             // precedent) -- requires an active tokio runtime, which holds here since `build_spec`
@@ -600,6 +601,12 @@ fn build_spec(
             }
             if let Some(app_name) = app_name {
                 encoder = encoder.with_app_name(app_name.clone());
+            }
+            if let Some(structured_data) = structured_data {
+                encoder =
+                    encoder.with_structured_data(structured_data.sd_id.clone()).with_context(
+                        || format!("component {id:?}: syslog_out structured_data.sd_id is invalid"),
+                    )?;
             }
             output = output
                 .with_encoder(encoder)

@@ -47,3 +47,7 @@ logit-script.workspace = true
 # `syslog.rs`'s relay test (decodes with a real `SyslogDecoder`) and `logit.rs`'s round-trip
 # tests (drive a real `LogitInput` rather than hand-rolling the wire protocol on both ends).
 logit-inputs.workspace = true
+# `syslog.rs`'s pure-codec fixed-point property test (docs/plans/lossless-transit.md's W5):
+# generates small RFC 5424 STRUCTURED-DATA grammars and asserts
+# `decode(encode(decode(x))) == decode(x)`.
+proptest.workspace = true

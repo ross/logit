@@ -24,6 +24,15 @@ impl MessageBuf {
         self.ranges.push(start..self.bytes.len());
     }
 
+    /// Same as [`MessageBuf::push`], for a message that is already raw bytes (arbitrary, not
+    /// assumed to be valid UTF-8) -- `syslog_out`'s `Value::Bytes` message path
+    /// (`crates/logit-outputs/src/syslog.rs`'s module doc, "Message body" section).
+    pub(crate) fn push_bytes(&mut self, msg: &[u8]) {
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(msg);
+        self.ranges.push(start..self.bytes.len());
+    }
+
     /// One slice per encoded message, in batch order.
     pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
         self.ranges.iter().map(move |r| &self.bytes[r.clone()])

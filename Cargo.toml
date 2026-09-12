@@ -133,11 +133,11 @@ tracing = "0.1"
 # already promoted above. All MIT or (MIT OR Apache-2.0); `deny.toml`'s allowlist already covers
 # both -- script/audit confirms, not assumes.
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
-# `logit-proto`'s OTLP fixed-point pure-codec tests only (`crates/logit-proto/tests/
-# otlp_fixed_point.rs`) -- MIT OR Apache-2.0, covered by deny.toml's allowlist (`script/deny`
-# confirms, not assumes). Not a W1-style "not added" dependency: W4's decision explicitly adds it
-# (`docs/plans/lossless-transit.md`'s W4 section), unlike W1's metrics-model-v2 PR, which left it
-# out on purpose.
+# Pure-codec fixed-point property tests only, dev-only everywhere it's used: `logit-proto`'s
+# OTLP suite (`crates/logit-proto/tests/otlp_fixed_point.rs`, `docs/plans/lossless-transit.md`'s
+# W4) and `crates/logit-outputs/src/syslog.rs`'s RFC 5424 STRUCTURED-DATA grammar suite (W5),
+# both asserting `decode(encode(decode(x))) == decode(x)`. MIT OR Apache-2.0, covered by
+# deny.toml's allowlist (`script/audit` confirms, not assumes).
 proptest = "1"
 
 [profile.release]

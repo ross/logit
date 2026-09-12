@@ -168,26 +168,43 @@ point. A new pure-codec `crates/logit-proto/tests/otlp_fixed_point.rs` checks
 
 ### syslog_in -> syslog_out
 
-Decode (`crates/logit-inputs/src/syslog.rs`): RFC 5424 STRUCTURED-DATA is parsed only far enough to
-be balanced and skipped (`skip_structured_data`, ~L529-565) — its contents never reach an attribute
-at all. A non-numeric PROCID is dropped because `syslog.pid` is typed `Value::U64` (~L623-631). A
-non-UTF-8 MSG is a rejected line rather than a `Value::Bytes` emission. Preserved: `syslog.facility`/
-`.severity` at full 8-level fidelity (~L475-476/L589-590), hostname, tag/app-name, pid (when
-numeric), and 5424's msgid.
+Decode (`crates/logit-inputs/src/syslog.rs`), as this assessment was originally written: RFC 5424
+STRUCTURED-DATA was parsed only far enough to be balanced and skipped (`skip_structured_data`) — its
+contents never reached an attribute at all. A non-numeric PROCID was dropped because `syslog.pid`
+was typed `Value::U64` only. A non-UTF-8 MSG was a rejected line rather than a `Value::Bytes`
+emission. Preserved even then: `syslog.facility`/`.severity` at full 8-level fidelity
+(`parse_5424`/`parse_3164`), hostname, tag/app-name, pid (when numeric), and 5424's msgid.
 
-Encode (`crates/logit-outputs/src/syslog.rs`): STRUCTURED-DATA is always emitted as the NILVALUE `-`
-(~L365-368) regardless of what `syslog.sd` — which doesn't exist yet — or any other attribute might
-carry, so a `syslog_in -> json -> syslog_out` relay is strictly less than byte-for-byte even before
-considering `json`'s own additions; `syslog.timestamp` is parsed on decode but never consulted on
-encode, which always stamps `event.timestamp` (receipt time) instead (~L20-30) — the single largest
-named gap in `docs/known-gaps.md`'s syslog section. Output dialect (3164 vs. 5424) is a sink
-configuration choice independent of the input's dialect — a permitted normalization, not a bug.
-`syslog.severity` already outranks `log.severity` on encode (~L327-342), which is exactly the
-pattern the ADR generalizes to OTLP severity.
+Encode (`crates/logit-outputs/src/syslog.rs`), as it stood then: STRUCTURED-DATA was always emitted
+as the NILVALUE `-` (`write_structured_data`'s predecessor) regardless of what `syslog.sd` — which
+didn't exist yet — or any other attribute might carry, so a `syslog_in -> json -> syslog_out` relay
+was strictly less than byte-for-byte even before considering `json`'s own additions;
+`syslog.timestamp` was parsed on decode but never consulted on encode, which always stamped
+`event.timestamp` (receipt time) instead — the single largest named gap in `docs/known-gaps.md`'s
+syslog section at the time. Output dialect (3164 vs. 5424) is a sink configuration choice
+independent of the input's dialect — a permitted normalization, not a bug. `syslog.severity`
+already outranked `log.severity` on encode (`resolve_severity`), which is exactly the pattern the
+ADR generalizes to OTLP severity.
 
-Only one relay test exists (`crates/logit-outputs/src/syslog.rs:1161`, a single 3164-in/5424-out
-hop asserting facility and hostname); no 5424-in/5424-out test, no msgid/procid/timestamp coverage,
-and no integration-level test through real sockets.
+At the time, only one relay test existed (a single 3164-in/5424-out hop asserting facility and
+hostname); no 5424-in/5424-out test, no msgid/procid/timestamp coverage, and no integration-level
+test through real sockets.
+
+**W5 outcome ([ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md)):**
+landed as designed. `parse_structured_data`/`parse_sd_name`/`parse_param_value`
+(`crates/logit-inputs/src/syslog.rs`) replace `skip_structured_data` with a real, quote-aware RFC
+5424 §6.3 parser into `syslog.sd`; `write_structured_data`/`write_sd_element`/`write_sd_param`
+(`crates/logit-outputs/src/syslog.rs`) are its exact encoder inverse, plus the opt-in
+`structured_data: { sd_id }` element for non-`syslog.*` attributes. `syslog.pid` is `Value::Str`
+when PROCID/the 3164 bracket isn't numeric; a nil 5424 TIMESTAMP stamps `syslog.timestamp` as
+`Value::Null`; a non-UTF-8 MSG decodes to `Value::Bytes` instead of rejecting the line.
+`syslog_out`'s TIMESTAMP now follows the precedence table in the new ADR instead of always being
+`event.timestamp`. Unit coverage for the new parse/encode paths lands directly in
+`crates/logit-inputs/src/syslog.rs`/`crates/logit-outputs/src/syslog.rs`'s own `#[cfg(test)]`
+modules; the `crates/logit-cli/tests/syslog_round_trip.rs` integration coverage this assessment
+named as missing (5424-in/5424-out and 3164-in/3164-out over real UDP sockets, plus a
+`decode(encode(decode(x))) == decode(x)` proptest) is this workstream's Phase B, tracked separately
+from this Phase C docs pass.
 
 ### Native `logit_in -> logit_out`
 
@@ -329,10 +346,19 @@ current term-by-term breakdown.
   the marker attributes present.
 - `syslog.sd`: `Value::Map { "<SD-ID>" -> Value::Map { "<PARAM-NAME>" -> Value::Str |
   Value::Array<Value::Str> } }` — nested rather than flattened, because RFC 5424's `SD-NAME` grammar
-  permits `.`, which would make a flattened `syslog.sd.<id>.<param>` key ambiguous to reassemble;
-  nesting also interns one bounded key (`syslog.sd`) instead of interning attacker-chosen SD-ID/
-  PARAM-NAME strings directly. A repeated PARAM-NAME becomes an `Array`. `syslog_out` re-emits every
-  element with the same `"`/`\`/`]` escaping the RFC requires.
+  permits `.`, which would make a flattened `syslog.sd.<id>.<param>` key ambiguous to reassemble.
+  **Correction to an earlier draft of this rationale:** nesting does *not* avoid interning
+  attacker-chosen SD-ID/PARAM-NAME strings — `AttrMap::insert` interns every key at every nesting
+  depth, so the inner maps intern their own SD-ID/PARAM-NAME keys exactly as if they were top-level
+  attribute names. The real reasons for the nested shape are disambiguation (above), a free round
+  trip through the native codec (no separate encoding for a nested vs. flattened attribute), and
+  Lua ergonomics (`event.attrs["syslog.sd"]["origin"]["ip"]` vs. parsing a dotted key back apart).
+  Growth is bounded by RFC 5424's own grammar on parse (1 to 32 PRINTUSASCII bytes per SD-ID/
+  PARAM-NAME), not by the nesting — the same interner exposure `json`
+  ([ADR `json-parsing-into-attributes`](../adr/json-parsing-into-attributes.md)) already has for an
+  arbitrary object's keys. See [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md).
+  A repeated PARAM-NAME becomes an `Array`. `syslog_out` re-emits every element with the same
+  `"`/`\`/`]` escaping the RFC requires.
 - A non-`syslog.*` attribute reaching `syslog_out` (the `syslog_in -> json -> syslog_out` gap) is
   carried only when the operator opts in via `structured_data: { sd_id: "<name>@<PEN>" }` — **no
   default private enterprise number is shipped**; `32473` in RFC 5424's own examples is
@@ -409,7 +435,7 @@ metric-kind fields, not just presence.
 | W2 | `aggregate`: `Samples` sketching moved out of decode, `distributions: sketch \| samples` config, `SetMembers` union plus a real `HyperLogLog`, cumulative-kind pass-through; amends `aggregation-window-semantics` | M | W1 |
 | W3 | statsd pair: `Samples`/`SetMembers` in and out, `|c:`, `|T`, sample-rate retention on timers, `statsd_round_trip.rs`, updated `allocations.rs` cases; amends `statsd-output` (v1 deferral narrowed to post-sketch kinds; "no sample rate/timestamp" reversed) | M | W1, W2 |
 | W4 | **Landed.** OTLP pair: start_time, description, exemplars, `NO_RECORDED_VALUE` round-tripped as a flagged point, batch-level scope grouping + `schema_url`, `event_name`, `observed_timestamp`, dropped-attribute counts, span fields, `otel.severity_*`; `otlp_round_trip.rs` rewritten to per-field assertions; new pure-codec `crates/logit-proto/tests/otlp_fixed_point.rs` plus a `proptest`-based `decode(encode(x)) == x` suite in `otlp/metrics.rs`; `internal` stamps a real `Scope` (`crates/logit-inputs/src/internal.rs`) now that `otlp_out` no longer invents one. New `MetricRecord.flags: u32`/`MR_FLAGS` native tag amends `metrics-model-v2`. (`Sum`/temporality/monotonic, `ExponentialHistogram`'s 1:1 mapping, and histogram sum/min/max + summary count/sum were pulled forward into W1 — see its "W1 outcome" note above.) | L | W1 |
-| W5 | syslog pair: structured-data parse and emit, timestamp precedence and the nil case, `Value::Bytes` MSG, `Value::Str` PROCID, opt-in PEN-qualified structured-data element; `syslog_round_trip.rs`; new ADR `syslog-structured-data-convention`; amends `syslog-output` | M | W0 (parallel with W1) |
+| W5 | **Landed.** syslog pair: structured-data parse and emit, timestamp precedence and the nil case, `Value::Bytes` MSG, `Value::Str` PROCID, opt-in PEN-qualified structured-data element; `crates/logit-cli/tests/syslog_round_trip.rs` over real UDP sockets with a fixture corpus plus a `proptest` fixed point; new ADR `syslog-structured-data-convention`; amends `syslog-output` | M | W0 (parallel with W1) |
 | W6 | DogStatsD events and service checks, in and out | S | W3 |
 | W7 | Expose the new fields through the Lua proxy (`docs/design/lua-api.md`) — otherwise the model is lossless but the scripting surface can't see any of it | M | W1 |
 | W8 | Closeout: rewrite or remove the `docs/known-gaps.md` entries each workstream closes, rewrite `docs/design/data-model.md`'s metric-kinds section for the new shapes, update `AGENTS.md`'s current-state paragraph | S | all |

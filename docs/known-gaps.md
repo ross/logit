@@ -389,14 +389,24 @@ already built that have a known, accepted rough edge.
 
   **`otlp_in` is the sharpest form of the growth premise yet, now that it's landed (PR3).**
   Every earlier listener's attribute *keys* come from `logit`'s own config or a fixed protocol
-  grammar (statsd's `#tag:value`, syslog's structured-data field names) — a bounded set by
-  construction. `crates/logit-proto/src/otlp/common.rs`'s `key_values_into_attrs` interns every
-  OTLP `KeyValue.key` it decodes, and OTLP attribute keys are arbitrary peer-supplied strings with
-  no `logit`-side grammar bounding them at all — the first listener where "a metric name that
-  never repeats" (this entry's stated retrofit trigger, above) could plausibly come from something
-  other than a user's own naming mistake. The mitigation this entry already names is documented for
-  real now: [`docs/deploying.md`](deploying.md) has a `keep`-in-front recommendation specifically
-  for `otlp_in`, not just the general `aggregate`-cardinality one
+  grammar (statsd's `#tag:value`) — a bounded set by construction.
+  **Correction: syslog's structured-data field names are not actually in that bounded-set
+  category.** `syslog.sd` (`Value::Map { "<SD-ID>" -> Value::Map { "<PARAM-NAME>" -> ... } }`,
+  [ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md)) interns
+  every SD-ID and PARAM-NAME a peer sends, at both map levels, exactly like any other `AttrMap`
+  key — nesting doesn't bound that. The real bound is RFC 5424's own grammar (1 to 32 PRINTUSASCII
+  bytes, excluding `=`, SP, `]`, `"`), not a fixed set `logit` defines — the same interner exposure
+  the `json` transform already has for an arbitrary JSON object's keys
+  ([ADR `json-parsing-into-attributes`](adr/json-parsing-into-attributes.md)), just with a length
+  cap `json` doesn't have. `crates/logit-proto/src/otlp/common.rs`'s `key_values_into_attrs` interns
+  every OTLP `KeyValue.key` it decodes, and OTLP attribute keys are arbitrary peer-supplied strings
+  with no `logit`-side grammar bounding them at all — including no length cap, which is what makes
+  OTLP the sharpest form of this yet, sharper even than `syslog.sd`'s 32-byte-capped tokens — the
+  first listener where "a metric name that never repeats" (this entry's stated retrofit trigger,
+  above) could plausibly come from something other than a user's own naming mistake. The mitigation
+  this entry already names is documented for real now: [`docs/deploying.md`](deploying.md) has a
+  `keep`-in-front recommendation specifically for `otlp_in`, not just the general
+  `aggregate`-cardinality one
   [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml) already demonstrates.
 - ~~**`statsd_in` copies tag values instead of slicing them**~~ — **closed.** It used to build
   attribute values with `attributes.insert(k, v)` on a `&str`, routing through
@@ -460,26 +470,41 @@ already built that have a known, accepted rough edge.
   substituted a placeholder for a missing variable was tried and reverted (ADR `env-yaml-tag`'s
   Alternatives) — visualizing a config's shape without its production secrets set needs a copy of
   the config with dummy values filled in, not a feature of `logit graph` itself.
-- **`syslog_in` is UDP-only, and skips RFC 5424 structured data** — nginx's `syslog:` writer is
-  UDP-only, so TCP buys the driving integration nothing, and `syslog_in` skips RFC 5424
-  STRUCTURED-DATA rather than merging it into attributes (no producer needs it yet, and a naming
-  scheme for `[id@32473 k="v"]` invented without a consumer would be guesswork). Both stay
-  additive-later on the *input* side specifically — `syslog_out` (the egress side,
-  `docs/adr/syslog-output.md`) does support both UDP and TCP, and that asymmetry is
-  deliberate, not a sign this entry needs closing to match. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
-- **`syslog_out` doesn't emit RFC 5424 structured data either** — everything a `json`/`kv_metrics`
-  stage merged into `event.attributes` is lost on the way out unless the message body already
-  carried it, so `syslog_in -> json -> syslog_out` is *less* than a byte-for-byte relay. Mapping
-  attributes to SD-ELEMENTs would need an SD-ID convention (a private enterprise number, RFC 5424
-  §7.2.2) that shouldn't be picked in passing while implementing the sink itself. Same reason a
+- **`syslog_in` is UDP-only** — nginx's `syslog:` writer is UDP-only, so a TCP accept loop would
+  buy the driving integration nothing. `syslog_out` (the egress side, `docs/adr/syslog-output.md`)
+  supports both UDP and TCP, and that asymmetry is deliberate, not a sign this entry needs closing
+  to match. Stays additive-later on the *input* side specifically. **Closed: `syslog_in` no longer
+  skips RFC 5424 STRUCTURED-DATA** — `parse_structured_data`
+  (`crates/logit-inputs/src/syslog.rs`) is a real, quote-aware parser into `syslog.sd`; see
+  [ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md).
+- **Closed: `syslog_out` now emits RFC 5424 STRUCTURED-DATA** — every `syslog.sd` element an
+  event carries round-trips (`write_structured_data`,
+  `crates/logit-outputs/src/syslog.rs`), and an opt-in `structured_data: { sd_id: "<name>@<PEN>" }`
+  element carries every non-`syslog.*` attribute — what a `json`/`kv_metrics` stage merged into
+  `event.attributes` — once an operator picks an SD-ID (a private-enterprise-number-qualified one,
+  RFC 5424 §7.2.2; no default is shipped). See
+  [ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md). Still open: a
   log's native trace context (`log.trace`, [ADR `log-record-trace-context`](adr/log-record-trace-context.md))
-  has nowhere to go over this wire today — no SD-ELEMENT convention exists to carry it. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
-- **`syslog_out` re-stamps a relayed message's timestamp rather than preserving the origin's** —
-  every emitted message's TIMESTAMP is `event.timestamp` (receipt time), never the `syslog.
-  timestamp` attribute `syslog_in` may have left on the event, for the same reason `syslog_in`
-  itself can't resolve that attribute to an instant for RFC 3164 (no year, no timezone) without
-  guessing (see the receipt-time entry below, which this mirrors on the way out). The opt-in
-  `syslog_timestamp` transform sketched there would fix this in both directions at once.
+  isn't an `event.attribute` at all, so the opt-in element still can't carry it.
+- **SD-ELEMENT/SD-PARAM order is canonicalized by name, not by wire position** — `write_structured_data`/
+  `write_sd_element` (`crates/logit-outputs/src/syslog.rs`) sort SD-IDs and PARAM-NAMEs by name
+  bytes rather than reproducing `AttrMap`/attribute iteration order (process-global intern order,
+  not wire order); a repeated PARAM-NAME's occurrences are emitted grouped under one name, so a
+  wire `a b a` interleaving (the same PARAM-NAME appearing, another PARAM-NAME, then the first
+  again) is re-emitted as `a a b`, not preserved. Permitted under
+  [ADR `lossless-transit`](adr/lossless-transit.md)'s attribute-reordering normalization; recorded
+  in [ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md)'s
+  Consequences and `crates/logit-cli/tests/syslog_round_trip.rs`'s normalization list.
+- **Narrowed: `syslog_out` only re-stamps a relayed timestamp when the origin's own can't be
+  rendered on the configured output format** — per the timestamp-precedence rule in
+  [ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md)
+  (`write_5424_timestamp`/`write_3164_timestamp`, `crates/logit-outputs/src/syslog.rs`), a resolved
+  `syslog.timestamp` now renders directly (a `Value::Timestamp` on either output format; a
+  `Value::Str` verbatim only when the output is also 3164). What still falls through to
+  `event.timestamp` (receipt time): a 3164-origin `Value::Str` token relayed onto a 5424 output (no
+  year or timezone to build an RFC 3339 stamp from), a nil `Value::Null` relayed onto a 3164 output
+  (3164 has no NILVALUE), and an absent attribute. The opt-in `syslog_timestamp` transform sketched
+  below would still be the way to resolve `event.timestamp` itself, for either direction.
 - **`syslog_out`'s control-character escaping is ambiguous with a message that already contained
   the escape sequence literally** — the encoder escapes an embedded newline as the two characters
   `\`/`n` (and similarly for `\r`/NUL) so it can't forge a second syslog message downstream, but
@@ -526,25 +551,25 @@ already built that have a known, accepted rough edge.
 - **`statsd_out` has no TLS/DTLS** — plaintext UDP/TCP only, same gap as `syslog_out`'s above, and
   the same `TlsClientConfig`/`TlsServerConfig` pair would be the config-plumbing exercise if it
   lands.
-- **A non-UTF-8 syslog MSG is a rejected line, not a `Value::Bytes` event** — RFC 5424's `MSG-ANY`
-  permits arbitrary octets, and `logit-core::Value` already has a `Bytes` variant for exactly this.
-  `syslog_in` isolates UTF-8 validation to one line at a time (so one bad line no longer takes its
-  datagram siblings down with it — see the fixed panic/data-loss bugs this gap replaced), but a line
-  whose header parses cleanly while its MSG bytes aren't valid UTF-8 still fails as a malformed
-  line rather than being decoded with a `Value::Bytes` message. Doing better means parsing the
-  ASCII header fields directly off the line's raw bytes instead of a validated `&str`, deferring
-  UTF-8 validation to the MSG slice alone — a real change, not a one-line fix, and nginx's
-  `escape=json` access-log writer never emits invalid UTF-8 in practice, so there's no production
-  producer forcing the issue yet. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+- **Closed: a non-UTF-8 syslog MSG decodes to a `Value::Bytes` event instead of being rejected** —
+  RFC 5424's `MSG-ANY` permits arbitrary octets, and `logit-core::Value`'s `Bytes` variant now
+  carries it. `parse_line`/`parse_5424`/`parse_3164` (`crates/logit-inputs/src/syslog.rs`) parse
+  header fields directly off the line's raw bytes and validate each individually as PRINTUSASCII;
+  only the MSG slice is UTF-8-validated (`message_value`), so a line whose header parses cleanly
+  while MSG isn't valid UTF-8 now decodes with a `Value::Bytes` message instead of failing outright.
+  `syslog_out` writes a `Value::Bytes` message raw, sanitized at the byte level
+  (`sanitize_msg_bytes`), never lossy-decoded. See
+  [ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md).
 
-  **UTF-8 rejection is not the only thing standing between a syslog line and an arbitrary-binary
-  payload.** `SyslogDecoder::decode_into` (`crates/logit-inputs/src/syslog.rs:190-197`) splits a
-  datagram on `\n` *before* any UTF-8 check runs, so a binary payload containing a `0x0A` byte is
-  cut mid-value by the framing regardless of what this entry's fix would do — see the HAProxy CBOR
-  entry below, where this framing gap is what actually blocks the case that motivated writing it
-  down. Fixing UTF-8 validation alone would not be sufficient for a binary payload that isn't
+  **UTF-8 rejection was never the only thing standing between a syslog line and an arbitrary-binary
+  payload, and closing it above doesn't change that.** `SyslogDecoder::decode_into`
+  (`crates/logit-inputs/src/syslog.rs`) still splits a datagram on `\n` *before* any UTF-8 check
+  runs, so a binary payload containing a `0x0A` byte is still cut mid-value by the framing — see the
+  HAProxy CBOR entry below, where this framing gap is what actually blocks the case that motivated
+  writing it down. `Value::Bytes` MSG closes the UTF-8 half of the gap; a binary payload that isn't
   newline-safe by construction (nginx's `escape=json` output happens to be; not every binary format
-  is).
+  is) still needs an escaped-binary encoding or an opt-out of `syslog_in`'s newline splitting to
+  round-trip.
 - **HAProxy's native CBOR log output (`%{+cbor}o`/`%{+cbor+bin}o`) was evaluated as a cheaper way to
   source its access logs and deliberately not pursued** — a considered "not now," not an
   unexplored idea, recorded here so the investigation doesn't get redone. Three findings, each
@@ -586,18 +611,23 @@ already built that have a known, accepted rough edge.
   claim a multi-gigabyte array in a handful of bytes). CBOR tag 1 (epoch time), decodable straight
   into `Value::Timestamp`, is the one thing the format would offer that JSON doesn't — the reason
   it's worth this entry rather than a closed door.
-- **A syslog event's `timestamp` is receipt time, not the sender's** — every event is stamped with
-  the instant its datagram came off the socket (`received_at`, captured by the read half and
-  threaded through to `Decoder::decode_into` explicitly since
-  [ADR `decoupled-listener-io`](adr/decoupled-listener-io.md) decoupled decode from the read loop — not a fresh
-  clock read at decode time, which could otherwise run arbitrarily behind arrival under backlog)
-  and preserves the sender's own timestamp separately, as the
-  `syslog.timestamp` attribute (a `Value::Timestamp` for RFC 5424's RFC 3339 form, a raw
-  `Value::Str` for RFC 3164's). The two can diverge: by network and queueing delay always, and by an
-  arbitrary amount when the sender's clock is skewed or when messages are replayed or forwarded
-  through a relay. Everything downstream keyed on time — `aggregate`'s tumbling window, the point
-  timestamp `influxdb_out` writes — uses `event.timestamp`, so today a delayed or replayed message
-  lands in the window it *arrived* in, not the one it *happened* in. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+- **Narrowed: `event.timestamp` is still receipt time, not the sender's — but that's no longer the
+  only place the sender's own clock can land.** Every event is still stamped with the instant its
+  datagram came off the socket (`received_at`, captured by the read half and threaded through to
+  `Decoder::decode_into` explicitly since [ADR `decoupled-listener-io`](adr/decoupled-listener-io.md)
+  decoupled decode from the read loop — not a fresh clock read at decode time, which could
+  otherwise run arbitrarily behind arrival under backlog), and preserves the sender's own timestamp
+  separately, as the `syslog.timestamp` attribute (a `Value::Timestamp` for RFC 5424's RFC 3339
+  form, a raw `Value::Str` for RFC 3164's, or `Value::Null` for a nil 5424 TIMESTAMP). The two can
+  diverge: by network and queueing delay always, and by an arbitrary amount when the sender's clock
+  is skewed or when messages are replayed or forwarded through a relay. Everything downstream keyed
+  on time — `aggregate`'s tumbling window, the point timestamp `influxdb_out` writes — still uses
+  `event.timestamp` unconditionally, so today a delayed or replayed message still lands in the
+  window it *arrived* in, not the one it *happened* in; that part of this entry is unchanged. What
+  *has* changed: `syslog_out`'s own emitted TIMESTAMP field now follows the precedence rule in
+  [ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md), so a
+  `syslog_in -> syslog_out` relay's *wire* timestamp can reflect the origin again even though
+  `event.timestamp` itself does not. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
 
   Deriving `event.timestamp` from the sender instead was considered and deliberately not done here:
   RFC 3164's timestamp carries no year and no timezone, so resolving it to an instant means guessing
