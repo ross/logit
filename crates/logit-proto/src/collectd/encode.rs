@@ -11,13 +11,14 @@
 
 use super::part::{self, DsValue};
 use super::{
-    nanos_to_cdtime, ATTR_PREFIX, CDTIME_ONE_SECOND, DATA_MAX_NAME_LEN, MAX_VALUES_PER_LIST,
+    nanos_to_cdtime, ATTR_PREFIX, ATTR_SEVERITY, CDTIME_ONE_SECOND, DATA_MAX_NAME_LEN,
+    MAX_VALUES_PER_LIST, NOTIF_MAX_MSG_LEN,
 };
 use crate::{FramedEncoder, MessageBuf};
 use bytes::Bytes;
 use logit_core::{
-    Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Temporality,
-    Value,
+    Diagnostics, Event, EventBatch, LogRecord, MetricKind, MetricRecord, Resource, Telemetry,
+    Temporality, Value,
 };
 
 /// Usable bytes in an identity field: [`DATA_MAX_NAME_LEN`] minus the NUL terminator collectd's own
@@ -84,6 +85,21 @@ pub struct EncodeStats {
     pub identity_sanitized_substituted: usize,
     /// An identity field truncated to [`MAX_IDENTITY_BYTES`]. Counted once per field.
     pub identity_sanitized_truncated: usize,
+    /// A `log`-only event carrying a [`super::ATTR_SEVERITY`] attribute that is not `Value::U64` or
+    /// not one of `{1, 2, 4}` -- an attempted notification whose severity this codec cannot put on
+    /// the wire. Distinct from [`Self::skipped_no_metrics`]: an event with **no**
+    /// `collectd.severity` attribute at all is not a notification attempt in the first place, and
+    /// is counted there instead (this module's own doc table).
+    pub dropped_notification: usize,
+    /// An attempted notification whose `LogRecord::message` is empty (after sanitizing) or is not
+    /// a `Str`/`Bytes` `Value` -- collectd's own receiver rejects an empty notification message.
+    pub dropped_empty_message: usize,
+    /// A single notification larger than `max_packet_bytes` all by itself: dropped whole, never
+    /// split -- the notification's own [`Self::dropped_oversize_list`].
+    pub dropped_oversize_notification: usize,
+    /// A notification message truncated to [`NOTIF_MAX_MSG_LEN`] `- 1` (255) bytes. Counted once
+    /// per message, not once per byte -- collectd's own sender-side `NOTIF_MAX_MSG_LEN`.
+    pub notification_messages_truncated: usize,
 }
 
 /// The identity a value list is dispatched against, owned rather than borrowed: the *previous*
@@ -177,10 +193,15 @@ pub struct CollectdEncoder {
     cur: Identity,
     /// The datagram being packed.
     packet: Vec<u8>,
-    /// One encoded value list -- cleared per list, never reallocated.
+    /// One encoded value list *or* one encoded notification -- cleared before each, never
+    /// reallocated. The two never overlap in time (one event's encoding finishes before the
+    /// next's begins), so a single buffer serves both.
     list: Vec<u8>,
     /// The resolved wire values of the list currently being encoded.
     values: Vec<DsValue>,
+    /// The sanitized message of the notification currently being encoded -- cleared and rewritten
+    /// per notification, never reallocated once grown to a message's steady-state size.
+    message: Vec<u8>,
 }
 
 impl Default for CollectdEncoder {
@@ -201,6 +222,7 @@ impl CollectdEncoder {
             packet: Vec::new(),
             list: Vec::new(),
             values: Vec::new(),
+            message: Vec::new(),
         }
     }
 
@@ -259,10 +281,10 @@ impl FramedEncoder for CollectdEncoder {
         out.clear();
         let mut stats = EncodeStats::default();
         let max_packet_bytes = self.max_packet_bytes;
-        // Destructured rather than reached through `self`: `last`, `cur`, `packet`, `list` and
-        // `values` are all borrowed at once by the packing loop below, which `&mut self` methods
-        // could not express.
-        let Self { telemetry, diag, hostname, last, cur, packet, list, values, .. } = self;
+        // Destructured rather than reached through `self`: `last`, `cur`, `packet`, `list`,
+        // `values` and `message` are all borrowed at once by the packing loop below, which
+        // `&mut self` methods could not express.
+        let Self { telemetry, diag, hostname, last, cur, packet, list, values, message, .. } = self;
         let mut ctx = Ctx { telemetry, diag, stats: &mut stats };
 
         packet.clear();
@@ -271,7 +293,38 @@ impl FramedEncoder for CollectdEncoder {
 
         for event in &batch.events {
             if event.metrics.is_empty() {
-                ctx.stats.skipped_no_metrics += 1;
+                // A `log`-only event is not a notification *attempt* unless it carries a
+                // `collectd.severity` attribute at all -- a plain log event with no such attribute
+                // is exactly the "no counter of its own" skip this module doc's table already
+                // documents, unchanged from before this attribute existed. Checked with a plain
+                // scan rather than `collect_carriers` so that non-attempt (the common case) costs
+                // nothing beyond this scan and, critically, does not count every other attribute on
+                // the event as `tags_dropped_no_wire_form` -- work `collect_carriers` only does once
+                // an attempt is actually underway.
+                let is_notification_attempt = event.log.is_some()
+                    && logit_core::attrs::merged(&batch.resource, event)
+                        .any(|(key, _)| logit_core::interner::resolve(key) == ATTR_SEVERITY);
+                if is_notification_attempt {
+                    let carriers = collect_carriers(&batch.resource, event, &mut ctx);
+                    let log = event.log.as_ref().expect("checked by is_notification_attempt");
+                    encode_notification(
+                        event,
+                        &carriers,
+                        log,
+                        message,
+                        hostname.as_deref(),
+                        packet,
+                        list,
+                        last,
+                        cur,
+                        max_packet_bytes,
+                        &mut lists_in_packet,
+                        out,
+                        &mut ctx,
+                    );
+                } else {
+                    ctx.stats.skipped_no_metrics += 1;
+                }
                 continue;
             }
 
@@ -572,6 +625,73 @@ impl Ctx<'_> {
             ),
         );
     }
+
+    /// A `log`-only event's [`super::ATTR_SEVERITY`] resolved to nothing this codec can put on the
+    /// wire -- absent-despite-being-attempted (present but the wrong `Value` type), or present as
+    /// `Value::U64` but outside `{1, 2, 4}`.
+    fn drop_notification(&mut self, severity: Option<u64>) {
+        self.stats.dropped_notification += 1;
+        self.telemetry.count(
+            "logit.output.metrics.skipped",
+            1.0,
+            &[("reason", "notification_dropped")],
+        );
+        self.diag.warn_throttled(
+            "notification_dropped",
+            format_args!(
+                "collectd_out: a log event's collectd.severity ({severity:?}) is not one of 1 \
+                 (FAILURE), 2 (WARNING), or 4 (OKAY); dropping the notification"
+            ),
+        );
+    }
+
+    /// An attempted notification whose message is empty (after sanitizing) or not a `Str`/`Bytes`
+    /// `Value` -- collectd's own receiver rejects an empty notification message.
+    fn drop_empty_message(&mut self) {
+        self.stats.dropped_empty_message += 1;
+        self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("reason", "empty_message")]);
+        self.diag.warn_throttled(
+            "empty_message",
+            "collectd_out: a notification's message is empty; dropping (collectd's own receiver \
+             rejects the same notification)",
+        );
+    }
+
+    /// A notification message truncated to [`NOTIF_MAX_MSG_LEN`] `- 1` bytes. Counted once per
+    /// message, the `logit.output.messages.truncated` shape `syslog_out` already established for
+    /// an oversize message body (as opposed to `identity.sanitized`, which is for the five
+    /// identity fields).
+    fn notification_message_truncated(&mut self) {
+        self.stats.notification_messages_truncated += 1;
+        self.telemetry.count("logit.output.messages.truncated", 1.0, &[]);
+        self.diag.warn_throttled(
+            "message_truncated",
+            format_args!(
+                "collectd_out: a notification message exceeded {} bytes; truncated",
+                NOTIF_MAX_MSG_LEN - 1
+            ),
+        );
+    }
+
+    /// A single notification larger than `max_packet_bytes` all by itself -- the notification's own
+    /// [`Ctx::drop_oversize_list`], counted separately so the two reasons stay distinguishable in
+    /// telemetry (a notification is never a value list, and vice versa).
+    fn drop_oversize_notification(&mut self, max_packet_bytes: usize) {
+        self.stats.dropped_oversize_notification += 1;
+        self.telemetry.count(
+            "logit.output.metrics.skipped",
+            1.0,
+            &[("reason", "oversize_notification")],
+        );
+        self.diag.warn_throttled(
+            "oversize_notification",
+            format_args!(
+                "collectd_out: a single notification exceeds max_packet_bytes \
+                 ({max_packet_bytes}); dropping it whole rather than splitting it across \
+                 datagrams"
+            ),
+        );
+    }
 }
 
 /// The `collectd.*` carriers (plus `host.name`) read off one event's merged attributes.
@@ -586,6 +706,15 @@ struct Carriers<'a> {
     interval_cdtime: u64,
     /// The normalized host attribute, used only when `collectd.host` is absent.
     host_name: Option<&'a Value>,
+    /// Whether a [`super::ATTR_SEVERITY`] attribute was present at all, in **any** `Value` type --
+    /// what `encode_into` reads to decide a `log`-only event is an *attempted* notification rather
+    /// than an ordinary metrics-empty skip. See [`EncodeStats::dropped_notification`]'s own doc for
+    /// why this is `bool` and [`Self::severity`] is a separate, narrower `Option`.
+    severity_present: bool,
+    /// The raw wire severity, resolved only when the attribute was `Value::U64` -- `None` covers
+    /// both "absent" and "present with the wrong `Value` type", which fail identically once a
+    /// notification is attempted ([`EncodeStats::dropped_notification`]).
+    severity: Option<u64>,
 }
 
 /// Walks one event's attributes merged over its resource (event wins -- [`logit_core::attrs::merged`]),
@@ -612,10 +741,21 @@ fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx)
                     // decode side divided by, so `10.0` seconds comes back as `10 << 30` ticks.
                     carriers.interval_cdtime = (seconds * CDTIME_ONE_SECOND as f64).round() as u64;
                 }
+                ("severity", Value::U64(v)) => {
+                    carriers.severity_present = true;
+                    carriers.severity = Some(*v);
+                }
+                // Present, but not `Value::U64` -- resolves to nothing (`severity` stays `None`),
+                // yet still marks the attempt as having *had* a `collectd.severity` attribute, so
+                // `encode_into` treats this as a failed notification (`dropped_notification`)
+                // rather than an ordinary metrics-empty skip.
+                ("severity", _) => {
+                    carriers.severity_present = true;
+                    ctx.tag_dropped_unrepresentable();
+                }
                 // A carrier of the wrong `Value` type, a non-positive interval, or a `collectd.*`
-                // name this codec has no wire form for yet (`collectd.severity`, until W5). Not
-                // silently ignored: an operator who set one of these deliberately deserves to see
-                // it counted.
+                // name this codec has no wire form for. Not silently ignored: an operator who set
+                // one of these deliberately deserves to see it counted.
                 _ => ctx.tag_dropped_unrepresentable(),
             }
             continue;
@@ -915,18 +1055,182 @@ fn pack_list(
     last.clone_from(cur);
 }
 
+/// Sanitizes a notification message into `out` (cleared first): NUL becomes `_` (uncounted -- a
+/// message is free text, not a path-like identity field, and collectd's own C strings make this
+/// substitution routine regardless), `/` rides through untouched, truncated to
+/// [`NOTIF_MAX_MSG_LEN`] `- 1` bytes on a character boundary (`is_utf8`) or a byte boundary.
+/// Returns whether it truncated.
+fn sanitize_message(out: &mut Vec<u8>, raw: &[u8], is_utf8: bool) -> bool {
+    out.clear();
+    for &byte in raw {
+        out.push(if byte == 0 { b'_' } else { byte });
+    }
+    let max = NOTIF_MAX_MSG_LEN - 1;
+    if out.len() <= max {
+        return false;
+    }
+    let mut end = max;
+    if is_utf8 {
+        // Same character-boundary walk-back as `sanitize_raw` -- see its own doc comment.
+        while end > 0 && out[end] & 0xC0 == 0x80 {
+            end -= 1;
+        }
+    }
+    out.truncate(end);
+    true
+}
+
+/// Encodes one notification into `notif` (cleared first), in collectd's own sender order: TimeHR,
+/// Severity, Host, Plugin, PluginInstance, Type, TypeInstance, Message. Plugin/PluginInstance/
+/// Type/TypeInstance are written only when non-empty -- absent exactly as an absent instance on a
+/// value list is -- but, unlike [`write_list`], **never elided against `last`**: see this crate's
+/// `collectd` module doc, "a notification's identity is always written in full."
+fn write_notification(
+    notif: &mut Vec<u8>,
+    cur: &Identity,
+    time_cdtime: u64,
+    severity: u64,
+    message: &[u8],
+) {
+    notif.clear();
+    part::write_number_part(notif, part::TYPE_TIME_HR, time_cdtime);
+    part::write_number_part(notif, part::TYPE_SEVERITY, severity);
+    part::write_string_part(notif, part::TYPE_HOST, &cur.host);
+    if !cur.plugin.is_empty() {
+        part::write_string_part(notif, part::TYPE_PLUGIN, &cur.plugin);
+    }
+    if !cur.plugin_instance.is_empty() {
+        part::write_string_part(notif, part::TYPE_PLUGIN_INSTANCE, &cur.plugin_instance);
+    }
+    if !cur.type_.is_empty() {
+        part::write_string_part(notif, part::TYPE_TYPE, &cur.type_);
+    }
+    if !cur.type_instance.is_empty() {
+        part::write_string_part(notif, part::TYPE_TYPE_INSTANCE, &cur.type_instance);
+    }
+    part::write_string_part(notif, part::TYPE_MESSAGE, message);
+}
+
+/// Encodes one notification and appends it to the packet being packed, flushing the packet first
+/// if it will not fit -- [`pack_list`]'s notification twin, simpler in exactly one way: because
+/// [`write_notification`] never elides, there is no need to re-encode after a flush.
+#[allow(clippy::too_many_arguments)]
+fn pack_notification(
+    packet: &mut Vec<u8>,
+    notif: &mut Vec<u8>,
+    last: &mut Identity,
+    cur: &Identity,
+    time_cdtime: u64,
+    severity: u64,
+    message: &[u8],
+    max_packet_bytes: usize,
+    lists_in_packet: &mut usize,
+    out: &mut MessageBuf<usize>,
+    ctx: &mut Ctx,
+) {
+    write_notification(notif, cur, time_cdtime, severity, message);
+
+    if !packet.is_empty() && packet.len() + notif.len() > max_packet_bytes {
+        out.push_with(packet, *lists_in_packet);
+        packet.clear();
+        *lists_in_packet = 0;
+        last.clear();
+    }
+
+    if notif.len() > max_packet_bytes {
+        ctx.drop_oversize_notification(max_packet_bytes);
+        return;
+    }
+
+    packet.extend_from_slice(notif);
+    *lists_in_packet += 1;
+    // Elision state is shared with value lists even though a notification's own encoding never
+    // reads it: a value list immediately following this notification, in the same datagram, may
+    // still elide against the identity just written.
+    last.clone_from(cur);
+}
+
+/// Encodes one `log`-only event that has already been established as an *attempted* notification
+/// (`carriers.severity_present`) into `packet`/`notif` -- the notification half of
+/// [`CollectdEncoder::encode_into`]'s per-event loop. Every early return here is a drop, already
+/// counted by the callee that returns `None`/`false`.
+#[allow(clippy::too_many_arguments)]
+fn encode_notification(
+    event: &Event,
+    carriers: &Carriers,
+    log: &LogRecord,
+    message: &mut Vec<u8>,
+    hostname: Option<&[u8]>,
+    packet: &mut Vec<u8>,
+    notif: &mut Vec<u8>,
+    last: &mut Identity,
+    cur: &mut Identity,
+    max_packet_bytes: usize,
+    lists_in_packet: &mut usize,
+    out: &mut MessageBuf<usize>,
+    ctx: &mut Ctx,
+) {
+    let Some(severity) = carriers.severity.filter(|v| matches!(v, 1 | 2 | 4)) else {
+        ctx.drop_notification(carriers.severity);
+        return;
+    };
+
+    let time_cdtime = nanos_to_cdtime(event.timestamp);
+    if time_cdtime == 0 {
+        ctx.drop_unencodable_timestamp(event.timestamp, 1);
+        return;
+    }
+
+    cur.host.clear();
+    if !resolve_host(&mut cur.host, carriers, hostname, 1, ctx) {
+        return;
+    }
+
+    let Some((raw, is_utf8)) = text_of(&log.message) else {
+        ctx.drop_empty_message();
+        return;
+    };
+    if sanitize_message(message, raw, is_utf8) {
+        ctx.notification_message_truncated();
+    }
+    if message.is_empty() {
+        ctx.drop_empty_message();
+        return;
+    }
+
+    cur.clear_below_host();
+    sanitize_carrier(&mut cur.plugin, carriers.plugin, ctx);
+    sanitize_carrier(&mut cur.plugin_instance, carriers.plugin_instance, ctx);
+    sanitize_carrier(&mut cur.type_, carriers.type_, ctx);
+    sanitize_carrier(&mut cur.type_instance, carriers.type_instance, ctx);
+
+    pack_notification(
+        packet,
+        notif,
+        last,
+        cur,
+        time_cdtime,
+        severity,
+        message,
+        max_packet_bytes,
+        lists_in_packet,
+        out,
+        ctx,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::collectd::decode::tests::{single_gauge_packet, PacketBuilder, GAUGE_1_5};
     use crate::collectd::{
-        CollectdDecoder, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE, ATTR_TYPE,
-        ATTR_TYPE_INSTANCE, DEFAULT_MAX_PACKET_BYTES,
+        CollectdDecoder, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE,
+        ATTR_SEVERITY, ATTR_TYPE, ATTR_TYPE_INSTANCE, DEFAULT_MAX_PACKET_BYTES,
     };
     use crate::Decoder;
     use logit_core::interner::intern;
     use logit_core::telemetry::Registry;
-    use logit_core::{AttrMap, Sum};
+    use logit_core::{AttrMap, BodyFormat, Severity, Sum};
     use std::sync::Arc;
 
     const TS: i64 = 1_700_000_000_000_000_000;
@@ -1008,6 +1312,15 @@ mod tests {
         registry.drain(0).iter().any(|event| {
             event.metrics.iter().any(|m| logit_core::interner::resolve(m.name) == metric)
                 && event.attributes.get(tag.0).and_then(|v| v.as_str()) == Some(tag.1)
+        })
+    }
+
+    /// Whether `registry` recorded a point named `metric` at all, regardless of tags -- for a
+    /// counter with none (`logit.output.messages.truncated`), unlike [`counted`]. Drains, so call
+    /// once.
+    fn metric_recorded(registry: &Registry, metric: &str) -> bool {
+        registry.drain(0).iter().any(|event| {
+            event.metrics.iter().any(|m| logit_core::interner::resolve(m.name) == metric)
         })
     }
 
@@ -1872,5 +2185,272 @@ mod tests {
         let (packets, stats) = encode(&batch(first.clone()), DEFAULT_MAX_PACKET_BYTES);
         assert_eq!(stats, EncodeStats::default());
         assert_eq!(decode_all(&packets), first);
+    }
+
+    // --- notifications --------------------------------------------------------------------------
+
+    fn log_record(message: Value, severity: Severity) -> LogRecord {
+        LogRecord {
+            message,
+            severity: Some(severity),
+            body_format: BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        }
+    }
+
+    /// A notification-shaped event: `log` set, no metrics, `collectd.severity` present as the raw
+    /// wire value. `severity` mapping is left to the caller via `log_severity` rather than derived
+    /// here, so a test can construct the mismatched combinations the encoder ignores (it is the
+    /// attribute, never `LogRecord::severity`, that reaches the wire).
+    fn notification_event(wire_severity: Value, log_severity: Severity, message: &str) -> Event {
+        let mut attrs = attrs(&[
+            (ATTR_HOST, Value::from("web-1")),
+            (ATTR_PLUGIN, Value::from("load")),
+            (ATTR_TYPE, Value::from("load")),
+        ]);
+        attrs.insert(ATTR_SEVERITY, wire_severity);
+        Event::log(TS, attrs, log_record(Value::from(message), log_severity))
+    }
+
+    #[test]
+    fn every_severity_encodes_as_a_notification_that_decodes_back_the_same() {
+        for (wire, severity) in
+            [(1u64, Severity::Error), (2u64, Severity::Warn), (4u64, Severity::Info)]
+        {
+            let event = notification_event(Value::U64(wire), severity, "threshold exceeded");
+            let (packets, stats) = encode(&batch(vec![event.clone()]), DEFAULT_MAX_PACKET_BYTES);
+            assert_eq!(stats, EncodeStats::default(), "severity {wire}");
+            let decoded = decode_all(&packets);
+            assert_eq!(decoded.len(), 1, "severity {wire}");
+            assert!(decoded[0].metrics.is_empty(), "a notification carries no metrics");
+            let log = decoded[0].log.as_ref().expect("must decode back to a log record");
+            assert_eq!(log.severity, Some(severity), "severity {wire}");
+            assert_eq!(log.message, Value::from("threshold exceeded"));
+            assert_eq!(attr(&decoded[0], ATTR_HOST), Some(Value::from("web-1")));
+            assert_eq!(attr(&decoded[0], ATTR_PLUGIN), Some(Value::from("load")));
+            assert_eq!(attr(&decoded[0], ATTR_TYPE), Some(Value::from("load")));
+            assert_eq!(decoded[0].attributes.get(ATTR_SEVERITY), Some(&Value::U64(wire)));
+        }
+    }
+
+    /// A non-UTF-8 message rides byte-verbatim, like a non-UTF-8 identity field.
+    #[test]
+    fn a_non_utf8_message_encodes_and_decodes_byte_verbatim() {
+        let raw = Bytes::from(vec![0xFFu8, 0xFE, b'm']);
+        let mut event = notification_event(Value::U64(2), Severity::Warn, "placeholder");
+        event.log.as_mut().unwrap().message = Value::Bytes(raw.clone());
+        let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(stats, EncodeStats::default());
+        let decoded = decode_all(&packets);
+        assert_eq!(decoded[0].log.as_ref().unwrap().message, Value::Bytes(raw));
+    }
+
+    #[test]
+    fn an_empty_message_is_dropped_and_counted() {
+        let event = notification_event(Value::U64(2), Severity::Warn, "");
+        let (packets, stats, registry, diag_registry) =
+            encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+        assert!(packets.is_empty());
+        assert_eq!(stats.dropped_empty_message, 1);
+        assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "empty_message")));
+        assert!(counted(&diag_registry, "logit.component.diagnostics", ("key", "empty_message")));
+    }
+
+    #[test]
+    fn a_message_value_that_is_not_str_or_bytes_is_treated_as_empty_and_dropped() {
+        let mut event = notification_event(Value::U64(1), Severity::Error, "placeholder");
+        event.log.as_mut().unwrap().message = Value::I64(42);
+        let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+        assert!(packets.is_empty());
+        assert_eq!(stats.dropped_empty_message, 1);
+    }
+
+    #[test]
+    fn an_out_of_set_severity_is_dropped_and_counted() {
+        for wire in [Value::U64(0), Value::U64(3), Value::U64(5), Value::U64(u64::MAX)] {
+            let event = notification_event(wire.clone(), Severity::Warn, "x");
+            let (packets, stats, registry, diag_registry) =
+                encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+            assert!(packets.is_empty(), "{wire:?}");
+            assert_eq!(stats.dropped_notification, 1, "{wire:?}");
+            assert!(counted(
+                &registry,
+                "logit.output.metrics.skipped",
+                ("reason", "notification_dropped")
+            ));
+            assert!(counted(
+                &diag_registry,
+                "logit.component.diagnostics",
+                ("key", "notification_dropped")
+            ));
+        }
+    }
+
+    /// A `collectd.severity` attribute of the wrong `Value` type is still an *attempt* -- it must
+    /// not fall back to `skipped_no_metrics` -- and is counted both as an unrepresentable tag and
+    /// as a dropped notification.
+    #[test]
+    fn a_severity_attribute_of_the_wrong_type_is_an_attempt_that_fails() {
+        let event = notification_event(Value::from("2"), Severity::Warn, "x");
+        let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+        assert!(packets.is_empty());
+        assert_eq!(stats.dropped_notification, 1);
+        assert_eq!(stats.tags_dropped_unrepresentable, 1);
+        assert_eq!(stats.skipped_no_metrics, 0, "a present collectd.severity is an attempt");
+    }
+
+    /// A `log`-only event with **no** `collectd.severity` attribute at all is not a notification
+    /// attempt -- the unchanged, pre-existing `skipped_no_metrics` path.
+    #[test]
+    fn a_log_event_without_collectd_severity_is_not_a_notification() {
+        let event = Event::log(
+            TS,
+            attrs(&[(ATTR_HOST, Value::from("web-1"))]),
+            log_record(Value::from("just a log line"), Severity::Info),
+        );
+        let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+        assert!(packets.is_empty());
+        assert_eq!(stats, EncodeStats { skipped_no_metrics: 1, ..EncodeStats::default() });
+    }
+
+    #[test]
+    fn a_non_positive_timestamp_drops_the_notification() {
+        for timestamp in [0i64, -1] {
+            let mut event = notification_event(Value::U64(4), Severity::Info, "x");
+            event.timestamp = timestamp;
+            let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+            assert!(packets.is_empty(), "timestamp {timestamp}");
+            assert_eq!(stats.dropped_unencodable_timestamp, 1);
+        }
+    }
+
+    #[test]
+    fn a_notification_with_no_host_and_no_configured_hostname_is_dropped() {
+        let mut event = notification_event(Value::U64(1), Severity::Error, "x");
+        event.attributes.remove(ATTR_HOST);
+
+        let mut encoder = CollectdEncoder::new().with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES);
+        let mut packets = MessageBuf::default();
+        let stats = encoder.encode_into(&batch(vec![event]), &mut packets);
+        assert!(packets.is_empty());
+        assert_eq!(stats.dropped_no_host, 1);
+    }
+
+    /// The host fallback chain is identical to a value list's: `collectd.host`, then `host.name`,
+    /// then the encoder's configured hostname.
+    #[test]
+    fn a_notification_falls_back_from_host_name_to_the_configured_hostname() {
+        let mut event = notification_event(Value::U64(1), Severity::Error, "x");
+        event.attributes.remove(ATTR_HOST);
+        event.attributes.insert("host.name", Value::from("from-host-name"));
+        let (packets, _) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("from-host-name")));
+    }
+
+    /// A message longer than 255 bytes truncates on a character boundary and is counted; a
+    /// message at exactly the limit is untouched.
+    #[test]
+    fn a_notification_message_over_255_bytes_is_truncated_and_counted() {
+        let long: String = "é".repeat(200); // 400 bytes, well past the limit
+        let event = notification_event(Value::U64(1), Severity::Error, &long);
+        let (packets, stats, registry, diag_registry) =
+            encode_counted(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(stats.notification_messages_truncated, 1);
+        assert!(metric_recorded(&registry, "logit.output.messages.truncated"));
+        assert!(counted(
+            &diag_registry,
+            "logit.component.diagnostics",
+            ("key", "message_truncated")
+        ));
+        let decoded = decode_all(&packets);
+        let Value::Str(message) = &decoded[0].log.as_ref().unwrap().message else {
+            panic!("a truncated UTF-8 message must still be a Value::Str")
+        };
+        assert!(message.len() <= 255);
+        assert!(std::str::from_utf8(message).is_ok());
+    }
+
+    /// A message at exactly the 255-byte limit round-trips untouched -- the off-by-one guard.
+    #[test]
+    fn a_notification_message_at_exactly_255_bytes_is_not_truncated() {
+        let message: String = "a".repeat(255);
+        let event = notification_event(Value::U64(2), Severity::Warn, &message);
+        let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(stats.notification_messages_truncated, 0);
+        let decoded = decode_all(&packets);
+        assert_eq!(decoded[0].log.as_ref().unwrap().message, Value::str(message));
+    }
+
+    /// NUL inside a message becomes `_`, uncounted -- unlike an identity field's substitution.
+    #[test]
+    fn a_nul_in_a_notification_message_becomes_an_underscore_uncounted() {
+        let event = notification_event(Value::U64(1), Severity::Error, "disk\0full");
+        let (packets, stats) = encode(&batch(vec![event]), DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(
+            stats.identity_sanitized_substituted, 0,
+            "not counted the way identity fields are"
+        );
+        let decoded = decode_all(&packets);
+        assert_eq!(decoded[0].log.as_ref().unwrap().message, Value::from("disk_full"));
+    }
+
+    /// A notification's identity is written in full every time, never elided against a preceding
+    /// value list's identity -- even one carrying the exact same host/plugin/type.
+    #[test]
+    fn a_notifications_identity_is_never_elided_against_a_preceding_list() {
+        let list_event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let notif_event = notification_event(Value::U64(2), Severity::Warn, "load high");
+        let (packets, stats) =
+            encode(&batch(vec![list_event, notif_event]), DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(packets.len(), 1, "both fit one datagram");
+        let bytes = packets.iter().next().unwrap();
+        // Two Host parts: the value list's own, and the notification's full (non-elided) one.
+        assert_eq!(count_parts(bytes, part::TYPE_HOST), 2);
+        assert_eq!(count_parts(bytes, part::TYPE_PLUGIN), 2);
+        assert_eq!(count_parts(bytes, part::TYPE_TYPE), 2);
+        assert_eq!(count_parts(bytes, part::TYPE_MESSAGE), 1);
+        assert_eq!(count_parts(bytes, part::TYPE_SEVERITY), 1);
+
+        let decoded = decode_all(&packets);
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded[0].log.is_none() && !decoded[0].metrics.is_empty());
+        assert!(decoded[1].log.is_some() && decoded[1].metrics.is_empty());
+    }
+
+    /// A value list immediately after a notification, sharing its identity, still elides -- the
+    /// elision *state* the notification updates even though its own bytes never read it.
+    #[test]
+    fn a_value_list_after_a_notification_still_elides_against_it() {
+        let notif_event = notification_event(Value::U64(2), Severity::Warn, "load high");
+        let list_event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
+        let (packets, stats) =
+            encode(&batch(vec![notif_event, list_event]), DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(stats, EncodeStats::default());
+        let bytes = packets.iter().next().unwrap();
+        assert_eq!(
+            count_parts(bytes, part::TYPE_HOST),
+            1,
+            "the value list must elide against the notification's identity"
+        );
+    }
+
+    #[test]
+    fn a_datagram_mixing_a_value_list_and_a_notification_round_trips() {
+        let list_event = relay_event(vec![
+            record("load.load.0", MetricKind::Gauge(0.1)),
+            record("load.load.1", MetricKind::Gauge(0.2)),
+        ]);
+        let notif_event = notification_event(Value::U64(1), Severity::Error, "load spiked");
+        let (packets, stats) =
+            encode(&batch(vec![list_event.clone(), notif_event.clone()]), DEFAULT_MAX_PACKET_BYTES);
+        assert_eq!(stats, EncodeStats::default());
+        let decoded = decode_all(&packets);
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].metrics.len(), 2);
+        assert_eq!(decoded[1].log.as_ref().unwrap().message, Value::from("load spiked"));
     }
 }
