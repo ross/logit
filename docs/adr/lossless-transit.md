@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-10
+updated: 2026-09-11
 ---
 
 # Lossless like-protocol transit: the internal model is a superset of every supported wire protocol
@@ -161,3 +161,13 @@ fixture, not after.
   (`crates/logit-cli/tests/otlp_round_trip.rs`'s `assert_round_tripped`) only checks that a log, a
   metric, and a span each exist with roughly the right shape — it becomes a per-field fixed-point
   assertion once the model changes it's meant to protect exist.
+
+## Amendment: a fourth like pair (2026-09-11)
+
+`prometheus_in -> prometheus_out` is a fourth like-protocol pair in scope under this ADR, alongside
+`statsd`, `otlp`, and `syslog` — the first one designed against the model *after* it became the
+superset this ADR requires, rather than retrofitted onto it. See
+[ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md) for the transports,
+dialect negotiation, model mapping, and permitted normalizations, and
+[`docs/plans/prometheus-scrape-and-exposition.md`](../plans/prometheus-scrape-and-exposition.md)
+for the workstreams closing it.
