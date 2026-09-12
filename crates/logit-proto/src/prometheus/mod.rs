@@ -83,11 +83,12 @@
 //! | `Set` / `SetMembers` | `gauge` of `estimate()` / the distinct member count -- `degraded{metric_kind="set"\|"set_members"}` |
 //! | `ExponentialHistogram` | **skipped**, `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` -- neither text dialect has native-histogram syntax |
 //! | `flags & NO_RECORDED_VALUE` | **skipped**, `logit.output.metrics.skipped{reason="no_recorded_value"}` (`MetricRecord::flags`' own doc: every non-OTLP sink must treat a flagged point as carrying no reading) |
-//! | exemplars | carried onto the family; [`text`] emits them on `_total`/`_bucket` lines in OpenMetrics only |
+//! | exemplars | carried onto the family; [`text`] emits them on `_total`/`_bucket` lines in OpenMetrics only, at most one per line, each on the bucket its own value falls in. One that has no line left to sit on -- a counter's second exemplar, two in one bucket's range, one over OpenMetrics' 128-code-point label budget -- is dropped, `logit.output.metrics.degraded{reason="exemplar_dropped"}` (text 0.0.4 drops all of them uncounted: that is the operator's dialect choice, not a lossy mapping) |
 //! | `Event::timestamp` | emitted only when `prometheus.timestamp: true` is present (consumed) |
 //! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Array/Map` dropped -- `logit.output.labels.dropped{reason="unrepresentable"}` |
 //! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]); labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.dropped{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is dropped -- `logit.output.labels.dropped{reason="reserved"}` |
-//! | `unit` / `description` | `# UNIT` (OM only) / `# HELP` |
+//! | two names sanitizing onto one wire name | the family whose *model* name sorts first is exposed, the rest are **skipped** -- `logit.output.metrics.skipped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body |
+//! | `unit` / `description` | `# UNIT` (OM only, and only when `_<unit>` suffixes the family name and the unit is `[a-zA-Z0-9_]+` -- the OpenMetrics spec requires it and Prometheus's parser fails the entire body otherwise; dropped counted `logit.output.metrics.degraded{reason="unit_not_suffix"}`) / `# HELP` |
 //! | two records, one name, different family types | the first record's type wins, the rest are **skipped**, `logit.output.metrics.skipped{reason="type_conflict"}` -- one name cannot carry two `# TYPE` lines |
 //! | `EventBatch::scope`, `Resource::schema_url`, `dropped_attributes_count` | dropped (known-gaps rows) |
 //!
@@ -126,6 +127,8 @@
 //! - `# EOF` present per dialect; blank lines, non-`HELP`/`TYPE`/`UNIT` comments dropped;
 //! - a histogram's `+Inf` bucket is authoritative for the total: a `_count` line that disagrees is
 //!   ignored rather than kept as a second, conflicting total the model has nowhere to put;
+//! - a histogram exemplar sits on the bucket its own *value* falls in, which for a conforming
+//!   producer is the bucket it arrived on and for a non-conforming one is a relocation;
 //! - a wire `summary` with no `_sum`/`_count` re-emits `_sum 0`/`_count 0`: [`logit_core::Summary`]
 //!   holds `sum: f64`/`count: u64`, not `Option`s, so "absent" and "zero" are the same model value.
 //!   (The reverse direction is exact: a `Distribution`'s sum-less summary stays sum-less, because
@@ -394,6 +397,13 @@ impl PrometheusEncoder {
         self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("metric_kind", metric_kind)]);
     }
 
+    /// `logit.output.metrics.degraded{reason}` -- the same counter keyed by *why* rather than by
+    /// which model kind, for a degradation the wire format forces on a metric of any kind (a
+    /// `# UNIT` the format won't accept, an exemplar with nowhere to sit).
+    fn degraded_reason(&self, reason: &'static str) {
+        self.telemetry.count("logit.output.metrics.degraded", 1.0, &[("reason", reason)]);
+    }
+
     fn label_dropped(&self, reason: &'static str) {
         self.telemetry.count("logit.output.labels.dropped", 1.0, &[("reason", reason)]);
     }
@@ -526,7 +536,10 @@ pub fn events_to_families<'a>(
     events: impl Iterator<Item = (&'a Resource, &'a Event)>,
     encoder: &mut PrometheusEncoder,
 ) -> Vec<MetricFamily> {
-    let mut families: BTreeMap<&str, MetricFamily> = BTreeMap::new();
+    // Keyed by the *emitted* (sanitized) name, not the model name: two model names that sanitize
+    // onto one cannot both be exposed -- a second `# TYPE` line for one name makes Prometheus reject
+    // the whole scrape, so one naming clash would poison every other metric in the body.
+    let mut families: BTreeMap<String, FamilyEntry> = BTreeMap::new();
     for (resource, event) in events {
         for record in &event.metrics {
             if record.is_no_recorded_value() {
@@ -534,14 +547,38 @@ pub fn events_to_families<'a>(
                 continue;
             }
             let Some((kind, point)) = record_to_point(record, event, encoder) else { continue };
-            let key = resolve(record.name);
-            let entry = families.entry(key).or_insert_with(|| MetricFamily {
-                name: sanitize_metric_name(key),
-                kind,
-                help: record.description.map(|s| resolve(s).to_string()),
-                unit: record.unit.map(|s| resolve(s).to_string()),
-                series: Vec::new(),
-            });
+            let name = resolve(record.name);
+            let key = sanitize_metric_name(name);
+            let fresh = || FamilyEntry {
+                origin: name,
+                family: MetricFamily {
+                    name: key.clone(),
+                    kind,
+                    help: record.description.map(|s| resolve(s).to_string()),
+                    unit: record.unit.map(|s| resolve(s).to_string()),
+                    series: Vec::new(),
+                },
+            };
+            match families.get(&key) {
+                // The family this record belongs to, already started.
+                Some(existing) if existing.origin == name => {}
+                // A different model name sanitizing onto the same wire name: the one whose original
+                // name sorts first wins, so the outcome is the data's, not the arrival order's.
+                Some(existing) if name < existing.origin => {
+                    let displaced = families.insert(key.clone(), fresh()).expect("just probed");
+                    for _ in 0..displaced.family.series.len().max(1) {
+                        encoder.skipped_reason("name_collision");
+                    }
+                }
+                Some(_) => {
+                    encoder.skipped_reason("name_collision");
+                    continue;
+                }
+                None => {
+                    families.insert(key.clone(), fresh());
+                }
+            }
+            let entry = &mut families.get_mut(&key).expect("inserted above").family;
             if entry.kind != kind {
                 // Two records sharing one name but disagreeing on type: the wire has exactly one
                 // `# TYPE` line per name, so the second one has nowhere to go.
@@ -568,7 +605,9 @@ pub fn events_to_families<'a>(
         }
     }
 
-    let mut out: Vec<MetricFamily> = families.into_values().collect();
+    // The map is keyed by the emitted name, so draining it in key order is already the canonical
+    // family ordering -- no re-sort needed.
+    let mut out: Vec<MetricFamily> = families.into_values().map(|entry| entry.family).collect();
     for family in &mut out {
         // Stable, so the last of a run of equal label sets is the last one pushed -- latest wins,
         // the cumulative-series semantics `prometheus_out`'s registry upsert also uses.
@@ -582,10 +621,14 @@ pub fn events_to_families<'a>(
         }
         family.series = deduped;
     }
-    // `families` was keyed by the *pre-sanitization* name, so two names that sanitize onto one are
-    // still two families here; re-sort by the emitted name to keep the output canonically ordered.
-    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// A family under construction plus the model name that claimed it -- the two together are what
+/// resolves a post-sanitization name collision deterministically (see [`events_to_families`]).
+struct FamilyEntry {
+    origin: &'static str,
+    family: MetricFamily,
 }
 
 /// One [`MetricRecord`] → its family type and wire point, or `None` for a kind Prometheus can't
@@ -1652,5 +1695,59 @@ mod tests {
     #[test]
     fn a_colon_is_forbidden_in_a_label_name_though_legal_in_a_metric_name() {
         assert_eq!(sanitize_label_name("job:rate"), "job_rate");
+    }
+
+    // --- review follow-up: post-sanitization metric-name collisions -------------------------------
+
+    /// Two model names that sanitize onto one wire name cannot both be exposed: a second `# TYPE`
+    /// line for one name makes Prometheus reject the whole scrape, so one clash would poison every
+    /// other metric in the body. The family whose *model* name sorts first wins.
+    #[test]
+    fn two_metric_names_sanitizing_onto_one_expose_the_first_and_count_the_rest() {
+        let (registry, telemetry) = telemetry();
+        let mut encoder = PrometheusEncoder::new().with_telemetry(telemetry);
+        let resource = Resource::default();
+        let dotted = event_with(&[], record("a.b", MetricKind::Gauge(1.0)));
+        let dashed = event_with(&[], record("a-b", MetricKind::Gauge(2.0)));
+        let families = events_to_families(
+            [(&resource, &dotted), (&resource, &dashed)].into_iter(),
+            &mut encoder,
+        );
+        assert_eq!(families.len(), 1, "one wire name is one family");
+        assert_eq!(families[0].name, "a_b");
+        // `a-b` < `a.b`, so the dashed one wins however the events arrive.
+        assert_eq!(families[0].series[0].point, Point::Gauge(2.0));
+        assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "name_collision")));
+    }
+
+    /// The same, with the winner arriving *second*: the already-started family is displaced rather
+    /// than the outcome depending on arrival order.
+    #[test]
+    fn a_colliding_name_that_sorts_first_displaces_the_family_already_started() {
+        let (registry, telemetry) = telemetry();
+        let mut encoder = PrometheusEncoder::new().with_telemetry(telemetry);
+        let resource = Resource::default();
+        let dotted = event_with(&[], record("a.b", MetricKind::Gauge(1.0)));
+        let dashed = event_with(&[], record("a-b", MetricKind::Gauge(2.0)));
+        // Reverse arrival order from the test above; the result must be identical.
+        let families = events_to_families(
+            [(&resource, &dashed), (&resource, &dotted)].into_iter(),
+            &mut encoder,
+        );
+        assert_eq!(families.len(), 1);
+        assert_eq!(families[0].series[0].point, Point::Gauge(2.0));
+        assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "name_collision")));
+    }
+
+    /// A name that needs sanitizing but collides with nothing is simply renamed, not counted.
+    #[test]
+    fn a_sanitized_name_with_no_collision_is_not_counted() {
+        let (registry, telemetry) = telemetry();
+        let mut encoder = PrometheusEncoder::new().with_telemetry(telemetry);
+        let resource = Resource::default();
+        let event = event_with(&[], record("a.b", MetricKind::Gauge(1.0)));
+        let families = events_to_families(std::iter::once((&resource, &event)), &mut encoder);
+        assert_eq!(families[0].name, "a_b");
+        assert!(!counted(&registry, "logit.output.metrics.skipped", ("reason", "name_collision")));
     }
 }

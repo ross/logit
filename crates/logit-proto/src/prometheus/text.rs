@@ -14,9 +14,9 @@
 //! | | text 0.0.4 | OpenMetrics 1.0 |
 //! |---|---|---|
 //! | timestamps | integer milliseconds | decimal **seconds** |
-//! | trailing `# EOF` | absent (a plain comment if present) | **required** -- its absence is [`CodecError::Malformed`] |
+//! | trailing `# EOF` | not part of the format: a plain comment wherever it appears, with ordinary exposition allowed after it | **required** -- its absence, or any content after it, is [`CodecError::Malformed`] |
 //! | counter samples | `<family>` -- and the family is named `<name>_total`, so the sample carries the suffix either way | `<family>_total` (+ `<family>_created`), family named without it |
-//! | `# UNIT` | not part of the format (accepted on parse, never written) | written when a family has a unit |
+//! | `# UNIT` | not part of the format (accepted on parse, never written) | written when a family has a unit **and** `_<unit>` suffixes the family name, which OpenMetrics requires and Prometheus enforces by failing the whole scrape; otherwise dropped, counted `logit.output.metrics.degraded{reason="unit_not_suffix"}` |
 //! | `_created` | not part of the format (accepted on parse, never written) | written for counter/histogram/summary |
 //! | exemplars | none (parsed and discarded, never written) | ` # {labels} value [ts]` on `_total`/`_bucket` lines |
 //! | unannotated samples | `# TYPE x untyped` | `# TYPE x unknown` |
@@ -71,7 +71,7 @@
 //! | Reason | What it counts |
 //! |---|---|
 //! | `malformed_line` | a sample line this grammar rejects: a bad name, an unterminated label set, an unparsable value or timestamp, non-UTF-8 bytes, or Prometheus 3's quoted UTF-8 name syntax (`{"my.dotted.metric"} 1`), which this codec does not implement (`docs/known-gaps.md`) |
-//! | `malformed_metadata` | a `# HELP`/`# TYPE`/`# UNIT` line with a bad name, a missing field, or an unrecognized type keyword -- the family stays untyped rather than the body failing |
+//! | `malformed_metadata` | a `# HELP`/`# TYPE`/`# UNIT` line with a bad name, a missing field (a bare `# TYPE` included), or an unrecognized type keyword -- the family stays untyped rather than the body failing. Fields are separated by a run of spaces or tabs, either way |
 //! | `duplicate_type` | a second, conflicting `# TYPE` for one family; the first wins |
 //! | `duplicate_metadata` | a second `# HELP`/`# UNIT` for one family; the first wins |
 //! | `duplicate_series` | one sample repeated: the same label set twice for a family's primary/`_sum`/`_count`/`_created` sample, or the same `le`/`quantile` twice. Both formats require "a unique combination of a metric name and labels"; the first wins |
@@ -105,13 +105,19 @@
 //! ## Writing is deterministic
 //!
 //! Families sorted by name, series by label set, labels by name, the generated `le`/`quantile`
-//! label written last. `write` never fails and never allocates per line (two reused scratch
-//! `String`s for number formatting). One exemplar per `_total`/`_bucket` line, as OpenMetrics
-//! requires ("a bucket MUST NOT have more than one exemplar"), each placed on the bucket its own
-//! value falls in; an exemplar whose label set exceeds OpenMetrics' 128-code-point budget, or that
-//! has no bucket to sit on, is dropped.
+//! label written last. [`write`]/[`write_with`] never fail and never allocate per line (reused
+//! scratch `String`s for number formatting).
+//!
+//! One exemplar per `_total`/`_bucket` line, as OpenMetrics requires ("a bucket MUST NOT have more
+//! than one exemplar"), each placed on the bucket **its own value falls in** -- for a conforming
+//! producer that is the bucket it arrived on, and for a non-conforming one it is a relocation, which
+//! is on [`super`]'s permitted-normalization list. Everything with no line left to sit on is dropped
+//! and counted `logit.output.metrics.degraded{reason="exemplar_dropped"}` (a counter's second
+//! exemplar, two in one bucket's range, one over OpenMetrics' 128-code-point label budget). In text
+//! 0.0.4 every exemplar is dropped and none of it is counted: that is the operator's dialect choice,
+//! not a lossy mapping.
 
-use super::{FamilyType, MetricFamily, Point, PrometheusDecoder, Series};
+use super::{FamilyType, MetricFamily, Point, PrometheusDecoder, PrometheusEncoder, Series};
 use crate::CodecError;
 use logit_core::interner::resolve;
 use logit_core::trace::{parse_span_id, parse_trace_id, to_hex};
@@ -313,12 +319,16 @@ impl Parser {
 
     /// A `#` line: `HELP`/`TYPE`/`UNIT` metadata, the `EOF` terminator, or a comment to ignore.
     fn comment(&mut self, rest: &str, decoder: &mut PrometheusDecoder) {
-        if rest == "EOF" {
+        // `# EOF` terminates the body in OpenMetrics only. Text 0.0.4 has no terminator at all, so
+        // there a `# EOF` is an ordinary comment and whatever follows it is ordinary exposition --
+        // treating it as a terminator would discard a scrape Prometheus itself accepts.
+        if rest == "EOF" && self.dialect.is_openmetrics() {
             self.saw_eof = true;
             return;
         }
-        let Some((keyword, remainder)) = rest.split_once(' ') else { return };
-        let remainder = remainder.trim_start();
+        // Both formats separate metadata fields with spaces or tabs interchangeably; a metadata
+        // keyword with nothing after it is a malformed line, not a comment to ignore.
+        let (keyword, remainder) = split_field(rest);
         match keyword {
             "HELP" => {
                 let (name, help) = split_field(remainder);
@@ -856,13 +866,14 @@ fn push_char_at(out: &mut String, line: &str, i: usize) {
     out.push_str(&line[i..i + len]);
 }
 
-/// `# HELP <name> <text>` / `# TYPE <name> <keyword>` / `# UNIT <name> <unit>`: the name and
-/// whatever follows it (empty when there is nothing).
+/// Splits one metadata field off the front: `# HELP <name> <text>` / `# TYPE <name> <keyword>` /
+/// `# UNIT <name> <unit>` all separate their fields with a run of spaces **or tabs** (both formats
+/// treat the two interchangeably, as the sample path's `skip_ws` already does). Returns the field
+/// and whatever follows the separator, each empty when there is nothing there.
 fn split_field(s: &str) -> (&str, &str) {
-    match s.split_once(' ') {
-        Some((name, rest)) => (name, rest),
-        None => (s, ""),
-    }
+    let bytes = s.as_bytes();
+    let end = token_end(bytes, 0);
+    (&s[..end], &s[skip_ws(bytes, end)..])
 }
 
 fn is_metric_name(s: &str) -> bool {
@@ -987,12 +998,31 @@ fn parse_created(text: &str) -> Option<i64> {
 /// Renders `families` into `out` (appended, never cleared), deterministically -- see the module
 /// doc's "Writing is deterministic" note. Infallible: every family is representable in both
 /// dialects, if only as its nearest text 0.0.4 shape.
+///
+/// Counters go nowhere: this is the no-telemetry convenience over [`write_with`], the mirror of
+/// [`parse`]'s relationship to [`parse_with`]. A sink renders through `write_with` so the two
+/// OpenMetrics-only degradations this pass can make -- an unusable `# UNIT`, an exemplar with no line
+/// to sit on -- are counted rather than silent.
 pub fn write(families: &[MetricFamily], dialect: Dialect, out: &mut Vec<u8>) {
+    write_with(families, dialect, out, &mut PrometheusEncoder::new());
+}
+
+/// [`write`], counting what it has to drop on `encoder`'s telemetry:
+/// `logit.output.metrics.degraded{reason="unit_not_suffix"|"exemplar_dropped"}`. Text 0.0.4's
+/// wholesale exemplar and `_created`/`# UNIT` drops are *not* counted -- those are the operator's
+/// dialect choice, listed with the permitted normalizations rather than as lossy mappings.
+pub fn write_with(
+    families: &[MetricFamily],
+    dialect: Dialect,
+    out: &mut Vec<u8>,
+    encoder: &mut PrometheusEncoder,
+) {
     let mut order: Vec<&MetricFamily> = families.iter().collect();
     order.sort_by(|a, b| a.name.cmp(&b.name));
     let mut writer = Writer {
         out,
         dialect,
+        encoder,
         number: String::new(),
         bound: String::new(),
         name: String::new(),
@@ -1013,6 +1043,7 @@ pub fn write(families: &[MetricFamily], dialect: Dialect, out: &mut Vec<u8>) {
 struct Writer<'a> {
     out: &'a mut Vec<u8>,
     dialect: Dialect,
+    encoder: &'a mut PrometheusEncoder,
     number: String,
     bound: String,
     name: String,
@@ -1028,7 +1059,10 @@ impl Writer<'_> {
             // A counter's value sample always ends in `_total`; only the family name differs.
             // OpenMetrics names the family without the suffix, text 0.0.4 with it.
             (FamilyType::Counter, true) => {
-                self.base.push_str(family.name.strip_suffix("_total").unwrap_or(&family.name));
+                // A counter named exactly `_total` is legal (`_` is a valid leading character), and
+                // stripping the suffix there would leave a nameless `# TYPE  counter` line.
+                let stripped = family.name.strip_suffix("_total").filter(|s| !s.is_empty());
+                self.base.push_str(stripped.unwrap_or(&family.name));
             }
             (FamilyType::Counter, false) => {
                 self.base.push_str(&family.name);
@@ -1049,7 +1083,11 @@ impl Writer<'_> {
         if om {
             push_metadata(self.out, "TYPE", &self.base, keyword);
             if let Some(unit) = &family.unit {
-                push_metadata(self.out, "UNIT", &self.base, unit);
+                if unit_suffixes(&self.base, unit) {
+                    push_metadata(self.out, "UNIT", &self.base, unit);
+                } else {
+                    self.encoder.degraded_reason("unit_not_suffix");
+                }
             }
             if let Some(help) = &family.help {
                 push_help(self.out, &self.base, help, self.dialect);
@@ -1076,6 +1114,12 @@ impl Writer<'_> {
                 // there); OpenMetrics keeps the suffix off the family and on the sample.
                 self.suffixed(if om { "_total" } else { "" });
                 let exemplar = series.exemplars.first();
+                if om {
+                    // One line, so one exemplar: OpenMetrics has nowhere to put the rest.
+                    for _ in series.exemplars.iter().skip(1) {
+                        self.encoder.degraded_reason("exemplar_dropped");
+                    }
+                }
                 self.sample(&series.labels, None, *v, series, exemplar);
                 self.created(series);
             }
@@ -1103,6 +1147,15 @@ impl Writer<'_> {
                     previous = *le;
                     self.suffixed("_bucket");
                     self.count_sample(&series.labels, Some("le"), *cumulative, series, exemplar);
+                }
+                if om {
+                    // At most one exemplar per bucket (OpenMetrics), each on the bucket its own
+                    // value falls in: a second one in the same range, or one whose value is `NaN`,
+                    // has no line left to sit on.
+                    let unplaced = self.used.iter().filter(|claimed| !**claimed).count();
+                    for _ in 0..unplaced {
+                        self.encoder.degraded_reason("exemplar_dropped");
+                    }
                 }
                 // A gaugehistogram's `_gcount` exists if and only if its `_gsum` does
                 // (OpenMetrics); an ordinary histogram always reports `_count`, which is what every
@@ -1211,6 +1264,11 @@ impl Writer<'_> {
             self.out.extend_from_slice(self.number.as_bytes());
         }
         if self.dialect.is_openmetrics() {
+            if exemplar.is_some_and(|e| !exemplar_fits(e)) {
+                // Over OpenMetrics' 128-code-point exemplar label budget: emitting it would make the
+                // line invalid, and truncating a trace id would make it a lie.
+                self.encoder.degraded_reason("exemplar_dropped");
+            }
             if let Some(exemplar) = exemplar.filter(|e| exemplar_fits(e)) {
                 self.out.extend_from_slice(b" # ");
                 push_exemplar_labels(self.out, exemplar);
@@ -1262,6 +1320,22 @@ impl Writer<'_> {
         }
         None
     }
+}
+
+/// Whether `# UNIT <name> <unit>` is legal for this family name. OpenMetrics 1.0: "an underscore
+/// and the unit MUST be the suffix of the MetricFamily name", and Prometheus's own OpenMetrics
+/// parser fails the *entire* scrape when it isn't (`unit %q not a suffix of metric %q`) -- so a unit
+/// that doesn't fit, or one carrying anything outside `[a-zA-Z0-9_]` (`{requests}`, which would also
+/// break the line grammar), is dropped rather than emitted. Appending the unit to the metric name
+/// instead, the way Prometheus's own OTLP translation does, is a follow-up rather than something to
+/// do silently here.
+fn unit_suffixes(name: &str, unit: &str) -> bool {
+    if unit.is_empty() || !unit.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return false;
+    }
+    name.len() > unit.len() + 1
+        && name.as_bytes()[name.len() - unit.len() - 1] == b'_'
+        && name.ends_with(unit)
 }
 
 /// The `# TYPE` keyword: this family's own type in OpenMetrics, its nearest text 0.0.4 equivalent
@@ -2067,17 +2141,19 @@ mod tests {
 
     #[test]
     fn openmetrics_only_features_are_dropped_when_writing_text_0_0_4() {
+        // `foo_seconds`, not `foo`: OpenMetrics requires `_<unit>` to suffix the family name, so a
+        // fixture naming a unit has to obey that rule to be a legal body in the first place.
         let body = concat!(
-            "# TYPE foo counter\n",
-            "# UNIT foo seconds\n",
-            "foo_total 17 # {detail=\"x\"} 0.67\n",
-            "foo_created 1605281325\n",
+            "# TYPE foo_seconds counter\n",
+            "# UNIT foo_seconds seconds\n",
+            "foo_seconds_total 17 # {detail=\"x\"} 0.67\n",
+            "foo_seconds_created 1605281325\n",
             "# EOF\n",
         );
         let families = parsed(body, Dialect::OpenMetrics1_0);
         assert_eq!(
             written(&families, Dialect::Text0_0_4),
-            "# TYPE foo_total counter\nfoo_total 17\n",
+            "# TYPE foo_seconds_total counter\nfoo_seconds_total 17\n",
             "no `# UNIT`, no `_created`, no exemplar, no `# EOF`"
         );
     }
@@ -2371,5 +2447,233 @@ mod tests {
         let families =
             parsed("# TYPE foo histogram\n# HELP foo nothing here\n", Dialect::Text0_0_4);
         assert!(families.is_empty());
+    }
+
+    // --- review follow-ups: counted write-side degradations, dialect edges ------------------------
+
+    /// Renders with counters live, returning the body and every
+    /// `logit.output.metrics.degraded{reason}` count it recorded.
+    fn write_counted(families: &[MetricFamily], dialect: Dialect) -> (String, Vec<(String, f64)>) {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("prometheus", "prometheus_out", "sink");
+        let mut encoder = PrometheusEncoder::new().with_telemetry(telemetry);
+        let mut out = Vec::new();
+        write_with(families, dialect, &mut out, &mut encoder);
+        let counts = registry
+            .drain(0)
+            .iter()
+            .filter_map(|event| {
+                let reason = event.attributes.get("reason")?.as_str()?.to_string();
+                let value = event.metrics.iter().find_map(|m| match &m.kind {
+                    logit_core::MetricKind::Sum(s) => Some(s.value),
+                    _ => None,
+                })?;
+                Some((reason, value))
+            })
+            .collect();
+        (String::from_utf8(out).expect("exposition must be utf-8"), counts)
+    }
+
+    fn unit_family(name: &str, unit: &str) -> MetricFamily {
+        let mut family = MetricFamily::new(name, FamilyType::Gauge);
+        family.unit = Some(unit.to_string());
+        family.series = vec![Series::new(vec![], Point::Gauge(1.0))];
+        family
+    }
+
+    /// OpenMetrics: "an underscore and the unit MUST be the suffix of the MetricFamily name", and
+    /// Prometheus's parser fails the *entire* scrape when it isn't -- so a unit that doesn't fit is
+    /// dropped rather than poisoning every other family in the response.
+    #[test]
+    fn an_openmetrics_unit_is_written_only_when_it_suffixes_the_family_name() {
+        let (body, counts) =
+            write_counted(&[unit_family("latency_seconds", "seconds")], Dialect::OpenMetrics1_0);
+        assert!(body.contains("# UNIT latency_seconds seconds\n"), "{body}");
+        assert!(counts.is_empty(), "a conforming unit is not a degradation: {counts:?}");
+
+        for (name, unit) in [
+            ("request_duration", "s"),   // not a suffix at all
+            ("seconds", "seconds"),      // the name *is* the unit, with no `_` before it
+            ("_seconds", "seconds"),     // only the underscore, no name left
+            ("requests_total", "total"), // a suffix, but this family's unit isn't `total`
+        ] {
+            let (body, counts) = write_counted(&[unit_family(name, unit)], Dialect::OpenMetrics1_0);
+            if name == "requests_total" {
+                // This one *is* a legal suffix relationship, so it is written.
+                assert!(body.contains("# UNIT requests_total total\n"), "{body}");
+                assert!(counts.is_empty());
+                continue;
+            }
+            assert!(!body.contains("# UNIT"), "{name}/{unit} must not emit a unit: {body}");
+            assert_eq!(counts, vec![("unit_not_suffix".to_string(), 1.0)], "{name}/{unit}");
+        }
+    }
+
+    /// A unit like OpenMetrics' `{requests}` would break the line grammar as well as the suffix
+    /// rule, so the charset is checked too.
+    #[test]
+    fn an_openmetrics_unit_outside_the_name_charset_is_dropped_and_counted() {
+        let (body, counts) = write_counted(
+            &[unit_family("queue_{requests}", "{requests}")],
+            Dialect::OpenMetrics1_0,
+        );
+        assert!(!body.contains("# UNIT"), "{body}");
+        assert_eq!(counts, vec![("unit_not_suffix".to_string(), 1.0)]);
+    }
+
+    /// Text 0.0.4 never writes `# UNIT` at all, so a unit it cannot carry is the operator's dialect
+    /// choice rather than a degradation -- and must not be counted as one.
+    #[test]
+    fn a_unit_dropped_by_the_text_dialect_is_not_counted() {
+        let (body, counts) =
+            write_counted(&[unit_family("request_duration", "s")], Dialect::Text0_0_4);
+        assert!(!body.contains("# UNIT"), "{body}");
+        assert!(counts.is_empty(), "{counts:?}");
+    }
+
+    /// `# EOF` terminates an OpenMetrics body and nothing else: in text 0.0.4 it is an ordinary
+    /// comment, and the exposition after it is ordinary exposition.
+    #[test]
+    fn a_text_0_0_4_eof_comment_does_not_terminate_the_body() {
+        let families = parsed("# EOF\nfoo 1\nbar 2\n", Dialect::Text0_0_4);
+        assert_eq!(family_names(&families), vec!["bar", "foo"]);
+
+        // The same bytes are malformed in OpenMetrics, where `# EOF` is the terminator.
+        assert!(matches!(
+            parse(b"# EOF\nfoo 1\n", Dialect::OpenMetrics1_0).unwrap_err(),
+            CodecError::Malformed(_)
+        ));
+    }
+
+    fn exemplar(value: f64, attrs: &[(&str, &str)]) -> Exemplar {
+        let mut filtered_attributes = AttrMap::new();
+        for (key, value) in attrs {
+            filtered_attributes.insert(key, Value::str(*value));
+        }
+        Exemplar { timestamp: 0, value, trace: None, filtered_attributes }
+    }
+
+    fn counter_with_exemplars(exemplars: Vec<Exemplar>) -> MetricFamily {
+        let mut family = MetricFamily::new("requests_total", FamilyType::Counter);
+        family.series = vec![Series { exemplars, ..Series::new(vec![], Point::Counter(17.0)) }];
+        family
+    }
+
+    /// A counter has one line, so OpenMetrics has room for one exemplar -- an OTLP `Sum` carrying
+    /// three loses two, counted.
+    #[test]
+    fn a_counters_extra_exemplars_are_dropped_and_counted() {
+        let family = counter_with_exemplars(vec![
+            exemplar(0.1, &[("n", "1")]),
+            exemplar(0.2, &[("n", "2")]),
+            exemplar(0.3, &[("n", "3")]),
+        ]);
+        let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
+        assert_eq!(body, "# TYPE requests counter\nrequests_total 17 # {n=\"1\"} 0.1\n# EOF\n");
+        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 2.0)]);
+    }
+
+    /// Two exemplars whose values land in one bucket's range: OpenMetrics allows one exemplar per
+    /// bucket, so the second has nowhere to sit.
+    #[test]
+    fn two_exemplars_in_one_bucket_range_lose_one_counted() {
+        let mut family = MetricFamily::new("latency", FamilyType::Histogram);
+        family.series = vec![Series {
+            exemplars: vec![exemplar(0.05, &[("n", "1")]), exemplar(0.06, &[("n", "2")])],
+            ..Series::new(
+                vec![],
+                Point::Histogram {
+                    buckets: vec![(0.1, 2), (f64::INFINITY, 2)],
+                    sum: None,
+                    count: 2,
+                },
+            )
+        }];
+        let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
+        assert!(body.contains("latency_bucket{le=\"0.1\"} 2 # {n=\"1\"} 0.05\n"), "{body}");
+        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
+    }
+
+    /// An exemplar whose value falls in no bucket at all (`NaN`, or above the highest bound when
+    /// there is no `+Inf` bucket) is dropped rather than attached to an arbitrary line.
+    #[test]
+    fn an_exemplar_with_no_bucket_to_sit_on_is_dropped_and_counted() {
+        let mut family = MetricFamily::new("latency", FamilyType::Histogram);
+        family.series = vec![Series {
+            exemplars: vec![exemplar(f64::NAN, &[("n", "1")])],
+            ..Series::new(
+                vec![],
+                Point::Histogram { buckets: vec![(f64::INFINITY, 1)], sum: None, count: 1 },
+            )
+        }];
+        let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
+        assert!(!body.contains('#') || !body.contains("{n="), "{body}");
+        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
+    }
+
+    /// OpenMetrics caps an exemplar's label set at 128 UTF-8 code points; emitting a longer one
+    /// would make the line invalid and truncating a trace id would make it a lie.
+    #[test]
+    fn an_over_budget_exemplar_label_set_is_dropped_and_counted() {
+        let long = "x".repeat(200);
+        let family = counter_with_exemplars(vec![exemplar(0.1, &[("detail", &long)])]);
+        let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
+        assert_eq!(body, "# TYPE requests counter\nrequests_total 17\n# EOF\n");
+        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
+    }
+
+    /// Text 0.0.4 has no exemplars at all, so dropping every one of them is the dialect's own
+    /// doing -- a permitted normalization, not a counted degradation.
+    #[test]
+    fn text_0_0_4_drops_every_exemplar_without_counting_any() {
+        let family = counter_with_exemplars(vec![exemplar(0.1, &[]), exemplar(0.2, &[])]);
+        let (body, counts) = write_counted(&[family], Dialect::Text0_0_4);
+        assert_eq!(body, "# TYPE requests_total counter\nrequests_total 17\n");
+        assert!(counts.is_empty(), "{counts:?}");
+    }
+
+    /// `_total` is a legal metric name on its own (`_` is a valid leading character), and stripping
+    /// the suffix for the OpenMetrics family name would leave a nameless `# TYPE  counter` line.
+    #[test]
+    fn a_counter_named_total_keeps_its_whole_name_as_the_openmetrics_family_name() {
+        let families = parsed("# TYPE _total counter\n_total 1\n", Dialect::Text0_0_4);
+        assert_eq!(families[0].name, "_total");
+        assert_eq!(
+            written(&families, Dialect::OpenMetrics1_0),
+            "# TYPE _total counter\n_total_total 1\n# EOF\n"
+        );
+    }
+
+    /// Both formats separate metadata fields with spaces or tabs interchangeably, exactly as the
+    /// sample path already does.
+    #[test]
+    fn tab_separated_metadata_lines_are_honored() {
+        let families =
+            parsed("# TYPE\tfoo\tgauge\n# HELP\tfoo\ttabbed help\nfoo 1\n", Dialect::Text0_0_4);
+        assert_eq!(families[0].kind, FamilyType::Gauge);
+        assert_eq!(families[0].help.as_deref(), Some("tabbed help"));
+    }
+
+    #[test]
+    fn a_metadata_keyword_with_nothing_after_it_is_counted_malformed() {
+        for line in ["# TYPE\n", "# HELP\n", "# UNIT\n"] {
+            let (_, reasons) = parse_reasons(&format!("{line}foo 1\n"), Dialect::Text0_0_4);
+            assert!(
+                reasons.contains(&"malformed_metadata".to_string()),
+                "{line:?} must count as malformed metadata, got {reasons:?}"
+            );
+        }
+        // A `# TYPE` with a name but no type keyword is the same kind of malformed.
+        let (families, reasons) = parse_reasons("# TYPE foo\nfoo 1\n", Dialect::Text0_0_4);
+        assert_eq!(families[0].kind, FamilyType::Untyped);
+        assert!(reasons.contains(&"malformed_metadata".to_string()));
+    }
+
+    /// An ordinary comment is still an ordinary comment, keyword-shaped or not.
+    #[test]
+    fn a_non_metadata_comment_is_ignored_rather_than_counted() {
+        let (families, reasons) = parse_reasons("# just a comment\n#\nfoo 1\n", Dialect::Text0_0_4);
+        assert_eq!(family_names(&families), vec!["foo"]);
+        assert!(reasons.is_empty(), "{reasons:?}");
     }
 }
