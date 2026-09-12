@@ -25,6 +25,14 @@
 //! -- a plain, non-trait method, directly testable without a runtime harness. Unlike `internal`,
 //! there is no `bind` override: a scrape client has no socket of its own to open ahead of time.
 //!
+//! One deliberate difference from `internal.rs`: the ticker's missed-tick behavior is set to
+//! `Delay`, not the default `Burst`. `internal`'s own tick never does network I/O, so `Burst`
+//! (fire every missed tick back-to-back the moment a stall clears) is harmless there; this tick
+//! awaits `sink.send` (bounded-channel backpressure) plus a per-target request timeout, so a
+//! downstream stall lasting several intervals is ordinary here, and `Burst` would turn it into N
+//! full scrape rounds fired in a row -- `Delay` resumes on a fixed cadence instead, matching
+//! Prometheus's own scrape scheduler, which skips a missed scrape rather than bursting to catch up.
+//!
 //! ## Dialect negotiation
 //!
 //! Every request carries `Accept: application/openmetrics-text;version=1.0.0,text/plain;
@@ -40,9 +48,13 @@
 //! Built once per target in [`PrometheusInput::new`], never per scrape: an unprefixed `instance`
 //! (`host:port` -- port defaulted to 80/443 when the target URL omits one, exactly matching
 //! Prometheus's own scrape) via [`logit_proto::prometheus::LABEL_INSTANCE`], and
-//! [`logit_proto::prometheus::ATTR_TARGET`], the full scrape URL. Both ride on every batch this
-//! target ever produces, including its synthetic metrics, which is what keeps two targets exposing
-//! the same exporter from colliding once relayed onward.
+//! [`logit_proto::prometheus::ATTR_TARGET`], the scrape URL with its userinfo (`user:pass@`, a
+//! legitimate way to put HTTP basic-auth credentials in a scrape URL) and query string stripped
+//! ([`redact_url`]) -- unlike `instance`, this attribute rides on every event this target
+//! produces, reaching whatever sink the pipeline routes it to, so it must never carry a
+//! credential in cleartext. Both ride on every batch this target ever produces, including its
+//! synthetic metrics, which is what keeps two targets exposing the same exporter from colliding
+//! once relayed onward.
 //!
 //! ## Synthetic scrape metrics
 //!
@@ -61,9 +73,10 @@
 //! `logit.input.scrape.duration` -- a timing sample per target per tick, recorded regardless of
 //! outcome. `logit.input.samples` -- the number of series decoded, summed across every target
 //! (`0` contributes nothing but is still a well-formed call). A scrape failure also reports
-//! `Diagnostics::warn_throttled("scrape_failed", ..)`, with the failing URL in the message text
-//! only -- never a tag, since a target URL isn't `&'static` and isn't safe to intern per-target
-//! (`AGENTS.md`'s tag-cardinality convention).
+//! `Diagnostics::warn_throttled("scrape_failed", ..)`, with the failing target's [`redact_url`]ed
+//! form in the message text only -- never a tag (a target URL isn't `&'static` and isn't safe to
+//! intern per-target, `AGENTS.md`'s tag-cardinality convention) and never the raw URL, which may
+//! carry a credential.
 
 use crate::tls::apply_client_tls;
 use crate::Input;
@@ -105,19 +118,24 @@ const USER_AGENT_VALUE: &str = concat!("logit/", env!("CARGO_PKG_VERSION"));
 /// import, the same convention `otlp::TlsServerSettings` already follows.
 pub use crate::tls::TlsClientSettings;
 
-/// One configured scrape target: the URL to `GET`, and the `Resource` every batch built from it
-/// carries. Built once in [`PrometheusInput::new`] -- see this module's doc comment.
+/// One configured scrape target: the URL to `GET`, its [`redact_url`]ed form (for anything that
+/// isn't the request itself -- diagnostics text, `prometheus.target`), and the `Resource` every
+/// batch built from it carries. Built once in [`PrometheusInput::new`] -- see this module's doc
+/// comment.
 #[derive(Clone)]
 struct Target {
     url: String,
+    redacted_url: String,
     resource: Arc<Resource>,
 }
 
 /// `host:port` of `url`'s authority, port defaulted to the scheme's well-known one (80/443) when
 /// absent -- exactly what Prometheus's own `instance` label holds, and what
-/// [`logit_proto::prometheus::LABEL_INSTANCE`] documents. Falls back to `url` itself if it somehow
-/// doesn't parse (graph validation's rule 40 already rejects a non-absolute-http(s) URL before a
-/// `PrometheusInput` is ever built from one, so this is a defensive fallback, not a real path).
+/// [`logit_proto::prometheus::LABEL_INSTANCE`] documents. Falls back to [`redact_url`]'s own
+/// fallback if `url` somehow doesn't parse (graph validation's rule 40 already rejects a
+/// non-absolute-http(s) URL before a `PrometheusInput` is ever built from one, so this is a
+/// defensive fallback, not a real path) -- never the raw `url` itself, which may carry a
+/// `user:pass@` credential this fallback must not leak.
 fn instance_of(url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(parsed) => {
@@ -127,14 +145,41 @@ fn instance_of(url: &str) -> String {
                 None => host.to_string(),
             }
         }
-        Err(_) => url.to_string(),
+        Err(_) => redact_url(url),
+    }
+}
+
+/// `url` with its userinfo (`user:pass@`) and query string stripped -- what every place that
+/// isn't the actual scrape request itself (the `prometheus.target` resource attribute, every
+/// `scrape_failed` diagnostic) must use instead of the raw target. A scrape URL can legitimately
+/// carry HTTP basic-auth credentials (`http://user:pass@host/metrics`) -- `reqwest` turns that
+/// into an `Authorization` header and never puts it on the wire itself, but the raw `String` this
+/// input was configured with still holds it in memory, and `prometheus.target` rides on every
+/// event's resource, reaching whatever sink the pipeline is configured with (InfluxDB tags,
+/// statsd tag sets, a forwarded OTLP resource, a stdout/file render) -- rendering the password in
+/// cleartext into every one of them if not stripped first. The query string goes too, since a
+/// bearer-token-in-query auth scheme (`?token=...`) is just as real a credential shape. Falls back
+/// to a fixed placeholder, never the raw `url`, if `url` doesn't parse at all.
+fn redact_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            // `Url::set_username`/`set_password` only fail for a URL kind that can't have
+            // userinfo at all (`cannot-be-a-base`, e.g. `data:`) -- never true for an absolute
+            // `http`/`https` URL, which is all rule 40 ever lets through; the `Result` is
+            // discarded rather than propagated for exactly that reason.
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.to_string()
+        }
+        Err(_) => "<unparseable target>".to_string(),
     }
 }
 
 fn build_resource(url: &str) -> Resource {
     let mut attributes = AttrMap::new();
     attributes.insert(LABEL_INSTANCE, Value::str(instance_of(url)));
-    attributes.insert(ATTR_TARGET, Value::str(url));
+    attributes.insert(ATTR_TARGET, Value::str(redact_url(url)));
     Resource { attributes, ..Default::default() }
 }
 
@@ -249,7 +294,8 @@ impl PrometheusInput {
             .into_iter()
             .map(|url| {
                 let resource = Arc::new(build_resource(&url));
-                Target { url, resource }
+                let redacted_url = redact_url(&url);
+                Target { url, redacted_url, resource }
             })
             .collect();
         Self {
@@ -394,7 +440,7 @@ impl PrometheusInput {
                                 format_args!(
                                     "prometheus_in: scraping {} succeeded but its response body \
                                      failed to parse: {err}",
-                                    target.url
+                                    target.redacted_url
                                 ),
                             );
                             ("parse_error", 0.0, 0, Vec::new())
@@ -406,7 +452,7 @@ impl PrometheusInput {
                         "scrape_failed",
                         format_args!(
                             "prometheus_in: scraping {} returned HTTP {status_code}",
-                            target.url
+                            target.redacted_url
                         ),
                     );
                     (status_class(status_code), 0.0, 0, Vec::new())
@@ -416,7 +462,7 @@ impl PrometheusInput {
                         "scrape_failed",
                         format_args!(
                             "prometheus_in: scraping {} failed: connection error",
-                            target.url
+                            target.redacted_url
                         ),
                     );
                     ("network_error", 0.0, 0, Vec::new())
@@ -424,7 +470,7 @@ impl PrometheusInput {
                 ScrapeStatus::Timeout => {
                     self.diag.warn_throttled(
                         "scrape_failed",
-                        format_args!("prometheus_in: scraping {} timed out", target.url),
+                        format_args!("prometheus_in: scraping {} timed out", target.redacted_url),
                     );
                     ("timeout", 0.0, 0, Vec::new())
                 }
@@ -434,7 +480,7 @@ impl PrometheusInput {
                         format_args!(
                             "prometheus_in: scraping {} exceeded the {MAX_SCRAPE_BYTES}-byte \
                              scrape limit",
-                            target.url
+                            target.redacted_url
                         ),
                     );
                     ("oversize", 0.0, 0, Vec::new())
@@ -462,6 +508,16 @@ impl PrometheusInput {
 impl Input for PrometheusInput {
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         let mut ticker = tokio::time::interval(self.interval);
+        // `Delay`, not the default `Burst`: unlike `internal.rs`'s own tick (which never does
+        // network I/O), a tick here awaits `sink.send` (bounded-channel backpressure) plus a
+        // per-target request timeout, so a downstream stall lasting several intervals is
+        // ordinary, not exceptional. `Burst` would fire every missed tick back-to-back the moment
+        // the stall clears -- N full scrape rounds in a row, each target hit N times with
+        // near-identical `received_at`, inflating `logit.input.scrapes`/`samples` and the
+        // synthetic series. `Delay` instead resumes on a fixed cadence from whenever the last
+        // tick actually completed, matching Prometheus's own scrape scheduler, which skips rather
+        // than bursts.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Swallow the immediate first tick, `internal.rs`'s own pattern -- the first real scrape
         // happens after one full `interval` has elapsed, not at t=0.
         ticker.tick().await;
@@ -483,6 +539,7 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use logit_core::{MetricKind, Registry};
     use logit_pipeline::Delivered;
+    use rustls_pki_types::pem::PemObject;
     use std::convert::Infallible;
     use std::net::SocketAddr;
     use std::sync::Mutex;
@@ -722,6 +779,111 @@ mod tests {
         assert_eq!(synthetic_value(&batch, "up"), 0.0);
     }
 
+    // ---- TLS: a canned `tokio-rustls`-wrapped scrape target -- mirrors
+    // `logit_outputs::otlp`'s own `canned_tls_http_server`/`test_server_tls_config` test pattern,
+    // since `PrometheusInput::with_tls` is a client the same shape `OtlpOutput::with_tls` is. ----
+
+    fn testdata_dir() -> std::path::PathBuf {
+        // `logit-inputs` lives at `crates/logit-inputs`; the fixtures live at the repo root's
+        // `testdata/tls` (`testdata/tls/README.md`) -- two levels up from `CARGO_MANIFEST_DIR`.
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
+    }
+
+    /// Builds a `rustls::ServerConfig` presenting `testdata/tls/server.{pem,key}` -- no client
+    /// certificate required, since `PrometheusInput` doesn't (yet) support mutual TLS.
+    fn test_server_tls_config() -> Arc<rustls::ServerConfig> {
+        let dir = testdata_dir();
+        let chain: Vec<rustls_pki_types::CertificateDer<'static>> =
+            rustls_pki_types::CertificateDer::pem_file_iter(dir.join("server.pem"))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_file(dir.join("server.key")).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .unwrap();
+        Arc::new(cfg)
+    }
+
+    /// A TLS-wrapped `canned_server`: replies with a fixed text-0.0.4 body over a real TLS
+    /// handshake against `testdata/tls/server.pem`.
+    async fn canned_tls_server() -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let acceptor = tokio_rustls::TlsAcceptor::from(test_server_tls_config());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let Ok(mut tls_stream) = acceptor.accept(stream).await else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = tls_stream.read(&mut buf).await;
+                let body = text_0_0_4_body();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = tls_stream.write_all(response.as_bytes()).await;
+                let _ = tls_stream.write_all(&body).await;
+                let _ = tls_stream.shutdown().await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_trusted_ca_file_lets_an_https_scrape_succeed() {
+        let addr = canned_tls_server().await;
+        let mut input = input_for(&format!("https://{addr}/metrics"))
+            .with_tls(
+                &TlsClientSettings { ca_file: Some("ca.pem".to_string()), ..Default::default() },
+                &testdata_dir(),
+            )
+            .expect("a well-formed tls: block should build fine");
+        let (tx, mut rx) = mpsc::channel(4);
+        let fanout = Fanout::new(vec![tx]);
+
+        input.tick(&fanout).await;
+
+        let batch = recv_batch(&mut rx).await;
+        assert_eq!(
+            synthetic_value(&batch, "up"),
+            1.0,
+            "a trusted CA should let the scrape succeed"
+        );
+    }
+
+    /// The regression test for `apply_client_tls`'s `tls_built_in_root_certs(false)`: without it,
+    /// `ca_file` only ever *adds* a root rather than replacing the bundled Mozilla set, so this
+    /// would (incorrectly) still leave the client trusting whatever it trusted before `ca_file`
+    /// was set. `other-ca.pem` signs nothing here (`testdata/tls/README.md`), so a client that
+    /// actually confines its trust to it must reject `server.pem` (signed by `ca.pem`).
+    #[tokio::test]
+    async fn an_untrusted_ca_file_rejects_an_https_scrape() {
+        let addr = canned_tls_server().await;
+        let mut input = input_for(&format!("https://{addr}/metrics"))
+            .with_tls(
+                &TlsClientSettings {
+                    ca_file: Some("other-ca.pem".to_string()),
+                    ..Default::default()
+                },
+                &testdata_dir(),
+            )
+            .expect("a well-formed tls: block should build fine");
+        let (tx, mut rx) = mpsc::channel(4);
+        let fanout = Fanout::new(vec![tx]);
+
+        input.tick(&fanout).await;
+
+        let batch = recv_batch(&mut rx).await;
+        assert_eq!(synthetic_value(&batch, "up"), 0.0, "an untrusted CA should reject the scrape");
+    }
+
     #[tokio::test]
     async fn the_resource_carries_instance_and_prometheus_target() {
         let (addr, _captured) = canned_server(CannedResponse::Body {
@@ -746,6 +908,55 @@ mod tests {
             batch.resource.attributes.get("prometheus.target").and_then(|v| v.as_str()),
             Some(url.as_str())
         );
+    }
+
+    /// The regression test for the credential-leak fix: `prometheus.target` rides on every event
+    /// this target produces, reaching whatever sink the pipeline routes to (InfluxDB tags, statsd
+    /// tag sets, a forwarded OTLP resource, a stdout render) -- it must never carry a scrape URL's
+    /// userinfo or query string in cleartext, even though the *request itself* still needs and
+    /// uses them (a scrape URL's `user:pass@` is a legitimate way to configure HTTP basic auth).
+    #[tokio::test]
+    async fn the_prometheus_target_attribute_strips_userinfo_and_query() {
+        let (addr, captured) = canned_server(CannedResponse::Body {
+            status: 200,
+            content_type: Some("text/plain; version=0.0.4"),
+            body: text_0_0_4_body(),
+        })
+        .await;
+        let url = format!("http://user:pass@{addr}/metrics?token=x");
+        let mut input = input_for(&url);
+        let (tx, mut rx) = mpsc::channel(4);
+        let fanout = Fanout::new(vec![tx]);
+
+        input.tick(&fanout).await;
+
+        let batch = recv_batch(&mut rx).await;
+        let target =
+            batch.resource.attributes.get("prometheus.target").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(target, format!("http://{addr}/metrics"), "got: {target}");
+        assert!(!target.contains("pass"), "got: {target}");
+        assert!(!target.contains("token"), "got: {target}");
+
+        // The request itself still authenticates: `reqwest` turns the URL's userinfo into a real
+        // `Authorization` header, which this redaction must not have broken.
+        let headers = captured.lock().unwrap();
+        let auth = headers[0].get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+        assert!(auth.is_some(), "expected an Authorization header from the URL's userinfo");
+    }
+
+    #[test]
+    fn redact_url_strips_userinfo_and_query_but_keeps_the_path() {
+        assert_eq!(
+            redact_url("http://user:pass@example.com:9100/metrics?token=x"),
+            "http://example.com:9100/metrics"
+        );
+        assert_eq!(redact_url("https://example.com/metrics"), "https://example.com/metrics");
+    }
+
+    #[test]
+    fn redact_url_falls_back_to_a_placeholder_on_an_unparseable_url() {
+        assert_eq!(redact_url("not a url"), "<unparseable target>");
+        assert_eq!(instance_of("not a url"), "<unparseable target>");
     }
 
     #[tokio::test]

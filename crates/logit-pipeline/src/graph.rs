@@ -116,14 +116,16 @@
 //!     there.) A `prometheus_in` `targets` must be non-empty, and every entry must parse as an
 //!     absolute `http://`/`https://` URL with a non-empty authority -- `logit-pipeline` doesn't
 //!     depend on `reqwest`/`url` (`docs/design/pipeline-graph.md`'s crate layout), so this is a
-//!     small hand-rolled scheme/authority check, not a real URL parse. A `tls:` block is rejected
-//!     unless at least one target is `https://` (the same "would have no effect" reasoning as rule
-//!     24's `otlp_out` check). `timeout: 0s` is rejected (the same "0 is impossible" reasoning as
-//!     rule 9's `interval`). `headers` may not name a header this input sets itself (`accept`,
-//!     `user-agent`, `host`, `content-length`, `te`, `transfer-encoding`, `connection`, an empty
-//!     name, or an HTTP/2 pseudo-header starting with `:`), checked case-insensitively, and no two
-//!     entries may collide once case is ignored -- the same shape rule 22 already checks for
-//!     `otlp_out`.
+//!     small hand-rolled scheme/authority check, not a real URL parse. A `tls:` block must be
+//!     internally consistent -- `cert_file`/`key_file` set together, no `insecure_skip_verify`
+//!     alongside `ca_file` -- the same two checks rule 24 makes for `otlp_out`'s own `tls:` block
+//!     (and rule 34 for `logit_out`'s) -- and is rejected outright unless at least one target is
+//!     `https://` (the same "would have no effect" reasoning as rule 24's third check).
+//!     `timeout: 0s` is rejected (the same "0 is impossible" reasoning as rule 9's `interval`).
+//!     `headers` may not name a header this input sets itself (`accept`, `user-agent`, `host`,
+//!     `content-length`, `te`, `transfer-encoding`, `connection`, an empty name, or an HTTP/2
+//!     pseudo-header starting with `:`), checked case-insensitively, and no two entries may
+//!     collide once case is ignored -- the same shape rule 22 already checks for `otlp_out`.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -1399,6 +1401,19 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': 'timeout: 0s' would fail every scrape immediately -- use \
                      a positive duration"
+                );
+            }
+            if tls.cert_file.is_some() != tls.key_file.is_some() {
+                anyhow::bail!(
+                    "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
+                     mutual TLS, or both omitted -- one alone can't be used"
+                );
+            }
+            if tls.insecure_skip_verify && tls.ca_file.is_some() {
+                anyhow::bail!(
+                    "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both \
+                     be set -- 'insecure_skip_verify' trusts any certificate, which makes a \
+                     specific trusted CA meaningless"
                 );
             }
             let any_https = targets.iter().any(|t| t.to_ascii_lowercase().starts_with("https://"));
@@ -4234,6 +4249,60 @@ mod tests {
             ("out", vec!["in"], sink()),
         ]))
         .expect("a tls: block with at least one https:// target should resolve fine");
+    }
+
+    #[test]
+    fn a_prometheus_in_tls_cert_file_without_a_key_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            cert_file: Some("client.pem".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], prometheus_in_with_tls(vec!["https://node-exporter:9100/metrics"], tls)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("cert_file") && err.contains("key_file"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_in_tls_key_file_without_a_cert_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            key_file: Some("client.key".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], prometheus_in_with_tls(vec!["https://node-exporter:9100/metrics"], tls)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("cert_file") && err.contains("key_file"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_in_tls_insecure_skip_verify_with_a_ca_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            insecure_skip_verify: true,
+            ca_file: Some("ca.pem".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], prometheus_in_with_tls(vec!["https://node-exporter:9100/metrics"], tls)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("insecure_skip_verify") && err.contains("ca_file"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_in_tls_cert_and_key_file_together_resolve_fine() {
+        let tls = logit_config::TlsClientConfig {
+            cert_file: Some("client.pem".to_string()),
+            key_file: Some("client.key".to_string()),
+            ..Default::default()
+        };
+        resolve(cfg(vec![
+            ("in", vec![], prometheus_in_with_tls(vec!["https://node-exporter:9100/metrics"], tls)),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("cert_file and key_file set together should resolve fine");
     }
 
     #[test]

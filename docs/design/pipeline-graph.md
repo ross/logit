@@ -371,9 +371,12 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     "Crate layout" section), so this is a small hand-rolled scheme/authority check, not a full URL
     parse. `timeout: 0s` is rejected, the same "0 is impossible" reasoning as rule 9's `interval`
     (which also covers `prometheus_in`'s own `interval: 0s`, via the same generic check). A `tls:`
-    block is rejected unless at least one target is `https://` — TLS is selected per-target by its
-    own scheme, so a `tls:` block with nothing to tune would otherwise be silently ignored, the
-    same reasoning as rule 24's `otlp_out` check. `headers` may not name a header this input sets
+    block must be internally consistent — `cert_file`/`key_file` set together, no
+    `insecure_skip_verify` alongside `ca_file` — the same two checks rule 24 makes for `otlp_out`'s
+    own `tls:` block (and rule 34 for `logit_out`'s) — and is rejected outright unless at least one
+    target is `https://` — TLS is selected per-target by its own scheme, so a `tls:` block with
+    nothing to tune would otherwise be silently ignored, the same reasoning as rule 24's third
+    check. `headers` may not name a header this input sets
     itself (`accept`, `user-agent`, and the other protocol-owned names) or collide with another
     entry once case is ignored, checked case-insensitively — the same shape rule 22 already checks
     for `otlp_out`'s own `headers:` (`docs/adr/prometheus-scrape-and-exposition.md`). `receive:` on

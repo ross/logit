@@ -140,7 +140,13 @@ pub(crate) fn apply_client_tls(
             .with_context(|| format!("reading tls.ca_file {}", path.display()))?;
         let cert = reqwest::Certificate::from_pem(&pem)
             .with_context(|| format!("parsing tls.ca_file {}", path.display()))?;
-        builder = builder.add_root_certificate(cert);
+        // `add_root_certificate` alone is additive -- the bundled Mozilla root set stays trusted
+        // alongside `cert`, so a server whose leaf happens to chain to any public root would still
+        // verify even though the operator named a specific CA to trust "instead of" it (this
+        // struct's own doc comment, and `logit_config::TlsClientConfig::ca_file`'s). Disabling the
+        // built-in roots first is what actually makes `ca_file` a replacement, matching
+        // `logit_outputs::tls::build_client_config`'s `RootCertStore::empty()` starting point.
+        builder = builder.tls_built_in_root_certs(false).add_root_certificate(cert);
     }
     if let (Some(cert_file), Some(key_file)) = (&settings.cert_file, &settings.key_file) {
         let cert_path = base_dir.join(cert_file);
