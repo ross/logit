@@ -389,6 +389,17 @@ deployment conventions:
   statsd) calls the series: `collectd_out` re-encodes from the `collectd.*` attributes, so a
   `collectd_in -> collectd_out` relay puts the same bytes back on the wire either way.
 
+A complete, runnable topology is
+[`examples/collectd-to-influxdb.yaml`](../examples/collectd-to-influxdb.yaml): `collectd_in` on
+`0.0.0.0:25826` straight into `influxdb_out`, with both settings above present as commented
+alternatives. It deliberately has **no** `aggregate` in the middle, unlike
+[`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml) — a collectd value list is
+already one pre-aggregated reading per `Interval`, carrying its own timestamp, so re-windowing it
+would average averages and re-stamp them with the flush time. The file's header comment lists what
+that cross-protocol hop costs: the `collectd.*` attributes become ordinary InfluxDB tags rather than
+wire identity, and one N-data-source list becomes N measurements named `plugin.type.ds` sharing a
+tag set and a timestamp.
+
 ## Tailing files and Docker logs
 
 `tail_in` reads one or more files line by line; `docker_in` builds on the same driver to tail

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-10
+updated: 2026-09-12
 ---
 
 # Recorded interop fixtures: real producers, captured once, replayed as tests forever
@@ -66,6 +66,46 @@ same misunderstanding.
 - **TCP-framed syslog fixtures.** `syslog_in` is UDP-only today
   (`crates/logit-inputs/src/syslog.rs`'s module doc), so there's nothing to exercise yet — but
   `raw_capture.py` already implements a `--proto tcp` capture mode for when that changes.
+
+## Amendment (2026-09-12): collectd, recorded
+
+A **fifth producer** landed with W4a of [`collectd-binary-relay.md`](collectd-binary-relay.md):
+`record_collectd` in `script/record-fixtures` (plus `tools/record-fixtures/collectd.conf` and
+`collectd-entrypoint.sh`), three captured datagrams in `testdata/interop/collectd/`, and five
+`interop_fixture_*` tests in `crates/logit-inputs/src/collectd.rs` consuming them. It follows
+`record_rsyslog`'s shape exactly — a real Debian package (`collectd-core`) installed fresh into
+`debian:bookworm-slim` at record time — for the same verified reason: the collectd project's own
+Docker Hub namespace holds a single repository, `collectd/ci`, which is a *build-environment* image
+(one tag per distro, carrying what it takes to compile collectd), not a runnable daemon.
+
+Two findings worth recording alongside §1's, both specific to how collectd's `network` plugin
+behaves rather than to what its protocol says:
+
+- **A datagram is not a read cycle, and `--count 3` is not "three measurements."** The `network`
+  plugin packs value lists into a send buffer (`MaxPacketSize`, default 1452) and only puts a
+  datagram on the wire once that buffer is full, or at shutdown. So the recorded fixtures are
+  ~1.3 KB each rather than the few hundred bytes every syslog fixture is, and each one carries
+  ~25 value lists from several read cycles. This is what makes three datagrams a *good* size for
+  this corpus rather than an accident: sender-side identity elision (one Host part for ~25 lists),
+  a read cycle split across a packet boundary, and identity being re-stated in full at the start of
+  the next datagram are all things only a packed datagram can show, and all three are exactly what
+  `crates/logit-proto/src/collectd/decode.rs`'s sticky-identity state machine has to get right.
+  `Interval 1` in the config is there to make the buffer fill in seconds instead of minutes.
+- **Which lists land in which datagram is not stable across a re-record** — more so than for any
+  other producer here, since it depends on plugin read-thread scheduling. §1's "captures aren't
+  byte-reproducible, and that's fine" therefore applies with extra force: the consuming tests
+  assert a list's data-source count and kinds, its `collectd.*` identity, its interval and that the
+  whole datagram decodes with no diagnostics — never a measured value, a timestamp, or a per-file
+  list count.
+
+The follow-on list below is otherwise unchanged: syslog-ng is still not attempted, and
+statsd/DogStatsD, Docker json-file and `logit_in`/`logit_out` cross-version fixtures are still not
+started. One item is now *scheduled* rather than merely unstarted: a collectd `threshold`-plugin
+capture, exercising the notification parts (`Message` 0x0100 / `Severity` 0x0101), lands with W5 of
+`collectd-binary-relay.md`, which is the workstream that teaches the decoder to read them.
+`testdata/interop/collectd/README.md`'s own "what isn't covered here (yet)" section carries the
+rest (signed/encrypted traffic, multi-host forwarding, legacy second-resolution time parts,
+COUNTER/ABSOLUTE data sources).
 
 ## 1. How captures are recorded, reproducibly
 
