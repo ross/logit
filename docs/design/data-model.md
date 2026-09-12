@@ -180,6 +180,38 @@ unchanged nginx line carrying only `request_time` still yield a span. Everything
 computed as `i64` nanoseconds with checked arithmetic — `logit` never rounds a value below the
 precision the source actually offered.
 
+**The collectd codec is the same precedent once more** (`crates/logit-proto/src/collectd/`,
+[ADR `collectd-binary-relay`](../adr/collectd-binary-relay.md)): collectd identifies every value
+list by a five-tuple — host, plugin, plugin instance, type, type instance — that this model has one
+`MetricRecord.name` for, and carries a per-list reporting interval it has no field for at all. So
+the raw wire facts ride alongside as attributes and win on the way back out. Every `collectd.*`
+attribute is **consumed** by `collectd_out` (never re-emitted as anything else) and appears as an
+ordinary tag at every other sink, which is what makes `collectd_in -> collectd_out` a fixed point.
+These are **event** attributes, never resource ones: `logit_pipeline::BatchAccumulator::absorb` keys
+accumulation on `Arc::ptr_eq`, so a per-host resource would split every batch by sender — the same
+reasoning behind `syslog.hostname`. The presence of `collectd.type` is what selects like-relay
+encoding at `collectd_out`; an event without it is encoded through that sink's fallback naming path
+instead. `crates/logit-proto/src/collectd/mod.rs`'s module doc is the full mapping table.
+
+| Attribute | Value | Meaning |
+|---|---|---|
+| `collectd.host` | `Value::Str`, or `Value::Bytes` when the wire bytes aren't UTF-8 | The wire Host. Absent when the wire carried an empty one (an empty string part is how a sender *clears* a sticky field). Outranks `host.name` on `collectd_out`, which then falls back to `host.name` and finally to the sink's own `hostname:` — with none of the three, the value list is dropped and counted (`logit.output.metrics.skipped{reason="no_host"}`), since collectd's receiver rejects an empty host and inventing one would merge every unlabelled sender into a single host's metrics. |
+| `collectd.plugin` | `Value::Str`/`Value::Bytes` | The wire Plugin (`cpu`, `load`, `df`). Required for like-relay encoding: a list whose plugin or type sanitizes to nothing is dropped (`{reason="empty_name"}`). |
+| `collectd.plugin_instance` | `Value::Str`/`Value::Bytes`, only when non-empty | The wire PluginInstance (a CPU number, a mount point). |
+| `collectd.type` | `Value::Str`/`Value::Bytes` | The wire Type — a `types.db` entry name (`cpu`, `if_octets`, `df_complex`) naming the data-source layout the list's values follow. **Its presence is what selects like-relay encoding** on `collectd_out`. |
+| `collectd.type_instance` | `Value::Str`/`Value::Bytes`, only when non-empty | The wire TypeInstance (`user`, `system`, `free`). |
+| `collectd.interval` | `Value::F64` seconds | The list's reporting interval, exactly `cdtime / 2³⁰` — collectd's own 2⁻³⁰-second tick unit, converted losslessly. Absent when the wire carried no interval part or a zero one; re-emitted as `IntervalHR round(v · 2³⁰)`, or as `IntervalHR 0` when absent. A non-`F64` or non-positive value is counted `logit.output.tags.dropped{reason="unrepresentable"}` and written as zero. |
+| `collectd.severity` | `Value::U64` ∈ {1, 2, 4} | **Reserved for notifications** (W5 of [docs/plans/collectd-binary-relay.md](../plans/collectd-binary-relay.md)); nothing reads or writes it yet. The raw wire severity (1 FAILURE, 2 WARNING, 4 OKAY), which marks the event as a notification rather than a value list and will outrank `LogRecord.severity` on egress. |
+
+Two model-side rules follow from that table rather than from any one attribute. A Values part
+carrying N data sources becomes **one** event whose `metrics` holds N `MetricRecord`s in wire order
+(`logit_core::MetricList` is a `SmallVec` inlined at 1, so the common single-source list costs
+nothing extra) — not N events, which is what lets it be re-encoded as the same single list. And the
+record names are display/cross-protocol only: `<plugin>.<type>` for a single-source list,
+`<plugin>.<type>.<i>` (0-based) otherwise, with W2 resolving `<ds_name>` from an operator-supplied
+`types.db`. Like-relay fidelity rides on the attributes, the `MetricList` order and the metric
+kinds, never on the name.
+
 `tail_in`/`docker_in` (`crates/logit-inputs/src/tail/`, `crates/logit-inputs/src/docker.rs`,
 [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)) stamp two
 more event attributes, and a resource sub-convention of their own:

@@ -2,6 +2,7 @@
 //! format. See `docs/design/wire-protocol.md` for the framing and payload design.
 
 pub mod buffer;
+pub mod collectd;
 pub mod frame;
 pub mod native;
 pub mod otlp;
