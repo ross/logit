@@ -119,18 +119,20 @@ same key merges into the pending point rather than queueing a second one:
 
 | Kind | Coalesced by | Emitted as |
 |---|---|---|
-| count | sum | `MetricKind::Counter` |
+| count | sum | `MetricKind::Sum` (produced via `MetricKind::counter(v)`) |
 | gauge | last write wins | `MetricKind::Gauge` |
 | timing | samples merged into one sketch | `MetricKind::Distribution(DdSketch)` |
 
 These are exactly `logit-transforms::Aggregator`'s own merge rules
-(`Accumulator::Counter` sums, `Gauge` is last-write-wins, `Distribution` merges sketches). That
+(`Accumulator::Sum` sums, `Gauge` is last-write-wins, `Distribution` merges sketches). That
 identity is load-bearing, not incidental: it's what makes attaching a real `aggregate` component
 downstream of `internal` extend this to any actual time window *correctly* — the merges compose,
 because they're the same merges. The buffer itself has no notion of a time window; it holds
-whatever has accumulated since the last drain and nothing more. See ADR `internal-telemetry-as-pipeline-events` for why this can't
-take DogStatsD's "pack raw samples, let the server aggregate" option for timings —
-`logit_core::MetricKind` has no raw-sample representation, only mergeable ones.
+whatever has accumulated since the last drain and nothing more. `MetricKind::Samples` exists now
+(`docs/plans/lossless-transit.md`'s W1/W3), but this buffer deliberately keeps sketching timings
+into one running `DdSketch` between drains rather than retaining raw per-timing values — see ADR
+`internal-telemetry-as-pipeline-events` for why a mergeable running sketch, not raw retention, is
+still the right shape for internally generated points.
 
 **Cardinality is capped, not unbounded.** A component's buffer holds at most 1024 distinct
 `(name, tags)` keys (`telemetry::MAX_KEYS_PER_COMPONENT`); a new key beyond the cap is dropped and
@@ -607,11 +609,22 @@ Worked examples, one per shipped component:
   `max_packet_bytes` needs that a line count alone can't show, since `statsd_out` (unlike
   `syslog_out`) packs several lines per datagram. `logit.output.messages.dropped{reason=
   "unresolved_gauge_delta"|"unsupported_kind"|"unencodable_value"|"empty_name"|"oversize_line"|
-  "oversize_datagram"}` and, **new**, `logit.output.tags.dropped{reason="dialect"|
+  "oversize_datagram"|"dialect_field"|"dialect_event"|"invalid_service_check"|
+  "invalid_event_field"}` (`dialect_field`, for a `|c:`/`|T` field with nowhere to go under
+  `format: statsd`; `dialect_event`, **new**, a whole DogStatsD event or service check dropped
+  under `format: statsd`, which has no `_e`/`_sc` wire form at all; `invalid_service_check`,
+  **new**, a service check whose first metric isn't a `Gauge` or has no status resolving into
+  `0..=3`; `invalid_event_field`, **new**, an event's `p:`/`t:` field alone omitted for an
+  out-of-set value -- its own counter, not `unencodable_value`, since the rest of that line still
+  renders) and `logit.output.tags.dropped{reason="dialect"|
   "unrepresentable"}` for `format: statsd` dropping the whole tag segment or an individual
-  unrepresentable tag. A `MetricKind::GaugeDelta` reaching this encoder with `relative_gauges:
-  false` reports under `logit.component.diagnostics{key="gauge_delta_unresolved"}`, the identical
-  key `influxdb_out` uses, so one grep finds both sinks. Retry stays a Layer 2 metric here too.
+  unrepresentable tag. **New**, `logit.output.messages.normalized{reason="dialect"|
+  "member_sanitized"}` counts a lossless-but-different rendering rather than a drop: a timer's
+  `h`/`d` wire-type letter collapsing to `ms` under `format: statsd`, or a `SetMembers` member
+  changing after lossy UTF-8 plus sanitization. A `MetricKind::GaugeDelta` reaching this encoder
+  with `relative_gauges: false` reports under
+  `logit.component.diagnostics{key="gauge_delta_unresolved"}`, the identical key `influxdb_out`
+  uses, so one grep finds both sinks. Retry stays a Layer 2 metric here too.
 - `logit_out` (`crates/logit-outputs/src/logit.rs`, [ADR
   `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md)):
   `logit.proto.frames{direction="out",codec,compression}` and `logit.proto.frame.bytes` — the

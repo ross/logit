@@ -431,10 +431,10 @@ pub enum ComponentKind {
         /// retention window is. Least-recently-updated series are evicted first once exceeded.
         #[serde(default = "default_max_retained_series")]
         max_retained_series: usize,
-        /// Whether a raw `Samples` series (statsd `ms`/`h`/`d`, no producer until W3) absorbs into
-        /// this window as a sketch (the default -- exact, error-bounded quantiles, no raw values
-        /// retained past the window) or keeps its raw observations for the whole window, only
-        /// falling back to a sketch when `max_samples_per_series` is exceeded or an incoming
+        /// Whether a raw `Samples` series (statsd `ms`/`h`/`d`) absorbs into this window as a
+        /// sketch (the default -- exact, error-bounded quantiles, no raw values retained past the
+        /// window) or keeps its raw observations for the whole window, only falling back to a
+        /// sketch when `max_samples_per_series` is exceeded or an incoming
         /// record's `sample_rate` disagrees with the series' first one (that fallback is counted,
         /// see `docs/adr/aggregation-window-semantics.md`'s amendment). Raw retention is the
         /// lossless-transit option (`docs/adr/lossless-transit.md`): a downstream `logit`
@@ -449,8 +449,8 @@ pub enum ComponentKind {
         /// retained in that mode.
         #[serde(default = "default_max_samples_per_series")]
         max_samples_per_series: usize,
-        /// Whether a raw `SetMembers` series (statsd `s`, no producer until W3) absorbs into this
-        /// window as a `HyperLogLog` cardinality estimate (the default) or keeps its exact,
+        /// Whether a raw `SetMembers` series (statsd `s`) absorbs into this window as a
+        /// `HyperLogLog` cardinality estimate (the default) or keeps its exact,
         /// deduplicated member set for the whole window, only falling back to an estimate when
         /// `max_set_members_per_series` is exceeded (counted, see the amendment). Exact retention
         /// is the lossless-transit option: an exact member count/list only survives the window

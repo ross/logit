@@ -1325,12 +1325,14 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 /// on the runtime's own worker threads and never nests inside another `.await`. `fanout.send`
 /// becomes `fanout.send_blocking` for the same reason: no `.await` available outside `block_on`.
 ///
-/// Unlike `Transform::flush`, a Lua `flush()` has no resource of its own to stamp its emitted
-/// events with (`docs/adr/aggregation-window-semantics.md`) -- `last_resource` defaults to
-/// whichever resource this component most recently saw on a real batch (a fresh one if none has
-/// arrived yet), but a script that writes `resource` inside `process()` or `flush()`
-/// (`crates/logit-script/src/resource.rs`, `docs/adr/operator-declared-resource-attributes.md`)
-/// overrides that default explicitly -- see `flush_now`'s `take_resource` call below.
+/// Unlike `Transform::flush`, a Lua `flush()` has no resource (or scope) of its own to stamp its
+/// emitted events with (`docs/adr/aggregation-window-semantics.md`) -- `last_resource`/
+/// `last_scope` default to whichever resource/scope this component most recently saw on a real
+/// batch (a fresh resource, and no scope, if none has arrived yet), but a script that writes
+/// `resource` and/or `scope` inside `process()` or `flush()` (`crates/logit-script/src/resource.rs`,
+/// `crates/logit-script/src/scope.rs`, `docs/adr/operator-declared-resource-attributes.md`)
+/// overrides that default explicitly -- see `flush_now`'s `take_resource`/`take_scope` calls
+/// below.
 #[allow(clippy::too_many_arguments)]
 fn run_lua(
     id: String,
@@ -1364,10 +1366,11 @@ fn run_lua(
 
     let mut next_flush = configured_interval.map(|interval| tokio::time::Instant::now() + interval);
     let mut last_resource = Arc::new(Resource::default());
-    // Mirrors `last_resource`'s "whichever batch was last seen" approximation for `flush_now`'s
-    // benefit -- a Lua `flush()` has no scope-writing hook analogous to `resource`'s
-    // (`crates/logit-script/src/resource.rs`), so this is never overwritten by the script itself,
-    // only ever updated from whatever scope the most recently processed batch carried.
+    // `flush_now`'s default identity for a scope-less flush-driven emission -- the same
+    // "whichever batch was last seen" approximation `last_resource` uses, but (W7) a script that
+    // writes `scope` inside `process()`/`flush()` (`crates/logit-script/src/scope.rs`) overrides
+    // this default explicitly, exactly the way `resource` already does -- see `flush_now`'s
+    // `take_scope` call below.
     let mut last_scope: Option<Arc<Scope>> = None;
 
     // Mints its own root and records this node's `flush` span directly (rather than going
@@ -1385,7 +1388,7 @@ fn run_lua(
     let flush_now = |diag: &mut Diagnostics,
                      worker: &ScriptWorker,
                      resource: &mut Arc<Resource>,
-                     scope: &Option<Arc<Scope>>,
+                     scope: &mut Option<Arc<Scope>>,
                      fanout: &Fanout| {
         // Empty provenance in, same reasoning as `run_flush`'s own doc comment: a Lua `flush()`
         // is a fresh emission with no single incoming batch to inherit `origin`/`previous` from,
@@ -1408,6 +1411,13 @@ fn run_lua(
         // Lua-flush-staleness entry).
         if let Some(new_resource) = worker.take_resource() {
             *resource = new_resource;
+        }
+        // A `flush()` that wrote `scope` (`crates/logit-script/src/scope.rs`) commits that write
+        // here too, the same way as `resource` just above -- `take_scope` always returns `Some`
+        // once written, never `None`-meaning-"clear", so this only ever narrows toward a real
+        // scope, never back to `None`.
+        if let Some(new_scope) = worker.take_scope() {
+            *scope = Some(new_scope);
         }
         // Sampled here too, not only after a batch (below) -- `ScriptWorker::used_memory`'s own
         // doc comment names accumulation *across `flush()` calls* as exactly the leak shape this
@@ -1439,7 +1449,7 @@ fn run_lua(
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
-                flush_now(&mut diag, &worker, &mut last_resource, &last_scope, &fanout);
+                flush_now(&mut diag, &worker, &mut last_resource, &mut last_scope, &fanout);
                 let interval = configured_interval
                     .expect("next_flush is only ever Some for a component with an interval");
                 next_flush = Some(advance_flush_deadline(deadline, now_instant, interval));
@@ -1463,7 +1473,7 @@ fn run_lua(
         };
         let Some(batch) = batch else {
             if next_flush.is_some() {
-                flush_now(&mut diag, &worker, &mut last_resource, &last_scope, &fanout);
+                flush_now(&mut diag, &worker, &mut last_resource, &mut last_scope, &fanout);
             }
             return;
         };
@@ -1506,6 +1516,9 @@ fn run_lua(
         // every event errors, so a later `flush()` never reads a stale identity because this
         // batch happened to produce nothing.
         worker.set_resource(&batch.resource);
+        // Same reasoning, for `scope` (`crates/logit-script/src/scope.rs`) -- `batch.scope` is
+        // `Option`al (not every batch carries one), which `set_scope` itself handles.
+        worker.set_scope(&batch.scope);
         telemetry.count("logit.component.batches.received", 1.0, &[]);
         telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
 
@@ -1562,14 +1575,17 @@ fn run_lua(
         // never wrote it, so the incoming `Arc` moves straight through with no clone -- same
         // `map_resource`-shaped contract `process_batch` (above) gives native transforms.
         let resource = worker.take_resource().unwrap_or(batch.resource);
+        // Same pattern, for `scope` (`crates/logit-script/src/scope.rs`) -- `take_scope` returns
+        // `None` when the script never wrote it, so this falls back to whatever the incoming
+        // batch itself carried (which may itself be `None`), rather than `unwrap_or` (that would
+        // need an owned default `Scope` to unwrap into, and there isn't a sensible one -- `None`
+        // is the correct fallback, not `Scope::default()`).
+        let scope = worker.take_scope().or_else(|| batch.scope.clone());
         last_resource = resource.clone();
-        last_scope = batch.scope.clone();
+        last_scope = scope.clone();
         if !out.is_empty() {
             span.events(out.len() as u64);
-            fanout.send_blocking_with_own_context(
-                EventBatch { resource, scope: batch.scope, events: out },
-                ctx,
-            );
+            fanout.send_blocking_with_own_context(EventBatch { resource, scope, events: out }, ctx);
         }
     }
 }
@@ -2850,6 +2866,104 @@ mod tests {
             received.resource.attributes.get("service.name"),
             Some(&logit_core::Value::str("web")),
             "a resource write inside process() must reach the outgoing batch"
+        );
+    }
+
+    /// As `run_lua_process_writing_resource_re_stamps_the_outgoing_batch`, for `scope`
+    /// (`crates/logit-script/src/scope.rs`, W7): a Lua stage writing `scope.name` emits a batch
+    /// whose `scope` carries the new name, with `resource` left unchanged since this script never
+    /// touches it.
+    #[tokio::test]
+    async fn run_lua_process_writing_scope_re_stamps_the_outgoing_batch() {
+        let mut components = Map::new();
+        components.insert(
+            "in".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
+                sources: vec![],
+                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            },
+        );
+        let script = r#"
+            function process(event)
+                scope.name = "nginx-otel-module"
+                return event
+            end
+        "#
+        .to_string();
+        components.insert(
+            "enrich".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
+                sources: vec!["in".to_string()],
+                kind: ComponentKind::Lua { script: script.clone(), interval: None },
+            },
+        );
+        components.insert(
+            "out".to_string(),
+            Component {
+                buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
+                sources: vec!["enrich".to_string()],
+                kind: influxdb_out(),
+            },
+        );
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![counter_event("hits", 1.0)],
+        };
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert("enrich".to_string(), NodeSpec::Lua { script, interval: None });
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx: result_tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = ["in", "enrich", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, telemetry, Readiness::disabled(), std::future::pending()),
+        )
+        .await
+        .expect("should not hang")
+        .expect("should complete without error");
+
+        let received =
+            result_rx.recv_timeout(Duration::from_secs(1)).expect("output should receive a batch");
+        let scope =
+            received.scope.as_ref().expect("a scope write inside process() must produce a scope");
+        assert_eq!(
+            scope.name.as_ref(),
+            b"nginx-otel-module",
+            "a scope write inside process() must reach the outgoing batch"
+        );
+        assert!(
+            received.resource.attributes.is_empty(),
+            "a script that never touches resource must leave it unchanged"
         );
     }
 

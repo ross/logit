@@ -93,12 +93,12 @@ pub enum MetricKind {
     /// carries the running gauge value a delta needs to apply against. See
     /// `docs/adr/relative-gauge-adjustments.md`.
     GaugeDelta(f64),
-    /// Raw observations, as statsd `ms`/`h`/`d` values arrive -- no producer until W3
-    /// (`docs/plans/lossless-transit.md`).
+    /// Raw observations, as statsd `ms`/`h`/`d` values arrive -- `statsd_in` decodes `ms`/`h`/`d`
+    /// to it since W3 (`docs/plans/lossless-transit.md`).
     Samples(Samples),
     /// Produced only by `aggregate`, merging a run of [`MetricKind::Samples`].
     Distribution(DdSketch),
-    /// Raw set members, as statsd `s` arrives -- no producer until W3.
+    /// Raw set members, as statsd `s` arrives -- `statsd_in` decodes `s` to it since W3.
     SetMembers(Vec<bytes::Bytes>),
     /// Produced only by `aggregate`, merging a run of [`MetricKind::SetMembers`] into a real,
     /// mergeable cardinality estimate -- see [`HyperLogLog`].
@@ -242,7 +242,8 @@ pub struct Summary {
 
 /// A single sampled measurement backing a metric point -- OTLP's exemplar concept: the specific
 /// trace a particular observation happened under, plus whatever attributes were dropped from the
-/// point's own attribute set to reach it. No producer until W4 (`docs/plans/lossless-transit.md`).
+/// point's own attribute set to reach it. Produced by the OTLP codec since W4
+/// (`docs/plans/lossless-transit.md`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Exemplar {
     pub timestamp: i64,
@@ -346,9 +347,9 @@ impl Default for DdSketch {
 /// [`DdSketch`] needs a real error bound: the split-collection topology (`docs/OVERVIEW.md`) means
 /// two edge nodes' `Set` aggregates may need combining downstream, and a union of two independently
 /// built HyperLogLogs is the algorithm's whole point, not an approximation layered on top of one.
-/// See `docs/design/data-model.md`. Still no *producer* until W3 wires up statsd's `s` (set) metric
-/// type -- `crates/logit-inputs/src/statsd.rs` still returns a decode error for it -- but `aggregate`
-/// (W2) can now merge [`MetricKind::SetMembers`] into a real [`MetricKind::Set`].
+/// See `docs/design/data-model.md`. Since W3, `crates/logit-inputs/src/statsd.rs` decodes statsd's
+/// `s` (set) metric type straight to [`MetricKind::SetMembers`], and `aggregate` (W2) merges it
+/// into a real [`MetricKind::Set`].
 ///
 /// **`from_bytes` depends on a capacity invariant, not just a byte layout.** `cardinality-estimator`
 /// 1.0.3's `Array::from_vec` (its `src/array.rs`) reconstitutes the wrapped crate's own heap

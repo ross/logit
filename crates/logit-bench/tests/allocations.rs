@@ -114,11 +114,14 @@ fn statsd_decode_one_line() {
     expect_allocs("statsd_in: decode 1 line", stats, 2);
 }
 
-/// Pins the unsampled baseline that sample-rate extrapolation on the decode path
-/// (`DdSketch::add_weighted`, `crates/logit-core/src/metric.rs`) must add zero allocations over --
-/// which its delegation to `sketches_ddsketch::DDSketch::add_with_count` satisfies regardless of
-/// weight. [`statsd_decode_one_sampled_distribution_line`] pins the sampled case at the same
-/// count.
+/// `ms`/`h`/`d` now decode straight to a raw `MetricKind::Samples` (`docs/adr/lossless-transit.md`'s
+/// W3, `crates/logit-inputs/src/statsd.rs`) instead of sketching into a `DdSketch` at decode time
+/// -- one value fits inline in `Samples`'s `SmallVec` (`SAMPLES_INLINE = 19`,
+/// `crates/logit-core/src/metric.rs`), so building it costs nothing beyond the per-line/per-batch
+/// `Vec<Event>` allocations [`statsd_decode_one_line`] already pins; the `DdSketch` bin `Vec`
+/// this test used to also pay for is gone. [`statsd_decode_one_sampled_distribution_line`] pins
+/// the sampled case at the same count, since `sample_rate` now rides verbatim with no
+/// decode-time extrapolation to allocate for.
 #[test]
 fn statsd_decode_one_distribution_line() {
     let mut decoder = fixtures::statsd_decoder();
@@ -127,14 +130,22 @@ fn statsd_decode_one_distribution_line() {
 
     let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
     assert_eq!(batch.events.len(), 1);
-    expect_allocs("statsd_in: decode 1 distribution line", stats, 3);
+    match &batch.events[0].metrics[0].kind {
+        logit_core::MetricKind::Samples(samples) => {
+            assert_eq!(samples.values.as_slice(), &[120.0]);
+            assert_eq!(samples.sample_rate, 1.0);
+        }
+        other => panic!("expected Samples, got {other:?}"),
+    }
+    expect_allocs("statsd_in: decode 1 distribution line", stats, 2);
 }
 
-/// Same line as [`statsd_decode_one_distribution_line`], sampled at `@0.1` -- ten weighted
-/// `DdSketch::add_weighted` samples instead of one unweighted `add`. Must match that test's
-/// allocation count exactly: the bin `Vec` a `DdSketch` allocates on its first sample is the same
-/// single allocation whether that first sample carries a weight of one or ten, because
-/// `add_with_count` computes the bin index once and increments its stored count directly.
+/// Same line as [`statsd_decode_one_distribution_line`], sampled at `@0.1`. Pre-W3 this
+/// extrapolated to 10 weighted `DdSketch::add_weighted` samples at decode time; now the raw
+/// `sample_rate` rides verbatim on the decoded `Samples` (`docs/adr/lossless-transit.md`'s W3) --
+/// `aggregate` is the only component that still does the extrapolation, and only when it chooses
+/// to sketch. Same allocation count as the unsampled case: nothing here scales with the rate any
+/// more.
 #[test]
 fn statsd_decode_one_sampled_distribution_line() {
     let mut decoder = fixtures::statsd_decoder();
@@ -144,12 +155,89 @@ fn statsd_decode_one_sampled_distribution_line() {
     let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
     assert_eq!(batch.events.len(), 1);
     match &batch.events[0].metrics[0].kind {
-        logit_core::MetricKind::Distribution(sketch) => {
-            assert_eq!(sketch.count(), 10, "@0.1 should extrapolate to 10 weighted samples")
+        logit_core::MetricKind::Samples(samples) => {
+            assert_eq!(samples.values.as_slice(), &[120.0]);
+            assert_eq!(samples.sample_rate, 0.1, "the raw rate rides verbatim -- no extrapolation");
         }
-        other => panic!("expected Distribution, got {other:?}"),
+        other => panic!("expected Samples, got {other:?}"),
     }
-    expect_allocs("statsd_in: decode 1 sampled distribution line", stats, 3);
+    expect_allocs("statsd_in: decode 1 sampled distribution line", stats, 2);
+}
+
+/// `s` decodes to a raw `MetricKind::SetMembers` -- a `Vec<Bytes>` of zero-copy datagram slices,
+/// one per line (`docs/adr/lossless-transit.md`'s W3). The member `Vec` itself is a third
+/// allocation beyond the per-line/per-batch `Vec<Event>`s [`statsd_decode_one_line`] pins, since
+/// (unlike `Samples`'s inline `SmallVec`) `SetMembers` has no small-size optimization.
+#[test]
+fn statsd_decode_one_set_line() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_set_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    match &batch.events[0].metrics[0].kind {
+        logit_core::MetricKind::SetMembers(members) => {
+            assert_eq!(members, &vec![bytes::Bytes::from_static(b"abc123")]);
+        }
+        other => panic!("expected SetMembers, got {other:?}"),
+    }
+    expect_allocs("statsd_in: decode 1 set line", stats, 3);
+}
+
+/// A DogStatsD event (`_e{tlen,xlen}:title|text|...`) whose `TEXT` has no `\n` escape to unescape
+/// -- `parse_event`'s `unescape_event_text` takes its zero-copy path (a `slice_of`-backed slice of
+/// the datagram, same as `statsd.event.title` and every other string-valued attribute this decoder
+/// stamps), so this costs nothing beyond the per-line/per-batch `Vec<Event>` pair
+/// [`statsd_decode_one_line`] already pins -- same count, same reasoning, just a different line
+/// shape.
+#[test]
+fn statsd_decode_one_event_line() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_event_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    assert!(batch.events[0].log.is_some(), "expected a log-only event");
+    expect_allocs("statsd_in: decode 1 event line", stats, 2);
+}
+
+/// The one case `unescape_event_text` can't slice: `TEXT` contains a `\n` (backslash, `n`)
+/// two-byte escape, so the decoded message needs a real newline byte the wire text doesn't have.
+/// **One** extra allocation beyond [`statsd_decode_one_event_line`]'s zero-copy baseline: the
+/// decoded length is known up front (each two-byte escape becomes one byte), so
+/// `unescape_event_text` sizes its `Vec` exactly and `bytes::Bytes::from(Vec<u8>)` takes its
+/// `len == capacity` promotion path -- no realloc while unescaping, and no second, eager
+/// `Shared`-control-block allocation of the kind a slack-capacity `String::replace` result would
+/// cost (compare [`logfmt_parse_escaped_value_event`], which `shrink_to_fit`s for the same reason).
+#[test]
+fn statsd_decode_one_event_line_with_an_escaped_newline() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_event_with_escaped_newline_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    let message = batch.events[0].log.as_ref().unwrap().message.as_str().expect("str message");
+    assert!(message.contains('\n'), "the escape should have become a real newline");
+    expect_allocs("statsd_in: decode 1 event line with an escaped newline", stats, 3);
+}
+
+/// A DogStatsD service check (`_sc|name|status|...`) -- decodes to one `MetricKind::Gauge` event
+/// carrying the `statsd.service_check.*` carriers as zero-copy datagram slices, same shape as an
+/// ordinary metric line: no allocation beyond the per-line/per-batch `Vec<Event>` pair
+/// [`statsd_decode_one_line`] already pins.
+#[test]
+fn statsd_decode_one_service_check_line() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_service_check_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.events[0].metrics.len(), 1, "expected one Gauge metric");
+    expect_allocs("statsd_in: decode 1 service check line", stats, 2);
 }
 
 /// The logs-only workload `docs/design/memory.md` §0 names as unmeasured: a plain-text syslog
@@ -2144,6 +2232,297 @@ fn lua_process_one_event_reading_log_trace() {
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
     assert!(matches!(outcome, ProcessOutcome::Emit(_)));
     expect_allocs("lua: process 1 event, reading event.log.trace_id", stats, 9);
+}
+
+/// What a script reading `event.metrics[1].value` costs (`crates/logit-script/src/proxy.rs`'s
+/// `MetricsProxy`/`MetricProxy`). **11**, not the 9 a naive add-up from
+/// [`lua_process_one_event_reading_log_trace`]'s breakdown would predict (4 baseline + 1 `Box` +
+/// 3 for creating and caching `MetricsProxy` on the first `event.metrics` access, the same cost
+/// `AttrsProxy`/`LogProxy` pay for their own first access, + 1 for the "one small allocation"
+/// `MetricsProxy`'s own doc comment says a per-index `MetricProxy` costs).
+///
+/// Measured, not assumed, against two narrower scripts: one indexing `event.metrics[1]` but
+/// never reading `.value` off it (still 11 -- confirming the field read itself, a plain `f64`
+/// copied into `LuaValue::Number`, costs nothing, the same reason `event.span.name`'s
+/// `create_string` doesn't show up below either), and one indexing `event.metrics[1]` *twice*
+/// (14 -- confirming each index costs exactly +3, not +1, since 14 - 11 = 11 - 8 =
+/// [`lua_process_one_event_reading_metric_len`]'s own baseline). So a fresh, uncached
+/// `MetricProxy` costs the *same* 3 allocations `AttrsProxy`/`LogProxy`/`SpanProxy` pay for
+/// create-**and**-cache via a `RegistryKey`, even though `MetricProxy` never calls
+/// `create_registry_value` at all -- `lua.create_userdata` alone, returned as a fresh value from
+/// an `Index` metamethod rather than handed to Lua as a call argument the way `EventProxy` itself
+/// is, is evidently not the single cheap allocation `MetricsProxy`'s doc comment assumes when it
+/// argues against caching per-index handles. **Not changed here** (out of this crate's scope,
+/// `crates/logit-script/src/proxy.rs`) -- reported as a finding: a script that indexes the same
+/// metric repeatedly (`event.metrics[1].value`, then `.temporality`, then `.monotonic`, say) pays
+/// this 3-allocation mint on *every* index, not once per event the way every other sub-proxy in
+/// this module does.
+///
+/// Unaffected by `MetricProxy::event`'s field being a `Weak<RefCell<Event>>` rather than a
+/// strong `Rc` -- that change moved a *different* cost (a possible `Event::clone` on the way out,
+/// see [`lua_process_one_event_reading_metric_value_on_a_spilled_event`] below), not this one.
+/// `sum_metric_event`'s attributes are empty and its one metric stays inline, so `Event::clone`
+/// was already free here even before that field changed -- this row's total is identical either
+/// way, which is exactly why the spilled-fixture row below exists as its own, separate guard.
+#[test]
+fn lua_process_one_event_reading_metric_value() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_METRIC_VALUE_READ_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::sum_metric_event()));
+
+    let event = fixtures::sum_metric_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: process 1 event, reading event.metrics[1].value", stats, 11);
+}
+
+/// [`lua_process_one_event_reading_metric_value`]'s own script, run against
+/// [`fixtures::sum_metric_event_with_spilled_attributes`] instead of the plain, empty-`AttrMap`
+/// fixture -- the regression guard for `MetricProxy::event` being a `Weak<RefCell<Event>>`
+/// (`crates/logit-script/src/proxy.rs`) rather than a strong `Rc`.
+///
+/// **11, identical to the plain-fixture row above** -- confirmed against
+/// [`lua_process_one_event_passthrough_on_a_spilled_event`] just below, which measures this same
+/// spilled fixture through a script that touches nothing at all and also lands at the bare 5
+/// (baseline `EventProxy::into_inner`'s `Rc::try_unwrap` fast path always succeeds when nothing
+/// ever creates a second strong reference). So this fixture's own spill costs nothing on its own
+/// (nothing ever clones its `AttrMap`), and this row's total is exactly that passthrough's 5 plus
+/// the same +6 `event.metrics[1].value` costs against the plain fixture (11 - 5 = 6, matching
+/// `lua_process_one_event_reading_metric_value`'s own 11 minus its own baseline).
+///
+/// **Would not hold with a strong `Rc`.** Before `MetricProxy::event` was a `Weak`, a leftover,
+/// not-yet-GC'd `event.metrics[1]` temporary held a strong reference to the same
+/// `Rc<RefCell<Event>>` `EventProxy` holds -- if that temporary was still alive when `process()`
+/// returned (LuaJIT's GC is incremental, not deterministic, so a temporary going out of Lua-side
+/// scope is not the same as it being collected), `EventProxy::into_inner`'s `Rc::try_unwrap` would
+/// find two strong references, fail, and fall back to `rc.borrow().clone()` -- a real `Event`
+/// clone that this fixture's spilled `AttrMap` (unlike `sum_metric_event`'s empty, inline one)
+/// would make allocate for real. That regression was invisible against `sum_metric_event`'s own
+/// row above no matter which representation `MetricProxy::event` used, since an empty `AttrMap`
+/// clones for free either way -- this fixture exists specifically to make it visible: if this
+/// number ever climbs above the passthrough row's 5 plus this test's own +6 without a
+/// corresponding rise in the passthrough row itself, `MetricProxy` has regressed back to holding
+/// event alive past the call.
+#[test]
+fn lua_process_one_event_reading_metric_value_on_a_spilled_event() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_METRIC_VALUE_READ_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::sum_metric_event_with_spilled_attributes()));
+
+    let event = fixtures::sum_metric_event_with_spilled_attributes();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs(
+        "lua: process 1 event (spilled attrs), reading event.metrics[1].value",
+        stats,
+        11,
+    );
+}
+
+/// [`fixtures::sum_metric_event_with_spilled_attributes`] through a script that touches nothing
+/// at all -- the baseline
+/// [`lua_process_one_event_reading_metric_value_on_a_spilled_event`] above is measured against.
+/// **5** = 4 (baseline) + 1 (`Box` on `Emit`), identical to every other untouched-event baseline
+/// in this file: a script that creates no proxy leaves `EventProxy`'s own `Rc` as the *only*
+/// strong reference to the event, so `into_inner`'s `Rc::try_unwrap` fast path always succeeds,
+/// regardless of whether the event's own `AttrMap` is spilled -- spilling costs nothing when
+/// nothing ever clones it.
+#[test]
+fn lua_process_one_event_passthrough_on_a_spilled_event() {
+    let worker = ScriptWorker::new(fixtures::LUA_PASSTHROUGH_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::sum_metric_event_with_spilled_attributes()));
+
+    let event = fixtures::sum_metric_event_with_spilled_attributes();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: process 1 event (spilled attrs), passthrough", stats, 5);
+}
+
+/// What a script reading only `#event.metrics` costs -- no `event.metrics[i]` indexing at all, so
+/// this isolates `MetricsProxy`'s own first-access cost (**+3**, same as `AttrsProxy`/`LogProxy`)
+/// from the per-index `MetricProxy` [`lua_process_one_event_reading_metric_value`] above also
+/// pays. **8** = 4 (baseline) + 1 (`Box` on `Emit`) + 3 (`MetricsProxy` create-and-cache) -- 3
+/// less than that test's 11, confirming the `MetricProxy` index (not merely touching
+/// `event.metrics` at all) is exactly where that test's extra 3 allocations come from.
+#[test]
+fn lua_process_one_event_reading_metric_len() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_METRIC_LEN_READ_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::sum_metric_event()));
+
+    let event = fixtures::sum_metric_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: process 1 event, reading #event.metrics", stats, 8);
+}
+
+/// What a script reading `event.span.name` costs (`crates/logit-script/src/proxy.rs`'s
+/// `SpanProxy`). **8** = 4 (baseline) + 1 (`Box` on `Emit`) + 3 (creating and caching the
+/// `SpanProxy` userdata on the first `event.span` access, the same cost every other first-access
+/// proxy in this file pays). `span.name` is a `Value::Str`, read via the same `value_to_lua` ->
+/// `lua.create_string` path `event.attributes`/`event.log.message` use -- no Rust-side allocation
+/// of its own, the same reason `event.metrics[1].value`'s plain number above costs nothing extra
+/// either: LuaJIT's own string/number representations aren't tracked by this file's counting
+/// allocator.
+#[test]
+fn lua_process_one_event_reading_span_name() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_SPAN_NAME_READ_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::span_event()));
+
+    let event = fixtures::span_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: process 1 event, reading event.span.name", stats, 8);
+}
+
+/// `run_lua`'s full per-batch `scope` contract (`crates/logit-script/src/scope.rs`): a
+/// `set_scope` call before `process`, then `take_scope` after -- for a script that never touches
+/// `scope` at all, this must cost exactly what `lua_process_one_event` costs, the same contract
+/// `lua_process_one_event_with_resource_hooks_but_no_write_costs_the_same_as_process_alone`
+/// already establishes for `resource`. `set_scope` only assigns two fields (`ScopeState::base`/
+/// `modified`) and `take_scope` returns `None` (`modified` stays `None`) without touching the
+/// heap -- neither has a reason to cost anything, and this confirms it.
+#[test]
+fn lua_process_one_event_with_scope_hooks_but_no_write_costs_the_same_as_process_alone() {
+    let worker = ScriptWorker::new(fixtures::LUA_ENRICH_SCRIPT).expect("script should load");
+    let scope = Some(fixtures::scope());
+    worker.set_scope(&scope);
+    drop(worker.process(fixtures::nginx_event()));
+    drop(worker.take_scope());
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| {
+        worker.set_scope(&scope);
+        let outcome = worker.process(event).expect("script should run");
+        assert!(worker.take_scope().is_none(), "the script never writes scope");
+        outcome
+    });
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: set_scope + process + take_scope, no write", stats, 9);
+}
+
+/// What a script reading `scope.name` costs. **5** = 4 (baseline) + 1 (`Box` on `Emit`) -- no
+/// `+3` first-access cost the way `event.attributes`/`event.log`/`event.metrics`/`event.span` all
+/// pay, because `scope` (unlike every `EventProxy` sub-proxy) is installed **once**, in
+/// `ScriptWorker::new`, before this measurement's warm-up call ever runs -- there is no per-event
+/// userdata to create or cache, only a global table lookup and a field read off state already in
+/// hand. `scope.name`'s `lua.create_string` call is the same LuaJIT-internal, host-allocation-free
+/// path `event.span.name` uses above.
+#[test]
+fn lua_process_one_event_reading_scope_name() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_SCOPE_NAME_READ_SCRIPT).expect("script should load");
+    let scope = Some(fixtures::scope());
+    worker.set_scope(&scope);
+    drop(worker.process(fixtures::nginx_event()));
+    drop(worker.take_scope());
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| {
+        worker.set_scope(&scope);
+        let outcome = worker.process(event).expect("script should run");
+        drop(worker.take_scope());
+        outcome
+    });
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: set_scope + process (reading scope.name) + take_scope", stats, 5);
+}
+
+/// What a script's first write to `scope.attributes` in a batch costs
+/// (`crates/logit-script/src/scope.rs`'s `ensure_modified` copy-on-write path). **7** = 4
+/// (baseline) + 1 (`Box` on `Emit`) + 1 (`lua_to_scope_value`'s `Bytes::copy_from_slice` for the
+/// new `"v"` string, the same cost an event-attribute write pays) + 1 (`take_scope`'s
+/// `Arc::new(Scope { .. })` commit, the same cost `take_resource`'s does for `resource`) -- and
+/// **not** a separate allocation for `ensure_modified`'s `Scope` clone itself: the fixture's
+/// `scope.name`/`version` are `Bytes::from_static` (never-allocated, refcount-free) and its
+/// `attributes` map starts empty and inline, so cloning the whole `Scope` struct is a plain
+/// memcpy here, the same reason `lua_process_one_event_writing_resource`'s own `AttrMap` clone is
+/// free. Confirms the module doc comment's claim that `modified: None` -- not the clone itself --
+/// is what makes an *unwritten* batch allocation-free; a write's cost is the new value plus the
+/// commit, not the copy-on-write step in between.
+#[test]
+fn lua_process_one_event_writing_scope_attribute() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_SCOPE_ATTR_WRITE_SCRIPT).expect("script should load");
+    let scope = Some(fixtures::scope());
+    worker.set_scope(&scope);
+    drop(worker.process(fixtures::nginx_event()));
+    drop(worker.take_scope());
+
+    let event = fixtures::nginx_event();
+    let (committed, stats) = measure(|| {
+        worker.set_scope(&scope);
+        let outcome = worker.process(event).expect("script should run");
+        assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+        worker.take_scope()
+    });
+    let committed = committed.expect("the script writes scope on every call");
+    assert_eq!(committed.attributes.get("k"), Some(&Value::str("v")));
+    expect_allocs("lua: set_scope + process (writing scope.attributes.k) + take_scope", stats, 7);
+}
+
+/// What a script writing `resource.schema_url` costs
+/// (`crates/logit-script/src/resource.rs`'s `write_schema_url`), over
+/// [`lua_process_one_event_writing_resource`]'s attribute-write baseline above. **7** = 4
+/// (baseline) + 1 (`Box` on `Emit`) + 1 (`Bytes::copy_from_slice` for the new URL, the same
+/// `write_schema_url` cost an attribute write pays through `lua_to_resource_value`) + 1
+/// (`take_resource`'s `Arc::new(Resource { .. })` commit) -- the same total as
+/// `lua_process_one_event_writing_resource` even though the two scripts write different fields,
+/// because both pay exactly one "new value" allocation and one commit allocation on top of the
+/// same 5-allocation baseline (4 + `Box`), and this fixture's `Resource::default()` starts with
+/// `schema_url: None` and an empty, inline `AttrMap`, so `ensure_modified`'s clone is free here
+/// too.
+#[test]
+fn lua_process_one_event_writing_resource_schema_url() {
+    let worker = ScriptWorker::new(fixtures::LUA_RESOURCE_SCHEMA_URL_WRITE_SCRIPT)
+        .expect("script should load");
+    let resource = fixtures::resource();
+    worker.set_resource(&resource);
+    drop(worker.process(fixtures::nginx_event()));
+    drop(worker.take_resource());
+
+    let event = fixtures::nginx_event();
+    let (committed, stats) = measure(|| {
+        worker.set_resource(&resource);
+        let outcome = worker.process(event).expect("script should run");
+        assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+        worker.take_resource()
+    });
+    let committed = committed.expect("the script writes resource.schema_url on every call");
+    assert_eq!(committed.schema_url.as_deref(), Some(b"https://example.com/schema".as_slice()));
+    expect_allocs(
+        "lua: set_resource + process (writing resource.schema_url) + take_resource",
+        stats,
+        7,
+    );
+}
+
+/// `scope.name = scope.name` -- an identity write, which `crate::scope`'s no-op check
+/// (`scope_name(&state) == s`, a byte-slice comparison against the string already installed)
+/// must catch *before* ever calling `ensure_modified`, mirroring `AttrsProxy`/`ResourceProxy`'s
+/// own identity-write no-ops. Must cost exactly what
+/// [`lua_process_one_event_reading_scope_name`] costs (**5**): the comparison reads `scope.name`
+/// the same way that test does, then a string-equality check that touches no heap, and
+/// `take_scope` still returns `None` since `modified` was never set.
+#[test]
+fn lua_process_one_event_identity_write_to_scope_name_is_free() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_SCOPE_IDENTITY_NAME_SCRIPT).expect("script should load");
+    let scope = Some(fixtures::scope());
+    worker.set_scope(&scope);
+    drop(worker.process(fixtures::nginx_event()));
+    drop(worker.take_scope());
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| {
+        worker.set_scope(&scope);
+        let outcome = worker.process(event).expect("script should run");
+        assert!(worker.take_scope().is_none(), "an identity write must not count as a write");
+        outcome
+    });
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: set_scope + process (scope.name = scope.name) + take_scope", stats, 5);
 }
 
 // ---------------------------------------------------------------------------------------------

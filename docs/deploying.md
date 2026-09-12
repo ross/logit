@@ -525,8 +525,9 @@ anyway; the matching throttled diagnostics (`samples_cap_exceeded`, `samples_rat
 `set_members_cap_exceeded`) name which series and why. `logit.transform.samples.weight_clamped`
 (count) — a `sample_rate` implying a weight beyond `Samples::MAX_WEIGHT` (1000, i.e. `@0.001`) was
 clamped rather than extrapolated without bound; fires in both `distributions` modes (the sketch-mode
-absorb and the `samples`-mode fallback's own re-sketch), and also on `statsd_in`'s own copy of this
-diagnostic until W3 removes it, so a `statsd_in -> aggregate` pipeline reports it twice today.
+absorb and the `samples`-mode fallback's own re-sketch). `statsd_in` itself no longer has a copy of
+this diagnostic — [ADR `lossless-transit`](adr/lossless-transit.md)'s W3 deleted it, so `aggregate`
+is now the only place `sample_rate_clamped` ever fires.
 
 Neither raw mode changes tumbling: a `Samples`/`SetMembers`/`Set` series never survives a flush,
 even with `series_retention` set — retention exists specifically for a gauge's sticky-value
