@@ -93,6 +93,13 @@
 //! `delta_temporality_unresolved` diagnostic naming the fix (an `aggregate` with
 //! `temporality: cumulative` in front of the sink).
 //!
+//! **Both directions count under one encoder.** `send` and a render share a single
+//! [`PrometheusEncoder`], so the drops each side reaches -- `send`'s unrepresentable labels and
+//! skipped kinds, a render's `degraded{reason="exemplar_dropped"|"unit_not_suffix"}` from
+//! [`text::write_with`] -- add up as this component's totals rather than splitting across two
+//! encoder identities for the same sink. The lock order that implies (encoder before registry) is
+//! on [`PrometheusOutput::encoder`].
+//!
 //! ## Security posture: no TLS, no auth
 //!
 //! This server serves the **entire registry** -- every label on every series it currently holds --
@@ -304,15 +311,15 @@ impl Registry {
             .collect()
     }
 
-    /// Renders through the codec's no-telemetry [`text::write`] convenience. The writer is gaining
-    /// an encoder-taking variant (so its own drops -- an exemplar that doesn't fit OpenMetrics'
-    /// label budget, a unit that isn't a name suffix -- get counted); when it lands, this call site
-    /// is the one place to switch, handing it a [`PrometheusEncoder`] built from the sink's
-    /// `Telemetry`/`Diagnostics` clones. Nothing else here changes: family-name collisions after
-    /// sanitization are the encoder's to skip and count, never this registry's to special-case.
-    fn render(&self, dialect: Dialect) -> Vec<u8> {
+    /// Renders through [`text::write_with`], not the no-telemetry [`text::write`] convenience, so
+    /// the writer's own drops land under this component's identity: an exemplar with no line left
+    /// to sit on and a `# UNIT` whose unit doesn't suffix the family name are counted
+    /// `logit.output.metrics.degraded{reason="exemplar_dropped"|"unit_not_suffix"}` by the same
+    /// encoder `send` hands `events_to_families`. Family-name collisions after sanitization are
+    /// that encoder's to skip and count too, never this registry's to special-case.
+    fn render(&self, dialect: Dialect, encoder: &mut PrometheusEncoder) -> Vec<u8> {
         let mut out = Vec::new();
-        text::write(&self.families(), dialect, &mut out);
+        text::write_with(&self.families(), dialect, &mut out, encoder);
         out
     }
 }
@@ -321,6 +328,10 @@ impl Registry {
 /// connection rather than four fields.
 struct ServerState {
     registry: Arc<Mutex<Registry>>,
+    /// The *same* encoder `send` uses, not a second one built from the same handles: one component,
+    /// one encoder identity, so `logit.output.metrics.degraded` reads as this sink's total however
+    /// the drop was reached. See [`PrometheusOutput::encoder`] for the lock ordering it implies.
+    encoder: Arc<Mutex<PrometheusEncoder>>,
     path: String,
     expire_after: Duration,
     telemetry: Telemetry,
@@ -342,9 +353,13 @@ pub struct PrometheusOutput {
     /// [`Output::bind`] idempotent; the [`TcpListener`] itself is owned by that task, so aborting
     /// it (in [`Output::flush`]) closes the port.
     server: Option<JoinHandle<()>>,
-    encoder: PrometheusEncoder,
-    /// Kept alongside the copy the [`PrometheusEncoder`] holds: the accept loop reports its own
-    /// `accept_failed` under this handle, and the two are independent throttle keys.
+    /// Shared with the request handler, because both sides of this sink encode: `send` converts a
+    /// batch with `events_to_families`, and a render counts what [`text::write_with`] has to drop.
+    /// **Lock order is encoder before registry**, the one order both paths take -- `send` releases
+    /// the encoder before touching the registry, and a render holds both in that order.
+    encoder: Arc<Mutex<PrometheusEncoder>>,
+    /// The source of truth the encoder is rebuilt from by each builder below, and separately the
+    /// handle the accept loop reports its own `accept_failed` under.
     diag: Diagnostics,
     telemetry: Telemetry,
     clock: Clock,
@@ -362,7 +377,7 @@ impl PrometheusOutput {
             registry: Arc::new(Mutex::new(Registry::default())),
             local_addr: None,
             server: None,
-            encoder: PrometheusEncoder::new(),
+            encoder: Arc::new(Mutex::new(PrometheusEncoder::new())),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             clock: Arc::new(Instant::now),
@@ -385,19 +400,32 @@ impl PrometheusOutput {
         self
     }
 
-    /// Goes to the codec's encoder, which is what actually reports the throttled
-    /// `delta_temporality_unresolved`/`gauge_delta_unresolved` diagnostics -- this sink has no
-    /// diagnostic of its own to report.
+    /// Reaches the codec's encoder, which is what actually reports the throttled
+    /// `delta_temporality_unresolved`/`gauge_delta_unresolved` diagnostics -- and the accept loop,
+    /// whose own `accept_failed` is an independent throttle key.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.diag = diag.clone();
-        self.encoder = self.encoder.with_diagnostics(diag);
+        self.diag = diag;
+        self.rebuild_encoder();
         self
     }
 
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.telemetry = telemetry.clone();
-        self.encoder = self.encoder.with_telemetry(telemetry);
+        self.telemetry = telemetry;
+        self.rebuild_encoder();
         self
+    }
+
+    /// `telemetry`/`diag` are the source of truth; the encoder is derived from them. Replacing the
+    /// whole encoder (rather than mutating through the lock) keeps
+    /// `PrometheusEncoder`'s own `mut self -> Self` builders usable as written, and every call is a
+    /// builder running before `bind` -- so the `Arc` the handler later clones always holds the
+    /// finished article.
+    fn rebuild_encoder(&mut self) {
+        self.encoder = Arc::new(Mutex::new(
+            PrometheusEncoder::new()
+                .with_telemetry(self.telemetry.clone())
+                .with_diagnostics(self.diag.clone()),
+        ));
     }
 
     /// Overrides what the expiry sweep reads as "now" -- see [`Clock`]. Tests only: production has
@@ -437,6 +465,7 @@ impl Output for PrometheusOutput {
             Some(listener.local_addr().context("reading prometheus_out's bound address")?);
         let state = Arc::new(ServerState {
             registry: Arc::clone(&self.registry),
+            encoder: Arc::clone(&self.encoder),
             path: self.path.clone(),
             expire_after: self.expire_after,
             telemetry: self.telemetry.clone(),
@@ -450,10 +479,13 @@ impl Output for PrometheusOutput {
     /// Never fails: there is no I/O here at all, only a lock and a `BTreeMap`.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let resource = batch.resource.as_ref();
-        let families = events_to_families(
-            batch.events.iter().map(|event| (resource, event)),
-            &mut self.encoder,
-        );
+        // Encoder first, registry second -- the one lock order both this and a render take. The
+        // encoder is released here, before the registry is touched, so a scrape holding both never
+        // waits on a conversion.
+        let families = {
+            let mut encoder = lock(&self.encoder);
+            events_to_families(batch.events.iter().map(|event| (resource, event)), &mut encoder)
+        };
         let now = (self.clock)();
         // One critical section for the whole batch: upsert, then bring the registry back within
         // both bounds, so a scrape racing this `send` never observes a registry that is over its
@@ -568,9 +600,10 @@ fn handle(
     // `Instant` comparison per series, under a lock nothing else contends for between scrapes.
     // Rendered under the same lock, then released before the response is built.
     let body = {
+        let mut encoder = lock(&state.encoder);
         let mut registry = lock(&state.registry);
         registry.sweep(state.expire_after, (state.clock)(), &state.telemetry);
-        registry.render(dialect)
+        registry.render(dialect, &mut encoder)
     };
 
     let body = if gzip { gzip_encode(&body) } else { body };
@@ -1086,6 +1119,39 @@ mod tests {
         assert_eq!(
             counter(&registry, "logit.output.metrics.skipped", "metric_kind", "delta_sum"),
             1.0
+        );
+    }
+
+    /// A render's own drops count under the sink's identity, not a throwaway encoder's: only one
+    /// exemplar fits a counter's single `_total` line, so the second is dropped and counted. The
+    /// drop happens in the *writer*, which is exactly what `text::write_with` exists to report --
+    /// scraping as text 0.0.4 would drop both uncounted (a dialect choice, not a lossy mapping), so
+    /// this asks for OpenMetrics.
+    #[tokio::test]
+    async fn a_render_that_has_to_drop_an_exemplar_counts_it_under_the_sinks_own_telemetry() {
+        let registry = logit_core::Registry::new();
+        let mut record = MetricRecord::new(intern("hits"), cumulative_counter(2.0));
+        record.exemplars = vec![
+            Exemplar { timestamp: 0, value: 1.0, trace: None, filtered_attributes: AttrMap::new() },
+            Exemplar { timestamp: 0, value: 2.0, trace: None, filtered_attributes: AttrMap::new() },
+        ];
+        let mut sink = PrometheusOutput::new("127.0.0.1:0")
+            .with_expire_after(Duration::ZERO)
+            .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
+        sink.send(&batch(vec![Event::metric(0, AttrMap::new(), record)])).await.unwrap();
+        let (_sink, url) = bound(sink).await;
+
+        let body = get(&format!("{url}/metrics"), &[("accept", OM_ACCEPT)]).await;
+        let body = body.text().await.unwrap();
+        assert_eq!(
+            body.matches(" # {} ").count(),
+            1,
+            "exactly one exemplar reaches the wire: {body}"
+        );
+        assert_eq!(
+            counter(&registry, "logit.output.metrics.degraded", "reason", "exemplar_dropped"),
+            1.0,
+            "the one that had no line to sit on is counted"
         );
     }
 
