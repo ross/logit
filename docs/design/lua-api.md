@@ -329,7 +329,8 @@ change, the same "read-only, name it" rule `provenance` already follows
 **A named field takes precedence over an attribute of the same name.** `resource["schema_url"]`
 and `resource["dropped_attributes_count"]` always resolve to the named field above, never to an
 attribute literally keyed `schema_url`/`dropped_attributes_count` -- such an attribute still shows
-up in `resource:to_table().attributes`, just isn't reachable through `resource[...]` indexing. The
+up in `resource:to_table()` (a flat attribute snapshot: `resource:to_table()["schema_url"]`), it
+just isn't reachable through `resource[...]` indexing. The
 same trade `event`'s own fixed fields (`timestamp`, `attributes`, `log`, ...) already make against
 an attribute of the same name, documented rather than guarded against.
 
@@ -389,9 +390,11 @@ inside `flush()` itself, which gives that flush-driven emission a real identity 
 the same way it commits a `resource` write, for both the per-batch and the `flush()` path). See
 `docs/known-gaps.md`'s Lua-`flush()`-staleness entry, which now covers both globals.
 
-`scope:to_table()` enumerates every field the same way `resource:to_table()` does (no `__pairs`
-under LuaJIT) -- `{name=, version=, schema_url=, attributes=, dropped_attributes_count=}`,
-`schema_url` present only when set.
+`scope:to_table()` is the enumeration escape hatch, as `resource:to_table()` is (no `__pairs`
+under LuaJIT), but its shape differs: `resource:to_table()` is the flat attribute map, while
+`scope:to_table()` returns the named fields with the attributes nested --
+`{name=, version=, schema_url=, attributes={...}, dropped_attributes_count=}`, `schema_url`
+present only when set.
 
 ## Reading and writing `event.log`
 

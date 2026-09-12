@@ -24,7 +24,7 @@ use mlua::{
     AnyUserData, Lua, MetaMethod, RegistryKey, Table, UserData, UserDataMethods, Value as LuaValue,
 };
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 /// Wraps one [`Event`] for the duration of a `process()`/`flush()` call -- and possibly longer, if
 /// a script stashes it in a global or upvalue.
@@ -185,6 +185,16 @@ impl EventProxy {
             Ok(cell) => cell.into_inner(),
             Err(rc) => rc.borrow().clone(),
         }
+    }
+
+    /// Test-only window onto the strong-count `into_inner`'s `Rc::try_unwrap` above lives and
+    /// dies by: a `MetricProxy` minted for a script's `event.metrics[i]` read must never nudge
+    /// this above 1 (it holds a `Weak`, not an `Rc` -- see `MetricProxy`'s own doc comment for
+    /// why that's load-bearing), regardless of whether LuaJIT has gotten around to collecting the
+    /// userdata that read produced by the time this is checked.
+    #[cfg(test)]
+    fn strong_count(&self) -> usize {
+        Rc::strong_count(&self.event)
     }
 }
 
@@ -640,6 +650,9 @@ fn body_format_name(format: BodyFormat) -> &'static str {
 /// lifetime. A per-index cache would only win for a script that re-indexes the *same* metric
 /// repeatedly; `local m = event.metrics[1]` once is the idiom `docs/design/lua-api.md` shows, and
 /// `docs/design/memory.md` §8 records this as the known trade.
+///
+/// Not caching a `MetricProxy` is only safe because it holds a [`Weak`], not an [`Rc`], onto the
+/// event -- see [`MetricProxy`]'s own doc comment for why that's load-bearing, not incidental.
 struct MetricsProxy(Rc<RefCell<Event>>);
 
 impl UserData for MetricsProxy {
@@ -673,9 +686,10 @@ impl UserData for MetricsProxy {
             if zero_based >= this.0.borrow().metrics.len() {
                 return Ok(LuaValue::Nil);
             }
-            Ok(LuaValue::UserData(
-                lua.create_userdata(MetricProxy { event: this.0.clone(), index: zero_based })?,
-            ))
+            Ok(LuaValue::UserData(lua.create_userdata(MetricProxy {
+                event: Rc::downgrade(&this.0),
+                index: zero_based,
+            })?))
         });
     }
 }
@@ -684,20 +698,52 @@ impl UserData for MetricsProxy {
 /// [`MetricsProxy`]'s doc comment for why. `index` is 0-based (a plain `Vec`/`SmallVec` index);
 /// every user-facing message adds 1 back, to match the 1-based Lua index a script actually wrote.
 ///
-/// **Robust to a stale index.** Nothing in today's Lua surface can shrink `event.metrics`, so
-/// `index >= event.metrics.len()` can't actually happen through a script alone -- but this proxy
-/// checks for it on every access anyway (`with_metric`/`with_metric_mut` below), both as cheap
-/// insurance against a future surface that *can* (an eventual `event.metrics:remove(i)`, say) and
-/// because nothing about `MetricProxy`'s own type forbids constructing one with a bad index by
-/// hand (as this module's own tests do, directly, to exercise exactly this path).
+/// **Holds a [`Weak`], not an [`Rc`], onto the event -- load-bearing, not a style choice.** Every
+/// other proxy in this module (`AttrsProxy`, `LogProxy`, `SpanProxy`) is cached as a
+/// [`RegistryKey`] on its parent [`EventProxy`] and explicitly `take`n in
+/// [`EventProxy::into_inner`] before that method's own `Rc::try_unwrap` -- so by the time
+/// `into_inner` runs, none of them still hold a strong reference. `MetricProxy` is deliberately
+/// *not* cached that way (see [`MetricsProxy`]'s doc comment), so nothing tears one down on the
+/// same schedule; a script reading so much as `event.metrics[1].value` mints one, and LuaJIT's GC
+/// gives no guarantee it's been collected -- or even that its underlying `MetricProxy` has been
+/// dropped -- by the time `process()` returns and `take_event` calls `into_inner`. An `Rc` field
+/// here would silently defeat `into_inner`'s no-clone fast path on *every* script that ever reads
+/// a metric field (`Rc::try_unwrap` fails whenever any other strong reference is still alive,
+/// which a not-yet-collected `MetricProxy` always would be) -- paying a full `Event` clone on
+/// what should be the overwhelmingly common case, exactly the cost that field exists to avoid.
+/// Worse, a *stashed* `local m = event.metrics[1]` used from `flush()` after its event was
+/// returned would keep that returned event's clone alive and silently mutable through `m` --
+/// wrong data accepted quietly, rather than the "consumed handle" error every other stashed
+/// sub-proxy in this module already gives (see [`take_event`]'s and
+/// [`clarify_destructed_handle_use`]'s doc comments). A [`Weak`] fixes both: it costs nothing
+/// towards `Rc::try_unwrap`'s strong-count check regardless of GC timing, so the no-clone path
+/// keeps working; and `Weak::upgrade` on a `MetricProxy` outliving its event fails deterministically
+/// the moment that event is torn down, giving `with_metric`/`with_metric_mut` below a clear signal
+/// to raise the same "already returned" error the rest of this module's stashed-handle story
+/// already tells scripts, instead of resurrecting stale data.
+///
+/// **Robust to a stale index**, independent of the above: nothing in today's Lua surface can
+/// shrink `event.metrics` *while its event is still alive*, so `index >= event.metrics.len()`
+/// can't actually happen through a script alone -- but this proxy checks for it on every access
+/// anyway (`with_metric`/`with_metric_mut` below), both as cheap insurance against a future
+/// surface that *can* (an eventual `event.metrics:remove(i)`, say) and because nothing about
+/// `MetricProxy`'s own type forbids constructing one with a bad index by hand (as this module's
+/// own tests do, directly, to exercise exactly this path).
 struct MetricProxy {
-    event: Rc<RefCell<Event>>,
+    event: Weak<RefCell<Event>>,
     index: usize,
 }
 
 impl MetricProxy {
+    /// Upgrades the held [`Weak`] and, if that succeeds, looks up this proxy's metric by index --
+    /// the two ways a `MetricProxy` access can fail, kept distinct: an upgrade failure means the
+    /// *event* this handle pointed at is gone (already returned/emitted elsewhere -- see this
+    /// struct's own doc comment), while a successful upgrade with a missing index means the event
+    /// is still alive but this particular metric no longer is (today, unreachable through Lua
+    /// alone, but checked anyway -- same doc comment).
     fn with_metric<R>(&self, f: impl FnOnce(&MetricRecord) -> mlua::Result<R>) -> mlua::Result<R> {
-        let event = self.event.borrow();
+        let event = self.event.upgrade().ok_or_else(|| metric_handle_consumed_error(self.index))?;
+        let event = event.borrow();
         match event.metrics.get(self.index) {
             Some(record) => f(record),
             None => Err(stale_metric_error(self.index)),
@@ -708,12 +754,28 @@ impl MetricProxy {
         &self,
         f: impl FnOnce(&mut MetricRecord) -> mlua::Result<R>,
     ) -> mlua::Result<R> {
-        let mut event = self.event.borrow_mut();
+        let event = self.event.upgrade().ok_or_else(|| metric_handle_consumed_error(self.index))?;
+        let mut event = event.borrow_mut();
         match event.metrics.get_mut(self.index) {
             Some(record) => f(record),
             None => Err(stale_metric_error(self.index)),
         }
     }
+}
+
+/// The event behind this handle is gone -- it was returned from `process()` or included in a
+/// `flush()` table (and every other strong reference, per `MetricProxy`'s own doc comment, was
+/// already gone by then too), the same "consumed handle" failure
+/// [`clarify_destructed_handle_use`] gives a script for a stashed `event`/`event.attributes`/
+/// `event.log`, just discovered here via a failed `Weak::upgrade` instead of mlua's destructed-
+/// userdata marker (`MetricProxy` isn't registry-cached, so it was never a candidate for that
+/// mechanism in the first place -- see this module's doc comment on the difference).
+fn metric_handle_consumed_error(index: usize) -> mlua::Error {
+    mlua::Error::RuntimeError(format!(
+        "event.metrics[{}] belongs to an event that has already been returned from process() or \
+         included in a flush() table -- stash event:clone() instead if you need to keep using it",
+        index + 1
+    ))
 }
 
 fn stale_metric_error(index: usize) -> mlua::Error {
@@ -843,6 +905,26 @@ fn exp_buckets_table<'lua>(lua: &'lua Lua, bucket: &(i32, Vec<u64>)) -> mlua::Re
 
 impl UserData for MetricProxy {
     fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
+        // Registered via `add_method`, not handled inside the `MetaMethod::Index` closure below,
+        // and deliberately the *only* thing on this proxy that is: mlua consults a type's
+        // `add_method`-registered methods table before ever falling back to a custom `Index`
+        // meta method, so `m.quantile` (plain field read) and `m:quantile(q)` (sugar for
+        // `m.quantile(m, q)`) both resolve here regardless of what key names the `Index` closure
+        // handles -- no risk of the two definitions drifting or shadowing each other the way a
+        // second `"quantile"` arm down there would. `add_method` also hands the callback `&Self`
+        // directly and strips the implicit receiver argument a colon call passes, so unlike the
+        // hand-rolled closure this replaced, there's no `_self` parameter to thread through by
+        // hand. Only meaningful for `distribution` (`DdSketch::quantile`); every other kind's
+        // call returns `nil`, matching the field table's own wording for this method.
+        methods.add_method("quantile", |_, this, q: f64| {
+            this.with_metric(|m| {
+                Ok(match &m.kind {
+                    MetricKind::Distribution(sketch) => sketch.quantile(q),
+                    _ => None,
+                })
+            })
+        });
+
         methods.add_meta_method(MetaMethod::Index, |lua, this, key: mlua::String| {
             this.with_metric(|m| match key.to_str()? {
                 "name" => Ok(LuaValue::String(lua.create_string(resolve(m.name))?)),
@@ -999,25 +1081,9 @@ impl UserData for MetricProxy {
                     }
                     _ => Ok(LuaValue::Nil),
                 },
-                // The proxy's one method, always a bound function regardless of kind: a
-                // quantile's meaning depends on the `q` argument a plain field can't carry, so
-                // (unlike `count` above) there's no competing plain-field reading to reconcile.
-                // Only meaningful for `distribution`; every other kind's call returns `nil`.
-                "quantile" => {
-                    let event = this.event.clone();
-                    let index = this.index;
-                    // `metric:quantile(q)` desugars to `metric.quantile(metric, q)` -- the leading
-                    // `_self` is the colon call's implicit receiver, unused (the closure already
-                    // captured what it needs above).
-                    let f = lua.create_function(move |_, (_self, q): (LuaValue, f64)| {
-                        let event = event.borrow();
-                        Ok(match event.metrics.get(index).map(|m| &m.kind) {
-                            Some(MetricKind::Distribution(sketch)) => sketch.quantile(q),
-                            _ => None,
-                        })
-                    })?;
-                    Ok(LuaValue::Function(f))
-                }
+                // No `"quantile"` arm here -- it's registered via `add_method` above, which mlua
+                // resolves before ever reaching this `Index` fallback (see that registration's
+                // comment).
                 _ => Ok(LuaValue::Nil),
             })
         });
@@ -1505,6 +1571,17 @@ pub(crate) fn take_event(lua: &Lua, ud: AnyUserData) -> mlua::Result<Event> {
 /// error, plus a traceback, back through a `Function::call`) by the time `ScriptWorker::process`/
 /// `flush` see it -- so the only place this can be caught and clarified is here, wrapping the
 /// whole `process.call(...)`/`flush.call(())`, not inside any one metamethod.
+///
+/// `SpanProxy` fails exactly this same way for exactly this same reason: it's cached and `take`n
+/// in `into_inner` just like `AttrsProxy`/`LogProxy` are, so a stashed `local s = event.span`
+/// used after its event is returned hits the identical destructed-userdata path. `MetricProxy` is
+/// the one handle in this module that reaches an "already returned" error *without* going through
+/// this function at all -- it isn't registry-cached (see its own doc comment), so there's no
+/// destructed-userdata marker for it to trip; `metric_handle_consumed_error` raises a plain
+/// `RuntimeError` directly from a failed `Weak::upgrade` instead. The message below still names it
+/// alongside `event.attributes`/`event.log`/`event.span`, though, since a script doesn't need to
+/// know or care which internal mechanism caught the mistake -- only that stashing any handle this
+/// module hands out has the same rule.
 pub(crate) fn clarify_destructed_handle_use(err: mlua::Error) -> mlua::Error {
     fn is_destructed_handle_use(err: &mlua::Error) -> bool {
         match err {
@@ -1515,11 +1592,11 @@ pub(crate) fn clarify_destructed_handle_use(err: mlua::Error) -> mlua::Error {
     }
     if is_destructed_handle_use(&err) {
         return mlua::Error::RuntimeError(
-            "this event, or a handle obtained from it (event.attributes or event.log), was \
-             already returned/emitted elsewhere and can no longer be used -- an event handle, and \
-             any sub-handle obtained from it, are all consumed once the event is returned from \
-             process() or included in a flush() table; use event:clone() before returning if you \
-             need to keep using any of them afterward"
+            "this event, or a handle obtained from it (event.attributes, event.log, \
+             event.metrics[i], or event.span), was already returned/emitted elsewhere and can no \
+             longer be used -- an event handle, and any sub-handle obtained from it, are all \
+             consumed once the event is returned from process() or included in a flush() table; \
+             use event:clone() before returning if you need to keep using any of them afterward"
                 .to_string(),
         );
     }
@@ -1878,11 +1955,35 @@ mod tests {
         let lua = Lua::new();
         let event = Rc::new(RefCell::new(metric_event(sum_kind())));
         event.borrow_mut().metrics.clear(); // simulate a handle outliving its metric
-        let proxy = MetricProxy { event: event.clone(), index: 0 };
+                                            // The event itself is still alive (`event` stays in scope for the whole test), so
+                                            // `Weak::upgrade` succeeds and this exercises the *other* staleness check --
+                                            // `with_metric`'s index lookup -- not `metric_handle_consumed_error`.
+        let proxy = MetricProxy { event: Rc::downgrade(&event), index: 0 };
         let ud = lua.create_userdata(proxy).unwrap();
         lua.globals().set("m", ud).unwrap();
         let err = lua.load("return m.value").eval::<LuaValue>().unwrap_err();
         assert!(err.to_string().contains("event.metrics[1] no longer exists"), "{err}");
+    }
+
+    #[test]
+    fn metric_handle_errors_once_its_event_is_gone() {
+        let lua = Lua::new();
+        let weak = {
+            let event = Rc::new(RefCell::new(metric_event(sum_kind())));
+            Rc::downgrade(&event)
+            // `event`'s last strong reference drops here.
+        };
+        let proxy = MetricProxy { event: weak, index: 0 };
+        let ud = lua.create_userdata(proxy).unwrap();
+        lua.globals().set("m", ud).unwrap();
+        let err = lua.load("return m.value").eval::<LuaValue>().unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "event.metrics[1] belongs to an event that has already been returned from \
+                 process() or included in a flush() table -- stash event:clone() instead"
+            ),
+            "{err}"
+        );
     }
 
     // -- event.metrics: per-kind field reads -----------------------------------------------------
@@ -2403,5 +2504,72 @@ mod tests {
         let expected = input.clone();
         let out = emitted(w.process(input).unwrap());
         assert_eq!(out, expected);
+    }
+
+    // -- MetricProxy holds a Weak, not an Rc (PR #134 review finding 1) --------------------------
+
+    /// Direct regression coverage for the bug the `Weak` fix closes: with `MetricProxy` holding a
+    /// strong `Rc`, a script reading so much as `event.metrics[1].value` -- even without stashing
+    /// anything anywhere -- would leave that temporary `MetricProxy` userdata's `Rc` clone alive
+    /// on Lua's stack for as long as LuaJIT's GC hadn't gotten around to collecting it, which
+    /// `EventProxy::into_inner`'s `Rc::try_unwrap` has no way to wait for.
+    ///
+    /// Mints its `MetricProxy` directly against `EventProxy`'s own `event` field, bypassing
+    /// `event.metrics` (`MetricsProxy`) entirely -- going through the real `event.metrics[i]`
+    /// surface would also populate `EventProxy`'s *own* `metrics` registry cache (correctly
+    /// released inside `into_inner`, before its `Rc::try_unwrap`, same as `attrs`/`log`/`span`;
+    /// unrelated to this fix), which would confound a strong-count check taken *before*
+    /// `into_inner` runs. Isolating `MetricProxy` this way targets exactly the regression: does
+    /// *this* proxy type hold a strong `Rc`, independent of anything else `EventProxy` caches.
+    #[test]
+    fn reading_a_metric_field_keeps_into_inner_on_the_no_clone_path() {
+        let lua = Lua::new();
+        let event_proxy = EventProxy::new(metric_event(sum_kind()));
+        let metric_ud = lua
+            .create_userdata(MetricProxy { event: Rc::downgrade(&event_proxy.event), index: 0 })
+            .unwrap();
+        lua.globals().set("m", metric_ud).unwrap();
+        let value: f64 = lua.load("return m.value").eval().unwrap();
+        assert_eq!(value, 12.5);
+
+        assert_eq!(
+            event_proxy.strong_count(),
+            1,
+            "a MetricProxy minted for a metric read must never hold a strong Rc onto the event"
+        );
+        let _ = event_proxy.into_inner(&lua); // must not panic
+    }
+
+    /// The other half of the same fix: a script that stashes `event.metrics[i]` in a global and
+    /// uses it later (the same `flush()`-reuses-state idiom `docs/design/lua-api.md` documents for
+    /// `event`/`event.attributes` themselves) must get the same "already returned" error those
+    /// handles give, not silently read or write a resurrected copy of the metric.
+    #[test]
+    fn a_stashed_metric_handle_errors_after_the_event_is_returned() {
+        let w = worker(
+            r#"
+            function process(event)
+                stashed = event.metrics[1]
+                return event
+            end
+
+            function flush()
+                stashed.value = 99
+                return {}
+            end
+            "#,
+        );
+        emitted(w.process(metric_event(sum_kind())).unwrap());
+        let err = match w.flush() {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("expected flush() to reject the stashed metric handle"),
+        };
+        assert!(
+            err.contains(
+                "event.metrics[1] belongs to an event that has already been returned from \
+                 process() or included in a flush() table -- stash event:clone() instead"
+            ),
+            "{err}"
+        );
     }
 }

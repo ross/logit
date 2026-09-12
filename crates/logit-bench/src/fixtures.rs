@@ -688,6 +688,42 @@ pub fn scope() -> Arc<Scope> {
     })
 }
 
+/// Touches nothing at all -- no `.attributes`, `.log`, `.metrics`, `.span`, `resource`, or
+/// `scope` access, just the identity function. Isolates whatever a *fixture's own shape* costs
+/// (e.g. `Event::clone`, when something forces one) from any proxy's own first-access cost, since
+/// a script this narrow creates no proxy and therefore no extra strong reference to `event`'s
+/// `Rc<RefCell<Event>>` beyond `EventProxy`'s own -- `EventProxy::into_inner`'s `Rc::try_unwrap`
+/// fast path always succeeds here, regardless of the event's shape
+/// (`crates/logit-bench/tests/allocations.rs`'s
+/// `lua_process_one_event_passthrough_on_a_spilled_event`).
+pub const LUA_PASSTHROUGH_SCRIPT: &str = r#"
+function process(event)
+  return event
+end
+"#;
+
+/// [`sum_metric_event`], but with a *spilled* (9, past `AttrMap`'s 8-slot inline capacity)
+/// event-level attribute map -- makes a real `Event::clone` allocate instead of the free memcpy
+/// `sum_metric_event`'s own empty, inline `AttrMap` gets away with (mirrors `wide_gauge_event`'s
+/// own reasoning above). Exists to guard `MetricProxy`'s `Weak<RefCell<Event>>` field
+/// (`crates/logit-script/src/proxy.rs`): before that field was a `Weak`, a leftover, not-yet-GC'd
+/// `event.metrics[i]` temporary held a *strong* `Rc`, so `EventProxy::into_inner`'s
+/// `Rc::try_unwrap` fast path could fail and fall back to a real `Event::clone` -- a cost
+/// `sum_metric_event`'s own free clone could never make visible to this file's exact-equality
+/// assertions (`crates/logit-bench/tests/allocations.rs`'s
+/// `lua_process_one_event_reading_metric_value_on_a_spilled_event`).
+pub fn sum_metric_event_with_spilled_attributes() -> Event {
+    let mut attributes = AttrMap::new();
+    for i in 0..9 {
+        attributes.insert(&format!("tag{i}"), format!("value{i}").as_str());
+    }
+    Event::metric(
+        0,
+        attributes,
+        MetricRecord::new(logit_core::interner::intern("nginx.requests"), MetricKind::counter(1.0)),
+    )
+}
+
 // -------------------------------------------------------------------------------------------
 // Logs-only: a plain-text syslog line with no JSON body at all
 // -------------------------------------------------------------------------------------------

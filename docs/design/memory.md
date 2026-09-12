@@ -460,6 +460,7 @@ draft actually established:
 | `run_lua`: `set_resource` + `process` + `take_resource`, script writes `resource` | **7** | see `crates/logit-script/src/resource.rs` — lower than the row above because this script (unlike `LUA_ENRICH_SCRIPT`) never touches `event.attributes`, skipping its `AttrsProxy` cost; the `+1` here is `take_resource`'s `Arc::new(Resource { .. })` commit |
 | `process` reading `event.log.trace_id` (`LogProxy`) | **9** | same total a script touching `event.attributes` instead pays (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event`) despite touching no attributes at all — creating and caching the `LogProxy` userdata costs what `AttrsProxy` does there, `to_hex`'s returned `String` costs what an attribute write does; a script that never touches `event.log` pays none of it, unchanged at 9 either way |
 | `process` reading `event.metrics[1].value` (`MetricsProxy`/`MetricProxy`) | **11** | not the 9 a naive add-up predicts (4 baseline + 1 `Box` + 3 for `MetricsProxy`'s own first-access create-and-cache + 1 for the "one small allocation" `MetricProxy`'s doc comment assumes a per-index handle costs) — measured directly (`lua_process_one_event_reading_metric_value`) against a script that indexes `event.metrics[1]` but never reads `.value` (still 11, so the field read itself is free, the same reason `event.span.name` below is) and one that indexes it *twice* (14, exactly +3 more) — a fresh, uncached `MetricProxy` costs the same 3 allocations `AttrsProxy`/`LogProxy`/`SpanProxy` pay for create-**and**-cache via a `RegistryKey`, even though it never caches one; see §8 item 6 and `crates/logit-bench/tests/allocations.rs`'s comment for the full finding |
+| `process` reading `event.metrics[1].value`, event has a **spilled** (9-attribute) `AttrMap` | **11** | identical to the row above, and to that same script's own passthrough baseline on this fixture (**5**, `lua_process_one_event_passthrough_on_a_spilled_event`) plus 6 — the regression guard for `MetricProxy::event` being a `Weak<RefCell<Event>>` rather than a strong `Rc` (`crates/logit-script/src/proxy.rs`): a strong `Rc` left alive by an uncollected `event.metrics[1]` temporary would make `EventProxy::into_inner`'s `Rc::try_unwrap` fall back to a real `Event::clone` here, a cost `sum_metric_event`'s own empty, inline `AttrMap` could never make visible above (`lua_process_one_event_reading_metric_value_on_a_spilled_event`) |
 | `process` reading `#event.metrics` only (`MetricsProxy`, no index) | **8** | 4 baseline + 1 `Box` + 3 for `MetricsProxy`'s first-access create-and-cache, and nothing more — confirms the row above's extra 3 comes entirely from indexing, not from touching `event.metrics` at all (`lua_process_one_event_reading_metric_len`) |
 | `process` reading `event.span.name` (`SpanProxy`) | **8** | 4 baseline + 1 `Box` + 3 for `SpanProxy`'s first-access create-and-cache, the same bucket `AttrsProxy`/`LogProxy`/`MetricsProxy` pay for theirs; the `Value::Str` read itself costs nothing (`lua_process_one_event_reading_span_name`) |
 | `run_lua`: `set_scope` + `process` + `take_scope`, script never writes `scope` | **9** | identical to plain `process` — `set_scope`/`take_scope` are field assignments, no allocation, the same contract `set_resource`/`take_resource` already have (`lua_process_one_event_with_scope_hooks_but_no_write_costs_the_same_as_process_alone`) |
@@ -1210,7 +1211,19 @@ might regress a workload the fixtures don't cover.
    file's own rule: report an avoidable-looking cost in `logit-script` rather than fix it here),
    since whether that's worth a per-event cache (trading a `RegistryKey` slot for scripts that
    never touch `event.metrics` against one for scripts that index it repeatedly) is a real design
-   trade-off, not a bug.
+   trade-off, not a bug. **That per-index mint trade still stands** — it's unaffected by, and
+   orthogonal to, a second finding review caught alongside it: `MetricProxy`'s own field holding
+   the event was originally a *strong* `Rc<RefCell<Event>>`, which meant a leftover, not-yet-GC'd
+   `event.metrics[i]` temporary could still be a live second strong reference by the time
+   `EventProxy::into_inner` ran, forcing its `Rc::try_unwrap` fast path to fall back to a real
+   `Event::clone` — invisible against every fixture measured above, since `sum_metric_event`'s
+   attributes are empty and its one metric stays inline, so the fallback clone was free either way.
+   Fixed by making that field a `Weak<RefCell<Event>>` instead (`crates/logit-script/src/
+   proxy.rs`), and the clone risk is no longer a theoretical gap in this file's coverage: it's now
+   guarded by a dedicated row — a fixture with a *spilled* (9-attribute) `AttrMap`, whose clone
+   would allocate for real, measures identical to the plain fixture (§2's
+   `lua_process_one_event_reading_metric_value_on_a_spilled_event`) — so a regression back to a
+   strong `Rc` here would show up as a rise in that row alone, not as a silent, unmeasured cost.
 7. ~~**`Arc<EventBatch>` copy-on-write on channels.**~~ **Done, with real caveats** (§3) — landed
    over three rounds (`docs/adr/arc-eventbatch-copy-on-write.md`), each correcting an
    overclaim the previous one made. Single-consumer edges and all-`Output` fan-outs are

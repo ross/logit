@@ -2228,6 +2228,13 @@ fn lua_process_one_event_reading_log_trace() {
 /// metric repeatedly (`event.metrics[1].value`, then `.temporality`, then `.monotonic`, say) pays
 /// this 3-allocation mint on *every* index, not once per event the way every other sub-proxy in
 /// this module does.
+///
+/// Unaffected by `MetricProxy::event`'s field being a `Weak<RefCell<Event>>` rather than a
+/// strong `Rc` -- that change moved a *different* cost (a possible `Event::clone` on the way out,
+/// see [`lua_process_one_event_reading_metric_value_on_a_spilled_event`] below), not this one.
+/// `sum_metric_event`'s attributes are empty and its one metric stays inline, so `Event::clone`
+/// was already free here even before that field changed -- this row's total is identical either
+/// way, which is exactly why the spilled-fixture row below exists as its own, separate guard.
 #[test]
 fn lua_process_one_event_reading_metric_value() {
     let worker =
@@ -2240,12 +2247,74 @@ fn lua_process_one_event_reading_metric_value() {
     expect_allocs("lua: process 1 event, reading event.metrics[1].value", stats, 11);
 }
 
+/// [`lua_process_one_event_reading_metric_value`]'s own script, run against
+/// [`fixtures::sum_metric_event_with_spilled_attributes`] instead of the plain, empty-`AttrMap`
+/// fixture -- the regression guard for `MetricProxy::event` being a `Weak<RefCell<Event>>`
+/// (`crates/logit-script/src/proxy.rs`) rather than a strong `Rc`.
+///
+/// **11, identical to the plain-fixture row above** -- confirmed against
+/// [`lua_process_one_event_passthrough_on_a_spilled_event`] just below, which measures this same
+/// spilled fixture through a script that touches nothing at all and also lands at the bare 5
+/// (baseline `EventProxy::into_inner`'s `Rc::try_unwrap` fast path always succeeds when nothing
+/// ever creates a second strong reference). So this fixture's own spill costs nothing on its own
+/// (nothing ever clones its `AttrMap`), and this row's total is exactly that passthrough's 5 plus
+/// the same +6 `event.metrics[1].value` costs against the plain fixture (11 - 5 = 6, matching
+/// `lua_process_one_event_reading_metric_value`'s own 11 minus its own baseline).
+///
+/// **Would not hold with a strong `Rc`.** Before `MetricProxy::event` was a `Weak`, a leftover,
+/// not-yet-GC'd `event.metrics[1]` temporary held a strong reference to the same
+/// `Rc<RefCell<Event>>` `EventProxy` holds -- if that temporary was still alive when `process()`
+/// returned (LuaJIT's GC is incremental, not deterministic, so a temporary going out of Lua-side
+/// scope is not the same as it being collected), `EventProxy::into_inner`'s `Rc::try_unwrap` would
+/// find two strong references, fail, and fall back to `rc.borrow().clone()` -- a real `Event`
+/// clone that this fixture's spilled `AttrMap` (unlike `sum_metric_event`'s empty, inline one)
+/// would make allocate for real. That regression was invisible against `sum_metric_event`'s own
+/// row above no matter which representation `MetricProxy::event` used, since an empty `AttrMap`
+/// clones for free either way -- this fixture exists specifically to make it visible: if this
+/// number ever climbs above the passthrough row's 5 plus this test's own +6 without a
+/// corresponding rise in the passthrough row itself, `MetricProxy` has regressed back to holding
+/// event alive past the call.
+#[test]
+fn lua_process_one_event_reading_metric_value_on_a_spilled_event() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_METRIC_VALUE_READ_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::sum_metric_event_with_spilled_attributes()));
+
+    let event = fixtures::sum_metric_event_with_spilled_attributes();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs(
+        "lua: process 1 event (spilled attrs), reading event.metrics[1].value",
+        stats,
+        11,
+    );
+}
+
+/// [`fixtures::sum_metric_event_with_spilled_attributes`] through a script that touches nothing
+/// at all -- the baseline
+/// [`lua_process_one_event_reading_metric_value_on_a_spilled_event`] above is measured against.
+/// **5** = 4 (baseline) + 1 (`Box` on `Emit`), identical to every other untouched-event baseline
+/// in this file: a script that creates no proxy leaves `EventProxy`'s own `Rc` as the *only*
+/// strong reference to the event, so `into_inner`'s `Rc::try_unwrap` fast path always succeeds,
+/// regardless of whether the event's own `AttrMap` is spilled -- spilling costs nothing when
+/// nothing ever clones it.
+#[test]
+fn lua_process_one_event_passthrough_on_a_spilled_event() {
+    let worker = ScriptWorker::new(fixtures::LUA_PASSTHROUGH_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::sum_metric_event_with_spilled_attributes()));
+
+    let event = fixtures::sum_metric_event_with_spilled_attributes();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    expect_allocs("lua: process 1 event (spilled attrs), passthrough", stats, 5);
+}
+
 /// What a script reading only `#event.metrics` costs -- no `event.metrics[i]` indexing at all, so
 /// this isolates `MetricsProxy`'s own first-access cost (**+3**, same as `AttrsProxy`/`LogProxy`)
 /// from the per-index `MetricProxy` [`lua_process_one_event_reading_metric_value`] above also
-/// pays. **8** = 4 (baseline) + 1 (`Box` on `Emit`) + 3 (`MetricsProxy` create-and-cache) -- one
-/// less than that test's 9, confirming the `MetricProxy` index is exactly where the extra
-/// allocation comes from, not from touching `event.metrics` at all.
+/// pays. **8** = 4 (baseline) + 1 (`Box` on `Emit`) + 3 (`MetricsProxy` create-and-cache) -- 3
+/// less than that test's 11, confirming the `MetricProxy` index (not merely touching
+/// `event.metrics` at all) is exactly where that test's extra 3 allocations come from.
 #[test]
 fn lua_process_one_event_reading_metric_len() {
     let worker =
