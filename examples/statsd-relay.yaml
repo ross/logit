@@ -1,8 +1,16 @@
 # A statsd/DogStatsD relay: receive on one edge, aggregate, forward to a central statsd/DogStatsD
-# agent -- the topology `statsd_out` exists for (docs/adr/statsd-output.md). Counters and gauges
-# round-trip losslessly through the real decoder on the other end; a timer/histogram/distribution
-# metric (`ms`/`h`/`d` on the wire) is deliberately dropped here in v1 (docs/known-gaps.md) --
-# `statsd_out` only encodes `Counter`/`Gauge`/`GaugeDelta` today.
+# agent -- the topology `statsd_out` exists for (docs/adr/statsd-output.md). Counters, gauges, raw
+# timers/histograms/distributions, raw sets, and DogStatsD events/service checks all round-trip
+# losslessly through the real decoder on the other end (docs/adr/lossless-transit.md) -- an event
+# (a log, no metrics) passes straight through `aggregate` untouched; a service check (a `Gauge`
+# metric under the hood) is absorbed and retained like any other gauge, then re-emitted in
+# canonical `_sc` field order, `d:`/`m:` included, once the window flushes. The `windowed`
+# aggregate below uses its default
+# summarizing config (`distributions: sketch`, `sets: estimate`), which still turns every timer/set
+# metric into a sketch/estimate that `statsd_out` has no lossless wire form for and drops, counted
+# (docs/known-gaps.md) -- that's `aggregate`'s choice to summarize, not a `statsd_out` limitation:
+# configure it with `distributions: samples`/`sets: members` instead to relay the raw shapes
+# through unsummarized.
 #
 # Config is a flat graph of components (docs/design/pipeline-graph.md,
 # docs/adr/component-graph-configuration.md): each names its own `sources`, rather than sitting in
