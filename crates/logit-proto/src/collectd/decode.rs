@@ -8,6 +8,7 @@
 //! the receive buffer's allocation rather than copying out of it (`docs/design/memory.md` §2).
 
 use super::part::{self, DsValue, PartError, PartHeader};
+use super::types_db::{DataSource, TypesDb};
 use super::{cdtime_to_nanos, CDTIME_ONE_SECOND, MAX_VALUES_PER_LIST};
 use crate::{CodecError, Decoder};
 use bytes::Bytes;
@@ -35,6 +36,11 @@ pub struct CollectdDecoder {
     /// The six attribute keys, interned once at construction so the per-list hot path uses
     /// [`AttrMap::insert_sym`] instead of re-hashing the same six strings per value list.
     keys: AttrKeys,
+    /// The operator-supplied `types.db`, if `collectd_in`'s `types_db:` named one. Shared (`Arc`)
+    /// because one file serves every listener in a config; `None` -- the default -- means index
+    /// naming, which is what a `types.db`-less deployment gets. See
+    /// [`super::types_db`] for what this changes and, more importantly, what it does not.
+    types_db: Option<Arc<TypesDb>>,
 }
 
 /// The interned `collectd.*` attribute keys -- see [`CollectdDecoder::keys`].
@@ -61,11 +67,35 @@ impl CollectdDecoder {
                 type_instance: intern(super::ATTR_TYPE_INSTANCE),
                 interval: intern(super::ATTR_INTERVAL),
             },
+            types_db: None,
         }
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
+        self
+    }
+
+    /// Resolves data-source *names* from an operator-supplied `types.db`
+    /// ([`super::types_db::TypesDb`]), turning `load.load.0` into `load.load.shortterm`.
+    ///
+    /// Naming rule, per value list, exactly once per Values part:
+    ///
+    /// - the list's `type` resolves **and** the entry's data-source count and kinds match the
+    ///   wire's: `<plugin>.<type>` for a single-data-source type (the lone data source, which
+    ///   collectd conventionally calls `value`, is omitted -- `write_graphite`'s own default), else
+    ///   `<plugin>.<type>.<ds_name>`;
+    /// - it resolves but the count or a kind disagrees: index naming, plus a throttled
+    ///   `types_db_mismatch` diagnostic. A mismatch means the configured file is not the one the
+    ///   sender is running against, and inventing names from it would attach the wrong label to a
+    ///   real measurement -- worse than an honest index;
+    /// - it does not resolve: index naming, **no** diagnostic. A type missing from `types.db` is
+    ///   routine (a custom plugin, a newer collectd), not a misconfiguration.
+    ///
+    /// Never changes what `collectd_out` puts back on the wire -- see [`super::types_db`]'s module
+    /// doc, and `collectd_fixed_point.rs`'s `names_do_not_affect_the_fixed_point`.
+    pub fn with_types_db(mut self, types_db: Arc<TypesDb>) -> Self {
+        self.types_db = Some(types_db);
         self
     }
 
@@ -308,6 +338,11 @@ impl CollectdDecoder {
 
         let plugin_bytes = &bytes[plugin.clone()];
         let type_bytes = &bytes[type_.clone()];
+        // One `types.db` lookup per Values part, not per data source (see `with_types_db`). Borrows
+        // `self.types_db` while `self.name`/`self.diag` are used below -- disjoint fields, so the
+        // borrow checker is happy and nothing has to be cloned per list.
+        let data_sources =
+            resolve_data_sources(self.types_db.as_deref(), type_bytes, types, &mut self.diag);
         let values_at = 2 + count;
         for index in 0..count {
             let ds_type = types[index];
@@ -321,11 +356,19 @@ impl CollectdDecoder {
             push_lossy(&mut self.name, plugin_bytes);
             self.name.push('.');
             push_lossy(&mut self.name, type_bytes);
-            // W2: types.db DS names go here -- `.<ds_name>` when the type resolves with a matching
-            // data-source count and kinds, index naming otherwise (and a single-data-source type
-            // drops the suffix entirely, which is what the `count == 1` case below already does).
-            if count > 1 {
-                let _ = write!(self.name, ".{index}");
+            // A single-data-source list is `<plugin>.<type>` either way: collectd's own
+            // `write_graphite` omits the lone data source's name (conventionally `value`), and with
+            // nothing to omit there is nothing for `types.db` to add. Everything is written into
+            // the reused `name` scratch, so even a 64-data-source list allocates no `String`.
+            match data_sources {
+                Some(sources) if count > 1 => {
+                    self.name.push('.');
+                    self.name.push_str(&sources[index].name);
+                }
+                _ if count > 1 => {
+                    let _ = write!(self.name, ".{index}");
+                }
+                _ => {}
             }
             let name = intern(&self.name);
 
@@ -367,6 +410,50 @@ impl CollectdDecoder {
         out.push(event);
         Ok(())
     }
+}
+
+/// The `types.db` entry to name this value list's data sources from, or `None` for index naming.
+///
+/// `None` covers all three no-name cases -- no `types.db` configured, a type it does not define,
+/// and a type it defines *differently* from what arrived -- because the naming site treats them
+/// identically. Only the third is worth telling an operator about, so only it emits a diagnostic
+/// (and a throttled one: a sender running against a different `types.db` will repeat the same
+/// mismatch on every interval, forever).
+///
+/// The kinds are compared, not just the count: `types.db` is what says a two-data-source
+/// `if_octets` is `rx`/`tx` **DERIVE**, and a file that agrees on the count while disagreeing on
+/// the kinds is describing a different type that happens to be the same width.
+fn resolve_data_sources<'a>(
+    types_db: Option<&'a TypesDb>,
+    type_bytes: &[u8],
+    ds_types: &[u8],
+    diag: &mut Diagnostics,
+) -> Option<&'a [DataSource]> {
+    let types_db = types_db?;
+    // A non-UTF-8 type name simply cannot match a `types.db` key (which is text); it falls through
+    // to index naming like any other unresolved type, with no diagnostic.
+    let type_name = std::str::from_utf8(type_bytes).ok()?;
+    let sources = types_db.get(type_name)?;
+    let matches = sources.len() == ds_types.len()
+        && sources
+            .iter()
+            .zip(ds_types)
+            .all(|(source, &ds_type)| source.kind.ds_type_byte() == ds_type);
+    if matches {
+        return Some(sources);
+    }
+    diag.warn_throttled(
+        "types_db_mismatch",
+        format_args!(
+            "collectd: type '{type_name}' is defined in the configured types.db with {} data \
+             source(s) that do not match the {} on the wire; naming this list's records by index \
+             instead -- the configured types.db is probably not the one the sender is running \
+             against",
+            sources.len(),
+            ds_types.len()
+        ),
+    );
+    None
 }
 
 /// The byte range of a string part's content -- the payload minus its NUL terminator -- or `None`
@@ -1027,6 +1114,109 @@ pub(crate) mod tests {
     fn with_diagnostics_reaches_the_decoders_own_handle() {
         let decoder = decoder().with_diagnostics(Diagnostics::new("collectd_in/a"));
         assert_eq!(decoder.diag().component_id(), "collectd_in/a");
+    }
+
+    // --- types.db naming -----------------------------------------------------------------------
+
+    fn types_db() -> Arc<TypesDb> {
+        Arc::new(TypesDb::parse(super::super::types_db::TEST_TYPES_DB).expect("fixture parses"))
+    }
+
+    /// A packet carrying one list of `values` under `plugin`/`type`.
+    fn list_packet(plugin: &[u8], type_: &[u8], values: &[(u8, [u8; 8])]) -> Bytes {
+        PacketBuilder::new()
+            .string(part::TYPE_HOST, b"web-1")
+            .string(part::TYPE_PLUGIN, plugin)
+            .string(part::TYPE_TYPE, type_)
+            .values(values)
+            .build()
+    }
+
+    fn names_with_types_db(bytes: Bytes) -> (Vec<String>, Arc<Registry>) {
+        let (decoder, registry) = decoder_with_diag();
+        let mut decoder = decoder.with_types_db(types_db());
+        let mut out = Vec::new();
+        decoder.decode_into(bytes, RECEIVED_AT, &mut out).expect("decode must succeed");
+        let names =
+            out[0].metrics.iter().map(|record| resolve(record.name).to_string()).collect::<Vec<_>>();
+        (names, registry)
+    }
+
+    /// Outcome 1: the type resolves with a matching data-source count and kinds, so each record
+    /// takes its own data source's name.
+    #[test]
+    fn a_resolved_multi_data_source_type_names_its_records_after_its_data_sources() {
+        let (names, registry) = names_with_types_db(list_packet(
+            b"load",
+            b"load",
+            &[gauge(0.1), gauge(0.2), gauge(0.3)],
+        ));
+        assert_eq!(names, vec!["load.load.shortterm", "load.load.midterm", "load.load.longterm"]);
+        assert!(!diagnosed(&registry, "types_db_mismatch"), "a clean match must be silent");
+    }
+
+    /// Outcome 2: a resolved **single**-data-source type drops the lone name (`value`) entirely --
+    /// collectd's own `write_graphite` default, and identical to what index naming produces.
+    #[test]
+    fn a_resolved_single_data_source_type_omits_the_lone_data_source_name() {
+        let (names, _) = names_with_types_db(list_packet(b"cpu", b"cpu", &[derive(7)]));
+        assert_eq!(names, vec!["cpu.cpu"], "not `cpu.cpu.value`");
+    }
+
+    /// Outcome 3: the type is defined, but not the way the sender is sending it -- once on the
+    /// count, once on the kinds. Both fall back to index naming and report it.
+    #[test]
+    fn a_types_db_mismatch_falls_back_to_index_naming_and_reports_it() {
+        // Right type, wrong data-source count: the fixture's `load` has three.
+        let (names, registry) =
+            names_with_types_db(list_packet(b"load", b"load", &[gauge(0.1), gauge(0.2)]));
+        assert_eq!(names, vec!["load.load.0", "load.load.1"]);
+        assert!(diagnosed(&registry, "types_db_mismatch"));
+
+        // Right count, wrong kinds: the fixture's `if_octets` is two DERIVEs, not two GAUGEs.
+        let (names, registry) =
+            names_with_types_db(list_packet(b"interface", b"if_octets", &[gauge(1.0), gauge(2.0)]));
+        assert_eq!(names, vec!["interface.if_octets.0", "interface.if_octets.1"]);
+        assert!(diagnosed(&registry, "types_db_mismatch"));
+    }
+
+    /// Outcome 4: a type the file never defines is routine -- index naming, and **no** diagnostic,
+    /// or every custom plugin in a fleet would produce a permanent warning.
+    #[test]
+    fn an_unresolved_type_falls_back_to_index_naming_without_a_diagnostic() {
+        let (names, registry) =
+            names_with_types_db(list_packet(b"custom", b"custom_type", &[gauge(1.0), gauge(2.0)]));
+        assert_eq!(names, vec!["custom.custom_type.0", "custom.custom_type.1"]);
+        assert!(!diagnosed(&registry, "types_db_mismatch"), "an unknown type is not a mismatch");
+    }
+
+    /// A non-UTF-8 type name can never match a `types.db` key, and must fall through the *quiet*
+    /// path rather than the mismatch one.
+    #[test]
+    fn a_non_utf8_type_name_falls_back_quietly() {
+        let (names, registry) =
+            names_with_types_db(list_packet(b"p", &[0xFF, 0xFE], &[gauge(1.0), gauge(2.0)]));
+        assert_eq!(names.len(), 2);
+        assert!(names[0].ends_with(".0"));
+        assert!(!diagnosed(&registry, "types_db_mismatch"));
+    }
+
+    /// Without a `types.db` the same packet is index-named, silently -- the default every
+    /// deployment that never sets `types_db:` gets.
+    #[test]
+    fn no_types_db_configured_means_index_naming_and_no_diagnostic() {
+        let (mut decoder, registry) = decoder_with_diag();
+        let mut out = Vec::new();
+        decoder
+            .decode_into(
+                list_packet(b"load", b"load", &[gauge(0.1), gauge(0.2), gauge(0.3)]),
+                RECEIVED_AT,
+                &mut out,
+            )
+            .unwrap();
+        let names: Vec<&str> = out[0].metrics.iter().map(|r| resolve(r.name)).collect();
+        assert_eq!(names, vec!["load.load.0", "load.load.1", "load.load.2"]);
+        assert!(!diagnosed(&registry, "types_db_mismatch"));
     }
 
     #[test]
