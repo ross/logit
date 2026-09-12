@@ -988,6 +988,7 @@ dependencies = [
  "logit-pipeline",
  "logit-proto",
  "logit-transforms",
+ "reqwest",
  "rustls",
  "rustls-pki-types",
  "serde",

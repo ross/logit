@@ -35,6 +35,10 @@ flate2.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 tokio-rustls.workspace = true
+# prometheus_in's scrape client (docs/adr/prometheus-scrape-and-exposition.md) -- already a direct
+# dependency of `logit-outputs` at this exact version (its `otlp_out`/`influxdb_out` HTTP clients),
+# so promoting it here too adds no new crate version to `Cargo.lock`.
+reqwest.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # tail_in/docker_in's inotify wake source (docs/adr/file-tailing-and-docker-json-logs.md) --

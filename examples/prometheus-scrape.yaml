@@ -1,0 +1,18 @@
+# Scrapes a single node-exporter-style /metrics endpoint on the standard 15s Prometheus cadence
+# and prints the decoded events to stdout (docs/adr/prometheus-scrape-and-exposition.md).
+#
+# `prometheus_in` never binds a socket of its own -- it's an HTTP client, not a listener with
+# something to accept connections on -- so there's no loopback-vs-0.0.0.0 choice to make here the
+# way there is for `prometheus_out`'s `bind:` (a sink, not built yet, will bind to 127.0.0.1 in its
+# own example for exactly that reason). A `targets:` entry names whatever host the exporter you
+# want to scrape actually listens on; `127.0.0.1` below just matches a node-exporter run alongside
+# `logit` on the same host, the common case this example demonstrates.
+components:
+  node_exporter:
+    type: prometheus_in
+    targets: ["http://127.0.0.1:9100/metrics"]
+    interval: 15s
+
+  stdout:
+    type: stdio_out
+    sources: [node_exporter]
