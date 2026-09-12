@@ -27,6 +27,7 @@ use logit_outputs::otlp::{
     OtlpCompression as OtlpOutCompression, OtlpOutput, OtlpTransport as OtlpOutTransport,
     SignalPaths,
 };
+use logit_outputs::prometheus::PrometheusOutput;
 use logit_outputs::statsd::{StatsdEncoder, StatsdOutput};
 use logit_outputs::stdio::StreamOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
@@ -655,6 +656,23 @@ fn build_spec(
                 write_config(&component.buffer),
             )
         }
+
+        PrometheusOut { bind, path, expire_after, max_series } => {
+            // Nothing is bound here: `PrometheusOutput::bind` opens the listening socket in the
+            // runtime's pre-spawn pass (`logit_pipeline::Output::bind`), which is what turns an
+            // address already in use into a startup failure that names this component.
+            let output = PrometheusOutput::new(bind.clone())
+                .with_path(path.clone())
+                .with_expire_after(*expire_after)
+                .with_max_series(*max_series)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
     };
     Ok((spec, telemetry))
 }
@@ -1226,6 +1244,28 @@ mod tests {
                 org: "org".to_string(),
                 bucket: "bucket".to_string(),
                 token: "test-token".to_string(),
+            },
+        };
+        assert!(matches!(
+            build_spec("out", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    /// `bind: "127.0.0.1:0"` and no assertion about the port: `build_spec` must not bind anything
+    /// at all (that is `Output::bind`'s pre-spawn pass), so this test needs no runtime.
+    #[test]
+    fn build_spec_builds_a_prometheus_sink() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::PrometheusOut {
+                bind: "127.0.0.1:0".to_string(),
+                path: "/metrics".to_string(),
+                expire_after: Duration::from_secs(300),
+                max_series: 100_000,
             },
         };
         assert!(matches!(

@@ -914,6 +914,56 @@ pub enum ComponentKind {
         #[schemars(with = "String")]
         connect_timeout: Duration,
     },
+    /// A Prometheus/OpenMetrics **exposition** endpoint: a stateful sink holding a registry of
+    /// current series that an HTTP handler renders on demand, rather than one that writes anywhere.
+    /// The mirror of `PrometheusIn` (scrape). Both text dialects are served, negotiated on the
+    /// scraping client's `Accept`. See `docs/adr/prometheus-scrape-and-exposition.md` and
+    /// `logit_outputs::prometheus`'s module doc (the spec).
+    ///
+    /// A future remote-write **sender** is an optional `endpoint:` on this same variant, with a
+    /// graph rule requiring exactly one of `bind`/`endpoint` -- purely additive, so a config
+    /// written today keeps working.
+    PrometheusOut {
+        /// `host:port` to serve the exposition on. Required, and bound when the pipeline starts
+        /// (`Output::bind`'s pre-spawn pass), so an address already in use is a startup failure
+        /// rather than a scrape that silently answers nothing.
+        ///
+        /// **There is no TLS and no auth on this endpoint**, and it serves every label of every
+        /// series the registry holds to anything that connects: bind loopback or pod-local
+        /// (`127.0.0.1:9464`, as every shipped example does) and front it with something that has
+        /// both. See the ADR's "Security posture" section and `docs/known-gaps.md`.
+        bind: String,
+        /// The HTTP path the exposition is served on; any other path is a `404`. Defaults to
+        /// `/metrics`, what every Prometheus scrape config assumes when a target's own
+        /// `metrics_path` is unset.
+        #[serde(default = "default_prometheus_path")]
+        path: String,
+        /// A series not updated within this window is dropped from the registry and stops being
+        /// exposed. Defaults to 5 minutes -- Prometheus's own staleness horizon, so a series this
+        /// sink stops exposing is one a Prometheus-native exporter's consumer would already have
+        /// treated as stale. `0s` disables expiry entirely, leaving `max_series` as the only bound.
+        #[serde(default = "default_prometheus_expire_after", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        expire_after: Duration,
+        /// A hard cap on distinct series held in the registry; over it, the least-recently-updated
+        /// series is evicted to admit a new one, counted
+        /// `logit.output.series.evicted{reason="cardinality"}` -- the same shape as `aggregate`'s
+        /// `max_retained_gauge_series`, applied to registry memory instead of window memory.
+        #[serde(default = "default_prometheus_max_series")]
+        max_series: usize,
+    },
+}
+
+fn default_prometheus_path() -> String {
+    "/metrics".to_string()
+}
+
+fn default_prometheus_expire_after() -> Duration {
+    Duration::from_secs(300)
+}
+
+fn default_prometheus_max_series() -> usize {
+    100_000
 }
 
 fn default_max_message_bytes() -> u64 {
@@ -2774,6 +2824,69 @@ mod tests {
             }
             other => panic!("expected StatsdOut, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn prometheus_out_needs_only_bind_and_defaults_path_expiry_and_the_series_cap() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "prometheus_out", "sources": ["in"], "bind": "127.0.0.1:9464"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::PrometheusOut { bind, path, expire_after, max_series } => {
+                assert_eq!(bind, "127.0.0.1:9464");
+                assert_eq!(path, "/metrics");
+                assert_eq!(
+                    expire_after,
+                    Duration::from_secs(300),
+                    "Prometheus's own staleness horizon"
+                );
+                assert_eq!(max_series, 100_000);
+            }
+            other => panic!("expected PrometheusOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prometheus_out_expire_after_accepts_a_humantime_string_and_zero_to_disable_expiry() {
+        for (text, expected) in [("30s", Duration::from_secs(30)), ("0s", Duration::ZERO)] {
+            let component: Component = serde_json::from_str(&format!(
+                r#"{{"type": "prometheus_out", "sources": ["in"], "bind": "127.0.0.1:9464",
+                     "expire_after": "{text}"}}"#
+            ))
+            .unwrap();
+            match component.kind {
+                ComponentKind::PrometheusOut { expire_after, .. } => {
+                    assert_eq!(expire_after, expected)
+                }
+                other => panic!("expected PrometheusOut, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn prometheus_out_path_and_max_series_are_settable() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "prometheus_out", "sources": ["in"], "bind": "127.0.0.1:9464",
+                "path": "/exposed", "max_series": 25}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::PrometheusOut { path, max_series, .. } => {
+                assert_eq!(path, "/exposed");
+                assert_eq!(max_series, 25);
+            }
+            other => panic!("expected PrometheusOut, got {other:?}"),
+        }
+    }
+
+    /// `bind:` has no default, deliberately -- unlike `admin:`'s own `Option<String>`, an
+    /// exposition sink with nowhere to listen has nothing to do at all.
+    #[test]
+    fn prometheus_out_without_a_bind_is_rejected() {
+        let result: Result<Component, _> =
+            serde_json::from_str(r#"{"type": "prometheus_out", "sources": ["in"]}"#);
+        assert!(result.is_err(), "bind is required");
     }
 
     #[test]
