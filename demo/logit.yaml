@@ -2,9 +2,9 @@
 # docs/plans/otlp-end-to-end.md, docs/plans/otlp-logs-and-resource-identity.md,
 # docs/plans/access-log-spans.md, docs/plans/file-tailing.md, docs/plans/demo-richer-traces.md,
 # docs/plans/operator-surface.md).
-# Exercises syslog in, tail_in, docker_in, otlp_in, set + json + lua + trace_context + scale +
-# kv_metrics + keep_signals + keep + aggregate, InfluxDB out, OTLP/HTTP out, OTLP/gRPC out, plus
-# `internal` observing the pipeline itself (ADR `internal-telemetry-as-pipeline-events`, ADR
+# Exercises syslog in, tail_in, docker_in, otlp_in, set + json + lua + regex + trace_context +
+# scale + kv_metrics + keep_signals + keep + aggregate, InfluxDB out, OTLP/HTTP out, OTLP/gRPC out,
+# plus `internal` observing the pipeline itself (ADR `internal-telemetry-as-pipeline-events`, ADR
 # `internal-span-emission-and-deterministic-sampling`) -- against traffic that crosses five real
 # tiers: haproxy -> nginx -> app -> postgres, plus an async worker over Redis
 # (demo/compose.yaml's `traffic` service drives the first three; docs/plans/demo-tracing-stack.md's
@@ -95,8 +95,8 @@
 #   workstream D), which parents to whichever request enqueued it, same propagator, no code either
 #   side of that hop.
 #
-#   Two more parallel legs (docs/plans/demo-richer-traces.md workstreams C and D), untied to the
-#   diagram above since neither touches haproxy/nginx/app's own listeners:
+#   Three more parallel legs (docs/plans/demo-richer-traces.md workstreams C and D), untied to the
+#   diagram above since none touches haproxy/nginx/app's own listeners:
 #
 #   postgres --jsonlog file--> tail(tail_in)--> postgres_in -> postgres_identity (set)
 #             -> postgres_json (json) -> postgres_trace_lift (regex, extracts a `traceparent` out
@@ -106,6 +106,11 @@
 #   demo-worker --syslog/UDP:5143--> worker_in -> worker_identity (set) -> worker_json (json)
 #             -> worker_trace (trace_context, no `span:` -- the worker's own Celery/psycopg spans
 #             are already real) -> stdout / logs_only -> loki_out
+#
+#   redis --stdout--> json-file --tail(docker_in)--> redis_in -> redis_identity (set)
+#             -> redis_parse (regex, splits pid/role/level off Redis's plain-text line) -> stdout /
+#             logs_only -> loki_out. No trace_context -- Redis logs carry none; its query traffic
+#             is already real CLIENT spans from demo-app/demo-worker's own Redis instrumentation.
 #
 #   browser (real OTel SDK, or curl) --OTLP/JSON POST /v1/traces--> haproxy (`is_otlp` ACL,
 #             demo/haproxy/haproxy.cfg) --> browser_in (otlp_in, :4318) -> stdout / browser_spans
@@ -143,6 +148,19 @@ components:
     containers: [logit-demo-nginx]
     read_from: beginning
     checkpoint_path: /var/lib/logit/nginx.checkpoint
+
+  # Redis's own server log (Celery's broker, docs/plans/demo-richer-traces.md workstream D) --
+  # `docker_in` exactly like `nginx_in` above, against the fixed `container_name` demo/compose.yaml
+  # gives the `redis` service. No `nginx_stdout`-style iostream filter: Redis writes every log line
+  # to stdout, so there's no second stream in this container's json-file log to tell apart. Redis
+  # has no per-command log, so this is startup/persistence/warning lines only -- the broker's own
+  # query traffic is already covered by `demo-app`/`demo-worker`'s real
+  # `opentelemetry-instrumentation-redis` CLIENT spans (`LPUSH`, `LLEN`, ...) straight to Tempo.
+  redis_in:
+    type: docker_in
+    containers: [logit-demo-redis]
+    read_from: beginning
+    checkpoint_path: /var/lib/logit/redis.checkpoint
 
   # nginx's own error_log shares the same container (and so the same Docker json-file log) as its
   # access log, distinguished only by `log.iostream` (`stdout` vs `stderr`) -- `docker_in` itself
@@ -238,6 +256,13 @@ components:
     resource:
       service.name: postgres
       service.namespace: demo
+  # Overlays onto the `container.*` resource `redis_in` already stamped, same as `nginx_identity`.
+  redis_identity:
+    type: set
+    sources: [redis_in]
+    resource:
+      service.name: redis
+      service.namespace: demo
 
   haproxy_json:
     type: json
@@ -310,6 +335,23 @@ components:
     type: trace_context
     sources: [postgres_trace_lift]
 
+  # Redis's plain-text log line, `<pid>:<role> <day> <mon> <year> <hh:mm:ss.mmm> <level> <message>`
+  # (e.g. `1:M 12 Sep 2026 23:01:01.041 * DB saved on disk`) -- no JSON to hand `json`, so `regex`
+  # (docs/adr/regex-transform.md) splits it instead. `redis.role` is Redis's own one-letter process
+  # role (`M` primary, `S` replica, `C` a forked child such as a background save, `X` sentinel);
+  # `redis.level` its one-character severity (`.` debug, `-` verbose, `*` notice, `#` warning) --
+  # kept as the raw character, since `regex` has no mapping step and `event.log.severity` is
+  # read-only from `lua` (docs/design/lua-api.md). Namespaced, not a bare `level`, deliberately:
+  # Loki reads a `level` structured-metadata key as the line's severity, and would otherwise show
+  # every notice line with a `detected_level` of `*`. Redis's own timestamp is left unparsed: `docker_in` already stamps
+  # the json-file envelope's `time`, the same instant to within Docker's own write. A line that
+  # doesn't match (none expected, but a future Redis could change its format) passes through
+  # unchanged as a plain log. No `trace_context` stage after it -- Redis logs carry no trace.
+  redis_parse:
+    type: regex
+    sources: [redis_identity]
+    pattern: '^(?P<process.pid>\d+):(?P<redis.role>[MSCX]) \d{2} \w{3} \d{4} [\d:.]+ (?P<redis.level>[.\-*#]) '
+
   # No component here for the app's own OTel spans (demo/app/gunicorn.conf.py) -- they go straight
   # to Tempo's own `otlp.protocols.http` receiver on :4318 (`demo/tempo/tempo.yaml`), alongside the
   # gRPC one `tempo_out` below uses, never touching `logit` (see the header comment for why). The
@@ -330,7 +372,15 @@ components:
   stdout:
     type: stdio_out
     sources:
-      [haproxy_trace, nginx_trace, app_trace, worker_trace, postgres_trace, browser_in]
+      [
+        haproxy_trace,
+        nginx_trace,
+        app_trace,
+        worker_trace,
+        postgres_trace,
+        redis_parse,
+        browser_in,
+      ]
 
   # Loki's OTLP ingestion accepts logs only -- it registers no `TracesService`/`MetricsService` --
   # and `otlp_out` aborts an entire batch's `send` on the first signal request that fails
@@ -347,7 +397,8 @@ components:
   # without also sending `loki_out` a metric point or a span it would reject.
   logs_only:
     type: keep_signals
-    sources: [haproxy_trace, nginx_trace, app_trace, worker_trace, postgres_trace, self]
+    sources:
+      [haproxy_trace, nginx_trace, app_trace, worker_trace, postgres_trace, redis_parse, self]
     signals: [logs]
 
   # Logs to Loki, direct over OTLP -- no relay service in between (docs/plans/

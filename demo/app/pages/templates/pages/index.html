@@ -59,9 +59,9 @@ of the shortcuts that make that possible, so you don't copy them uncritically:</
   hostname to pin for a stack that answers on <code>localhost</code> at whatever port you gave
   it.</li>
   <li><code>logit</code> itself runs as root, specifically so it can read Docker's own
-  container log directory directly for <code>nginx</code>'s access log (<code>docker_in</code>,
-  see <code>demo/README.md</code>) -- real cost paid for one tier's telemetry, not a default
-  posture.</li>
+  container log directory directly for <code>nginx</code>'s access log and Redis's server log
+  (<code>docker_in</code>, see <code>demo/README.md</code>) -- real cost paid for two tiers'
+  telemetry, not a default posture.</li>
   <li>Postgres logs every statement (<code>log_min_duration_statement=0</code>,
   <code>demo/compose.yaml</code>) instead of sampling slow ones -- shows the mechanism, not a
   production logging policy.</li>

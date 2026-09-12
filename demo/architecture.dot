@@ -60,8 +60,8 @@ digraph architecture {
   client  -> grafana [label="web"];
 
   // -- Logging: every tier's access log reaches `logit` ------------------------------------
-  // haproxy's and app's over syslog; nginx's and postgres's by `logit` tailing their own logs
-  // directly off the host instead -- nginx's Docker json-file log
+  // haproxy's and app's over syslog; nginx's, redis's and postgres's by `logit` tailing their own
+  // logs directly off the host instead -- nginx's and redis's Docker json-file logs
   // (docs/adr/file-tailing-and-docker-json-logs.md, this demo's end-to-end proof for that ADR)
   // and postgres's plain rotating jsonlog directory (`tail_in`, docs/plans/demo-richer-traces.md's
   // workstream C). Still one "logging" edge either way: the distinction is a transport detail
@@ -72,6 +72,7 @@ digraph architecture {
   app      -> logit [label="logging"];
   worker   -> logit [label="logging"];
   postgres -> logit [label="logging"];
+  redis    -> logit [label="logging"];
   logit    -> loki  [label="logging"];
 
   // -- db: reads/writes against Postgres, from either app-tier process ---------------------
@@ -99,8 +100,9 @@ digraph architecture {
   // settled") -- not every telemetry leg needs `logit` in front of it, and this diagram shows
   // that honestly rather than drawing an edge through `logit` that doesn't exist. `postgres` and
   // `redis` themselves get no edge into `tempo` -- neither runs an SDK; postgres's trace id
-  // reaches Loki only, via the "logging" edge above, and redis's isn't captured by this demo at
-  // all (the broker traffic is instrumented from both endpoints, not the broker itself).
+  // reaches Loki only, via the "logging" edge above, and redis's own log carries none at all (its
+  // "logging" edge is server lines only; the broker traffic is traced from both client endpoints,
+  // `app`'s and `worker`'s Redis CLIENT spans, not from the broker itself).
   logit  -> tempo [label="tracing"];
   app    -> tempo [label="tracing"];
   worker -> tempo [label="tracing"];

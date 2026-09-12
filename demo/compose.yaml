@@ -80,9 +80,14 @@ services:
 
   # Celery's broker (`docs/plans/demo-richer-traces.md` workstream D) -- `app`'s `.delay()` and
   # `worker`'s own consumption both go through here. No persistence configured: this demo has
-  # nothing worth surviving a restart on the broker side, unlike `postgres_data` above.
+  # nothing worth surviving a restart on the broker side, unlike `postgres_data` above. Logs to
+  # stdout only, which `redis_in` (demo/logit.yaml) tails straight off the host with `docker_in` --
+  # the same mechanism `nginx_in` uses, and no Redis-side config change needed for it.
   redis:
     image: docker.io/library/redis:7-alpine
+    # Fixed, not Compose's default `<project>-redis-<n>`, for the same reason `nginx`'s is (below):
+    # `redis_in` names this container explicitly in `docker_in`'s `containers:`.
+    container_name: logit-demo-redis
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -200,9 +205,9 @@ services:
       # directory (not a directory this stack owns) would be actively harmful, unlike every other
       # bind mount in this file. `security_opt` below is the SELinux accommodation instead.
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      # `nginx_in`'s and `postgres_in`'s checkpoints (demo/logit.yaml) -- survive a `logit` restart
-      # so it resumes without replaying/losing lines; `docker compose down -v` wipes both along
-      # with everything else this stack persists.
+      # `nginx_in`'s, `redis_in`'s and `postgres_in`'s checkpoints (demo/logit.yaml) -- survive a
+      # `logit` restart so it resumes without replaying/losing lines; `docker compose down -v` wipes
+      # them along with everything else this stack persists.
       - logit_state:/var/lib/logit
       # `postgres_in`'s own source (demo/logit.yaml) -- `:ro`, unlike the Docker-state mount above,
       # since this is a directory this stack owns outright, not the daemon's live state.

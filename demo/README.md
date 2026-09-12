@@ -102,8 +102,8 @@ OTLP/gRPC into Tempo, one span per node-visit at `span_sample_rate: 1.0` so noth
 `../docs/adr/hand-rolled-grpc-over-hyper.md`) — alongside haproxy's and nginx's own access-line
 spans, sharing that same `tempo_out`.
 
-**The `logit` service runs as root, and reading `nginx`'s log this way only works on native Linux
-Docker Engine.** Docker's per-container state directories are `root:root 0710` and the log files
+**The `logit` service runs as root, and reading `nginx`'s (and `redis`'s, below) log this way only
+works on native Linux Docker Engine.** Docker's per-container state directories are `root:root 0710` and the log files
 `root:root 0640` on a stock install, so `docker_in` needs both root and a read-only bind mount of
 `/var/lib/docker/containers` (`demo/compose.yaml`'s `logit` service) — real cost specific to
 reading the json-file driver directly rather than the docker socket/API (see the ADR's "Root
@@ -187,6 +187,14 @@ response that started them has already reached the client — `app`'s gunicorn w
 `worker` service both run the identical `TracerProvider`/instrumentor setup
 (`app/demoproj/telemetry.py`, factored out once both processes needed it), each fed its own
 `service.name` by `OTEL_SERVICE_NAME` (`demo-app`/`demo-worker`, `compose.yaml`).
+
+Redis's own server log reaches Loki too, as `service.name: redis`: `redis_in` is a second
+`docker_in`, tailing the `logit-demo-redis` container's json-file log exactly the way `nginx_in`
+tails nginx's, and `redis_parse` (a `regex` stage) splits `process.pid`, the one-letter
+`redis.role`, and the one-character `redis.level` off Redis's plain-text line format. Redis has no per-command log, so these
+are startup, background-save, and warning lines only, with no trace id — the broker's actual query
+traffic (`LPUSH`, `LLEN`, ...) is already covered by `demo-app`'s and `demo-worker`'s
+`opentelemetry-instrumentation-redis` CLIENT spans in Tempo.
 
 The landing page shows two diagrams. The pipeline one (also at `:8080/graph.svg` directly) is
 rendered at startup, not hand-drawn: `graph-dot` runs `logit graph logit.yaml` against the actual
