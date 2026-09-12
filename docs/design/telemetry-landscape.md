@@ -143,23 +143,48 @@ egress fidelity, not a like-to-like pair under [ADR `lossless-transit`](../adr/l
 
 ### collectd binary/network protocol
 
-Reference: <https://github.com/collectd/collectd/wiki/Binary-protocol>. (Named in
-[`docs/OVERVIEW.md`](../OVERVIEW.md)'s ingest scope; no `collectd_in` exists yet.)
+Reference: <https://github.com/collectd/collectd/wiki/Binary-protocol>. See
+[ADR `collectd-binary-relay`](../adr/collectd-binary-relay.md) for `logit`'s `collectd_in`/
+`collectd_out` model mapping, attribute convention, and permitted normalizations.
 
-A stream of TLV "parts." Identity parts precede value parts: `Host` (string), `Plugin`/
-`PluginInstance` (string, e.g. `"cpu"`/`"1"`), `Type`/`TypeInstance` (string, e.g. `"cpu"`/
-`"idle"`), `Interval` (numeric, collection period), `Time` (unix seconds) or, v5.0+, a
-higher-resolution time encoded in 2⁻³⁰-second units instead of a float, avoiding floating-point
-time arithmetic.
+A stream of TLV "parts": `type u16 BE, len u16 BE` (`len` includes the 4-byte header). Strings are
+NUL-terminated (`len = 4 + n + 1`); numeric parts are a single `u64` BE (`len = 12`). Identity parts
+precede value parts and are **sticky within one datagram** — a `Host`/`Plugin`/etc. part applies to
+every `Values` part that follows it until replaced, so a sender may elide a string part that hasn't
+changed since the last one it wrote, and the receiver keeps the last value it saw. Part types:
+`Host` (0x0000, string), `Time` (0x0001, unix seconds) and, v5.0+, `TimeHR` (0x0008, higher-resolution
+time in 2⁻³⁰-second units — "cdtime" — instead of a float, avoiding floating-point time arithmetic),
+`Plugin`/`PluginInstance` (0x0002/0x0003, string, e.g. `"cpu"`/`"1"`), `Type`/`TypeInstance`
+(0x0004/0x0005, string, e.g. `"cpu"`/`"idle"`), `Values` (0x0006), `Interval` (0x0007, seconds) /
+`IntervalHR` (0x0009, cdtime) — the sender writes `TimeHR`/`IntervalHR` unconditionally per value
+list, never the legacy pair. `Message` (0x0100) and `Severity` (0x0101, one of 1 FAILURE/2 WARNING/
+4 OKAY) carry a notification instead of a metric value, sent in the order TimeHR, Severity, Host,
+Plugin, PluginInstance, Type, TypeInstance, Message; a receiver drops one with severity outside
+`{1,2,4}`, time `0`, or an empty message, and `NOTIF_MAX_MSG_LEN` is 256. `Signature` (0x0200) and
+`Encryption` (0x0210) optionally wrap the remainder of the payload; not a value-semantics concern on
+their own, but a receiver that can't verify/decrypt has nothing further to parse.
 
-- **Value types**, each a fixed-width wire value: `COUNTER` (u64, network/big-endian, semantics:
-  wraps on overflow — a monotonic counter with no OTLP-style explicit temporality flag, delta is
-  computed downstream by differencing), `GAUGE` (f64, **little-endian**, the one value type not in
-  network byte order), `DERIVE` (i64, network byte order — a signed monotonic-or-not counter,
+- **`Values` layout**: `u16 count`, then `count` one-byte data-source-type tags, then `count`
+  8-byte values — `len == 6 + 9*count` (2-byte count + `count` type bytes + `count*8` value bytes,
+  plus the 4-byte part header). Each a fixed-width wire value: `COUNTER` (u64, network/big-endian,
+  semantics: wraps on overflow — a monotonic counter with no OTLP-style explicit temporality flag,
+  delta is computed downstream by differencing), `GAUGE` (f64, **little-endian**, the one value type
+  not in network byte order), `DERIVE` (i64, network byte order — a signed monotonic-or-not counter,
   collectd's answer to "a counter that can also decrease or reset without wrapping"), `ABSOLUTE`
   (u64, network byte order — a counter reset to the reported value on every read, e.g. a queue
   depth sampled destructively).
-- Optional signing/encryption parts wrap the payload; not a value-semantics concern.
+- **Sender behavior** (`add_to_buffer`): elides only the five string identity parts versus what it
+  last wrote to the packet; packs value lists to `MaxPacketSize` (default **1452** bytes, matching a
+  typical Ethernet MTU after IP/UDP headers on a slightly-tunneled path), flushing and starting a new
+  packet when a list wouldn't fit. Default port 25826; default multicast groups `239.192.74.66` (v4)
+  / `ff18::efc0:4a42` (v6).
+- **Receiver behavior** (`network_dispatch_values`): rejects a value list outright (`-EINVAL`) when
+  its time is `0` or its host/plugin/type string is empty; `plugin_dispatch_values` separately
+  rejects a type not present in its configured `types.db`, or a value count that doesn't match that
+  type's declared data-source count. `escape_slashes` turns a literal `/` into `_` in every identity
+  string, since several collectd write plugins treat these fields as filesystem-adjacent.
+  `DATA_MAX_NAME_LEN` is 128 bytes (127 plus the trailing NUL); `parse_part_string` rejects the whole
+  packet if a string part overflows that bound or lacks its terminating NUL.
 
 ### Graphite
 
@@ -193,11 +218,12 @@ ingest. A pickle-serialized batch protocol exists as a transport optimization, s
 | Description | — | — | `Metric.description` | `# HELP` | via metadata (2.0) | — | — | — |
 | Start time | — | — | `start_time_unix_nano` | — (`_created`, OM) | `created_timestamp` (2.0) | — | — | — |
 | Point timestamp | — | `\|T` (c/g only) | `time_unix_nano` (ns) | ms | ms | configurable, ns default | s or 2⁻³⁰s | s |
+| Collection interval | — | — | — | — | — | — | `Interval`/`IntervalHR` per value list | — |
 | Sample rate | `@rate` | `@rate` (not g/s) | — | — | — | — | — | — |
 | Tags/labels | none | string k:v, bare | typed `AnyValue` attrs | string labels | string labels (interned, 2.0) | string tag values | identity parts only | `k=v`, string |
 | Resource/scope identity | — | — | `Resource`+`Scope` | job/instance labels (convention) | job/instance labels | tags (convention) | host/plugin parts | path prefix (convention) |
 | schema_url | — | — | yes | — | — | — | — | — |
-| Events/service checks | — | `_e{}` / `_sc` (in `logit`: `log` (`_e`) / `Gauge` + `statsd.service_check.*` carriers (`_sc`), both ways -- `docs/adr/statsd-output.md`'s amendment) | (as logs, not metrics) | — | — | — | — | — |
+| Events/service checks | — | `_e{}` / `_sc` (in `logit`: `log` (`_e`) / `Gauge` + `statsd.service_check.*` carriers (`_sc`), both ways -- `docs/adr/statsd-output.md`'s amendment) | (as logs, not metrics) | — | — | — | notifications (`Message`+`Severity` parts; in `logit`: `log` + `collectd.severity`) | — |
 | Container id | — | `\|c:` | resource attrs | — | — | — | — | — |
 | Multi-value point | `a:1:2:3\|c` | yes | one point per `Metric` (batch-level regroup) | one line per series | one series per point | multiple fields/point | one value/part | one value/line |
 | No-recorded-value / stale marker | — | — | `flags` bit 0 | staleness marker (internal) | — | — | — | — |
