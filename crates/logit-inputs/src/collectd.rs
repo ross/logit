@@ -180,9 +180,11 @@ impl Input for CollectdInput {
 mod tests {
     use super::*;
     use logit_core::interner::resolve;
-    use logit_core::{MetricKind, Value};
+    use logit_core::telemetry::Registry;
+    use logit_core::{Event, MetricKind, Temporality, Value};
     use logit_pipeline::unwrap_batch;
     use logit_proto::collectd::part;
+    use logit_proto::Decoder as _;
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -330,5 +332,271 @@ mod tests {
         let config = UdpListenerConfig { max_datagrams: 4242, ..UdpListenerConfig::default() };
         let input = CollectdInput::new("127.0.0.1:0").with_receive(config);
         assert_eq!(input.receive_config().max_datagrams, 4242);
+    }
+
+    // ---- recorded interop fixtures (testdata/interop/collectd/) --------------------------------
+    //
+    // Real datagrams from a real collectd's own `network` plugin -- not this codec's encoder, not a
+    // hand-built `PacketBuilder` packet -- recorded by `script/record-fixtures collectd`. See
+    // testdata/interop/collectd/README.md for the provenance table and
+    // docs/plans/recorded-interop-fixtures.md for why the corpus exists at all.
+    //
+    // These assert on **decoded, identifiable values** (the host, which plugins arrived, a list's
+    // data-source count and kinds, the interval), never on the fixture bytes: re-running the
+    // recorder changes every measured value, every timestamp, and even which lists land in which
+    // datagram, and a test pinned to any of that would be testing this directory's stability rather
+    // than the decoder (testdata/interop/README.md's "Consuming these fixtures").
+    //
+    // They live here rather than in `logit-proto` beside the codec's own unit tests for the same
+    // reason `syslog.rs`'s do: this is the component an operator actually points at a collectd, and
+    // `CollectdDecoder` plus `with_types_db` is exactly the surface `collectd_in` configures.
+
+    const INTEROP_FIXTURES: [&str; 3] =
+        ["collectd-000.raw", "collectd-001.raw", "collectd-002.raw"];
+
+    /// A hand-written `types.db` covering exactly the six types these fixtures carry, in stock
+    /// collectd's own data-source layout. Hand-written on purpose: collectd's own `types.db` is
+    /// GPL-licensed and is never copied into this repo (see this module's doc and
+    /// [`logit_proto::collectd::types_db`]), and a fixture that only has to cover six types is
+    /// clearer than 200 lines of someone else's file anyway.
+    const FIXTURE_TYPES_DB: &str = "\
+# hand-written for crates/logit-inputs/src/collectd.rs's interop tests -- not collectd's own file
+load\t\tshortterm:GAUGE:0:5000, midterm:GAUGE:0:5000, longterm:GAUGE:0:5000
+memory\t\tvalue:GAUGE:0:281474976710656
+if_octets\trx:DERIVE:0:U, tx:DERIVE:0:U
+if_packets\trx:DERIVE:0:U, tx:DERIVE:0:U
+if_errors\trx:DERIVE:0:U, tx:DERIVE:0:U
+if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
+";
+
+    /// Deliberately *before* the capture window (2023-11-14), so every "the timestamp came off the
+    /// wire" assertion below would fail loudly if the decoder ever fell back to receipt time for
+    /// these datagrams -- every list collectd sends carries a TimeHR part.
+    const RECEIVED_AT: i64 = 1_700_000_000_000_000_000;
+    /// 2026-09-12T00:00:00Z, the day these fixtures were recorded: a lower bound on every decoded
+    /// timestamp.
+    const CAPTURED_ON_OR_AFTER: i64 = 1_789_171_200_000_000_000;
+    /// 2100-01-01T00:00:00Z. Deliberately loose at this end: the capture date only ever moves
+    /// forward on a re-record, so a tight upper bound would be a test that expires.
+    const CAPTURED_BEFORE: i64 = 4_102_444_800_000_000_000;
+
+    fn interop_fixture(name: &str) -> bytes::Bytes {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/interop/collectd")
+            .join(name);
+        let raw = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("reading interop fixture {}: {e}", path.display()));
+        bytes::Bytes::from(raw)
+    }
+
+    /// Decodes one recorded datagram through a real [`CollectdDecoder`], with the diagnostics
+    /// mirrored into a drainable registry so a test can assert that *nothing* was diagnosed -- the
+    /// point of a recorded fixture being that a real sender's output should decode clean.
+    fn decode_interop(
+        name: &str,
+        types_db: Option<&str>,
+    ) -> (Vec<Event>, Arc<Registry>) {
+        let registry = Registry::new();
+        let diag = Diagnostics::new("collectd_in").with_telemetry(registry.telemetry_for(
+            "collectd_in",
+            "collectd_in",
+            "listener",
+        ));
+        let mut decoder =
+            CollectdDecoder::new(Arc::new(Resource::default())).with_diagnostics(diag);
+        if let Some(text) = types_db {
+            decoder = decoder.with_types_db(Arc::new(
+                TypesDb::parse(text).expect("the hand-written fixture types.db must parse"),
+            ));
+        }
+        let mut events = Vec::new();
+        decoder
+            .decode_into(interop_fixture(name), RECEIVED_AT, &mut events)
+            .unwrap_or_else(|e| panic!("{name} is a real collectd datagram and must decode: {e}"));
+        (events, registry)
+    }
+
+    /// Every `logit.component.diagnostics{key}` the registry saw. Drains, so call it once.
+    fn diagnostic_keys(registry: &Registry) -> Vec<String> {
+        let drained = registry.drain(0);
+        drained
+            .iter()
+            .filter(|event| {
+                event.metrics.iter().any(|m| resolve(m.name) == "logit.component.diagnostics")
+            })
+            .filter_map(|event| {
+                event.attributes.get("key").and_then(Value::as_str).map(str::to_owned)
+            })
+            .collect()
+    }
+
+    fn attr_str<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
+        event.attributes.get(key).and_then(Value::as_str)
+    }
+
+    /// The first event decoded from `name` whose plugin and type match -- collectd packs unrelated
+    /// lists into one datagram, so picking one out by identity is how these tests address a list.
+    fn list_of<'a>(
+        events: &'a [Event],
+        plugin: &str,
+        type_: &str,
+    ) -> &'a Event {
+        events
+            .iter()
+            .find(|e| {
+                attr_str(e, "collectd.plugin") == Some(plugin)
+                    && attr_str(e, "collectd.type") == Some(type_)
+            })
+            .unwrap_or_else(|| panic!("no {plugin}/{type_} list in this datagram"))
+    }
+
+    /// How many parts of `part_type` the raw datagram carries, walked with the codec's own framing
+    /// reader. Used to state the identity-elision claim concretely, in terms of the wire.
+    fn count_parts(raw: &bytes::Bytes, part_type: u16) -> usize {
+        let mut at = 0usize;
+        let mut found = 0usize;
+        while at < raw.len() {
+            let (header, _) = part::read_part(raw, at).expect("a recorded datagram is well framed");
+            if header.part_type == part_type {
+                found += 1;
+            }
+            at += header.len;
+        }
+        found
+    }
+
+    #[test]
+    fn interop_fixture_every_datagram_decodes_clean_with_the_expected_identity() {
+        for name in INTEROP_FIXTURES {
+            let (events, registry) = decode_interop(name, Some(FIXTURE_TYPES_DB));
+            assert!(!events.is_empty(), "{name}: a recorded datagram carries value lists");
+            assert_eq!(
+                diagnostic_keys(&registry),
+                Vec::<String>::new(),
+                "{name}: a real collectd's own output must decode with no bad_part, \
+                 incomplete_identity, types_db_mismatch or encrypted_packet_dropped diagnostic"
+            );
+            for event in &events {
+                assert_eq!(
+                    attr_str(event, "collectd.host"),
+                    Some("logit-fixture"),
+                    "{name}: tools/record-fixtures/collectd.conf sets `Hostname \"logit-fixture\"`"
+                );
+                let plugin = attr_str(event, "collectd.plugin").expect("every list carries a plugin");
+                assert!(
+                    matches!(plugin, "load" | "memory" | "interface"),
+                    "{name}: the config loads exactly these three read plugins, got {plugin:?}"
+                );
+                assert_eq!(
+                    event.attributes.get("collectd.interval"),
+                    Some(&Value::F64(1.0)),
+                    "{name}: `Interval 1`, carried as an IntervalHR part of 2^30 ticks"
+                );
+                assert!(
+                    (CAPTURED_ON_OR_AFTER..CAPTURED_BEFORE).contains(&event.timestamp),
+                    "{name}: the TimeHR part off the wire, not RECEIVED_AT -- got {}",
+                    event.timestamp
+                );
+                assert!(!event.metrics.is_empty(), "{name}: a value list has at least one value");
+            }
+        }
+    }
+
+    #[test]
+    fn interop_fixture_sender_elided_identity_parts_across_a_packed_datagram() {
+        // The elision rule this codec's sticky-identity state machine exists for: collectd writes
+        // an identity part only when it differs from the last one written *in the same datagram*,
+        // so a packet holding ~25 value lists from three plugins carries exactly one Host part.
+        // Asserted against the raw bytes and the decoded events together -- either one alone would
+        // miss the point (many events, one Host part *is* the elision).
+        for name in INTEROP_FIXTURES {
+            let raw = interop_fixture(name);
+            let (events, _) = decode_interop(name, None);
+            assert!(
+                events.len() > 1,
+                "{name}: collectd packs value lists up to MaxPacketSize, so one datagram is many \
+                 lists -- got {}",
+                events.len()
+            );
+            assert_eq!(
+                count_parts(&raw, part::TYPE_HOST),
+                1,
+                "{name}: one Host part for all {} lists is the sender-side elision",
+                events.len()
+            );
+            assert!(
+                count_parts(&raw, part::TYPE_PLUGIN) < events.len(),
+                "{name}: fewer Plugin parts than value lists means identity was elided, not \
+                 repeated per list"
+            );
+            assert_eq!(
+                count_parts(&raw, part::TYPE_VALUES),
+                events.len(),
+                "{name}: one Values part is one event"
+            );
+        }
+    }
+
+    #[test]
+    fn interop_fixture_load_is_three_gauges_index_named_without_a_types_db() {
+        // The multi-data-source case, from the real `load` plugin: three GAUGEs in one list, which
+        // a types.db-less deployment names by index.
+        let (events, _) = decode_interop("collectd-000.raw", None);
+        let load = list_of(&events, "load", "load");
+        let names: Vec<&str> = load.metrics.iter().map(|r| resolve(r.name)).collect();
+        assert_eq!(names, ["load.load.0", "load.load.1", "load.load.2"]);
+        for record in &load.metrics {
+            assert!(
+                matches!(record.kind, MetricKind::Gauge(v) if v >= 0.0),
+                "the load average is a GAUGE, got {:?}",
+                record.kind
+            );
+        }
+        assert_eq!(load.attributes.get("collectd.plugin_instance"), None);
+        assert_eq!(load.attributes.get("collectd.type_instance"), None);
+    }
+
+    #[test]
+    fn interop_fixture_load_is_named_from_a_types_db_and_memory_stays_single_data_source() {
+        // The same real list, with names: `load` resolves to three data sources, so the suffix
+        // becomes shortterm/midterm/longterm. `memory` is single-data-source, so it is
+        // `memory.memory` either way -- the omission rule, checked against a real single-DS list
+        // rather than a hand-built one.
+        let (events, _) = decode_interop("collectd-000.raw", Some(FIXTURE_TYPES_DB));
+        let load = list_of(&events, "load", "load");
+        let names: Vec<&str> = load.metrics.iter().map(|r| resolve(r.name)).collect();
+        assert_eq!(names, ["load.load.shortterm", "load.load.midterm", "load.load.longterm"]);
+
+        let memory = list_of(&events, "memory", "memory");
+        assert_eq!(memory.metrics.len(), 1);
+        assert_eq!(resolve(memory.metrics[0].name), "memory.memory");
+        assert!(
+            attr_str(memory, "collectd.type_instance").is_some(),
+            "the memory plugin distinguishes used/free/cached/... by type_instance"
+        );
+    }
+
+    #[test]
+    fn interop_fixture_if_octets_is_two_non_monotonic_cumulative_sums() {
+        // The other data-source kind, from the real `interface` plugin: DERIVE, which the model
+        // carries as a non-monotonic cumulative Sum (a counter that can be reset by a NIC reset or
+        // an interface going away, which is exactly why collectd has DERIVE and not just COUNTER).
+        let (events, _) = decode_interop("collectd-000.raw", Some(FIXTURE_TYPES_DB));
+        let if_octets = list_of(&events, "interface", "if_octets");
+        assert_eq!(if_octets.metrics.len(), 2, "if_octets is rx/tx");
+        for record in &if_octets.metrics {
+            let MetricKind::Sum(sum) = record.kind else {
+                panic!("a DERIVE data source decodes to a Sum, got {:?}", record.kind)
+            };
+            assert_eq!(sum.temporality, Temporality::Cumulative);
+            assert!(!sum.monotonic, "DERIVE is the non-monotonic cumulative case");
+        }
+        let names: Vec<&str> = if_octets.metrics.iter().map(|r| resolve(r.name)).collect();
+        assert_eq!(names, ["interface.if_octets.rx", "interface.if_octets.tx"]);
+        assert!(
+            attr_str(if_octets, "collectd.plugin_instance").is_some(),
+            "the interface plugin puts the interface name in plugin_instance"
+        );
+        assert_eq!(if_octets.attributes.get("collectd.type_instance"), None);
     }
 }
