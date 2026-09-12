@@ -211,8 +211,9 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `syslog_in` `decode_into` into a warm buffer | **0** | ADR `decoupled-listener-io` -- see below |
 | `statsd_in` decode 1 line | **2** | fixed -- see below, tag values now slice the datagram too |
 | `statsd_in` `decode_into` into a warm buffer | **1** | ADR `decoupled-listener-io` -- see below |
-| `statsd_in` decode 1 distribution line (`ms`/`h`/`d`, unsampled) | **3** | 2 as above + 1 `bins` Vec on the sketch's first sample |
-| `statsd_in` decode 1 sampled distribution line (`@0.1`, 10 weighted samples) | **3** | same as unsampled -- `DdSketch::add_weighted` delegates to `add_with_count`, O(1) and zero extra allocations regardless of weight |
+| `statsd_in` decode 1 distribution line (`ms`/`h`/`d`, unsampled) | **2** | same as `statsd_in` decode 1 line -- `ms`/`h`/`d` decode straight to `MetricKind::Samples` now (ADR `lossless-transit`'s W3), one value fits inline in `Samples`'s own `SmallVec`; no `DdSketch`/`bins` Vec is built at decode time any more |
+| `statsd_in` decode 1 sampled distribution line (`@0.1`) | **2** | same as unsampled -- the raw `sample_rate` now rides verbatim on the decoded `Samples`, with no decode-time extrapolation to allocate for |
+| `statsd_in` decode 1 set line (`s`) | **3** | 2 as above + 1 `Vec<Bytes>` for `MetricKind::SetMembers`'s members -- unlike `Samples`'s inline `SmallVec`, `SetMembers` has no small-size optimization |
 | `json` parse + merge (nginx shape) | **1** | fixed -- see below, was 7 |
 | `json` parse + merge (wide-JSON, 28 keys) | **1** | same fix, confirmed to generalize past a small field count |
 | `logfmt` parse + merge (go-kit-style, 9 fields) | **1** | hand-rolled scanner, zero-copy by construction -- see `docs/adr/logfmt-and-kv-parsing.md`; the one allocation is `event.attributes` spilling its inline capacity, same shape as `json`'s |
@@ -277,10 +278,13 @@ And the corresponding times:
 > than refreshing the whole table again for one new row -- its allocation count is exact and
 > comparable regardless (deterministic, not machine-dependent), but don't read its wall-clock
 > figure as directly comparable to the others' down to the nanosecond, per this same caveat. The
-> two `statsd_in` distribution-decode rows are a second such exception, added for decode-time
-> sample-rate extrapolation (`DdSketch::add_weighted`) without a wall-clock figure at all -- their
-> allocation counts are what `crates/logit-bench/tests/allocations.rs`'s
-> `statsd_decode_one_distribution_line`/`statsd_decode_one_sampled_distribution_line` pin.
+> `statsd_in` distribution/set-decode rows are a second such exception, added without a wall-clock
+> figure at all -- their allocation counts are what `crates/logit-bench/tests/allocations.rs`'s
+> `statsd_decode_one_distribution_line`/`statsd_decode_one_sampled_distribution_line`/
+> `statsd_decode_one_set_line` pin. (Pre-W3, the first two rows existed to pin decode-time
+> sample-rate extrapolation into a `DdSketch`; ADR `lossless-transit`'s W3 moved that step to
+> `aggregate` entirely, so `statsd_in` decode now costs the same regardless of sample rate -- see
+> §2's own notes on each row.)
 
 ### Listener I/O decoupling: the `decode_into` buffer-reuse win (ADR `decoupled-listener-io`)
 

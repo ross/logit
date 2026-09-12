@@ -52,17 +52,20 @@ pub const NGINX_SYSLOG_LINE: &str = concat!(
 pub const STATSD_LINE: &str = "page.views:1|c|@0.5|#env:prod,region:us-east-1,service:web";
 
 /// A statsd distribution (`ms`) line at the default, unsampled rate -- the baseline
-/// [`STATSD_SAMPLED_DISTRIBUTION_LINE`]'s allocation count is measured against: decode-time
-/// sample-rate extrapolation (`DdSketch::add_weighted`, `crates/logit-inputs/src/statsd.rs`) must
-/// add zero allocations over this unsampled case, which `add_weighted`'s delegation to
-/// `sketches_ddsketch::DDSketch::add_with_count` (constant-time, one bin touch regardless of
-/// weight) satisfies for free.
+/// [`STATSD_SAMPLED_DISTRIBUTION_LINE`]'s allocation count is measured against. Decodes straight
+/// to a raw `MetricKind::Samples` now (`docs/adr/lossless-transit.md`'s W3,
+/// `crates/logit-inputs/src/statsd.rs`) -- no `DdSketch`, no decode-time sample-rate
+/// extrapolation; only `aggregate` sketches these.
 pub const STATSD_DISTRIBUTION_LINE: &str = "request.latency:120|ms";
 
-/// The same line as [`STATSD_DISTRIBUTION_LINE`], sampled at `@0.1` -- ten weighted samples
-/// instead of one, exercising `DdSketch::add_weighted`'s `add_with_count` delegation on the decode
-/// path.
+/// The same line as [`STATSD_DISTRIBUTION_LINE`], sampled at `@0.1` -- the raw `sample_rate` now
+/// rides verbatim on the decoded `Samples` (`docs/adr/lossless-transit.md`'s W3: no decode-time
+/// extrapolation any more, `crates/logit-inputs/src/statsd.rs`).
 pub const STATSD_SAMPLED_DISTRIBUTION_LINE: &str = "request.latency:120|ms|@0.1";
+
+/// A statsd set (`s`) line -- decodes to one [`logit_core::MetricKind::SetMembers`] event, a
+/// single zero-copy member slice of the datagram.
+pub const STATSD_SET_LINE: &str = "unique.users:abc123|s";
 
 /// A logfmt-shaped log line (go-kit style), used to exercise the quoted-value scan path.
 pub const LOGFMT_LINE: &str = "level=info ts=2026-09-07T06:52:01Z caller=metrics.go:159 \
@@ -99,6 +102,11 @@ pub fn statsd_distribution_datagram(count: usize) -> Bytes {
 /// `count` copies of [`STATSD_SAMPLED_DISTRIBUTION_LINE`], newline-separated.
 pub fn statsd_sampled_distribution_datagram(count: usize) -> Bytes {
     join_lines(STATSD_SAMPLED_DISTRIBUTION_LINE, count)
+}
+
+/// `count` copies of [`STATSD_SET_LINE`], newline-separated.
+pub fn statsd_set_datagram(count: usize) -> Bytes {
+    join_lines(STATSD_SET_LINE, count)
 }
 
 fn join_lines(line: &str, count: usize) -> Bytes {
@@ -417,8 +425,8 @@ pub fn aggregator_with_samples_retention(max_samples_per_series: usize) -> Aggre
 }
 
 /// A metric-only event carrying one `MetricKind::Samples` record -- the raw shape statsd's
-/// `ms`/`h`/`d` timings will arrive as once W3 lands a producer (`docs/plans/lossless-transit.md`),
-/// used to measure what `aggregate` pays to absorb one
+/// `ms`/`h`/`d` timings decode to since W3 (`crates/logit-inputs/src/statsd.rs`,
+/// `docs/plans/lossless-transit.md`), used to measure what `aggregate` pays to absorb one
 /// (`aggregate_absorb_one_samples_event_sketch_mode`/
 /// `aggregate_absorb_25_samples_values_into_one_series_samples_mode`,
 /// `crates/logit-bench/tests/allocations.rs`). Unsampled (`sample_rate: 1.0`, `Samples::new`'s

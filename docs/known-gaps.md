@@ -27,19 +27,22 @@ already built that have a known, accepted rough edge.
   that shape natively. Sampling, throttling, dedup, and anything needing an actual operator
   (`>=`, `contains`, cross-attribute comparison) remain Lua-only; the gap above still applies to
   them unchanged.
-- **`HyperLogLog` is real now; statsd still has no producer for it.** [`docs/plans/lossless-transit.md`](plans/lossless-transit.md)'s
-  W2 gave `HyperLogLog` (`crates/logit-core/src/metric.rs`) a real implementation wrapping the
-  `cardinality-estimator` crate — merge (union), `estimate()`, and a canonical `to_bytes`/`from_bytes`
-  pinned to that crate's version, no longer a method-less placeholder. `logit-transforms::Aggregator`
-  now really merges `MetricKind::SetMembers` into a `Set` (`sets: estimate`, the default) or retains
-  an exact deduplicated member set (`sets: members`, bounded by `max_set_members_per_series`, falling
-  back to an estimate on overflow) — see [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s
+- ~~**`HyperLogLog` is real now; statsd still has no producer for it.**~~ — **closed, both halves,
+  as of W3.** [`docs/plans/lossless-transit.md`](plans/lossless-transit.md)'s W2 gave `HyperLogLog`
+  (`crates/logit-core/src/metric.rs`) a real implementation wrapping the `cardinality-estimator`
+  crate — merge (union), `estimate()`, and a canonical `to_bytes`/`from_bytes` pinned to that
+  crate's version, no longer a method-less placeholder. `logit-transforms::Aggregator` really
+  merges `MetricKind::SetMembers` into a `Set` (`sets: estimate`, the default) or retains an exact
+  deduplicated member set (`sets: members`, bounded by `max_set_members_per_series`, falling back
+  to an estimate on overflow) — see [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s
   amendment for the full design; `logit-outputs::influxdb` renders a `Set`'s estimate as a `value=`
-  field instead of erroring, and `logit-outputs::stdio` renders `set=<estimate>`. What's still open:
-  statsd's `s` (set) metric type is still a clear decode error, not silently losing data
-  (`crates/logit-inputs/src/statsd.rs`) — no *producer* for `SetMembers`/`Set` until W3 wires up `s`
-  the same way `ms`/`h`/`d` already produce `Samples`/`Distribution`. Tracked as debt against
-  [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+  field instead of erroring, and `logit-outputs::stdio` renders `set=<estimate>`. W3 closed the
+  other half: statsd's `s` (set) metric type is no longer a decode error —
+  `crates/logit-inputs/src/statsd.rs` decodes `s` straight to `MetricKind::SetMembers`, one event
+  per line, every member a zero-copy datagram slice, and `crates/logit-outputs/src/statsd.rs`
+  encodes it back as one `name:<member>|s` line per member — `SetMembers`/`Set`'s own producer, the
+  same way `ms`/`h`/`d` already produce `Samples`/`Distribution`. See
+  [ADR `statsd-output`](adr/statsd-output.md)'s amendment.
 - **`HyperLogLog::from_bytes` (`crates/logit-core/src/metric.rs`) works around an upstream
   allocation-layout bug in `cardinality-estimator` 1.0.3, not just a byte-shape mismatch.** That
   crate's `Array::from_vec` rounds a deserialized `Vec<u32>`'s length up to the next power of two,
@@ -251,6 +254,17 @@ already built that have a known, accepted rough edge.
   `logit.component.diagnostics{key="sample_rate_clamped"}` by `Diagnostics` for free — no separate
   counter), never silent. A sample rate on `g` (gauge) or `s` (set) stays ignored — extrapolating
   an absolute or a cardinality-estimator value is meaningless, unlike a count.
+
+  **Updated 2026-09-12 (W3):** the mechanism described in the paragraph above no longer lives in
+  `statsd_in` at all. [`docs/plans/lossless-transit.md`](plans/lossless-transit.md)'s W2 moved the
+  sketch-and-clamp step (verbatim, including `MAX_SAMPLE_WEIGHT`/`sample_rate_clamped`) into
+  `aggregate`'s default `distributions: sketch` absorb path (`Samples::sketch`/`Samples::MAX_WEIGHT`,
+  `crates/logit-core/src/metric.rs`), and W3 deleted `statsd_in`'s own copy entirely: `ms`/`h`/`d`
+  now decode straight to a raw `MetricKind::Samples` with `sample_rate` carried verbatim and no
+  sketching or extrapolation at decode time at all. A `statsd_in -> aggregate` pipeline reports
+  `sample_rate_clamped` exactly once now, not twice. See [ADR `statsd-output`](adr/statsd-output.md)'s
+  amendment and [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s own
+  amendment.
 - ~~**`eprintln!` instead of a real diagnostics facility** — every component's diagnostic now goes
   through `logit_core::diag::Diagnostics`, which closes the two concrete hazards this entry used to
   name: every message is prefixed with its component's id, and a message that can fire once per
@@ -549,22 +563,35 @@ already built that have a known, accepted rough edge.
   generalizing the trait (an associated framing type, or a sink-driven push interface) is still
   deferred, but no longer for lack of a second caller to design against; it's simply not yet been
   done.
-- **`statsd_out` only encodes `Sum`/`Gauge`/`GaugeDelta` in v1 — every `Distribution`/`Set`/
-  `Histogram`/`Summary` metric is dropped** — `ms`/`h`/`d` on the statsd wire all decode to
-  `MetricKind::Distribution` (`crates/logit-inputs/src/statsd.rs::build_event`), so a
-  `statsd_in -> aggregate -> statsd_out` relay drops every timer metric today: the single most
-  common statsd workload makes it through the input and the aggregator, then dies at this sink,
-  loudly counted (`unsupported_metric_kind`) but dropped. Not implemented because the aggregator's
-  merged `DdSketch` no longer holds the original samples it combined, so "how does a merged sketch
-  become one or more statsd lines" (one line per fixed quantile? synthesized samples at quantile
-  boundaries?) is a real design question deserving its own ADR, not a guess made while landing the
-  sink itself. See `docs/adr/statsd-output.md`. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
-- **`statsd_out` has no egress timestamp, no `unit`, and no metric renaming/prefixing** — the
-  classic statsd grammar has no timestamp segment at all (and `statsd_in` would silently ignore
-  one if emitted, so it wouldn't even round-trip through this repo's own input), so every relayed
-  metric is stamped with the receiver's own receipt time, exactly like `syslog_out`'s receipt-time
-  entry above. `MetricRecord::unit` has no statsd wire representation and is dropped the same way.
-  There is also no way to rename or namespace a metric on egress anywhere in the pipeline today
+- **`statsd_out` drops post-sketch metric kinds — `Distribution`/`Set`/`Histogram`/
+  `ExponentialHistogram`/`Summary`/a cumulative or non-monotonic `Sum`, counted
+  (`unsupported_metric_kind`).** **Narrowed by W3** — the original v1 deferral covered every
+  timer/set metric outright: `ms`/`h`/`d` on the statsd wire all decoded to
+  `MetricKind::Distribution` and `s` was a hard decode error, so a `statsd_in -> aggregate ->
+  statsd_out` relay dropped every timer/set metric regardless of `aggregate`'s config.
+  `crates/logit-outputs/src/statsd.rs` now encodes `MetricKind::Samples`/`SetMembers` — the raw
+  shapes `statsd_in` decodes `ms`/`h`/`d`/`s` to losslessly (`docs/adr/lossless-transit.md`'s W3) —
+  back to real statsd lines (`name:v1:v2|<type>|@rate` under `format: dogstatsd`, one line per
+  value under `format: statsd`; `name:m|s` one line per member for sets). **This means a
+  `statsd_in -> statsd_out` relay with no `aggregate` in between, or one configured
+  `distributions: samples`/`sets: members`, now round-trips a timer or set line intact; only
+  `aggregate`'s *default* summarizing config (`distributions: sketch`/`sets: estimate`) still drops
+  every timer/set metric** — the kinds still dropped above only ever exist *after* some stage has
+  already summarized, and a merged `DdSketch`/`HyperLogLog` has no lossless statsd rendering (see
+  `docs/adr/statsd-output.md`'s original Decision section for why that mapping still deserves its
+  own design, not a guess made in passing). Tracked as debt against
+  [ADR `lossless-transit`](adr/lossless-transit.md); see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing workstream.
+- **`statsd_out` has no `unit` and no metric renaming/prefixing; egress timestamp is now carried,
+  but only on a `|T`-marked line.** **Narrowed by W3** — DogStatsD's own `|T<unix-seconds>` segment
+  (`format: dogstatsd` only) now round-trips: `statsd_in` sets `Event::timestamp` from an incoming
+  `|T<secs>` and stamps a `statsd.timestamp: true` per-line marker (`docs/adr/statsd-output.md`'s
+  amendment), and `statsd_out` re-emits `|T<secs>` only when that marker is set — a receipt-time
+  timestamp is never mistaken for a wire-supplied one. The classic grammar still has no timestamp
+  segment at all (`format: statsd` drops `|T` and counts it, `dropped_dialect_fields`), and any
+  event with no marker set — everything that isn't a relayed `|T`-carrying line — is still stamped
+  with the receiver's own receipt time, exactly like `syslog_out`'s receipt-time entry above.
+  `MetricRecord::unit` still has no statsd wire representation and is dropped the same way. There
+  is also still no way to rename or namespace a metric on egress anywhere in the pipeline today
   (`docs/design/lua-api.md` notes a metric's value/fields are unexposed to Lua) — a sink-side
   `prefix` field was considered and rejected for `statsd_out` specifically
   (`docs/adr/statsd-output.md`'s Alternatives) in favor of a future general metric-rename

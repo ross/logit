@@ -1,31 +1,77 @@
 //! statsd / DogStatsD-tagged metrics over UDP -- the input side of the v0.1 vertical slice
-//! (`docs/OVERVIEW.md`: statsd -> transform -> InfluxDB).
+//! (`docs/OVERVIEW.md`: statsd -> transform -> InfluxDB) and, since W3, the input half of
+//! [`docs/adr/lossless-transit.md`]'s `statsd_in -> statsd_out` lossless-relay pair
+//! (`docs/plans/lossless-transit.md`'s W3).
 //!
-//! Grammar (superset covering both plain statsd and the DogStatsD tag extension):
+//! Grammar (superset covering plain statsd and the DogStatsD tag/container-id/timestamp
+//! extensions):
 //!
 //! ```text
-//! <name>:<value>[:<value>...]|<type>[|@<sample-rate>][|#<tag>[:<value>],...][|<ignored>]
+//! <name>:<value>[:<value>...]|<type>[|@<sample-rate>][|#<tag>[:<value>],...][|c:<container-id>][|T<unix-seconds>][|<ignored>]
 //! ```
 //!
-//! `<type>` is one of `c` (counter), `g` (gauge), `ms`/`h`/`d` (timing/histogram/distribution --
-//! decoded into a [`logit_core::DdSketch`], extrapolated to `(1.0 / sample_rate).round()` weighted
-//! samples when `@<sample-rate>` is present), or `s` (set, not yet implemented --
-//! see the note on [`HyperLogLog`](logit_core::HyperLogLog)). Multiple `:`-separated values share
-//! one type/sample-rate/tags and become one [`Event`] each. A datagram may contain multiple
+//! `<type>` is one of:
+//!
+//! - `c` (counter) -- one [`Event`] per value, sample-rate-extrapolated (`value / sample_rate`)
+//!   into [`logit_core::MetricKind::Sum`], as always.
+//! - `g` (gauge) -- one `Event` per value: unsigned into [`logit_core::MetricKind::Gauge`], a
+//!   leading `+`/`-` into an unresolved [`logit_core::MetricKind::GaugeDelta`]
+//!   (`docs/adr/relative-gauge-adjustments.md`). Sample rate is ignored -- a gauge value is not a
+//!   count to extrapolate.
+//! - `ms`/`h`/`d` (timing/histogram/distribution) -- **one `Event` per line, not per value**:
+//!   every `:`-separated value on the line lands in one [`logit_core::MetricKind::Samples`],
+//!   `sample_rate` carried verbatim, with no extrapolation and no sketching at decode time.
+//!   [`docs/adr/lossless-transit.md`]'s "summarization is opt-in and named" rule: only
+//!   `aggregate` decides whether/how to turn raw samples into a sketch
+//!   (`docs/adr/aggregation-window-semantics.md`'s amendment), never this decoder. This replaces
+//!   this module's pre-W3 behaviour of sketching straight into a [`logit_core::DdSketch`] at
+//!   decode time (extrapolating to `(1.0 / sample_rate).round()` weighted samples, clamped to a
+//!   `MAX_SAMPLE_WEIGHT` of 1000) -- both the sketch and the clamp diagnostic moved to
+//!   `aggregate`, which owns `Samples::MAX_WEIGHT`/the `samples_cap_exceeded`-style diagnostics
+//!   now. The wire type letter survives as the `statsd.type` attribute (rule (b),
+//!   `docs/adr/lossless-transit.md`: a protocol-namespaced carrier for something the model
+//!   normalizes) since `ms`/`h`/`d` all land on the same `Samples` shape.
+//! - `s` (set) -- **one `Event` per line**: every `:`-separated value on the line lands in one
+//!   [`logit_core::MetricKind::SetMembers`], each member a zero-copy `Bytes` slice of the
+//!   datagram, in wire order. `aggregate` is the only component that turns these into a real
+//!   [`logit_core::HyperLogLog`] estimate ([`logit_core::MetricKind::Set`]); sample rate is
+//!   ignored, same reasoning as `g`.
+//!
+//! Multiple `:`-separated values on a `c`/`g` line share one type/sample-rate/tags and become
+//! independent events (gauge sign semantics are per value, so folding them into one event would
+//! lose which value was which sign); a `ms`/`h`/`d`/`s` line's values stay together on one event
+//! instead, matching the shape statsd itself hands them over in. A datagram may contain multiple
 //! newline-separated lines.
 //!
-//! **DogStatsD tag values are zero-copy slices of the datagram**, exactly like every field
-//! [`crate::syslog`] extracts: `slice_of` reconstructs each tag value's `Bytes` by pointer
-//! arithmetic back into the datagram passed to [`StatsdDecoder::decode`], rather than going
-//! through `impl From<&str> for Value` (`Bytes::from(String)`, a fresh copy). Tag *keys* and the
-//! metric name don't need this treatment -- both only ever reach [`logit_core::interner::intern`],
-//! which hashes/copies into its own table regardless of where the `&str` it's given points.
+//! **`|c:<container-id>` and `|T<unix-seconds>` apply to every metric type here**, not only the
+//! `c`/`g` the DogStatsD spec itself restricts them to (`docs/design/telemetry-landscape.md`) --
+//! a forward-compatible superset, the same stance this decoder already takes toward unrecognized
+//! `|` segments generally. `|c:<id>` (v1.2+; v1.4+'s `ci-`/`in-`-prefixed variants land in the
+//! same slot verbatim) stamps `statsd.container_id: Value::Str`, a zero-copy datagram slice.
+//! `|T<secs>` sets [`Event::timestamp`] to `secs * 1_000_000_000` (checked -- a non-digit or
+//! overflowing value rejects *only that line*, as a `CodecError::Malformed`, leaving the rest of
+//! the datagram unaffected) instead of the receipt-time timestamp `decode_into`'s `received_at`
+//! would otherwise stamp, and marks `statsd.timestamp: Value::Bool(true)` so a consumer can tell
+//! a wire-supplied timestamp from a receipt-time one. Both attributes are rule-(b)
+//! protocol-namespaced carriers (`docs/adr/lossless-transit.md`) for a concept this model has no
+//! normalized field for at all. Every other unrecognized `|` segment (DogStatsD events/service
+//! checks use different leading sigils entirely) is accepted and silently ignored --
+//! forward-compatible with segment kinds this decoder doesn't know about yet, rather than a hard
+//! error on something benign.
+//!
+//! **DogStatsD tag values, `|c:<id>`, and `s`'s set members are all zero-copy slices of the
+//! datagram**, exactly like every field [`crate::syslog`] extracts: `slice_of` reconstructs each
+//! one's `Bytes` by pointer arithmetic back into the datagram passed to
+//! [`StatsdDecoder::decode`], rather than going through `impl From<&str> for Value`
+//! (`Bytes::from(String)`, a fresh copy). Tag *keys* and the metric name don't need this
+//! treatment -- both only ever reach [`logit_core::interner::intern`], which hashes/copies into
+//! its own table regardless of where the `&str` it's given points.
 
 use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use bytes::Bytes;
 use logit_core::{
-    interner::intern, AttrMap, DdSketch, Diagnostics, Event, MetricKind, MetricRecord, Resource,
+    interner::intern, AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, Samples,
     Scope, Telemetry, Value,
 };
 use logit_pipeline::Fanout;
@@ -86,6 +132,13 @@ impl StatsdInput {
     /// introspection (`logit-cli::pipeline`'s `build_spec` wiring tests).
     pub fn receive_config(&self) -> UdpListenerConfig {
         self.inner.config()
+    }
+
+    /// Passthrough to the wrapped [`UdpListener::local_addr`] -- mirrors
+    /// [`crate::syslog::SyslogInput::local_addr`]: lets a caller (a round-trip test) learn the
+    /// real ephemeral port after `bind()`, with no bind-drop race.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.local_addr()
     }
 }
 
@@ -151,7 +204,7 @@ impl Decoder for StatsdDecoder {
             // datagram -- StatsD clients routinely pack several independent metrics into one
             // packet, so treating the datagram as atomic would let a single bad line take down
             // everything alongside it. Isolate per line: keep what parsed, report what didn't.
-            match parse_line(&bytes, text, line, received_at, &mut self.diag) {
+            match parse_line(&bytes, text, line, received_at) {
                 Ok(mut line_events) => out.append(&mut line_events),
                 Err(err) => {
                     self.diag.warn_throttled("bad_line", err);
@@ -188,7 +241,6 @@ fn parse_line(
     text: &str,
     line: &str,
     timestamp: i64,
-    diag: &mut Diagnostics,
 ) -> Result<Vec<Event>, CodecError> {
     let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
 
@@ -203,6 +255,9 @@ fn parse_line(
 
     let mut sample_rate = 1.0f64;
     let mut attributes = AttrMap::new();
+    // Overridden by `|T<secs>` below; otherwise every event on this line keeps the receipt-time
+    // timestamp `decode_into` was called with.
+    let mut line_timestamp = timestamp;
     for extra in segments {
         if let Some(rate) = extra.strip_prefix('@') {
             let parsed: f64 = rate.parse().map_err(|_| malformed())?;
@@ -226,31 +281,85 @@ fn parse_line(
                     None => attributes.insert(tag, true),
                 }
             }
+        } else if let Some(container_id) = extra.strip_prefix("c:") {
+            // DogStatsD container id (`|c:<id>`, v1.2+; v1.4+'s `ci-`/`in-`-prefixed variants
+            // land in the same slot verbatim -- this decoder carries whatever follows `c:`
+            // unchanged, it doesn't parse the prefixed forms specially). Applied to every metric
+            // type here, not only `c`/`g` as the spec restricts it to -- see the module doc's
+            // forward-compatibility note. Rule (b) (`docs/adr/lossless-transit.md`): a
+            // protocol-namespaced carrier for a concept this model has no normalized field for.
+            attributes
+                .insert("statsd.container_id", Value::Str(slice_of(bytes, text, container_id)));
+        } else if let Some(secs) = extra.strip_prefix('T') {
+            // DogStatsD point timestamp (`|T<unix-seconds>`, v1.3+, spec-restricted to `c`/`g`
+            // but accepted here on every type -- see the module doc). A non-digit or
+            // seconds-to-nanoseconds-overflowing value rejects only this line, rather than
+            // silently falling back to receipt time.
+            let secs: u64 = secs.parse().map_err(|_| malformed())?;
+            let nanos = secs
+                .checked_mul(1_000_000_000)
+                .and_then(|n| i64::try_from(n).ok())
+                .ok_or_else(malformed)?;
+            line_timestamp = nanos;
+            attributes.insert("statsd.timestamp", true);
         }
-        // Anything else (e.g. DogStatsD's `|c:<container-id>`) is accepted and ignored --
-        // forward-compatible with segment kinds this decoder doesn't know about yet, rather than
-        // a hard error on something benign.
+        // Anything else (DogStatsD events/service checks use different leading sigils entirely)
+        // is accepted and ignored -- forward-compatible with segment kinds this decoder doesn't
+        // know about yet, rather than a hard error on something benign.
     }
 
-    values_part
-        .split(':')
-        .map(|raw_value| {
-            build_event(name, raw_value, type_part, sample_rate, &attributes, timestamp, line, diag)
-        })
-        .collect()
+    match type_part {
+        "c" | "g" => values_part
+            .split(':')
+            .map(|raw_value| {
+                build_event(
+                    name,
+                    raw_value,
+                    type_part,
+                    sample_rate,
+                    &attributes,
+                    line_timestamp,
+                    line,
+                )
+            })
+            .collect(),
+        "ms" | "h" | "d" => {
+            // One `Event` per *line*, not per value -- every value on the line shares one
+            // `Samples` record (`docs/adr/lossless-transit.md`'s "summarization is opt-in and
+            // named": no sketching, no sample-rate extrapolation here; `sample_rate` rides
+            // verbatim for `aggregate` to decide about). Pushed straight into `Samples::default`'s
+            // own inline `SmallVec` (`SAMPLES_INLINE = 19`, `crates/logit-core/src/metric.rs`)
+            // rather than collected into an intermediate `Vec<f64>` first -- an owned `Vec` would
+            // be a real allocation even for a single value, which `SmallVec`'s inline storage
+            // avoids up to 19 of them.
+            let mut samples = Samples::default();
+            for raw_value in values_part.split(':') {
+                samples.values.push(parse_finite_value(raw_value, "timing/histogram", line)?);
+            }
+            samples.sample_rate = sample_rate;
+            let mut attrs = attributes.clone();
+            // The wire type letter survives as `statsd.type` (rule (b)) since `ms`/`h`/`d` all
+            // land on the same `Samples` shape -- a zero-copy slice of the datagram, like every
+            // other string-valued attribute this decoder stamps.
+            attrs.insert("statsd.type", Value::Str(slice_of(bytes, text, type_part)));
+            let kind = MetricKind::Samples(samples);
+            Ok(vec![Event::metric(line_timestamp, attrs, MetricRecord::new(intern(name), kind))])
+        }
+        "s" => {
+            // One `Event` per line, mirroring `ms`/`h`/`d` above: every member on the line is a
+            // zero-copy `Bytes` slice of the datagram, in wire order. `sample_rate` is ignored,
+            // same reasoning as `g` -- a set member is not a count to extrapolate.
+            let members: Vec<Bytes> =
+                values_part.split(':').map(|raw_value| slice_of(bytes, text, raw_value)).collect();
+            Ok(vec![Event::metric(
+                line_timestamp,
+                attributes.clone(),
+                MetricRecord::new(intern(name), MetricKind::SetMembers(members)),
+            )])
+        }
+        other => Err(CodecError::Malformed(format!("unknown metric type '{other}': {line:?}"))),
+    }
 }
-
-/// Caps the number of weighted samples one sampled statsd value can insert into a `DdSketch`.
-/// `DdSketch::add_weighted` delegates to `sketches_ddsketch::DDSketch::add_with_count`, which is
-/// O(1) regardless of `count`, so this is not a CPU-loop DoS guard -- it bounds how far a single
-/// crafted `@`-rate can inflate a `Distribution`'s `count()` (a population estimate,
-/// `docs/design/data-model.md`) away from reality: without it, a single `@0.0000001` sample rate
-/// would claim ten million observations from one UDP value. A fixed constant, not configurable,
-/// matching `crates/logit-transforms/src/aggregate.rs`'s stated stance on
-/// `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`. Applied per value, not per line or per datagram -- a
-/// multi-value line (`name:v1:v2:...:vN|ms|@rate`) clamps each value independently, which is fine
-/// now that `add_weighted` is O(1) per call regardless of the weight involved.
-const MAX_SAMPLE_WEIGHT: u64 = 1000;
 
 #[allow(clippy::too_many_arguments)]
 fn build_event(
@@ -261,10 +370,7 @@ fn build_event(
     attributes: &AttrMap,
     timestamp: i64,
     line: &str,
-    diag: &mut Diagnostics,
 ) -> Result<Event, CodecError> {
-    let malformed = |what: &str| CodecError::Malformed(format!("{what}: {line:?}"));
-
     let kind = match type_part {
         "c" => {
             let value = parse_finite_value(raw_value, "counter", line)?;
@@ -287,11 +393,11 @@ fn build_event(
             // `aggregate` on its path is that component's problem to report, not this one's to
             // guess around.
             //
-            // `sample_rate` is deliberately ignored here (and below, for `s`): a gauge/set value
-            // is absolute (or, for a delta, an adjustment), not a count of occurrences, so there
-            // is nothing to extrapolate -- unlike `c`/`ms`/`h`/`d`, "1 in N samples reported this
-            // value" doesn't imply anything about the other N-1, and pretending otherwise would
-            // be meaningless, not just a missed opportunity.
+            // `sample_rate` is deliberately ignored here: a gauge value is absolute (or, for a
+            // delta, an adjustment), not a count of occurrences, so there is nothing to
+            // extrapolate -- unlike `c`/`ms`/`h`/`d`, "1 in N samples reported this value"
+            // doesn't imply anything about the other N-1, and pretending otherwise would be
+            // meaningless, not just a missed opportunity.
             let value = parse_finite_value(raw_value, "gauge", line)?;
             if raw_value.starts_with('+') || raw_value.starts_with('-') {
                 MetricKind::GaugeDelta(value)
@@ -299,41 +405,9 @@ fn build_event(
                 MetricKind::Gauge(value)
             }
         }
-        "ms" | "h" | "d" => {
-            let value = parse_finite_value(raw_value, "timing/histogram", line)?;
-            // Decode-time extrapolation, matching what `c` already does above
-            // (`Counter(value / sample_rate)`): a sampled distribution can't scale a single
-            // stored number the way a counter can, since `DdSketch` has no notion of "this one
-            // sample represents N" -- so the extrapolation has to happen as N actual samples
-            // instead. `parse_line` already guarantees `sample_rate` is finite and in `(0, 1]`
-            // before this is ever reached, so `1.0 / sample_rate` can't be NaN/inf/negative here.
-            let weight = (1.0 / sample_rate).round().max(1.0) as u64;
-            if weight > MAX_SAMPLE_WEIGHT {
-                // See `MAX_SAMPLE_WEIGHT`'s doc comment: this bounds the extrapolated population
-                // estimate, not a tuning knob. `warn_throttled` mirrors every occurrence (not
-                // just the throttled-to-stderr subset) into `logit.component.diagnostics
-                // {key="sample_rate_clamped"}` via `diag`'s own telemetry handle, so there's
-                // nowhere else this needs to report to.
-                diag.warn_throttled(
-                    "sample_rate_clamped",
-                    format_args!(
-                        "sample rate @{sample_rate} on {line:?} implies a weight of {weight}, \
-                         clamped to {MAX_SAMPLE_WEIGHT}"
-                    ),
-                );
-            }
-            let weight = weight.min(MAX_SAMPLE_WEIGHT);
-            let mut sketch = DdSketch::new();
-            sketch.add_weighted(value, weight);
-            MetricKind::Distribution(sketch)
-        }
-        "s" => {
-            // See the note on `HyperLogLog` in logit-core::metric: not implemented yet. When it
-            // is, `sample_rate` should stay ignored here too, for the same reason it's ignored on
-            // `g` above: a set membership is not a count to extrapolate.
-            return Err(malformed("set metrics ('s') are not implemented yet"));
-        }
-        other => return Err(malformed(&format!("unknown metric type '{other}'"))),
+        // `ms`/`h`/`d`/`s` never reach here -- `parse_line` handles them itself, one `Event` per
+        // line rather than per value.
+        other => unreachable!("build_event only handles c/g, got {other:?}"),
     };
 
     // Cheap for the multi-value form (`name:1:2:3|c`), where this runs once per shared value:
@@ -361,7 +435,6 @@ fn parse_finite_value(raw_value: &str, what: &str, line: &str) -> Result<f64, Co
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::Registry;
 
     fn decode(line: &str) -> Vec<Event> {
         let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
@@ -425,8 +498,7 @@ mod tests {
     fn parse_err(line: &str) -> CodecError {
         let bytes = Bytes::from(line.to_string());
         let text = std::str::from_utf8(&bytes).unwrap();
-        let mut diag = Diagnostics::default();
-        parse_line(&bytes, text, text, 0, &mut diag).expect_err("expected this line to be rejected")
+        parse_line(&bytes, text, text, 0).expect_err("expected this line to be rejected")
     }
 
     #[test]
@@ -577,113 +649,105 @@ mod tests {
         );
     }
 
+    /// `ms`/`h`/`d` decode straight to raw [`MetricKind::Samples`] now -- no sketching, no
+    /// extrapolation (`docs/adr/lossless-transit.md`'s "summarization is opt-in and named": only
+    /// `aggregate` sketches). This replaces this test's pre-W3 assertion that a single `ms` value
+    /// became a one-count `DdSketch`.
     #[test]
     fn timer_becomes_a_single_sample_distribution() {
         let metric = only_metric(decode("request.latency:120|ms"));
         match metric.kind {
-            MetricKind::Distribution(sketch) => {
-                assert_eq!(sketch.count(), 1);
-                let q = sketch.quantile(0.5).expect("quantile should be present");
-                assert!((q - 120.0).abs() < 1.0, "quantile {q} should be close to 120");
+            MetricKind::Samples(samples) => {
+                assert_eq!(samples.values.as_slice(), &[120.0]);
+                assert_eq!(samples.sample_rate, 1.0);
             }
-            other => panic!("expected Distribution, got {other:?}"),
+            other => panic!("expected Samples, got {other:?}"),
         }
     }
 
+    /// Pre-W3 this asserted the `@0.5` rate got extrapolated into two weighted `DdSketch`
+    /// samples at decode time. `docs/adr/lossless-transit.md`'s "summarization is opt-in and
+    /// named" moves that extrapolation to `aggregate` -- the raw rate now rides verbatim on the
+    /// decoded `Samples` instead.
     #[test]
-    fn sampled_distribution_at_half_rate_inserts_two_weighted_samples() {
+    fn sampled_distribution_at_half_rate_preserves_the_rate_without_extrapolating() {
         let metric = only_metric(decode("x:100|ms|@0.5"));
         match metric.kind {
-            MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 2),
-            other => panic!("expected Distribution, got {other:?}"),
+            MetricKind::Samples(samples) => {
+                assert_eq!(samples.values.as_slice(), &[100.0]);
+                assert_eq!(samples.sample_rate, 0.5);
+            }
+            other => panic!("expected Samples, got {other:?}"),
         }
     }
 
+    /// Same shift as the half-rate test above, at `@0.1`.
     #[test]
-    fn sampled_distribution_at_tenth_rate_inserts_ten_weighted_samples() {
+    fn sampled_distribution_at_tenth_rate_preserves_the_rate_without_extrapolating() {
         let metric = only_metric(decode("x:100|ms|@0.1"));
         match metric.kind {
-            MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 10),
-            other => panic!("expected Distribution, got {other:?}"),
+            MetricKind::Samples(samples) => {
+                assert_eq!(samples.values.as_slice(), &[100.0]);
+                assert_eq!(samples.sample_rate, 0.1);
+            }
+            other => panic!("expected Samples, got {other:?}"),
         }
     }
 
-    /// The most important test in this set: an explicit `@1` (the default, unsampled rate) must
-    /// decode a distribution exactly as it always has -- one sample, not extrapolated -- so this
-    /// change is additive only for genuinely sampled lines. `statsd_decode_one_line` in
+    /// An explicit `@1` (the default, unsampled rate) still decodes to one raw value at rate
+    /// `1.0` -- unchanged in spirit from this test's pre-W3 "one sample, not extrapolated"
+    /// claim, just against `Samples` instead of a `DdSketch`. `statsd_decode_one_line` in
     /// `crates/logit-bench/tests/allocations.rs` pins the same claim at the allocation level.
     #[test]
     fn unsampled_distribution_still_inserts_exactly_one_sample() {
         let metric = only_metric(decode("x:100|ms|@1"));
         match metric.kind {
-            MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 1),
-            other => panic!("expected Distribution, got {other:?}"),
-        }
-    }
-
-    /// A weighted extrapolation is still a real DDSketch, subject to `Config::defaults()`'s 1%
-    /// relative-accuracy bound (`crates/logit-core/src/metric.rs`) -- pins that decode-time
-    /// extrapolation doesn't degrade quantile accuracy versus an unsampled line.
-    #[test]
-    fn sampled_distribution_quantile_stays_within_the_configured_relative_error_bound() {
-        let metric = only_metric(decode("x:100|ms|@0.1"));
-        match metric.kind {
-            MetricKind::Distribution(sketch) => {
-                let q = sketch.quantile(0.5).expect("quantile should be present");
-                let relative_error = (q - 100.0).abs() / 100.0;
-                assert!(
-                    relative_error <= 0.01,
-                    "quantile {q} is more than 1% away from the true value 100.0"
-                );
+            MetricKind::Samples(samples) => {
+                assert_eq!(samples.values.as_slice(), &[100.0]);
+                assert_eq!(samples.sample_rate, 1.0);
             }
-            other => panic!("expected Distribution, got {other:?}"),
+            other => panic!("expected Samples, got {other:?}"),
         }
     }
 
-    /// A sample rate implying a weight above `MAX_SAMPLE_WEIGHT` (bounds the extrapolated
-    /// population estimate, not a tuning knob -- see its doc comment) clamps rather than
-    /// inflating `count()` unboundedly, and reports the clamp via `Diagnostics::warn_throttled`'s
-    /// own telemetry mirror (`logit.component.diagnostics{key="sample_rate_clamped"}`) -- the
-    /// same mechanism `logit_core::diag`'s
-    /// `every_warn_throttled_occurrence_increments_the_metric_...` test pins, asserted here via
-    /// its telemetry mirror rather than capturing stderr.
+    /// `ms`/`h`/`d` share one `Samples` record per *line*, not per value -- every `:`-separated
+    /// value on the line lands in `values`, in wire order, on a single `Event`.
     #[test]
-    fn extreme_sample_rate_clamps_the_weight_and_reports_it() {
-        let registry = Registry::new();
-        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
-        let diag = Diagnostics::new("statsd_in").with_telemetry(telemetry);
-        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default())).with_diagnostics(diag);
-
-        let events = decoder
-            .decode(Bytes::from("x:100|ms|@0.0000001".to_string()))
-            .expect("decode should succeed")
-            .events;
+    fn multi_value_timer_produces_one_event_with_all_values() {
+        let events = decode("request.latency:100:200:300|ms");
+        assert_eq!(events.len(), 1, "ms/h/d lines are one event per line, not per value");
         let metric = only_metric(events);
         match metric.kind {
-            MetricKind::Distribution(sketch) => {
-                assert_eq!(
-                    sketch.count(),
-                    MAX_SAMPLE_WEIGHT as usize,
-                    "weight should clamp to MAX_SAMPLE_WEIGHT"
-                );
+            MetricKind::Samples(samples) => {
+                assert_eq!(samples.values.as_slice(), &[100.0, 200.0, 300.0]);
             }
-            other => panic!("expected Distribution, got {other:?}"),
-        }
-
-        let diagnostics_event = registry
-            .drain(0)
-            .into_iter()
-            .find(|e| {
-                e.attributes.get("key").and_then(|v| v.as_str()) == Some("sample_rate_clamped")
-            })
-            .expect("sample_rate_clamped diagnostic should have fired");
-        match &diagnostics_event.metrics[0].kind {
-            MetricKind::Sum(sum) => {
-                assert_eq!(sum.value, 1.0, "clamping should report exactly once")
-            }
-            other => panic!("expected Sum, got {other:?}"),
+            other => panic!("expected Samples, got {other:?}"),
         }
     }
+
+    /// The wire type letter survives as `statsd.type` (rule (b), `docs/adr/lossless-transit.md`)
+    /// on every one of the three types that normalize onto the same `Samples` shape.
+    #[test]
+    fn statsd_type_is_stamped_for_each_timer_type() {
+        for (line, expected) in [("x:1|ms", "ms"), ("x:1|h", "h"), ("x:1|d", "d")] {
+            let events = decode(line);
+            assert_eq!(
+                events[0].attributes.get("statsd.type").and_then(|v| v.as_str()),
+                Some(expected),
+                "statsd.type should be stamped for {line:?}"
+            );
+        }
+    }
+
+    // The weight-clamping and decode-time-sketch-quantile-accuracy coverage that used to live
+    // here (an extreme `@rate` clamping to `MAX_SAMPLE_WEIGHT`, and a sampled distribution's
+    // quantile staying within the configured relative error bound) moved to `aggregate`, the
+    // only component that sketches a `Samples` record now
+    // (`docs/adr/aggregation-window-semantics.md`'s amendment) -- see
+    // `crates/logit-transforms/src/aggregate.rs`'s
+    // `samples_sketch_mode_merges_weighted_values_and_counts_weight_clamp` for the clamp, and
+    // `logit_core::metric`'s `Samples::sketch` tests for the quantile-accuracy claim. This
+    // decoder no longer builds a `DdSketch` at all.
 
     #[test]
     fn dogstatsd_tags_become_attributes() {
@@ -758,14 +822,137 @@ mod tests {
         assert!(matches!(parse_err("nocolon|c"), CodecError::Malformed(_)));
     }
 
+    /// `s` decodes to raw `SetMembers` now -- one member, a zero-copy slice of the datagram.
+    /// Replaces this test's pre-W3 "not implemented" assertion.
     #[test]
-    fn set_type_is_a_clear_not_implemented_error() {
-        assert!(matches!(parse_err("unique.users:abc123|s"), CodecError::Malformed(_)));
+    fn set_type_becomes_set_members() {
+        let metric = only_metric(decode("unique.users:abc123|s"));
+        match metric.kind {
+            MetricKind::SetMembers(members) => {
+                assert_eq!(members, vec![Bytes::from_static(b"abc123")])
+            }
+            other => panic!("expected SetMembers, got {other:?}"),
+        }
+    }
+
+    /// `s` shares one `SetMembers` record per line, same as `ms`/`h`/`d`: every `:`-separated
+    /// value on the line lands in the same event, in wire order.
+    #[test]
+    fn multi_value_set_produces_one_event_with_all_members() {
+        let events = decode("unique.users:abc123:def456|s");
+        assert_eq!(events.len(), 1, "s lines are one event per line, not per value");
+        let metric = only_metric(events);
+        match metric.kind {
+            MetricKind::SetMembers(members) => {
+                assert_eq!(
+                    members,
+                    vec![Bytes::from_static(b"abc123"), Bytes::from_static(b"def456")]
+                );
+            }
+            other => panic!("expected SetMembers, got {other:?}"),
+        }
     }
 
     #[test]
     fn blank_lines_are_skipped() {
         let events = decode("\n\na:1|c\n\n");
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn container_id_segment_becomes_an_attribute() {
+        let events = decode("hits:1|c|c:abcdef0123456789");
+        assert_eq!(
+            events[0].attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+            Some("abcdef0123456789")
+        );
+    }
+
+    /// `|c:<id>` applies to every metric type here, not only `c`/`g` as the DogStatsD spec
+    /// itself restricts it to -- see the module doc's forward-compatibility note.
+    #[test]
+    fn container_id_segment_applies_to_every_metric_type() {
+        for line in ["x:1|ms|c:cid", "x:1|s|c:cid", "x:1|g|c:cid"] {
+            let events = decode(line);
+            assert_eq!(
+                events[0].attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+                Some("cid"),
+                "expected statsd.container_id on {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_segment_sets_the_event_timestamp_and_marker() {
+        let events = decode("hits:1|c|T1700000000");
+        let event = &events[0];
+        assert_eq!(event.timestamp, 1_700_000_000 * 1_000_000_000);
+        assert!(matches!(event.attributes.get("statsd.timestamp"), Some(Value::Bool(true))));
+    }
+
+    #[test]
+    fn malformed_timestamp_segment_rejects_only_that_line() {
+        assert!(matches!(parse_err("hits:1|c|Tabc"), CodecError::Malformed(_)), "non-digit");
+        assert!(matches!(parse_err("hits:1|c|T-5"), CodecError::Malformed(_)), "negative");
+        assert!(
+            matches!(parse_err("hits:1|c|T18446744073709551615"), CodecError::Malformed(_)),
+            "seconds-to-nanoseconds overflow"
+        );
+
+        // A malformed |T must not take down the rest of the datagram -- same isolation contract
+        // as any other malformed line.
+        let events = decode("a:1|c|Tbad\nb:2|c");
+        assert_eq!(events.len(), 1, "only the malformed-T line should be dropped");
+        assert_eq!(intern("b"), only_metric(events).name);
+    }
+
+    /// `|c:`/`|T`/`@rate`/`#tags` combine freely, in any order, on the same line.
+    #[test]
+    fn container_id_timestamp_rate_and_tags_combine_in_any_order() {
+        let orderings = [
+            "x:100|ms|@0.5|#env:prod|c:abc123|T1700000000",
+            "x:100|ms|c:abc123|T1700000000|@0.5|#env:prod",
+            "x:100|ms|T1700000000|#env:prod|c:abc123|@0.5",
+            "x:100|ms|#env:prod|@0.5|T1700000000|c:abc123",
+        ];
+        for line in orderings {
+            let events = decode(line);
+            assert_eq!(events.len(), 1, "expected one event for {line:?}");
+            let event = &events[0];
+            assert_eq!(event.timestamp, 1_700_000_000 * 1_000_000_000, "line: {line:?}");
+            assert_eq!(
+                event.attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+                Some("abc123"),
+                "line: {line:?}"
+            );
+            assert_eq!(
+                event.attributes.get("env").and_then(|v| v.as_str()),
+                Some("prod"),
+                "line: {line:?}"
+            );
+            assert!(
+                matches!(event.attributes.get("statsd.timestamp"), Some(Value::Bool(true))),
+                "line: {line:?}"
+            );
+            match &event.metrics[0].kind {
+                MetricKind::Samples(samples) => {
+                    assert_eq!(samples.sample_rate, 0.5, "line: {line:?}")
+                }
+                other => panic!("expected Samples, got {other:?}"),
+            }
+        }
+    }
+
+    /// Mirrors `syslog.rs`'s own `local_addr`-after-`bind` property (`crates/logit-inputs/src/
+    /// udp.rs`'s `bind_then_run_delivers_a_real_datagram`): no address before `bind()`, a real
+    /// one after.
+    #[tokio::test]
+    async fn local_addr_is_available_after_bind() {
+        let mut input = StatsdInput::new("127.0.0.1:0");
+        assert_eq!(input.local_addr(), None, "no address before bind()");
+
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("bind() should leave a real address behind");
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
     }
 }

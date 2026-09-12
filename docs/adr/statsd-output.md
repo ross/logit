@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-10
+updated: 2026-09-12
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -217,3 +217,146 @@ three are recorded in `docs/known-gaps.md`.
 - `docs/known-gaps.md`: new entries for the v1 metric-kind deferral (and its timer-drop
   consequence for the `statsd_in -> aggregate -> statsd_out` path), no egress timestamp, no
   `unit`, no metric prefix/rename anywhere in the pipeline, and no TLS/DTLS.
+
+## Amendment: raw timers and sets relay; sample rate and timestamps are carried
+
+[ADR `lossless-transit`](lossless-transit.md) commits `logit` to a lossless `statsd_in ->
+statsd_out` relay; [ADR `metrics-model-v2`](metrics-model-v2.md) is what gives the model the
+raw-vs-summarized pair (`Samples`/`Distribution`, `SetMembers`/`Set`) this ADR's original deferral
+had nowhere to land against. [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s W3
+is the workstream landing the statsd side of both, once W1 (the model) and W2 (`aggregate`'s absorb
+rules) were in place.
+
+This ADR's "Metric-kind coverage" decision said: "Only `Counter` (`|c`) and `Gauge`/`GaugeDelta`
+(`|g`) are encoded. `Distribution`, `Set`, `Histogram`, and `Summary` are dropped with a clear 'not
+implemented yet' diagnostic (`unsupported_metric_kind`)" — and named the blocker directly: "the
+aggregator's `DdSketch` no longer holds the original samples it merged, so 'how does a merged
+sketch become one or more statsd lines' is a real design question... deserves its own ADR once
+there's a concrete consumer to design against." Its "No sample rate, no timestamp, no unit"
+decision said: "Never `@<rate>`: `statsd_in` already extrapolated at decode time... Never
+`|T<ts>`: the classic grammar has no timestamp segment at all, and
+`logit_inputs::statsd::parse_line` would silently ignore one if emitted, so it wouldn't even
+round-trip through this repo's own input."
+
+**Both premises are gone: `statsd_in` no longer sketches or extrapolates `ms`/`h`/`d`/`s` at decode
+time at all, and this sink now encodes the raw `Samples`/`SetMembers` shapes those lines decode to
+back onto the wire, carrying their real sample rate and, on `|T`-marked lines, their real
+timestamp.**
+
+### `Samples`/`SetMembers` wire forms, per dialect
+
+`MetricKind::Samples` (`crates/logit-outputs/src/statsd.rs`'s `render_samples`) renders under
+`format: dogstatsd` as one multi-value line, `name:v1:v2:...|<type>[|@rate]` — DogStatsD's own
+multi-value extension, the same one `logit_inputs::statsd::parse_line` parses on the way in.
+`<type>` is read off the record's `statsd.type` attribute when it names `ms`/`h`/`d`
+(`statsd_wire_type`), defaulting to `ms` when the attribute is absent or names anything else
+(`an_unrecognized_statsd_type_attribute_falls_back_to_ms`); `@rate` is omitted whenever
+`sample_rate == 1.0`. Under `format: statsd`, which has no multi-value grammar, each value becomes
+its own `name:v|ms[|@rate]` line, and `h`/`d` both collapse to `ms` (counted once per record via
+`EncodeStats::type_normalized_dialect`, not once per split line) — both are the "splitting a
+multi-value statsd line" and "sink-configured dialect change" normalizations
+[ADR `lossless-transit`](lossless-transit.md) already permits by name.
+
+`MetricKind::SetMembers` (`render_set_members`) renders one `name:<member>|s` line per member, in
+**both** dialects — the classic grammar has no multi-value extension for sets the way DogStatsD's
+timers get, so there is no dialect-conditional form here at all. Each member is rendered through
+the same tag-*value* sanitizer a tag value gets (lossy UTF-8 first, since a member is arbitrary
+bytes off the wire), and a member that comes out different from its raw bytes is counted
+(`EncodeStats::members_sanitized`).
+
+### `|c:`/`|T` carriage: dogstatsd only, dropped and counted under `format: statsd`
+
+`statsd.container_id` renders as `|c:<id>` and the per-line `statsd.timestamp ==
+Value::Bool(true)` marker renders as `|T<secs>` (`secs = event.timestamp / 1_000_000_000`) — both
+only under `Format::DogStatsd` (`append_dialect_extras`), appended after the tag segment to
+**every** physical line an event produces, so a negative-absolute-gauge's two-line pair or a
+multi-line `Samples`/`SetMembers` record carries them on each line. `|T` renders **only** when the
+per-line marker attribute is set, not merely because `Event::timestamp` is non-zero — a
+receipt-time stamp is not a wire-supplied timestamp, and re-emitting it as one would fabricate a
+`|T` segment no `|T` segment ever produced. A negative `event.timestamp` never reaches the wire
+even with the marker set: statsd's own grammar has no sign there, so a negative value can't have
+come from a real `|T<secs>` segment, and this sink skips rather than emit a segment no decoder
+produces (`a_negative_timestamp_never_reaches_the_wire`). Under `format: statsd`, neither field has
+anywhere to go — both are dropped and counted once per field per emitted physical line
+(`EncodeStats::dropped_dialect_fields`,
+`container_id_and_timestamp_are_dropped_and_counted_under_plain_statsd`).
+
+### `statsd.*` is never emitted as a tag
+
+`statsd.type`/`statsd.container_id`/`statsd.timestamp` are protocol-namespaced carriers this
+decoder stamped from a line's own wire-type/`|c:`/`|T` segments, not ordinary attributes —
+`build_tag_suffix` filters every key starting with `statsd.` out of the generic `|#k:v,...`
+segment before it's ever considered as a tag, uncounted (a carrier being read for its real
+purpose, not data being dropped), the same way `syslog_out` never re-emits its own `syslog.*`
+attributes as a generic SD-ELEMENT field.
+
+### What's still deferred, and why that's now the "opt-in summarization" carve-out
+
+`Distribution`, `Set`, `Histogram`, `ExponentialHistogram`, `Summary`, and a cumulative or
+non-monotonic `Sum` are still dropped and counted (`EncodeStats::dropped_unsupported_kind`,
+`unsupported_metric_kind`) — every kind that only exists *after* some stage has already
+summarized, none of which has a lossless statsd rendering. The difference from the original v1
+deferral is *when* that arm is ever reached: `aggregate`'s defaults (`distributions: sketch`,
+`sets: estimate`) still summarize a raw series the moment it's absorbed, so a `statsd_in ->
+aggregate -> statsd_out` relay using those defaults still drops every timer/set metric exactly as
+it did before this amendment — but that is now an operator's explicit choice, not the only path
+available. Configuring that `aggregate` with `distributions: samples`/`sets: members`
+(`docs/adr/aggregation-window-semantics.md`'s amendment) keeps the raw shapes flowing through
+instead, and a relay with no `aggregate` at all already only ever saw the raw shapes. This is
+[ADR `lossless-transit`](lossless-transit.md)'s "summarization is opt-in and named" rule made
+concrete on the egress side: the sink itself never guessed at a sketch-to-lines mapping (still
+deserving its own design, per the original Decision section above, should a concrete consumer ever
+need one), and the kinds it can't encode are now exactly the kinds *only* an explicit `aggregate`
+choice can produce.
+
+### Permitted normalizations, restated for the raw shapes
+
+Every normalization already permitted for `Counter`/`Gauge` applies identically to `Samples`/
+`SetMembers`: tag reordering (`AttrMap` order) and number formatting. New to this amendment,
+following directly from the wire forms above: splitting a multi-value statsd line into several
+single-value lines (`SetMembers`, always; `Samples`, only under `format: statsd`) or the reverse,
+and a timer's wire-type letter collapsing under a sink-configured dialect change (`h`/`d` → `ms`).
+None of these change a value, a tag, a sample rate, a container id, or a timestamp — only how many
+physical lines carry them and which literal type letter appears on the wire.
+
+### Closing test enumeration
+
+`crates/logit-outputs/src/statsd.rs` gained real-decoder relay coverage for both new kinds and
+both new segments: `a_single_value_samples_metric_encodes_as_name_colon_value_pipe_ms_by_default`,
+`a_multi_value_samples_metric_encodes_as_one_multi_value_line_under_dogstatsd`,
+`statsd_type_attribute_selects_the_wire_type_letter`/
+`an_unrecognized_statsd_type_attribute_falls_back_to_ms`,
+`a_sample_rate_other_than_one_is_written_as_at_rate`/`a_sample_rate_of_one_omits_at_rate`,
+`statsd_dialect_splits_multi_value_samples_and_normalizes_h_and_d_to_ms`/
+`statsd_dialect_does_not_count_normalization_when_the_wire_type_was_already_ms`,
+`a_non_finite_sample_value_is_dropped_and_counted_per_value_others_still_encode`,
+`an_out_of_range_sample_rate_omits_at_rate_and_is_counted`, and
+`an_empty_samples_list_emits_nothing_and_is_counted` for `Samples`;
+`a_single_member_set_members_metric_encodes_as_name_colon_member_pipe_s`,
+`a_multi_member_set_members_metric_encodes_as_one_line_per_member_in_both_formats`,
+`a_non_utf8_set_member_is_lossily_sanitized_and_counted`, and
+`an_empty_set_members_list_emits_nothing_and_is_counted` for `SetMembers`;
+`a_container_id_attribute_appends_pipe_c_under_dogstatsd`,
+`a_timestamp_marker_appends_pipe_t_seconds_under_dogstatsd`,
+`container_id_and_timestamp_come_after_the_tag_segment`,
+`a_negative_timestamp_never_reaches_the_wire`, and
+`container_id_and_timestamp_are_dropped_and_counted_under_plain_statsd` for `|c:`/`|T`; plus
+`a_container_id_and_timestamp_line_round_trips_through_the_real_statsd_decoder` and a `proptest`
+fixed point (`mod fixed_point::decode_encode_decode_is_a_fixed_point`, 200 generated cases over
+`c`/`g`/`ms`/`h`/`d`/`s` lines with an optional rate/tags/container id/timestamp) pinning
+`decode(encode(decode(line))) == decode(line)` and `encode(decode(line))` as a fixed point of
+`encode . decode`. `crates/logit-inputs/src/statsd.rs` gained the matching decode-side coverage:
+`timer_becomes_a_single_sample_distribution`,
+`sampled_distribution_at_half_rate_preserves_the_rate_without_extrapolating`/
+`sampled_distribution_at_tenth_rate_preserves_the_rate_without_extrapolating`,
+`unsampled_distribution_still_inserts_exactly_one_sample`,
+`multi_value_timer_produces_one_event_with_all_values`,
+`statsd_type_is_stamped_for_each_timer_type`, `set_type_becomes_set_members`,
+`multi_value_set_produces_one_event_with_all_members`,
+`container_id_segment_becomes_an_attribute`/`container_id_segment_applies_to_every_metric_type`,
+`timestamp_segment_sets_the_event_timestamp_and_marker`/
+`malformed_timestamp_segment_rejects_only_that_line`, and
+`container_id_timestamp_rate_and_tags_combine_in_any_order`.
+`crates/logit-cli/tests/statsd_round_trip.rs` (mirroring `syslog_round_trip.rs`'s real-UDP-socket
+harness, landing alongside this amendment per `docs/plans/lossless-transit.md`'s W3 phase B)
+extends the same coverage end to end through real sockets.
