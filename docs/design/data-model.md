@@ -114,6 +114,21 @@ the raw value rides alongside the normalized one and wins on the way back out.
 | `otel.severity_number` | `Value::I64`, `1..=24` | Stamped by `otlp_in` when the wire's `severity_number` is non-zero. `otlp_out` prefers this over the band-derived value when present, consuming (removing) it from the emitted attribute set the same way `otel.status_message` used to. |
 | `otel.severity_text` | `Value::Str` | Stamped by `otlp_in` when the wire's `severity_text` is non-empty. Same precedence and consumption rule as `otel.severity_number`. |
 
+**The Prometheus codec is the same precedent again** (`crates/logit-proto/src/prometheus/`,
+[ADR `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md)): the
+exposition format distinguishes things this model has one kind for — an `untyped` sample from a
+`gauge`, a sample that carried its own timestamp from one that didn't — so the protocol-native fact
+rides alongside as an attribute and wins on the way back out. Every `prometheus.*` attribute is
+**consumed** by `prometheus_out` (never rendered as a label) and appears as an ordinary tag at every
+other sink, which is what makes `prometheus_in -> prometheus_out` an exact fixed point.
+
+| Attribute | Value | Meaning |
+|---|---|---|
+| `prometheus.type` | `Value::Str`: `untyped`\|`unknown`\|`info`\|`stateset`\|`gaugehistogram` | The wire family type for the five cases the model has no distinct kind for: `untyped`/`unknown` (both a `Gauge`, one spelling per dialect), `info` (a `Gauge(1)` whose labels are the payload), `stateset` (one `Gauge(0\|1)` per state), `gaugehistogram` (a `Histogram` of a quantity that can decrease). Stamped by `prometheus_in`; read and consumed by `prometheus_out`, which re-emits that exact family type. |
+| `prometheus.timestamp` | `Value::Bool(true)` | The sample carried its own timestamp on the wire (most don't — a scrape stamps them all with its own start time). `prometheus_out` re-emits a timestamp on that line only, in the output dialect's own unit. Same shape as the planned `statsd.timestamp`. |
+| `prometheus.target` | `Value::Str`, a **resource** attribute | The full scrape URL of the target this batch came from (`http://node-exporter:9100/metrics`), stamped once per target by `prometheus_in`. Factual, like `docker_in`'s `container.*` — not an invented `service.name`. Consumed by `prometheus_out`. |
+| `instance` | `Value::Str`, a **resource** attribute | `host:port` of the scraped target — deliberately **unprefixed**, so it renders as a label like any other resource attribute, exactly the `instance` label Prometheus's own scrape adds. Without it two targets running the same exporter would collapse onto one series through a relay. An event-level `instance` wins over the resource's (`honor_labels` semantics), which falls out of the ordinary resource/event attribute merge. `job` is operator identity, not a scrape fact, and comes from a downstream `set`. |
+
 `trace_context`'s `span:` block
 ([ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md)) is the first place the
 same *reserved-attribute* convention is deliberately *read* by more than one producer, so it's worth
