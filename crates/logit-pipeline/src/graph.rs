@@ -398,9 +398,14 @@ const RESERVED_PROMETHEUS_HEADERS: &[&str] = &[
 /// authority. `logit-pipeline` doesn't depend on `reqwest`/`url` (`docs/design/pipeline-graph.md`'s
 /// crate layout keeps this crate free of any concrete protocol's dependencies), so this is a small
 /// hand-rolled scheme/authority check rather than a real URL parse -- good enough to catch a typo'd
-/// scheme or a bare `host:port` with none at all, which is what this rule exists for; the real
-/// parse (`reqwest::Url::parse`) happens once more, harmlessly, in `crates/logit-inputs/src/
-/// prometheus.rs` itself when building each target's resource.
+/// scheme or a bare `host:port` with none at all, which is what this rule exists for, but **not**
+/// good enough to catch every string `reqwest::Url::parse` itself would reject (an out-of-range
+/// octet like `999.999.999.999`, an unbalanced `[`/`]` in an IPv6 literal, a port past `u16::MAX`,
+/// a bare space or invalid percent-escape in the host). Such a target still reaches
+/// `crates/logit-inputs/src/prometheus.rs`, which does the real parse when building its
+/// `Resource` and falls back to a placeholder keyed by the target's own configured index (so two
+/// such targets never collide onto the same `instance`/`prometheus.target`) rather than silently
+/// treating it as scrapeable.
 fn is_absolute_http_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     let Some(rest) = lower.strip_prefix("http://").or_else(|| lower.strip_prefix("https://"))

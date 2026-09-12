@@ -132,11 +132,13 @@ struct Target {
 /// `host:port` of `url`'s authority, port defaulted to the scheme's well-known one (80/443) when
 /// absent -- exactly what Prometheus's own `instance` label holds, and what
 /// [`logit_proto::prometheus::LABEL_INSTANCE`] documents. Falls back to [`redact_url`]'s own
-/// fallback if `url` somehow doesn't parse (graph validation's rule 40 already rejects a
-/// non-absolute-http(s) URL before a `PrometheusInput` is ever built from one, so this is a
-/// defensive fallback, not a real path) -- never the raw `url` itself, which may carry a
-/// `user:pass@` credential this fallback must not leak.
-fn instance_of(url: &str) -> String {
+/// `index`-keyed placeholder if `url` doesn't parse -- graph validation's rule 40 only checks
+/// scheme plus a non-empty authority (a cheap, `reqwest`-free approximation, since
+/// `logit-pipeline` can't depend on it), not a full URL grammar, so a target like
+/// `http://999.999.999.999/metrics` or `http://[::1/metrics` passes rule 40 but still fails
+/// `reqwest::Url::parse` here -- a real path, not merely defensive. Never the raw `url` itself,
+/// which may carry a `user:pass@` credential this fallback must not leak.
+fn instance_of(index: usize, url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(parsed) => {
             let host = parsed.host_str().unwrap_or_default();
@@ -145,7 +147,7 @@ fn instance_of(url: &str) -> String {
                 None => host.to_string(),
             }
         }
-        Err(_) => redact_url(url),
+        Err(_) => redact_url(index, url),
     }
 }
 
@@ -158,9 +160,20 @@ fn instance_of(url: &str) -> String {
 /// event's resource, reaching whatever sink the pipeline is configured with (InfluxDB tags,
 /// statsd tag sets, a forwarded OTLP resource, a stdout/file render) -- rendering the password in
 /// cleartext into every one of them if not stripped first. The query string goes too, since a
-/// bearer-token-in-query auth scheme (`?token=...`) is just as real a credential shape. Falls back
-/// to a fixed placeholder, never the raw `url`, if `url` doesn't parse at all.
-fn redact_url(url: &str) -> String {
+/// bearer-token-in-query auth scheme (`?token=...`) is just as real a credential shape; the
+/// fragment is *not* stripped -- `url` crate parsing means this also normalizes the result (the
+/// host is lowercased, and a port matching the scheme's default is dropped), which is harmless
+/// for an already-valid absolute URL.
+///
+/// Falls back to `<unparseable target #{index}>` -- never the raw `url`, and never a placeholder
+/// shared across targets -- if `url` doesn't parse at all. Rule 40 (`logit-pipeline::graph`) only
+/// approximates a real URL grammar (scheme plus non-empty authority), so a target like
+/// `http://999.999.999.999/metrics`, `http://[::1/metrics`, `http://host:99999/metrics`, or a
+/// host containing a space or an invalid percent-escape reaches this function despite passing
+/// that check; `index` (this target's position in the configured `targets` list) is what keeps
+/// two such targets from colliding onto the same `instance`/`prometheus.target` and silently
+/// merging their series.
+fn redact_url(index: usize, url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(mut parsed) => {
             // `Url::set_username`/`set_password` only fail for a URL kind that can't have
@@ -172,14 +185,14 @@ fn redact_url(url: &str) -> String {
             parsed.set_query(None);
             parsed.to_string()
         }
-        Err(_) => "<unparseable target>".to_string(),
+        Err(_) => format!("<unparseable target #{index}>"),
     }
 }
 
-fn build_resource(url: &str) -> Resource {
+fn build_resource(index: usize, url: &str) -> Resource {
     let mut attributes = AttrMap::new();
-    attributes.insert(LABEL_INSTANCE, Value::str(instance_of(url)));
-    attributes.insert(ATTR_TARGET, Value::str(redact_url(url)));
+    attributes.insert(LABEL_INSTANCE, Value::str(instance_of(index, url)));
+    attributes.insert(ATTR_TARGET, Value::str(redact_url(index, url)));
     Resource { attributes, ..Default::default() }
 }
 
@@ -292,9 +305,10 @@ impl PrometheusInput {
     pub fn new(targets: Vec<String>, interval: Duration) -> Self {
         let targets = targets
             .into_iter()
-            .map(|url| {
-                let resource = Arc::new(build_resource(&url));
-                let redacted_url = redact_url(&url);
+            .enumerate()
+            .map(|(index, url)| {
+                let resource = Arc::new(build_resource(index, &url));
+                let redacted_url = redact_url(index, &url);
                 Target { url, redacted_url, resource }
             })
             .collect();
@@ -858,14 +872,22 @@ mod tests {
         );
     }
 
-    /// The regression test for `apply_client_tls`'s `tls_built_in_root_certs(false)`: without it,
-    /// `ca_file` only ever *adds* a root rather than replacing the bundled Mozilla set, so this
-    /// would (incorrectly) still leave the client trusting whatever it trusted before `ca_file`
-    /// was set. `other-ca.pem` signs nothing here (`testdata/tls/README.md`), so a client that
-    /// actually confines its trust to it must reject `server.pem` (signed by `ca.pem`).
+    /// Alongside the success case above, proves `ca_file` is actually *honored* -- a CA that
+    /// doesn't sign the server's leaf (`other-ca.pem` signs nothing here, `testdata/tls/
+    /// README.md`) is rejected, not silently ignored. This does **not** exercise
+    /// `apply_client_tls`'s `tls_built_in_root_certs(false)` call: `testdata/tls/server.pem` is
+    /// signed by a private test CA that no bundled public root chains to either, so the handshake
+    /// fails here whether or not the built-in roots are disabled -- a discriminating test would
+    /// need a leaf the *bundled* roots would otherwise accept, which isn't reproducible offline.
+    /// `tls_built_in_root_certs(false)`'s replacement guarantee (a configured `ca_file` trusted
+    /// *instead of*, not *alongside*, the bundled Mozilla set) is documented behavior of the
+    /// underlying `reqwest::ClientBuilder::tls_built_in_root_certs` call itself, taken on trust
+    /// from its own doc comment rather than re-verified by a test here.
     #[tokio::test]
     async fn an_untrusted_ca_file_rejects_an_https_scrape() {
         let addr = canned_tls_server().await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("scrape", "prometheus_in", "listener");
         let mut input = input_for(&format!("https://{addr}/metrics"))
             .with_tls(
                 &TlsClientSettings {
@@ -874,7 +896,8 @@ mod tests {
                 },
                 &testdata_dir(),
             )
-            .expect("a well-formed tls: block should build fine");
+            .expect("a well-formed tls: block should build fine")
+            .with_telemetry(telemetry);
         let (tx, mut rx) = mpsc::channel(4);
         let fanout = Fanout::new(vec![tx]);
 
@@ -882,6 +905,13 @@ mod tests {
 
         let batch = recv_batch(&mut rx).await;
         assert_eq!(synthetic_value(&batch, "up"), 0.0, "an untrusted CA should reject the scrape");
+        // `up == 0` alone can't distinguish a TLS handshake failure from a timeout or a 5xx --
+        // assert the actual class too, so this test only passes for the failure mode it names.
+        let events = registry.drain(0);
+        assert_eq!(
+            counter_in(&events, "logit.input.scrapes", ("class", "network_error")),
+            Some(1.0)
+        );
     }
 
     #[tokio::test]
@@ -947,16 +977,20 @@ mod tests {
     #[test]
     fn redact_url_strips_userinfo_and_query_but_keeps_the_path() {
         assert_eq!(
-            redact_url("http://user:pass@example.com:9100/metrics?token=x"),
+            redact_url(0, "http://user:pass@example.com:9100/metrics?token=x"),
             "http://example.com:9100/metrics"
         );
-        assert_eq!(redact_url("https://example.com/metrics"), "https://example.com/metrics");
+        assert_eq!(redact_url(0, "https://example.com/metrics"), "https://example.com/metrics");
     }
 
     #[test]
-    fn redact_url_falls_back_to_a_placeholder_on_an_unparseable_url() {
-        assert_eq!(redact_url("not a url"), "<unparseable target>");
-        assert_eq!(instance_of("not a url"), "<unparseable target>");
+    fn redact_url_falls_back_to_an_index_keyed_placeholder_on_an_unparseable_url() {
+        assert_eq!(redact_url(3, "not a url"), "<unparseable target #3>");
+        assert_eq!(instance_of(3, "not a url"), "<unparseable target #3>");
+        // Two malformed targets at different configured positions must not collapse onto the
+        // same placeholder -- see `an_unparseable_targets_placeholder_is_keyed_by_index` for the
+        // end-to-end version of this property (distinct `Resource`s, not just distinct strings).
+        assert_ne!(redact_url(0, "not a url"), redact_url(1, "not a url"));
     }
 
     #[tokio::test]
@@ -1080,8 +1114,36 @@ mod tests {
 
     #[test]
     fn instance_of_defaults_the_port_from_the_scheme() {
-        assert_eq!(instance_of("http://example.com/metrics"), "example.com:80");
-        assert_eq!(instance_of("https://example.com/metrics"), "example.com:443");
-        assert_eq!(instance_of("http://example.com:9100/metrics"), "example.com:9100");
+        assert_eq!(instance_of(0, "http://example.com/metrics"), "example.com:80");
+        assert_eq!(instance_of(0, "https://example.com/metrics"), "example.com:443");
+        assert_eq!(instance_of(0, "http://example.com:9100/metrics"), "example.com:9100");
+    }
+
+    /// The regression test for the placeholder-collision fix: rule 40's `is_absolute_http_url`
+    /// only approximates a real URL grammar, so a config can carry more than one target that
+    /// passes it but still fails `reqwest::Url::parse` (`redact_url`'s own doc comment lists the
+    /// shapes) -- without the configured index folded into the placeholder, two such targets
+    /// would build byte-identical `instance`/`prometheus.target` attributes and their `up=0`
+    /// series would collapse onto one another downstream.
+    #[test]
+    fn two_unparseable_targets_get_distinct_resources() {
+        let input = PrometheusInput::new(
+            vec!["http://999.999.999.999/metrics".to_string(), "http://[::1/metrics".to_string()],
+            Duration::from_secs(3600),
+        );
+        let instances: Vec<&str> = input
+            .targets
+            .iter()
+            .map(|t| t.resource.attributes.get("instance").and_then(|v| v.as_str()).unwrap())
+            .collect();
+        assert_ne!(instances[0], instances[1], "got: {instances:?}");
+        let target_attrs: Vec<&str> = input
+            .targets
+            .iter()
+            .map(|t| {
+                t.resource.attributes.get("prometheus.target").and_then(|v| v.as_str()).unwrap()
+            })
+            .collect();
+        assert_ne!(target_attrs[0], target_attrs[1], "got: {target_attrs:?}");
     }
 }
