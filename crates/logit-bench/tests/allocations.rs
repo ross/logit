@@ -2078,7 +2078,9 @@ fn prometheus_encode_100_series() {
         write(&families, Dialect::Text0_0_4, &mut out);
         out
     });
-    assert!(!out.is_empty());
+    let text = std::str::from_utf8(&out).expect("exposition must be utf-8");
+    let series = text.lines().filter(|line| line.starts_with("prom_bench_gauge{")).count();
+    assert_eq!(series, 100, "expected all 100 distinct series to render, got:\n{text}");
     expect_allocs("prometheus_out: encode 100 series", stats, 414);
 }
 

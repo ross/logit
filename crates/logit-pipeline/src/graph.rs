@@ -110,10 +110,19 @@
 //!     empty-name clauses are the "can only ever be a no-op" rule again; the duplicate clause is
 //!     the "a repeated entry silently doubles rather than erroring" rule applied to columns
 //!     instead of sources.
-//! 40. (Numbers 32-39 belong to other components' rules that landed after this list's numbering
-//!     already drifted from the code, per the note on rule 12 above -- left unnumbered here rather
-//!     than renumbered, so a rule referenced elsewhere by its own PR keeps the number it was given
-//!     there.) A `prometheus_in` `targets` must be non-empty, and every entry must parse as an
+//!
+//! (Numbers 32-38 belong to other components' rules that landed after this list's numbering
+//! already drifted from the code, per the note on rule 12 above -- left unnumbered here rather
+//! than renumbered, so a rule referenced elsewhere by its own PR keeps the number it was given
+//! there.)
+//!
+//! 39. An `aggregate` with `temporality: cumulative` requires `series_retention >= 1` (a count of
+//!     windows) and `max_retained_series >= 1` -- either at `0` means no accumulator survives a
+//!     flush, so every window would emit its own increment labelled a cumulative total, silently
+//!     wrong for the consumer that mode exists for. `series_retention: 0` stays legal under the
+//!     default `temporality: delta` (`docs/adr/aggregation-window-semantics.md`'s cumulative
+//!     amendment).
+//! 40. A `prometheus_in` `targets` must be non-empty, and every entry must parse as an
 //!     absolute `http://`/`https://` URL with a non-empty authority -- `logit-pipeline` doesn't
 //!     depend on `reqwest`/`url` (`docs/design/pipeline-graph.md`'s crate layout), so this is a
 //!     small hand-rolled scheme/authority check, not a real URL parse. A `tls:` block must be
@@ -126,6 +135,10 @@
 //!     `content-length`, `te`, `transfer-encoding`, `connection`, an empty name, or an HTTP/2
 //!     pseudo-header starting with `:`), checked case-insensitively, and no two entries may
 //!     collide once case is ignored -- the same shape rule 22 already checks for `otlp_out`.
+//! 41. A `prometheus_out` `path:` must start with `/` (a request URI's path is always absolute,
+//!     so anything else could never be scraped), and `max_series` must be >= 1 -- rule 38's
+//!     impossible-bound shape again: `0` would evict every series the instant it arrived
+//!     (`docs/adr/prometheus-scrape-and-exposition.md`).
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in

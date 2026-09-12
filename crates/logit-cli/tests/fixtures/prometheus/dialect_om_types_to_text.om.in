@@ -10,4 +10,9 @@ sizes_bucket{le="10"} 5
 sizes_bucket{le="+Inf"} 7
 sizes_gsum 300.5
 sizes_gcount 7
+# TYPE http_requests counter
+# UNIT http_requests requests
+# HELP http_requests Total HTTP requests.
+http_requests_total{method="get"} 5 # {trace_id="0123456789abcdef0123456789abcdef",span_id="fedcba9876543210"} 1 1700000000.5
+http_requests_created 1700000000
 # EOF
