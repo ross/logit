@@ -536,8 +536,9 @@ metric-kind fields, not just presence.
 | W6 | **Landed.** DogStatsD events and service checks, in and out: `_e{...}`/`_sc\|...` decode to `Event::log`/`Event::metric` (`event_name: None` deliberately), `statsd.event.*`/`statsd.service_check.*` carriers, canonical field order and `d:` (not `\|T`) on egress, `format: statsd` whole-event drop, first-metric-is-the-check rule; amends `statsd-output` | S | W3 |
 | W7 | **Landed.** Lua proxy: `event.log` gains `event_name`/`observed_timestamp` (read/write) and `dropped_attributes_count` (read-only); new `event.metrics` (array-like, every field readable, `value` writable on `sum`/`gauge`, `temporality`/`monotonic` writable on `sum`, everything else on every other kind read-only) and `event.span` (new, entirely read-only); `resource`/`scope` gain `schema_url` (read/write) and `dropped_attributes_count` (read-only), `scope` itself new, mirroring `resource`'s copy-on-write shape; extends `docs/design/lua-api.md`, no ADR (extension of the existing proxy design, not a new one) | M | W1 |
 | W8 | **Landed.** Closeout: `AGENTS.md`'s `statsd_out` and current-state paragraphs rewritten for the landed model, the stale `HyperLogLog` doc comment (`crates/logit-core/src/metric.rs`) and internal-telemetry's raw-sample claims (`docs/design/internal-telemetry.md`, an amendment on ADR `internal-telemetry-as-pipeline-events`) corrected, this plan's closing assessment added, and ADR `lossless-transit`'s Status marked realized — `docs/known-gaps.md`, `docs/design/data-model.md`, and the other docs a prior scoping pass verified already in sync were left alone | S | all |
+| W9 | **Landed.** A repeated DogStatsD tag key folds into a `Value::Array` at decode (`insert_tags`, mirroring `syslog_in`'s repeated-PARAM-NAME fold) instead of the last token silently winning; `statsd_out` expands an `Array`-valued attribute into one tag per element, with no dedupe on encode; `influxdb_out` and `prometheus_out` each render a multi-valued tag/label's last representable element, counted `*.{tags,labels}.normalized{reason="multi_value"}`; closes the "repeated DogStatsD tag key collapses to its last value" residual-debt item above; amends `statsd-output` and `lossless-transit` | M | W3, W6 |
 
-Landing order: W0 → W1 → (W2, W4, W5 in parallel) → W3 → W6 → W7 → W8. Each workstream is its own
+Landing order: W0 → W1 → (W2, W4, W5 in parallel) → W3 → W6 → W7 → W8 → W9. Each workstream is its own
 PR.
 
 ## Closing assessment
@@ -550,7 +551,11 @@ against the three like-protocol pairs is closed:
   lossless modulo the ADR's permitted normalizations: multi-value lines split, `h`/`d` normalize to
   `ms`), `|c:`/`|T` survive under `format: dogstatsd`, and DogStatsD events/service checks decode
   and re-encode losslessly — see "statsd_in -> statsd_out
-  (W3, landed)" and "DogStatsD events and service checks (W6, landed)" above.
+  (W3, landed)" and "DogStatsD events and service checks (W6, landed)" above. A repeated tag key
+  round-trips too (W9, landed): `crates/logit-cli/tests/fixtures/statsd/` gained
+  `repeated-tag-key-round-trips`, `repeated-tag-three-values`, `bare-and-valued-tag-mix`, and
+  `repeated-tag-on-event-line` as byte-for-byte fixtures, plus `repeated-tag-exact-duplicate-deduped`
+  and `bare-tag-exact-duplicate-deduped` pinning the agent's own exact-duplicate dedupe rule.
 - **otlp_in -> otlp_out**: every metric field the original assessment named (start time,
   description, `Histogram`/`Summary` sum/min/max/count, `ExponentialHistogram` as its own 1:1
   variant instead of materialized buckets, exemplars, a `NO_RECORDED_VALUE` point round-tripped
@@ -582,9 +587,6 @@ newly discovered here:
   `ExponentialHistogram`/`Summary`/a cumulative or non-monotonic `Sum`) — reachable only once
   `aggregate` has explicitly summarized, which is the ADR's own opt-in-summarization carve-out, not
   a like-to-like loss (`docs/known-gaps.md`'s "`statsd_out` drops post-sketch metric kinds" entry).
-- A repeated DogStatsD tag key (`#team:a,team:b`) collapses to its last value, because `AttrMap` is
-  a map, not a multiset — a model gap, not a codec bug (`docs/known-gaps.md`'s "A repeated DogStatsD
-  tag key collapses to its last value" entry).
 - ~~`logit_proto::Encoder`'s one-`Bytes`-per-batch contract still doesn't fit `syslog_out`'s/
   `statsd_out`'s per-message framing, so both bypass the trait entirely — unchanged by this
   plan~~ — **closed as of 2026-09-12**: both now implement `logit_proto::FramedEncoder` over a

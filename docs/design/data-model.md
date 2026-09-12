@@ -137,6 +137,14 @@ same *reserved-attribute* convention is deliberately *read* by more than one pro
 naming as a real table too rather than leaving it to be reverse-engineered from that transform's
 source:
 
+A protocol whose tag/param namespace is a **multiset** rather than a map — a key can legally repeat
+on one line, each occurrence a distinct value — folds those repeats into one attribute holding a
+`Value::Array`, in wire order, rather than letting a plain last-write-wins map insertion silently
+destroy every occurrence but the last. `syslog.sd` below (a repeated RFC 5424 PARAM-NAME within one
+SD-ELEMENT) and DogStatsD's `|#` tags (a repeated tag key) are the two producers of this shape today;
+see [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md) and [ADR
+`statsd-output`](../adr/statsd-output.md)'s amendment.
+
 | Attribute | Value | Meaning |
 |---|---|---|
 | `traceparent` | `Value::Str`, `00-<32 hex>-<16 hex>-<2 hex>` | The W3C Trace Context header (<https://www.w3.org/TR/trace-context/>), logged verbatim by a tier that received or forwarded one. Yields a trace id, this line's *parent* span id, and flags (hex, by that header's own definition) — an explicit field below always wins over the header's corresponding piece. |
@@ -155,6 +163,7 @@ source:
 | `span.duration_s` | decimal seconds (number or `Str`) | nginx's `$request_time`. |
 | `span.{start,end}_rfc3339` | RFC 3339 string | Parsed by `logit_core::parse_rfc3339_to_nanos`, up to 9 fractional digits. |
 | `syslog.sd` | `Value::Map { "<SD-ID>" -> Value::Map { "<PARAM-NAME>" -> Value::Str \| Value::Array<Value::Str> } }` | `syslog_in`'s parsed RFC 5424 STRUCTURED-DATA (absent when the wire carried the nil `-`); a repeated PARAM-NAME within one SD-ELEMENT becomes the `Array` form, in order. `syslog_out` re-emits every element, escaped per RFC 5424 §6.3.3; see [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md). |
+| *(any DogStatsD tag key)* | `Value::Str`\|`Value::Bool`, or `Value::Array` of either when the key repeated | `statsd_in`'s `insert_tags` folds a repeated `\|#` tag key into a `Value::Array` in wire order (`#team:a,team:b` -> `Array[Str("a"), Str("b")]`), the same multiset fold `syslog.sd` above uses; an exact-duplicate token dedupes at decode instead, so a non-repeated tag's shape is unchanged (`Value::Str` for `key:value`, `Value::Bool(true)` for a bare `key`). `statsd_out` expands an `Array` back into one wire tag per element. See [ADR `statsd-output`](../adr/statsd-output.md)'s amendment. |
 | `statsd.type` | `Value::Str`: `ms`\|`h`\|`d` | `statsd_in`'s wire-type letter for a timer/histogram/distribution line, stamped on the `MetricKind::Samples` record it decodes to since all three land on the same shape; `statsd_out` reads it to pick the wire-type letter it re-emits, defaulting to `ms` when absent or unrecognized. See [ADR `statsd-output`](../adr/statsd-output.md)'s amendment. |
 | `statsd.container_id` | `Value::Str` | `statsd_in`'s `\|c:<container-id>` segment (DogStatsD v1.2+, accepted here on every metric type, not only `c`/`g`), round-tripped by `statsd_out` under `format: dogstatsd` only. |
 | `statsd.timestamp` | `Value::U64` | The raw seconds off an incoming `\|T<unix-seconds>` segment, stamped by `statsd_in` alongside moving the same value onto `Event::timestamp` (as `secs * 1_000_000_000`) -- carrying the wire value itself, not just a marker bit, so a stage that rebuilds `Event::timestamp` after decode (`aggregate`'s flush, notably) can't fabricate or collapse a `\|T` on the way back out; `statsd_out` re-emits `\|T<secs>` from this attribute's own `U64` value (never from `Event::timestamp`) under `format: dogstatsd` only, and not at all when the attribute is absent or not a `U64`. Also stamped, with the identical value/round-trip contract, from a DogStatsD event's or service check's own `d:<unix-seconds>` field -- `statsd_out` re-emits it as `d:<secs>` (never `\|T`) on those two line shapes. |

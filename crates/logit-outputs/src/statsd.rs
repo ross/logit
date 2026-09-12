@@ -31,7 +31,9 @@
 //!
 //! `Format::DogStatsd` (default) emits the `|#k:v,k:v` tag segment; `Format::Statsd` omits it
 //! entirely -- not an empty `|#`, which some plain-statsd receivers reject outright -- and counts
-//! every tag it drops (`EncodeStats::tags_dropped_dialect`).
+//! every tag it drops (`EncodeStats::tags_dropped_dialect`). That counter's unit is a **wire
+//! tag**, not an attribute: a multi-value tag (see "Multi-value tags" below) counts once per
+//! element, since one element is exactly one `k:v` token the DogStatsD segment would have carried.
 //!
 //! `Format::Statsd` also normalizes two shapes that only DogStatsD's grammar can express:
 //! `Samples` loses its multi-value line (`name:v1:v2|ms`) and becomes one `name:v|ms` line per
@@ -60,7 +62,9 @@
 //! remainder folded into the value. Tag *values* forbid the same set **except `:`, which is
 //! deliberately allowed**: since only the first colon is significant, `env:a:b` round-trips as key
 //! `env`, value `a:b` -- an asymmetry between key and value sanitization that is easy to get
-//! backwards, so it has its own test.
+//! backwards, so it has its own test. A multi-value tag's key and value are sanitized **per
+//! element** under these same two rules, with no cross-element interaction at all (see
+//! "Multi-value tags" below).
 //!
 //! A `SetMembers` member is rendered through its own, narrower rule
 //! ([`is_forbidden_in_set_member`]: lossy UTF-8 first, since a member is arbitrary bytes off the
@@ -77,6 +81,37 @@
 //! any of them would corrupt line/datagram framing regardless of position. A member that comes out
 //! different from its raw bytes, either because the bytes weren't valid UTF-8 or because a
 //! forbidden character was substituted, is counted (`EncodeStats::members_sanitized`).
+//!
+//! ## Multi-value tags (a repeated tag key)
+//!
+//! A DogStatsD `|#` segment is a **list** of `key[:value]` tokens, not a map, so `#team:a,team:b`
+//! is two live tags and a query grouping by `team` places that point in both groups.
+//! `logit_inputs::statsd::insert_tags` folds a repeated key into a [`Value::Array`] in wire order
+//! (the same fold `syslog_in` uses for a repeated PARAM-NAME), and this sink is its inverse: an
+//! `Array`-valued attribute expands to one wire tag per element, in array order, each through the
+//! very same [`push_one_tag`] a scalar tag goes through. A `Bool(true)` element emits the bare form
+//! (`#urgent`), so a bare/valued mix (`#urgent,urgent:1`) relays intact too.
+//!
+//! Three things this deliberately does *not* do:
+//!
+//! - **No encode-side dedupe.** The Datadog agent's "only exact duplicates are one tag" rule is
+//!   applied once, at decode; encode stays a pure function of the array. A Lua-authored
+//!   `Array[Str("a"), Str("a")]` therefore emits `#k:a,k:a`, which the agent itself then dedupes.
+//! - **No sorting.** Element order is array order -- unlike `syslog_out`'s SD-ID/PARAM-NAME
+//!   canonicalization, which exists only because `AttrMap` order is process-global intern order.
+//!   An `Array` carries real order, and that order is the wire's.
+//! - **No element-level union across the merge.** [`build_tag_suffix`]'s merged resource⊕event walk
+//!   ([`crate::attrs::merged`]) has the event's value win *whole* on an equal key, so an
+//!   event-level `Array` overrides a resource-level scalar entirely, and a resource-level `Array`
+//!   is overridden whole by an event-level scalar. The resource's value was never part of *this*
+//!   event's wire tag list, so unioning the two lists element-wise would emit tags nothing sent.
+//!
+//! An element [`tag_value`] can't render (`Null`, `Bytes`, `Timestamp`, `Map`, a nested `Array`) is
+//! skipped and counted `EncodeStats::tags_dropped_unrepresentable` **per element**; an array whose
+//! every element drops emits no tag at all and leaves no stray `,` behind. A tag *literally named*
+//! `statsd.type` inside the `#` segment can now decode to an `Array` as well; it matches no
+//! [`Carriers`] arm (each expects a `Value::Str`/`Value::U64`) and is filtered out of the tag
+//! segment uncounted, exactly as a wrong-typed carrier already is.
 //!
 //! ## Metric-kind coverage: raw kinds in, sketches still deferred
 //!
@@ -346,7 +381,16 @@ pub struct EncodeStats {
     pub dropped_unencodable_value: usize,
     pub dropped_empty_name: usize,
     pub dropped_oversize_line: usize,
+    /// Tags dropped because [`Format::Statsd`] has no tag segment at all. Counted **per wire
+    /// tag**, not per attribute: a multi-value `Array` attribute would have rendered one `k:v`
+    /// token per element, so it counts once per element (and an empty `Array`, which would have
+    /// rendered no token at all, counts nothing). See the module doc's "Dialects" section.
     pub tags_dropped_dialect: usize,
+    /// A tag that [`tag_value`] has no plain-text rendering for (`Null`, `Bytes`, `Timestamp`,
+    /// `Map`, a nested `Array`), or whose key is empty/sanitizes to nothing. Counted **per wire
+    /// tag** for the same reason as [`Self::tags_dropped_dialect`]: one unrepresentable element of
+    /// a multi-value tag counts once, and an array whose every element drops counts once per
+    /// element. See the module doc's "Multi-value tags" section.
     pub tags_dropped_unrepresentable: usize,
     /// A timer's wire-type letter (`statsd.type`) was `h`/`d` and had to collapse to `ms` under
     /// `Format::Statsd`, which has no such distinction -- counted once per `Samples` record
@@ -680,6 +724,11 @@ struct Carriers<'a> {
 /// [`crate::attrs::merged`]. Under [`Format::Statsd`] this always leaves `suffix` empty and counts
 /// every attribute that would otherwise have become a tag into `stats.tags_dropped_dialect`.
 ///
+/// Every tag is appended by [`push_one_tag`], once per attribute for a scalar value and once per
+/// **element** for a `Value::Array` -- a repeated DogStatsD tag key, see the module doc's
+/// "Multi-value tags" section. `stats.tags_dropped_dialect`/`tags_dropped_unrepresentable` are
+/// therefore counted per wire tag, not per attribute.
+///
 /// The same merged walk also captures the three `statsd.*` carriers into `carriers` -- see
 /// [`Carriers`]'s doc comment for why that happens here rather than as a second, separate read of
 /// `event.attributes` later.
@@ -752,43 +801,88 @@ fn build_tag_suffix<'a>(
         }
 
         if format == Format::Statsd {
-            stats.tags_dropped_dialect += 1;
+            // Per *wire tag*, not per attribute: a multi-value `Array` would have rendered one
+            // `k:v` token per element, so that is what the classic dialect is dropping here (an
+            // empty `Array` would have rendered no token, and so counts nothing). See the module
+            // doc's "Dialects" and "Multi-value tags" sections.
+            stats.tags_dropped_dialect += match value {
+                Value::Array(elements) => elements.len(),
+                _ => 1,
+            };
             continue;
         }
 
-        if key_str.is_empty() {
-            stats.tags_dropped_unrepresentable += 1;
-            continue;
-        }
-        // `Bool(true)` is DogStatsD's own bare-tag idiom (`#urgent`, no `:value`) -- exactly what
-        // `logit_inputs::statsd::parse_line` produces for a valueless tag. Emitting `key:true`
-        // instead would round-trip as `Value::Str("true")`, silently changing the value's type.
-        let bare = matches!(value, Value::Bool(true));
-        let rendered_value = if bare { None } else { tag_value(scratch, value) };
-        if !bare && rendered_value.is_none() {
-            stats.tags_dropped_unrepresentable += 1;
-            continue;
-        }
-
-        if !suffix.is_empty() {
-            suffix.push(',');
-        }
-        let key_start = suffix.len();
-        sanitize_into(suffix, key_str, is_forbidden_in_tag_key);
-        if suffix.len() == key_start {
-            // Sanitized to nothing (only possible if `key_str` itself was empty, already handled
-            // above, but kept as a defensive no-op-key guard) -- undo any separator just pushed.
-            if suffix.ends_with(',') {
-                suffix.pop();
+        match value {
+            // A repeated DogStatsD tag key reaches this sink as a `Value::Array` in wire order
+            // (`logit_inputs::statsd::insert_tags`), and the `|#` segment is a list, not a map --
+            // so it expands back to one `key[:value]` token per element, in array order, with no
+            // encode-side dedupe and no sorting. The module doc's "Multi-value tags" section has
+            // the full rule, including why the merged resource-then-event walk this loop is
+            // walking never unions two arrays element-wise.
+            Value::Array(elements) => {
+                for element in elements {
+                    push_one_tag(suffix, scratch, key_str, element, stats);
+                }
             }
-            stats.tags_dropped_unrepresentable += 1;
-            continue;
-        }
-        if let Some(v) = rendered_value {
-            suffix.push(':');
-            sanitize_into(suffix, v, is_forbidden_in_tag_value_only);
+            _ => {
+                push_one_tag(suffix, scratch, key_str, value, stats);
+            }
         }
     }
+}
+
+/// Appends one `key[:value]` wire tag to `suffix`, comma-separated from whatever is already there,
+/// returning whether it did. On any reason not to (an empty key, a key that sanitizes to nothing,
+/// a `value` [`tag_value`] has no plain-text rendering for) it counts
+/// `stats.tags_dropped_unrepresentable` and leaves `suffix` **byte-identical to what it was on
+/// entry** -- including undoing the separator it had already pushed, which is what stops an array
+/// whose every element drops from leaving a stray `,` behind.
+///
+/// Factored out of [`build_tag_suffix`] so a multi-value tag (a `Value::Array`, see the module
+/// doc's "Multi-value tags" section) can call it once per element and get byte-for-byte the same
+/// grammar, sanitization and counting a scalar tag gets. `scratch` is rendered **and copied into
+/// `suffix`** before this returns, which is exactly what keeps [`StatsdEncoder::scratch`]'s
+/// single-use-at-a-time contract intact across a multi-element array.
+fn push_one_tag(
+    suffix: &mut String,
+    scratch: &mut String,
+    key_str: &str,
+    value: &Value,
+    stats: &mut EncodeStats,
+) -> bool {
+    if key_str.is_empty() {
+        stats.tags_dropped_unrepresentable += 1;
+        return false;
+    }
+    // `Bool(true)` is DogStatsD's own bare-tag idiom (`#urgent`, no `:value`) -- exactly what
+    // `logit_inputs::statsd::parse_line` produces for a valueless tag. Emitting `key:true`
+    // instead would round-trip as `Value::Str("true")`, silently changing the value's type.
+    let bare = matches!(value, Value::Bool(true));
+    let rendered_value = if bare { None } else { tag_value(scratch, value) };
+    if !bare && rendered_value.is_none() {
+        stats.tags_dropped_unrepresentable += 1;
+        return false;
+    }
+
+    let restore_to = suffix.len();
+    if !suffix.is_empty() {
+        suffix.push(',');
+    }
+    let key_start = suffix.len();
+    sanitize_into(suffix, key_str, is_forbidden_in_tag_key);
+    if suffix.len() == key_start {
+        // Sanitized to nothing (only possible if `key_str` itself was empty, already handled
+        // above, but kept as a defensive no-op-key guard) -- rewind to exactly where this call
+        // started, separator included.
+        suffix.truncate(restore_to);
+        stats.tags_dropped_unrepresentable += 1;
+        return false;
+    }
+    if let Some(v) = rendered_value {
+        suffix.push(':');
+        sanitize_into(suffix, v, is_forbidden_in_tag_value_only);
+    }
+    true
 }
 
 /// Appends `line`'s `|#`-prefixed tag segment, if `tag_suffix` is non-empty. Shared by every
@@ -2127,6 +2221,217 @@ mod tests {
         assert_eq!(stats.tags_dropped_dialect, 1);
     }
 
+    // -- Multi-value tags (a repeated tag key) ---------------------------------------------------
+
+    /// A batch whose resource carries attributes of its own -- `batch_with` always uses a default,
+    /// attribute-less `Resource`, and the resource⊕event merge precedence is part of the
+    /// multi-value contract (the event's value wins *whole*, never element-wise).
+    fn encode_with_resource(resource: Resource, events: Vec<Event>) -> (Vec<String>, EncodeStats) {
+        let mut encoder = StatsdEncoder::new(Format::DogStatsd);
+        let mut out = MessageBuf::default();
+        let batch = EventBatch { resource: Arc::new(resource), scope: None, events };
+        let stats = encoder.encode_into(&batch, &mut out);
+        let msgs = out.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect();
+        (msgs, stats)
+    }
+
+    #[test]
+    fn an_array_tag_expands_to_one_tag_per_element_in_array_order() {
+        let (msgs, stats) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[("team", Value::Array(vec![Value::str("a"), Value::str("b")]))],
+        )]);
+        assert_eq!(msgs[0], "hits:1|c|#team:a,team:b");
+        assert_eq!(stats, EncodeStats::default());
+    }
+
+    /// `#urgent,urgent:1`: a bare token and a valued one sharing a key are two tags that differ in
+    /// *form*, and both forms survive, in array order.
+    #[test]
+    fn an_array_tag_of_a_bare_and_a_valued_element_keeps_both_forms_in_order() {
+        let (msgs, _) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[("urgent", Value::Array(vec![Value::Bool(true), Value::str("1")]))],
+        )]);
+        assert_eq!(msgs[0], "hits:1|c|#urgent,urgent:1");
+
+        let (msgs, _) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[("urgent", Value::Array(vec![Value::str("1"), Value::Bool(true)]))],
+        )]);
+        assert_eq!(msgs[0], "hits:1|c|#urgent:1,urgent");
+    }
+
+    /// A Lua-authored numeric array gets the identical per-element formatting a scalar `I64` tag
+    /// gets -- both go through the same [`tag_value`].
+    #[test]
+    fn an_array_tag_of_numbers_gets_the_same_formatting_a_scalar_number_gets() {
+        let (msgs, _) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[("shard", Value::Array(vec![Value::I64(1), Value::I64(2)]))],
+        )]);
+        assert_eq!(msgs[0], "hits:1|c|#shard:1,shard:2");
+    }
+
+    #[test]
+    fn each_element_of_an_array_tag_is_sanitized_on_its_own() {
+        let (msgs, _) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[("team", Value::Array(vec![Value::str("a@b"), Value::str("c,d")]))],
+        )]);
+        assert_eq!(msgs[0], "hits:1|c|#team:a_b,team:c_d");
+    }
+
+    /// The key is sanitized per element too (the same key, the same way, every time) -- there is no
+    /// cross-element interaction and no "sanitize once, reuse" shortcut to get subtly wrong.
+    #[test]
+    fn an_array_tags_key_is_sanitized_identically_for_every_element() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("a:b", Value::Array(vec![Value::str("x"), Value::str("y")]));
+        let event =
+            Event::metric(0, attrs, MetricRecord::new(intern("hits"), MetricKind::counter(1.0)));
+        let (msgs, _) = encode(vec![event]);
+        assert_eq!(msgs[0], "hits:1|c|#a_b:x,a_b:y");
+    }
+
+    #[test]
+    fn an_unrepresentable_array_element_is_skipped_and_counted_per_element() {
+        let (msgs, stats) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[(
+                "team",
+                Value::Array(vec![
+                    Value::str("a"),
+                    Value::Null,
+                    Value::Map(Box::new(AttrMap::new())),
+                    Value::Array(vec![Value::str("nested")]),
+                ]),
+            )],
+        )]);
+        assert_eq!(msgs[0], "hits:1|c|#team:a");
+        assert_eq!(
+            stats.tags_dropped_unrepresentable, 3,
+            "the counter's unit is a wire tag: `Null`, `Map` and a nested `Array` each cost one"
+        );
+    }
+
+    #[test]
+    fn an_all_unrepresentable_array_tag_emits_no_tag_segment_at_all() {
+        let (msgs, stats) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[("team", Value::Array(vec![Value::Null, Value::Timestamp(1)]))],
+        )]);
+        assert_eq!(msgs[0], "hits:1|c", "no `|#`, and no stray `,` inside one either");
+        assert_eq!(stats.tags_dropped_unrepresentable, 2);
+    }
+
+    /// An empty `Array` would have rendered no wire tag at all, so it drops the tag and counts
+    /// nothing -- neither `unrepresentable` (no element was unrepresentable) nor anything else.
+    #[test]
+    fn an_empty_array_tag_emits_no_tag_and_counts_nothing() {
+        let (msgs, stats) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[("team", Value::Array(Vec::new()))],
+        )]);
+        assert_eq!(msgs[0], "hits:1|c");
+        assert_eq!(stats, EncodeStats::default());
+    }
+
+    /// [`push_one_tag`] directly, because this is the one guarantee an end-to-end assertion can't
+    /// isolate: when every element of an array drops, the suffix a *previous* tag already wrote
+    /// must come back byte-identical, separator included.
+    #[test]
+    fn an_all_unrepresentable_array_leaves_a_non_empty_tag_suffix_byte_identical() {
+        let mut suffix = String::from("env:prod");
+        let mut scratch = String::new();
+        let mut stats = EncodeStats::default();
+        for element in [Value::Null, Value::Map(Box::new(AttrMap::new()))] {
+            assert!(!push_one_tag(&mut suffix, &mut scratch, "team", &element, &mut stats));
+        }
+        assert_eq!(suffix, "env:prod");
+        assert_eq!(stats.tags_dropped_unrepresentable, 2);
+    }
+
+    /// Pins the "no encode-side dedupe" decision: the agent's exact-duplicate rule is applied once,
+    /// at decode, and encode stays a pure function of the array. A duplicate can only get here from
+    /// a Lua-authored array in the first place, and the agent dedupes it again on receipt.
+    #[test]
+    fn duplicate_array_elements_are_not_deduped_on_encode() {
+        let (msgs, stats) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[("team", Value::Array(vec![Value::str("a"), Value::str("a")]))],
+        )]);
+        assert_eq!(msgs[0], "hits:1|c|#team:a,team:a");
+        assert_eq!(stats, EncodeStats::default());
+    }
+
+    /// [`crate::attrs::merged`] has the event's value win **whole** on an equal key, so there is no
+    /// element-level union: the resource's `team` was never part of this event's wire tag list.
+    #[test]
+    fn an_event_level_array_tag_overrides_a_resource_level_scalar_whole() {
+        let mut resource = Resource::default();
+        resource.attributes.insert("team", "resource");
+        let (msgs, _) = encode_with_resource(
+            resource,
+            vec![metric_event(
+                "hits",
+                MetricKind::counter(1.0),
+                &[("team", Value::Array(vec![Value::str("a"), Value::str("b")]))],
+            )],
+        );
+        assert_eq!(msgs[0], "hits:1|c|#team:a,team:b");
+    }
+
+    /// And the reverse direction, for the same reason: a resource-level `Array` is overridden whole
+    /// by an event-level scalar.
+    #[test]
+    fn an_event_level_scalar_tag_overrides_a_resource_level_array_whole() {
+        let mut resource = Resource::default();
+        resource.attributes.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
+        let (msgs, _) = encode_with_resource(
+            resource,
+            vec![metric_event("hits", MetricKind::counter(1.0), &[("team", "c".into())])],
+        );
+        assert_eq!(msgs[0], "hits:1|c|#team:c");
+    }
+
+    #[test]
+    fn plain_statsd_format_counts_a_multi_value_tag_once_per_element() {
+        let (msgs, stats) = encode_with_format(
+            vec![metric_event(
+                "hits",
+                MetricKind::counter(1.0),
+                &[("team", Value::Array(vec![Value::str("a"), Value::str("b")]))],
+            )],
+            Format::Statsd,
+        );
+        assert_eq!(msgs[0], "hits:1|c");
+        assert_eq!(
+            stats.tags_dropped_dialect, 2,
+            "the counter's unit is a wire tag, so a two-element array costs two, not one"
+        );
+
+        // An empty array would have rendered no wire tag, so the classic dialect drops nothing.
+        let (_, stats) = encode_with_format(
+            vec![metric_event(
+                "hits",
+                MetricKind::counter(1.0),
+                &[("team", Value::Array(Vec::new()))],
+            )],
+            Format::Statsd,
+        );
+        assert_eq!(stats.tags_dropped_dialect, 0);
+    }
+
     // -- Sanitization ---------------------------------------------------------------------------
 
     #[test]
@@ -3347,6 +3652,34 @@ mod tests {
         assert!(matches!(events[0].attributes.get("urgent"), Some(Value::Bool(true))));
     }
 
+    /// The workstream's headline claim, end to end through the real decoder: `#team:a,team:b` in,
+    /// byte-identical bytes out. Depends on the decoder's repeated-key fold -- before that landed,
+    /// the decoder collapsed `team` to `Str("b")` and this failed on the first assert.
+    #[test]
+    fn a_repeated_tag_key_relays_byte_for_byte_through_the_real_statsd_decoder() {
+        let line = "x:1|c|#team:a,team:b";
+        let events = decode_one(line);
+        assert!(
+            matches!(events[0].attributes.get("team"), Some(Value::Array(a)) if a.len() == 2),
+            "the decoder must fold a repeated tag key into a two-element Array; got {:?}",
+            events[0].attributes.get("team")
+        );
+        let (msgs, stats) = encode(events);
+        assert_eq!(msgs, vec![line.to_string()]);
+        assert_eq!(stats, EncodeStats::default());
+    }
+
+    /// The same claim for the bare/valued mix, whose loss was the same gap in a second `Value`
+    /// type. Also depends on the decoder's repeated-key fold.
+    #[test]
+    fn a_bare_and_valued_tag_mix_relays_byte_for_byte_through_the_real_statsd_decoder() {
+        let line = "x:1|c|#urgent,urgent:1";
+        let events = decode_one(line);
+        let (msgs, stats) = encode(events);
+        assert_eq!(msgs, vec![line.to_string()]);
+        assert_eq!(stats, EncodeStats::default());
+    }
+
     #[test]
     fn a_packed_multi_line_datagram_round_trips_as_several_events() {
         let mut encoder = StatsdEncoder::new(Format::DogStatsd);
@@ -3597,12 +3930,44 @@ mod tests {
             prop_oneof![Just(None), (1u32..=100).prop_map(Some)]
         }
 
-        fn tag() -> impl Strategy<Value = (String, String)> {
-            ("[a-z][a-z0-9]{0,6}", "[a-z][a-z0-9]{0,6}")
+        /// One `key[:value]` tag token. The key is drawn from a deliberately **two-element pool**
+        /// so a repeated key -- the multi-value case (`#team:a,team:b` -> `Value::Array`, the
+        /// module doc's "Multi-value tags" section) -- is generated constantly rather than by
+        /// luck, and the value is an `Option` so the bare form (`#urgent`) and every bare/valued
+        /// mix (`#urgent,urgent:1`, `#urgent:1,urgent`) are generated too. Exact duplicates come
+        /// out of the same pool, which is what exercises the decoder's dedupe rule.
+        ///
+        /// Key *sanitization* is not this generator's job (both pool entries are already legal
+        /// wire keys) -- that has its own unit tests; what a small pool buys is collision
+        /// frequency.
+        fn tag() -> impl Strategy<Value = (String, Option<String>)> {
+            (
+                prop_oneof![Just("team".to_string()), Just("env".to_string())],
+                prop_oneof![Just(None), "[a-z][a-z0-9]{0,6}".prop_map(Some)],
+            )
         }
 
-        fn tags() -> impl Strategy<Value = Vec<(String, String)>> {
-            prop::collection::vec(tag(), 0..=2)
+        fn tags() -> impl Strategy<Value = Vec<(String, Option<String>)>> {
+            prop::collection::vec(tag(), 0..=3)
+        }
+
+        /// Appends a `|#`-prefixed tag segment, rendering a valueless token bare (`k`, no `:`) --
+        /// shared by all three `render_*` functions below, which write an identical segment.
+        fn push_tag_segment(line: &mut String, tags: &[(String, Option<String>)]) {
+            if tags.is_empty() {
+                return;
+            }
+            line.push_str("|#");
+            line.push_str(
+                &tags
+                    .iter()
+                    .map(|(k, v)| match v {
+                        Some(v) => format!("{k}:{v}"),
+                        None => k.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
         }
 
         fn opt_container_id() -> impl Strategy<Value = Option<String>> {
@@ -3621,7 +3986,7 @@ mod tests {
             kind: &str,
             values: &[String],
             rate: Option<u32>,
-            tags: &[(String, String)],
+            tags: &[(String, Option<String>)],
             container_id: &Option<String>,
             secs: Option<u32>,
         ) -> String {
@@ -3629,12 +3994,7 @@ mod tests {
             if let Some(r) = rate {
                 let _ = write!(line, "|@{:.2}", f64::from(r) / 100.0);
             }
-            if !tags.is_empty() {
-                line.push_str("|#");
-                line.push_str(
-                    &tags.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(","),
-                );
-            }
+            push_tag_segment(&mut line, tags);
             if let Some(id) = container_id {
                 let _ = write!(line, "|c:{id}");
             }
@@ -3705,7 +4065,7 @@ mod tests {
                 kind: &'static str,
                 values: Vec<String>,
                 rate: Option<u32>,
-                tags: Vec<(String, String)>,
+                tags: Vec<(String, Option<String>)>,
                 container_id: Option<String>,
                 secs: Option<u32>,
             },
@@ -3718,7 +4078,7 @@ mod tests {
                 alert_type: Option<&'static str>,
                 key: Option<String>,
                 source: Option<String>,
-                tags: Vec<(String, String)>,
+                tags: Vec<(String, Option<String>)>,
                 container_id: Option<String>,
             },
             ServiceCheck {
@@ -3726,7 +4086,7 @@ mod tests {
                 status: u32,
                 secs: Option<u32>,
                 host: Option<String>,
-                tags: Vec<(String, String)>,
+                tags: Vec<(String, Option<String>)>,
                 container_id: Option<String>,
                 message: Option<String>,
             },
@@ -3747,7 +4107,7 @@ mod tests {
             alert_type: Option<&str>,
             key: &Option<String>,
             source: &Option<String>,
-            tags: &[(String, String)],
+            tags: &[(String, Option<String>)],
             container_id: &Option<String>,
         ) -> String {
             let mut line = format!("_e{{{},{}}}:{title}|{text}", title.len(), text.len());
@@ -3769,12 +4129,7 @@ mod tests {
             if let Some(s) = source {
                 let _ = write!(line, "|s:{s}");
             }
-            if !tags.is_empty() {
-                line.push_str("|#");
-                line.push_str(
-                    &tags.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(","),
-                );
-            }
+            push_tag_segment(&mut line, tags);
             if let Some(id) = container_id {
                 let _ = write!(line, "|c:{id}");
             }
@@ -3788,7 +4143,7 @@ mod tests {
             status: u32,
             secs: Option<u32>,
             host: &Option<String>,
-            tags: &[(String, String)],
+            tags: &[(String, Option<String>)],
             container_id: &Option<String>,
             message: &Option<String>,
         ) -> String {
@@ -3799,12 +4154,7 @@ mod tests {
             if let Some(h) = host {
                 let _ = write!(line, "|h:{h}");
             }
-            if !tags.is_empty() {
-                line.push_str("|#");
-                line.push_str(
-                    &tags.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(","),
-                );
-            }
+            push_tag_segment(&mut line, tags);
             if let Some(id) = container_id {
                 let _ = write!(line, "|c:{id}");
             }

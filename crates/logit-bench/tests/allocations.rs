@@ -186,6 +186,56 @@ fn statsd_decode_one_set_line() {
     expect_allocs("statsd_in: decode 1 set line", stats, 3);
 }
 
+/// A repeated DogStatsD tag key folds into a `Value::Array` at decode
+/// (`crates/logit-inputs/src/statsd.rs`'s "DogStatsD tags" section) -- **two** allocations beyond
+/// [`statsd_decode_one_line`]'s pair (the per-line and per-batch `Vec<Event>`s), not one: `insert_tags`
+/// builds the `Array`'s `Vec` spine (`vec![existing, value]`), and then `build_event`'s own
+/// `attributes.clone()` -- run once even for this single-value counter line -- deep-copies that
+/// same spine a second time to build the `Event`. A scalar-valued tag's share of that same clone
+/// costs nothing (a `SmallVec` memcpy plus a `Bytes` refcount bump), which is what makes the
+/// `Array` case different rather than free like every other attribute here.
+#[test]
+fn statsd_decode_one_line_with_a_repeated_tag_key() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_repeated_tag_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    match batch.events[0].attributes.get("team") {
+        Some(Value::Array(elements)) => assert_eq!(elements.len(), 2, "team:a,team:b"),
+        other => panic!("expected a 2-element Array under 'team', got {other:?}"),
+    }
+    expect_allocs("statsd_in: decode 1 line with a repeated tag key", stats, 4);
+}
+
+/// The same repeated tag key, on a multi-value counter line (`name:v1:v2:v3|c`): `parse_line`
+/// decodes this to three `Event`s sharing one `AttrMap`, and `build_event` clones that map once
+/// per value (`crates/logit-inputs/src/statsd.rs`'s `build_event` doc). Every scalar-valued tag
+/// clones cheaply -- a `SmallVec` memcpy plus a refcount bump on its already-shared `Bytes` slices
+/// of the datagram -- but the repeated tag's `Value::Array` holds a real `Vec` spine, which
+/// `Clone` deep-copies: one fresh allocation per value event (three, here), on top of the one
+/// `insert_tags` itself builds -- four `Array`-shaped allocations in total, plus the same
+/// per-line/per-batch `Vec<Event>` pair every decode pays, for six overall. This is the measured
+/// correction to `build_event`'s doc comment's "memcpy plus a refcount bump" claim, which holds
+/// for a scalar tag but not for an `Array`-valued one.
+#[test]
+fn statsd_decode_one_multi_value_counter_line_with_a_repeated_tag_key() {
+    let mut decoder = fixtures::statsd_decoder();
+    let datagram = fixtures::statsd_multi_value_repeated_tag_datagram(1);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 3, "one event per value (1, 2, 3)");
+    for event in &batch.events {
+        match event.attributes.get("team") {
+            Some(Value::Array(elements)) => assert_eq!(elements.len(), 2, "team:a,team:b"),
+            other => panic!("expected a 2-element Array under 'team', got {other:?}"),
+        }
+    }
+    expect_allocs("statsd_in: decode 1 multi-value counter line with a repeated tag key", stats, 6);
+}
+
 /// A DogStatsD event (`_e{tlen,xlen}:title|text|...`) whose `TEXT` has no `\n` escape to unescape
 /// -- `parse_event`'s `unescape_event_text` takes its zero-copy path (a `slice_of`-backed slice of
 /// the datagram, same as `statsd.event.title` and every other string-valued attribute this decoder
