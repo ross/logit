@@ -1,0 +1,5 @@
+# TYPE bare_no_type unknown
+bare_no_type{instance="{port}"} 1
+# TYPE legacy_metric unknown
+legacy_metric{env="prod",instance="{port}"} 7
+# EOF

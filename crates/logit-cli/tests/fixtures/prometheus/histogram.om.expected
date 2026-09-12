@@ -1,0 +1,10 @@
+# TYPE latency_seconds histogram
+# UNIT latency_seconds seconds
+# HELP latency_seconds Request latency.
+latency_seconds_bucket{instance="{port}",le="0.1"} 1 # {slow="no"} 0.05
+latency_seconds_bucket{instance="{port}",le="1"} 3
+latency_seconds_bucket{instance="{port}",le="+Inf"} 4
+latency_seconds_sum{instance="{port}"} 2.5
+latency_seconds_count{instance="{port}"} 4
+latency_seconds_created{instance="{port}"} 1605281325
+# EOF

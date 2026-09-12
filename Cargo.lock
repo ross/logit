@@ -939,6 +939,7 @@ dependencies = [
  "logit-pipeline",
  "logit-proto",
  "logit-transforms",
+ "reqwest",
  "serde_json",
  "serde_norway",
  "tikv-jemallocator",

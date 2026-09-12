@@ -1,13 +1,19 @@
-# Expose a `/metrics` endpoint for Prometheus to scrape: receive statsd on one edge, aggregate,
-# and serve the result as Prometheus text 0.0.4 / OpenMetrics 1.0 -- the topology `prometheus_out`
-# exists for (docs/adr/prometheus-scrape-and-exposition.md). The scraping client picks the dialect
-# with its own `Accept` header; both are served off the one endpoint.
+# Expose a `/metrics` endpoint for Prometheus to scrape: drain logit's own self-telemetry,
+# aggregate it into cumulative counters/histograms, and serve the result as Prometheus text 0.0.4 /
+# OpenMetrics 1.0 -- the topology `prometheus_out` exists for
+# (docs/adr/prometheus-scrape-and-exposition.md). The scraping client picks the dialect with its
+# own `Accept` header; both are served off the one endpoint.
+#
+# `internal -> aggregate -> prometheus_out` rather than a statsd/OTLP source, so this example runs
+# standalone with nothing external to feed it: `self` below drains logit's own
+# `logit.component.*`/`logit.internal.*`/`logit.process.*` points
+# (docs/design/internal-telemetry.md) and exposes them the same way any other metrics source would.
 #
 # NOTE ON TEMPORALITY -- why the `aggregate` stage is not optional here. Prometheus counters are
 # cumulative, and `prometheus_out` deliberately does *not* accumulate deltas itself: that is
 # summarization, which ADR `lossless-transit` reserves for a stage named in the config rather than
-# something a sink does silently on the way out. statsd counters arrive as delta `Sum`s, and a delta
-# `Sum`/`Histogram` reaching this sink is skipped and counted
+# something a sink does silently on the way out. `internal`'s own `logit.component.*` counters
+# arrive as delta `Sum`s, and a delta `Sum`/`Histogram` reaching this sink is skipped and counted
 # (`logit.output.metrics.skipped{metric_kind="delta_sum"}`) with a throttled
 # `delta_temporality_unresolved` diagnostic naming the fix. `aggregate`'s `temporality: cumulative`
 # is that named stage -- it keeps a per-series running total alive across window boundaries and emits
@@ -19,13 +25,13 @@
 # docs/adr/component-graph-configuration.md): each names its own `sources`, rather than sitting in
 # a fixed inputs/transforms/outputs pipeline.
 components:
-  statsd_in:
-    type: statsd_in
-    bind: 127.0.0.1:8125
+  self:
+    type: internal
+    interval: 10s
 
   windowed:
     type: aggregate
-    sources: [statsd_in]
+    sources: [self]
     interval: 10s
     temporality: cumulative
     # `series_retention` and `max_retained_series` both default to a non-zero value, which

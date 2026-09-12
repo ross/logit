@@ -6,7 +6,7 @@ each file's frontmatter is what orders this index, not the filename.
 
 | Plan | Created | Updated |
 |---|---|---|
-| [Enabling plan: Prometheus scrape ingestion and exposition](prometheus-scrape-and-exposition.md) | 2026-09-11 | 2026-09-11 |
+| [Enabling plan: Prometheus scrape ingestion and exposition](prometheus-scrape-and-exposition.md) | 2026-09-11 | 2026-09-12 |
 | [Closing plan: lossless like-protocol transit](lossless-transit.md) | 2026-09-10 | 2026-09-12 |
 | [Recorded interop fixtures: real producers, captured once, replayed as tests forever](recorded-interop-fixtures.md) | 2026-09-10 | 2026-09-10 |
 | [Enabling plan: `logit_out`/`logit_in` — the native transport](native-transport.md) | 2026-09-09 | 2026-09-09 |

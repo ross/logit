@@ -1,0 +1,6 @@
+# TYPE requests counter
+# HELP requests Total requests served.
+requests_total{method="get"} 1027 1395066363.5
+requests_created{method="get"} 1605281325.123
+requests_total{method="post"} 3
+# EOF

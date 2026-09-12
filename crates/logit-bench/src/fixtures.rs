@@ -24,6 +24,7 @@ use logit_core::{
 use logit_inputs::statsd::StatsdDecoder;
 use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
+use logit_proto::prometheus::{PrometheusDecoder, PrometheusEncoder};
 use logit_proto::Decoder;
 use logit_transforms::{
     AggregateTemporality, Aggregator, CsvParser, Distributions, JsonParser, Keep, Kv, KvMetrics,
@@ -988,4 +989,75 @@ pub fn span_event() -> Event {
         ext: None,
     };
     Event::span(1_725_091_200_000_000_000, attrs, record)
+}
+
+/// One Prometheus text 0.0.4 scrape body, modeled on the metric names and shapes real Node
+/// Exporter and application scrapes actually carry (`docs/design/telemetry-landscape.md`'s
+/// "Prometheus exposition format / OpenMetrics" section) rather than a synthetic shape chosen to
+/// flatter the numbers: two counter families (HTTP request totals, per-CPU seconds), one gauge, one
+/// histogram, and one summary -- 11 series in total (a histogram's buckets and a summary's
+/// quantiles are one composite series each, not one per wire sample line -- see
+/// `logit_proto::prometheus::Point`), covering every kind `prometheus_decode_one_scrape`
+/// (`tests/allocations.rs`) has to walk.
+pub const PROMETHEUS_SCRAPE_BODY: &str = concat!(
+    "# HELP http_requests_total Total HTTP requests processed.\n",
+    "# TYPE http_requests_total counter\n",
+    "http_requests_total{method=\"get\",code=\"200\"} 1027\n",
+    "http_requests_total{method=\"get\",code=\"404\"} 3\n",
+    "http_requests_total{method=\"post\",code=\"200\"} 512\n",
+    "http_requests_total{method=\"post\",code=\"500\"} 2\n",
+    "# HELP node_cpu_seconds_total Seconds the CPUs spent in each mode.\n",
+    "# TYPE node_cpu_seconds_total counter\n",
+    "node_cpu_seconds_total{cpu=\"0\",mode=\"idle\"} 8523.4\n",
+    "node_cpu_seconds_total{cpu=\"0\",mode=\"user\"} 102.4\n",
+    "node_cpu_seconds_total{cpu=\"1\",mode=\"idle\"} 8501.9\n",
+    "node_cpu_seconds_total{cpu=\"1\",mode=\"user\"} 110.2\n",
+    "# HELP node_memory_MemAvailable_bytes Memory available for starting new applications.\n",
+    "# TYPE node_memory_MemAvailable_bytes gauge\n",
+    "node_memory_MemAvailable_bytes 3.1826688e+09\n",
+    "# HELP request_duration_seconds Request latency.\n",
+    "# TYPE request_duration_seconds histogram\n",
+    "request_duration_seconds_bucket{le=\"0.1\"} 1200\n",
+    "request_duration_seconds_bucket{le=\"0.5\"} 1900\n",
+    "request_duration_seconds_bucket{le=\"1\"} 1980\n",
+    "request_duration_seconds_bucket{le=\"+Inf\"} 2000\n",
+    "request_duration_seconds_sum 412.5\n",
+    "request_duration_seconds_count 2000\n",
+    "# HELP go_gc_duration_seconds A summary of the wall-time pause across GC cycles.\n",
+    "# TYPE go_gc_duration_seconds summary\n",
+    "go_gc_duration_seconds{quantile=\"0\"} 0.0001\n",
+    "go_gc_duration_seconds{quantile=\"0.25\"} 0.0003\n",
+    "go_gc_duration_seconds{quantile=\"0.5\"} 0.0006\n",
+    "go_gc_duration_seconds{quantile=\"1\"} 0.0021\n",
+    "go_gc_duration_seconds_sum 0.412\n",
+    "go_gc_duration_seconds_count 812\n",
+);
+
+pub fn prometheus_decoder() -> PrometheusDecoder {
+    PrometheusDecoder::new()
+}
+
+pub fn prometheus_encoder() -> PrometheusEncoder {
+    PrometheusEncoder::new()
+}
+
+/// `count` distinct gauge series under one family, each with its own `shard` label value --
+/// `prometheus_encode_100_series` (`tests/allocations.rs`)'s workload. One family rather than
+/// `wide_gauge_event`'s many-attribute shape: encoding cost here is dominated by the number of
+/// distinct *series* the registry/writer walks, not by any one series' label count.
+pub fn prometheus_gauge_events(count: usize) -> Vec<Event> {
+    (0..count)
+        .map(|i| {
+            let mut attributes = AttrMap::new();
+            attributes.insert("shard", format!("{i}").as_str());
+            Event::metric(
+                0,
+                attributes,
+                MetricRecord::new(
+                    logit_core::interner::intern("prom_bench_gauge"),
+                    MetricKind::Gauge(i as f64),
+                ),
+            )
+        })
+        .collect()
 }

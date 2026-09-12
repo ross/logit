@@ -1,0 +1,4 @@
+# HELP requests_total Total requests served.
+# TYPE requests_total counter
+requests_total{instance="{port}",method="get"} 5 1395066363000
+requests_total{instance="{port}",method="post"} 2

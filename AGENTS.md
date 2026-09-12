@@ -166,7 +166,23 @@ closing assessment; residual debt (post-sketch metric kinds at `statsd_out`, a r
 tag key collapsing to its last value, `Encoder`'s per-batch-`Bytes` shape not fitting per-message
 framing, `statsd_out` carrying no `unit` and no native rename/prefix and stamping an egress
 timestamp only on a `|T`-marked line, and syslog's `event.timestamp` staying receipt time while the
-wire TIMESTAMP follows the precedence table) lives in `docs/known-gaps.md`.
+wire TIMESTAMP follows the precedence table) lives in `docs/known-gaps.md`. `prometheus_in`/`prometheus_out`
+(`crates/logit-inputs`/`crates/logit-outputs`, `crates/logit-proto`'s `prometheus` codec) are the
+fourth like-protocol pair under that ADR, and the first one built lossless against the model from
+its first PR rather than retrofitted: `prometheus_in` scrapes `/metrics` targets on an interval,
+`prometheus_out` serves one back, both dialects (Prometheus text 0.0.4 and OpenMetrics 1.0)
+negotiated on `Accept`/`Content-Type`, so `prometheus_in -> prometheus_out` is a fixed point modulo
+a short, named list of normalizations
+([ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md),
+[examples/prometheus-relay.yaml](examples/prometheus-relay.yaml)). `aggregate` gained a
+`temporality: cumulative` mode alongside them: a delta `Sum`/`Histogram` accumulator survives each
+flush and keeps summing instead of resetting, which is what lets `statsd_in -> aggregate ->
+prometheus_out` and `internal -> aggregate -> prometheus_out` expose real running counters
+(`prometheus_out` itself never accumulates a delta — that summarization stays `aggregate`'s job,
+per `lossless-transit`'s "summarization is opt-in and named" rule) — see that same ADR's
+"Temporality is `aggregate`'s job" section and the
+[ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md) cumulative
+amendment.
 
 ## Environment
 

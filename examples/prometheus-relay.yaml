@@ -1,0 +1,27 @@
+# Relays a scraped `/metrics` endpoint through `logit` unchanged (modulo the permitted
+# normalizations `docs/adr/prometheus-scrape-and-exposition.md`'s "Permitted normalizations for
+# this pair" section names): `prometheus_in` pulls a target's exposition on an interval,
+# `prometheus_out` re-exposes exactly what it decoded for something else to scrape. No `aggregate`
+# in between -- this is the like-pair relay shape `docs/adr/lossless-transit.md` calls a "fixed
+# point," the same role `syslog_in -> syslog_out` and `otlp_in -> otlp_out` play for their own
+# protocols, applied to Prometheus.
+#
+# `prometheus_in -> prometheus_out` is a fixed point modulo one named normalization: the scraper
+# stamps an unprefixed `instance` label (`host:port` of the scraped target) onto every series,
+# exactly as Prometheus's own scrape does -- so every series `metrics` below exposes carries
+# `instance="127.0.0.1:9100"` even though the target itself never sent that label. `job` is
+# operator identity, not a fact about the target, so it is deliberately *not* stamped here; add a
+# `set` component between the two if this relay needs one.
+components:
+  node_exporter:
+    type: prometheus_in
+    targets: ["http://127.0.0.1:9100/metrics"] # an absolute http(s) URL; node-exporter's default
+    interval: 15s # the standard Prometheus scrape cadence
+
+  metrics:
+    type: prometheus_out
+    sources: [node_exporter]
+    # 127.0.0.1, not 0.0.0.0: no TLS and no auth on this endpoint in v1
+    # (docs/adr/prometheus-scrape-and-exposition.md's "Security posture", docs/known-gaps.md) --
+    # bind loopback or pod-local and front it with something that has both.
+    bind: 127.0.0.1:9464

@@ -302,6 +302,34 @@ fn statsd_decode_into_a_warm_reused_buffer_costs_one_not_two() {
     expect_allocs("statsd_in: decode_into into a warm buffer", stats, 1);
 }
 
+/// `prometheus_in`'s decode path has no `Decoder` trait to go through (`docs/adr/
+/// prometheus-scrape-and-exposition.md`'s "No `logit_proto::Encoder`" section) -- it's the two
+/// plain functions a real scrape tick calls in sequence: `text::parse_with` (bytes -> families)
+/// then `families_to_events` (families -> `Event`s), against `fixtures::PROMETHEUS_SCRAPE_BODY`'s
+/// 11-series scrape (a histogram's buckets and a summary's quantiles are each one composite series,
+/// not one per wire sample line). Warmed first so every metric/label name's one-time
+/// `interner::intern` cost (paid once per process, not per scrape) doesn't inflate the steady-state
+/// count this pins.
+#[test]
+fn prometheus_decode_one_scrape() {
+    use logit_proto::prometheus::families_to_events;
+    use logit_proto::prometheus::text::{parse_with, Dialect};
+
+    let mut decoder = fixtures::prometheus_decoder();
+    let body = fixtures::PROMETHEUS_SCRAPE_BODY.as_bytes();
+    let warm_families =
+        parse_with(body, Dialect::Text0_0_4, &mut decoder).expect("fixture body must parse");
+    drop(families_to_events(&warm_families, 0, &mut decoder));
+
+    let (events, stats) = measure(|| {
+        let families =
+            parse_with(body, Dialect::Text0_0_4, &mut decoder).expect("fixture body must parse");
+        families_to_events(&families, 0, &mut decoder)
+    });
+    assert_eq!(events.len(), 11, "fixtures::PROMETHEUS_SCRAPE_BODY carries 11 series");
+    expect_allocs("prometheus_in: decode 1 scrape (11 series)", stats, 161);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Listener receive queue and batch accumulator (docs/adr/decoupled-listener-io.md)
 // ---------------------------------------------------------------------------------------------
@@ -2110,6 +2138,38 @@ fn syslog_encode_into_100_events() {
     assert_eq!(out.len(), 100);
     assert_eq!(stats_out.skipped_no_log, 0);
     expect_allocs("syslog_out: encode_into 100 events", stats, 100);
+}
+
+/// `prometheus_out`'s encode path, like `prometheus_in`'s, is two plain functions rather than a
+/// `Decoder`/`Encoder` trait call (`docs/adr/prometheus-scrape-and-exposition.md`'s "No
+/// `logit_proto::Encoder`" section): `events_to_families` (a stateful sink's `send`) then
+/// `text::write` (a scrape request's own render) -- against 100 distinct gauge series under one
+/// family (`fixtures::prometheus_gauge_events`), the shape `prometheus_out`'s own registry walks on
+/// every scrape.
+#[test]
+fn prometheus_encode_100_series() {
+    use logit_proto::prometheus::events_to_families;
+    use logit_proto::prometheus::text::{write, Dialect};
+
+    let mut encoder = fixtures::prometheus_encoder();
+    let events = fixtures::prometheus_gauge_events(100);
+    let resource = fixtures::resource();
+    let warm_families =
+        events_to_families(events.iter().map(|event| (resource.as_ref(), event)), &mut encoder);
+    let mut warm_out = Vec::new();
+    write(&warm_families, Dialect::Text0_0_4, &mut warm_out);
+
+    let (out, stats) = measure(|| {
+        let families =
+            events_to_families(events.iter().map(|event| (resource.as_ref(), event)), &mut encoder);
+        let mut out = Vec::new();
+        write(&families, Dialect::Text0_0_4, &mut out);
+        out
+    });
+    let text = std::str::from_utf8(&out).expect("exposition must be utf-8");
+    let series = text.lines().filter(|line| line.starts_with("prom_bench_gauge{")).count();
+    assert_eq!(series, 100, "expected all 100 distinct series to render, got:\n{text}");
+    expect_allocs("prometheus_out: encode 100 series", stats, 414);
 }
 
 // ---------------------------------------------------------------------------------------------
