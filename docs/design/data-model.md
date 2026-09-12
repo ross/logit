@@ -72,10 +72,12 @@ buffer should end up as a zero-copy slice of that buffer, not a fresh allocation
 cheaply `Clone`-able (refcounted) and cheaply sliced, which both the parsing path and the Lua proxy
 depend on.
 
-Measured, `syslog_in` and `json` keep that promise (decoding a line costs one allocation regardless
-of how many fields it yields) and `statsd_in` does not (it copies each tag value out of the
-datagram instead of slicing it). See [memory.md](memory.md)'s zero-copy section — both facts are
-pinned by tests, not left to inspection.
+Measured, `syslog_in`, `json`, and `statsd_in` all keep that promise now: decoding a line costs one
+allocation (`statsd_in`: two, split across a per-line and a per-batch `Vec<Event>` by its
+multi-value grammar) regardless of how many fields, tag values, or set members it yields.
+`statsd_in`'s tag values, `|c:<id>`, and a `SetMembers` line's members are all zero-copy slices of
+the datagram, the same pointer-arithmetic reconstruction (`slice_of`) `syslog_in`'s own fields use.
+See [memory.md](memory.md)'s zero-copy section — pinned by tests, not left to inspection.
 
 ## Attributes: interned keys, small-map storage
 
@@ -125,7 +127,7 @@ other sink, which is what makes `prometheus_in -> prometheus_out` an exact fixed
 | Attribute | Value | Meaning |
 |---|---|---|
 | `prometheus.type` | `Value::Str`: `untyped`\|`unknown`\|`info`\|`stateset`\|`gaugehistogram` | The wire family type for the five cases the model has no distinct kind for: `untyped`/`unknown` (both a `Gauge`, one spelling per dialect), `info` (a `Gauge(1)` whose labels are the payload), `stateset` (one `Gauge(0\|1)` per state), `gaugehistogram` (a `Histogram` of a quantity that can decrease). Stamped by `prometheus_in`; read and consumed by `prometheus_out`, which re-emits that exact family type. |
-| `prometheus.timestamp` | `Value::Bool(true)` | The sample carried its own timestamp on the wire (most don't — a scrape stamps them all with its own start time). `prometheus_out` re-emits a timestamp on that line only, in the output dialect's own unit. Same shape as the planned `statsd.timestamp`. |
+| `prometheus.timestamp` | `Value::Bool(true)` | The sample carried its own timestamp on the wire (most don't — a scrape stamps them all with its own start time). `prometheus_out` re-emits a timestamp on that line only, in the output dialect's own unit. The same "the wire carried its own timestamp" convention `statsd.timestamp` below already uses for DogStatsD's `|T` segment, in the shape a boolean marker needs: a Prometheus sample's timestamp is the event's own, so there is nothing to carry but the fact that it was sent. |
 | `prometheus.target` | `Value::Str`, a **resource** attribute | The full scrape URL of the target this batch came from (`http://node-exporter:9100/metrics`), stamped once per target by `prometheus_in`. Factual, like `docker_in`'s `container.*` — not an invented `service.name`. Consumed by `prometheus_out`. |
 | `instance` | `Value::Str`, a **resource** attribute | `host:port` of the scraped target — deliberately **unprefixed**, so it renders as a label like any other resource attribute, exactly the `instance` label Prometheus's own scrape adds. Without it two targets running the same exporter would collapse onto one series through a relay. An event-level `instance` wins over the resource's (`honor_labels` semantics), which falls out of the ordinary resource/event attribute merge. `job` is operator identity, not a scrape fact, and comes from a downstream `set`. |
 
@@ -153,6 +155,19 @@ source:
 | `span.duration_s` | decimal seconds (number or `Str`) | nginx's `$request_time`. |
 | `span.{start,end}_rfc3339` | RFC 3339 string | Parsed by `logit_core::parse_rfc3339_to_nanos`, up to 9 fractional digits. |
 | `syslog.sd` | `Value::Map { "<SD-ID>" -> Value::Map { "<PARAM-NAME>" -> Value::Str \| Value::Array<Value::Str> } }` | `syslog_in`'s parsed RFC 5424 STRUCTURED-DATA (absent when the wire carried the nil `-`); a repeated PARAM-NAME within one SD-ELEMENT becomes the `Array` form, in order. `syslog_out` re-emits every element, escaped per RFC 5424 §6.3.3; see [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md). |
+| `statsd.type` | `Value::Str`: `ms`\|`h`\|`d` | `statsd_in`'s wire-type letter for a timer/histogram/distribution line, stamped on the `MetricKind::Samples` record it decodes to since all three land on the same shape; `statsd_out` reads it to pick the wire-type letter it re-emits, defaulting to `ms` when absent or unrecognized. See [ADR `statsd-output`](../adr/statsd-output.md)'s amendment. |
+| `statsd.container_id` | `Value::Str` | `statsd_in`'s `\|c:<container-id>` segment (DogStatsD v1.2+, accepted here on every metric type, not only `c`/`g`), round-tripped by `statsd_out` under `format: dogstatsd` only. |
+| `statsd.timestamp` | `Value::U64` | The raw seconds off an incoming `\|T<unix-seconds>` segment, stamped by `statsd_in` alongside moving the same value onto `Event::timestamp` (as `secs * 1_000_000_000`) -- carrying the wire value itself, not just a marker bit, so a stage that rebuilds `Event::timestamp` after decode (`aggregate`'s flush, notably) can't fabricate or collapse a `\|T` on the way back out; `statsd_out` re-emits `\|T<secs>` from this attribute's own `U64` value (never from `Event::timestamp`) under `format: dogstatsd` only, and not at all when the attribute is absent or not a `U64`. Also stamped, with the identical value/round-trip contract, from a DogStatsD event's or service check's own `d:<unix-seconds>` field -- `statsd_out` re-emits it as `d:<secs>` (never `\|T`) on those two line shapes. |
+| `statsd.event.title` | `Value::Str` | `statsd_in`'s decode of a DogStatsD event (`_e{TITLE_LEN,TEXT_LEN}:title\|text\|...`) -- always present. `statsd_out` renders it as the line's `title`, sanitized (control bytes only; a bare `\|` is fine, since the byte-length prefix delimits the field). See [ADR `statsd-output`](../adr/statsd-output.md)'s "DogStatsD events and service checks" amendment. |
+| `statsd.event.priority` | `Value::Str`: `normal`\|`low` | `statsd_in`'s `p:` field, only when sent. `statsd_out` writes it verbatim when it's exactly `normal`/`low`; any other value is omitted and counted (`EncodeStats::dropped_invalid_event_fields`), not synthesized or substituted. |
+| `statsd.event.alert_type` | `Value::Str`: `info`\|`success`\|`warning`\|`error` | `statsd_in`'s `t:` field, only when sent -- also what `t:warning`/`t:error`/`t:success`/`t:info` map onto `LogRecord.severity` (`Warn`/`Error`/`Info`/`Info`) at decode time. `statsd_out` never re-derives this from `LogRecord.severity`: an absent carrier means an absent `t:` field, never an invented one. Same omit-and-count treatment as `statsd.event.priority` for an out-of-set value. |
+| `statsd.event.aggregation_key` | `Value::Str` | `statsd_in`'s `k:` field, only when sent; round-tripped as `k:` verbatim (`\|`/control bytes substituted). |
+| `statsd.event.source_type` | `Value::Str` | `statsd_in`'s `s:` field, only when sent; round-tripped as `s:` the same way as `statsd.event.aggregation_key`. |
+| `statsd.event.host` | `Value::Str` | `statsd_in`'s `h:` field on an event line, only when sent; round-tripped as `h:` the same way. |
+| `statsd.service_check.name` | `Value::Str` | `statsd_in`'s decode of a DogStatsD service check (`_sc\|name\|status\|...`) -- always present; the raw wire spelling, kept separately from the metric's own (normalized, interned) name since `MetricRecord` has nowhere else for it to land (rule (b), [ADR `lossless-transit`](../adr/lossless-transit.md)). `statsd_out` renders it as `name`, sanitized with the same `\|`/control-byte rule as `statsd.event.host` (not the metric-name sanitizer), so `.` and spaces survive as sent. |
+| `statsd.service_check.status` | `Value::U64`: `0..=3` | `statsd_in`'s `STATUS` field -- always present, and also what the event's own `MetricKind::Gauge` value is set to. `statsd_out` prefers this carrier for the wire `status`, falling back to the gauge's own value (finite, rounding into `0..=3`) only when the carrier is absent or out of range; a service check with neither is dropped whole and counted (`EncodeStats::dropped_invalid_service_check`). |
+| `statsd.service_check.message` | `Value::Str` | `statsd_in`'s `m:` field, only when sent -- verbatim, including any `\|` it contains (`m:` is always the wire line's last field, so nothing after it needs its own delimiter). `statsd_out` re-emits it last, with control bytes (including a real newline) substituted and `\|` left alone. |
+| `statsd.service_check.host` | `Value::Str` | `statsd_in`'s `h:` field on a service-check line, only when sent; round-tripped the same way as `statsd.event.host`/`statsd.event.aggregation_key`. |
 
 Rules that apply across the whole table (the trace/span rows above; `syslog.sd`'s own rules are the
 linked ADR's, not these): `""`, `"-"`, and `Null` all count as absent — how nginx's
@@ -217,9 +232,9 @@ pub enum MetricKind {
     Sum(Sum),                             // replaces Counter; MetricKind::counter(v) for delta+monotonic
     Gauge(f64),
     GaugeDelta(f64),   // unresolved relative adjustment; resolved into Gauge by `aggregate` only
-    Samples(Samples),                     // raw observations, e.g. statsd ms/h/d -- no producer until W3
+    Samples(Samples),                     // raw observations -- statsd_in's ms/h/d decode straight to this
     Distribution(DdSketch),               // produced only by `aggregate`, merging a run of Samples
-    SetMembers(Vec<bytes::Bytes>),        // raw set members, e.g. statsd s -- no producer until W3
+    SetMembers(Vec<bytes::Bytes>),        // raw set members -- statsd_in's s decodes straight to this
     Set(HyperLogLog),                     // produced only by `aggregate`, merging a run of SetMembers
     Histogram(Histogram),                 // fixed, explicit bucket bounds
     ExponentialHistogram(ExpHistogram),   // OTLP/Prometheus base-2 exponential bucketing, kept
@@ -325,18 +340,20 @@ temporality and monotonicity on `Sum`, sum/count/min/max on `Histogram`/`Exponen
   error bound. Plain reservoir sampling or naive percentile-of-percentiles does not merge correctly
   — merging two nodes' p99s is not the p99 of the merged data — so DDSketch is load-bearing for the
   whole distributed-aggregation story, not a nice-to-have. `Samples` (raw statsd `ms`/`h`/`d`
-  observations) is what `aggregate` sketches into a `Distribution` — no *producer* until W3, but a
-  real absorb rule since W2 (above).
+  observations, `statsd_in`'s own decode target since W3) is what `aggregate` sketches into a
+  `Distribution` by default, or retains raw under `distributions: samples` (a real absorb rule
+  since W2, above).
 - `Set` uses a **HyperLogLog** (wrapping the `cardinality-estimator` crate), which merges (union)
-  exactly by construction. `SetMembers` (raw statsd `s` members) is `Set`'s own raw counterpart,
-  same relationship as `Samples`/`Distribution` — no *producer* until W3 (`statsd_in` still decodes
-  straight to `Distribution`/errors on `s`), but `aggregate` (W2) now really absorbs both raw pairs:
-  a `Samples` series sketches into a `Distribution` by default (or retains raw values under
-  `distributions: samples`, bounded by a cap), and a `SetMembers` series estimates into a `Set` by
-  default (or retains an exact deduplicated member set under `sets: members`, bounded by a cap) —
-  see [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment for
-  the full design, including the fallback rule each raw mode's cap (or, for `distributions: samples`,
-  a `sample_rate` mismatch) triggers.
+  exactly by construction. `SetMembers` (raw statsd `s` members, `statsd_in`'s own decode target
+  since W3) is `Set`'s own raw counterpart, same relationship as `Samples`/`Distribution`.
+  `aggregate` (W2) absorbs both raw pairs: a `Samples` series sketches into a `Distribution` by
+  default (or retains raw values under `distributions: samples`, bounded by a cap), and a
+  `SetMembers` series estimates into a `Set` by default (or retains an exact deduplicated member
+  set under `sets: members`, bounded by a cap) — see
+  [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment for the
+  full design, including the fallback rule each raw mode's cap (or, for `distributions: samples`,
+  a `sample_rate` mismatch) triggers, and [ADR `statsd-output`](../adr/statsd-output.md)'s amendment
+  for `statsd_in`/`statsd_out`'s own side of the raw pair.
 - `Sum`/`Gauge` merge trivially (sum / last-write-wins by timestamp) for the delta-monotonic case
   `MetricKind::counter` produces; a cumulative or non-monotonic `Sum` has no merge rule defined
   here and passes through unmerged, the same as `Histogram`/`ExponentialHistogram`/`Summary`.
@@ -349,13 +366,18 @@ temporality and monotonicity on `Sum`, sum/count/min/max on `Histogram`/`Exponen
   [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment for why that's true for
   gauges specifically and not for a delta-monotonic `Sum`.
 
-A `Distribution`'s `count()` becomes a **population estimate**, not a count of received
-datagrams, wherever sample-rate extrapolation is in play: `statsd_in`'s `ms`/`h`/`d` decoding
-(`crates/logit-inputs/src/statsd.rs`) inserts `(1.0 / sample_rate).round()` weighted samples per
-line via `DdSketch::add_weighted`, so a sketch fed by `100|ms|@0.1` reports `count() == 10` even
-though only one datagram arrived. This is the same relationship `MetricKind::counter(value / sample_rate)`
-already has for counters, made explicit for distributions too — `count` answers "how many events
-this represents," not "how many datagrams I received."
+A `Distribution`'s `count()` becomes a **population estimate**, not a count of raw observations
+retained, wherever sample-rate extrapolation is in play: `aggregate`'s default `distributions:
+sketch` mode inserts `(1.0 / sample_rate).round()` weighted samples per absorbed `Samples` record
+via `Samples::sketch`/`DdSketch::add_weighted` (`crates/logit-core/src/metric.rs`), so a sketch fed
+by the `Samples` record `statsd_in` decodes from `100|ms|@0.1` reports `count() == 10` even though
+that record itself held one raw value. This is the same relationship
+`MetricKind::counter(value / sample_rate)` already has for counters, made explicit for
+distributions too — `count` answers "how many events this represents," not "how many raw
+observations were retained." Since [ADR `lossless-transit`](../adr/lossless-transit.md)'s W3,
+`statsd_in` itself performs no such extrapolation at decode time at all: the raw `sample_rate`
+rides verbatim on the `Samples` record it decodes to, and only `aggregate` (or a sink encoding
+`Samples` directly) ever reads it.
 
 ## What lives outside `Event`
 
