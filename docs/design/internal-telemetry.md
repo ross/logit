@@ -661,6 +661,29 @@ Worked examples, one per shipped component:
   unstable. `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` — the `Fault`
   taxonomy itself as request-outcome classes, the same shape `influxdb_out`'s HTTP-status classes
   and `syslog_out`'s `ok`/`error` pair are, just with this sink's own vocabulary.
+- `prometheus_out` (`crates/logit-outputs/src/prometheus.rs`, codec in
+  `crates/logit-proto/src/prometheus/`, [ADR
+  `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md)): the one pull
+  sink, so no `requests`/`request.duration`/`batch.bytes` — nothing is pushed per batch. In their
+  place, `logit.output.scrapes{class="ok"|"not_found"|"method"}` (count, one per inbound HTTP
+  request — `ok` means *rendered*, not acknowledged, since a `Full<Bytes>` body has no completion
+  hook) and `logit.output.scrape.bytes` (post-gzip when negotiated, so transfer cost rather than
+  exposition size). Registry state, which no push sink holds: `logit.output.series` (gauge, series
+  held after each `send`), `logit.output.series.evicted{reason="expired"|"cardinality"}` (the
+  `expire_after` sweep — run on every `send` *and* every scrape — and the `max_series` LRU cap), and
+  `logit.output.metrics.type_conflict` (a family re-typed across batches, evicting every series held
+  under the old type). The codec's `PrometheusEncoder`, shared by `send` and render so both sides
+  total under one component: `logit.output.metrics.skipped{metric_kind="delta_sum"|
+  "delta_histogram"|"gauge_delta"|"exponential_histogram"}` and `{reason="no_recorded_value"|
+  "type_conflict"|"name_collision"}` (the latter two *within* one batch, distinct from the
+  cross-batch `type_conflict` counter above), `logit.output.metrics.degraded{metric_kind=
+  "non_monotonic_sum"|"distribution"|"samples"|"set"|"set_members"}` and `{reason=
+  "exemplar_dropped"|"unit_not_suffix"}` (render-side), and `logit.output.labels.dropped{reason=
+  "unrepresentable"|"reserved"|"collision"}`. Diagnostics: `delta_temporality_unresolved` (both
+  delta arms, naming the `aggregate` with `temporality: cumulative` fix), the shared
+  `gauge_delta_unresolved` key `influxdb_out`/`statsd_out` use, `prometheus_exponential_histogram_
+  skipped`, and `prometheus_accept_failed` from the scrape listener's accept loop. Retry stays a
+  Layer 2 metric, though for a pull sink `send` is an in-memory upsert that has nothing to retry.
 
 ## Metrics from Lua scripts
 
