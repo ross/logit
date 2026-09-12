@@ -739,11 +739,11 @@ fn aggregate_flush_100_series() {
 }
 
 /// The retention path's own allocation cost, isolated on purpose from the fixture above:
-/// `flush`'s retain branch (`gauge_retention > 0`, `crates/logit-transforms/src/aggregate.rs`)
+/// `flush`'s retain branch (`series_retention > 0`, `crates/logit-transforms/src/aggregate.rs`)
 /// clones `key.attributes` for a retained series -- unlike the default tumbling path, which
 /// moves it -- because the series' key has to survive to become its own map key again for the
 /// next window. `aggregate_flush_100_series` never exercises this branch at all
-/// (`gauge_retention: 0` there, the fixture-default `Aggregator`), and its `keep`-trimmed
+/// (`series_retention: 0` there, the fixture-default `Aggregator`), and its `keep`-trimmed
 /// attributes fit inline, so it couldn't pin this cost even if it did. This fixture is
 /// deliberately *not* `keep`-trimmed (12 attributes, past `AttrMap`'s 8-slot inline capacity),
 /// specifically so the clone this measures is a real heap allocation, not a memcpy that would
@@ -755,7 +755,7 @@ fn aggregate_flush_100_series() {
 #[test]
 fn aggregate_flush_retained_gauges() {
     let resource = fixtures::resource();
-    let mut agg = fixtures::aggregator_with_gauge_retention(5, 1_000);
+    let mut agg = fixtures::aggregator_with_series_retention(5, 1_000);
     for i in 0..100 {
         drop(agg.process(&resource, fixtures::wide_gauge_event(&format!("gauge{i}"), i as f64)));
     }
@@ -774,6 +774,35 @@ fn aggregate_flush_retained_gauges() {
     let series: usize = flushed.iter().map(|(_, _, events)| events.len()).sum();
     assert_eq!(series, 100, "every series was updated again before this flush");
     expect_allocs("aggregate: flush 100 retained gauge series (spilled attrs)", stats, 209);
+}
+
+/// `temporality: cumulative`'s own flush cost (`docs/adr/aggregation-window-semantics.md`'s
+/// cumulative amendment), measured against [`aggregate_flush_retained_gauges`] deliberately: same
+/// 100 series, same spilled 12-attribute maps, same steady-state second flush, a retained delta
+/// `Sum` instead of a retained `Gauge`. The point of the comparison is that the number is *the
+/// same*: a retained `Sum` reports through the identical copy-then-keep path a retained gauge does
+/// (`Accumulator::kind_for_retained`, `Copy` fields both), so cumulative counters cost a flush
+/// nothing beyond what gauge retention already costs -- the `key.attributes.clone()` plus the
+/// per-series `Vec<SpanLink>`, and nothing else. A cumulative `Histogram` is the one shape that
+/// would add to this (one bucket-`Vec` clone per series per flush); it has no wire producer in this
+/// workstream, so there is nothing honest to fixture it from yet.
+#[test]
+fn aggregate_flush_cumulative_sums() {
+    let resource = fixtures::resource();
+    let mut agg = fixtures::aggregator_cumulative(5, 1_000);
+    for i in 0..100 {
+        drop(agg.process(&resource, fixtures::wide_counter_event(&format!("counter{i}"), 1.0)));
+    }
+    drop(agg.flush(1_000_000_000)); // warm: interns every series name, grows every buffer once
+
+    for i in 0..100 {
+        drop(agg.process(&resource, fixtures::wide_counter_event(&format!("counter{i}"), 1.0)));
+    }
+
+    let (flushed, stats) = measure(|| agg.flush(2_000_000_000));
+    let series: usize = flushed.iter().map(|(_, _, events)| events.len()).sum();
+    assert_eq!(series, 100, "every cumulative series was updated again before this flush");
+    expect_allocs("aggregate: flush 100 cumulative sum series (spilled attrs)", stats, 209);
 }
 
 /// The absorb-path cost of a raw `Samples` record in the default `distributions: sketch` mode

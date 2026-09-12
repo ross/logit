@@ -405,22 +405,32 @@ pub enum ComponentKind {
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         interval: Duration,
-        /// How many consecutive windows a gauge series with no new data is retained past its
-        /// last update, so a relative gauge adjustment (`docs/adr/relative-gauge-adjustments.md`)
-        /// arriving in a later window can still resolve against the value it last held. `0`
-        /// disables retention entirely -- every gauge series is drained every window exactly like
-        /// a counter, matching this field's absence before it existed. See the
-        /// `docs/adr/aggregation-window-semantics.md` amendment for the full design.
-        #[serde(default = "default_gauge_retention")]
-        gauge_retention: u32,
-        /// A hard cap on how many gauge series may be retained across this component's whole
-        /// window at once -- a DoS/cardinality guard, not a tuning knob. `gauge_retention` alone
-        /// bounds only how long one series survives; without this, a sustained stream of
-        /// never-repeating series names would hold unboundedly many retained series regardless of
-        /// how short the retention window is. Least-recently-updated series are evicted first
-        /// once exceeded.
-        #[serde(default = "default_max_retained_gauge_series")]
-        max_retained_gauge_series: usize,
+        /// Whether each window's emitted `Sum`/`Histogram` is that window's own increment
+        /// (`delta`, the default -- strictly tumbling, self-contained) or a running total since
+        /// the series was first seen (`cumulative`, what OTLP and Prometheus scrapes carry). See
+        /// [`AggregateTemporality`] and the `docs/adr/aggregation-window-semantics.md`
+        /// "cumulative temporality as an opt-in mode" amendment.
+        #[serde(default)]
+        temporality: AggregateTemporality,
+        /// How many consecutive windows a series with no new data is retained past its last
+        /// update. For a gauge that's so a relative gauge adjustment
+        /// (`docs/adr/relative-gauge-adjustments.md`) arriving in a later window can still resolve
+        /// against the value it last held; under `temporality: cumulative` it is also what keeps a
+        /// `Sum`/`Histogram`'s running total alive across the window boundary. `0` disables
+        /// retention entirely -- every series is drained every window, matching this field's
+        /// absence before it existed -- and is therefore rejected at graph-validation time
+        /// alongside `temporality: cumulative`, which would otherwise emit each window's delta
+        /// labelled as a cumulative total. See the `docs/adr/aggregation-window-semantics.md`
+        /// amendments for the full design.
+        #[serde(default = "default_series_retention")]
+        series_retention: u32,
+        /// A hard cap on how many series may be retained across this component's whole window at
+        /// once -- a DoS/cardinality guard, not a tuning knob. `series_retention` alone bounds
+        /// only how long one series survives; without this, a sustained stream of never-repeating
+        /// series names would hold unboundedly many retained series regardless of how short the
+        /// retention window is. Least-recently-updated series are evicted first once exceeded.
+        #[serde(default = "default_max_retained_series")]
+        max_retained_series: usize,
         /// Whether a raw `Samples` series (statsd `ms`/`h`/`d`) absorbs into this window as a
         /// sketch (the default -- exact, error-bounded quantiles, no raw values retained past the
         /// window) or keeps its raw observations for the whole window, only falling back to a
@@ -434,7 +444,7 @@ pub enum ComponentKind {
         distributions: Distributions,
         /// A hard cap on how many raw values one `Samples` series may retain in one window before
         /// `distributions: samples` falls back to sketching what it already holds -- a DoS/memory
-        /// guard, not a tuning knob, the same role `max_retained_gauge_series` plays for gauges.
+        /// guard, not a tuning knob, the same role `max_retained_series` plays for retention.
         /// Meaningless when `distributions` is `sketch` (the default), since nothing raw is ever
         /// retained in that mode.
         #[serde(default = "default_max_samples_per_series")]
@@ -1081,17 +1091,37 @@ pub enum Sets {
     Members,
 }
 
-/// `Aggregate::gauge_retention`'s default: retention is on by default, at a modest depth --
+/// [`ComponentKind::Aggregate`]'s `temporality` field -- what a flushed `Sum`/`Histogram` means.
+/// See that field's own doc comment and the `docs/adr/aggregation-window-semantics.md`
+/// "cumulative temporality as an opt-in mode" amendment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AggregateTemporality {
+    /// Every window's emitted `Sum`/`Histogram` is that window's own increment, and the
+    /// accumulator resets at each flush -- strictly tumbling, the behavior every config had before
+    /// this field existed, and what an InfluxDB/statsd-shaped consumer expects.
+    #[default]
+    Delta,
+    /// A `Sum`/`Histogram` series' accumulator survives the flush and keeps summing, so every
+    /// window emits the running total since the series was first seen, stamped with that
+    /// first-seen time as `start_timestamp` -- the reset signal OTLP and Prometheus use. Required
+    /// by `prometheus_out`, which skips delta records
+    /// (`docs/adr/prometheus-scrape-and-exposition.md`). Bounded by `series_retention` /
+    /// `max_retained_series`, exactly as gauge retention is.
+    Cumulative,
+}
+
+/// `Aggregate::series_retention`'s default: retention is on by default, at a modest depth --
 /// `0` (the pre-existing, always-tumbling behavior) is an explicit opt-out, not the default,
 /// since a relative gauge adjustment silently resolving against 0.0 every time (what `0` means)
 /// is the wrong default for a feature whose entire point is making that case rare.
-fn default_gauge_retention() -> u32 {
+fn default_series_retention() -> u32 {
     5
 }
 
-/// `Aggregate::max_retained_gauge_series`'s default -- a DoS/cardinality guard, not a tuning
+/// `Aggregate::max_retained_series`'s default -- a DoS/cardinality guard, not a tuning
 /// knob (see the field's own doc comment).
-fn default_max_retained_gauge_series() -> usize {
+fn default_max_retained_series() -> usize {
     10_000
 }
 
@@ -2017,8 +2047,9 @@ mod tests {
         match component.kind {
             ComponentKind::Aggregate {
                 interval,
-                gauge_retention,
-                max_retained_gauge_series,
+                temporality,
+                series_retention,
+                max_retained_series,
                 distributions,
                 max_samples_per_series,
                 sets,
@@ -2028,8 +2059,9 @@ mod tests {
                 // Additive fields: an existing config with none of these at all still
                 // deserializes, defaulting all of them (proves the config change is additive, per
                 // script/validate over demo/examples).
-                assert_eq!(gauge_retention, 5);
-                assert_eq!(max_retained_gauge_series, 10_000);
+                assert_eq!(temporality, AggregateTemporality::Delta);
+                assert_eq!(series_retention, 5);
+                assert_eq!(max_retained_series, 10_000);
                 assert_eq!(distributions, Distributions::Sketch);
                 assert_eq!(max_samples_per_series, 1000);
                 assert_eq!(sets, Sets::Estimate);
@@ -2040,22 +2072,40 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_component_can_override_gauge_retention() {
+    fn aggregate_component_can_override_series_retention() {
         let component: Component = serde_json::from_str(
-            r#"{"type": "aggregate", "sources": ["in"], "interval": "10s", "gauge_retention": 0, "max_retained_gauge_series": 100}"#,
+            r#"{"type": "aggregate", "sources": ["in"], "interval": "10s", "series_retention": 0, "max_retained_series": 100}"#,
         )
         .unwrap();
         match component.kind {
-            ComponentKind::Aggregate { gauge_retention, max_retained_gauge_series, .. } => {
-                assert_eq!(gauge_retention, 0);
-                assert_eq!(max_retained_gauge_series, 100);
+            ComponentKind::Aggregate { series_retention, max_retained_series, .. } => {
+                assert_eq!(series_retention, 0);
+                assert_eq!(max_retained_series, 100);
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    /// `temporality: cumulative` parses as the opt-in mode (`docs/adr/
+    /// aggregation-window-semantics.md`'s cumulative amendment) -- `snake_case`, like every other
+    /// config enum.
+    #[test]
+    fn aggregate_component_parses_cumulative_temporality() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "aggregate", "sources": ["in"], "interval": "10s", "temporality": "cumulative"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Aggregate { temporality, series_retention, .. } => {
+                assert_eq!(temporality, AggregateTemporality::Cumulative);
+                assert_eq!(series_retention, 5, "retention keeps its own default under cumulative");
             }
             other => panic!("expected Aggregate, got {other:?}"),
         }
     }
 
     /// Same defaults assertion as `aggregate_component_with_interval_deserializes`, isolated to
-    /// just the four W2 fields so a future change to the gauge-retention fields can't mask a
+    /// just the four W2 fields so a future change to the retention fields can't mask a
     /// regression here (or vice versa).
     #[test]
     fn aggregate_component_defaults_to_sketch_and_estimate_with_1000_caps() {
