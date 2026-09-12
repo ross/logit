@@ -585,9 +585,11 @@ newly discovered here:
 - A repeated DogStatsD tag key (`#team:a,team:b`) collapses to its last value, because `AttrMap` is
   a map, not a multiset — a model gap, not a codec bug (`docs/known-gaps.md`'s "A repeated DogStatsD
   tag key collapses to its last value" entry).
-- `logit_proto::Encoder`'s one-`Bytes`-per-batch contract still doesn't fit `syslog_out`'s/
-  `statsd_out`'s per-message framing, so both bypass the trait entirely — unchanged by this plan
-  (`docs/known-gaps.md`'s "`logit_proto::Encoder`'s single-`Bytes`-per-batch contract..." entry).
+- ~~`logit_proto::Encoder`'s one-`Bytes`-per-batch contract still doesn't fit `syslog_out`'s/
+  `statsd_out`'s per-message framing, so both bypass the trait entirely — unchanged by this
+  plan~~ — **closed as of 2026-09-12**: both now implement `logit_proto::FramedEncoder` over a
+  shared `logit_proto::MessageBuf` ([ADR `framed-encoder`](../adr/framed-encoder.md)); the
+  `docs/known-gaps.md` entry is closed, with collectd's adoption as the named follow-up.
 - `statsd_out` still has no `unit` and no native metric rename/prefix, and only carries an egress
   timestamp on a `|T`-marked line — everything else is stamped with the receiver's own receipt time
   (`docs/known-gaps.md`'s "`statsd_out` has no `unit` and no metric renaming/prefixing..." entry).

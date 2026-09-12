@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-11
+updated: 2026-09-12
 ---
 
 # Syslog egress: format, transport, and header-field precedence
@@ -158,8 +158,17 @@ boundary (never the header); an oversize header (only reachable with an absurdly
 That trait returns one opaque `Bytes` per batch with no framing metadata, which cannot express
 per-message boundaries (one UDP datagram per message, one octet-counted frame per message on TCP).
 `SyslogEncoder::encode_into` is a bespoke, still-pure, still-directly-unit-testable method instead
-— `EventDump` (`stdio.rs`) is the in-tree precedent for a sink whose encoder sidesteps the trait
-for the same class of reason.
+— `EventDump` (`stdio.rs`) *was* the in-tree precedent for a sink whose encoder sidesteps the
+trait for the same class of reason when this was written; it has since joined `Encoder`
+([ADR `rotating-file-output`](rotating-file-output.md)), since a human-readable dump *is* one
+blob per batch.
+
+**Amendment (2026-09-12): implements `FramedEncoder`.** The bespoke method is now the
+implementation of [ADR `framed-encoder`](framed-encoder.md)'s `logit_proto::FramedEncoder`
+(`type Meta = (); type Stats = EncodeStats;`), over a `MessageBuf` that moved to `logit_proto`
+(no `logit_outputs::syslog::MessageBuf` re-export any more). Same signature, same bytes, same
+stats; the only thing that changed is that there is now a trait naming the shape, and
+`statsd_out` implements the same one.
 
 ## Alternatives considered
 

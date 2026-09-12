@@ -256,6 +256,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `disk_queue`: peek, cached (no re-decode) | **0** | `write_loop`'s retry loop calls `peek` once per attempt; only the first (uncached) peek after a push touches disk |
 | accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR `decoupled-listener-io` -- see below |
 | `syslog_out` encode_into 100 events | **100** | ~1/event -- reused struct-held scratch buffers, was 401, see below |
+| `statsd_out` encode_into 100 events | **0** | measured through the same `FramedEncoder::encode_into` call as the syslog row (ADR `framed-encoder`), over 100 single-counter DogStatsD events: every per-metric buffer was a reused struct field from the start, and a statsd line has no timestamp to format, so a warm `MessageBuf` never touches the allocator |
 | `prometheus_out` encode 100 series (1 gauge family) | **414** | `events_to_families` + `text::write`, no `Encoder` trait (same ADR as the decode row above) -- ~4.1/series: one `String` label key/value pair, one `MetricFamily`/`Series` entry, and the rendered text line's own buffer growth per series; not yet optimized, tracked as follow-up work alongside the decode row above |
 
 And the corresponding times:
@@ -293,7 +294,9 @@ And the corresponding times:
 > §2's own notes on each row.) The `statsd_in` DogStatsD event/service-check rows (W6) are the same
 > kind of exception, for the same reason -- their counts are what `statsd_decode_one_event_line`/
 > `statsd_decode_one_event_line_with_an_escaped_newline`/`statsd_decode_one_service_check_line`
-> pin.
+> pin. So is the `statsd_out` encode_into row (ADR `framed-encoder`): its count is what
+> `statsd_encode_into_100_events` pins; `benches/pipeline.rs` has a matching `encode::statsd`
+> arm, but no wall-clock figure has been folded into this table for it.
 
 ### Listener I/O decoupling: the `decode_into` buffer-reuse win (ADR `decoupled-listener-io`)
 

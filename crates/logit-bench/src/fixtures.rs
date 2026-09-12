@@ -524,6 +524,17 @@ pub fn statsd_event() -> Event {
     batch.events.into_iter().next().expect("fixture line should produce one event")
 }
 
+/// `count` copies of [`statsd_event`] in one batch -- [`nginx_batch`]'s metric-only twin, for
+/// measuring `statsd_out`'s encoder against the shape it actually relays.
+pub fn statsd_batch(count: usize) -> EventBatch {
+    let event = statsd_event();
+    EventBatch {
+        resource: resource(),
+        scope: None,
+        events: (0..count).map(|_| event.clone()).collect(),
+    }
+}
+
 /// A single-sample distribution event -- the shape `kv_metrics` and `statsd`'s `ms`/`h`/`d` types
 /// both produce, and the one that carries a whole `DDSketch` to describe one `f64`
 /// (`docs/design/memory.md`'s `MetricKind` section).
