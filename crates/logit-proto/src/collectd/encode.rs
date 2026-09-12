@@ -22,9 +22,9 @@ use std::ops::Range;
 const MAX_IDENTITY_BYTES: usize = DATA_MAX_NAME_LEN - 1;
 
 /// Encoded datagrams: one contiguous buffer, one range per datagram, and the number of value lists
-/// each datagram carries. [`crate::buffer`]'s `MessageBuf` is the same shape minus that last vector
-/// and lives in `logit-outputs`, which `logit-proto` cannot reach into (the dependency runs the
-/// other way) -- hence this type rather than a reuse.
+/// each datagram carries. [`crate::MessageBuf`]`<usize>` is now exactly this shape (ADR
+/// `framed-encoder`); replacing this type with it, and implementing [`crate::FramedEncoder`], is
+/// the named follow-up before `collectd_out` is built on it.
 ///
 /// The per-datagram list count is what `collectd_out` needs to report an `EMSGSIZE` honestly: the
 /// number dropped is the lists in that one datagram, not one "message."

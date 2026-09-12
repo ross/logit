@@ -18,10 +18,11 @@
 use divan::{AllocProfiler, Bencher};
 use logit_bench::fixtures;
 use logit_outputs::influxdb::InfluxLineEncoder;
+use logit_outputs::statsd::{Format as StatsdFormat, StatsdEncoder};
 use logit_outputs::stdio::{EventDump, Format};
-use logit_outputs::syslog::{Format as SyslogFormat, MessageBuf, SyslogEncoder};
+use logit_outputs::syslog::{Format as SyslogFormat, SyslogEncoder};
 use logit_pipeline::Transform;
-use logit_proto::{Decoder, Encoder};
+use logit_proto::{Decoder, Encoder, FramedEncoder, MessageBuf};
 use logit_script::ScriptWorker;
 
 /// Divan's own allocator, so every bench reports allocation count and bytes alongside its timing.
@@ -147,6 +148,14 @@ mod encode {
     fn syslog(bencher: Bencher, events: usize) {
         let batch = fixtures::nginx_batch(events);
         let mut encoder = SyslogEncoder::new(SyslogFormat::Rfc5424, 16);
+        let mut out = MessageBuf::default();
+        bencher.bench_local(|| encoder.encode_into(divan::black_box(&batch), &mut out));
+    }
+
+    #[divan::bench(args = [1, 100])]
+    fn statsd(bencher: Bencher, events: usize) {
+        let batch = fixtures::statsd_batch(events);
+        let mut encoder = StatsdEncoder::new(StatsdFormat::DogStatsd);
         let mut out = MessageBuf::default();
         bencher.bench_local(|| encoder.encode_into(divan::black_box(&batch), &mut out));
     }

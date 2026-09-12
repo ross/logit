@@ -21,14 +21,15 @@ use logit_bench::alloc::{measure, CountingAlloc, Stats};
 use logit_bench::fixtures;
 use logit_core::{AttrMap, EventBatch, Registry, Resource, Telemetry, TraceRef, Value};
 use logit_outputs::influxdb::InfluxLineEncoder;
+use logit_outputs::statsd::{Format as StatsdFormat, StatsdEncoder};
 use logit_outputs::stdio::{EventDump, Format};
-use logit_outputs::syslog::{Format as SyslogFormat, MessageBuf, SyslogEncoder};
+use logit_outputs::syslog::{Format as SyslogFormat, SyslogEncoder};
 use logit_pipeline::runtime::drain_inbox;
 use logit_pipeline::{
     process_batch, send_batch, unwrap_batch, BatchContext, Delivered, Fanout, SinkQueue,
     SinkQueueConfig, SinkStore, Transform,
 };
-use logit_proto::{Decoder, Encoder};
+use logit_proto::{Decoder, Encoder, FramedEncoder, MessageBuf};
 use logit_script::{ProcessOutcome, ScriptWorker};
 use std::sync::Arc;
 
@@ -2220,12 +2221,44 @@ fn syslog_encode_into_100_events() {
     let mut encoder = SyslogEncoder::new(SyslogFormat::Rfc5424, 16);
     let batch = fixtures::nginx_batch(100);
     let mut out = MessageBuf::default();
-    let _ = encoder.encode_into(&batch, &mut out); // warm-up call; EncodeStats is Copy
 
-    let (stats_out, stats) = measure(|| encoder.encode_into(&batch, &mut out));
+    let (stats_out, stats) = measure_framed(&mut encoder, &batch, &mut out);
     assert_eq!(out.len(), 100);
     assert_eq!(stats_out.skipped_no_log, 0);
     expect_allocs("syslog_out: encode_into 100 events", stats, 100);
+}
+
+/// The one generic consumer of `logit_proto::FramedEncoder` in the tree (ADR `framed-encoder`):
+/// one warm-up call (the encoder's own struct-held scratch buffers and `out`'s backing `Vec`s
+/// reach their working capacity), then the measured call, on the same `out`. Both framed rows
+/// go through this so a third framed sink's row is one more call, not a fourth copy of the
+/// warm-then-measure pattern.
+fn measure_framed<E: FramedEncoder<Meta = ()>>(
+    encoder: &mut E,
+    batch: &EventBatch,
+    out: &mut MessageBuf,
+) -> (E::Stats, Stats) {
+    let _ = encoder.encode_into(batch, out);
+    measure(|| encoder.encode_into(batch, out))
+}
+
+/// Zero: `StatsdEncoder` was built with every per-metric buffer (`line`/`name`/`tag_suffix`/
+/// `scratch`/...) as a reused struct field from the start (`syslog_out`'s lesson above, applied
+/// before rather than after measurement), and, unlike syslog's RFC 5424 header, a statsd line
+/// has no timestamp to format through `format_rfc3339_utc` -- so once `MessageBuf`'s backing
+/// `Vec`s are warm, a batch of 100 single-counter DogStatsD events touches the allocator not at
+/// all. Measured through `FramedEncoder::encode_into` with the encoder's default (uncapped)
+/// `max_packet_bytes`, exactly what `StatsdOutput::send` calls on TCP.
+#[test]
+fn statsd_encode_into_100_events() {
+    let mut encoder = StatsdEncoder::new(StatsdFormat::DogStatsd);
+    let batch = fixtures::statsd_batch(100);
+    let mut out = MessageBuf::default();
+
+    let (stats_out, stats) = measure_framed(&mut encoder, &batch, &mut out);
+    assert_eq!(out.len(), 100);
+    assert_eq!(stats_out, logit_outputs::statsd::EncodeStats::default());
+    expect_allocs("statsd_out: encode_into 100 events", stats, 0);
 }
 
 /// `prometheus_out`'s encode path, like `prometheus_in`'s, is two plain functions rather than a
