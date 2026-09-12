@@ -57,8 +57,31 @@
 //! | a part whose `len` is `< 4`, runs past the datagram, a string part with no NUL terminator, a numeric part not 12 bytes, a Values part where `len != 6 + 9 * count`, `count == 0`, `count > `[`MAX_VALUES_PER_LIST`], or an unknown data-source type byte | the rest of the datagram is abandoned; events already decoded from it are **kept** | `bad_part` when something was already decoded, else `CodecError::Malformed` (the listener's own `bad_datagram`) |
 //! | `0x0200` Signature | skipped by length, **unverified** | -- (`docs/known-gaps.md`) |
 //! | `0x0210` Encryption | the rest of the datagram is dropped | `encrypted_packet_dropped` |
-//! | `0x0100` Message / `0x0101` Severity | skipped by length until W5 | -- |
+//! | `0x0101` Severity | sets sticky severity (raw `u64`); reset per datagram like every other sticky field | -- |
+//! | `0x0100` Message | dispatches a **notification**: one [`logit_core::Event::log`] built from the current sticky host/plugin/plugin_instance/type/type_instance/time/severity -- see "Notifications" below | `notification_dropped` when severity, host or the message itself fails validation |
 //! | any other part type | skipped by length | -- |
+//!
+//! ## Notifications: `0x0100`/`0x0101`
+//!
+//! A notification is dispatched **at the Message part**, against whatever sticky state the
+//! datagram currently holds -- the same compression scheme a value list uses, and why a
+//! `0x0101` Severity part sets sticky state rather than being read directly. Unlike a value
+//! list, collectd's own `notification_t` has no interval field at all, so a notification never
+//! carries [`ATTR_INTERVAL`] even when an earlier value list in the same datagram set one.
+//!
+//! | Condition | Outcome |
+//! |---|---|
+//! | sticky severity ∈ {1 FAILURE, 2 WARNING, 4 OKAY} and the message is non-empty and a host is set | one [`logit_core::Event::log`], `timestamp` = TimeHR/Time/`received_at` exactly as a value list's, [`logit_core::LogRecord::message`] = the wire bytes (`Str` if UTF-8, `Bytes` if not -- collectd's own strings are bytes, not text), `severity` = 1→`Error`/2→`Warn`/4→`Info`, plus [`ATTR_HOST`]/[`ATTR_PLUGIN`]/[`ATTR_PLUGIN_INSTANCE`]/[`ATTR_TYPE`]/[`ATTR_TYPE_INSTANCE`] (each present only when sticky) and [`ATTR_SEVERITY`] = `Value::U64` of the raw severity |
+//! | sticky severity outside {1, 2, 4} | dropped, nothing pushed | `notification_dropped` |
+//! | the message is empty | dropped | `notification_dropped` |
+//! | no host is set | dropped | `notification_dropped` |
+//! | a message longer than [`NOTIF_MAX_MSG_LEN`] `- 1` bytes | accepted as-is -- collectd's own `NOTIF_MAX_MSG_LEN` bounds what its *sender* writes, not what a length-prefixed part can carry, so there is nothing here for this decoder to cap |
+//!
+//! `collectd_out` re-encodes the inverse: a `log`-only event (no metrics) carrying a
+//! [`ATTR_SEVERITY`] attribute is a notification, and the raw attribute -- not the normalized
+//! [`logit_core::LogRecord::severity`] -- is what reaches the wire, rule (b) of
+//! [ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md)'s raw-outranks-normalized
+//! precedent. See [`encode`]'s own module doc for the wire order and drop table.
 //!
 //! The decoded [`logit_core::Resource`] is always the decoder's own, shared, usually-default one and
 //! the [`logit_core::Scope`] is always `None`: a per-host resource would look tidier but
@@ -101,8 +124,27 @@
 //! | plugin or type empty after sanitizing | the list is dropped | `logit.output.metrics.skipped{reason="empty_name"}` |
 //! | a like-relay event carrying more than [`MAX_VALUES_PER_LIST`] records | the list is dropped whole | `logit.output.metrics.skipped{reason="too_many_values"}` + diag `too_many_values`. The cap is pair-wide: a longer list fits comfortably under the byte cap, but the decode side of this very codec rejects it as a malformed part -- and that abandons every unrelated list packed behind it in the same datagram. `aggregate`/`kv_metrics` can both put far more than 64 records on one event. |
 //! | a list that alone exceeds `max_packet_bytes` | dropped whole, never split | `logit.output.metrics.skipped{reason="oversize_value_list"}` + diag `oversize_value_list` |
-//! | an event with no metrics at all (a log- or span-only event) | skipped | [`EncodeStats::skipped_no_metrics`] (no counter of its own -- nothing was lost, there was nothing to send) |
+//! | an event with no metrics at all, no [`ATTR_SEVERITY`] attribute (present in any form) either | skipped | [`EncodeStats::skipped_no_metrics`] (no counter of its own -- nothing was lost, there was nothing to send) |
 //! | `MetricRecord`'s `unit`, `description`, `start_timestamp`, `exemplars`; `EventBatch::scope`; `Resource::schema_url` | dropped | none; `docs/known-gaps.md` rows -- the protocol has no field for any of them |
+//! | an event with no metrics, `Event::log` set, and an [`ATTR_SEVERITY`] attribute present (any `Value` type) | a **notification**: TimeHR, Severity, Host, Plugin, PluginInstance, Type, TypeInstance (the last four only when non-empty; identity written in **full**, never elided against the previous list -- see below), Message | -- |
+//! | that notification's [`ATTR_SEVERITY`] is not `Value::U64` or not one of {1, 2, 4} | dropped whole | `logit.output.metrics.skipped{reason="notification_dropped"}` + diag `notification_dropped` ([`EncodeStats::dropped_notification`]) |
+//! | that notification's `LogRecord::message` is empty, or not a `Str`/`Bytes` `Value` | dropped whole | `logit.output.metrics.skipped{reason="empty_message"}` + diag `empty_message` ([`EncodeStats::dropped_empty_message`]) |
+//! | that notification's message, `Str` or `Bytes`, NUL byte | written verbatim, NUL → `_` (uncounted -- collectd's own C strings make this substitution routine, unlike an identity field where it changes what a receiver keys a series on) | -- |
+//! | that notification's message longer than [`NOTIF_MAX_MSG_LEN`] `- 1` (255) bytes | truncated on a character (`Str`) or byte (`Bytes`) boundary | `logit.output.messages.truncated` + diag `message_truncated` ([`EncodeStats::notification_messages_truncated`]) |
+//! | a notification alone exceeding `max_packet_bytes` | dropped whole, never split | `logit.output.metrics.skipped{reason="oversize_notification"}` + diag `oversize_notification` ([`EncodeStats::dropped_oversize_notification`]) |
+//!
+//! A notification's identity is **always written in full**, never elided against the previous
+//! list's -- unlike a value list, which elides every string part matching `last`. collectd's own
+//! `notification_t` and `value_list_t` are distinct C structs, and the network plugin's write
+//! callback (`network.c`'s `nc_dispatch`/`write_notification`) is not reachable from this repo to
+//! confirm bit-for-bit whether it compares a notification's fields against the same "last written"
+//! state a value list would; writing every field unconditionally is correct regardless of which
+//! way that turns out (a receiver reads whatever is on the wire, whether or not it was strictly
+//! necessary to write it), so this codec takes the always-write side of that uncertainty rather
+//! than risk relaying a notification with a stale plugin or type inherited from an unrelated list
+//! earlier in the datagram. `last` is still **updated** after a notification's own write, so a
+//! value list immediately following one in the same datagram can still elide against it -- the
+//! elision *state* is shared, even though the notification's own encoding never reads from it.
 //!
 //! ## Well-known attributes (`collectd.*`)
 //!
@@ -121,7 +163,7 @@
 //! | [`ATTR_TYPE`] | `Str`/`Bytes` | the wire Type; **its presence is what selects like-relay encoding** |
 //! | [`ATTR_TYPE_INSTANCE`] | `Str`/`Bytes` | the wire TypeInstance, only when non-empty |
 //! | [`ATTR_INTERVAL`] | `F64` seconds | `cdtime / 2³⁰`, exact; absent when the wire carried no interval or a zero one |
-//! | [`ATTR_SEVERITY`] | `U64` ∈ {1, 2, 4} | **reserved for notifications (W5)**; raw wire severity, marking the event as a notification rather than a value list |
+//! | [`ATTR_SEVERITY`] | `U64` ∈ {1, 2, 4} | the raw wire severity of a *notification* (1 FAILURE, 2 WARNING, 4 OKAY); its presence is what makes `collectd_out` encode a `log`-only event as a notification rather than skip it, and its value -- not the normalized [`logit_core::LogRecord::severity`] -- is what reaches the wire, outranking it exactly as `syslog.severity`/`otel.severity_number` outrank their own normalized field (rule (b) of [ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md)) |
 //!
 //! ## Sanitization
 //!
@@ -132,6 +174,14 @@
 //! Both are counted (`logit.output.identity.sanitized{reason}`). Nothing else is substituted:
 //! whitespace and control bytes ride through collectd untouched, and sanitizing them would break the
 //! fixed point for no wire-level reason.
+//!
+//! A notification's **message** is not an identity field and gets a narrower rule: NUL becomes
+//! `_` (uncounted -- unlike an identity field, a `_` in a log message changes nothing a receiver
+//! keys a series on), `/` rides through untouched (a message is free text, not a path-like name),
+//! and it is truncated to [`NOTIF_MAX_MSG_LEN`] `- 1` (255) bytes on a character or byte boundary,
+//! counted `logit.output.messages.truncated` -- collectd's own sender-side bound
+//! (`NOTIF_MAX_MSG_LEN`), applied here on egress since this codec's decoder has no reason to
+//! enforce a sender's own limit on what it receives.
 //!
 //! ## Permitted normalizations
 //!
@@ -152,7 +202,12 @@
 //! 7. a list that arrived with no Time part at all leaves carrying `TimeHR = received_at`;
 //! 8. `/` and NUL become `_`, and an identity field longer than 127 bytes is truncated (both
 //!    counted);
-//! 9. an absent interval leaves as `IntervalHR 0`.
+//! 9. an absent interval leaves as `IntervalHR 0`;
+//! 10. a notification's identity (Host/Plugin/PluginInstance/Type/TypeInstance) is written in
+//!     full on every re-encode, never elided against a preceding list -- so a notification
+//!     dispatched from elided sticky state on the way in leaves carrying its own full identity;
+//! 11. NUL in a notification message becomes `_` (uncounted); a message longer than 255 bytes is
+//!     truncated (counted).
 //!
 //! Everything else is an error or a counted drop, never a silent reinterpretation.
 
@@ -218,8 +273,9 @@ pub const ATTR_TYPE_INSTANCE: &str = "collectd.type_instance";
 /// The wire Interval, as `Value::F64` seconds (`cdtime / 2³⁰`, exact).
 pub const ATTR_INTERVAL: &str = "collectd.interval";
 /// The raw wire severity of a *notification* (`1` FAILURE, `2` WARNING, `4` OKAY), as
-/// `Value::U64`. **Reserved for W5** -- nothing reads or writes it yet; it is named here so the
-/// attribute namespace is decided in one place rather than invented twice.
+/// `Value::U64`. Its presence on a `log`-only event (no metrics) is what [`encode::CollectdEncoder`]
+/// reads to decide the event is a notification rather than an ordinary skipped log; its value, not
+/// the normalized [`logit_core::LogRecord::severity`], is what reaches the wire.
 pub const ATTR_SEVERITY: &str = "collectd.severity";
 
 /// The prefix every attribute above shares. The encoder skips the whole namespace when it decides

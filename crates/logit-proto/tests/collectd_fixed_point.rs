@@ -37,7 +37,11 @@
 //!   `[2^60, 2^61)` with every sub-second bit live, and intervals likewise legacy-seconds or an
 //!   arbitrary `cdtime_t` below 2^53 ticks. The high-resolution branch is what reaches
 //!   **normalization 2** — a `TimeHR` that may move ≤1 tick on the first hop and is stable after —
-//!   which a whole-second `TimeHR` cannot, since it is bit-identical to its own legacy spelling.
+//!   which a whole-second `TimeHR` cannot, since it is bit-identical to its own legacy spelling;
+//! - an optional notification (`0x0101`/`0x0100`) trailing the packet, dispatched against whatever
+//!   sticky identity the last generated list left behind, with a valid severity and a non-empty
+//!   message (an invalid severity or an empty message is a counted drop, not a fixed point, and has
+//!   its own unit tests in `encode.rs` instead).
 //!
 //! Because of that last point the property is asserted **from the first hop on**, not from the
 //! input bytes: see the test's own doc comment for the exact chain, and for why the model half of
@@ -78,6 +82,8 @@ const TYPE_VALUES: u16 = 0x0006;
 const TYPE_INTERVAL: u16 = 0x0007;
 const TYPE_TIME_HR: u16 = 0x0008;
 const TYPE_INTERVAL_HR: u16 = 0x0009;
+const TYPE_MESSAGE: u16 = 0x0100;
+const TYPE_SEVERITY: u16 = 0x0101;
 
 const DS_COUNTER: u8 = 0;
 const DS_GAUGE: u8 = 1;
@@ -535,6 +541,89 @@ fn types_db_names_do_not_affect_the_fixed_point() {
     assert_fixed_point(batch(plain_events));
 }
 
+// -- notification fixtures -----------------------------------------------------------------------
+
+/// A single value list's worth of identity plus one notification dispatched right after it, at
+/// wire level. One [`assert_wire_fixed_point`] call decodes both, so the property covers a
+/// notification sharing sticky identity with a preceding list -- the ordinary shape a `threshold`
+/// plugin produces alongside `load`/`memory` reads on the same host.
+fn notification_after_a_list(severity: u64, message: &[u8]) -> Bytes {
+    PacketBuilder::new()
+        .string(TYPE_HOST, b"web-1")
+        .number(TYPE_TIME_HR, 1_700_000_000u64 << 30)
+        .string(TYPE_PLUGIN, b"load")
+        .string(TYPE_TYPE, b"load")
+        .values(&[(DS_GAUGE, 0.5f64.to_le_bytes())])
+        .number(TYPE_SEVERITY, severity)
+        .string(TYPE_MESSAGE, message)
+        .build()
+}
+
+#[test]
+fn every_severity_notification_is_a_fixed_point() {
+    for severity in [1u64, 2, 4] {
+        assert_wire_fixed_point(notification_after_a_list(severity, b"threshold exceeded"), 2);
+    }
+}
+
+/// A notification with no plugin or type at all -- legal, unlike a value list.
+#[test]
+fn a_notification_with_no_plugin_or_type_is_a_fixed_point() {
+    assert_wire_fixed_point(
+        PacketBuilder::new()
+            .string(TYPE_HOST, b"web-1")
+            .number(TYPE_SEVERITY, 1)
+            .string(TYPE_MESSAGE, b"host is down")
+            .build(),
+        1,
+    );
+}
+
+/// A notification carrying its own plugin/type/instance -- present, unlike the fixture above.
+#[test]
+fn a_notification_with_plugin_and_type_is_a_fixed_point() {
+    assert_wire_fixed_point(
+        PacketBuilder::new()
+            .string(TYPE_HOST, b"web-1")
+            .string(TYPE_PLUGIN, b"df")
+            .string(TYPE_PLUGIN_INSTANCE, b"root")
+            .string(TYPE_TYPE, b"df_complex")
+            .string(TYPE_TYPE_INSTANCE, b"free")
+            .number(TYPE_SEVERITY, 2)
+            .string(TYPE_MESSAGE, b"disk almost full")
+            .build(),
+        1,
+    );
+}
+
+/// A message at exactly the 255-byte usable limit (`NOTIF_MAX_MSG_LEN - 1`) round-trips untouched
+/// -- the decoder accepts it as-is (this codec's own cap is an encode-side concern only).
+#[test]
+fn a_message_at_exactly_255_bytes_is_a_fixed_point() {
+    let message = vec![b'm'; 255];
+    assert_wire_fixed_point(
+        PacketBuilder::new()
+            .string(TYPE_HOST, b"web-1")
+            .number(TYPE_SEVERITY, 4)
+            .string(TYPE_MESSAGE, &message)
+            .build(),
+        1,
+    );
+}
+
+/// A non-UTF-8 message rides byte-verbatim, exactly like a non-UTF-8 identity field.
+#[test]
+fn a_non_utf8_message_is_a_fixed_point() {
+    assert_wire_fixed_point(
+        PacketBuilder::new()
+            .string(TYPE_HOST, b"web-1")
+            .number(TYPE_SEVERITY, 2)
+            .string(TYPE_MESSAGE, &[0xFF, 0xFE, b'm'])
+            .build(),
+        1,
+    );
+}
+
 // -- the generated grammar -------------------------------------------------------------------
 
 /// One generated value list: its identity (each field optional except the three collectd's own
@@ -630,11 +719,21 @@ fn gen_list() -> impl Strategy<Value = GenList> {
         )
 }
 
+/// An optional trailing notification for one generated packet: a valid severity (an invalid one
+/// would be a counted drop, not a fixed point, and has its own unit tests in `encode.rs`) and a
+/// non-empty message (an empty one drops the notification entirely, same reasoning) from the same
+/// restricted alphabet [`identity_string`] uses.
+fn gen_notification() -> impl Strategy<Value = (u64, String)> {
+    (prop_oneof![Just(1u64), Just(2u64), Just(4u64)], identity_string())
+}
+
 /// Renders generated lists into one datagram, writing only the parts each list actually names --
 /// so elision within the packet is part of what is generated, not something this helper decides.
 /// The first list always gets a full host/plugin/type, since a datagram whose opening list has no
-/// identity is one collectd itself rejects (and this codec skips, counted).
-fn render(lists: &[GenList]) -> Bytes {
+/// identity is one collectd itself rejects (and this codec skips, counted). `notification`, when
+/// present, is dispatched last, against whatever sticky identity the final list left behind --
+/// exactly the shape a `threshold` plugin's notification takes alongside ordinary value lists.
+fn render(lists: &[GenList], notification: &Option<(u64, String)>) -> Bytes {
     let mut builder = PacketBuilder::new();
     for (index, list) in lists.iter().enumerate() {
         let first = index == 0;
@@ -673,6 +772,9 @@ fn render(lists: &[GenList]) -> Bytes {
         }
         builder = builder.values(&list.values);
     }
+    if let Some((severity, message)) = notification {
+        builder = builder.number(TYPE_SEVERITY, *severity).string(TYPE_MESSAGE, message.as_bytes());
+    }
     builder.build()
 }
 
@@ -695,14 +797,15 @@ proptest! {
     /// would catch that stopping being true.
     #[test]
     fn a_generated_packet_is_a_fixed_point_at_every_cap(
-        lists in proptest::collection::vec(gen_list(), 1..8)
+        lists in proptest::collection::vec(gen_list(), 1..8),
+        notification in proptest::option::of(gen_notification()),
     ) {
-        let packet = render(&lists);
+        let packet = render(&lists, &notification);
         let resource = Arc::new(Resource::default());
         let mut decoder = CollectdDecoder::new(resource.clone());
         let mut d1 = Vec::new();
         decoder.decode_into(packet, RECEIVED_AT, &mut d1).expect("a generated packet must decode");
-        prop_assert_eq!(d1.len(), lists.len());
+        prop_assert_eq!(d1.len(), lists.len() + notification.is_some() as usize);
 
         for cap in CAPS {
             let e1 = encode_at(&rebatch(&resource, d1.clone()), cap);
