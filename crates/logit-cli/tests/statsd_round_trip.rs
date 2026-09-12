@@ -105,13 +105,16 @@
 //!    (`(6)`'s second bullet is the same normalization on decode's own multi-value `ms`/`h`/`d`
 //!    form). Exercised by `dogstatsd-set` (single member, so trivially one line) and by the
 //!    `statsd_in -> aggregate -> statsd_out` test below (two distinct members, two lines).
-//! 8. **A repeated tag key collapses to its last value.** `#team:a,team:b` is legal DogStatsD, but
-//!    `AttrMap` is a map, not a multiset, so `statsd_in` overwrites `team:a` with `team:b` while
-//!    building the event's attributes, before this sink ever sees the line -- this is a model gap
-//!    (`docs/known-gaps.md`), not a normalization this sink chooses, but it's recorded here because
-//!    it's the same "one wire input, fewer bits of information out" shape as (7)'s decode-side
-//!    collapse. Exercised by `repeated-tag-key-collapses-to-last-value`
-//!    (`x:1|c|#team:a,team:b` -> `x:1|c|#team:b`).
+//! 8. **A repeated tag key's exact-duplicate tokens dedupe.** `#team:a,team:b` is two live tags
+//!    now -- `statsd_in`'s `insert_tags` folds a repeated key into a `Value::Array` in wire order
+//!    (`crates/logit-inputs/src/statsd.rs`'s "DogStatsD tags" section) and `statsd_out` expands it
+//!    back to one tag per element, so that case is byte-for-byte, not a normalization (see
+//!    `repeated-tag-key-round-trips` below). What *does* still collapse is an **exact** duplicate
+//!    token, `#team:a,team:a` -> `#team:a` (and a bare `#urgent,urgent` -> `#urgent`) -- the
+//!    Datadog agent's own dedupe rule, applied at decode so a `Value::Array` is never one element
+//!    long. Exercised by `repeated-tag-exact-duplicate-deduped` (`x:1|c|#team:a,team:a` ->
+//!    `x:1|c|#team:a`) and `bare-tag-exact-duplicate-deduped` (`x:1|c|#urgent,urgent` ->
+//!    `x:1|c|#urgent`).
 //! 9. **A DogStatsD event/service check's fields re-emit in canonical order, regardless of the
 //!    order they arrived in on the wire, and an event `TEXT`'s `\n` escape re-emits the same way it
 //!    decoded.** `_e{tlen,xlen}:title|text` canonical order is `d:`/`h:`/`p:`/`t:`/`k:`/`s:`/`#tags`/
@@ -135,6 +138,7 @@
 use bytes::Bytes;
 use logit_core::{Event, EventBatch, Value};
 use logit_inputs::statsd::{StatsdDecoder, StatsdInput};
+use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::statsd::{Format, StatsdEncoder, StatsdOutput};
 // `MessageBuf` lives in `logit-outputs`'s private `msgbuf` module; `syslog.rs` is the one that
 // re-exports it under a stable public path (`docs/adr/statsd-output.md`'s Consequences section),
@@ -142,7 +146,7 @@ use logit_outputs::statsd::{Format, StatsdEncoder, StatsdOutput};
 // names it the same way.
 use logit_outputs::syslog::MessageBuf;
 use logit_pipeline::{Delivered, Fanout, Input, Output};
-use logit_proto::Decoder;
+use logit_proto::{Decoder, Encoder};
 use logit_transforms::{Aggregator, Distributions, Sets};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -412,16 +416,139 @@ async fn a_member_with_a_space_round_trips_byte_for_byte() {
     .await;
 }
 
-/// Module doc normalization (8): a repeated tag key collapses to its last value at decode time
-/// (`AttrMap` is a map, not a multiset) -- the round trip is still exact from that point on, since
-/// both the direct decode and the live `statsd_in` decode see the same collapsed attribute map.
+// ---- Multi-value DogStatsD tags (module doc (8), W9) ----------------------------------------------
+
+/// A repeated tag key is byte-for-byte, not a normalization: `insert_tags` folds it into a
+/// `Value::Array` in wire order and `statsd_out` expands it back to one tag per element (module
+/// doc (8)).
 #[tokio::test]
-async fn repeated_tag_key_collapses_to_its_last_value() {
+async fn a_repeated_tag_key_round_trips_byte_for_byte() {
     let mut harness = Harness::new().await;
-    assert_byte_for_byte(&mut harness, "repeated-tag-key-collapses-to-last-value", || {
+    assert_byte_for_byte(&mut harness, "repeated-tag-key-round-trips", || {
         StatsdEncoder::new(Format::DogStatsd)
     })
     .await;
+}
+
+/// Three occurrences of the same tag key fold into a three-element `Array` and expand back to
+/// three wire tags, still in wire order.
+#[tokio::test]
+async fn a_tag_key_repeated_three_times_round_trips_byte_for_byte() {
+    let mut harness = Harness::new().await;
+    assert_byte_for_byte(&mut harness, "repeated-tag-three-values", || {
+        StatsdEncoder::new(Format::DogStatsd)
+    })
+    .await;
+}
+
+/// A bare tag and a valued tag sharing a key are not duplicates -- both forms survive, in order
+/// (`#urgent,urgent:1` -> `Array[Bool(true), Str("1")]` -> `urgent,urgent:1`).
+#[tokio::test]
+async fn a_bare_and_valued_tag_sharing_a_key_round_trips_byte_for_byte() {
+    let mut harness = Harness::new().await;
+    assert_byte_for_byte(&mut harness, "bare-and-valued-tag-mix", || {
+        StatsdEncoder::new(Format::DogStatsd)
+    })
+    .await;
+}
+
+/// The same fold applies to a DogStatsD event line's `#` field -- `insert_tags` backs every `#`
+/// field alike, metric line or event line (`crates/logit-inputs/src/statsd.rs`'s doc at the
+/// `insert_tags` call sites).
+#[tokio::test]
+async fn a_repeated_tag_key_on_an_event_line_round_trips_byte_for_byte() {
+    let mut harness = Harness::new().await;
+    assert_byte_for_byte(&mut harness, "repeated-tag-on-event-line", || {
+        StatsdEncoder::new(Format::DogStatsd)
+    })
+    .await;
+}
+
+/// Module doc (8): an *exact* duplicate token dedupes at decode -- the Datadog agent's own rule --
+/// so `#team:a,team:a` never becomes a one-element `Array`, it stays `Str("a")` and relays as
+/// `#team:a`.
+#[tokio::test]
+async fn an_exact_duplicate_tag_value_dedupes_to_a_single_tag() {
+    let mut harness = Harness::new().await;
+    assert_byte_for_byte(&mut harness, "repeated-tag-exact-duplicate-deduped", || {
+        StatsdEncoder::new(Format::DogStatsd)
+    })
+    .await;
+}
+
+/// The bare-token form of the same dedupe rule: `#urgent,urgent` -> `Bool(true)` (never a
+/// one-element `Array`) -> `#urgent`.
+#[tokio::test]
+async fn an_exact_duplicate_bare_tag_dedupes_to_a_single_tag() {
+    let mut harness = Harness::new().await;
+    assert_byte_for_byte(&mut harness, "bare-tag-exact-duplicate-deduped", || {
+        StatsdEncoder::new(Format::DogStatsd)
+    })
+    .await;
+}
+
+/// `statsd_in -> aggregate -> statsd_out`: two lines carrying the same multi-valued tag are the
+/// same series (`aggregate`'s `SeriesKey` recurses element-wise into an `Array`, so equal arrays
+/// key equal), so they merge into one flushed event whose tag bytes survive the round trip
+/// unchanged -- proof that a multi-valued tag is one series, not two.
+#[tokio::test]
+async fn statsd_in_aggregate_statsd_out_relay_preserves_a_multi_valued_tag() {
+    let mut harness = Harness::new().await;
+
+    let raw = b"x:1|c|#team:a,team:b\nx:1|c|#team:a,team:b";
+    let batch = harness.send_raw_and_decode(raw).await;
+    assert_eq!(batch.events.len(), 2, "one event per line");
+
+    let mut aggregator = Aggregator::new(Duration::from_secs(10));
+    let resource = batch.resource.clone();
+    let mut forwarded = Vec::new();
+    for event in batch.events {
+        if let Some(event) = aggregator.process(&resource, event) {
+            forwarded.push(event);
+        }
+    }
+    assert!(forwarded.is_empty(), "a delta Counter is always absorbed by aggregate");
+
+    let mut flushed = aggregator.flush(1_800_000_000_000_000_000);
+    assert_eq!(flushed.len(), 1, "one (resource, scope) group");
+    let (flush_resource, flush_scope, events) = flushed.remove(0);
+    let out_batch = EventBatch {
+        resource: flush_resource,
+        scope: flush_scope,
+        events: events.into_iter().map(|(event, _links)| event).collect(),
+    };
+    assert_eq!(
+        out_batch.events.len(),
+        1,
+        "both lines share the same multi-valued-tag series, so they merge into one"
+    );
+
+    let captured = harness.capture_only(&out_batch, StatsdEncoder::new(Format::DogStatsd)).await;
+    assert_eq!(
+        std::str::from_utf8(&captured).expect("ascii output"),
+        "x:2|c|#team:a,team:b",
+        "the summed counter should still carry both tag values, in wire order"
+    );
+}
+
+/// `influxdb_out`: a repeated tag key reaches this sink as a `Value::Array` too, and line
+/// protocol's tag set is a map, not a multiset, so `render_tag_suffix` renders only the **last**
+/// representable element and counts it (`crates/logit-outputs/src/influxdb.rs`'s
+/// `render_tag_suffix` doc, "Multi-value tags: last-value-wins, counted"). Decodes with the real
+/// statsd decoder (not a hand-built `EventBatch`) and encodes with `InfluxLineEncoder` directly --
+/// there is no influx round-trip fixture file in this crate's `tests/`, so this stays a
+/// unit-style case in the file that already owns the real-decoder path.
+#[test]
+fn influxdb_out_renders_the_last_element_of_a_multi_valued_tag_and_counts_it() {
+    let batch = direct_batch(b"x:1|c|#team:a,team:b");
+    let mut encoder = InfluxLineEncoder::default();
+    let body = encoder.encode(&batch).expect("encoding should succeed");
+    let line = std::str::from_utf8(&body).expect("ascii output");
+    assert!(line.contains("team=b"), "the last tag element should win: {line}");
+    assert_eq!(
+        encoder.multi_value_tags, 1,
+        "one multi-valued tag attribute reached the wire, collapsed to its last element"
+    );
 }
 
 // ---- Relative gauges (opt-in `relative_gauges: true`) -------------------------------------------

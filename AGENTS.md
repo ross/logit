@@ -162,9 +162,9 @@ data as `syslog.sd`, timestamp precedence, bytes MSG, opt-in structured-data emi
 timers/sets, `|c:`/`|T`, events/service checks), `aggregate`'s raw-retention modes (which keep exact
 values, with a real HyperLogLog backing `sets: estimate` and the overflow fallback), and the Lua
 surface (`event.metrics`, `event.span`, `scope`, the new log/resource fields) have all landed. [`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md) has the
-closing assessment; residual debt (post-sketch metric kinds at `statsd_out`, a repeated DogStatsD
-tag key collapsing to its last value, `Encoder`'s per-batch-`Bytes` shape not fitting per-message
-framing, `statsd_out` carrying no `unit` and no native rename/prefix and stamping an egress
+closing assessment; residual debt (post-sketch metric kinds at `statsd_out`, `Encoder`'s
+per-batch-`Bytes` shape not fitting per-message framing, `statsd_out` carrying no `unit` and no
+native rename/prefix and stamping an egress
 timestamp only on a `|T`-marked line, and syslog's `event.timestamp` staying receipt time while the
 wire TIMESTAMP follows the precedence table) lives in `docs/known-gaps.md`. `prometheus_in`/`prometheus_out`
 (`crates/logit-inputs`/`crates/logit-outputs`, `crates/logit-proto`'s `prometheus` codec) are the

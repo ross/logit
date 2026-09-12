@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-09-11
+updated: 2026-09-12
 ---
 
 # Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping
@@ -126,7 +126,7 @@ can't carry natively:
 | `flags & NO_RECORDED_VALUE` | skipped, `skipped{reason="no_recorded_value"}` |
 | exemplars | OM only, on `_total`/`_bucket` lines (bucket chosen by value); text mode drops them (dialect choice, not counted) |
 | `Event::timestamp` | emitted only when `prometheus.timestamp: true` is present (consumed); ms in text, float s in OM |
-| labels | `logit_core::attrs::merged(resource, event)` (event wins), skipping the consumed `prometheus.type`/`prometheus.timestamp`/`prometheus.target` attributes; `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Array/Map` dropped — `logit.output.labels.dropped{reason="unrepresentable"}` |
+| labels | `logit_core::attrs::merged(resource, event)` (event wins), skipping the consumed `prometheus.type`/`prometheus.timestamp`/`prometheus.target` attributes; `Value::Str/I64/U64/F64/Bool` stringified; a multi-valued `Array` (a relayed, repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s amendment) renders its **last** representable element, counted `logit.output.labels.normalized{reason="multi_value"}` once per attribute; `Null/Bytes/Timestamp/Map`, and an `Array` with no representable element, dropped — `logit.output.labels.dropped{reason="unrepresentable"}` |
 | names | see "Names and sanitization" below |
 | `unit` / `description` | `# UNIT` (OM only) / `# HELP` |
 | `EventBatch::scope`, `Resource.schema_url`, `dropped_attributes_count` | dropped (known-gaps rows) |
@@ -256,6 +256,12 @@ equality modulo:
 - **A cross-dialect family-type substitution** per "Cross-dialect family types" above
   (`untyped`↔`unknown`, `info`/`stateset`/`gaugehistogram` down-converted on text egress, `_info`
   re-appended on OM egress) when the output dialect lacks the wire type the model attribute names.
+- **A multi-valued label (an `Array`, from a relayed, repeated DogStatsD tag key) renders its last
+  representable element** — the exposition grammar has no multi-value label of its own, so this
+  mirrors `influxdb_out`'s identical rule (`docs/design/internal-telemetry.md`) — counted
+  `logit.output.labels.normalized{reason="multi_value"}` once per attribute rather than silently
+  dropped; an empty or all-unrepresentable array still drops the label entirely and counts
+  `labels.dropped{reason="unrepresentable"}` as before.
 - The three synthetic families `prometheus_in` always adds (`up`, `scrape_duration_seconds`,
   `scrape_samples_scraped` — see "Synthetic scrape metrics" below) are excluded from the
   round-trip fixed-point comparison by name, not asserted equal at all: `scrape_duration_seconds`

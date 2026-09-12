@@ -10,6 +10,10 @@
 //! <name>:<value>[:<value>...]|<type>[|@<sample-rate>][|#<tag>[:<value>],...][|c:<container-id>][|T<unix-seconds>][|<ignored>]
 //! ```
 //!
+//! The `|#` segment is a comma-separated **list**, not a map -- a key may legally repeat, and a
+//! repeat folds into a [`logit_core::Value::Array`] rather than overwriting; see the "DogStatsD
+//! tags" section below.
+//!
 //! `<type>` is one of:
 //!
 //! - `c` (counter) -- one [`Event`] per value, sample-rate-extrapolated (`value / sample_rate`)
@@ -61,6 +65,42 @@
 //! Every other unrecognized `|` segment is accepted and silently ignored -- forward-compatible
 //! with segment kinds this decoder doesn't know about yet, rather than a hard error on something
 //! benign.
+//!
+//! ## DogStatsD tags
+//!
+//! A `|#` segment is a **list** of `key[:value]` tokens, not a map. The Datadog agent keeps every
+//! token and dedupes only *exact* duplicates, so `#team:a,team:b` is two live tags -- a query
+//! grouping by `team` places that point in both the `a` and the `b` group -- while `#team:a,team:a`
+//! is one. `insert_tags` reproduces exactly that: **a repeated tag key folds into a
+//! [`logit_core::Value::Array`] in wire order** (`#team:a,team:b` -> `team: Array[Str("a"),
+//! Str("b")]`, three occurrences -> three elements), and **an exact duplicate token is deduped at
+//! decode** (`#team:a,team:a` -> `Str("a")`, `#urgent,urgent` -> `Bool(true)`). **A one-element
+//! `Array` is never produced**, so a non-repeated tag's decoded shape is byte-identical to what it
+//! was before this fold existed. It is the same fold [`crate::syslog`]'s `insert_param` applies to
+//! a repeated RFC 5424 PARAM-NAME (`docs/adr/syslog-structured-data-convention.md`), for the same
+//! reason: a plain `AttrMap::insert` per token lets the last token win, destroying a value the
+//! wire carried inside the decoder, before any sink sees the event -- loss, not a re-spelling,
+//! under `docs/adr/lossless-transit.md`.
+//!
+//! A bare token and a valued one that share a key are not duplicates; **both forms survive, in
+//! order**: `#urgent,urgent:1` -> `urgent: Array[Bool(true), Str("1")]` (re-emitted by
+//! `statsd_out` as `urgent,urgent:1`) and `#urgent:1,urgent` -> `Array[Str("1"), Bool(true)]` ->
+//! `urgent:1,urgent`. Array order is wire order and array-internal; the attribute map itself stays
+//! sorted by `Symbol` as always, so nothing about tag *key* order changes. Element values stay
+//! zero-copy `slice_of` slices of the datagram, exactly like a scalar tag value.
+//!
+//! **The fold applies to the `#` segment's payload only.** A repeated `|` *segment* keeps
+//! `parse_line`'s pre-existing behaviour, unchanged and out of scope: every `#` segment on a line
+//! unions its tokens into the same attribute map (so `|#a:1|#a:2` folds just as a single
+//! `|#a:1,a:2` would), while `@`, `|c:` and `|T` are last-segment-wins -- a repeat of one of those
+//! simply overwrites what the earlier one stamped. A repeated `|T`/`|c:`/wire-type therefore can't
+//! reach `insert_tags` at all. What *can* is a tag **literally named** `statsd.type` (or any other
+//! `statsd.*` carrier key) inside the `#` segment: that now decodes to an `Array` where it
+//! previously always decoded to a scalar. On egress such a value matches no `statsd_out` carrier
+//! arm (each expects a `Value::Str`/`Value::U64`) and is filtered out of the tag segment
+//! uncounted, exactly as a wrong-typed carrier already is today. On a `ms`/`h`/`d` line the
+//! decoder's own `statsd.type` stamp runs after the tags and overwrites whatever the `#` segment
+//! folded there.
 //!
 //! ## DogStatsD events and service checks
 //!
@@ -305,19 +345,63 @@ fn slice_of(bytes: &Bytes, text: &str, sub: &str) -> Bytes {
 }
 
 /// Parses a comma-separated `#<tag>[:<value>],...` segment (the text after the `#`, for a metric
-/// line, an event, or a service check alike) and inserts each tag into `attributes`. A `key:value`
+/// line, an event, or a service check alike) and folds each tag into `attributes`. A `key:value`
 /// tag's value is a zero-copy [`slice_of`] `text`/`bytes`; a valueless tag (`#urgent`) marks
 /// presence as `Value::Bool(true)` instead, since there's nothing to slice. Shared verbatim across
 /// every line shape that carries `#tags` -- factored out of `parse_line`'s original inline loop
 /// once events and service checks needed the identical behaviour.
+///
+/// **A repeated tag key folds into a `Value::Array` in wire order**, rather than the
+/// last-token-wins behaviour a plain [`AttrMap::insert`] per token would give: a `|#` segment is a
+/// list, not a map, so `#team:a,team:b` decodes to `team: Array[Str("a"), Str("b")]`. **An exact duplicate
+/// token is deduped here**, matching the Datadog agent's own rule (it keeps every token and
+/// dedupes only exact duplicates): `#team:a,team:a` stays `Str("a")` and `#urgent,urgent` stays
+/// `Bool(true)`, so a one-element `Array` is never produced and a non-repeated tag's decoded shape
+/// is byte-identical to what it was before this fold existed. A bare token and a valued one that
+/// share a key are *not* duplicates and both survive, in wire order: `#urgent,urgent:1` is
+/// `Array[Bool(true), Str("1")]`, `#urgent:1,urgent` is `Array[Str("1"), Bool(true)]`.
+///
+/// [`AttrMap::remove`] + [`AttrMap::insert`] is the same two-step [`crate::syslog`]'s
+/// `insert_param` uses for a repeated RFC 5424 PARAM-NAME -- two binary searches over the sorted
+/// inline map, paid only on a repeat. See the module doc's "DogStatsD tags" section for the
+/// semantics this implements and for what it deliberately leaves alone (a repeated `|` *segment*,
+/// and the `statsd.*` carrier keys).
 fn insert_tags(attributes: &mut AttrMap, bytes: &Bytes, text: &str, tags: &str) {
     for tag in tags.split(',').filter(|t| !t.is_empty()) {
-        match tag.split_once(':') {
+        let (key, value) = match tag.split_once(':') {
             // `v` is a genuine `&str` slice of `text`, so `slice_of` shares the datagram's
             // allocation instead of `Value::from(&str)`'s `Bytes::from(String)` copy.
-            Some((k, v)) => attributes.insert(k, Value::Str(slice_of(bytes, text, v))),
-            None => attributes.insert(tag, true),
-        }
+            Some((k, v)) => (k, Value::Str(slice_of(bytes, text, v))),
+            None => (tag, Value::Bool(true)),
+        };
+        let merged = match attributes.remove(key) {
+            None => value,
+            Some(Value::Array(mut arr)) => {
+                if !arr.iter().any(|e| tag_element_eq(e, &value)) {
+                    arr.push(value);
+                }
+                Value::Array(arr)
+            }
+            Some(existing) if tag_element_eq(&existing, &value) => existing,
+            Some(existing) => Value::Array(vec![existing, value]),
+        };
+        attributes.insert(key, merged);
+    }
+}
+
+/// Exact-token equality for [`insert_tags`]'s dedupe rule: `Str`/`Str` by bytes, `Bool`/`Bool` by
+/// value, anything else unequal. Allocation-free -- `Bytes: PartialEq` is a plain byte compare, so
+/// two tokens pointing at different offsets of the same datagram still compare equal on content.
+/// Only these two variants can appear as a decoded tag value (a valued token is always `Str`, a
+/// bare one always `Bool(true)`), and the catch-all arm is what makes a `Bool`/`Str` pairing
+/// unequal -- the rule that keeps both forms of `#urgent,urgent:1`. Deliberately not `Value`'s own
+/// `PartialEq`: that compares `F64`s and nested maps too, neither of which a tag token can be, and
+/// this function's contract is the agent's exact-token rule rather than general value equality.
+fn tag_element_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -721,8 +805,12 @@ fn build_event(
 
     // Cheap for the multi-value form (`name:1:2:3|c`), where this runs once per shared value:
     // every `Value::Str` in `attributes` is already a slice of the datagram's one shared
-    // allocation (see `slice_of`), so cloning the map is a `SmallVec` memcpy plus a refcount
-    // bump per tag, not a fresh copy of the tag bytes.
+    // allocation (see `slice_of`), so cloning a scalar-valued map is a `SmallVec` memcpy plus a
+    // refcount bump per tag, not a fresh copy of the tag bytes. A tag whose key repeated on the
+    // wire is the one exception: it holds a `Value::Array` (see `insert_tags`), and cloning that
+    // deep-copies the `Vec` spine -- one fresh allocation per such tag per value event -- though
+    // the elements inside it are still refcounted `Bytes` slices of the same datagram, never
+    // copied bytes.
     Ok(Event::metric(timestamp, attributes.clone(), MetricRecord::new(intern(name), kind)))
 }
 
@@ -1082,19 +1170,136 @@ mod tests {
     fn dogstatsd_tag_value_is_a_zero_copy_slice_of_the_datagram() {
         // Structural companion to `syslog.rs`'s `emitted_message_is_a_zero_copy_slice_of_the_datagram`
         // -- pins the property this module's `slice_of` exists for, not just its resulting value.
-        let datagram = Bytes::from("page.views:1|c|#env:prod".to_string());
+        // The repeated `team` key carries the same assertion through the `Value::Array` fold: a
+        // repeat must not start reaching for `Value::from(&str)`'s copy -- each element is the
+        // same datagram slice a scalar tag value gets.
+        let datagram = Bytes::from("page.views:1|c|#env:prod,team:a,team:b".to_string());
         let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
         let event = only_metric_event(decoder.decode(datagram.clone()).unwrap().events);
-        let tag = event.attributes.get("env").expect("env tag");
-        let logit_core::Value::Str(tag) = tag else { panic!("expected Value::Str, got {tag:?}") };
 
+        let tag = event.attributes.get("env").expect("env tag");
+        let Value::Str(tag) = tag else { panic!("expected Value::Str, got {tag:?}") };
+        assert_shares_datagram_allocation(&datagram, tag, "a scalar tag value");
+
+        let team = event.attributes.get("team").expect("team tag");
+        let Value::Array(elements) = team else { panic!("expected Value::Array, got {team:?}") };
+        assert_eq!(elements.len(), 2, "both wire values should survive the fold");
+        for element in elements {
+            let Value::Str(element) = element else {
+                panic!("expected Value::Str element, got {element:?}")
+            };
+            assert_shares_datagram_allocation(&datagram, element, "an array tag element");
+        }
+    }
+
+    /// Asserts `slice` points inside `datagram`'s allocation -- i.e. it is a [`slice_of`] view
+    /// into the received bytes rather than a fresh copy of them.
+    fn assert_shares_datagram_allocation(datagram: &Bytes, slice: &Bytes, what: &str) {
         let base_start = datagram.as_ptr() as usize;
         let base_end = base_start + datagram.len();
-        let tag_start = tag.as_ptr() as usize;
-        let tag_end = tag_start + tag.len();
+        let start = slice.as_ptr() as usize;
+        let end = start + slice.len();
         assert!(
-            tag_start >= base_start && tag_end <= base_end,
-            "tag value should be a slice of the original datagram, not a copy"
+            start >= base_start && end <= base_end,
+            "{what} should be a slice of the original datagram, not a copy"
+        );
+    }
+
+    /// A `|#` segment is a list, not a map: `#team:a,team:b` is two live tags, so the repeated key
+    /// folds into a `Value::Array` in wire order instead of the last token winning.
+    #[test]
+    fn a_repeated_tag_key_folds_into_an_array_in_wire_order() {
+        let events = decode("page.views:1|c|#team:a,team:b");
+        assert_eq!(
+            events[0].attributes.get("team"),
+            Some(&Value::Array(vec![Value::str("a"), Value::str("b")]))
+        );
+    }
+
+    #[test]
+    fn three_occurrences_of_a_tag_key_fold_into_three_array_elements() {
+        let events = decode("page.views:1|c|#team:a,team:b,team:c");
+        assert_eq!(
+            events[0].attributes.get("team"),
+            Some(&Value::Array(vec![Value::str("a"), Value::str("b"), Value::str("c")]))
+        );
+    }
+
+    /// The Datadog agent dedupes *exact* duplicate tokens, and so does this decoder -- which is
+    /// also what guarantees a one-element `Array` is never produced, leaving a non-repeated tag's
+    /// decoded shape exactly as it was before the fold existed.
+    #[test]
+    fn an_exact_duplicate_tag_is_deduped_instead_of_becoming_an_array() {
+        let events = decode("page.views:1|c|#team:a,team:a");
+        assert_eq!(events[0].attributes.get("team"), Some(&Value::str("a")));
+    }
+
+    #[test]
+    fn an_exact_duplicate_bare_tag_is_deduped_instead_of_becoming_an_array() {
+        let events = decode("page.views:1|c|#urgent,urgent");
+        assert_eq!(events[0].attributes.get("urgent"), Some(&Value::Bool(true)));
+    }
+
+    /// A duplicate among distinct values drops only the duplicate -- `a,b,a` is two live tags.
+    #[test]
+    fn a_duplicate_among_distinct_tag_values_drops_only_the_duplicate() {
+        let events = decode("page.views:1|c|#team:a,team:b,team:a");
+        assert_eq!(
+            events[0].attributes.get("team"),
+            Some(&Value::Array(vec![Value::str("a"), Value::str("b")]))
+        );
+    }
+
+    /// A bare token and a valued one that share a key differ in *form*, not just value, so they
+    /// are not duplicates: both survive, in wire order, and `statsd_out` re-emits both forms.
+    #[test]
+    fn a_bare_and_a_valued_tag_sharing_a_key_keep_both_forms_in_wire_order() {
+        let events = decode("page.views:1|c|#urgent,urgent:1");
+        assert_eq!(
+            events[0].attributes.get("urgent"),
+            Some(&Value::Array(vec![Value::Bool(true), Value::str("1")]))
+        );
+
+        let events = decode("page.views:1|c|#urgent:1,urgent");
+        assert_eq!(
+            events[0].attributes.get("urgent"),
+            Some(&Value::Array(vec![Value::str("1"), Value::Bool(true)]))
+        );
+    }
+
+    /// An event line's `#` field goes through the same `insert_tags` a metric line's `|#` segment
+    /// does, so it folds a repeat identically.
+    #[test]
+    fn a_repeated_tag_key_on_an_event_line_folds_into_an_array() {
+        let event = only_log_event(decode("_e{5,4}:title|text|#k:a,k:b"));
+        assert_eq!(
+            event.attributes.get("k"),
+            Some(&Value::Array(vec![Value::str("a"), Value::str("b")]))
+        );
+    }
+
+    /// ...and so does a service check's, the third caller of that same function.
+    #[test]
+    fn a_repeated_tag_key_on_a_service_check_line_folds_into_an_array() {
+        let events = decode("_sc|check|0|#k:a,k:b");
+        assert_eq!(
+            events[0].attributes.get("k"),
+            Some(&Value::Array(vec![Value::str("a"), Value::str("b")]))
+        );
+    }
+
+    /// A tag *literally named* `statsd.type` inside the `#` segment now folds like any other
+    /// repeated key -- the carrier namespace buys no protection here, since `insert_tags` only
+    /// ever sees the `#` payload. On egress an `Array` matches no `statsd_out` carrier arm and is
+    /// filtered out of the tag segment uncounted, exactly as a wrong-typed carrier already is.
+    /// (Deliberately a `c` line: on `ms`/`h`/`d` the decoder stamps its own `statsd.type` after
+    /// the tags, overwriting whatever the `#` segment folded there.)
+    #[test]
+    fn a_tag_literally_named_statsd_type_folds_into_an_array_like_any_other() {
+        let events = decode("page.views:1|c|#statsd.type:ms,statsd.type:h");
+        assert_eq!(
+            events[0].attributes.get("statsd.type"),
+            Some(&Value::Array(vec![Value::str("ms"), Value::str("h")]))
         );
     }
 

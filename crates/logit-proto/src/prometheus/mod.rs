@@ -85,7 +85,7 @@
 //! | `flags & NO_RECORDED_VALUE` | **skipped**, `logit.output.metrics.skipped{reason="no_recorded_value"}` (`MetricRecord::flags`' own doc: every non-OTLP sink must treat a flagged point as carrying no reading) |
 //! | exemplars | carried onto the family; [`text`] emits them on `_total`/`_bucket` lines in OpenMetrics only, at most one per line, each on the bucket its own value falls in. One that has no line left to sit on -- a counter's second exemplar, two in one bucket's range, one over OpenMetrics' 128-code-point label budget -- is dropped, `logit.output.metrics.degraded{reason="exemplar_dropped"}` (text 0.0.4 drops all of them uncounted: that is the operator's dialect choice, not a lossy mapping) |
 //! | `Event::timestamp` | emitted only when `prometheus.timestamp: true` is present (consumed) |
-//! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Array/Map` dropped -- `logit.output.labels.dropped{reason="unrepresentable"}` |
+//! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.dropped{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `logit_inputs::statsd::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `dropped{reason="unrepresentable"}` path |
 //! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]); labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.dropped{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is dropped -- `logit.output.labels.dropped{reason="reserved"}` |
 //! | two names sanitizing onto one wire name | the family whose *model* name sorts first is exposed, the rest are **skipped** -- `logit.output.metrics.skipped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body. The tie-break is on model names, which means a name that needed no sanitizing can lose to one that did (`a.b` sorts before `a_b`) -- deterministic and counted, but worth knowing before reading it as a bug |
 //! | `unit` / `description` | `# UNIT` (OM only, and only when `_<unit>` suffixes the family name and the unit is `[a-zA-Z0-9_]+` -- the OpenMetrics spec requires it and Prometheus's parser fails the entire body otherwise; dropped counted `logit.output.metrics.degraded{reason="unit_not_suffix"}`) / `# HELP` |
@@ -407,6 +407,20 @@ impl PrometheusEncoder {
 
     fn label_dropped(&self, reason: &'static str) {
         self.telemetry.count("logit.output.labels.dropped", 1.0, &[("reason", reason)]);
+    }
+
+    /// `logit.output.labels.normalized{reason}` -- a label that reached the wire, but not in the
+    /// form the model held it. The only reason so far is `multi_value`: a `Value::Array` attribute
+    /// collapsed to its last representable element by [`build_labels`], because a Prometheus label
+    /// set is a map and has no multi-value label at all.
+    ///
+    /// **This reason is lossy**, unlike every other `*.normalized` reason in
+    /// `docs/design/internal-telemetry.md`: those are a lossless-but-different rendering of the
+    /// same information, whereas this discards the non-last elements outright. It is `normalized`
+    /// rather than `dropped` because the label itself survives and the series still exposes -- but
+    /// an operator reading this counter should read it as data loss.
+    fn label_normalized(&self, reason: &'static str) {
+        self.telemetry.count("logit.output.labels.normalized", 1.0, &[("reason", reason)]);
     }
 }
 
@@ -807,7 +821,25 @@ fn build_labels(
         if key.starts_with(ATTR_PREFIX) {
             continue;
         }
-        let Some(rendered) = label_value(value) else {
+        // A repeated DogStatsD tag key arrives as a `Value::Array` in wire order
+        // (`logit_inputs::statsd::insert_tags`; `statsd_out` re-expands it to one tag per
+        // element). A Prometheus label set is a map -- one name, one value -- so the **last**
+        // representable element wins, walked backwards so a trailing unrepresentable element falls
+        // through to the one before it. Last, not first, for the same reason `influxdb_out` picks
+        // last: it reproduces what this sink exposed back when the decoder itself collapsed a
+        // repeated key to its last token. An empty or entirely unrepresentable array has no
+        // element to fall back to and stays on the `unrepresentable` drop path below.
+        let rendered = match value {
+            Value::Array(elements) => match elements.iter().rev().find_map(label_value) {
+                Some(last) => {
+                    encoder.label_normalized("multi_value");
+                    Some(last)
+                }
+                None => None,
+            },
+            _ => label_value(value),
+        };
+        let Some(rendered) = rendered else {
             encoder.label_dropped("unrepresentable");
             continue;
         };
@@ -1567,7 +1599,11 @@ mod tests {
                 ("null", Value::Null),
                 ("bytes", Value::Bytes(bytes::Bytes::from_static(b"\xff"))),
                 ("ts", Value::Timestamp(1)),
-                ("arr", Value::Array(vec![Value::I64(1)])),
+                // An *empty* array: a non-empty one now renders its last element instead (see
+                // `a_multi_value_label_renders_its_last_element_and_is_counted` below), so the
+                // "no faithful string form" case this row covers is the one with no element to
+                // fall back to.
+                ("arr", Value::Array(Vec::new())),
                 ("map", Value::Map(Box::new(AttrMap::new()))),
             ],
             record("m", MetricKind::Gauge(1.0)),
@@ -1578,6 +1614,96 @@ mod tests {
             labels(&[("b", "true"), ("f", "1.5"), ("i", "-3"), ("s", "text"), ("u", "7")])
         );
         assert!(counted(&registry, "logit.output.labels.dropped", ("reason", "unrepresentable")));
+    }
+
+    /// Every `(point name, reason)` pair the registry holds, from **one** drain -- [`counted`]
+    /// drains, so a test that asserts one counter fired *and* another didn't cannot call it twice
+    /// (the second call would see an already-empty registry and pass vacuously).
+    fn label_points(registry: &Registry) -> Vec<(String, String)> {
+        registry
+            .drain(0)
+            .iter()
+            .flat_map(|event| {
+                let reason = event
+                    .attributes
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                event
+                    .metrics
+                    .iter()
+                    .map(|m| (resolve(m.name).to_string(), reason.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn has_point(points: &[(String, String)], name: &str, reason: &str) -> bool {
+        points.iter().any(|(n, r)| n == name && r == reason)
+    }
+
+    /// A Prometheus label set is a map, so a multi-value attribute (a repeated DogStatsD tag key,
+    /// folded into a `Value::Array` by `logit_inputs::statsd::insert_tags`) has no faithful
+    /// rendering here: the **last** representable element wins, counted -- the same rule, and the
+    /// same "last, not first" reasoning, as `influxdb_out`'s. Without it this label would vanish
+    /// entirely, which is strictly worse than the `team="b"` a collapsing decoder used to produce.
+    #[test]
+    fn a_multi_value_label_renders_its_last_element_and_is_counted() {
+        let event = event_with(
+            &[("team", Value::Array(vec![Value::from("a"), Value::from("b")]))],
+            record("m", MetricKind::Gauge(1.0)),
+        );
+        let (families, registry, _) = encode_counted(&Resource::default(), &event);
+        assert_eq!(families[0].series[0].labels, labels(&[("team", "b")]));
+        let points = label_points(&registry);
+        assert!(has_point(&points, "logit.output.labels.normalized", "multi_value"), "{points:?}");
+        assert!(
+            !has_point(&points, "logit.output.labels.dropped", "unrepresentable"),
+            "a normalized label is not also a dropped one: {points:?}"
+        );
+    }
+
+    #[test]
+    fn a_multi_value_label_walks_back_past_an_unrepresentable_last_element() {
+        let event = event_with(
+            &[(
+                "team",
+                Value::Array(vec![
+                    Value::from("a"),
+                    Value::from("b"),
+                    Value::Null,
+                    Value::Map(Box::new(AttrMap::new())),
+                ]),
+            )],
+            record("m", MetricKind::Gauge(1.0)),
+        );
+        let (families, registry, _) = encode_counted(&Resource::default(), &event);
+        assert_eq!(families[0].series[0].labels, labels(&[("team", "b")]));
+        assert!(counted(&registry, "logit.output.labels.normalized", ("reason", "multi_value")));
+    }
+
+    /// An array with no element to fall back to has nothing to normalize *to*, so it stays on the
+    /// pre-existing `dropped{reason="unrepresentable"}` path and counts nothing as normalized.
+    #[test]
+    fn an_all_unrepresentable_array_label_is_dropped_unrepresentable_not_normalized() {
+        for elements in [Vec::new(), vec![Value::Null, Value::Timestamp(1)]] {
+            let event = event_with(
+                &[("team", Value::Array(elements))],
+                record("m", MetricKind::Gauge(1.0)),
+            );
+            let (families, registry, _) = encode_counted(&Resource::default(), &event);
+            assert!(families[0].series[0].labels.is_empty());
+            let points = label_points(&registry);
+            assert!(
+                has_point(&points, "logit.output.labels.dropped", "unrepresentable"),
+                "{points:?}"
+            );
+            assert!(
+                !has_point(&points, "logit.output.labels.normalized", "multi_value"),
+                "nothing was normalized: {points:?}"
+            );
+        }
     }
 
     /// Two attribute names that sanitize onto one label: the one whose *original* name sorts first

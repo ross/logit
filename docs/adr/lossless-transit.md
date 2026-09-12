@@ -66,6 +66,12 @@ round-trip test can assert equality against a concrete expectation rather than "
   sample rate is not folded away**: the raw value and its `@rate` both survive until something
   chooses to summarize (see below), because unlike a counter's value, a timer's individual samples
   are real values a lossless relay has to be able to hand back one-for-one.
+- Exact-duplicate tag dedupe: a repeated DogStatsD tag key whose values are identical
+  (`#team:a,team:a`) collapses to one occurrence (`#team:a`) at decode — the destination protocol's
+  own stated behaviour (the Datadog agent dedupes only exact duplicates too), not a loss of a value
+  the wire carried. A repeated key whose values *differ* (`#team:a,team:b`) is not a duplicate and
+  is not folded away; it decodes to a `Value::Array` in wire order instead (`docs/adr/statsd-output.md`'s
+  amendment).
 
 **The internal model is a superset of every supported protocol's data model, not only OTLP's.**
 A field or semantic a protocol can carry that `Event`/`EventBatch` cannot represent at all is a

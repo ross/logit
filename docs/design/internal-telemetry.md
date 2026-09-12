@@ -584,7 +584,15 @@ Worked examples, one per shipped component:
   `MetricKind::GaugeDelta` reaching this encoder unresolved (`docs/adr/relative-gauge-adjustments.md`
   — means the pipeline is missing an `aggregate` component) reports under its own
   `logit.component.diagnostics{key="gauge_delta_unresolved"}`, not the generic `encode_error` every
-  other unrepresentable kind uses, specifically so it's greppable on its own. **Not**
+  other unrepresentable kind uses, specifically so it's greppable on its own. **New**,
+  `logit.output.tags.normalized{reason="multi_value"}` counts a multi-valued tag (an `Array`, from
+  a relayed, repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s amendment) rendered as its
+  last representable element, once per attribute — line syntax has no multi-value tag, so this is
+  the fallback. **This `normalized` reason is lossy, unlike every other `*.normalized` reason in
+  this doc**: every other one renders a *different but equivalent* wire form (batching, reordering,
+  a dialect substitution), while `multi_value` renders only the tag's last element and silently
+  drops every other element the array carried — a deliberate, counted exception to the "normalized
+  means lossless-but-different" convention this family of counters otherwise holds to. **Not**
   `logit.output.retries` — retry moved out of this sink entirely
   (`docs/adr/buffered-sink-delivery.md`) into the generic `deliver_with_retry` every sink now
   shares, so retry counting is a Layer 2 metric (`logit.component.retries`, above), not something
@@ -618,7 +626,10 @@ Worked examples, one per shipped component:
   out-of-set value -- its own counter, not `unencodable_value`, since the rest of that line still
   renders) and `logit.output.tags.dropped{reason="dialect"|
   "unrepresentable"}` for `format: statsd` dropping the whole tag segment or an individual
-  unrepresentable tag. **New**, `logit.output.messages.normalized{reason="dialect"|
+  unrepresentable tag — counted **per wire tag**, so a multi-valued attribute (an `Array`, from a
+  repeated DogStatsD tag key, `docs/adr/statsd-output.md`'s amendment) that expands to several tags
+  on the wire counts once per element, not once per attribute. **New**,
+  `logit.output.messages.normalized{reason="dialect"|
   "member_sanitized"}` counts a lossless-but-different rendering rather than a drop: a timer's
   `h`/`d` wire-type letter collapsing to `ms` under `format: statsd`, or a `SetMembers` member
   changing after lossy UTF-8 plus sanitization. A `MetricKind::GaugeDelta` reaching this encoder
