@@ -181,6 +181,7 @@ pub fn role(kind: &ComponentKind) -> Role {
     use ComponentKind::*;
     match kind {
         StatsdIn { .. }
+        | CollectdIn { .. }
         | SyslogIn { .. }
         | OtlpIn { .. }
         | TailIn { .. }
@@ -231,6 +232,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
     use ComponentKind::*;
     match kind {
         StatsdIn { .. } => "statsd_in",
+        CollectdIn { .. } => "collectd_in",
         SyslogIn { .. } => "syslog_in",
         OtlpIn { .. } => "otlp_in",
         TailIn { .. } => "tail_in",
@@ -277,6 +279,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
     matches!(
         kind,
         ComponentKind::StatsdIn { .. }
+            | ComponentKind::CollectdIn { .. }
             | ComponentKind::SyslogIn { .. }
             | ComponentKind::OtlpIn { .. }
             | ComponentKind::TailIn { .. }
@@ -667,7 +670,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             if let Some(field) = queue_only_field {
                 anyhow::bail!(
                     "component '{id}': 'receive.{field}' is only meaningful on a datagram \
-                     listener (statsd_in, syslog_in) -- a tail listener has no receive queue; \
+                     listener (statsd_in, collectd_in, syslog_in) -- a tail listener has no \
+                     receive queue; \
                      only receive.batch_max_events, batch_max_bytes, batch_flush_interval, and \
                      shutdown_grace apply"
                 );
@@ -676,7 +680,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
         anyhow::bail!(
             "component '{id}': 'receive' is only meaningful on a datagram or tail listener \
-             (statsd_in, syslog_in, tail_in, docker_in), but '{id}' is a {}",
+             (statsd_in, collectd_in, syslog_in, tail_in, docker_in), but '{id}' is a {}",
             role(&component.kind).as_str()
         );
     }
@@ -1539,7 +1543,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 /// Kept explicit rather than derived from [`Role`] -- see rule 17's own doc comment -- so a new
 /// listener kind rejects `receive:` until it is actually wired to that driver.
 fn is_datagram_listener(kind: &ComponentKind) -> bool {
-    matches!(kind, ComponentKind::StatsdIn { .. } | ComponentKind::SyslogIn { .. })
+    matches!(
+        kind,
+        ComponentKind::StatsdIn { .. }
+            | ComponentKind::CollectdIn { .. }
+            | ComponentKind::SyslogIn { .. }
+    )
 }
 
 /// The predicate rules 17/18/28 need: which `ComponentKind`s the file-tailing driver
@@ -4520,6 +4529,62 @@ mod tests {
             err.contains("'receive' is only meaningful on a datagram or tail listener"),
             "got: {err}"
         );
+    }
+
+    // ---- collectd_in (docs/adr/collectd-binary-relay.md) --------------------------------------
+
+    fn collectd_in(types_db: Vec<&str>) -> ComponentKind {
+        ComponentKind::CollectdIn {
+            bind: "0.0.0.0:25826".to_string(),
+            types_db: types_db.into_iter().map(std::path::PathBuf::from).collect(),
+        }
+    }
+
+    #[test]
+    fn a_collectd_in_resolves_as_an_implemented_listener() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], collectd_in(vec![])),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("a collectd_in should resolve");
+        assert_eq!(graph.components["in"].role(), Role::Listener);
+        assert_eq!(graph.components["in"].kind_name(), "collectd_in");
+    }
+
+    #[test]
+    fn a_collectd_in_with_types_db_paths_resolves() {
+        resolve(cfg(vec![
+            ("in", vec![], collectd_in(vec!["/usr/share/collectd/types.db", "local.db"])),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("types_db paths are resolved at build time, not here");
+    }
+
+    /// `collectd_in` runs on the shared UDP listener driver, so rule 17 must let a `receive:`
+    /// block through -- the property `is_datagram_listener` exists to carry.
+    #[test]
+    fn a_non_default_receive_on_collectd_in_is_allowed() {
+        let graph = resolve(cfg_with_receive(vec![
+            ("in", vec![], collectd_in(vec![]), non_default_receive()),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("collectd_in is a datagram listener, so receive: applies to it");
+        assert_eq!(graph.components["in"].receive.max_datagrams, 4096);
+    }
+
+    /// Rule 18's zero-bound check reaches `collectd_in` through the same predicate.
+    #[test]
+    fn a_zero_receive_bound_on_collectd_in_is_rejected() {
+        let err = expect_err(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                collectd_in(vec![]),
+                ReceiveConfig { max_datagrams: 0, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'receive.max_datagrams' must be at least 1"), "got: {err}");
     }
 
     // ---- rule 41: prometheus_out --------------------------------------------------------------
