@@ -216,6 +216,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | FileOut { .. }
         | SyslogOut { .. }
         | StatsdOut { .. }
+        | CollectdOut { .. }
         | PrometheusOut { .. } => Role::Sink,
     }
 }
@@ -266,6 +267,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         FileOut { .. } => "file_out",
         SyslogOut { .. } => "syslog_out",
         StatsdOut { .. } => "statsd_out",
+        CollectdOut { .. } => "collectd_out",
         PrometheusOut { .. } => "prometheus_out",
     }
 }
@@ -312,6 +314,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::LogitIn { .. }
             | ComponentKind::LogitOut { .. }
             | ComponentKind::StatsdOut { .. }
+            | ComponentKind::CollectdOut { .. }
             | ComponentKind::PrometheusOut { .. }
     )
 }
@@ -1387,11 +1390,15 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 38: `statsd_out`'s `max_packet_bytes: 0` is rejected the same way rule 15's
-    // `max_batches`/`max_bytes: 0` is -- an impossible bound (every line would overflow it and be
-    // dropped whole), not a small one.
+    // Rule 38: `statsd_out`'s/`collectd_out`'s `max_packet_bytes: 0` is rejected the same way rule
+    // 15's `max_batches`/`max_bytes: 0` is -- an impossible bound (every line/value list would
+    // overflow it and be dropped whole), not a small one.
     for (id, component) in &components {
-        if let ComponentKind::StatsdOut { max_packet_bytes: 0, .. } = &component.kind {
+        if matches!(
+            &component.kind,
+            ComponentKind::StatsdOut { max_packet_bytes: 0, .. }
+                | ComponentKind::CollectdOut { max_packet_bytes: 0, .. }
+        ) {
             anyhow::bail!(
                 "component '{id}': max_packet_bytes: 0 would drop every metric line -- use a \
                  positive byte size"
@@ -1781,6 +1788,14 @@ mod tests {
             relative_gauges: false,
             max_packet_bytes,
             connect_timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn collectd_out(max_packet_bytes: u64) -> ComponentKind {
+        ComponentKind::CollectdOut {
+            endpoint: "127.0.0.1:25826".to_string(),
+            max_packet_bytes,
+            hostname: None,
         }
     }
 
@@ -4223,6 +4238,32 @@ mod tests {
     fn a_zero_max_packet_bytes_is_rejected() {
         let err =
             expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], statsd_out(0))]));
+        assert!(err.contains("'out'") && err.contains("max_packet_bytes: 0"), "got: {err}");
+    }
+
+    #[test]
+    fn collectd_out_is_a_sink_and_is_implemented() {
+        let kind = collectd_out(1452);
+        assert_eq!(kind_name(&kind), "collectd_out");
+        assert_eq!(role(&kind), Role::Sink);
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], collectd_out(1452))]))
+            .expect("a well-formed collectd_out should resolve fine");
+    }
+
+    #[test]
+    fn a_collectd_out_with_no_sources_is_rejected() {
+        let err = expect_err(cfg(vec![("out", vec![], collectd_out(1452))]));
+        assert!(err.contains("'out'") && err.contains("sink"), "got: {err}");
+    }
+
+    /// Rule 38 (extended): `collectd_out`'s `max_packet_bytes: 0` is the same impossible bound as
+    /// `statsd_out`'s own.
+    #[test]
+    fn a_zero_max_packet_bytes_is_rejected_for_collectd_out_too() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], collectd_out(0)),
+        ]));
         assert!(err.contains("'out'") && err.contains("max_packet_bytes: 0"), "got: {err}");
     }
 
