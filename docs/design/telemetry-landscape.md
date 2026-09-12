@@ -193,7 +193,7 @@ ingest. A pickle-serialized batch protocol exists as a transport optimization, s
 | Tags/labels | none | string k:v, bare | typed `AnyValue` attrs | string labels | string labels (interned, 2.0) | string tag values | identity parts only | `k=v`, string |
 | Resource/scope identity | — | — | `Resource`+`Scope` | job/instance labels (convention) | job/instance labels | tags (convention) | host/plugin parts | path prefix (convention) |
 | schema_url | — | — | yes | — | — | — | — | — |
-| Events/service checks | — | `_e{}` / `_sc` | (as logs, not metrics) | — | — | — | — | — |
+| Events/service checks | — | `_e{}` / `_sc` (in `logit`: `log` (`_e`) / `Gauge` + `statsd.service_check.*` carriers (`_sc`), both ways -- `docs/adr/statsd-output.md`'s amendment) | (as logs, not metrics) | — | — | — | — | — |
 | Container id | — | `\|c:` | resource attrs | — | — | — | — | — |
 | Multi-value point | `a:1:2:3\|c` | yes | one point per `Metric` (batch-level regroup) | one line per series | one series per point | multiple fields/point | one value/part | one value/line |
 | No-recorded-value / stale marker | — | — | `flags` bit 0 | staleness marker (internal) | — | — | — | — |

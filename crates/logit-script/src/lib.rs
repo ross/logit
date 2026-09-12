@@ -8,7 +8,7 @@
 //! rather than relying on a convention nobody checks. The pipeline runs one [`ScriptWorker`] per
 //! worker thread.
 
-use logit_core::{Event, Resource, Telemetry};
+use logit_core::{Event, Resource, Scope, Telemetry};
 use mlua::{Lua, LuaOptions, RegistryKey, StdLib, Value as LuaValue};
 use std::cell::RefCell;
 use std::marker::PhantomData;
@@ -18,6 +18,7 @@ use std::sync::Arc;
 mod provenance;
 mod proxy;
 mod resource;
+mod scope;
 mod telemetry;
 mod trace;
 mod value;
@@ -90,6 +91,10 @@ pub struct ScriptWorker {
     /// doc for why this is a plain `Rc`, not a `RegistryKey` like `trace_table`: `set_resource`/
     /// `take_resource` need to hand a real `Arc<Resource>` back out without a `&Lua` in hand.
     resource_state: Rc<RefCell<resource::ResourceState>>,
+    /// Shared with the installed `scope` global's userdata -- same reasoning as `resource_state`,
+    /// and the same shape (`crate::scope`'s module doc), just for `Option<Arc<Scope>>` instead of
+    /// `Arc<Resource>`.
+    scope_state: Rc<RefCell<scope::ScopeState>>,
     /// Shared with the installed `provenance` global's userdata -- same reasoning as
     /// `resource_state`. See `crate::provenance`'s module doc.
     provenance_state: Rc<RefCell<provenance::ProvenanceState>>,
@@ -139,6 +144,8 @@ impl ScriptWorker {
         // Same "before `.exec()`" reasoning as `trace_table` above, and the same unconditional
         // (not opt-in) installation -- see `crate::resource`'s module doc.
         let resource_state = resource::install(&lua)?;
+        // Same "before `.exec()`" reasoning again -- see `crate::scope`'s module doc.
+        let scope_state = scope::install(&lua)?;
         // Same "before `.exec()`" reasoning again -- see `crate::provenance`'s module doc.
         let provenance_state = provenance::install(&lua)?;
         lua.load(source).exec()?;
@@ -164,6 +171,7 @@ impl ScriptWorker {
             flush,
             trace_table,
             resource_state,
+            scope_state,
             provenance_state,
             _not_send_sync: PhantomData,
         })
@@ -196,6 +204,23 @@ impl ScriptWorker {
     /// doc; `run_lua` uses this both after a batch's `process()` calls and after `flush()`.
     pub fn take_resource(&self) -> Option<Arc<Resource>> {
         resource::take(&self.resource_state)
+    }
+
+    /// Resets `scope` (`crate::scope`) so this worker's next `process()`/`flush()` call reads the
+    /// given batch's scope (or, for a batch with none, the all-clear defaults `crate::scope`
+    /// documents), and clears any write left over from a previous batch. Called once per incoming
+    /// batch, before its events reach `process` (`crates/logit-pipeline/src/runtime.rs`'s
+    /// `run_lua`) -- same reasoning and same plain-`Rc` shape as `set_resource`.
+    pub fn set_scope(&self, scope: &Option<Arc<Scope>>) {
+        scope::set(&self.scope_state, scope);
+    }
+
+    /// `Some` if a script wrote `scope` since the last [`ScriptWorker::set_scope`] call -- `None`,
+    /// the common case, if it never touched the global. See `crate::scope`'s module doc; `run_lua`
+    /// uses this both after a batch's `process()` calls and after `flush()`, the same two call
+    /// sites `take_resource` has.
+    pub fn take_scope(&self) -> Option<Arc<Scope>> {
+        scope::take(&self.scope_state)
     }
 
     /// Overwrites the read-only `provenance` global's `origin`/`previous` fields so this worker's
@@ -1687,6 +1712,50 @@ mod tests {
             out.attributes.get("trace_id").and_then(|v| v.as_str()),
             Some(&"0".repeat(32)[..]),
             "a top-level alias of `trace` should see the installed table, not nil"
+        );
+    }
+
+    /// `scope` (`crate::scope`) is readable inside `process()`, the same as `resource` -- see
+    /// that module's own doc comment. Installed unconditionally, starting all-clear (`""`) before
+    /// any `set_scope` call, exactly like `trace_context_is_readable_in_process...` above covers
+    /// for `trace`.
+    #[test]
+    fn scope_name_is_readable_in_process() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.scope_name = scope.name
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(counter_event("hits", 1.0)).unwrap());
+        assert_eq!(out.attributes.get("scope_name").and_then(|v| v.as_str()), Some(""));
+    }
+
+    /// A script writing both `scope.version` (`crate::scope`) and `resource.schema_url`
+    /// (`crate::resource`, W7) commits both independently: `ScriptWorker::take_scope`/
+    /// `take_resource` each report the new value after the same `process()` call.
+    #[test]
+    fn writing_scope_version_and_resource_schema_url_commits_through_take() {
+        let w = worker(
+            r#"
+            function process(event)
+                scope.version = "2.0.0"
+                resource.schema_url = "https://example.com/schema"
+                return event
+            end
+            "#,
+        );
+        w.process(counter_event("hits", 1.0)).unwrap();
+
+        let scope = w.take_scope().expect("a scope write must report Some");
+        assert_eq!(scope.version.as_ref(), b"2.0.0");
+
+        let resource = w.take_resource().expect("a resource write must report Some");
+        assert_eq!(
+            resource.schema_url,
+            Some(bytes::Bytes::from_static(b"https://example.com/schema"))
         );
     }
 }
