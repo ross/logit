@@ -87,7 +87,7 @@
 //! | `Event::timestamp` | emitted only when `prometheus.timestamp: true` is present (consumed) |
 //! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Array/Map` dropped -- `logit.output.labels.dropped{reason="unrepresentable"}` |
 //! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]); labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.dropped{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is dropped -- `logit.output.labels.dropped{reason="reserved"}` |
-//! | two names sanitizing onto one wire name | the family whose *model* name sorts first is exposed, the rest are **skipped** -- `logit.output.metrics.skipped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body |
+//! | two names sanitizing onto one wire name | the family whose *model* name sorts first is exposed, the rest are **skipped** -- `logit.output.metrics.skipped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body. The tie-break is on model names, which means a name that needed no sanitizing can lose to one that did (`a.b` sorts before `a_b`) -- deterministic and counted, but worth knowing before reading it as a bug |
 //! | `unit` / `description` | `# UNIT` (OM only, and only when `_<unit>` suffixes the family name and the unit is `[a-zA-Z0-9_]+` -- the OpenMetrics spec requires it and Prometheus's parser fails the entire body otherwise; dropped counted `logit.output.metrics.degraded{reason="unit_not_suffix"}`) / `# HELP` |
 //! | two records, one name, different family types | the first record's type wins, the rest are **skipped**, `logit.output.metrics.skipped{reason="type_conflict"}` -- one name cannot carry two `# TYPE` lines |
 //! | `EventBatch::scope`, `Resource::schema_url`, `dropped_attributes_count` | dropped (known-gaps rows) |
@@ -146,6 +146,7 @@ use logit_core::{
     AttrMap, DdSketch, Diagnostics, Event, Exemplar, Histogram, MetricKind, MetricRecord, Resource,
     Sum, Summary, Telemetry, Temporality, Value,
 };
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -548,43 +549,9 @@ pub fn events_to_families<'a>(
             }
             let Some((kind, point)) = record_to_point(record, event, encoder) else { continue };
             let name = resolve(record.name);
+            // Borrows `name` whenever it already conforms, which is nearly always -- one allocation
+            // per *family*, not per point, and only for a name that really has to change.
             let key = sanitize_metric_name(name);
-            let fresh = || FamilyEntry {
-                origin: name,
-                family: MetricFamily {
-                    name: key.clone(),
-                    kind,
-                    help: record.description.map(|s| resolve(s).to_string()),
-                    unit: record.unit.map(|s| resolve(s).to_string()),
-                    series: Vec::new(),
-                },
-            };
-            match families.get(&key) {
-                // The family this record belongs to, already started.
-                Some(existing) if existing.origin == name => {}
-                // A different model name sanitizing onto the same wire name: the one whose original
-                // name sorts first wins, so the outcome is the data's, not the arrival order's.
-                Some(existing) if name < existing.origin => {
-                    let displaced = families.insert(key.clone(), fresh()).expect("just probed");
-                    for _ in 0..displaced.family.series.len().max(1) {
-                        encoder.skipped_reason("name_collision");
-                    }
-                }
-                Some(_) => {
-                    encoder.skipped_reason("name_collision");
-                    continue;
-                }
-                None => {
-                    families.insert(key.clone(), fresh());
-                }
-            }
-            let entry = &mut families.get_mut(&key).expect("inserted above").family;
-            if entry.kind != kind {
-                // Two records sharing one name but disagreeing on type: the wire has exactly one
-                // `# TYPE` line per name, so the second one has nowhere to go.
-                encoder.skipped_reason("type_conflict");
-                continue;
-            }
             let labels = build_labels(resource, event, kind, encoder);
             let timestamp = match event.attributes.get(ATTR_TIMESTAMP) {
                 Some(Value::Bool(true)) => Some(event.timestamp),
@@ -595,13 +562,58 @@ pub fn events_to_families<'a>(
             } else {
                 None
             };
-            entry.series.push(Series {
+            let mut series = Some(Series {
                 labels,
                 point,
                 timestamp,
                 created,
                 exemplars: record.exemplars.clone(),
             });
+
+            // One map probe on the steady-state path (a family this record already belongs to); the
+            // second write happens only when a family is created or displaced.
+            let mut start_family = false;
+            let mut displaced = 0;
+            match families.get_mut(key.as_ref()) {
+                Some(existing) if existing.origin == name => {
+                    if existing.family.kind != kind {
+                        // Two records sharing one name but disagreeing on type: the wire has exactly
+                        // one `# TYPE` line per name, so the second one has nowhere to go.
+                        encoder.skipped_reason("type_conflict");
+                    } else {
+                        existing.family.series.push(series.take().expect("built above"));
+                    }
+                }
+                // A different model name sanitizing onto the same wire name: the one whose model
+                // name sorts first wins, so the outcome is the data's, not the arrival order's.
+                Some(existing) if name < existing.origin => {
+                    displaced = existing.family.series.len().max(1);
+                    start_family = true;
+                }
+                Some(_) => encoder.skipped_reason("name_collision"),
+                None => start_family = true,
+            }
+            if !start_family {
+                continue;
+            }
+            let series = series.take().expect("only the matching-family arm consumes it");
+            for _ in 0..displaced {
+                encoder.skipped_reason("name_collision");
+            }
+            let key = key.into_owned();
+            families.insert(
+                key.clone(),
+                FamilyEntry {
+                    origin: name,
+                    family: MetricFamily {
+                        name: key,
+                        kind,
+                        help: record.description.map(|s| resolve(s).to_string()),
+                        unit: record.unit.map(|s| resolve(s).to_string()),
+                        series: vec![series],
+                    },
+                },
+            );
         }
     }
 
@@ -789,7 +801,7 @@ fn build_labels(
         FamilyType::Summary => Some("quantile"),
         _ => None,
     };
-    let mut candidates: Vec<(&str, String, String)> = Vec::new();
+    let mut candidates: Vec<(&str, Cow<'_, str>, String)> = Vec::new();
     for (key, value) in logit_core::attrs::merged(resource, event) {
         let key = resolve(key);
         if key.starts_with(ATTR_PREFIX) {
@@ -800,7 +812,7 @@ fn build_labels(
             continue;
         };
         let name = sanitize_label_name(key);
-        if Some(name.as_str()) == generated {
+        if Some(name.as_ref()) == generated {
             encoder.label_dropped("reserved");
             continue;
         }
@@ -809,11 +821,11 @@ fn build_labels(
     candidates.sort_by(|a, b| a.0.cmp(b.0));
     let mut labels: Vec<(String, String)> = Vec::with_capacity(candidates.len());
     for (_, name, value) in candidates {
-        if labels.iter().any(|(existing, _)| *existing == name) {
+        if labels.iter().any(|(existing, _)| existing.as_str() == name.as_ref()) {
             encoder.label_dropped("collision");
             continue;
         }
-        labels.push((name, value));
+        labels.push((name.into_owned(), value));
     }
     labels.sort_by(|a, b| a.0.cmp(&b.0));
     labels
@@ -838,35 +850,46 @@ fn label_value(value: &Value) -> Option<String> {
 // Sanitization
 // -------------------------------------------------------------------------------------------------
 
-/// A metric name forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`: every other byte becomes `_`
+/// A metric name forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`: every other character becomes `_`
 /// (substitution, not deletion, so distinct inputs stay distinct -- the `statsd_out` precedent,
 /// `crates/logit-outputs/src/statsd.rs`'s `sanitize_into`), and a leading digit gains a `_` prefix
 /// rather than being replaced, which would fold `5xx_total` and `_xx_total` together. An empty name
-/// becomes `_`. Two names that sanitize onto one produce two families with the same name; the
-/// exposition then carries a duplicate `# TYPE`, which is the operator's own naming collision
-/// (known-gaps row) rather than something this codec can resolve.
-pub fn sanitize_metric_name(name: &str) -> String {
+/// becomes `_`.
+///
+/// Returns a [`Cow`] **borrowing** `name` whenever it already conforms, which is the overwhelmingly
+/// common case: every name off a Prometheus scrape, and every name a metrics library produces.
+/// [`events_to_families`] calls this once per metric *record*, so allocating there would cost one
+/// allocation per point rather than one per family (`docs/design/memory.md`,
+/// [ADR `minimize-allocations-over-event-size`](../../../../docs/adr/minimize-allocations-over-event-size.md)).
+///
+/// Two names that sanitize onto one cannot both be exposed -- see [`events_to_families`] and the
+/// module doc's encode table for how that collision is resolved and counted.
+pub fn sanitize_metric_name(name: &str) -> Cow<'_, str> {
     sanitize(name, true)
 }
 
 /// A label name forced into `[a-zA-Z_][a-zA-Z0-9_]*` -- the same rules as
 /// [`sanitize_metric_name`] minus `:`, which is legal in a metric name and not in a label name.
-pub fn sanitize_label_name(name: &str) -> String {
+pub fn sanitize_label_name(name: &str) -> Cow<'_, str> {
     sanitize(name, false)
 }
 
-fn sanitize(name: &str, colon_ok: bool) -> String {
+fn sanitize(name: &str, colon_ok: bool) -> Cow<'_, str> {
+    let conforms = |c: char| c.is_ascii_alphanumeric() || c == '_' || (colon_ok && c == ':');
+    let leads = |c: char| conforms(c) && !c.is_ascii_digit();
+    if name.starts_with(leads) && name.chars().all(conforms) {
+        return Cow::Borrowed(name);
+    }
     let mut out = String::with_capacity(name.len() + 1);
     for c in name.chars() {
-        let ok = c.is_ascii_alphanumeric() || c == '_' || (colon_ok && c == ':');
-        out.push(if ok { c } else { '_' });
+        out.push(if conforms(c) { c } else { '_' });
     }
     match out.chars().next() {
         None => out.push('_'),
         Some(c) if c.is_ascii_digit() => out.insert(0, '_'),
         Some(_) => {}
     }
-    out
+    Cow::Owned(out)
 }
 
 #[cfg(test)]

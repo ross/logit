@@ -1124,14 +1124,17 @@ impl Writer<'_> {
                 self.created(series);
             }
             Point::Gauge(v) | Point::Unknown(v) => {
+                self.drop_exemplars(series);
                 self.suffixed("");
                 self.sample(&series.labels, None, *v, series, None);
             }
             Point::Info => {
+                self.drop_exemplars(series);
                 self.suffixed(if om { "_info" } else { "" });
                 self.sample(&series.labels, None, 1.0, series, None);
             }
             Point::StateSet(on) => {
+                self.drop_exemplars(series);
                 self.suffixed("");
                 self.sample(&series.labels, None, if *on { 1.0 } else { 0.0 }, series, None);
             }
@@ -1171,6 +1174,10 @@ impl Writer<'_> {
                 self.created(series);
             }
             Point::Summary { quantiles, sum, count } => {
+                // A summary has no line OpenMetrics allows an exemplar on -- only `_total` and
+                // `_bucket` carry them -- which is the same structural reason OTLP's
+                // `SummaryDataPoint` has no exemplars field at all.
+                self.drop_exemplars(series);
                 for (q, v) in quantiles {
                     self.bound.clear();
                     push_float_str(&mut self.bound, *q);
@@ -1187,6 +1194,21 @@ impl Writer<'_> {
                 }
                 self.created(series);
             }
+        }
+    }
+
+    /// Counts every exemplar on a series whose point type has no line that can carry one:
+    /// OpenMetrics permits exemplars on `_total` and `_bucket` samples only, so a gauge's, an
+    /// `info`'s, a `stateset`'s or a summary's are dropped -- and `events_to_families` attaches
+    /// whatever the record carried regardless of kind, so an `otlp_in`-sourced `Gauge` or `Summary`
+    /// really does arrive here with exemplars on it. Text 0.0.4 drops every exemplar anyway, which
+    /// is the operator's dialect choice and deliberately uncounted.
+    fn drop_exemplars(&mut self, series: &Series) {
+        if !self.dialect.is_openmetrics() {
+            return;
+        }
+        for _ in &series.exemplars {
+            self.encoder.degraded_reason("exemplar_dropped");
         }
     }
 
@@ -1333,7 +1355,9 @@ fn unit_suffixes(name: &str, unit: &str) -> bool {
     if unit.is_empty() || !unit.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return false;
     }
-    name.len() > unit.len() + 1
+    // `>`, not `> unit.len() + 1`: a family named exactly `_<unit>` satisfies the rule, and
+    // Prometheus's own check rejects only `len(name) < len(unit) + 1`.
+    name.len() > unit.len()
         && name.as_bytes()[name.len() - unit.len() - 1] == b'_'
         && name.ends_with(unit)
 }
@@ -2486,27 +2510,39 @@ mod tests {
     /// dropped rather than poisoning every other family in the response.
     #[test]
     fn an_openmetrics_unit_is_written_only_when_it_suffixes_the_family_name() {
-        let (body, counts) =
-            write_counted(&[unit_family("latency_seconds", "seconds")], Dialect::OpenMetrics1_0);
-        assert!(body.contains("# UNIT latency_seconds seconds\n"), "{body}");
-        assert!(counts.is_empty(), "a conforming unit is not a degradation: {counts:?}");
+        // Legal: `_<unit>` suffixes the name -- including a name that is *exactly* `_<unit>`, which
+        // both the spec and Prometheus's own length check accept.
+        for (name, unit) in
+            [("latency_seconds", "seconds"), ("_seconds", "seconds"), ("requests_total", "total")]
+        {
+            let (body, counts) = write_counted(&[unit_family(name, unit)], Dialect::OpenMetrics1_0);
+            assert!(body.contains(&format!("# UNIT {name} {unit}\n")), "{name}/{unit}: {body}");
+            assert!(counts.is_empty(), "a conforming unit is not a degradation: {counts:?}");
+        }
 
         for (name, unit) in [
-            ("request_duration", "s"),   // not a suffix at all
-            ("seconds", "seconds"),      // the name *is* the unit, with no `_` before it
-            ("_seconds", "seconds"),     // only the underscore, no name left
-            ("requests_total", "total"), // a suffix, but this family's unit isn't `total`
+            ("request_duration", "s"),  // not a suffix at all
+            ("seconds", "seconds"),     // the name *is* the unit, with no `_` before it
+            ("latency_seconds", "sec"), // a prefix of the suffix, not the suffix
         ] {
             let (body, counts) = write_counted(&[unit_family(name, unit)], Dialect::OpenMetrics1_0);
-            if name == "requests_total" {
-                // This one *is* a legal suffix relationship, so it is written.
-                assert!(body.contains("# UNIT requests_total total\n"), "{body}");
-                assert!(counts.is_empty());
-                continue;
-            }
             assert!(!body.contains("# UNIT"), "{name}/{unit} must not emit a unit: {body}");
             assert_eq!(counts, vec![("unit_not_suffix".to_string(), 1.0)], "{name}/{unit}");
         }
+    }
+
+    /// The parser is deliberately lenient about the suffix rule -- a scraper keeps what it is given
+    /// -- so a non-conforming unit rides through the model and only the *writer* drops it. That
+    /// pairing is what makes a relay lose the unit rather than emit a body Prometheus would reject
+    /// wholesale.
+    #[test]
+    fn a_non_suffix_unit_is_accepted_on_parse_and_dropped_on_write() {
+        let families =
+            parsed("# TYPE foo gauge\n# UNIT foo bar\nfoo 1\n# EOF\n", Dialect::OpenMetrics1_0);
+        assert_eq!(families[0].unit.as_deref(), Some("bar"), "parse keeps what it was given");
+        let (body, counts) = write_counted(&families, Dialect::OpenMetrics1_0);
+        assert_eq!(body, "# TYPE foo gauge\nfoo 1\n# EOF\n");
+        assert_eq!(counts, vec![("unit_not_suffix".to_string(), 1.0)]);
     }
 
     /// A unit like OpenMetrics' `{requests}` would break the line grammar as well as the suffix
@@ -2622,6 +2658,60 @@ mod tests {
         assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
     }
 
+    /// OpenMetrics allows exemplars on `_total` and `_bucket` samples only, so a gauge's are dropped
+    /// -- and `otlp_in` really does produce them: OTLP carries exemplars on `Gauge` and on the
+    /// non-monotonic `Sum` this codec renders as a gauge.
+    #[test]
+    fn a_gauges_exemplars_are_dropped_and_counted() {
+        let mut family = MetricFamily::new("temperature", FamilyType::Gauge);
+        family.series = vec![Series {
+            exemplars: vec![exemplar(0.1, &[("n", "1")]), exemplar(0.2, &[("n", "2")])],
+            ..Series::new(vec![], Point::Gauge(21.5))
+        }];
+        let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
+        assert_eq!(body, "# TYPE temperature gauge\ntemperature 21.5\n# EOF\n");
+        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 2.0)]);
+    }
+
+    /// Same for a summary, which has no exemplar-carrying line either -- the structural reason
+    /// OTLP's own `SummaryDataPoint` has no exemplars field. `Distribution`/`Samples` reach the wire
+    /// through this arm too.
+    #[test]
+    fn a_summarys_exemplars_are_dropped_and_counted() {
+        let mut family = MetricFamily::new("rpc_seconds", FamilyType::Summary);
+        family.series = vec![Series {
+            exemplars: vec![exemplar(0.1, &[])],
+            ..Series::new(
+                vec![],
+                Point::Summary { quantiles: vec![(0.5, 0.2)], sum: Some(1.0), count: Some(3) },
+            )
+        }];
+        let (body, counts) = write_counted(&[family], Dialect::OpenMetrics1_0);
+        assert!(!body.contains('#') || !body.contains(" # {"), "{body}");
+        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
+    }
+
+    /// And for the two OpenMetrics-only gauge-shaped types, so no arm of the writer is left silently
+    /// dropping one.
+    #[test]
+    fn an_info_and_a_stateset_exemplar_are_dropped_and_counted() {
+        let mut info = MetricFamily::new("build", FamilyType::Info);
+        info.series = vec![Series {
+            exemplars: vec![exemplar(1.0, &[])],
+            ..Series::new(vec![], Point::Info)
+        }];
+        let (_, counts) = write_counted(&[info], Dialect::OpenMetrics1_0);
+        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
+
+        let mut state = MetricFamily::new("state", FamilyType::StateSet);
+        state.series = vec![Series {
+            exemplars: vec![exemplar(1.0, &[])],
+            ..Series::new(vec![("state".to_string(), "on".to_string())], Point::StateSet(true))
+        }];
+        let (_, counts) = write_counted(&[state], Dialect::OpenMetrics1_0);
+        assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
+    }
+
     /// Text 0.0.4 has no exemplars at all, so dropping every one of them is the dialect's own
     /// doing -- a permitted normalization, not a counted degradation.
     #[test]
@@ -2629,6 +2719,15 @@ mod tests {
         let family = counter_with_exemplars(vec![exemplar(0.1, &[]), exemplar(0.2, &[])]);
         let (body, counts) = write_counted(&[family], Dialect::Text0_0_4);
         assert_eq!(body, "# TYPE requests_total counter\nrequests_total 17\n");
+        assert!(counts.is_empty(), "{counts:?}");
+
+        // Including the kinds that have no exemplar-carrying line even in OpenMetrics.
+        let mut gauge = MetricFamily::new("temperature", FamilyType::Gauge);
+        gauge.series = vec![Series {
+            exemplars: vec![exemplar(0.1, &[])],
+            ..Series::new(vec![], Point::Gauge(1.0))
+        }];
+        let (_, counts) = write_counted(&[gauge], Dialect::Text0_0_4);
         assert!(counts.is_empty(), "{counts:?}");
     }
 
