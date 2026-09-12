@@ -459,6 +459,20 @@ Worked examples, one per shipped component:
   separate counter needed, since the bridge already mirrors every occurrence.
 - `syslog_in` (`crates/logit-inputs/src/syslog.rs`): the same pair, `logit.input.datagrams`/
   `.datagram.bytes` — direct parity with `statsd_in`, the other UDP listener.
+- `collectd_in` (`crates/logit-inputs/src/collectd.rs`,
+  [ADR `collectd-binary-relay`](../adr/collectd-binary-relay.md)): **no layer-3 counters of its
+  own** — the same `logit.input.datagrams`/`.datagram.bytes` pair and the whole `ReceiveQueue`/
+  `receive_buffer.*` table come free from the shared `UdpListener` driver, and collectd's binary
+  framing gives this listener nothing further that only it can see. What it does add is a
+  `Diagnostics` vocabulary, mirrored as `logit.component.diagnostics{key}` by the bridge:
+  `bad_datagram` (the driver's own, for a datagram where the *first* part is malformed, so nothing
+  was salvaged), `bad_part` (a malformed part behind at least one decoded value list — the earlier
+  lists are kept and the rest of the datagram abandoned), `incomplete_identity` (a value list with
+  an empty host, plugin or type, which collectd's own receiver rejects too),
+  `encrypted_packet_dropped` (a `SecurityLevel Encrypt` datagram — this codec holds no keys), and
+  `types_db_mismatch` (the configured `types_db` defines the list's type with a different
+  data-source count or kinds than arrived, so its records fall back to index naming). A type simply
+  *missing* from `types_db` is deliberately not reported: that is routine, not a misconfiguration.
 - `tail_in`/`docker_in` (`crates/logit-inputs/src/tail/driver.rs`, `docker.rs` — one shared
   `Tailer<D, F>` driver, [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)):
   `logit.input.lines` / `.line.bytes` — the read-side parity with `statsd_in`'s per-datagram pair,
