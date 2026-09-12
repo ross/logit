@@ -203,10 +203,16 @@
 //! 8. `/` and NUL become `_`, and an identity field longer than 127 bytes is truncated (both
 //!    counted);
 //! 9. an absent interval leaves as `IntervalHR 0`;
-//! 10. a notification's identity (Host/Plugin/PluginInstance/Type/TypeInstance) is written in
-//!     full on every re-encode, never elided against a preceding list -- so a notification
-//!     dispatched from elided sticky state on the way in leaves carrying its own full identity;
-//! 11. NUL in a notification message becomes `_` (uncounted); a message longer than 255 bytes is
+//! 10. `TimeHR`/`IntervalHR` are written for **every** value list ([`encode`]'s `write_list`), so a
+//!     sender's elided (unchanged) time or interval part is restored -- information-preserving (the
+//!     restored part carries what the receiver's sticky state already held) but not free: a packed
+//!     datagram grows and may split across `max_packet_bytes`. Only (3)'s *string* parts are
+//!     elided on egress. Added by the ADR's "an eleventh normalization" amendment, where the same
+//!     entry is numbered 11 because that list splits (3) in two;
+//! 11. a notification always leaves as its own datagram, carrying its identity in full -- a
+//!     notification dispatched from elided sticky state on the way in leaves with its own full
+//!     identity, never inherited from (or shared with) a value list packed elsewhere in the batch;
+//! 12. NUL in a notification message becomes `_` (uncounted); a message longer than 255 bytes is
 //!     truncated (counted).
 //!
 //! Everything else is an error or a counted drop, never a silent reinterpretation.

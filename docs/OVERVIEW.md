@@ -24,9 +24,10 @@ internal wire protocol designed for it, and OpenTelemetry (OTLP) as the interope
 edges.
 
 A stated property of that internal event model: data of the same protocol should transit `logit`
-losslessly — `statsd_in` to `statsd_out`, `otlp_in` to `otlp_out`, `syslog_in` to `syslog_out` are
-each meant to be a transparent relay, with regrouping and summing allowed but no information
-dropped, per [ADR `lossless-transit`](adr/lossless-transit.md).
+losslessly — `statsd_in` to `statsd_out`, `otlp_in` to `otlp_out`, `syslog_in` to `syslog_out`,
+`prometheus_in` to `prometheus_out`, `collectd_in` to `collectd_out` are each meant to be a
+transparent relay, with regrouping and summing allowed but no information dropped, per
+[ADR `lossless-transit`](adr/lossless-transit.md).
 
 ## Scope (v1 direction)
 

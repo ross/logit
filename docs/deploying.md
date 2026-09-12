@@ -400,6 +400,50 @@ that cross-protocol hop costs: the `collectd.*` attributes become ordinary Influ
 wire identity, and one N-data-source list becomes N measurements named `plugin.type.ds` sharing a
 tag set and a timestamp.
 
+### `collectd_out`: relaying back onto the wire
+
+`collectd_out` is the like-for-like other half, and the sink to reach for when the destination is
+another collectd (or anything else speaking its `network` protocol) rather than a time-series
+database: `collectd_in -> collectd_out` is a fixed point modulo the named normalization list in
+[ADR `collectd-binary-relay`](adr/collectd-binary-relay.md), which
+`crates/logit-cli/tests/collectd_round_trip.rs` pins fixture by fixture over real sockets.
+[`examples/collectd-relay.yaml`](../examples/collectd-relay.yaml) is the runnable topology —
+`collectd_in` on `0.0.0.0:25826` straight into `collectd_out`, every default present as a commented
+reference. Three things worth knowing before deploying one:
+
+- **UDP only, and no `aggregate` in the middle.** collectd's `network` plugin has no TCP mode to
+  relay onto. And unlike [`examples/statsd-relay.yaml`](../examples/statsd-relay.yaml), the collectd
+  relay example has no `aggregate` between the two ends: collectd data is already one pre-aggregated
+  reading per `Interval`. A window there would re-window it, and would stop the relay being
+  byte-for-byte for the kinds `aggregate` genuinely absorbs — a GAUGE and an ABSOLUTE come back
+  stamped with the flush time, where a COUNTER/DERIVE (a cumulative `Sum`) passes straight through
+  untouched. Add one only to re-window deliberately.
+- **A relay emits more bytes than it received — size for that.** `collectd_out` writes a `TimeHR`
+  and an `IntervalHR` part for *every* value list, where collectd's own sender elides one that
+  hasn't changed since the last list in the same datagram (normalization 11 in the ADR's list). The
+  restored parts carry exactly what the receiver's sticky state already held, so nothing about the
+  data changes — but the datagram grows, and may split. The recorded capture
+  `testdata/interop/collectd/collectd-000.raw` is a real Debian `collectd`'s output and shows the
+  scale: 26 value lists behind 17 `TimeHR` parts and a single `IntervalHR`, 1296 bytes in one
+  datagram, which this relay re-emits as 1717 bytes across two. Budget roughly a third more egress
+  bytes and packets than the fleet sends, and expect a capture of the relayed traffic to look
+  chattier than the original.
+- **`max_packet_bytes:` bounds a datagram, not a value list**, and defaults to collectd's own
+  `MaxPacketSize` default of `1452`. Graph validation rejects anything outside `1024..=65535`,
+  collectd's own range. Lower it to match a path MTU; the encoder re-packs incoming lists into
+  datagrams of its own choosing regardless of how the sender packed them, so this is the setting
+  that decides egress framing — together with the inflation above, which is what pushes that
+  1296-byte capture over the default cap. A single value list too large to fit even alone is
+  dropped whole and counted `logit.output.metrics.skipped{reason="oversize_value_list"}` rather
+  than split.
+- **`hostname:` is the fallback for events that never came from `collectd_in`.** A relayed list
+  already carries its origin's host on `collectd.host`, so a pure relay never needs this. A pipeline
+  that also carries metrics from a `statsd_in`/`internal` does: without `collectd.host` or
+  `host.name` and with no `hostname:` set, such a list is dropped and counted
+  `logit.output.metrics.skipped{reason="no_host"}` with a `no_host` diagnostic. That is deliberate —
+  collectd's receiver rejects an empty host, and inventing one would merge every unlabelled sender
+  into a single host's metrics.
+
 ## Tailing files and Docker logs
 
 `tail_in` reads one or more files line by line; `docker_in` builds on the same driver to tail

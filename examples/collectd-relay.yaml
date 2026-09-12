@@ -1,0 +1,108 @@
+# A collectd relay: receive collectd's binary `network` protocol on one edge, forward it to a
+# central collectd (or to anything else that speaks the protocol) -- the topology `collectd_out`
+# exists for, and the like-for-like half of ADR `collectd-binary-relay`
+# (docs/adr/collectd-binary-relay.md). Point an edge fleet at this host with
+# `<Plugin network> Server "<this host>" "25826" </Plugin>`, point this at the central collector,
+# and nothing collectd-side changes.
+#
+# What round-trips: everything a collectd value list carries. Host, plugin, plugin_instance, type
+# and type_instance ride on `collectd.*` event attributes and go back out as the same wire parts;
+# an N-data-source list stays one list with its N values in wire order; COUNTER, GAUGE, DERIVE and
+# ABSOLUTE keep their own data-source types; a NaN gauge (collectd's "no reading this interval")
+# survives as a NaN; a non-UTF-8 host name is relayed byte-verbatim. The relay is a fixed point
+# modulo exactly the normalization list in docs/adr/collectd-binary-relay.md -- legacy
+# second-resolution Time/Interval parts re-emit as their high-resolution equivalents, string-part
+# elision and datagram boundaries are recomputed by this sink's own max_packet_bytes, elided
+# (unchanged) time and interval parts are restated on every list, unknown and Signature parts are
+# dropped, and a NaN's payload bits canonicalize. Nothing else changes silently:
+# anything this pair cannot carry is a counted drop (logit.output.metrics.skipped) with a throttled
+# diagnostic, never a quiet reinterpretation. Encrypted packets (collectd's `SecurityLevel Encrypt`)
+# are the one input this codec cannot read at all: the datagram's tail is dropped and counted
+# (docs/known-gaps.md).
+#
+# One consequence of that restating worth sizing for: a relay emits more bytes than it received.
+# collectd elides an unchanged time or interval part and this sink does not, so the recorded capture
+# in testdata/interop/collectd/ -- 26 value lists behind 17 TimeHR parts and one IntervalHR, 1296
+# bytes in a single datagram -- leaves here as 1717 bytes across two. Budget roughly a third more
+# egress bytes and packets than the sending fleet produces.
+#
+# **No `aggregate` here, unlike examples/statsd-relay.yaml.** That is the one real difference
+# between the two relay topologies, and it is deliberate: statsd is a firehose of individual samples
+# that an `aggregate` window turns into something a receiver can hold, whereas collectd has already
+# done that work -- every value list is one pre-aggregated reading per `Interval`, carrying its own
+# timestamp. An `aggregate` here would re-window already-windowed data. It would also change what
+# comes out the far side: a cumulative Sum (what COUNTER and DERIVE decode to) passes through a
+# window untouched, but a GAUGE and an ABSOLUTE are absorbed and re-emitted stamped with the flush
+# time rather than the origin's, so the byte-for-byte relay above stops being byte-for-byte. Add an
+# `aggregate` only if you genuinely want to re-window -- a 10s edge interval stored at 60s, say --
+# and then set `sources: [windowed]` on the sink below and say in a comment why.
+#
+# Config is a flat graph of components (docs/design/pipeline-graph.md,
+# docs/adr/component-graph-configuration.md): each names its own `sources`, rather than sitting in
+# a fixed inputs/transforms/outputs pipeline.
+components:
+  collectd_in:
+    type: collectd_in
+    # collectd's own default port. `0.0.0.0` accepts unicast from any sender.
+    bind: 0.0.0.0:25826
+    # A **multicast group** instead, for an edge fleet configured with a bare
+    # `Server "239.192.74.66"` (collectd's own IPv4 default; `ff18::efc0:4a42` is the IPv6 one).
+    # No extra field: a multicast IP is detected from the address itself, and the listener sets
+    # SO_REUSEADDR, binds the unspecified address on that port and joins the group. Joining is
+    # additive -- such a listener still accepts ordinary unicast traffic on the same port.
+    # bind: 239.192.74.66:25826
+    #
+    # Optional, and on a pure relay it changes **nothing about what goes back on the wire**:
+    # `types_db:` supplies data-source *names*, and `collectd_out` re-encodes from the `collectd.*`
+    # attributes, the value order and each record's kind, never from the record name. Configure it
+    # only if something else in this pipeline (an influxdb_out, a Lua transform, a routing
+    # predicate) reads the names. collectd's own types.db is GPL-licensed and is not shipped with
+    # logit: point this at the copy the sending hosts already have.
+    # types_db:
+    #   - /usr/share/collectd/types.db
+    #
+    # Every field below defaults (docs/adr/decoupled-listener-io.md) -- an omitted `receive:` block
+    # is exactly the values shown here, commented out purely as a reference for tuning a real
+    # deployment. `receive:` is meaningful only on a datagram listener (collectd_in, statsd_in,
+    # syslog_in); `logit-pipeline`'s graph validation rejects it on any other component kind.
+    # receive:
+    #   max_datagrams: 10000        # receive-queue depth, in datagrams -- whichever of this or max_bytes trips first
+    #   max_bytes: "32MiB"          # bound on undecoded datagram bytes held in the queue
+    #   overflow: drop_oldest       # block | drop_oldest | drop_newest -- what happens once both bounds are full;
+    #                               # drop_oldest (not buffer:'s block) is the default here on purpose -- blocking a
+    #                               # UDP reader relocates loss into the kernel where nothing counts it
+    #   batch_max_events: 1000      # events accumulated across datagrams before one send downstream; 1 means
+    #                               # one send per datagram, today's pre-ADR `decoupled-listener-io` behavior
+    #   batch_max_bytes: "1MiB"     # the other accumulation bound -- whichever trips first
+    #   batch_flush_interval: 100ms # longest an accumulated batch waits before being sent regardless of size;
+    #                               # 0s disables the timer, leaving the two bounds above as the only trigger
+    #   # receive_buffer_bytes: 8MiB  # SO_RCVBUF, requested at bind -- omitted leaves the kernel default alone
+    #   shutdown_grace: 5s          # how long SIGTERM waits for the receive queue to drain before dropping the rest
+
+  collectd_out:
+    type: collectd_out
+    sources: [collectd_in]
+    # `host:port`, resolved once per batch at send time rather than at config load -- a central
+    # collector that isn't up yet is not a config error. UDP only: collectd's `network` plugin has
+    # no TCP mode to relay onto.
+    endpoint: central-collectd:25826
+    # Every field below defaults -- an omitted field is exactly the value shown here, commented
+    # out purely as a reference for tuning a real deployment.
+    # max_packet_bytes: "1452"   # bounds one UDP datagram's worth of packed value lists, not a single
+    #                            # list's length -- collectd's own MaxPacketSize default (1500 MTU minus
+    #                            # the IPv4 and UDP headers minus headroom). Graph rule 38 rejects
+    #                            # anything outside 1024..=65535, collectd's own range. Lower it to match
+    #                            # a path MTU; a list that alone exceeds it is dropped whole and counted
+    #                            # (oversize_value_list) rather than split across datagrams.
+    # hostname:                  # unset, and deliberately so: used *only* for an event that carries
+    #                            # neither `collectd.host` nor `host.name`, which on a pure relay never
+    #                            # happens -- every list from collectd_in already has its origin's host.
+    #                            # Set it if this pipeline also carries metrics from somewhere else
+    #                            # (a statsd_in, an internal_in); without it such an event is dropped and
+    #                            # counted (metrics.skipped{reason="no_host"}), since collectd's receiver
+    #                            # rejects an empty host and there is no honest substitute for one.
+    # buffer: (all defaults, see docs/adr/buffered-sink-delivery.md -- max_batches 1024,
+    #          max_bytes "64MiB", overflow block, retry_budget 60s, retry_max_delay 10s,
+    #          shutdown_grace 5s, plus an optional `disk:` sub-block for durable buffering.
+    #          `delivery:` derives from the sink's own duplicate_safe(), which is false here:
+    #          a redelivered list double-counts every COUNTER/DERIVE/ABSOLUTE it carries)

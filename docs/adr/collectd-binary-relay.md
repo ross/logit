@@ -304,6 +304,33 @@ modulo:
 9. `/` and NUL substituted with `_`; names truncated to 127 bytes (both counted).
 10. `IntervalHR = 0` stands in for an absent `Interval`/`IntervalHR` part on the way in.
 
+**Amendment (2026-09-12): an eleventh normalization — elided time and interval parts are
+restored.** The list above covers *string*-part elision (3) but says nothing about the two numeric
+parts, and the encoder treats them differently: it writes `TimeHR` **and** `IntervalHR` for every
+value list and never elides an unchanged one
+(`crates/logit-proto/src/collectd/encode.rs`'s `write_list`). A real collectd sender does elide
+them — the committed capture `testdata/interop/collectd/collectd-000.raw` carries 26 value lists
+behind 17 `TimeHR` parts and a single `IntervalHR` — so:
+
+11. `TimeHR`/`IntervalHR` are written for every value list on egress; a sender's elided (unchanged)
+    time or interval part is restored, so a packed collectd datagram grows and may split across
+    `max_packet_bytes`.
+
+This is information-preserving in both directions — a restored part carries exactly the value the
+receiver's sticky state already held — but it is not free, and an operator sizing a relay needs to
+know it: that same 1296-byte capture re-encodes to 1717 bytes in two datagrams at the default
+1452-byte cap, about 30% more bytes and one more packet than the fleet emitted. Eliding them on
+egress would be a legitimate future optimization (it costs one comparison against the last written
+value, exactly as the five identity strings already get); it is not done today, and until it is this
+entry is what makes "fixed point modulo the named list" true.
+`crates/logit-cli/tests/collectd_round_trip.rs`'s `elided-time-interval` fixture pins the
+byte-level shape, and its `a_real_collectd_capture_grows_when_its_elided_time_parts_are_restored`
+test pins the numbers quoted above against the real capture.
+
+Note the numbering: `crates/logit-proto/src/collectd/mod.rs`'s module doc carries the same list with
+(3) and (4) above folded into a single entry, so this amendment is **item 10** there and item 11
+here. Both files name the same eleven facts.
+
 ### Signing and encryption: deferred
 
 Signature parts (0x0200) are skipped on decode without verification — the payload following one is
