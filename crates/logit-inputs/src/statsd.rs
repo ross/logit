@@ -363,7 +363,8 @@ fn slice_of(bytes: &Bytes, text: &str, sub: &str) -> Bytes {
 ///
 /// [`AttrMap::remove`] + [`AttrMap::insert`] is the same two-step [`crate::syslog`]'s
 /// `insert_param` uses for a repeated RFC 5424 PARAM-NAME -- two binary searches over the sorted
-/// inline map, paid only on a repeat. See the module doc's "DogStatsD tags" section for the
+/// inline map per token (the `remove` probe misses on a first occurrence, the `insert` then lands
+/// it), where a plain `insert` was one. See the module doc's "DogStatsD tags" section for the
 /// semantics this implements and for what it deliberately leaves alone (a repeated `|` *segment*,
 /// and the `statsd.*` carrier keys).
 fn insert_tags(attributes: &mut AttrMap, bytes: &Bytes, text: &str, tags: &str) {
