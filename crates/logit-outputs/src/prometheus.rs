@@ -80,8 +80,8 @@
 //!
 //! | Point | Meaning |
 //! |---|---|
-//! | `logit.output.scrapes{class="ok"\|"not_found"\|"method"}` | one per HTTP request, by outcome |
-//! | `logit.output.scrape.bytes` | response body bytes actually written -- post-gzip when the client asked for it, so it measures transfer cost, not exposition size |
+//! | `logit.output.scrapes{class="ok"\|"not_found"\|"method"}` | one per HTTP request, by outcome. `ok` means the response was *rendered*, not acknowledged: a `Full<Bytes>` response offers no body-completion hook, so a connection dropped mid-write still counts `ok` |
+//! | `logit.output.scrape.bytes` | response body bytes as rendered -- post-gzip when the client asked for it, so it measures transfer cost rather than exposition size. Counted when the body is built, same caveat as `ok` above |
 //! | `logit.output.series` (gauge) | series held after each `send` |
 //! | `logit.output.series.evicted{reason="expired"\|"cardinality"}` | see above |
 //! | `logit.output.metrics.type_conflict` | see above |
@@ -146,16 +146,45 @@ pub const DEFAULT_MAX_SERIES: usize = 100_000;
 /// connections rather than an unbounded accept loop.
 const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 
-/// How long one connection (accept to response finished) may take before this server closes it, so
-/// a hung client or a port scanner cannot pin one of the 16 slots forever.
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a client has to finish sending its request headers. Hyper's own knob (it needs a timer
+/// installed, hence the [`hyper_util::rt::TokioTimer`] on the builder), and the right place for the
+/// slowloris bound that an all-encompassing connection deadline used to carry: a client that opens
+/// a socket and dribbles -- or never finishes -- must not hold one of the 16 slots, and *that* is
+/// cheap to bound tightly because a scrape request is a few hundred bytes of headers.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The floor for a whole connection, response body included. Deliberately well past Prometheus's
+/// own default `scrape_timeout` of 10s: the response here is not a probe's few hundred bytes but up
+/// to `max_series` series, and a deadline shorter than the scraper's own would drop hyper mid-body
+/// and hand the client a short read against the `Content-Length` it already trusted -- while this
+/// sink had already counted the scrape a success. `admin.rs`'s 5s is right for `admin.rs`'s payload;
+/// it is not right here.
+const RESPONSE_TIMEOUT_BASE: Duration = Duration::from_secs(30);
+
+/// Added to [`RESPONSE_TIMEOUT_BASE`] per 1000 series of *configured capacity*, so a deployment that
+/// raised `max_series` raises its own write deadline with it rather than having to know this
+/// constant exists. At the default 100 000 cap that is 40s total.
+const RESPONSE_TIMEOUT_PER_1K_SERIES: Duration = Duration::from_millis(100);
 
 /// How long the accept loop pauses after an `accept()` failure that is not one client's own
 /// accident -- fd exhaustion (`EMFILE`/`ENFILE`) being the realistic case, which neither clears
 /// instantly nor persists forever. Without it a sustained one spins a core.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
+/// [`RESPONSE_TIMEOUT_BASE`] plus [`RESPONSE_TIMEOUT_PER_1K_SERIES`] per 1000 of `max_series`,
+/// saturating rather than panicking on an absurd configured cap.
+fn response_timeout(max_series: usize) -> Duration {
+    let thousands = u32::try_from(max_series / 1_000).unwrap_or(u32::MAX);
+    RESPONSE_TIMEOUT_BASE.saturating_add(
+        RESPONSE_TIMEOUT_PER_1K_SERIES.checked_mul(thousands).unwrap_or(Duration::MAX),
+    )
+}
+
 const SCRAPES: &str = "logit.output.scrapes";
+/// Response body bytes as *rendered* (post-gzip when the client asked for it), counted when the
+/// body is built rather than when its last byte is acknowledged -- a `Full<Bytes>` response has no
+/// body-completion hook to count from, so a connection dropped mid-write is still counted here and
+/// still counted `scrapes{class="ok"}`.
 const SCRAPE_BYTES: &str = "logit.output.scrape.bytes";
 const SERIES: &str = "logit.output.series";
 const SERIES_EVICTED: &str = "logit.output.series.evicted";
@@ -257,34 +286,55 @@ impl Registry {
         }
     }
 
-    /// Evicts least-recently-updated series until at most `max_series` remain. Linear per eviction
-    /// rather than a second index keyed by `updated_at`: this runs only while the registry is
-    /// actually over its cap, which for a correctly-sized cap is never, and a wrongly-sized one has
-    /// a cardinality problem worth feeling.
+    /// Evicts least-recently-updated series until at most `max_series` remain, in **one pass over
+    /// the registry** regardless of how many have to go.
+    ///
+    /// Being over the cap is not a rare accident -- it is the steady state the cap exists for, so
+    /// this runs under load, holding the lock a render also needs. Hence: borrow
+    /// `(updated_at, &name, &labels)` for every series once (no allocation per candidate),
+    /// [`select_nth_unstable_by`](slice::select_nth_unstable_by) to partition the `k` oldest into
+    /// the front of that slice in O(N) without sorting the rest, clone only those `k` keys, and
+    /// remove them. A `while len() > max` loop calling `min_by` instead would re-scan and
+    /// re-allocate every candidate `k` times over -- at the default cap of 100 000 that is `k` full
+    /// allocating scans per `send`, exactly when cardinality is the thing being diagnosed.
+    ///
+    /// The tie-break past `updated_at` is the series' own key (family name, then label set), so
+    /// which of two series updated in the same batch goes is a function of the data rather than of
+    /// `Instant` resolution or map iteration order.
     fn enforce_cap(&mut self, max_series: usize, telemetry: &Telemetry) {
-        let mut evicted = 0u64;
-        while self.len() > max_series {
-            let oldest = self
-                .families
-                .iter()
-                .flat_map(|(name, family)| {
-                    family.series.iter().map(move |(labels, stored)| {
-                        (stored.updated_at, name.clone(), labels.clone())
-                    })
-                })
-                .min_by(|a, b| a.0.cmp(&b.0).then_with(|| (&a.1, &a.2).cmp(&(&b.1, &b.2))));
-            let Some((_, name, labels)) = oldest else { break };
+        let total = self.len();
+        if total <= max_series {
+            return;
+        }
+        let excess = total - max_series;
+
+        let mut candidates: Vec<(Instant, &str, &LabelKey)> = Vec::with_capacity(total);
+        for (name, family) in &self.families {
+            for (labels, stored) in &family.series {
+                candidates.push((stored.updated_at, name.as_str(), labels));
+            }
+        }
+        // `excess <= total` (`excess = total - max_series`) and `total > 0` here, so
+        // `excess - 1` is a valid index into `candidates`.
+        let order = |a: &(Instant, &str, &LabelKey), b: &(Instant, &str, &LabelKey)| {
+            a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)).then_with(|| a.2.cmp(b.2))
+        };
+        candidates.select_nth_unstable_by(excess - 1, order);
+        let doomed: Vec<(String, LabelKey)> = candidates[..excess]
+            .iter()
+            .map(|(_, name, labels)| ((*name).to_string(), (*labels).clone()))
+            .collect();
+        drop(candidates);
+
+        for (name, labels) in doomed {
             if let Some(family) = self.families.get_mut(&name) {
                 family.series.remove(&labels);
                 if family.series.is_empty() {
                     self.families.remove(&name);
                 }
             }
-            evicted += 1;
         }
-        if evicted > 0 {
-            telemetry.count(SERIES_EVICTED, evicted as f64, &[("reason", "cardinality")]);
-        }
+        telemetry.count(SERIES_EVICTED, excess as f64, &[("reason", "cardinality")]);
     }
 
     /// The registry as the codec's own family list -- the seam [`text::write`] renders from.
@@ -334,6 +384,9 @@ struct ServerState {
     encoder: Arc<Mutex<PrometheusEncoder>>,
     path: String,
     expire_after: Duration,
+    /// Derived from `max_series` once, at bind time, by [`response_timeout`] -- the whole-connection
+    /// deadline, separate from hyper's own [`HEADER_READ_TIMEOUT`].
+    response_timeout: Duration,
     telemetry: Telemetry,
     clock: Clock,
 }
@@ -461,13 +514,20 @@ impl Output for PrometheusOutput {
         let listener = TcpListener::bind(&self.bind)
             .await
             .with_context(|| format!("binding prometheus_out on '{}'", self.bind))?;
-        self.local_addr =
-            Some(listener.local_addr().context("reading prometheus_out's bound address")?);
+        let local_addr = listener.local_addr().context("reading prometheus_out's bound address")?;
+        // The same `bound` lifecycle line every listener emits from its own `bind`
+        // (`logit_inputs::udp`, `logit_inputs::otlp`) -- a sink that listens advances to
+        // `NodeState::Bound` through the same pre-spawn pass, so it must not do so silently.
+        // `local_addr`, not `self.bind`: a configured `:0` is the one case where what was asked for
+        // and what was opened differ, and the port actually listening is the useful one.
+        self.diag.info("bound", format_args!("serving {} on {local_addr}", self.path));
+        self.local_addr = Some(local_addr);
         let state = Arc::new(ServerState {
             registry: Arc::clone(&self.registry),
             encoder: Arc::clone(&self.encoder),
             path: self.path.clone(),
             expire_after: self.expire_after,
+            response_timeout: response_timeout(self.max_series),
             telemetry: self.telemetry.clone(),
             clock: Arc::clone(&self.clock),
         });
@@ -503,11 +563,11 @@ impl Output for PrometheusOutput {
         Ok(())
     }
 
-    /// Stops serving. Aborting the accept task is deliberately the *only* teardown, the same shape
-    /// `logit-cli`'s admin server uses: the task owns the [`TcpListener`], so dropping its future
-    /// closes the port, and each in-flight connection is already bounded by
-    /// [`CONNECTION_TIMEOUT`]. Nothing is buffered here to flush -- `send` has already committed
-    /// every batch to the registry by the time it returns.
+    /// Stops serving. Aborting the accept task is the whole teardown: it owns the [`TcpListener`],
+    /// so dropping its future closes the port, and each in-flight connection is already bounded by
+    /// [`response_timeout`]. Nothing is buffered here to flush -- `send` has already committed every
+    /// batch to the registry by the time it returns. [`Drop`] does the same thing, for the paths
+    /// that never reach a graceful `flush` at all.
     async fn flush(&mut self) -> anyhow::Result<()> {
         if let Some(server) = self.server.take() {
             server.abort();
@@ -520,6 +580,24 @@ impl Output for PrometheusOutput {
     /// `statsd_out`, there is no counter at a destination to double.
     fn duplicate_safe(&self) -> bool {
         true
+    }
+}
+
+/// Aborts the accept loop when the sink itself is dropped, not only when `flush` runs. `flush` is
+/// the *graceful* teardown and the runtime calls it on every path it finishes a sink on -- but not on
+/// the startup-failure path: if a later component's `bind` fails, `run_with_telemetry` returns
+/// `RunError::Startup` and drops every spec without flushing anything, which would leave this
+/// listener holding its port for the rest of the runtime's life. Moot under the CLI (the process is
+/// exiting anyway) and real for in-process use and for any test that binds a sink and then fails
+/// startup, so the listener gets the same non-`flush` teardown `logit-cli`'s own admin listener has.
+///
+/// `abort` rather than an await: `Drop` cannot be async, and abort is all `flush` does anyway -- the
+/// task owns the `TcpListener`, so dropping its future closes the port.
+impl Drop for PrometheusOutput {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.take() {
+            server.abort();
+        }
     }
 }
 
@@ -561,15 +639,22 @@ async fn serve(listener: TcpListener, state: Arc<ServerState>, mut diag: Diagnos
         let permit =
             connection_limit.clone().acquire_owned().await.expect("this semaphore is never closed");
         let state = Arc::clone(&state);
+        let response_deadline = state.response_timeout;
         tokio::spawn(async move {
             let _permit = permit; // held for the connection's lifetime; released on drop
             let svc = service_fn(move |req| {
                 let state = Arc::clone(&state);
                 async move { handle(req, state) }
             });
+            // Two deadlines, not one: hyper bounds how long request *headers* may take to
+            // arrive (the slowloris case, cheap to bound tightly), while the outer timeout bounds
+            // the whole connection including the body write, which scales with `max_series` and
+            // must outlast the scraper's own `scrape_timeout`.
             let serve = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(HEADER_READ_TIMEOUT)
                 .serve_connection(TokioIo::new(stream), svc);
-            let _ = tokio::time::timeout(CONNECTION_TIMEOUT, serve).await;
+            let _ = tokio::time::timeout(response_deadline, serve).await;
         });
     }
 }
@@ -607,12 +692,19 @@ fn handle(
     };
 
     let body = if gzip { gzip_encode(&body) } else { body };
+    // Counted here, when the body is *rendered*, not when the last byte reaches the client: the
+    // response is a `Full<Bytes>`, which offers no body-completion hook to count from, so a
+    // connection that dies mid-write still lands as `ok`. See `SCRAPE_BYTES`' own doc comment.
     state.telemetry.count(SCRAPES, 1.0, &[("class", "ok")]);
     state.telemetry.count(SCRAPE_BYTES, body.len() as f64, &[]);
 
     let mut builder = http::Response::builder()
         .status(StatusCode::OK)
-        .header("content-type", dialect.content_type());
+        .header("content-type", dialect.content_type())
+        // The representation genuinely varies on both, and the module doc tells operators to front
+        // this endpoint with a proxy -- without `Vary` a caching intermediary is entitled to hand a
+        // text-0.0.4 scraper an OpenMetrics (or gzipped) body it never asked for.
+        .header("vary", "Accept, Accept-Encoding");
     if gzip {
         builder = builder.header("content-encoding", "gzip");
     }
@@ -862,6 +954,11 @@ mod tests {
             response.headers()[http::header::CONTENT_TYPE],
             "text/plain; version=0.0.4; charset=utf-8"
         );
+        assert_eq!(
+            response.headers()[http::header::VARY],
+            "Accept, Accept-Encoding",
+            "the representation varies on both, and a caching proxy has to know"
+        );
         assert_eq!(response.text().await.unwrap(), EXPECTED_TEXT);
     }
 
@@ -874,6 +971,7 @@ mod tests {
             response.headers()[http::header::CONTENT_TYPE],
             "application/openmetrics-text; version=1.0.0; charset=utf-8"
         );
+        assert_eq!(response.headers()[http::header::VARY], "Accept, Accept-Encoding");
         assert_eq!(response.text().await.unwrap(), EXPECTED_OPENMETRICS);
     }
 
@@ -901,6 +999,11 @@ mod tests {
         assert_eq!(
             response.headers()[http::header::CONTENT_LENGTH],
             EXPECTED_TEXT.len().to_string().as_str()
+        );
+        assert_eq!(
+            response.headers()[http::header::VARY],
+            "Accept, Accept-Encoding",
+            "HEAD sends the headers a GET would, Vary included"
         );
         assert!(response.bytes().await.unwrap().is_empty(), "a HEAD response has no body");
     }
@@ -1026,8 +1129,10 @@ mod tests {
         );
     }
 
-    /// The cap evicts the *least recently updated* series, not an arbitrary one: `a` is delivered
-    /// first, `b` and `c` later, so `a` is the one that goes.
+    /// The cap evicts the *least recently updated* series, not an arbitrary one. The oldest series
+    /// is deliberately `id="z"`, which sorts **last** in the registry's `BTreeMap`: an
+    /// implementation that evicted the first series in iteration order would keep `z` and drop `a`,
+    /// so this distinguishes LRU from map order rather than passing on a coincidence.
     #[tokio::test]
     async fn the_max_series_cap_evicts_the_least_recently_updated_series_and_counts_it() {
         let start = Instant::now();
@@ -1043,14 +1148,14 @@ mod tests {
         sink.send(&batch(vec![metric_event(
             "hits",
             cumulative_counter(1.0),
-            &[("id", Value::str("a"))],
+            &[("id", Value::str("z"))],
         )]))
         .await
         .unwrap();
         *lock(&now) = start + Duration::from_secs(1);
         sink.send(&batch(vec![
-            metric_event("hits", cumulative_counter(2.0), &[("id", Value::str("b"))]),
-            metric_event("hits", cumulative_counter(3.0), &[("id", Value::str("c"))]),
+            metric_event("hits", cumulative_counter(2.0), &[("id", Value::str("a"))]),
+            metric_event("hits", cumulative_counter(3.0), &[("id", Value::str("b"))]),
         ]))
         .await
         .unwrap();
@@ -1060,12 +1165,75 @@ mod tests {
             get(&format!("{url}/metrics"), &[]).await.text().await.unwrap(),
             concat!(
                 "# TYPE hits_total counter\n",
-                "hits_total{id=\"b\"} 2\n",
-                "hits_total{id=\"c\"} 3\n",
+                "hits_total{id=\"a\"} 2\n",
+                "hits_total{id=\"b\"} 3\n",
             ),
-            "the oldest series is the one evicted"
+            "the oldest series goes even though it sorts last in the map"
         );
         assert_eq!(counter(&registry, SERIES_EVICTED, "reason", "cardinality"), 1.0);
+    }
+
+    /// The regime the cap actually operates in: thousands of series, hundreds over the cap, evicted
+    /// in **one** pass. Pins *which* ones go -- the oldest, by `updated_at` -- not just how many, so
+    /// a one-pass rewrite cannot quietly evict the wrong half.
+    #[tokio::test]
+    async fn a_batch_far_over_the_cap_evicts_exactly_the_oldest_series_in_one_pass() {
+        const OLD: usize = 3_000;
+        const NEW: usize = 500;
+        const CAP: usize = 3_000;
+
+        fn series(prefix: &str, count: usize) -> Vec<Event> {
+            (0..count)
+                .map(|i| {
+                    metric_event(
+                        "hits",
+                        cumulative_counter(i as f64),
+                        &[("id", Value::str(format!("{prefix}_{i:05}")))],
+                    )
+                })
+                .collect()
+        }
+
+        let start = Instant::now();
+        let now = Arc::new(Mutex::new(start));
+        let clock_handle = Arc::clone(&now);
+        let registry = logit_core::Registry::new();
+        let mut sink = PrometheusOutput::new("127.0.0.1:0")
+            .with_expire_after(Duration::ZERO)
+            .with_max_series(CAP)
+            .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"))
+            .with_clock(Arc::new(move || *lock(&clock_handle)));
+
+        // The `old_*` series fill the cap exactly, so nothing is evicted yet.
+        sink.send(&batch(series("old", OLD))).await.unwrap();
+        assert_eq!(counter(&registry, SERIES_EVICTED, "reason", "cardinality"), 0.0);
+
+        // A later batch of NEW fresh series takes the total to CAP + NEW, so exactly NEW have to
+        // go -- and every `old_*` is strictly older than every `new_*`.
+        *lock(&now) = start + Duration::from_secs(1);
+        sink.send(&batch(series("new", NEW))).await.unwrap();
+        assert_eq!(counter(&registry, SERIES_EVICTED, "reason", "cardinality"), NEW as f64);
+
+        let (_sink, url) = bound(sink).await;
+        let body = get(&format!("{url}/metrics"), &[]).await.text().await.unwrap();
+        assert_eq!(body.lines().filter(|l| l.starts_with("hits_total{")).count(), CAP);
+        // Every `old_*` shares one `updated_at`, so the documented key tie-break decides between
+        // them: the evicted set is exactly the NEW lowest `old_*` keys.
+        for i in 0..NEW {
+            assert!(
+                !body.contains(&format!("id=\"old_{i:05}\"")),
+                "old_{i:05} is among the NEW oldest and should have been evicted"
+            );
+        }
+        for i in NEW..OLD {
+            assert!(
+                body.contains(&format!("id=\"old_{i:05}\"")),
+                "old_{i:05} should have survived"
+            );
+        }
+        for i in 0..NEW {
+            assert!(body.contains(&format!("id=\"new_{i:05}\"")), "new_{i:05} is the freshest");
+        }
     }
 
     /// One name cannot carry two `# TYPE` lines, so the newer type wins and the old series go --
@@ -1190,6 +1358,31 @@ mod tests {
         sink.flush().await.expect("flush never fails");
         let refused = reqwest::Client::new().get(format!("{url}/metrics")).send().await;
         assert!(refused.is_err(), "the port should be closed after flush, got {refused:?}");
+    }
+
+    /// The startup-failure path in miniature: a bound sink that is *dropped* without a graceful
+    /// `flush` -- which is exactly what `run_with_telemetry` does to every spec when a later
+    /// component's `bind` fails -- must not leave its accept loop holding the port.
+    #[tokio::test]
+    async fn dropping_an_unflushed_bound_sink_closes_the_port() {
+        let (sink, url) = bound(PrometheusOutput::new("127.0.0.1:0")).await;
+        assert_eq!(get(&format!("{url}/metrics"), &[]).await.status(), 200);
+
+        drop(sink); // no flush, exactly as a startup failure would
+                    // The abort has to be observed by the runtime before the listener is really gone; a
+                    // scrape that still connects retries until it doesn't, rather than racing on one attempt.
+        let mut refused = None;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            match reqwest::Client::new().get(format!("{url}/metrics")).send().await {
+                Err(err) => {
+                    refused = Some(err);
+                    break;
+                }
+                Ok(_) => continue,
+            }
+        }
+        assert!(refused.is_some(), "dropping the sink should have closed the port");
     }
 
     /// Nothing has been delivered yet, and a scraper polling a freshly-started process must be

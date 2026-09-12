@@ -1192,6 +1192,16 @@ already built that have a known, accepted rough edge.
   lifecycle phase and every component's coarse state. Deliberate, not deferred: adding either would
   protect against a threat model this endpoint doesn't have, for a caller that's already inside
   the process's own network namespace.
+- **`prometheus_out` has no TLS and no auth either** (ADR `prometheus-scrape-and-exposition`'s
+  "Security posture") — anyone who can reach its `bind:` reads the entire registry: every label on
+  every series the sink currently holds. Two things make this a *deferred* gap rather than the
+  deliberate non-goal the admin endpoint's is. Its `bind:` is required, not off-by-default, so
+  every `prometheus_out` in existence is listening; and the payload is the full metric surface,
+  which can carry far more about a deployment than a lifecycle phase. `examples/prometheus-expose.yaml`
+  therefore binds `127.0.0.1`, and the field's own doc comment says to keep it loopback or pod-local
+  and front it with something that has both. Real server-side TLS would reuse `logit-inputs`'
+  existing builder (`otlp_in`'s `tls:`); auth has no in-tree precedent on any listener yet, so it
+  needs a decision about what kind (bearer, mTLS) before it needs code.
 - **Readiness is per-process, not per-sink.** A single sink stuck retrying (`degraded`, in the
   self-logging sense) does not flip `/readyz` to unready — that's what a sink's own `buffer:`
   block (retry budget, queue depth) exists to absorb. `/readyz`'s `degraded` phase is reserved for
