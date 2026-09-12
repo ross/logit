@@ -1394,6 +1394,61 @@
               ]
             }
           }
+        },
+        {
+          "description": "Scrapes Prometheus `/metrics` endpoints on `interval`, the way Prometheus's own server does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each target's response declares via its own `Content-Type`. Always synthesizes `up`, `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. See `docs/adr/prometheus-scrape-and-exposition.md`. A future `bind:` field on this same variant (a remote-write receiver) is planned as an additive, non-breaking change -- \"exactly one of `targets`/`bind`\" would become a graph rule once it lands, not a new kind.",
+          "type": "object",
+          "required": [
+            "targets",
+            "type"
+          ],
+          "properties": {
+            "headers": {
+              "description": "Extra headers sent on every scrape request. A name this input sets itself (`accept`, `user-agent`, and the other protocol-owned names -- rule 40) is rejected at config-validation time, the same shape as `otlp_out`'s `headers:` (rule 22).",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "interval": {
+              "description": "Scrape cadence. Rule 9 rejects `0s`.",
+              "default": "15s",
+              "type": "string"
+            },
+            "targets": {
+              "description": "Absolute `http://`/`https://` scrape URLs. Required, non-empty (rule 40).",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "timeout": {
+              "description": "Per-request timeout. Rule 40 rejects `0s`.",
+              "default": "10s",
+              "type": "string"
+            },
+            "tls": {
+              "description": "Client-side TLS tuning for any `https://` target -- see [`TlsClientConfig`]. A non-default value with no `https://` target is a config error (rule 40), not silently ignored.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "prometheus_in"
+              ]
+            }
+          }
         }
       ],
       "properties": {
