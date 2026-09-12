@@ -213,6 +213,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `statsd_in` `decode_into` into a warm buffer | **1** | ADR `decoupled-listener-io` -- see below |
 | `statsd_in` decode 1 distribution line (`ms`/`h`/`d`, unsampled) | **3** | 2 as above + 1 `bins` Vec on the sketch's first sample |
 | `statsd_in` decode 1 sampled distribution line (`@0.1`, 10 weighted samples) | **3** | same as unsampled -- `DdSketch::add_weighted` delegates to `add_with_count`, O(1) and zero extra allocations regardless of weight |
+| `prometheus_in` decode 1 scrape (11 series: 2 counter families, 1 gauge, 1 histogram, 1 summary) | **161** | `text::parse_with` + `families_to_events`, no `Decoder` trait (ADR `prometheus-scrape-and-exposition`'s "No `logit_proto::Encoder`") -- ~14.6/series, dominated by one `String`/`AttrMap` per label pair (labels are decoded as owned `String`s, not sliced from the scrape body, unlike syslog/statsd's zero-copy `Bytes` fields) plus one `Vec` per family's series list; not yet optimized the way syslog/statsd's decode paths were, tracked as follow-up work rather than fixed here |
 | `json` parse + merge (nginx shape) | **1** | fixed -- see below, was 7 |
 | `json` parse + merge (wide-JSON, 28 keys) | **1** | same fix, confirmed to generalize past a small field count |
 | `logfmt` parse + merge (go-kit-style, 9 fields) | **1** | hand-rolled scanner, zero-copy by construction -- see `docs/adr/logfmt-and-kv-parsing.md`; the one allocation is `event.attributes` spilling its inline capacity, same shape as `json`'s |
@@ -251,6 +252,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `disk_queue`: peek, cached (no re-decode) | **0** | `write_loop`'s retry loop calls `peek` once per attempt; only the first (uncached) peek after a push touches disk |
 | accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR `decoupled-listener-io` -- see below |
 | `syslog_out` encode_into 100 events | **100** | ~1/event -- reused struct-held scratch buffers, was 401, see below |
+| `prometheus_out` encode 100 series (1 gauge family) | **414** | `events_to_families` + `text::write`, no `Encoder` trait (same ADR as the decode row above) -- ~4.1/series: one `String` label key/value pair, one `MetricFamily`/`Series` entry, and the rendered text line's own buffer growth per series; not yet optimized, tracked as follow-up work alongside the decode row above |
 
 And the corresponding times:
 
