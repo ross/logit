@@ -176,7 +176,7 @@ the tag's literal argument string instead of failing.
 |---|---|---|
 | Listener (`statsd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
-| Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`) | ≥1 required | must not be |
+| Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `prometheus_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
 considered and rejected (ADR `component-graph-configuration`): a typo'd source reference would silently turn a real sink into
@@ -364,6 +364,11 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 38. A `statsd_out` `max_packet_bytes: 0` is rejected, the same shape as rule 15's
     `buffer.max_batches`/`max_bytes: 0` — an impossible bound (every metric line would overflow it
     and be dropped whole), not a small one (`docs/adr/statsd-output.md`).
+41. A `prometheus_out` `path:` must start with `/`, and `max_series` must be ≥ 1
+    (`docs/adr/prometheus-scrape-and-exposition.md`). A request URI's path is always absolute, so a
+    relative or empty `path:` could never match one — every scrape would 404 against an endpoint
+    that looks configured. `max_series: 0` is rule 38's impossible bound in another shape: every
+    series would be evicted the instant it arrived, so the endpoint would always be empty.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that
@@ -383,6 +388,17 @@ no special-casing needed, and no restriction to state.
 - **Fan-out costs a clone per extra consumer**: exactly the `output_txs.split_last()` pattern
   `send_batch` already uses (`crates/logit-cli/src/pipeline.rs`), generalized from "per output" to
   "per downstream consumer of any node."
+- **Bind before spawning anything.** Before the first channel exists, let alone the first task,
+  the runtime walks every component in **sorted id order** and calls `Input::bind` on each listener
+  and `Output::bind` on each sink, marking each `NodeState::Bound`
+  (`crates/logit-pipeline/src/readiness.rs`). Both default to a no-op, so only a component that
+  actually opens something overrides one; a failure is a *startup* failure naming that component
+  (exit code 1) with nothing else running yet, rather than the first `JoinSet` error once every
+  sibling is already live. Sinks are in this pass because a sink can listen too — `prometheus_out`
+  serves an exposition endpoint, so an address already in use is its startup failure mode, not a
+  delivery one for `write_loop`'s retry to absorb
+  (`docs/adr/prometheus-scrape-and-exposition.md`'s "`Output::bind`"). Sorted, sequential order is
+  what makes "which one failed" reproducible instead of a race between binds.
 - **Build in reverse topological order** — from sinks back toward listeners — so every node's
   outbound `Fanout` is fully wired (every consumer's inbox already exists) before that node can
   start producing. This generalizes what `run_config` already does today (build outputs, then the
