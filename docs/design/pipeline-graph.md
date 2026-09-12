@@ -364,7 +364,12 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 38. A `statsd_out` or `collectd_out` `max_packet_bytes: 0` is rejected, the same shape as rule 15's
     `buffer.max_batches`/`max_bytes: 0` — an impossible bound (every metric line/value list would
     overflow it and be dropped whole), not a small one (`docs/adr/statsd-output.md`,
-    `docs/adr/collectd-binary-relay.md`).
+    `docs/adr/collectd-binary-relay.md`). `collectd_out` additionally rejects any value outside
+    `1024..=65535` — collectd's own `MaxPacketSize` range (`docs/adr/collectd-binary-relay.md`):
+    above it, every datagram fails `EMSGSIZE` at the socket (no UDP payload is that large), which
+    `collectd_out` counts as a per-datagram drop rather than surfacing as a `Fault` — so an
+    unbounded value would silently report `requests{class="ok"}` while delivering nothing.
+    `statsd_out` makes no such range claim in its own ADR, so it keeps only the zero check.
 39. An `aggregate` with `temporality: cumulative` requires `series_retention >= 1` (a count of
     windows, not a duration) and `max_retained_series >= 1` — those two bounds are what keeps a running total alive
     across the window boundary, so with either at `0` no accumulator survives a flush and every
