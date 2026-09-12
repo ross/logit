@@ -1,7 +1,11 @@
 # A statsd/DogStatsD relay: receive on one edge, aggregate, forward to a central statsd/DogStatsD
 # agent -- the topology `statsd_out` exists for (docs/adr/statsd-output.md). Counters, gauges, raw
-# timers/histograms/distributions, and raw sets all round-trip losslessly through the real decoder
-# on the other end (docs/adr/lossless-transit.md). The `windowed` aggregate below uses its default
+# timers/histograms/distributions, raw sets, and DogStatsD events/service checks all round-trip
+# losslessly through the real decoder on the other end (docs/adr/lossless-transit.md) -- an event
+# (a log, no metrics) passes straight through `aggregate` untouched; a service check (a `Gauge`
+# metric under the hood) is absorbed and retained like any other gauge, then re-emitted in
+# canonical `_sc` field order, `d:`/`m:` included, once the window flushes. The `windowed`
+# aggregate below uses its default
 # summarizing config (`distributions: sketch`, `sets: estimate`), which still turns every timer/set
 # metric into a sketch/estimate that `statsd_out` has no lossless wire form for and drops, counted
 # (docs/known-gaps.md) -- that's `aggregate`'s choice to summarize, not a `statsd_out` limitation:

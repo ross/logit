@@ -181,6 +181,97 @@
 //! carrier set only on the resource (a `set` transform's `resource:` block, say) is honored the
 //! same way an event-level one already is -- `append_dialect_extras`/`statsd_wire_type` read
 //! `EncodeCtx`, never `event.attributes`, directly, keeping the filter and the read symmetric.
+//!
+//! ## DogStatsD events and service checks
+//!
+//! An **event** is `event.log.is_some()` *and* carries `statsd.event.title` as a `Value::Str`
+//! (the shape `statsd_in`'s `parse_event` always produces), event value winning over the
+//! resource's on collision, mirroring `crate::attrs::merged`'s precedence for this one key; a
+//! **service check** is `statsd.service_check.name` present as a `Value::Str`. Detection is
+//! two-tier in [`StatsdEncoder::encode_into`], split on `event.metrics.is_empty()` -- a real
+//! event/service check never has both an empty `metrics` list and no event-ness, but the
+//! overwhelming majority of metrics-empty events are a plain log/span-only line with no
+//! `statsd.*` carriers at all (any log-only input, `statsd_in`'s own event lines aside), so:
+//! a metrics-empty event first gets a single, *unmerged* [`is_dogstatsd_event`] lookup
+//! (`event.attributes.get` then, only if absent, `resource.attributes.get`) -- cheap enough that
+//! the ordinary "not an event" case never touches [`build_tag_suffix`]'s full merged walk at all,
+//! and is counted straight into `skipped_no_metrics` without inflating `tags_dropped_dialect` for
+//! tags nothing was ever going to render; only once that lookup says "yes" does the full walk run
+//! (for every other carrier the line needs). An event with metrics (a service check, or an
+//! ordinary metric event) always runs the full walk first, exactly as before -- service-check
+//! detection reads `Carriers::service_check_name` off it, zero extra lookups. Either way, the
+//! full walk (into [`Carriers`]) is what `statsd.type`/`statsd.container_id`/`statsd.timestamp`
+//! are also captured from, so a carrier set only on the resource is honored the same way an
+//! event-level one is -- `event.attributes` is never read a second time for those.
+//!
+//! **Event wire form**, one line: `_e{tlen,xlen}:title|text`, followed, in this order and only
+//! when the field is present and valid, by `|d:<secs>` (from the `statsd.timestamp` carrier --
+//! `d:`, never `|T`: an event/service-check line's timestamp is a named field of its own grammar,
+//! not the generic metric-line extension `append_dialect_extras` emits elsewhere in this module),
+//! `|h:<host>`, `|p:<priority>` (`normal`/`low` only), `|t:<alert_type>` (`info`/`success`/
+//! `warning`/`error` only), `|k:<aggregation_key>`, `|s:<source_type>`, the `|#...` tag segment
+//! (via [`build_tag_suffix`]/[`append_tags`], identical to a metric line's), then `|c:<container
+//! id>`. `title` is `statsd.event.title` verbatim; `text` is the log `message` -- must be a
+//! `Value::Str`, anything else drops the event and counts `EncodeStats::dropped_unencodable_value`
+//! -- with every real `\n` it contains escaped to the two bytes `\n` (`statsd_in`'s
+//! `unescape_event_text` is the decode-side mirror of exactly this). `tlen`/`xlen` are the *byte*
+//! lengths of the sanitized title and the escaped text as written, not char counts -- DogStatsD's
+//! `_e{TITLE_LEN,TEXT_LEN}` header is a byte-length-prefixed encoding, and `parse_event` slices by
+//! those exact byte counts, so a char count would silently corrupt a multi-byte title/text.
+//! Severity is never re-derived from `LogRecord.severity` to synthesize a `t:` field when
+//! `statsd.event.alert_type` is absent -- rule (b) (`docs/adr/lossless-transit.md`): the raw
+//! carrier outranks the normalized field on this protocol's own egress, and an absent carrier
+//! means an absent wire field, not an invented one.
+//!
+//! **Service-check wire form**, one line: `_sc|<name>|<status>`, followed by `|d:<secs>`, `|h:
+//! <host>`, the `|#...` tag segment, `|c:<container id>`, and -- always last, since `m:` consumes
+//! the rest of the line verbatim on decode -- `|m:<message>`. The event's **first** metric is the
+//! service check; it must be a `Gauge`, else the whole event is dropped and counted
+//! (`EncodeStats::dropped_invalid_service_check`) rather than falling through to an ordinary
+//! `name:v|g` line -- the point *is* the check, not a gauge that happens to share its value.
+//! `name` is the `statsd.service_check.name` carrier, **not** the metric's own (normalized) name
+//! -- rule (b) again, and unlike a metric name this is sanitized with [`is_forbidden_in_extended_field`]
+//! (`|`/control bytes only), not [`is_forbidden_in_name`], so a service check name keeps `.` and
+//! spaces exactly as sent. `status` is `statsd.service_check.status` when it's a `U64` in `0..=3`;
+//! otherwise the gauge's own value, if finite and rounding into `0..=3`; otherwise the service
+//! check is dropped and counted (`dropped_invalid_service_check`) rather than writing an
+//! out-of-range status DogStatsD's own decoder would reject. `message` is
+//! `statsd.service_check.message` verbatim except a newline or other control byte substituted
+//! with `_` -- unlike event text, there is no escape for this position, only substitution; `|`
+//! survives untouched since `m:` is always the last field. Any metrics after the first on a
+//! service-check event render as ordinary lines (`render_metric`), right after the `_sc` line.
+//!
+//! **Sanitization**, one rule per field, all substitution (never deletion, following this
+//! module's existing convention): event title -- control bytes -> `_` ([`is_forbidden_in_event_title`];
+//! a bare `|` is fine, since the length prefix delimits the field, not a scan for `|`). Event text
+//! -- a real newline becomes the two-byte escape `\n`; any other control byte -> `_`
+//! ([`append_event_text`]). Event host/aggregation-key/source, and service-check name/host --
+//! `|`/control bytes -> `_` ([`is_forbidden_in_extended_field`] -- shared by all five, since each
+//! sits in a `|letter:value` field a real decode splits on the *next* `|`, exactly the way a tag
+//! value does, except a tag value's own `:`-preserving rule doesn't apply here since none of these
+//! fields has a tag value's colon-splitting ambiguity). Event priority/alert-type are never
+//! sanitized at all -- either they exactly match the fixed allowed set (`normal`/`low`;
+//! `info`/`success`/`warning`/`error`) and are written verbatim, or they don't and are omitted,
+//! counting `EncodeStats::dropped_invalid_event_fields` (an out-of-set value has no sanitized form
+//! that would still mean the same thing, so there is nothing to substitute into -- and it's a
+//! dropped *field* on a line that still gets emitted, not a dropped message, hence its own counter
+//! rather than `dropped_unencodable_value`, which reports as a message drop). Service-check
+//! message -- control bytes (including a real newline) -> `_`, `|` left alone
+//! ([`is_forbidden_in_service_check_message`]).
+//!
+//! **`Format::Statsd` has no wire form for either shape at all** -- the classic grammar has no
+//! `_e`/`_sc` sigil -- so the whole event is dropped and counted
+//! (`EncodeStats::dropped_dialect_events`) before anything else about it is even inspected; a
+//! service check's gauge is not emitted as `name:v|g` either, since the point being made is the
+//! check, not a value that happens to coincide with one. A real event/service check dropped this
+//! way still had its full merged walk run first ([`is_dogstatsd_event`] said "yes"), so its
+//! ordinary attributes are also tallied into `tags_dropped_dialect` by that walk -- both counters
+//! incrementing for the one dropped line is expected, not a double-count bug.
+//!
+//! `statsd.event.*`/`statsd.service_check.*` are protocol carriers exactly like `statsd.type`/
+//! `statsd.container_id`/`statsd.timestamp` -- filtered out of the generic `|#k:v,...` tag segment
+//! by the same `key_str.starts_with("statsd.")` check in [`build_tag_suffix`], never re-emitted as
+//! a tag on any line, event/service-check or otherwise.
 
 use crate::influxdb::{push_float, tag_value};
 use crate::msgbuf::MessageBuf;
@@ -235,10 +326,17 @@ pub struct EncodeStats {
     pub dropped_no_recorded_value: usize,
     pub dropped_unsupported_kind: usize,
     /// Also counts a non-finite value inside a `Samples`/`Sum`/`Gauge`/`GaugeDelta` record, an
-    /// out-of-range `Samples.sample_rate` (finite, `@rate` omitted rather than written), and an
+    /// out-of-range `Samples.sample_rate` (finite, `@rate` omitted rather than written), an
     /// entirely empty `Samples`/`SetMembers` record -- see [`render_metric`]'s `Samples`/
-    /// `SetMembers` arms. The shared name follows this file's existing "one bucket per kind of
-    /// unencodable input" convention rather than adding three near-duplicate counters.
+    /// `SetMembers` arms -- and, new in this workstream: an event whose log `message` isn't a
+    /// `Value::Str` (or isn't valid UTF-8), or whose `statsd.event.title` itself isn't valid UTF-8
+    /// (accepted by [`is_dogstatsd_event`] as any `Value::Str`, but with no `carriers.event_title`
+    /// to render), either of which drops the whole event ([`render_event`]). The shared name
+    /// follows this file's existing "one bucket per kind of unencodable input" convention rather
+    /// than adding a near-duplicate counter. An out-of-the-fixed-set
+    /// `statsd.event.priority`/`statsd.event.alert_type` is a *different* shape of problem --
+    /// the line still gets emitted, just without that one field -- so it's counted separately, in
+    /// [`Self::dropped_invalid_event_fields`], not here.
     pub dropped_unencodable_value: usize,
     pub dropped_empty_name: usize,
     pub dropped_oversize_line: usize,
@@ -257,6 +355,22 @@ pub struct EncodeStats {
     /// [`is_forbidden_in_set_member`]'s own, member-specific substitution -- see the module doc's
     /// "Sanitization" section.
     pub members_sanitized: usize,
+    /// An event or service check dropped whole under [`Format::Statsd`], which has no `_e`/`_sc`
+    /// wire form at all -- counted before anything else about the event is inspected. See the
+    /// module doc's "DogStatsD events and service checks" section.
+    pub dropped_dialect_events: usize,
+    /// A service check whose first metric wasn't a `Gauge` (the shape `statsd_in` always
+    /// produces), or whose status was neither a `statsd.service_check.status` carrier in `0..=3`
+    /// nor a gauge value finite and rounding into `0..=3` -- the whole event is dropped rather
+    /// than falling through to an ordinary `name:v|g` line. See [`render_service_check`].
+    pub dropped_invalid_service_check: usize,
+    /// An event's `statsd.event.priority`/`statsd.event.alert_type` carrier held a value outside
+    /// its fixed allowed set (`normal`/`low`; `info`/`success`/`warning`/`error`) -- that one
+    /// field is omitted, counted once per occurrence, but the rest of the line still renders and
+    /// is still emitted. Deliberately **not** `dropped_unencodable_value`: that field reports as
+    /// `logit.output.messages.dropped{reason="unencodable_value"}`, which would claim the whole
+    /// message was dropped when only one of its fields was. See [`render_event`].
+    pub dropped_invalid_event_fields: usize,
 }
 
 /// Encodes events as statsd lines. Pure -- no socket anywhere -- so every grammar/sanitization/
@@ -282,6 +396,15 @@ pub struct StatsdEncoder {
     /// Scratch for [`tag_value`]'s non-`Str` formatting only -- every use within one event is
     /// read-immediately-into-`tag_suffix`-then-cleared before the next, never overlapping in time.
     scratch: String,
+    /// The sanitized event title currently being rendered -- its own field for the same
+    /// reallocation-avoidance reason `name`/`member` are. Never live at the same time as `name`/
+    /// `member`: an event line and an ordinary metric line are never rendered from the same call.
+    title_buf: String,
+    /// The escaped event text (the log message, real `\n` turned into the two-byte `\n` escape)
+    /// currently being rendered -- computed into its own buffer, alongside `title_buf`, before
+    /// either is known to fit in the final line (the `_e{tlen,xlen}` header needs both lengths
+    /// first).
+    text_buf: String,
 }
 
 impl StatsdEncoder {
@@ -295,6 +418,8 @@ impl StatsdEncoder {
             name: String::new(),
             member: String::new(),
             scratch: String::new(),
+            title_buf: String::new(),
+            text_buf: String::new(),
         }
     }
 
@@ -324,9 +449,61 @@ impl StatsdEncoder {
         let mut stats = EncodeStats::default();
         for event in &batch.events {
             if event.metrics.is_empty() {
-                stats.skipped_no_metrics += 1;
+                // A metrics-empty event is either a DogStatsD event or (overwhelmingly more
+                // often -- any log-only input, `statsd_in`'s own event lines aside) a plain log/
+                // span-only line with nothing to render. Deciding which needs only
+                // `statsd.event.title`'s own precedence, not the full merged walk
+                // `build_tag_suffix` runs -- see [`is_dogstatsd_event`] and the module doc's
+                // "DogStatsD events and service checks" section.
+                if !is_dogstatsd_event(&batch.resource, event) {
+                    stats.skipped_no_metrics += 1;
+                    continue;
+                }
+
+                let mut carriers = Carriers::default();
+                build_tag_suffix(
+                    &mut self.tag_suffix,
+                    &mut self.scratch,
+                    self.format,
+                    &batch.resource,
+                    event,
+                    &mut stats,
+                    &mut carriers,
+                );
+
+                if self.format == Format::Statsd {
+                    // No `Format::Statsd` wire form at all -- drop the whole event. The walk just
+                    // above already tallied this event's ordinary attributes into
+                    // `tags_dropped_dialect`, same as any other dialect-dropped tag; both counters
+                    // incrementing here is expected (module doc).
+                    stats.dropped_dialect_events += 1;
+                    continue;
+                }
+
+                let mut ctx = EncodeCtx {
+                    format: self.format,
+                    tag_suffix: &self.tag_suffix,
+                    statsd_type: carriers.statsd_type,
+                    container_id: carriers.container_id,
+                    timestamp_secs: carriers.timestamp_secs,
+                    max_packet_bytes,
+                    stats: &mut stats,
+                    diag: &mut self.diag,
+                    out: &mut *out,
+                };
+                render_event(
+                    &mut self.line,
+                    &mut self.title_buf,
+                    &mut self.text_buf,
+                    &carriers,
+                    event,
+                    &mut ctx,
+                );
                 continue;
             }
+
+            // An event with metrics: the full merged walk always runs (as it always has), and
+            // service-check detection reads it straight off `carriers` -- zero extra lookups.
             let mut carriers = Carriers::default();
             build_tag_suffix(
                 &mut self.tag_suffix,
@@ -337,6 +514,16 @@ impl StatsdEncoder {
                 &mut stats,
                 &mut carriers,
             );
+
+            let is_service_check = carriers.service_check_name.is_some();
+
+            if is_service_check && self.format == Format::Statsd {
+                // No `Format::Statsd` wire form at all -- drop the whole event before inspecting
+                // anything else about it (module doc).
+                stats.dropped_dialect_events += 1;
+                continue;
+            }
+
             let mut ctx = EncodeCtx {
                 format: self.format,
                 tag_suffix: &self.tag_suffix,
@@ -348,6 +535,37 @@ impl StatsdEncoder {
                 diag: &mut self.diag,
                 out: &mut *out,
             };
+
+            if is_service_check {
+                match event.metrics.first() {
+                    Some(first) if matches!(first.kind, MetricKind::Gauge(_)) => {
+                        render_service_check(&mut self.line, &carriers, first, &mut ctx);
+                        for metric in &event.metrics[1..] {
+                            render_metric(
+                                &mut self.line,
+                                &mut self.name,
+                                &mut self.member,
+                                self.relative_gauges,
+                                metric,
+                                &mut ctx,
+                            );
+                        }
+                    }
+                    _ => {
+                        ctx.stats.dropped_invalid_service_check += 1;
+                        ctx.diag.warn_throttled(
+                            "invalid_service_check",
+                            format_args!(
+                                "statsd_out: service check {:?} has no Gauge as its first \
+                                 metric; dropping",
+                                carriers.service_check_name.unwrap_or_default()
+                            ),
+                        );
+                    }
+                }
+                continue;
+            }
+
             for metric in &event.metrics {
                 render_metric(
                     &mut self.line,
@@ -361,6 +579,28 @@ impl StatsdEncoder {
         }
         stats
     }
+}
+
+/// Cheap detection for a metrics-empty event: does it carry `statsd.event.title` as a
+/// `Value::Str`, the event's own value winning over the resource's on collision (mirroring
+/// `crate::attrs::merged`'s precedence for this one key, without paying the full merged walk over
+/// every attribute)? `event.attributes.get`/`resource.attributes.get` are `O(log n)` binary
+/// searches on an already-sorted `AttrMap` (`crates/logit-core/src/attrs.rs`), not a scan -- so
+/// this costs at most two lookups, against the full walk [`build_tag_suffix`] would otherwise run
+/// (over every resource and event attribute, plus a `tags_dropped_dialect` tally under
+/// `Format::Statsd`) for what is, for the overwhelming majority of metrics-empty events, a plain
+/// log line carrying no `statsd.*` carrier at all. Used only to gate whether
+/// [`StatsdEncoder::encode_into`] pays that full walk for a metrics-empty event; an event with
+/// metrics always pays it regardless (service-check detection needs the rest of `Carriers` too).
+fn is_dogstatsd_event(resource: &Resource, event: &Event) -> bool {
+    if event.log.is_none() {
+        return false;
+    }
+    let title = event
+        .attributes
+        .get("statsd.event.title")
+        .or_else(|| resource.attributes.get("statsd.event.title"));
+    matches!(title, Some(Value::Str(_)))
 }
 
 /// Bundles the per-batch context [`render_metric`] and its `Samples`/`SetMembers` helpers need but
@@ -394,6 +634,21 @@ struct Carriers<'a> {
     statsd_type: Option<&'a str>,
     container_id: Option<&'a str>,
     timestamp_secs: Option<u64>,
+    /// `statsd.event.title` -- always present on a real `statsd_in`-decoded event; its presence
+    /// (alongside `event.log.is_some()`) is exactly [`StatsdEncoder::encode_into`]'s event
+    /// detection rule.
+    event_title: Option<&'a str>,
+    event_priority: Option<&'a str>,
+    event_alert_type: Option<&'a str>,
+    event_aggregation_key: Option<&'a str>,
+    event_source_type: Option<&'a str>,
+    event_host: Option<&'a str>,
+    /// `statsd.service_check.name` -- always present on a real `statsd_in`-decoded service check;
+    /// its presence is exactly the encoder's service-check detection rule.
+    service_check_name: Option<&'a str>,
+    service_check_status: Option<u64>,
+    service_check_message: Option<&'a str>,
+    service_check_host: Option<&'a str>,
 }
 
 /// Builds this event's DogStatsD tag segment into `suffix` (cleared first, **no** leading `|#` --
@@ -434,6 +689,36 @@ fn build_tag_suffix<'a>(
                 }
                 ("statsd.timestamp", Value::U64(secs)) => {
                     carriers.timestamp_secs = Some(*secs);
+                }
+                ("statsd.event.title", Value::Str(s)) => {
+                    carriers.event_title = std::str::from_utf8(s).ok();
+                }
+                ("statsd.event.priority", Value::Str(s)) => {
+                    carriers.event_priority = std::str::from_utf8(s).ok();
+                }
+                ("statsd.event.alert_type", Value::Str(s)) => {
+                    carriers.event_alert_type = std::str::from_utf8(s).ok();
+                }
+                ("statsd.event.aggregation_key", Value::Str(s)) => {
+                    carriers.event_aggregation_key = std::str::from_utf8(s).ok();
+                }
+                ("statsd.event.source_type", Value::Str(s)) => {
+                    carriers.event_source_type = std::str::from_utf8(s).ok();
+                }
+                ("statsd.event.host", Value::Str(s)) => {
+                    carriers.event_host = std::str::from_utf8(s).ok();
+                }
+                ("statsd.service_check.name", Value::Str(s)) => {
+                    carriers.service_check_name = std::str::from_utf8(s).ok();
+                }
+                ("statsd.service_check.status", Value::U64(v)) => {
+                    carriers.service_check_status = Some(*v);
+                }
+                ("statsd.service_check.message", Value::Str(s)) => {
+                    carriers.service_check_message = std::str::from_utf8(s).ok();
+                }
+                ("statsd.service_check.host", Value::Str(s)) => {
+                    carriers.service_check_host = std::str::from_utf8(s).ok();
                 }
                 // Anything else (an absent/wrong-typed carrier, or a `statsd.*` key this sink
                 // doesn't know about) is ignored here the same way it's ignored as a tag --
@@ -523,6 +808,206 @@ fn append_dialect_extras(line: &mut String, ctx: &mut EncodeCtx) {
             }
         }
     }
+}
+
+/// Appends `|c:<container-id>` only, **never** `|T` -- the counterpart to
+/// [`append_dialect_extras`] for an event/service-check line, whose own timestamp carriage
+/// already happened via its `d:<secs>` field (module doc's "DogStatsD events and service checks"
+/// section). Called only under `Format::DogStatsd`: [`StatsdEncoder::encode_into`] drops an
+/// event/service-check whole under `Format::Statsd` before either render function -- and
+/// therefore this -- is ever reached, so there is no dialect-drop accounting to do here the way
+/// `append_dialect_extras` has to for an ordinary metric line.
+fn append_container_id(line: &mut String, ctx: &EncodeCtx) {
+    if let Some(id) = ctx.container_id {
+        line.push_str("|c:");
+        sanitize_into(line, id, is_forbidden_in_tag_value_only);
+    }
+}
+
+/// Renders one `_e{tlen,xlen}:title|text[...]` line for an event straight into `line`, or renders
+/// nothing (dropping and counting `EncodeStats::dropped_unencodable_value`) if the log `message`
+/// isn't valid UTF-8 text, or if `statsd.event.title` itself isn't -- [`is_dogstatsd_event`]
+/// accepts any `Value::Str` title, UTF-8 or not, so `carriers.event_title` (populated only when
+/// `from_utf8` succeeds) can legitimately be `None` here even though this function was correctly
+/// called. `title_buf`/`text_buf` are reused scratch (never live at the same time as
+/// `render_metric`'s `name`/`member` -- an event line and an ordinary metric line are never
+/// rendered from the same call). See the module doc's "DogStatsD events and service checks"
+/// section for the full field order and sanitization rules.
+fn render_event(
+    line: &mut String,
+    title_buf: &mut String,
+    text_buf: &mut String,
+    carriers: &Carriers,
+    event: &Event,
+    ctx: &mut EncodeCtx,
+) {
+    let Some(title) = carriers.event_title else {
+        ctx.stats.dropped_unencodable_value += 1;
+        ctx.diag.warn_throttled(
+            "unencodable_value",
+            format_args!("statsd_out: event has a non-UTF-8 title; dropping"),
+        );
+        return;
+    };
+    let log = event.log.as_ref().expect("caller only calls this when event.log is Some");
+
+    let Value::Str(raw) = &log.message else {
+        ctx.stats.dropped_unencodable_value += 1;
+        ctx.diag.warn_throttled(
+            "unencodable_value",
+            format_args!("statsd_out: event {title:?} has a non-string log message; dropping"),
+        );
+        return;
+    };
+    let Ok(raw_text) = std::str::from_utf8(raw) else {
+        ctx.stats.dropped_unencodable_value += 1;
+        ctx.diag.warn_throttled(
+            "unencodable_value",
+            format_args!("statsd_out: event {title:?} has a non-UTF-8 log message; dropping"),
+        );
+        return;
+    };
+
+    title_buf.clear();
+    sanitize_into(title_buf, title, is_forbidden_in_event_title);
+    text_buf.clear();
+    append_event_text(text_buf, raw_text);
+
+    line.clear();
+    let _ = write!(line, "_e{{{},{}}}:", title_buf.len(), text_buf.len());
+    line.push_str(title_buf);
+    line.push('|');
+    line.push_str(text_buf);
+
+    if let Some(secs) = ctx.timestamp_secs {
+        let _ = write!(line, "|d:{secs}");
+    }
+    if let Some(host) = carriers.event_host {
+        line.push_str("|h:");
+        sanitize_into(line, host, is_forbidden_in_extended_field);
+    }
+    match carriers.event_priority {
+        Some(p @ ("normal" | "low")) => {
+            line.push_str("|p:");
+            line.push_str(p);
+        }
+        Some(p) => {
+            ctx.stats.dropped_invalid_event_fields += 1;
+            ctx.diag.warn_throttled(
+                "invalid_event_field",
+                format_args!(
+                    "statsd_out: event {title:?} has an out-of-set priority {p:?}; omitting the \
+                     p: field"
+                ),
+            );
+        }
+        None => {}
+    }
+    match carriers.event_alert_type {
+        Some(t @ ("info" | "success" | "warning" | "error")) => {
+            line.push_str("|t:");
+            line.push_str(t);
+        }
+        Some(t) => {
+            ctx.stats.dropped_invalid_event_fields += 1;
+            ctx.diag.warn_throttled(
+                "invalid_event_field",
+                format_args!(
+                    "statsd_out: event {title:?} has an out-of-set alert_type {t:?}; omitting the \
+                     t: field"
+                ),
+            );
+        }
+        None => {}
+    }
+    if let Some(key) = carriers.event_aggregation_key {
+        line.push_str("|k:");
+        sanitize_into(line, key, is_forbidden_in_extended_field);
+    }
+    if let Some(source) = carriers.event_source_type {
+        line.push_str("|s:");
+        sanitize_into(line, source, is_forbidden_in_extended_field);
+    }
+    append_tags(line, ctx.tag_suffix);
+    append_container_id(line, ctx);
+
+    push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
+}
+
+/// Renders one `_sc|name|status[...]` line for a service check straight into `line`. `metric` is
+/// the event's first metric, already confirmed by the caller ([`StatsdEncoder::encode_into`]) to
+/// be a `MetricKind::Gauge`. Renders nothing (dropping and counting
+/// `EncodeStats::dropped_invalid_service_check`) if no valid `0..=3` status can be found on
+/// either the `statsd.service_check.status` carrier or the gauge's own value, or (dropping and
+/// counting `EncodeStats::dropped_empty_name`, mirroring [`render_metric`]'s identical guard) if
+/// the sanitized name is empty -- `_sc||0` is not a legal service check any more than an empty
+/// metric name is a legal metric line. See the module doc's "DogStatsD events and service checks"
+/// section.
+fn render_service_check(
+    line: &mut String,
+    carriers: &Carriers,
+    metric: &MetricRecord,
+    ctx: &mut EncodeCtx,
+) {
+    let name = carriers
+        .service_check_name
+        .expect("caller only calls this when service_check_name is Some");
+    let gauge_value = match &metric.kind {
+        MetricKind::Gauge(v) => *v,
+        other => {
+            unreachable!("caller only calls this when the first metric is a Gauge, got {other:?}")
+        }
+    };
+
+    let status = match carriers.service_check_status {
+        Some(s) if s <= 3 => s,
+        _ => {
+            let rounded = gauge_value.round();
+            if gauge_value.is_finite() && (0.0..=3.0).contains(&rounded) {
+                rounded as u64
+            } else {
+                ctx.stats.dropped_invalid_service_check += 1;
+                ctx.diag.warn_throttled(
+                    "invalid_service_check",
+                    format_args!(
+                        "statsd_out: service check {name:?} has no valid status in 0..=3; \
+                         dropping"
+                    ),
+                );
+                return;
+            }
+        }
+    };
+
+    line.clear();
+    line.push_str("_sc|");
+    let name_start = line.len();
+    sanitize_into(line, name, is_forbidden_in_extended_field);
+    if line.len() == name_start {
+        ctx.stats.dropped_empty_name += 1;
+        ctx.diag.warn_throttled(
+            "empty_metric_name",
+            format_args!("statsd_out: service check name {name:?} sanitizes to nothing; dropping"),
+        );
+        return;
+    }
+    let _ = write!(line, "|{status}");
+
+    if let Some(secs) = ctx.timestamp_secs {
+        let _ = write!(line, "|d:{secs}");
+    }
+    if let Some(host) = carriers.service_check_host {
+        line.push_str("|h:");
+        sanitize_into(line, host, is_forbidden_in_extended_field);
+    }
+    append_tags(line, ctx.tag_suffix);
+    append_container_id(line, ctx);
+    if let Some(message) = carriers.service_check_message {
+        line.push_str("|m:");
+        sanitize_into(line, message, is_forbidden_in_service_check_message);
+    }
+
+    push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
 }
 
 /// Checks `line`'s length against `max_packet_bytes` and either pushes it to `out` or counts and
@@ -979,6 +1464,57 @@ fn is_forbidden_in_set_member(c: char) -> bool {
     matches!(c, ':' | '|') || c.is_control()
 }
 
+/// Forbidden in an event title -- control bytes only ([`char::is_control`], which covers
+/// `\n`/`\r`/`\0`). A bare `|` is fine: `parse_event` slices `TITLE`/`TEXT` by the `_e{tlen,xlen}`
+/// header's own byte lengths, not by scanning for `|`, so nothing here is delimiter-sensitive the
+/// way a name/tag-key/member is. Control bytes still have to go: an embedded raw `\n` would look
+/// like a line boundary to a receiver once several statsd lines get packed into one `\n`-joined
+/// UDP datagram (module doc's "Packing and framing" section), which the byte-length header alone
+/// doesn't protect against.
+fn is_forbidden_in_event_title(c: char) -> bool {
+    c.is_control()
+}
+
+/// Appends `raw` to `out` as DogStatsD event `TEXT`: a real newline becomes the two-byte escape
+/// `\n` (the wire encoding `statsd_in`'s `unescape_event_text` turns back into a real newline on
+/// decode), and any other control byte is substituted with `_` -- there is no escape for those,
+/// and, same reasoning as [`is_forbidden_in_event_title`], an unescaped one could corrupt a
+/// packed datagram's line framing.
+fn append_event_text(out: &mut String, raw: &str) {
+    for c in raw.chars() {
+        if c == '\n' {
+            out.push('\\');
+            out.push('n');
+        } else if c.is_control() {
+            out.push('_');
+        } else {
+            out.push(c);
+        }
+    }
+}
+
+/// Forbidden in an event's `host`/`aggregation_key`/`source_type` field and a service check's
+/// `name`/`host` field -- `|` and control bytes, substituted with `_`. Each of these sits in a
+/// `|letter:value` field a real decode reads up to the *next* `|` (or, for a service check's
+/// `name`, up to the second `|` on the line -- `parse_service_check`'s own `splitn(3, '|')`), so
+/// an embedded `|` would truncate the field and leak its remainder into whatever comes next --
+/// unlike a tag value, none of these fields has a colon-splitting ambiguity that would need `:`
+/// forbidden too. Deliberately **not** [`is_forbidden_in_name`]: a service check name keeps `.`
+/// and spaces exactly as sent (module doc), which the name/tag-key rule would substitute.
+fn is_forbidden_in_extended_field(c: char) -> bool {
+    c == '|' || c.is_control()
+}
+
+/// Forbidden in a service check's `message` (`m:`) field -- control bytes only, substituted with
+/// `_`. Unlike event text, a real newline is *not* escaped here (there is no equivalent unescape
+/// on the decode side for this field): both are simply substituted, the same defensive reasoning
+/// as [`is_forbidden_in_event_title`]. `|` is deliberately left alone: `m:` is always the last
+/// field on the line (this module always renders it last, and `parse_service_check` always reads
+/// it last), so an embedded `|` can't be misread as the start of another field.
+fn is_forbidden_in_service_check_message(c: char) -> bool {
+    c.is_control()
+}
+
 /// The live half of a `statsd_out` sink: `Udp` binds eagerly (a bad local bind is a config error);
 /// `Tcp` connects lazily inside `send`, since a not-yet-up downstream receiver must not block
 /// `logit` from starting. Mirrors `syslog::Conn` exactly.
@@ -1104,6 +1640,21 @@ impl Output for StatsdOutput {
             "logit.output.messages.dropped",
             stats.dropped_dialect_fields as f64,
             &[("reason", "dialect_field")],
+        );
+        self.telemetry.count(
+            "logit.output.messages.dropped",
+            stats.dropped_dialect_events as f64,
+            &[("reason", "dialect_event")],
+        );
+        self.telemetry.count(
+            "logit.output.messages.dropped",
+            stats.dropped_invalid_service_check as f64,
+            &[("reason", "invalid_service_check")],
+        );
+        self.telemetry.count(
+            "logit.output.messages.dropped",
+            stats.dropped_invalid_event_fields as f64,
+            &[("reason", "invalid_event_field")],
         );
         self.telemetry.count(
             "logit.output.messages.normalized",
@@ -1360,7 +1911,7 @@ fn is_message_too_large(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::{interner::intern, AttrMap, MetricRecord, Resource};
+    use logit_core::{interner::intern, AttrMap, BodyFormat, LogRecord, MetricRecord, Resource};
     use logit_inputs::statsd::StatsdDecoder;
     use logit_proto::Decoder;
     use std::net::SocketAddr;
@@ -1439,6 +1990,36 @@ mod tests {
         let (msgs, stats) = encode(vec![log_event(0)]);
         assert!(msgs.is_empty());
         assert_eq!(stats.skipped_no_metrics, 1);
+    }
+
+    /// A plain log event (no `statsd.event.title`, so not a DogStatsD event) with ordinary
+    /// attributes must not pay the merged tag walk at all under `Format::Statsd` -- it's
+    /// `skipped_no_metrics`, full stop, not also `tags_dropped_dialect` for tags nothing was
+    /// ever going to render. Regression for a `syslog_in -> statsd_out` relay inflating that
+    /// counter for every ordinary log line.
+    #[test]
+    fn a_plain_log_event_under_statsd_is_skipped_without_touching_tags_dropped_dialect() {
+        let mut attributes = AttrMap::new();
+        attributes.insert("host", "web1");
+        attributes.insert("env", "prod");
+        attributes.insert("service", "api");
+        let event = Event::log(
+            0,
+            attributes,
+            LogRecord {
+                message: Value::str("hello"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        let (msgs, stats) = encode_with_format(vec![event], Format::Statsd);
+        assert!(msgs.is_empty());
+        assert_eq!(stats.skipped_no_metrics, 1);
+        assert_eq!(stats.tags_dropped_dialect, 0);
     }
 
     #[test]
@@ -2067,6 +2648,330 @@ mod tests {
         assert_eq!(msgs, vec!["hits:1|c|#env:prod|c:abcd1234|T0"]);
     }
 
+    // -- Events -----------------------------------------------------------------------------
+
+    fn event_line_event(title: &str, text: &str, extra_attrs: &[(&str, Value)]) -> Event {
+        let mut attributes = AttrMap::new();
+        attributes.insert("statsd.event.title", Value::str(title));
+        for (k, v) in extra_attrs {
+            attributes.insert(k, v.clone());
+        }
+        Event::log(
+            0,
+            attributes,
+            LogRecord {
+                message: Value::str(text),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn an_event_with_every_field_renders_the_canonical_line_with_byte_lengths() {
+        // "héllo" is 6 UTF-8 bytes but 5 chars -- proves `tlen` counts bytes, not chars.
+        let event = event_line_event(
+            "héllo",
+            "world",
+            &[
+                ("statsd.timestamp", Value::U64(1_700_000_000)),
+                ("statsd.event.host", Value::str("web1")),
+                ("statsd.event.priority", Value::str("low")),
+                ("statsd.event.alert_type", Value::str("error")),
+                ("statsd.event.aggregation_key", Value::str("key1")),
+                ("statsd.event.source_type", Value::str("my_app")),
+                ("statsd.container_id", Value::str("cid1")),
+                ("env", "prod".into()),
+            ],
+        );
+        let (msgs, stats) = encode(vec![event]);
+        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(
+            msgs,
+            vec![
+                "_e{6,5}:héllo|world|d:1700000000|h:web1|p:low|t:error|k:key1|s:my_app|#env:prod|c:cid1"
+            ]
+        );
+    }
+
+    #[test]
+    fn event_text_with_a_real_newline_is_escaped_and_the_length_counts_the_escape() {
+        let event = event_line_event("t", "a\nb", &[]);
+        let (msgs, _) = encode(vec![event]);
+        // "a\nb" (3 bytes) escapes to "a\\nb" (4 bytes): tlen=1, xlen=4.
+        assert_eq!(msgs, vec!["_e{1,4}:t|a\\nb"]);
+    }
+
+    #[test]
+    fn absent_event_carriers_produce_no_optional_fields() {
+        let event = event_line_event("t", "x", &[]);
+        let (msgs, _) = encode(vec![event]);
+        assert_eq!(msgs, vec!["_e{1,1}:t|x"]);
+    }
+
+    #[test]
+    fn an_invalid_event_priority_is_omitted_and_counted() {
+        let event = event_line_event("t", "x", &[("statsd.event.priority", Value::str("urgent"))]);
+        let (msgs, stats) = encode(vec![event]);
+        assert_eq!(msgs, vec!["_e{1,1}:t|x"]);
+        // A dropped *field* on an otherwise-emitted line, not a dropped message -- its own
+        // counter, not `dropped_unencodable_value` (which would claim the whole event was
+        // dropped).
+        assert_eq!(stats.dropped_invalid_event_fields, 1);
+        assert_eq!(stats.dropped_unencodable_value, 0);
+    }
+
+    #[test]
+    fn an_invalid_event_alert_type_is_omitted_and_counted() {
+        let event =
+            event_line_event("t", "x", &[("statsd.event.alert_type", Value::str("critical"))]);
+        let (msgs, stats) = encode(vec![event]);
+        assert_eq!(msgs, vec!["_e{1,1}:t|x"]);
+        assert_eq!(stats.dropped_invalid_event_fields, 1);
+        assert_eq!(stats.dropped_unencodable_value, 0);
+    }
+
+    #[test]
+    fn an_event_with_a_non_string_log_message_is_dropped_and_counted() {
+        let mut attributes = AttrMap::new();
+        attributes.insert("statsd.event.title", Value::str("t"));
+        let event = Event::log(
+            0,
+            attributes,
+            LogRecord {
+                message: Value::U64(5),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        let (msgs, stats) = encode(vec![event]);
+        assert!(msgs.is_empty());
+        assert_eq!(stats.dropped_unencodable_value, 1);
+    }
+
+    /// [`is_dogstatsd_event`] accepts any `Value::Str` title, UTF-8 or not -- `Value::Str` doesn't
+    /// enforce its own "UTF-8 text" invariant at construction, only by convention -- so
+    /// `render_event` must handle a non-UTF-8 title as a dropped, counted event rather than
+    /// `expect`-panicking the whole sink (the bug this test pins).
+    #[test]
+    fn an_event_with_a_non_utf8_title_is_dropped_and_counted_rather_than_panicking() {
+        let mut attributes = AttrMap::new();
+        attributes.insert("statsd.event.title", Value::Str(bytes::Bytes::from_static(b"\xff")));
+        let event = Event::log(
+            0,
+            attributes,
+            LogRecord {
+                message: Value::str("x"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        let (msgs, stats) = encode(vec![event]);
+        assert!(msgs.is_empty());
+        assert_eq!(stats.dropped_unencodable_value, 1);
+    }
+
+    #[test]
+    fn event_carriers_never_appear_as_tags() {
+        let event = event_line_event(
+            "t",
+            "x",
+            &[("statsd.event.host", Value::str("web1")), ("env", "prod".into())],
+        );
+        let (msgs, _) = encode(vec![event]);
+        assert_eq!(msgs, vec!["_e{1,1}:t|x|h:web1|#env:prod"]);
+    }
+
+    #[test]
+    fn event_carriers_set_on_the_resource_are_honored() {
+        let mut resource_attrs = AttrMap::new();
+        resource_attrs.insert("statsd.event.title", Value::str("from-resource"));
+        let resource = Arc::new(Resource { attributes: resource_attrs, ..Default::default() });
+        let event = Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str("x"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        let batch = EventBatch { resource, scope: None, events: vec![event] };
+        let mut encoder = StatsdEncoder::new(Format::DogStatsd);
+        let mut out = MessageBuf::default();
+        encoder.encode_into(&batch, usize::MAX, &mut out);
+        let msgs: Vec<String> =
+            out.iter().map(|b| std::str::from_utf8(b).unwrap().to_string()).collect();
+        assert_eq!(msgs, vec!["_e{13,1}:from-resource|x"]);
+    }
+
+    #[test]
+    fn an_oversize_event_line_is_dropped_via_the_existing_oversize_path() {
+        let event = event_line_event("t", "x", &[]);
+        let mut encoder = StatsdEncoder::new(Format::DogStatsd);
+        let mut out = MessageBuf::default();
+        // "_e{1,1}:t|x" is 11 bytes, longer than this cap.
+        let stats = encoder.encode_into(&batch_with(vec![event]), 5, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(stats.dropped_oversize_line, 1);
+    }
+
+    // -- Service checks -----------------------------------------------------------------------
+
+    fn service_check_event(name: &str, status: MetricKind, extra_attrs: &[(&str, Value)]) -> Event {
+        let mut attributes = AttrMap::new();
+        attributes.insert("statsd.service_check.name", Value::str(name));
+        for (k, v) in extra_attrs {
+            attributes.insert(k, v.clone());
+        }
+        Event::metric(0, attributes, MetricRecord::new(intern("ignored"), status))
+    }
+
+    #[test]
+    fn a_service_check_renders_the_canonical_line() {
+        let event = service_check_event(
+            "my.check",
+            MetricKind::Gauge(1.0),
+            &[
+                ("statsd.timestamp", Value::U64(1_700_000_000)),
+                ("statsd.service_check.host", Value::str("web1")),
+                ("env", "prod".into()),
+                ("statsd.container_id", Value::str("cid1")),
+            ],
+        );
+        let (msgs, stats) = encode(vec![event]);
+        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(msgs, vec!["_sc|my.check|1|d:1700000000|h:web1|#env:prod|c:cid1"]);
+    }
+
+    #[test]
+    fn a_service_check_message_containing_a_pipe_is_kept_since_m_is_last() {
+        let event = service_check_event(
+            "chk",
+            MetricKind::Gauge(0.0),
+            &[("statsd.service_check.message", Value::str("a|b"))],
+        );
+        let (msgs, _) = encode(vec![event]);
+        assert_eq!(msgs, vec!["_sc|chk|0|m:a|b"]);
+    }
+
+    #[test]
+    fn service_check_status_attribute_wins_over_the_gauge_value() {
+        let event = service_check_event(
+            "chk",
+            MetricKind::Gauge(3.0),
+            &[("statsd.service_check.status", Value::U64(1))],
+        );
+        let (msgs, _) = encode(vec![event]);
+        assert_eq!(msgs, vec!["_sc|chk|1"]);
+    }
+
+    #[test]
+    fn service_check_status_falls_back_to_the_rounded_gauge_value() {
+        let event = service_check_event("chk", MetricKind::Gauge(1.6), &[]);
+        let (msgs, _) = encode(vec![event]);
+        assert_eq!(msgs, vec!["_sc|chk|2"]);
+    }
+
+    #[test]
+    fn an_out_of_range_service_check_status_is_dropped_and_counted() {
+        let event = service_check_event(
+            "chk",
+            MetricKind::Gauge(9.0),
+            &[("statsd.service_check.status", Value::U64(5))],
+        );
+        let (msgs, stats) = encode(vec![event]);
+        assert!(msgs.is_empty());
+        assert_eq!(stats.dropped_invalid_service_check, 1);
+    }
+
+    /// An empty (or sanitizes-to-empty) `statsd.service_check.name` must drop the whole event
+    /// rather than render `_sc||0` -- mirrors [`render_metric`]'s identical
+    /// sanitizes-to-nothing guard for an ordinary metric name.
+    #[test]
+    fn a_service_check_with_an_empty_name_is_dropped_and_counted() {
+        let event = service_check_event("", MetricKind::Gauge(0.0), &[]);
+        let (msgs, stats) = encode(vec![event]);
+        assert!(msgs.is_empty());
+        assert_eq!(stats.dropped_empty_name, 1);
+    }
+
+    #[test]
+    fn a_non_gauge_first_metric_on_a_service_check_event_is_dropped_and_counted() {
+        let mut attributes = AttrMap::new();
+        attributes.insert("statsd.service_check.name", Value::str("chk"));
+        let event = Event::metric(
+            0,
+            attributes,
+            MetricRecord::new(intern("chk"), MetricKind::counter(1.0)),
+        );
+        let (msgs, stats) = encode(vec![event]);
+        assert!(msgs.is_empty());
+        assert_eq!(stats.dropped_invalid_service_check, 1);
+    }
+
+    #[test]
+    fn a_second_metric_on_a_service_check_event_renders_as_a_normal_line_after_it() {
+        let mut attributes = AttrMap::new();
+        attributes.insert("statsd.service_check.name", Value::str("chk"));
+        let mut event =
+            Event::metric(0, attributes, MetricRecord::new(intern("chk"), MetricKind::Gauge(0.0)));
+        event.metrics.push(MetricRecord::new(intern("extra"), MetricKind::counter(1.0)));
+        let (msgs, _) = encode(vec![event]);
+        assert_eq!(msgs, vec!["_sc|chk|0", "extra:1|c"]);
+    }
+
+    #[test]
+    fn service_check_carriers_never_appear_as_tags() {
+        let event = service_check_event(
+            "chk",
+            MetricKind::Gauge(0.0),
+            &[("statsd.service_check.message", Value::str("m")), ("env", "prod".into())],
+        );
+        let (msgs, _) = encode(vec![event]);
+        assert_eq!(msgs, vec!["_sc|chk|0|#env:prod|m:m"]);
+    }
+
+    #[test]
+    fn events_and_service_checks_are_dropped_under_plain_statsd() {
+        let ev = event_line_event("t", "x", &[]);
+        let sc = service_check_event("chk", MetricKind::Gauge(0.0), &[]);
+        let (msgs, stats) = encode_with_format(vec![ev, sc], Format::Statsd);
+        assert!(msgs.is_empty());
+        assert_eq!(stats.dropped_dialect_events, 2);
+    }
+
+    /// Unlike a plain log line (which is `skipped_no_metrics` without ever touching the merged
+    /// walk -- see `a_plain_log_event_under_statsd_is_skipped_without_touching_tags_dropped_
+    /// dialect` above), a *real* event dropped under `Format::Statsd` did have its full merged
+    /// walk run (that's how it was confirmed to be an event at all), so its ordinary attributes
+    /// are also tallied into `tags_dropped_dialect` by that walk -- both counters incrementing
+    /// for the one dropped line is expected, not a double-count bug (module doc).
+    #[test]
+    fn a_real_event_dropped_under_statsd_also_tallies_its_tags_into_tags_dropped_dialect() {
+        let ev = event_line_event("t", "x", &[("env", "prod".into())]);
+        let (msgs, stats) = encode_with_format(vec![ev], Format::Statsd);
+        assert!(msgs.is_empty());
+        assert_eq!(stats.dropped_dialect_events, 1);
+        assert_eq!(stats.tags_dropped_dialect, 1);
+    }
+
     // -- Packing and framing ------------------------------------------------------------------
 
     #[tokio::test]
@@ -2496,6 +3401,52 @@ mod tests {
         assert_eq!(relayed[0].attributes.get("statsd.timestamp"), Some(&Value::U64(1_700_000_000)));
     }
 
+    /// An event line round-trips through the real decoder: title/text, every optional field, and
+    /// a tag all survive `statsd_in -> statsd_out` with no `aggregate` in between.
+    #[test]
+    fn an_event_line_round_trips_through_the_real_statsd_decoder() {
+        let original_line =
+            "_e{5,18}:title|line one\\nline two|d:1700000000|h:web1|p:low|t:warning|k:key1|\
+             s:my_app|#env:prod|c:cid1";
+        let original = decode_one(original_line);
+        assert_eq!(original.len(), 1, "one Event event per line");
+        let (msgs, _) = encode(original);
+        assert_eq!(msgs, vec![original_line]);
+        let relayed = decode_one(&msgs[0]);
+        assert_eq!(
+            relayed[0].log.as_ref().map(|l| l.message.clone()),
+            Some(Value::str("line one\nline two"))
+        );
+        assert_eq!(
+            relayed[0].attributes.get("statsd.event.title").and_then(|v| v.as_str()),
+            Some("title")
+        );
+        assert_eq!(relayed[0].attributes.get("statsd.timestamp"), Some(&Value::U64(1_700_000_000)));
+        assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+    }
+
+    /// A service check line round-trips through the real decoder: name, status, every optional
+    /// field, and a `|`-containing message all survive.
+    #[test]
+    fn a_service_check_line_round_trips_through_the_real_statsd_decoder() {
+        let original_line = "_sc|my.check|2|d:1700000000|h:web1|#env:prod|c:cid1|m:a|b";
+        let original = decode_one(original_line);
+        assert_eq!(original.len(), 1, "one service-check event per line");
+        let (msgs, _) = encode(original);
+        assert_eq!(msgs, vec![original_line]);
+        let relayed = decode_one(&msgs[0]);
+        assert!(matches!(relayed[0].metrics[0].kind, MetricKind::Gauge(v) if v == 2.0));
+        assert_eq!(
+            relayed[0].attributes.get("statsd.service_check.name").and_then(|v| v.as_str()),
+            Some("my.check")
+        );
+        assert_eq!(
+            relayed[0].attributes.get("statsd.service_check.message").and_then(|v| v.as_str()),
+            Some("a|b")
+        );
+        assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
+    }
+
     // -- Fixed-point property: decode/encode agree with each other -----------------------------
     //
     // `docs/plans/lossless-transit.md`'s W3 fixed-point requirement: for a small DogStatsD
@@ -2617,19 +3568,290 @@ mod tests {
             }
         }
 
+        // -- Events and service checks: extra generators -----------------------------------
+
+        /// A small piece of an event `TITLE`/`TEXT`: plain ASCII, `|`/`:` (both legal in this
+        /// position -- the `_e{tlen,xlen}` header delimits by byte length, not by scanning for
+        /// either), the literal two-byte escape sequence `\n` (the wire's own encoding of a real
+        /// newline -- `parse_event`'s `unescape_event_text` turns it back into one on decode, and
+        /// `render_event`'s `append_event_text` turns a real one back into this on re-encode), and
+        /// a multi-byte UTF-8 character, so `tlen`/`xlen` byte-counting is exercised too.
+        fn event_piece() -> impl Strategy<Value = String> {
+            prop::collection::vec(
+                prop_oneof![
+                    Just("a".to_string()),
+                    Just("|".to_string()),
+                    Just(":".to_string()),
+                    Just("\\n".to_string()),
+                    Just("é".to_string()),
+                    Just(" ".to_string()),
+                ],
+                0..=6,
+            )
+            .prop_map(|parts| parts.concat())
+        }
+
+        fn opt_priority() -> impl Strategy<Value = Option<&'static str>> {
+            prop_oneof![Just(None), Just(Some("normal")), Just(Some("low"))]
+        }
+
+        fn opt_alert_type() -> impl Strategy<Value = Option<&'static str>> {
+            prop_oneof![
+                Just(None),
+                Just(Some("info")),
+                Just(Some("success")),
+                Just(Some("warning")),
+                Just(Some("error")),
+            ]
+        }
+
+        fn opt_word() -> impl Strategy<Value = Option<String>> {
+            prop_oneof![Just(None), "[a-z][a-z0-9]{0,6}".prop_map(Some)]
+        }
+
+        /// One generated line, of any of the three shapes this fixed point covers. Carries
+        /// exactly the pieces its own `render_*` function needs -- kept as one enum, rather than
+        /// three separate `proptest!` blocks, so all three shapes exercise the same
+        /// decode-encode-decode/encode-is-a-fixed-point body below.
+        #[derive(Debug)]
+        #[allow(clippy::large_enum_variant)]
+        enum GeneratedLine {
+            Metric {
+                name: String,
+                kind: &'static str,
+                values: Vec<String>,
+                rate: Option<u32>,
+                tags: Vec<(String, String)>,
+                container_id: Option<String>,
+                secs: Option<u32>,
+            },
+            Event {
+                title: String,
+                text: String,
+                secs: Option<u32>,
+                host: Option<String>,
+                priority: Option<&'static str>,
+                alert_type: Option<&'static str>,
+                key: Option<String>,
+                source: Option<String>,
+                tags: Vec<(String, String)>,
+                container_id: Option<String>,
+            },
+            ServiceCheck {
+                name: String,
+                status: u32,
+                secs: Option<u32>,
+                host: Option<String>,
+                tags: Vec<(String, String)>,
+                container_id: Option<String>,
+                message: Option<String>,
+            },
+        }
+
+        /// Renders a `GeneratedLine::Event` -- field order matches [`render_event`]'s own
+        /// canonical order exactly (`d:`,`h:`,`p:`,`t:`,`k:`,`s:`,tags,`c:`): `AttrMap` sorts by
+        /// key regardless of insertion order, so this doesn't matter for `d1 == d2` below, but
+        /// matching it anyway keeps `e1 == e2` (the literal re-encoded bytes) trivially true
+        /// rather than merely equal-after-reordering.
+        #[allow(clippy::too_many_arguments)]
+        fn render_event_line(
+            title: &str,
+            text: &str,
+            secs: Option<u32>,
+            host: &Option<String>,
+            priority: Option<&str>,
+            alert_type: Option<&str>,
+            key: &Option<String>,
+            source: &Option<String>,
+            tags: &[(String, String)],
+            container_id: &Option<String>,
+        ) -> String {
+            let mut line = format!("_e{{{},{}}}:{title}|{text}", title.len(), text.len());
+            if let Some(s) = secs {
+                let _ = write!(line, "|d:{s}");
+            }
+            if let Some(h) = host {
+                let _ = write!(line, "|h:{h}");
+            }
+            if let Some(p) = priority {
+                let _ = write!(line, "|p:{p}");
+            }
+            if let Some(t) = alert_type {
+                let _ = write!(line, "|t:{t}");
+            }
+            if let Some(k) = key {
+                let _ = write!(line, "|k:{k}");
+            }
+            if let Some(s) = source {
+                let _ = write!(line, "|s:{s}");
+            }
+            if !tags.is_empty() {
+                line.push_str("|#");
+                line.push_str(
+                    &tags.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(","),
+                );
+            }
+            if let Some(id) = container_id {
+                let _ = write!(line, "|c:{id}");
+            }
+            line
+        }
+
+        /// Renders a `GeneratedLine::ServiceCheck` -- field order matches [`render_service_check`]
+        /// exactly (name, status, `d:`, `h:`, tags, `c:`, `m:` last).
+        fn render_service_check_line(
+            name: &str,
+            status: u32,
+            secs: Option<u32>,
+            host: &Option<String>,
+            tags: &[(String, String)],
+            container_id: &Option<String>,
+            message: &Option<String>,
+        ) -> String {
+            let mut line = format!("_sc|{name}|{status}");
+            if let Some(s) = secs {
+                let _ = write!(line, "|d:{s}");
+            }
+            if let Some(h) = host {
+                let _ = write!(line, "|h:{h}");
+            }
+            if !tags.is_empty() {
+                line.push_str("|#");
+                line.push_str(
+                    &tags.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(","),
+                );
+            }
+            if let Some(id) = container_id {
+                let _ = write!(line, "|c:{id}");
+            }
+            if let Some(m) = message {
+                let _ = write!(line, "|m:{m}");
+            }
+            line
+        }
+
+        fn event_strategy() -> impl Strategy<Value = GeneratedLine> {
+            (
+                event_piece(),
+                event_piece(),
+                opt_secs(),
+                opt_word(),
+                opt_priority(),
+                opt_alert_type(),
+                opt_word(),
+                opt_word(),
+                tags(),
+                opt_container_id(),
+            )
+                .prop_map(
+                    |(
+                        title,
+                        text,
+                        secs,
+                        host,
+                        priority,
+                        alert_type,
+                        key,
+                        source,
+                        tags,
+                        container_id,
+                    )| {
+                        GeneratedLine::Event {
+                            title,
+                            text,
+                            secs,
+                            host,
+                            priority,
+                            alert_type,
+                            key,
+                            source,
+                            tags,
+                            container_id,
+                        }
+                    },
+                )
+        }
+
+        fn service_check_strategy() -> impl Strategy<Value = GeneratedLine> {
+            (
+                metric_name(),
+                0u32..=3,
+                opt_secs(),
+                opt_word(),
+                tags(),
+                opt_container_id(),
+                // Reuses `event_piece`'s richer alphabet (including `|`) for the message: `m:` is
+                // always the last field, so an embedded `|` must survive untouched.
+                prop_oneof![Just(None), event_piece().prop_map(Some)],
+            )
+                .prop_map(|(name, status, secs, host, tags, container_id, message)| {
+                    GeneratedLine::ServiceCheck {
+                        name,
+                        status,
+                        secs,
+                        host,
+                        tags,
+                        container_id,
+                        message,
+                    }
+                })
+        }
+
+        fn arb_line() -> impl Strategy<Value = GeneratedLine> {
+            prop_oneof![
+                (
+                    metric_name(),
+                    kind_and_values(),
+                    opt_rate(),
+                    tags(),
+                    opt_container_id(),
+                    opt_secs()
+                )
+                    .prop_map(
+                        |(name, (kind, values), rate, tags, container_id, secs)| {
+                            GeneratedLine::Metric {
+                                name,
+                                kind,
+                                values,
+                                rate,
+                                tags,
+                                container_id,
+                                secs,
+                            }
+                        }
+                    ),
+                event_strategy(),
+                service_check_strategy(),
+            ]
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(200))]
 
             #[test]
-            fn decode_encode_decode_is_a_fixed_point(
-                name in metric_name(),
-                (kind, values) in kind_and_values(),
-                rate in opt_rate(),
-                tags in tags(),
-                container_id in opt_container_id(),
-                secs in opt_secs(),
-            ) {
-                let line = render_line(&name, kind, &values, rate, &tags, &container_id, secs);
+            fn decode_encode_decode_is_a_fixed_point(generated in arb_line()) {
+                let (line, secs, is_set_members) = match &generated {
+                    GeneratedLine::Metric { name, kind, values, rate, tags, container_id, secs } => (
+                        render_line(name, kind, values, *rate, tags, container_id, *secs),
+                        *secs,
+                        *kind == "s",
+                    ),
+                    GeneratedLine::Event {
+                        title, text, secs, host, priority, alert_type, key, source, tags, container_id,
+                    } => (
+                        render_event_line(
+                            title, text, *secs, host, *priority, *alert_type, key, source, tags,
+                            container_id,
+                        ),
+                        *secs,
+                        false,
+                    ),
+                    GeneratedLine::ServiceCheck { name, status, secs, host, tags, container_id, message } => (
+                        render_service_check_line(name, *status, *secs, host, tags, container_id, message),
+                        *secs,
+                        false,
+                    ),
+                };
 
                 let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
                 let mut d1 = match decoder.decode(bytes::Bytes::from(line.clone())) {
@@ -2638,8 +3860,30 @@ mod tests {
                                               // decoder rejects (e.g. an out-of-range value) --
                                               // not what this property tests.
                 };
-                if d1.events.is_empty() {
-                    return Ok(());
+                match &generated {
+                    // A generated ordinary metric line can legitimately decode to zero events for
+                    // reasons unrelated to what this property tests (e.g. a `parse_line` edge case
+                    // this generator doesn't otherwise filter out) -- keep the early-out here.
+                    GeneratedLine::Metric { .. } => {
+                        if d1.events.is_empty() {
+                            return Ok(());
+                        }
+                    }
+                    // An `_e{`/`_sc|` line is never blank-line-skipped and either the whole line
+                    // decodes to exactly one event or `decoder.decode` above already returned
+                    // early on `Err`. Asserting this (rather than silently early-returning on
+                    // empty, the way the metric arm does) is what catches a decode bug that
+                    // corrupts the line into something `parse_line` silently drops zero events
+                    // for instead of rejecting outright -- exactly the bug trailing whitespace on
+                    // these two shapes used to cause before `decode_into` stopped trimming it.
+                    GeneratedLine::Event { .. } | GeneratedLine::ServiceCheck { .. } => {
+                        prop_assert_eq!(
+                            d1.events.len(),
+                            1,
+                            "expected exactly one decoded event for {:?}",
+                            line
+                        );
+                    }
                 }
 
                 // `relative_gauges: true` -- otherwise every generated `g` line with a leading
@@ -2661,7 +3905,7 @@ mod tests {
 
                 normalize_receipt_time(&mut d1, secs.is_some());
                 normalize_receipt_time(&mut d2, secs.is_some());
-                if kind == "s" {
+                if is_set_members {
                     // `SetMembers` splits from one line (one event, N members) into N one-member
                     // lines regardless of dialect (the module doc's "Sanitization" section) -- a
                     // permitted normalization (`docs/adr/lossless-transit.md`'s "splitting a
