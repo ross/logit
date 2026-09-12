@@ -8,7 +8,7 @@
 //! Aggregator` needs no reshaping of its existing methods.
 
 use crate::fanout::TraceContext;
-use logit_core::{Event, Provenance, Resource, SpanLink};
+use logit_core::{Event, Provenance, Resource, Scope, SpanLink};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,9 +16,16 @@ use std::time::Duration;
 /// contributed to it -- see [`Transform::flush`]'s doc comment.
 pub type FlushedEvent = (Event, Vec<SpanLink>);
 
-/// [`Transform::flush`]'s return type: one entry per resource group, each holding every series
-/// flushed for that resource.
-pub type FlushOutput = Vec<(Arc<Resource>, Vec<FlushedEvent>)>;
+/// [`Transform::flush`]'s return type: one entry per `(resource, scope)` group, each holding
+/// every series flushed for that group. `scope` closes the `otlp_in -> aggregate -> otlp_out`
+/// scope-loss gap (`docs/plans/lossless-transit.md`'s W2): before this, `run_flush`
+/// (`crates/logit-pipeline/src/runtime.rs`) always stamped a flushed batch's scope `None`,
+/// regardless of what scope the events that fed it arrived under, because `Transform::flush` had
+/// nowhere to carry one. `Aggregator` groups by `(resource, scope)` now (`ResourceGroup`,
+/// `crates/logit-transforms/src/aggregate.rs`), same reasoning as grouping by resource value at
+/// all: two batches that happen to build their own equal-content `Arc<Scope>` describe the same
+/// instrumentation scope and should aggregate together.
+pub type FlushOutput = Vec<(Arc<Resource>, Option<Arc<Scope>>, Vec<FlushedEvent>)>;
 
 pub trait Transform: Send {
     /// Consumes or transforms one event. `Some` means "forward this downstream" (possibly
@@ -53,6 +60,20 @@ pub trait Transform: Send {
     /// gives. Default no-op, same reasoning as `observe_batch_context`'s own doc comment.
     fn observe_provenance(&mut self, provenance: Provenance) {
         let _ = provenance;
+    }
+
+    /// Called once per incoming batch, alongside `observe_batch_context`/`observe_provenance` --
+    /// gives a transform whose emission spans several batches (only `Aggregator` today) a chance
+    /// to record which scope contributed to whatever it's about to absorb, so `flush` can stamp
+    /// its own emission with it (`FlushOutput`'s own doc comment). Not a `process` parameter, same
+    /// reasoning as `observe_batch_context`'s own doc comment: scope is a per-*batch* fact (`
+    /// process_batch`, `crates/logit-pipeline/src/runtime.rs`, reads it off the incoming
+    /// `EventBatch` once, before its per-event loop), and widening the per-event hot path would
+    /// cost every implementer for the one that actually needs it. Default no-op:
+    /// `Json`/`KvMetrics`/`Keep` never flush, so they have nothing to attribute across batches and
+    /// never override this, same as `observe_batch_context`.
+    fn observe_scope(&mut self, scope: Option<Arc<Scope>>) {
+        let _ = scope;
     }
 
     /// Called once per incoming batch, after `observe_batch_context` and before any of that

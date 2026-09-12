@@ -1226,8 +1226,13 @@ pub fn process_batch(
     // comment -- `None` (the common case) moves the incoming `Arc` straight through with no
     // clone; `Some` substitutes it for both `process`'s argument and the outgoing batch. `scope`
     // is read out first since it has no analogous `map_scope` hook to consult -- it always rides
-    // straight through onto the outgoing batch unchanged.
+    // straight through onto the outgoing batch unchanged, but is *also* handed to
+    // `Transform::observe_scope` (a no-op for every implementer but `Aggregator`) so a
+    // flush-bearing transform can stamp its own, separately-timed emission with it too
+    // (`FlushOutput`'s own doc comment) -- the same "read here, cached on self, consulted again at
+    // flush" shape `observe_batch_context` already uses for `TraceContext`.
     let scope = batch.scope.clone();
+    transform.observe_scope(scope.clone());
     let resource = transform.map_resource(&batch.resource).unwrap_or(batch.resource);
 
     let process_timer = telemetry.timer("logit.component.process.duration");
@@ -1291,7 +1296,7 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
     drop(timer);
 
     let mut total_events: u64 = 0;
-    for (resource, events_with_links) in flushed {
+    for (resource, scope, events_with_links) in flushed {
         if events_with_links.is_empty() {
             continue;
         }
@@ -1302,11 +1307,13 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
             span.links(links);
             events.push(event);
         }
-        // `scope: None` -- `Transform::flush` groups only by resource (its per-resource windowing,
-        // `docs/adr/aggregation-window-semantics.md`), with no analogous per-scope key to carry
-        // through; same reasoning as `run_flush`'s own doc comment for why there's no single
-        // incoming batch's identity to inherit here either.
-        fanout.send_with_own_context(EventBatch { resource, scope: None, events }, ctx).await;
+        // `scope` now rides straight through from `Transform::flush`'s own `(resource, scope,
+        // events)` grouping (`FlushOutput`'s doc comment) instead of always being `None` -- the
+        // `otlp_in -> aggregate -> otlp_out` scope loss this closes (`docs/plans/
+        // lossless-transit.md`'s W2). `Aggregator` groups by `(resource, scope)` value
+        // (`ResourceGroup`, `crates/logit-transforms/src/aggregate.rs`), so each flushed group
+        // here already carries the one scope every series in it shares.
+        fanout.send_with_own_context(EventBatch { resource, scope, events }, ctx).await;
     }
     span.events(total_events);
 }
@@ -2115,13 +2122,16 @@ mod tests {
             Some(self.interval)
         }
 
-        fn flush(&mut self, _now: i64) -> Vec<(Arc<Resource>, Vec<(Event, Vec<SpanLink>)>)> {
+        fn flush(
+            &mut self,
+            _now: i64,
+        ) -> Vec<(Arc<Resource>, Option<Arc<Scope>>, Vec<(Event, Vec<SpanLink>)>)> {
             if self.buffered.is_empty() {
                 return Vec::new();
             }
             let events =
                 std::mem::take(&mut self.buffered).into_iter().map(|e| (e, Vec::new())).collect();
-            vec![(Arc::new(Resource::default()), events)]
+            vec![(Arc::new(Resource::default()), None, events)]
         }
     }
 
@@ -2176,6 +2186,10 @@ mod tests {
                     interval: Duration::from_secs(3600),
                     gauge_retention: 5,
                     max_retained_gauge_series: 10_000,
+                    distributions: logit_config::Distributions::default(),
+                    max_samples_per_series: 1000,
+                    sets: logit_config::Sets::default(),
+                    max_set_members_per_series: 1000,
                 },
             },
         );
@@ -5492,13 +5506,17 @@ mod tests {
             Some(Duration::from_secs(3600))
         }
 
-        fn flush(&mut self, _now: i64) -> Vec<(Arc<Resource>, Vec<(Event, Vec<SpanLink>)>)> {
+        fn flush(
+            &mut self,
+            _now: i64,
+        ) -> Vec<(Arc<Resource>, Option<Arc<Scope>>, Vec<(Event, Vec<SpanLink>)>)> {
             vec![
                 (
                     Arc::new(Resource::default()),
+                    None,
                     vec![(counter_event("a", 1.0), self.links_for_first_group.clone())],
                 ),
-                (Arc::new(Resource::default()), vec![(counter_event("b", 1.0), Vec::new())]),
+                (Arc::new(Resource::default()), None, vec![(counter_event("b", 1.0), Vec::new())]),
             ]
         }
     }
@@ -5542,6 +5560,57 @@ mod tests {
         let a = out_rx.recv().await.expect("the first group should send").context();
         let b = out_rx.recv().await.expect("the second group should send").context();
         assert_eq!(a, b, "both resource groups from one flush should share the identical context");
+    }
+
+    /// A local fake `Transform`, standing in for `Aggregator`'s own `(resource, scope)` grouping
+    /// (`crates/logit-transforms/src/aggregate.rs`) -- proves `run_flush` carries a flushed
+    /// group's scope onto the outgoing `EventBatch` (`FlushOutput`'s own doc comment) instead of
+    /// hardcoding `None` the way it used to.
+    struct ScopedFlushTransform {
+        scope: Arc<Scope>,
+    }
+
+    impl Transform for ScopedFlushTransform {
+        fn process(&mut self, _resource: &Arc<Resource>, _event: Event) -> Option<Event> {
+            None
+        }
+
+        fn flush_interval(&self) -> Option<Duration> {
+            Some(Duration::from_secs(3600))
+        }
+
+        fn flush(
+            &mut self,
+            _now: i64,
+        ) -> Vec<(Arc<Resource>, Option<Arc<Scope>>, Vec<(Event, Vec<SpanLink>)>)> {
+            vec![(
+                Arc::new(Resource::default()),
+                Some(self.scope.clone()),
+                vec![(counter_event("a", 1.0), Vec::new())],
+            )]
+        }
+    }
+
+    #[tokio::test]
+    async fn run_flush_carries_the_transforms_scope_onto_the_outgoing_batch() {
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        let fanout = Fanout::new(vec![out_tx]);
+        let scope =
+            Arc::new(Scope { name: bytes::Bytes::from_static(b"scope-x"), ..Scope::default() });
+        let mut transform = ScopedFlushTransform { scope: scope.clone() };
+
+        run_flush(&mut transform, &fanout, &Telemetry::default()).await;
+
+        let delivered = out_rx.recv().await.expect("the group should send");
+        let batch = match delivered {
+            Delivered::Owned(batch, _) => batch,
+            Delivered::Shared(batch, _) => (*batch).clone(),
+        };
+        assert_eq!(
+            batch.scope,
+            Some(scope),
+            "run_flush must carry the transform's own scope through"
+        );
     }
 
     /// The whole point of instrumenting a sink: `write_loop`'s span is the only one that can

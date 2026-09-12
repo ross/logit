@@ -26,9 +26,9 @@
 use bytes::Bytes;
 use logit_bench::{bakeoff, fixtures};
 use logit_core::{
-    AttrMap, BodyFormat, Event, EventBatch, Exemplar, ExpHistogram, LogRecord, MetricKind,
-    MetricRecord, Resource, Samples, Scope, Severity, SpanExt, SpanKind, SpanRecord, SpanStatus,
-    Sum, Temporality, TraceRef, Value,
+    AttrMap, BodyFormat, Event, EventBatch, Exemplar, ExpHistogram, HyperLogLog, LogRecord,
+    MetricKind, MetricRecord, Resource, Samples, Scope, Severity, SpanExt, SpanKind, SpanRecord,
+    SpanStatus, Sum, Temporality, TraceRef, Value,
 };
 use logit_proto::{Signal, SignalEncoder};
 use std::sync::Arc;
@@ -148,8 +148,8 @@ fn log_with_fidelity_fields_batch() -> EventBatch {
 /// Every fixture this gate runs each arm against -- deliberately the same shapes
 /// `crates/logit-bench/src/fixtures.rs`'s own doc comment argues for (mixed, logs-only,
 /// wide-JSON, distribution-heavy, span), per `AGENTS.md`'s "don't generalize a measurement from
-/// one event shape", plus one batch per new W1 metric kind and one each for a populated
-/// `Scope`/`SpanExt`.
+/// one event shape", plus one batch per new W1 metric kind, one for a populated `Set` (W2's real
+/// `HyperLogLog`), and one each for a populated `Scope`/`SpanExt`.
 fn representative_batches() -> Vec<EventBatch> {
     vec![
         fixtures::nginx_batch(3),
@@ -171,6 +171,13 @@ fn representative_batches() -> Vec<EventBatch> {
             Bytes::from_static(b"a"),
             Bytes::from_static(b"b"),
         ])),
+        metric_batch(MetricKind::Set({
+            let mut hll = HyperLogLog::new();
+            hll.insert(b"a");
+            hll.insert(b"b");
+            hll.insert(b"c");
+            hll
+        })),
         metric_batch(MetricKind::ExponentialHistogram(ExpHistogram {
             scale: 2,
             zero_count: 1,

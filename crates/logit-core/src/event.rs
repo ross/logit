@@ -121,14 +121,14 @@ fn value_heap_bytes(value: &Value) -> u64 {
 }
 
 /// Heap bytes owned by one `MetricRecord`: its name/unit/description symbols, its exemplars, plus
-/// a kind-dependent contribution. `Sum`/`Gauge`/`GaugeDelta`/`Set` are effectively free (no heap
-/// payload of their own -- `HyperLogLog` is still a stub, see `metric.rs`); `Samples` counts its
-/// `SmallVec`'s heap allocation only once it has actually spilled past its inline capacity (an
-/// unspilled `Samples` pays nothing extra here, the same way `AttrMap`'s own inline capacity
-/// doesn't count as heap); `SetMembers` counts each member's own byte length;
-/// `Histogram`/`ExponentialHistogram`/`Summary` count their actual bucket/quantile `Vec`s, since
-/// those are plain `Vec`s and doing so costs nothing extra; `Distribution` uses
-/// [`ESTIMATED_DISTRIBUTION_HEAP_BYTES`] rather than walking the sketch.
+/// a kind-dependent contribution. `Sum`/`Gauge`/`GaugeDelta` are free (no heap payload of their
+/// own); `Set` counts `HyperLogLog::heap_bytes` -- real state now, not the zero-sized stub it used
+/// to be (see `metric.rs`); `Samples` counts its `SmallVec`'s heap allocation only once it has
+/// actually spilled past its inline capacity (an unspilled `Samples` pays nothing extra here, the
+/// same way `AttrMap`'s own inline capacity doesn't count as heap); `SetMembers` counts each
+/// member's own byte length; `Histogram`/`ExponentialHistogram`/`Summary` count their actual
+/// bucket/quantile `Vec`s, since those are plain `Vec`s and doing so costs nothing extra;
+/// `Distribution` uses [`ESTIMATED_DISTRIBUTION_HEAP_BYTES`] rather than walking the sketch.
 fn metric_record_heap_bytes(record: &MetricRecord) -> u64 {
     let symbols = symbol_heap_bytes(record.name)
         + record.unit.map(symbol_heap_bytes).unwrap_or(0)
@@ -144,10 +144,8 @@ fn metric_record_heap_bytes(record: &MetricRecord) -> u64 {
                 .sum::<u64>()
     };
     let kind = match &record.kind {
-        MetricKind::Sum(_)
-        | MetricKind::Gauge(_)
-        | MetricKind::GaugeDelta(_)
-        | MetricKind::Set(_) => 0,
+        MetricKind::Sum(_) | MetricKind::Gauge(_) | MetricKind::GaugeDelta(_) => 0,
+        MetricKind::Set(hll) => hll.heap_bytes(),
         MetricKind::Samples(s) => {
             if s.values.spilled() {
                 (s.values.capacity() * std::mem::size_of::<f64>()) as u64

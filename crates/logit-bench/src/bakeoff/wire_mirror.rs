@@ -4,11 +4,12 @@
 //! format (`logit_proto::native`, which is hand-rolled either way and doesn't use this type at
 //! all).
 //!
-//! Holds no foreign types -- no `bytes::Bytes`, no `SmallVec`, no `lasso::Spur`, no `DDSketch` --
-//! so both `rkyv` and `serde` can derive their traits directly with no remote-type wrapper
-//! plumbing. Two of the correctness rules `logit_proto::native`'s own module doc states apply here
-//! too, for a fair comparison: a `Symbol` is dictionary-indexed rather than written raw, and
-//! `MetricKind::Distribution` rides as `DdSketch::to_java_bytes()`'s blob.
+//! Holds no foreign types -- no `bytes::Bytes`, no `SmallVec`, no `lasso::Spur`, no `DDSketch`, no
+//! `cardinality_estimator::CardinalityEstimator` -- so both `rkyv` and `serde` can derive their
+//! traits directly with no remote-type wrapper plumbing. Two of the correctness rules
+//! `logit_proto::native`'s own module doc states apply here too, for a fair comparison: a `Symbol`
+//! is dictionary-indexed rather than written raw, and `MetricKind::Distribution`/`MetricKind::Set`
+//! ride as `DdSketch::to_java_bytes()`/`HyperLogLog::to_bytes()`'s blobs, respectively.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -203,7 +204,9 @@ pub enum WireMetricKind {
     /// (`crates/logit-core/src/metric.rs`).
     Distribution(Vec<u8>),
     SetMembers(Vec<Vec<u8>>),
-    Set,
+    /// `HyperLogLog::to_bytes()` -- mirrors `Distribution` above; see
+    /// `crates/logit-core/src/metric.rs`.
+    Set(Vec<u8>),
     Histogram(WireHistogram),
     ExponentialHistogram(WireExpHistogram),
     Summary(WireSummary),
@@ -481,7 +484,7 @@ fn metric_kind_to_wire(kind: &MetricKind) -> WireMetricKind {
         MetricKind::SetMembers(members) => {
             WireMetricKind::SetMembers(members.iter().map(|m| m.to_vec()).collect())
         }
-        MetricKind::Set(_) => WireMetricKind::Set,
+        MetricKind::Set(hll) => WireMetricKind::Set(hll.to_bytes()),
         MetricKind::Histogram(h) => WireMetricKind::Histogram(WireHistogram {
             buckets: h.buckets.clone(),
             temporality: temporality_tag(h.temporality),
@@ -532,7 +535,9 @@ fn wire_to_metric_kind(kind: &WireMetricKind) -> MetricKind {
         WireMetricKind::SetMembers(members) => {
             MetricKind::SetMembers(members.iter().map(|m| bytes::Bytes::from(m.clone())).collect())
         }
-        WireMetricKind::Set => MetricKind::Set(HyperLogLog::default()),
+        WireMetricKind::Set(blob) => {
+            MetricKind::Set(HyperLogLog::from_bytes(blob).expect("valid blob"))
+        }
         WireMetricKind::Histogram(h) => MetricKind::Histogram(Histogram {
             buckets: h.buckets.clone(),
             temporality: temporality_from_tag(h.temporality),

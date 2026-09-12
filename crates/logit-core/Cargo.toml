@@ -11,6 +11,12 @@ bytes.workspace = true
 smallvec.workspace = true
 lasso = { version = "0.7", features = ["multi-threaded"] }
 sketches-ddsketch.workspace = true
+# `HyperLogLog`'s underlying cardinality estimator (docs/plans/lossless-transit.md's W2).
+cardinality-estimator.workspace = true
+# Drives `cardinality-estimator`'s tuple-shaped `Serialize`/`Deserialize` impl through the
+# hand-rolled byte `Serializer`/`Deserializer` in `metric.rs` -- no data-format crate needed, just
+# the trait definitions themselves.
+serde.workspace = true
 # `Diagnostics::warn`/`warn_throttled` emit through it (docs/plans/operator-surface.md).
 tracing.workspace = true
 # `telemetry::TelemetryLayer` captures `tracing` events into the pipeline as log events

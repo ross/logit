@@ -19,14 +19,15 @@
 use bytes::Bytes;
 use logit_core::{
     AttrMap, BodyFormat, DdSketch, Event, EventBatch, LogRecord, MetricKind, MetricRecord,
-    Resource, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus, Value,
+    Resource, Samples, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus, Value,
 };
 use logit_inputs::statsd::StatsdDecoder;
 use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
 use logit_proto::Decoder;
 use logit_transforms::{
-    Aggregator, CsvParser, JsonParser, Keep, Kv, KvMetrics, Logfmt, MetricSpec, RegexParser, Set,
+    Aggregator, CsvParser, Distributions, JsonParser, Keep, Kv, KvMetrics, Logfmt, MetricSpec,
+    RegexParser, Set,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -404,6 +405,34 @@ pub fn aggregator() -> Aggregator {
 /// above never exercises.
 pub fn aggregator_with_gauge_retention(retention: u32, max_retained: usize) -> Aggregator {
     Aggregator::new(Duration::from_secs(10)).with_gauge_retention(retention, max_retained)
+}
+
+/// Like [`aggregator`], with `distributions: samples` and the given cap -- for measuring the raw
+/// `Samples`-retention path's own allocation cost
+/// (`aggregate_absorb_25_samples_values_into_one_series_samples_mode`, `crates/logit-bench/tests/
+/// allocations.rs`), which the default (`distributions: sketch`) fixture above never exercises.
+pub fn aggregator_with_samples_retention(max_samples_per_series: usize) -> Aggregator {
+    Aggregator::new(Duration::from_secs(10))
+        .with_distributions(Distributions::Samples, max_samples_per_series)
+}
+
+/// A metric-only event carrying one `MetricKind::Samples` record -- the raw shape statsd's
+/// `ms`/`h`/`d` timings will arrive as once W3 lands a producer (`docs/plans/lossless-transit.md`),
+/// used to measure what `aggregate` pays to absorb one
+/// (`aggregate_absorb_one_samples_event_sketch_mode`/
+/// `aggregate_absorb_25_samples_values_into_one_series_samples_mode`,
+/// `crates/logit-bench/tests/allocations.rs`). Unsampled (`sample_rate: 1.0`, `Samples::new`'s
+/// default) -- these measurements are about the absorb path's own allocation shape, not
+/// `Samples::weight`'s clamping.
+pub fn samples_event(name: &str, values: impl IntoIterator<Item = f64>) -> Event {
+    Event::metric(
+        0,
+        AttrMap::new(),
+        MetricRecord::new(
+            logit_core::interner::intern(name),
+            MetricKind::Samples(Samples::new(values)),
+        ),
+    )
 }
 
 /// One event as it looks leaving `kv_metrics` -- decoded, JSON-merged, four metrics attached.

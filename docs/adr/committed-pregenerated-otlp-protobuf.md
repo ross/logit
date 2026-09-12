@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-02
+updated: 2026-09-11
 ---
 
 # Committed, pre-generated OTLP protobuf types; no `protoc` in any build path
@@ -98,7 +98,8 @@ files (vendored anyway, for provenance and for PR3 to reference directly).
   or the OTLP codec becomes lossy" assumed the loss, if any, would run *into* `logit`'s model from
   OTLP's. `crates/logit-proto/src/otlp/metrics.rs`'s `Distribution`→`Summary` and `Set`→skip
   mappings are the opposite direction: here it's `logit`'s own model (a mergeable `DDSketch`, a
-  `HyperLogLog` stub with no cardinality to read) that cannot be losslessly re-expressed *as* OTLP.
+  `HyperLogLog` cardinality estimate OTLP has no wire type for) that cannot be losslessly
+  re-expressed *as* OTLP.
   Both are counted (`logit.output.metrics.degraded`/`.skipped{metric_kind}`) and documented in
   `docs/known-gaps.md`'s "Cross-protocol semantic gaps" entry rather than silently contradicting
   ADR `native-wire-format-with-otlp-bridge`'s claim.

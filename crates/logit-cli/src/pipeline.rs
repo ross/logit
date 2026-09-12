@@ -37,14 +37,14 @@ use logit_pipeline::{
 };
 use logit_proto::frame::Compression as NativeCompression;
 use logit_transforms::{
-    Aggregator, CsvParser, DropAttributes as DropAttributesTransform,
-    DropProvenance as DropProvenanceTransform, DropSignals as DropSignalsTransform,
-    HasAttributes as HasAttributesTransform, HasProvenance as HasProvenanceTransform,
-    HasSignal as HasSignalTransform, JsonParser, Keep as KeepTransform,
-    KeepSignals as KeepSignalsTransform, Kv as KvTransform, KvMetrics as KvMetricsTransform,
-    Logfmt as LogfmtTransform, MatchMode as TransformMatchMode, RegexParser,
-    Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform, SignalSet, SpanLift,
-    TraceContext as TraceContextTransform,
+    Aggregator, CsvParser, Distributions as TransformDistributions,
+    DropAttributes as DropAttributesTransform, DropProvenance as DropProvenanceTransform,
+    DropSignals as DropSignalsTransform, HasAttributes as HasAttributesTransform,
+    HasProvenance as HasProvenanceTransform, HasSignal as HasSignalTransform, JsonParser,
+    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, Kv as KvTransform,
+    KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
+    RegexParser, Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform,
+    Sets as TransformSets, SignalSet, SpanLift, TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -398,14 +398,22 @@ fn build_spec(
                 .with_context(|| format!("reading lua_file {}", script_path.display()))?;
             NodeSpec::Lua { script, interval: *interval }
         }
-        Aggregate { interval, gauge_retention, max_retained_gauge_series } => {
-            NodeSpec::Transform(Box::new(
-                Aggregator::new(*interval)
-                    .with_gauge_retention(*gauge_retention, *max_retained_gauge_series)
-                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                    .with_telemetry(telemetry.clone()),
-            ))
-        }
+        Aggregate {
+            interval,
+            gauge_retention,
+            max_retained_gauge_series,
+            distributions,
+            max_samples_per_series,
+            sets,
+            max_set_members_per_series,
+        } => NodeSpec::Transform(Box::new(
+            Aggregator::new(*interval)
+                .with_gauge_retention(*gauge_retention, *max_retained_gauge_series)
+                .with_distributions(to_distributions(*distributions), *max_samples_per_series)
+                .with_sets(to_sets(*sets), *max_set_members_per_series)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
+        )),
         Json { skip_to_brace } => NodeSpec::Transform(Box::new(
             JsonParser::new(*skip_to_brace)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
@@ -903,6 +911,25 @@ fn to_match_mode(mode: logit_config::MatchMode) -> TransformMatchMode {
     }
 }
 
+/// `logit_config::Distributions` -> `logit_transforms::Distributions` -- `logit-transforms`
+/// deliberately doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate
+/// layout), so this wiring boundary maps every config enum `aggregate` is configured by, the same
+/// `to_match_mode` precedent above.
+fn to_distributions(mode: logit_config::Distributions) -> TransformDistributions {
+    match mode {
+        logit_config::Distributions::Sketch => TransformDistributions::Sketch,
+        logit_config::Distributions::Samples => TransformDistributions::Samples,
+    }
+}
+
+/// `logit_config::Sets` -> `logit_transforms::Sets` -- see [`to_distributions`]'s doc comment.
+fn to_sets(mode: logit_config::Sets) -> TransformSets {
+    match mode {
+        logit_config::Sets::Estimate => TransformSets::Estimate,
+        logit_config::Sets::Members => TransformSets::Members,
+    }
+}
+
 /// Converts config's `OtlpPaths` (`logit-config`, which `logit-outputs` deliberately doesn't
 /// depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the output crate's own
 /// identically-shaped `SignalPaths`.
@@ -1166,6 +1193,10 @@ mod tests {
                 interval: Duration::from_secs(10),
                 gauge_retention: 5,
                 max_retained_gauge_series: 10_000,
+                distributions: logit_config::Distributions::default(),
+                max_samples_per_series: 1000,
+                sets: logit_config::Sets::default(),
+                max_set_members_per_series: 1000,
             },
         };
         assert!(matches!(

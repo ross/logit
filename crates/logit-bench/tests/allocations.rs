@@ -645,7 +645,7 @@ fn aggregate_flush_100_series() {
     }
 
     let (flushed, stats) = measure(|| agg.flush(1_000_000_000));
-    let series: usize = flushed.iter().map(|(_, events)| events.len()).sum();
+    let series: usize = flushed.iter().map(|(_, _, events)| events.len()).sum();
     assert_eq!(series, 4, "one series per metric name -- keep bounds the tag set");
     expect_allocs("aggregate: flush 4 series", stats, 6);
 }
@@ -683,9 +683,50 @@ fn aggregate_flush_retained_gauges() {
     }
 
     let (flushed, stats) = measure(|| agg.flush(2_000_000_000));
-    let series: usize = flushed.iter().map(|(_, events)| events.len()).sum();
+    let series: usize = flushed.iter().map(|(_, _, events)| events.len()).sum();
     assert_eq!(series, 100, "every series was updated again before this flush");
     expect_allocs("aggregate: flush 100 retained gauge series (spilled attrs)", stats, 209);
+}
+
+/// The absorb-path cost of a raw `Samples` record in the default `distributions: sketch` mode
+/// (`docs/plans/lossless-transit.md`'s W2): every value sketches directly into the series'
+/// `DdSketch` accumulator (`Accumulator::Distribution`) via `add_weighted` -- no raw values are
+/// ever retained, so this is the steady-state cost of continuing to absorb into an already-open
+/// sketch, the same shape [`aggregate_absorb_one_event`] measures for the nginx fixture's own
+/// metrics.
+#[test]
+fn aggregate_absorb_one_samples_event_sketch_mode() {
+    let mut agg = fixtures::aggregator();
+    let resource = fixtures::resource();
+    for _ in 0..4 {
+        drop(agg.process(&resource, fixtures::samples_event("app.latency", [1.0, 2.0, 3.0])));
+    }
+
+    let event = fixtures::samples_event("app.latency", [1.0, 2.0, 3.0]);
+    let (_, stats) = measure(|| agg.process(&resource, event));
+    expect_allocs("aggregate: absorb one Samples event (sketch mode)", stats, 0);
+}
+
+/// The absorb-path cost in `distributions: samples` mode: raw values concatenate into the
+/// series' own `Samples` accumulator (`held.values.extend(..)`,
+/// `crates/logit-transforms/src/aggregate.rs`). `SAMPLES_INLINE` (`logit_core::metric`) is 19, so
+/// a series already holding a few inline values that then absorbs 25 more in one record spills
+/// the accumulator's `SmallVec` on *this* call -- the cost this test pins, not the free
+/// still-inline case.
+#[test]
+fn aggregate_absorb_25_samples_values_into_one_series_samples_mode() {
+    let mut agg = fixtures::aggregator_with_samples_retention(1_000);
+    let resource = fixtures::resource();
+    // Warm with a small, still-inline series -- isolates the spill on the *measured* record
+    // rather than whatever the very first record into this series happens to cost.
+    for _ in 0..4 {
+        drop(agg.process(&resource, fixtures::samples_event("app.latency", [1.0])));
+    }
+
+    let values: Vec<f64> = (0..25).map(|i| i as f64).collect();
+    let event = fixtures::samples_event("app.latency", values);
+    let (_, stats) = measure(|| agg.process(&resource, event));
+    expect_allocs("aggregate: absorb 25 Samples values into one series (samples mode)", stats, 1);
 }
 
 // ---------------------------------------------------------------------------------------------
