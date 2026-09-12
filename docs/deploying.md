@@ -482,11 +482,17 @@ records rather than resolving them itself
 `cumulative` is bounded by the same `series_retention`/`max_retained_series` pair above — that is
 what keeps the running totals alive — so both must be above `0`; `logit validate` rejects the
 combination otherwise, since with no retention every window's increment would be emitted labelled as
-a running total. Watch the same two signals as for gauge retention:
-`logit.transform.series.retained` for how many totals are being carried, and
-`logit.transform.series.evicted{reason="cardinality"|"idle"}` — an evicted cumulative series
-restarts from zero with a new `start_timestamp` (correct, and visible to a consumer, but a gap in
-that series' graph), and hitting the cap also warns under
+a running total.
+
+**Size `max_retained_series` from `series.active + series.retained`, not from `.retained` alone.**
+The cap bounds every series that survives a flush, but the two gauges split that population by
+whether it saw data *this* window: a counter incremented every window reports under
+`logit.transform.series.active`, and `logit.transform.series.retained` counts only the
+idle-but-carried tail. A healthy cumulative pipeline whose counters are all live therefore reports
+`retained = 0` while sitting right at the cap — so watching `.retained` alone shows nothing until
+`logit.transform.series.evicted{reason="cardinality"}` starts firing, which is already the symptom.
+An evicted cumulative series restarts from zero with a new `start_timestamp` (correct, and visible to
+a consumer, but a gap in that series' graph), and hitting the cap also warns under
 `logit.component.diagnostics{key="series_retention_full"}`.
 
 ## Raw samples and set members

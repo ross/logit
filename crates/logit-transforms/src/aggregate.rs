@@ -33,7 +33,12 @@
 //! (`series_retention`/`max_retained_series`) a retained gauge already uses -- and emits the running
 //! total every window as `Sum { temporality: Cumulative, .. }` / `Histogram { temporality:
 //! Cumulative, .. }` stamped with `MetricRecord::start_timestamp` = the series' first-seen event
-//! timestamp. That stamp is the restart/reset signal OTLP and Prometheus consumers detect a counter
+//! timestamp. A histogram's per-bucket counts add with `saturating_add`, not `+`: they are
+//! wire-supplied `u64`s, so a hostile or broken producer sending `u64::MAX` twice on one series
+//! pins the affected bucket at `u64::MAX` -- visibly wrong and still monotonic -- rather than
+//! panicking the transform task or wrapping the running total backwards while `start_timestamp`
+//! still claims the series never restarted. (`Sum`'s `f64` needs no such guard; it saturates to
+//! `inf`.) That stamp is the restart/reset signal OTLP and Prometheus consumers detect a counter
 //! reset with: it never changes while the series lives, and a series that is evicted (TTL or
 //! cardinality cap) and later re-created gets a new one. An incoming *cumulative* `Sum` is still
 //! pass-through in both modes -- `aggregate` re-summing an already-running total would double-count
@@ -585,7 +590,20 @@ impl Aggregator {
                             for (held_bucket, incoming_bucket) in
                                 held.buckets.iter_mut().zip(incoming.buckets.iter())
                             {
-                                held_bucket.1 += incoming_bucket.1;
+                                // `saturating_add`, not `+`: these counts arrive from the wire
+                                // (`otlp_in` copies `bucket_counts` verbatim, no clamp) and this
+                                // is the only place this stage sums *integers* rather than
+                                // `f64`s, which saturate to `inf` on their own. Unchecked, two
+                                // delta points carrying `u64::MAX` on one series would panic the
+                                // transform task under `overflow-checks` and wrap the running
+                                // total *backwards* without them -- while `start_timestamp` stays
+                                // pinned, i.e. the one thing the reset protocol promises a
+                                // consumer cannot happen. Saturating matches this crate's posture
+                                // on untrusted numbers elsewhere (`trace_context.rs`'s
+                                // `checked_mul`/`checked_add`, `scale.rs`'s overflow guard): a
+                                // pinned `u64::MAX` is visibly wrong and monotonic, where a
+                                // wrapped total is invisibly wrong.
+                                held_bucket.1 = held_bucket.1.saturating_add(incoming_bucket.1);
                             }
                             // `sum` adds only when *both* sides have one: a running total missing
                             // one window's contribution understates the series outright, which is
@@ -3305,6 +3323,38 @@ mod tests {
         assert_eq!(emitted.sum, None, "a sum missing one window's contribution is no sum at all");
         assert_eq!(emitted.min, Some(0.5), "the extremes observed so far still stand");
         assert_eq!(emitted.max, Some(2.0));
+    }
+
+    /// Bucket counts are wire-supplied `u64`s (`otlp_in` copies `bucket_counts` verbatim, with no
+    /// clamp), and this is the only place the stage sums integers rather than `f64`s. Two delta
+    /// points carrying `u64::MAX` on one series must saturate: unchecked, this panics the transform
+    /// task under `overflow-checks` and wraps the running total backwards without them -- while
+    /// `start_timestamp` stays pinned, which is exactly the "the series did not restart" promise a
+    /// cumulative consumer relies on. Asserting `u64::MAX` (not just "no panic") is what pins the
+    /// saturation rather than any other recovery.
+    #[test]
+    fn cumulative_histogram_bucket_counts_saturate_instead_of_overflowing() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+        let maxed = [(1.0, u64::MAX), (f64::INFINITY, u64::MAX)];
+        assert!(agg
+            .process(&resource, delta_histogram_event("sizes", &maxed, None, None, None, 0))
+            .is_none());
+        assert!(agg
+            .process(&resource, delta_histogram_event("sizes", &maxed, None, None, None, 1))
+            .is_none());
+
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(
+            histogram_of(&flushed[0].1[0]).buckets,
+            vec![(1.0, u64::MAX), (f64::INFINITY, u64::MAX)],
+            "a saturated bucket pins at u64::MAX -- never wraps back around"
+        );
+        assert_eq!(
+            start_timestamp_of(&flushed[0].1[0]),
+            0,
+            "and the series is still the same series, which is why wrapping would be so wrong"
+        );
     }
 
     /// Two histograms of one series with different bucket *bounds* have no correct merge -- adding
