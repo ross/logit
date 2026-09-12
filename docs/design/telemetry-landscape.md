@@ -87,7 +87,11 @@ References: <https://prometheus.io/docs/instrumenting/exposition_formats/>,
 <https://github.com/OpenObservability/OpenMetrics/blob/main/specification/OpenMetrics.md>.
 
 Text format: `# HELP <name> <description>`, `# TYPE <name> <type>`, then
-`<name>{label="value",...} <float value> [<timestamp ms>]` lines per sample.
+`<name>{label="value",...} <float value> [<timestamp ms>]` lines per sample. The timestamp unit
+differs by dialect: text 0.0.4's is an integer count of milliseconds since the epoch, while
+OpenMetrics's `Timestamp` (and its `_created` series) is Unix epoch time in **float seconds** —
+the two are not interchangeable digit-for-digit, a detail a codec crossing between them has to
+convert rather than reinterpret.
 
 - **Types:** `counter` (with a companion `_total` suffix and, in OpenMetrics, an optional
   `_created` timestamp series), `gauge`, `histogram` (`_bucket{le="<bound>"}` cumulative counts
