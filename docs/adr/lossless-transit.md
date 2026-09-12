@@ -180,3 +180,12 @@ superset this ADR requires, rather than retrofitted onto it. See
 dialect negotiation, model mapping, and permitted normalizations, and
 [`docs/plans/prometheus-scrape-and-exposition.md`](../plans/prometheus-scrape-and-exposition.md)
 for the workstreams closing it.
+
+## Amendment: a fifth like pair (2026-09-12)
+
+`collectd_in -> collectd_out` is a fifth like-protocol pair in scope under this ADR, alongside
+`statsd`, `otlp`, `syslog`, and `prometheus`. See
+[ADR `collectd-binary-relay`](collectd-binary-relay.md) for the transport, the model mapping,
+the `collectd.*` attribute convention, and the permitted normalizations, and
+[`docs/plans/collectd-binary-relay.md`](../plans/collectd-binary-relay.md) for the workstreams
+closing it.

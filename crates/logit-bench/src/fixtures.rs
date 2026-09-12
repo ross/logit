@@ -24,6 +24,8 @@ use logit_core::{
 use logit_inputs::statsd::StatsdDecoder;
 use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
+use logit_proto::collectd::types_db::TEST_TYPES_DB;
+use logit_proto::collectd::{CollectdDecoder, TypesDb};
 use logit_proto::prometheus::{PrometheusDecoder, PrometheusEncoder};
 use logit_proto::Decoder;
 use logit_transforms::{
@@ -191,6 +193,85 @@ pub fn syslog_decoder() -> SyslogDecoder {
 
 pub fn statsd_decoder() -> StatsdDecoder {
     StatsdDecoder::new(resource())
+}
+
+pub fn collectd_decoder() -> CollectdDecoder {
+    CollectdDecoder::new(resource())
+}
+
+/// The same decoder with the short hand-written `types.db` fixture attached
+/// (`logit_proto::collectd::types_db`), so `load`'s three data sources resolve to
+/// `shortterm`/`midterm`/`longterm` instead of `0`/`1`/`2`. Pairs with [`collectd_decoder`] to show
+/// the lookup costs nothing per list (`docs/design/memory.md` §2).
+pub fn collectd_decoder_with_types_db() -> CollectdDecoder {
+    let types_db = Arc::new(TypesDb::parse(TEST_TYPES_DB).expect("the fixture types.db parses"));
+    CollectdDecoder::new(resource()).with_types_db(types_db)
+}
+
+/// A collectd datagram of `lists` single-GAUGE value lists, packed the way collectd's own sender
+/// packs them: the identity is written once and **elided** on every list after the first, each
+/// subsequent list carrying only a TypeInstance part to distinguish it plus its Values part. That
+/// elision is the whole point of the measurement -- a 25-list datagram is what a real host agent
+/// sends, and its per-list cost is what `decode_into` has to keep flat.
+pub fn collectd_packet(lists: usize) -> Bytes {
+    let mut bytes = Vec::new();
+    collectd_string_part(&mut bytes, 0x0000, b"web-1"); // Host
+    collectd_number_part(&mut bytes, 0x0008, 1_700_000_000u64 << 30); // TimeHR
+    collectd_number_part(&mut bytes, 0x0009, 10u64 << 30); // IntervalHR
+    collectd_string_part(&mut bytes, 0x0002, b"memory"); // Plugin
+    collectd_string_part(&mut bytes, 0x0004, b"memory"); // Type
+    for index in 0..lists {
+        collectd_string_part(&mut bytes, 0x0005, format!("used-{index}").as_bytes());
+        collectd_values_part(&mut bytes, &[(1, (index as f64).to_le_bytes())]);
+    }
+    Bytes::from(bytes)
+}
+
+/// One three-data-source `load`/`load` list -- the multi-value shape whose records spill
+/// `MetricList`'s inline capacity of 1, and the one a `types.db` actually renames.
+pub fn collectd_load_packet() -> Bytes {
+    let mut bytes = Vec::new();
+    collectd_string_part(&mut bytes, 0x0000, b"web-1");
+    collectd_number_part(&mut bytes, 0x0008, 1_700_000_000u64 << 30);
+    collectd_string_part(&mut bytes, 0x0002, b"load");
+    collectd_string_part(&mut bytes, 0x0004, b"load");
+    collectd_values_part(
+        &mut bytes,
+        &[(1, 0.1f64.to_le_bytes()), (1, 0.2f64.to_le_bytes()), (1, 0.3f64.to_le_bytes())],
+    );
+    Bytes::from(bytes)
+}
+
+/// Part framing, written by hand rather than through `logit_proto::collectd::part`'s writers: a
+/// fixture the codec built for itself would stop being an independent statement of the wire format
+/// the moment that code changed.
+fn collectd_part_header(out: &mut Vec<u8>, part_type: u16, payload_len: usize) {
+    out.extend_from_slice(&part_type.to_be_bytes());
+    out.extend_from_slice(&((payload_len + 4) as u16).to_be_bytes());
+}
+
+fn collectd_string_part(out: &mut Vec<u8>, part_type: u16, value: &[u8]) {
+    collectd_part_header(out, part_type, value.len() + 1);
+    out.extend_from_slice(value);
+    out.push(0);
+}
+
+fn collectd_number_part(out: &mut Vec<u8>, part_type: u16, value: u64) {
+    collectd_part_header(out, part_type, 8);
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn collectd_values_part(out: &mut Vec<u8>, values: &[(u8, [u8; 8])]) {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(values.len() as u16).to_be_bytes());
+    for (ds_type, _) in values {
+        payload.push(*ds_type);
+    }
+    for (_, raw) in values {
+        payload.extend_from_slice(raw);
+    }
+    collectd_part_header(out, 0x0006, payload.len());
+    out.extend_from_slice(&payload);
 }
 
 /// `skip_to_brace` off, matching `examples/nginx-to-influxdb.yaml` -- the syslog decoder has
@@ -547,6 +628,17 @@ pub fn statsd_event() -> Event {
     let mut decoder = statsd_decoder();
     let batch = decoder.decode(statsd_datagram(1)).expect("fixture line should decode");
     batch.events.into_iter().next().expect("fixture line should produce one event")
+}
+
+/// `count` copies of [`statsd_event`] in one batch -- [`nginx_batch`]'s metric-only twin, for
+/// measuring `statsd_out`'s encoder against the shape it actually relays.
+pub fn statsd_batch(count: usize) -> EventBatch {
+    let event = statsd_event();
+    EventBatch {
+        resource: resource(),
+        scope: None,
+        events: (0..count).map(|_| event.clone()).collect(),
+    }
 }
 
 /// A single-sample distribution event -- the shape `kv_metrics` and `statsd`'s `ms`/`h`/`d` types

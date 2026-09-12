@@ -1,7 +1,9 @@
-//! Robustness/mutation testing over every decoder that will read untrusted bytes off a
-//! `logit_in` socket: [`frame::read_frame`], [`native::decode_batch`], and each
-//! `native::control::*::decode`. Workstream A of `docs/plans/native-transport.md`: this gate must
-//! exist and pass *before* `logit_in` listens on a real network.
+//! Robustness/mutation testing over every decoder that will read untrusted bytes off a socket:
+//! [`frame::read_frame`], [`native::decode_batch`], each `native::control::*::decode`, and
+//! `collectd::CollectdDecoder` (a UDP listener's datagrams are as untrusted as a `logit_in`
+//! connection's frames, and rather easier to spoof). Workstream A of
+//! `docs/plans/native-transport.md`: this gate must exist and pass *before* `logit_in` listens on a
+//! real network -- and `docs/plans/collectd-binary-relay.md` holds `collectd_in` to the same bar.
 //!
 //! What's checked, for each decoder: every single-byte truncation of a valid input; several
 //! thousand seeded bit flips; a length-bearing field inflated to a value far past what the input
@@ -237,6 +239,61 @@ fn deeply_nested_batch(depth: usize) -> EventBatch {
     EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![event] }
 }
 
+/// A complete, realistic collectd datagram: two value lists sharing one host/plugin/type, the
+/// second eliding everything but its own TypeInstance -- so a truncation or a bit flip can land in a
+/// part header, an identity string, a sticky-state boundary, or a value vector.
+fn sample_collectd_packet() -> Vec<u8> {
+    /// Appends one part: `type u16 BE, len u16 BE` (the length *includes* the header), payload.
+    /// Hand-written rather than reusing `logit_proto::collectd::part`'s writers, so a bug in those
+    /// writers cannot quietly produce a fixture this suite then declares safe.
+    fn part(out: &mut Vec<u8>, part_type: u16, payload: &[u8]) {
+        out.extend_from_slice(&part_type.to_be_bytes());
+        out.extend_from_slice(&((4 + payload.len()) as u16).to_be_bytes());
+        out.extend_from_slice(payload);
+    }
+    fn string(out: &mut Vec<u8>, part_type: u16, value: &[u8]) {
+        let mut payload = value.to_vec();
+        payload.push(0);
+        part(out, part_type, &payload);
+    }
+    fn number(out: &mut Vec<u8>, part_type: u16, value: u64) {
+        part(out, part_type, &value.to_be_bytes());
+    }
+    fn values(out: &mut Vec<u8>, entries: &[(u8, [u8; 8])]) {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        for (ds_type, _) in entries {
+            payload.push(*ds_type);
+        }
+        for (_, raw) in entries {
+            payload.extend_from_slice(raw);
+        }
+        part(out, 0x0006, &payload);
+    }
+
+    let mut out = Vec::new();
+    string(&mut out, 0x0000, b"robustness-host");
+    number(&mut out, 0x0008, 1_700_000_000u64 << 30); // TimeHR
+    number(&mut out, 0x0009, 10u64 << 30); // IntervalHR
+    string(&mut out, 0x0002, b"cpu"); // Plugin
+    string(&mut out, 0x0003, b"0"); // PluginInstance
+    string(&mut out, 0x0004, b"cpu"); // Type
+    string(&mut out, 0x0005, b"user"); // TypeInstance
+    values(&mut out, &[(2, 1234i64.to_be_bytes())]); // one DERIVE
+    string(&mut out, 0x0005, b"system");
+    values(&mut out, &[(1, 0.5f64.to_le_bytes()), (0, 7u64.to_be_bytes())]); // GAUGE + COUNTER
+    out
+}
+
+/// Runs `CollectdDecoder::decode_into` over `bytes` with a fresh decoder, returning whether it
+/// failed. A fresh decoder per call because the sweeps below run one mutation at a time and must not
+/// let an earlier one's state colour a later one.
+fn decode_collectd(bytes: &Bytes) -> bool {
+    let mut decoder = logit_proto::collectd::CollectdDecoder::new(Arc::new(Resource::default()));
+    let mut events = Vec::new();
+    decoder.decode_into(bytes.clone(), 0, &mut events).is_err()
+}
+
 fn sample_hello() -> Hello {
     Hello {
         version: control::PROTOCOL_VERSION,
@@ -412,6 +469,49 @@ fn native_decoder_decode_into_never_panics_on_a_truncated_framed_batch() {
         .is_err();
         assert!(!panicked, "decode_into panicked on a {len}-byte truncated frame");
     }
+}
+
+// -- collectd ---------------------------------------------------------------------------------
+
+/// The **weaker** truncation helper, deliberately: a collectd datagram is a flat sequence of
+/// self-delimiting parts with no trailing checksum or total length, so a prefix that happens to end
+/// exactly on a part boundary is not a truncation at all -- it is a shorter, perfectly valid
+/// datagram, and `decode_into` correctly returns `Ok` with the lists it did read. (The same is true
+/// one level down: a prefix ending mid-list still yields `Ok`, because every list the truncation
+/// left intact is kept and only the rest of the datagram is abandoned -- `collectd/decode.rs`'s
+/// per-datagram isolation rule.) `assert_every_truncation_fails_cleanly`'s stronger property
+/// genuinely does not hold here, and asserting it would be asserting a bug.
+#[test]
+fn collectd_decode_survives_every_single_byte_truncation() {
+    let packet = sample_collectd_packet();
+    assert_every_truncation_never_panics(&packet, |bytes| decode_collectd(bytes));
+}
+
+#[test]
+fn collectd_decode_survives_seeded_bit_flips() {
+    let packet = sample_collectd_packet();
+    assert_bit_flips_never_panic(&packet, 4000, |bytes| decode_collectd(bytes));
+}
+
+/// A Values part declaring 65535 data sources over a 20-byte buffer: the count is attacker-chosen
+/// (`u16`) and must be checked against the part's own declared length *before* anything is sized
+/// from it. 65535 data sources would be ~590 KB of type bytes and values.
+#[test]
+fn collectd_decode_rejects_a_values_count_inflated_far_past_what_the_input_holds() {
+    let mut hostile = Vec::new();
+    hostile.extend_from_slice(&0x0006u16.to_be_bytes()); // Values
+    hostile.extend_from_slice(&20u16.to_be_bytes()); // a 20-byte part...
+    hostile.extend_from_slice(&65535u16.to_be_bytes()); // ...declaring 65535 data sources
+    hostile.extend_from_slice(&[0xAA; 14]);
+    let bytes = Bytes::from(hostile);
+    assert!(decode_collectd(&bytes), "an impossible data-source count must be rejected");
+
+    let peak = peak_live_bytes(|| {
+        let _ = decode_collectd(&bytes);
+    });
+    // 65535 data sources would be ~590 KB before a single byte of it was read; anything under a few
+    // KB proves the declared count was checked against the part's own length first.
+    assert!(peak < 4096, "peak live bytes {peak} suggests the values count was trusted");
 }
 
 // -- control messages -----------------------------------------------------------------------

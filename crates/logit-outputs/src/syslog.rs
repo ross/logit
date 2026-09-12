@@ -7,15 +7,14 @@
 //! format/precedence/sanitization test runs against it directly) plus the thin [`SyslogOutput`]
 //! that owns the socket.
 //!
-//! **This does not implement `logit_proto::Encoder`.** That trait is `fn encode(&mut self,
-//! &EventBatch) -> Result<Bytes, CodecError>` -- one opaque buffer per batch, with no framing
-//! metadata -- and this sink genuinely needs per-message boundaries: one UDP datagram per message,
-//! or one octet-counted frame per message on TCP. There is no single `Bytes` that carries those
-//! boundaries without reinventing them on the other side, which is worse than not implementing the
-//! trait. [`EventDump`](crate::stdio::EventDump) is the in-tree precedent for a sink whose encoder
-//! sidesteps the trait for the same class of reason (it returns a `String`, not a `Bytes`, since a
-//! human terminal has no framing at all). See `docs/known-gaps.md` for this recorded as an open
-//! gap in `logit_proto::Encoder`'s shape, not a defect in this module.
+//! **This implements [`logit_proto::FramedEncoder`], not `logit_proto::Encoder`.** The latter is
+//! `fn encode(&mut self, &EventBatch) -> Result<Bytes, CodecError>` -- one opaque buffer per
+//! batch, with no framing metadata -- and this sink genuinely needs per-message boundaries: one
+//! UDP datagram per message, or one octet-counted frame per message on TCP. There is no single
+//! `Bytes` that carries those boundaries without reinventing them on the other side, which is
+//! exactly the shape `FramedEncoder` exists for: [`SyslogEncoder::encode_into`] fills one
+//! [`MessageBuf`] entry per message and reports every skip/drop through [`EncodeStats`] instead
+//! of failing (ADR `framed-encoder`). `statsd_out` is the other implementor.
 //!
 //! ## Timestamp semantics
 //!
@@ -182,6 +181,7 @@ use anyhow::Context;
 use logit_core::time::format_rfc3339_utc;
 use logit_core::{interner, AttrMap, Diagnostics, Event, EventBatch, Severity, Telemetry, Value};
 use logit_pipeline::Fault;
+use logit_proto::{FramedEncoder, MessageBuf};
 use std::fmt::Write as _;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -209,13 +209,9 @@ pub enum Format {
     Rfc5424,
 }
 
-/// `SyslogOutput` reuses one across every `send`. Lifted out to [`crate::msgbuf`] once
-/// `statsd_out` needed the identical shape; re-exported here under its original path since
-/// `crates/logit-bench` names it as `logit_outputs::syslog::MessageBuf`.
-pub use crate::msgbuf::MessageBuf;
-
-/// Per-batch outcome counts from [`SyslogEncoder::encode_into`] -- what `SyslogOutput::send` turns
-/// into `logit.output.*` telemetry (`docs/design/internal-telemetry.md`).
+/// Per-batch outcome counts from [`SyslogEncoder::encode_into`] -- this sink's
+/// [`FramedEncoder::Stats`], what `SyslogOutput::send` turns into `logit.output.*` telemetry
+/// (`docs/design/internal-telemetry.md`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeStats {
     /// Events with no `log` record (legal under `docs/adr/multi-payload-events.md`) -- a
@@ -339,12 +335,20 @@ impl SyslogEncoder {
         self.diag = diag;
         self
     }
+}
+
+impl FramedEncoder for SyslogEncoder {
+    /// A syslog message is self-describing: the transport frames each entry as-is (one datagram
+    /// on UDP, one octet-counted frame on TCP), so there is nothing to say about it beyond its
+    /// bytes.
+    type Meta = ();
+    type Stats = EncodeStats;
 
     /// Encodes every event in `batch` into `out` (cleared first), one message per event that
     /// carries a `log` record. Never fails -- a per-event problem (no log record, an oversize
     /// header) is a skip/drop counted in the returned [`EncodeStats`], not an error; there is
     /// nothing for a caller to react to beyond what the stats already report.
-    pub fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf) -> EncodeStats {
+    fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf) -> EncodeStats {
         out.clear();
         let mut stats = EncodeStats::default();
         for event in &batch.events {
@@ -353,7 +357,9 @@ impl SyslogEncoder {
         }
         stats
     }
+}
 
+impl SyslogEncoder {
     /// Encodes one event's header into `self.line` (already cleared by the caller), then its
     /// message -- pushed into `out` as raw bytes ([`MessageBuf::push_bytes`]) for a
     /// `Value::Bytes` message (module doc's "Message body" section), or as `self.line` itself

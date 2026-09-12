@@ -21,14 +21,15 @@ use logit_bench::alloc::{measure, CountingAlloc, Stats};
 use logit_bench::fixtures;
 use logit_core::{AttrMap, EventBatch, Registry, Resource, Telemetry, TraceRef, Value};
 use logit_outputs::influxdb::InfluxLineEncoder;
+use logit_outputs::statsd::{Format as StatsdFormat, StatsdEncoder};
 use logit_outputs::stdio::{EventDump, Format};
-use logit_outputs::syslog::{Format as SyslogFormat, MessageBuf, SyslogEncoder};
+use logit_outputs::syslog::{Format as SyslogFormat, SyslogEncoder};
 use logit_pipeline::runtime::drain_inbox;
 use logit_pipeline::{
     process_batch, send_batch, unwrap_batch, BatchContext, Delivered, Fanout, SinkQueue,
     SinkQueueConfig, SinkStore, Transform,
 };
-use logit_proto::{Decoder, Encoder};
+use logit_proto::{Decoder, Encoder, FramedEncoder, MessageBuf};
 use logit_script::{ProcessOutcome, ScriptWorker};
 use std::sync::Arc;
 
@@ -350,6 +351,94 @@ fn statsd_decode_into_a_warm_reused_buffer_costs_one_not_two() {
         measure(|| decoder.decode_into(datagram.clone(), 0, &mut out).expect("should decode"));
     assert_eq!(out.len(), 1);
     expect_allocs("statsd_in: decode_into into a warm buffer", stats, 1);
+}
+
+// -- collectd_in (docs/adr/collectd-binary-relay.md) -------------------------------------------
+
+/// One allocation, matching `syslog_in`: the `Vec<Event>` the batch is collected into. Every
+/// identity field is a refcounted slice of the datagram (`decode.rs`'s `string_value`), the record
+/// name is built into the decoder's reused scratch `String` before interning, and a
+/// single-data-source list fits `MetricList`'s inline capacity -- so the value list itself costs
+/// nothing.
+#[test]
+fn collectd_decode_one_list() {
+    let mut decoder = fixtures::collectd_decoder();
+    let datagram = fixtures::collectd_packet(1);
+    drop(decoder.decode(datagram.clone())); // warm: interns the six attribute keys and the name
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.events[0].metrics.len(), 1);
+    expect_allocs("collectd_in: decode 1 list", stats, 1);
+}
+
+/// The listener's actual hot path (`docs/adr/decoupled-listener-io.md`): `decode_into` against a
+/// buffer `decode_loop` reuses across datagrams. Zero -- there is nothing left to allocate once the
+/// caller's `Vec<Event>` keeps its capacity, which is the strongest statement this codec can make.
+#[test]
+fn collectd_decode_into_a_warm_reused_buffer_costs_nothing() {
+    let mut decoder = fixtures::collectd_decoder();
+    let datagram = fixtures::collectd_packet(1);
+    let mut out = Vec::new();
+    decoder.decode_into(datagram.clone(), 0, &mut out).expect("should decode");
+    out.clear(); // capacity intact -- this is the property under test
+
+    let (_resource, stats) =
+        measure(|| decoder.decode_into(datagram.clone(), 0, &mut out).expect("should decode"));
+    assert_eq!(out.len(), 1);
+    expect_allocs("collectd_in: decode_into into a warm buffer", stats, 0);
+}
+
+/// Two: the `Vec<Event>`, plus one spill of the event's `MetricList`. `logit_core::MetricList` is a
+/// `SmallVec` inlined at 1, so a three-data-source `load` list is the first shape that has to move
+/// its records to the heap -- exactly once, not once per record (`docs/design/memory.md` §3).
+#[test]
+fn collectd_decode_one_three_value_list() {
+    let mut decoder = fixtures::collectd_decoder();
+    let datagram = fixtures::collectd_load_packet();
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1, "one Values part is one event, whatever its width");
+    assert_eq!(batch.events[0].metrics.len(), 3);
+    expect_allocs("collectd_in: decode 1 three-value list", stats, 2);
+}
+
+/// A 25-list datagram -- what a real collectd host agent packs into one 1452-byte packet. Still one
+/// allocation, not 25: the per-list cost is the `Vec<Event>`'s own growth, which shows up as
+/// *reallocs* rather than allocs (4 -> 8 -> 16 -> 32, three of them) because `decode_into` cannot
+/// know the list count in advance -- a collectd datagram has no header saying how many Values parts
+/// it holds, only a flat part stream.
+#[test]
+fn collectd_decode_a_25_list_packet() {
+    let mut decoder = fixtures::collectd_decoder();
+    let datagram = fixtures::collectd_packet(25);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 25);
+    assert_eq!(stats.reallocs, 3, "the events Vec grows 4 -> 8 -> 16 -> 32");
+    expect_allocs("collectd_in: decode a 25-list packet", stats, 1);
+}
+
+/// The same three-data-source list decoded through a decoder holding a `types.db`, which renames
+/// its records `load.load.shortterm`/`midterm`/`longterm`. **The same count as without it**: the
+/// lookup is one `HashMap::get` per Values part returning a borrowed slice, and the names are
+/// written into the same reused scratch `String` before interning, so resolving them costs no
+/// allocation at all.
+#[test]
+fn collectd_decode_one_list_with_types_db_resolution() {
+    let mut decoder = fixtures::collectd_decoder_with_types_db();
+    let datagram = fixtures::collectd_load_packet();
+    drop(decoder.decode(datagram.clone())); // warm: interns the three resolved names
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(
+        logit_core::interner::resolve(batch.events[0].metrics[0].name),
+        "load.load.shortterm",
+        "the types.db must actually have resolved, or this measures the wrong thing"
+    );
+    expect_allocs("collectd_in: decode 1 list with types.db", stats, 2);
 }
 
 /// `prometheus_in`'s decode path has no `Decoder` trait to go through (`docs/adr/
@@ -2182,12 +2271,44 @@ fn syslog_encode_into_100_events() {
     let mut encoder = SyslogEncoder::new(SyslogFormat::Rfc5424, 16);
     let batch = fixtures::nginx_batch(100);
     let mut out = MessageBuf::default();
-    let _ = encoder.encode_into(&batch, &mut out); // warm-up call; EncodeStats is Copy
 
-    let (stats_out, stats) = measure(|| encoder.encode_into(&batch, &mut out));
+    let (stats_out, stats) = measure_framed(&mut encoder, &batch, &mut out);
     assert_eq!(out.len(), 100);
     assert_eq!(stats_out.skipped_no_log, 0);
     expect_allocs("syslog_out: encode_into 100 events", stats, 100);
+}
+
+/// The one generic consumer of `logit_proto::FramedEncoder` in the tree (ADR `framed-encoder`):
+/// one warm-up call (the encoder's own struct-held scratch buffers and `out`'s backing `Vec`s
+/// reach their working capacity), then the measured call, on the same `out`. Both framed rows
+/// go through this so a third framed sink's row is one more call, not a fourth copy of the
+/// warm-then-measure pattern.
+fn measure_framed<E: FramedEncoder<Meta = ()>>(
+    encoder: &mut E,
+    batch: &EventBatch,
+    out: &mut MessageBuf,
+) -> (E::Stats, Stats) {
+    let _ = encoder.encode_into(batch, out);
+    measure(|| encoder.encode_into(batch, out))
+}
+
+/// Zero: `StatsdEncoder` was built with every per-metric buffer (`line`/`name`/`tag_suffix`/
+/// `scratch`/...) as a reused struct field from the start (`syslog_out`'s lesson above, applied
+/// before rather than after measurement), and, unlike syslog's RFC 5424 header, a statsd line
+/// has no timestamp to format through `format_rfc3339_utc` -- so once `MessageBuf`'s backing
+/// `Vec`s are warm, a batch of 100 single-counter DogStatsD events touches the allocator not at
+/// all. Measured through `FramedEncoder::encode_into` with the encoder's default (uncapped)
+/// `max_packet_bytes`, exactly what `StatsdOutput::send` calls on TCP.
+#[test]
+fn statsd_encode_into_100_events() {
+    let mut encoder = StatsdEncoder::new(StatsdFormat::DogStatsd);
+    let batch = fixtures::statsd_batch(100);
+    let mut out = MessageBuf::default();
+
+    let (stats_out, stats) = measure_framed(&mut encoder, &batch, &mut out);
+    assert_eq!(out.len(), 100);
+    assert_eq!(stats_out, logit_outputs::statsd::EncodeStats::default());
+    expect_allocs("statsd_out: encode_into 100 events", stats, 0);
 }
 
 /// `prometheus_out`'s encode path, like `prometheus_in`'s, is two plain functions rather than a

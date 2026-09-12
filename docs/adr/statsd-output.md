@@ -158,6 +158,15 @@ Same reasoning as `syslog_out`: that trait returns one opaque `Bytes` per batch 
 metadata, which can't express the per-line/per-datagram boundaries this sink genuinely needs.
 `StatsdEncoder::encode_into` is a bespoke, pure, directly-unit-testable method instead.
 
+**Amendment (2026-09-12): implements `FramedEncoder`.** The method is now the implementation of
+[ADR `framed-encoder`](framed-encoder.md)'s `logit_proto::FramedEncoder` (`type Meta = ();
+type Stats = EncodeStats;`), over a `MessageBuf` that moved from `crates/logit-outputs/src/
+msgbuf.rs` (the Consequences entry below) to `logit_proto`. One signature change: the
+per-call `max_packet_bytes` argument became encoder state (`StatsdEncoder::with_max_packet_bytes`,
+default uncapped), and `StatsdOutput` applies the transport's cap -- the configured value on
+UDP, none on TCP -- once at build time rather than on every `send`. The cap in effect, the
+send-time packing, the wire bytes, and `EncodeStats` are all unchanged.
+
 ### No sample rate, no timestamp, no unit
 
 Never `@<rate>`: `statsd_in` already extrapolated at decode time (a `Counter`'s value already has

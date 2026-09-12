@@ -409,7 +409,10 @@ request, not one batch at a time. The codec instead exposes plain functions
 (`families_to_events`/`events_to_families`, `text::parse`/`text::write`) plus a
 `PrometheusDecoder { telemetry, diagnostics }` / `PrometheusEncoder` pair with
 `with_telemetry`/`with_diagnostics` builders for their own counters, the same shape `syslog_out`/
-`statsd_out` already established.
+`statsd_out` already established. (2026-09-12: [ADR `framed-encoder`](framed-encoder.md)'s
+`FramedEncoder`, which `syslog_out`/`statsd_out` now implement, doesn't fit either -- it is still
+a per-batch call, and `prometheus_out` is a pull-shaped registry with no batch to encode at
+scrape time; it remains the one sink outside all three codec traits, by design.)
 
 ## Alternatives considered
 
