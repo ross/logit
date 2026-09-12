@@ -1424,43 +1424,6 @@
           }
         },
         {
-          "description": "A Prometheus/OpenMetrics **exposition** endpoint: a stateful sink holding a registry of current series that an HTTP handler renders on demand, rather than one that writes anywhere. The mirror of `PrometheusIn` (scrape). Both text dialects are served, negotiated on the scraping client's `Accept`. See `docs/adr/prometheus-scrape-and-exposition.md` and `logit_outputs::prometheus`'s module doc (the spec).\n\nA future remote-write **sender** is an optional `endpoint:` on this same variant, with a graph rule requiring exactly one of `bind`/`endpoint` -- purely additive, so a config written today keeps working.",
-          "type": "object",
-          "required": [
-            "bind",
-            "type"
-          ],
-          "properties": {
-            "bind": {
-              "description": "`host:port` to serve the exposition on. Required, and bound when the pipeline starts (`Output::bind`'s pre-spawn pass), so an address already in use is a startup failure rather than a scrape that silently answers nothing.\n\n**There is no TLS and no auth on this endpoint**, and it serves every label of every series the registry holds to anything that connects: bind loopback or pod-local (`127.0.0.1:9464`, as every shipped example does) and front it with something that has both. See the ADR's \"Security posture\" section and `docs/known-gaps.md`.",
-              "type": "string"
-            },
-            "expire_after": {
-              "description": "A series not updated within this window is dropped from the registry and stops being exposed. Defaults to 5 minutes -- Prometheus's own staleness horizon, so a series this sink stops exposing is one a Prometheus-native exporter's consumer would already have treated as stale. `0s` disables expiry entirely, leaving `max_series` as the only bound.",
-              "default": "300s",
-              "type": "string"
-            },
-            "max_series": {
-              "description": "A hard cap on distinct series held in the registry; over it, the least-recently-updated series is evicted to admit a new one, counted `logit.output.series.evicted{reason=\"cardinality\"}` -- the same shape as `aggregate`'s `max_retained_gauge_series`, applied to registry memory instead of window memory.",
-              "default": 100000,
-              "type": "integer",
-              "format": "uint",
-              "minimum": 0.0
-            },
-            "path": {
-              "description": "The HTTP path the exposition is served on; any other path is a `404`. Defaults to `/metrics`, what every Prometheus scrape config assumes when a target's own `metrics_path` is unset.",
-              "default": "/metrics",
-              "type": "string"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "prometheus_out"
-              ]
-            }
-          }
-        },
-        {
           "description": "Scrapes Prometheus `/metrics` endpoints on `interval`, the way Prometheus's own server does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each target's response declares via its own `Content-Type`. Always synthesizes `up`, `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. See `docs/adr/prometheus-scrape-and-exposition.md`. A future `bind:` field on this same variant (a remote-write receiver) is planned as an additive, non-breaking change -- \"exactly one of `targets`/`bind`\" would become a graph rule once it lands, not a new kind.",
           "type": "object",
           "required": [
@@ -1511,6 +1474,43 @@
               "type": "string",
               "enum": [
                 "prometheus_in"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A Prometheus/OpenMetrics **exposition** endpoint: a stateful sink holding a registry of current series that an HTTP handler renders on demand, rather than one that writes anywhere. The mirror of `PrometheusIn` (scrape). Both text dialects are served, negotiated on the scraping client's `Accept`. See `docs/adr/prometheus-scrape-and-exposition.md` and `logit_outputs::prometheus`'s module doc (the spec).\n\nA future remote-write **sender** is an optional `endpoint:` on this same variant, with a graph rule requiring exactly one of `bind`/`endpoint` -- purely additive, so a config written today keeps working.",
+          "type": "object",
+          "required": [
+            "bind",
+            "type"
+          ],
+          "properties": {
+            "bind": {
+              "description": "`host:port` to serve the exposition on. Required, and bound when the pipeline starts (`Output::bind`'s pre-spawn pass), so an address already in use is a startup failure rather than a scrape that silently answers nothing.\n\n**There is no TLS and no auth on this endpoint**, and it serves every label of every series the registry holds to anything that connects: bind loopback or pod-local (`127.0.0.1:9464`, as every shipped example does) and front it with something that has both. See the ADR's \"Security posture\" section and `docs/known-gaps.md`.",
+              "type": "string"
+            },
+            "expire_after": {
+              "description": "A series not updated within this window is dropped from the registry and stops being exposed. Defaults to 5 minutes -- Prometheus's own staleness horizon, so a series this sink stops exposing is one a Prometheus-native exporter's consumer would already have treated as stale. `0s` disables expiry entirely, leaving `max_series` as the only bound.",
+              "default": "300s",
+              "type": "string"
+            },
+            "max_series": {
+              "description": "A hard cap on distinct series held in the registry; over it, the least-recently-updated series is evicted to admit a new one, counted `logit.output.series.evicted{reason=\"cardinality\"}` -- the same shape as `aggregate`'s `max_retained_gauge_series`, applied to registry memory instead of window memory.",
+              "default": 100000,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "path": {
+              "description": "The HTTP path the exposition is served on; any other path is a `404`. Defaults to `/metrics`, what every Prometheus scrape config assumes when a target's own `metrics_path` is unset.",
+              "default": "/metrics",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "prometheus_out"
               ]
             }
           }
