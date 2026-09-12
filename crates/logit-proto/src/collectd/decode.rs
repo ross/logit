@@ -14,7 +14,8 @@ use crate::{CodecError, Decoder};
 use bytes::Bytes;
 use logit_core::interner::{intern, Symbol};
 use logit_core::{
-    AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, Scope, Sum, Temporality, Value,
+    AttrMap, BodyFormat, Diagnostics, Event, LogRecord, MetricKind, MetricRecord, Resource, Scope,
+    Severity, Sum, Temporality, Value,
 };
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -52,6 +53,7 @@ struct AttrKeys {
     type_: Symbol,
     type_instance: Symbol,
     interval: Symbol,
+    severity: Symbol,
 }
 
 impl CollectdDecoder {
@@ -67,6 +69,7 @@ impl CollectdDecoder {
                 type_: intern(super::ATTR_TYPE),
                 type_instance: intern(super::ATTR_TYPE_INSTANCE),
                 interval: intern(super::ATTR_INTERVAL),
+                severity: intern(super::ATTR_SEVERITY),
             },
             types_db: None,
         }
@@ -130,6 +133,10 @@ struct Sticky {
     time_ns: i64,
     /// Raw `cdtime_t`; `0` means unspecified, which leaves `collectd.interval` absent.
     interval_cdtime: u64,
+    /// The raw wire severity from the most recent `0x0101` Severity part; `0` (no valid severity
+    /// is ever `0`) means none has arrived yet in this datagram. Read only when a Message part
+    /// dispatches a notification -- see [`CollectdDecoder::decode_notification`].
+    severity: u64,
 }
 
 /// Whether to keep walking this datagram after a part. Only an Encryption part stops early -- every
@@ -244,6 +251,14 @@ impl CollectdDecoder {
             part::TYPE_VALUES => {
                 self.decode_values(bytes, payload, sticky, received_at, out)?;
             }
+            // Sets sticky state; the notification itself is dispatched at the Message part below,
+            // exactly the way a Values part dispatches against sticky identity (this module doc's
+            // "Notifications" section).
+            part::TYPE_SEVERITY => sticky.severity = read_number(&header, payload)?,
+            part::TYPE_MESSAGE => {
+                let message_range = string_range(&header, payload, payload_at)?;
+                self.decode_notification(bytes, message_range, sticky, received_at, out);
+            }
             // Everything after an Encryption part is ciphertext, and this codec holds no keys
             // (`docs/known-gaps.md`): stop, rather than walking what would look like garbage parts
             // and reporting each one as malformed.
@@ -260,8 +275,6 @@ impl CollectdDecoder {
             // diagnostic per signed packet would fire on every datagram from a `SecurityLevel Sign`
             // sender forever.
             part::TYPE_SIGNATURE => {}
-            // Notifications -- W5 of `docs/plans/collectd-binary-relay.md`.
-            part::TYPE_MESSAGE | part::TYPE_SEVERITY => {}
             // An unknown part type is skipped by its own length, which is the whole reason `len`
             // exists: a newer collectd can add a part type without breaking this decoder.
             _ => {}
@@ -414,6 +427,88 @@ impl CollectdDecoder {
         out.push(event);
         Ok(())
     }
+
+    /// Dispatches a notification at a Message part -- this module doc's "Notifications" section is
+    /// the spec. Unlike [`Self::decode_values`], there is no structural-error path here: framing and
+    /// NUL-termination were already validated by [`string_range`] before this is called, so every
+    /// failure from here on is a *semantic* one (an invalid severity, an empty message, no host),
+    /// each a skip-and-count rather than a `PartFault`.
+    fn decode_notification(
+        &mut self,
+        bytes: &Bytes,
+        message_range: Option<Range<usize>>,
+        sticky: &Sticky,
+        received_at: i64,
+        out: &mut Vec<Event>,
+    ) {
+        // collectd's own `notification_t` has no interval field at all -- unlike a value list, a
+        // notification never carries `collectd.interval`, even when an earlier list in the same
+        // datagram set one.
+        let severity = match sticky.severity {
+            1 => Severity::Error,
+            2 => Severity::Warn,
+            4 => Severity::Info,
+            other => {
+                self.diag.warn_throttled(
+                    "notification_dropped",
+                    format_args!(
+                        "collectd: notification severity {other} is not one of 1 (FAILURE), 2 \
+                         (WARNING), 4 (OKAY); dropping"
+                    ),
+                );
+                return;
+            }
+        };
+        let Some(message_range) = message_range else {
+            self.diag.warn_throttled(
+                "notification_dropped",
+                "collectd: notification message is empty; dropping (collectd's own receiver \
+                 rejects the same notification)",
+            );
+            return;
+        };
+        let Some(host) = &sticky.host else {
+            self.diag.warn_throttled(
+                "notification_dropped",
+                "collectd: notification arrived with no host set; dropping",
+            );
+            return;
+        };
+
+        let mut attrs = AttrMap::new();
+        attrs.insert_sym(self.keys.host, string_value(bytes, host.clone()));
+        if let Some(range) = &sticky.plugin {
+            attrs.insert_sym(self.keys.plugin, string_value(bytes, range.clone()));
+        }
+        if let Some(range) = &sticky.plugin_instance {
+            attrs.insert_sym(self.keys.plugin_instance, string_value(bytes, range.clone()));
+        }
+        if let Some(range) = &sticky.type_ {
+            attrs.insert_sym(self.keys.type_, string_value(bytes, range.clone()));
+        }
+        if let Some(range) = &sticky.type_instance {
+            attrs.insert_sym(self.keys.type_instance, string_value(bytes, range.clone()));
+        }
+        attrs.insert_sym(self.keys.severity, Value::U64(sticky.severity));
+
+        // Lenient exactly where the Values path is: collectd's own receiver rejects `time == 0`,
+        // this codec stamps receipt time instead.
+        let timestamp = if sticky.time_ns != 0 { sticky.time_ns } else { received_at };
+        let message = string_value(bytes, message_range);
+        out.push(Event::log(
+            timestamp,
+            attrs,
+            LogRecord {
+                message,
+                severity: Some(severity),
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        ));
+    }
 }
 
 /// The `types.db` entry to name this value list's data sources from, or `None` for index naming.
@@ -516,7 +611,8 @@ fn push_lossy(out: &mut String, bytes: &[u8]) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::super::{
-        ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE, ATTR_TYPE, ATTR_TYPE_INSTANCE,
+        ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE, ATTR_SEVERITY, ATTR_TYPE,
+        ATTR_TYPE_INSTANCE,
     };
     use super::*;
     use logit_core::interner::resolve;
@@ -954,19 +1050,221 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_message_or_severity_part_is_skipped_until_w5() {
+    fn a_message_before_any_identity_part_is_dropped_for_missing_host() {
+        // A Message dispatched before any Host part has ever arrived in this datagram --
+        // `sticky.host` is `None`, so the notification is dropped even though it otherwise has a
+        // valid severity and a non-empty message. The value list right behind it, once identity is
+        // set, still decodes.
+        let (mut decoder, registry) = decoder_with_diag();
+        let mut out = Vec::new();
+        decoder
+            .decode_into(
+                PacketBuilder::new()
+                    .number(part::TYPE_SEVERITY, 2)
+                    .string(part::TYPE_MESSAGE, b"disk almost full")
+                    .string(part::TYPE_HOST, b"h")
+                    .string(part::TYPE_PLUGIN, b"p")
+                    .string(part::TYPE_TYPE, b"t")
+                    .values(&[gauge(1.0)])
+                    .build(),
+                RECEIVED_AT,
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(out.len(), 1, "the notification is dropped, the value list is not");
+        assert!(out[0].log.is_none());
+        assert!(diagnosed(&registry, "notification_dropped"));
+    }
+
+    // --- notifications (0x0100 Message / 0x0101 Severity) --------------------------------------
+
+    /// One notification per stock severity, verbatim: the mapping this module doc's table pins.
+    #[test]
+    fn every_severity_maps_to_its_own_log_severity() {
+        for (wire, expected) in
+            [(1u64, Severity::Error), (2u64, Severity::Warn), (4u64, Severity::Info)]
+        {
+            let events = decode(
+                PacketBuilder::new()
+                    .string(part::TYPE_HOST, b"web-1")
+                    .string(part::TYPE_PLUGIN, b"load")
+                    .string(part::TYPE_TYPE, b"load")
+                    .number(part::TYPE_TIME_HR, TIME_HR)
+                    .number(part::TYPE_SEVERITY, wire)
+                    .string(part::TYPE_MESSAGE, b"threshold exceeded")
+                    .build(),
+            );
+            assert_eq!(events.len(), 1, "severity {wire}");
+            let log = events[0].log.as_ref().expect("a Message part must produce a log record");
+            assert_eq!(log.severity, Some(expected), "severity {wire}");
+            assert_eq!(log.message, Value::from("threshold exceeded"));
+            assert_eq!(events[0].timestamp, 1_700_000_000_000_000_000);
+            assert_eq!(attr(&events[0], ATTR_HOST), Some(Value::from("web-1")));
+            assert_eq!(attr(&events[0], ATTR_PLUGIN), Some(Value::from("load")));
+            assert_eq!(attr(&events[0], ATTR_TYPE), Some(Value::from("load")));
+            assert_eq!(events[0].attributes.get(ATTR_SEVERITY), Some(&Value::U64(wire)));
+            assert!(events[0].metrics.is_empty(), "a notification carries no metrics");
+        }
+    }
+
+    /// A notification never carries `collectd.interval`, even when an `IntervalHR` part set one
+    /// earlier in the same datagram for a value list -- collectd's own `notification_t` has no such
+    /// field.
+    #[test]
+    fn a_notification_never_carries_an_interval_even_when_one_is_sticky() {
         let events = decode(
             PacketBuilder::new()
-                .number(part::TYPE_SEVERITY, 2)
-                .string(part::TYPE_MESSAGE, b"disk almost full")
-                .string(part::TYPE_HOST, b"h")
-                .string(part::TYPE_PLUGIN, b"p")
-                .string(part::TYPE_TYPE, b"t")
-                .values(&[gauge(1.0)])
+                .string(part::TYPE_HOST, b"web-1")
+                .string(part::TYPE_PLUGIN, b"load")
+                .string(part::TYPE_TYPE, b"load")
+                .number(part::TYPE_INTERVAL_HR, 10u64 << 30)
+                .number(part::TYPE_SEVERITY, 4)
+                .string(part::TYPE_MESSAGE, b"ok now")
+                .build(),
+        );
+        assert_eq!(attr(&events[0], ATTR_INTERVAL), None);
+    }
+
+    /// Plugin and type may be absent on a notification -- unlike a value list, which requires
+    /// both.
+    #[test]
+    fn a_notification_with_no_plugin_or_type_still_decodes() {
+        let events = decode(
+            PacketBuilder::new()
+                .string(part::TYPE_HOST, b"web-1")
+                .number(part::TYPE_SEVERITY, 1)
+                .string(part::TYPE_MESSAGE, b"host is down")
                 .build(),
         );
         assert_eq!(events.len(), 1);
-        assert!(events[0].log.is_none(), "notifications are W5, not a log record yet");
+        assert_eq!(attr(&events[0], ATTR_PLUGIN), None);
+        assert_eq!(attr(&events[0], ATTR_TYPE), None);
+        assert_eq!(events[0].log.as_ref().unwrap().severity, Some(Severity::Error));
+    }
+
+    #[test]
+    fn a_non_utf8_message_becomes_value_bytes_rather_than_lossy_text() {
+        let events = decode(
+            PacketBuilder::new()
+                .string(part::TYPE_HOST, b"h")
+                .number(part::TYPE_SEVERITY, 2)
+                .string(part::TYPE_MESSAGE, &[0xFF, 0xFE, b'm'])
+                .build(),
+        );
+        assert_eq!(
+            events[0].log.as_ref().unwrap().message,
+            Value::Bytes(Bytes::from_static(&[0xFF, 0xFE, b'm']))
+        );
+    }
+
+    #[test]
+    fn an_empty_message_is_dropped_and_counted() {
+        let (mut decoder, registry) = decoder_with_diag();
+        let mut out = Vec::new();
+        decoder
+            .decode_into(
+                PacketBuilder::new()
+                    .string(part::TYPE_HOST, b"h")
+                    .number(part::TYPE_SEVERITY, 2)
+                    .string(part::TYPE_MESSAGE, b"")
+                    .build(),
+                RECEIVED_AT,
+                &mut out,
+            )
+            .unwrap();
+        assert!(out.is_empty());
+        assert!(diagnosed(&registry, "notification_dropped"));
+    }
+
+    #[test]
+    fn an_out_of_set_severity_is_dropped_and_counted() {
+        for wire in [0u64, 3, 5, 8, u64::MAX] {
+            let (mut decoder, registry) = decoder_with_diag();
+            let mut out = Vec::new();
+            decoder
+                .decode_into(
+                    PacketBuilder::new()
+                        .string(part::TYPE_HOST, b"h")
+                        .number(part::TYPE_SEVERITY, wire)
+                        .string(part::TYPE_MESSAGE, b"whatever")
+                        .build(),
+                    RECEIVED_AT,
+                    &mut out,
+                )
+                .unwrap();
+            assert!(out.is_empty(), "severity {wire}");
+            assert!(diagnosed(&registry, "notification_dropped"), "severity {wire}");
+        }
+    }
+
+    /// No Severity part at all: `sticky.severity` stays `0`, which is not in `{1, 2, 4}` either --
+    /// the same drop path as an explicit out-of-set value.
+    #[test]
+    fn a_message_with_no_severity_part_at_all_is_dropped() {
+        let events = decode(
+            PacketBuilder::new()
+                .string(part::TYPE_HOST, b"h")
+                .string(part::TYPE_MESSAGE, b"x")
+                .build(),
+        );
+        assert!(events.is_empty());
+    }
+
+    /// Sticky severity resets at the datagram boundary like every other sticky field: a second,
+    /// independent `decode_into` call must not inherit the first datagram's severity.
+    #[test]
+    fn sticky_severity_resets_per_datagram() {
+        let mut decoder = decoder();
+        let mut out = Vec::new();
+        decoder
+            .decode_into(
+                PacketBuilder::new()
+                    .string(part::TYPE_HOST, b"h")
+                    .number(part::TYPE_SEVERITY, 4)
+                    .string(part::TYPE_MESSAGE, b"first")
+                    .build(),
+                RECEIVED_AT,
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(out.len(), 1);
+
+        // A second, independent datagram with no Severity part of its own: if severity leaked
+        // across the `decode_into` call, this would decode too.
+        decoder
+            .decode_into(
+                PacketBuilder::new()
+                    .string(part::TYPE_HOST, b"h")
+                    .string(part::TYPE_MESSAGE, b"second")
+                    .build(),
+                RECEIVED_AT,
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(out.len(), 1, "the second datagram's severity-less message must be dropped");
+    }
+
+    /// A datagram mixing a value list and a notification under one shared identity -- the ordinary
+    /// case a `threshold` plugin produces alongside `load`/`memory` reads on the same host.
+    #[test]
+    fn a_datagram_mixing_a_value_list_and_a_notification_decodes_both() {
+        let events = decode(
+            PacketBuilder::new()
+                .string(part::TYPE_HOST, b"web-1")
+                .number(part::TYPE_TIME_HR, TIME_HR)
+                .string(part::TYPE_PLUGIN, b"load")
+                .string(part::TYPE_TYPE, b"load")
+                .values(&[gauge(0.1), gauge(0.2), gauge(0.3)])
+                .number(part::TYPE_SEVERITY, 2)
+                .string(part::TYPE_MESSAGE, b"load average high")
+                .build(),
+        );
+        assert_eq!(events.len(), 2);
+        assert!(events[0].log.is_none() && !events[0].metrics.is_empty(), "the value list first");
+        assert!(events[1].log.is_some() && events[1].metrics.is_empty(), "the notification second");
+        assert_eq!(attr(&events[1], ATTR_HOST), Some(Value::from("web-1")));
+        assert_eq!(attr(&events[1], ATTR_PLUGIN), Some(Value::from("load")));
+        assert_eq!(attr(&events[1], ATTR_TYPE), Some(Value::from("load")));
     }
 
     // --- skips and faults ----------------------------------------------------------------------

@@ -16,8 +16,8 @@
 //! `1.5` in both directions so a "fix" to this asymmetry fails loudly.
 
 /// Part types, from collectd's `network.h`. `TYPE_MESSAGE`/`TYPE_SEVERITY` are notification parts
-/// (W5 of `docs/plans/collectd-binary-relay.md`); `TYPE_SIGNATURE`/`TYPE_ENCRYPTION` are the
-/// security parts this codec deliberately does not verify or decrypt (see [`super`]'s module doc).
+/// (see [`super`]'s "Notifications" section); `TYPE_SIGNATURE`/`TYPE_ENCRYPTION` are the security
+/// parts this codec deliberately does not verify or decrypt (see [`super`]'s module doc).
 pub const TYPE_HOST: u16 = 0x0000;
 pub const TYPE_TIME: u16 = 0x0001;
 pub const TYPE_PLUGIN: u16 = 0x0002;
