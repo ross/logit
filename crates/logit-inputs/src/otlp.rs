@@ -31,6 +31,28 @@
 //! request, and can't block the accept loop from serving the next connection
 //! (`docs/adr/otlp-tls-and-pooled-grpc-client.md`).
 //!
+//! **Handshake timeout.** That TLS accept is bounded by [`OtlpInput::handshake_timeout`] (a
+//! field, defaulted to [`HANDSHAKE_TIMEOUT`] and set from config by
+//! [`OtlpInput::with_handshake_timeout`]), copied from `logit_in`'s accept loop
+//! (`crates/logit-inputs/src/logit.rs`'s "Pre-`Hello` timeout" section): without it a client that
+//! completes the TCP connect and then never sends a ClientHello pinned a
+//! `MAX_CONCURRENT_CONNECTIONS` permit forever, and since this listener *blocks* on
+//! `acquire_owned` rather than rejecting, enough such connections stop the accept loop draining
+//! its backlog at all.
+//!
+//! **It bounds that one phase and no other -- narrower than `logit_in`/`syslog_in`.** Those two
+//! read the first post-handshake message themselves, so the same knob bounds that wait too. Here
+//! the accepted stream goes straight to `hyper`: [`hyper_util::server::conn::auto::Builder`]
+//! reads the connection's first bytes itself (`ReadVersion`, up to 24 of them) to tell HTTP/1.1
+//! from an HTTP/2 preface, and that read is not this module's to wrap -- bounding it would mean
+//! reimplementing the sniff over a `Rewind`-shaped buffer. `hyper`'s own
+//! `http1().header_read_timeout(..)` is not that bound either: it starts only once the version is
+//! already decided, so a connection that says *nothing* never reaches it (and under
+//! `protocol: grpc`, served by `hyper::server::conn::http2::Builder`, there is no such knob at
+//! all). So a handshaken-then-silent connection here still holds its permit, which is the same
+//! open row as the post-handshake idle case -- `docs/known-gaps.md`'s "no idle-connection timeout
+//! on a TCP listener," deliberately left to its own effort rather than half-built per transport.
+//!
 //! **Gzip is supported; nothing else is.** `Content-Encoding: gzip` (HTTP) and a gRPC frame's own
 //! compressed flag plus `grpc-encoding: gzip` are both decoded via [`inflate`]; any other declared
 //! encoding is rejected (`415`/`grpc-status: 12`) rather than silently mishandled. Decompressing
@@ -118,6 +140,16 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// `docs/known-gaps.md` for whoever needs a measured one.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
+/// Default for [`OtlpInput::handshake_timeout`] -- how long a connection has to finish its TLS
+/// accept before this listener gives up on it and releases its
+/// [`MAX_CONCURRENT_CONNECTIONS`] permit. The same 5s `logit_in` and `syslog_in` default to
+/// (`crates/logit-inputs/src/logit.rs`, `crates/logit-inputs/src/tcp.rs`), and mirrored by hand in
+/// `logit_config`'s own `default_handshake_timeout`: one number across every TCP listener is one
+/// thing for an operator to learn. Overridden by `otlp_in`'s `handshake_timeout:` config field
+/// through [`OtlpInput::with_handshake_timeout`]. See this module's "Handshake timeout" doc
+/// section for what it does *not* bound.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Which OTLP wire transport this listener accepts. See `logit_outputs::otlp::OtlpTransport`'s
 /// identical doc comment -- same reasoning, mirrored independently rather than shared, since this
 /// crate doesn't depend on `logit-config` any more than `logit-outputs` does.
@@ -144,6 +176,8 @@ pub struct OtlpInput {
     /// workstream B. `None` after a run, so a second run rebinds, same as before this field
     /// existed.
     listener: Option<TcpListener>,
+    /// See this module's own "Handshake timeout" doc section.
+    handshake_timeout: std::time::Duration,
 }
 
 impl OtlpInput {
@@ -155,6 +189,7 @@ impl OtlpInput {
             telemetry: Telemetry::default(),
             tls: None,
             listener: None,
+            handshake_timeout: HANDSHAKE_TIMEOUT,
         }
     }
 
@@ -189,6 +224,16 @@ impl OtlpInput {
         self.tls = Some(Arc::new(crate::tls::build_server_config(settings, base_dir, alpn)?));
         Ok(self)
     }
+
+    /// Overrides [`HANDSHAKE_TIMEOUT`], the bound on this listener's TLS accept -- what
+    /// `otlp_in`'s `handshake_timeout:` config field sets. The constant stays the default when
+    /// this is never called; a test uses it to observe a silent connection actually being closed
+    /// without a multi-second sleep. Graph rule 45 rejects `0s` before it can reach here. Only
+    /// the TLS accept is bounded -- see this module's "Handshake timeout" doc section.
+    pub fn with_handshake_timeout(mut self, handshake_timeout: std::time::Duration) -> Self {
+        self.handshake_timeout = handshake_timeout;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -213,6 +258,7 @@ impl Input for OtlpInput {
         // Built once outside the loop -- `TlsAcceptor::from` just wraps the `Arc<ServerConfig>`,
         // so cloning it per connection below is cheap (an `Arc` clone, not a config rebuild).
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
+        let handshake_timeout = self.handshake_timeout;
         loop {
             let (stream, _peer) = listener.accept().await?;
             // Acquired *after* `accept`, not before: the kernel's own accept backlog still
@@ -243,13 +289,31 @@ impl Input for OtlpInput {
                 // counts against `MAX_CONCURRENT_CONNECTIONS` like any other slow request, rather
                 // than blocking `run`'s own accept loop (this module's doc comment).
                 let result = match tls_acceptor {
-                    Some(acceptor) => match acceptor.accept(stream).await {
-                        Ok(tls_stream) => {
-                            serve_connection(TokioIo::new(tls_stream), transport, sink, telemetry)
+                    // Bounded exactly the way `logit_in`'s accept loop bounds its own
+                    // (`crates/logit-inputs/src/logit.rs`): an unbounded accept lets a client
+                    // that connects and then sends no ClientHello pin this permit forever. Both
+                    // the failure and the timeout fall through to the `warn_throttled(
+                    // "connection_error", ..)` below, and the permit comes back because this task
+                    // ends -- no explicit release needed. This is the only phase bounded here;
+                    // see this module's "Handshake timeout" doc section for why.
+                    Some(acceptor) => {
+                        match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await
+                        {
+                            Ok(Ok(tls_stream)) => {
+                                serve_connection(
+                                    TokioIo::new(tls_stream),
+                                    transport,
+                                    sink,
+                                    telemetry,
+                                )
                                 .await
+                            }
+                            Ok(Err(err)) => Err(format!("TLS handshake failed: {err}")),
+                            Err(_elapsed) => Err(format!(
+                                "TLS handshake did not complete within {handshake_timeout:?}"
+                            )),
                         }
-                        Err(err) => Err(format!("TLS handshake failed: {err}")),
-                    },
+                    }
                     None => {
                         serve_connection(TokioIo::new(stream), transport, sink, telemetry).await
                     }
@@ -1562,6 +1626,59 @@ mod tests {
             !response.starts_with("HTTP/1.1"),
             "a client with no certificate should be rejected: got {response:?}"
         );
+    }
+
+    /// The handshake timeout's whole purpose (this module's "Handshake timeout" doc section):
+    /// a client that completes the TCP connect and never sends a ClientHello must not pin a
+    /// `MAX_CONCURRENT_CONNECTIONS` permit forever. `OtlpInput` has no test hook for the cap
+    /// itself (unlike `logit_in`/`syslog_in`, whose loops reject at the cap rather than block on
+    /// it), so what is asserted here is the observable half: the silent connection is *closed*
+    /// from the server side inside the budget, and the listener is still serving afterwards.
+    /// Modelled on `crate::tcp`'s
+    /// `a_silent_connection_releases_its_permit_after_the_handshake_timeout`.
+    #[tokio::test]
+    async fn a_silent_tls_connection_is_closed_after_the_handshake_timeout() {
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input
+            .with_tls(&test_tls_settings(None), &testdata_dir())
+            .unwrap()
+            .with_handshake_timeout(Duration::from_millis(50));
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Raw TCP, not a byte sent, and held (not dropped) until the close is observed -- so
+        // nothing but the server's own deadline could have closed it. A 1s read budget against a
+        // 50ms handshake timeout.
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let result = tokio::time::timeout(Duration::from_secs(1), silent.read(&mut buf))
+            .await
+            .expect("a silent TLS connection should be closed within 1s");
+        match result {
+            Ok(n) => assert_eq!(n, 0, "expected a close, got a byte"),
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(err) => panic!("read failed outright: {err}"),
+        }
+
+        // And the listener is still serving real TLS traffic afterwards.
+        let mut encoder = logit_proto::otlp::OtlpEncoder::new();
+        let payloads =
+            logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
+        let (_, body) = payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap();
+        let connector = tls_connector(None).await;
+        let response = post_raw_tls(
+            &connector,
+            &addr,
+            "/v1/metrics",
+            "Content-Type: application/x-protobuf\r\nConnection: close\r\n",
+            &body,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        recv_batch(&mut rx).await;
+
+        drop(silent);
     }
 
     fn metric_batch() -> logit_core::EventBatch {
