@@ -180,6 +180,11 @@
             "bind": {
               "type": "string"
             },
+            "handshake_timeout": {
+              "description": "**`transport: tcp` only** (rule 45 rejects a non-default value under `transport: udp`, where a datagram listener has no connection to time out). How long one connection has, **per pre-message phase**, to get somewhere before this listener closes it and hands back its connection-cap permit: the TLS accept when `tls:` is set, and then the wait for the connection's very first byte. Each phase gets its own budget of this length, so a TLS connection that says nothing at all costs up to two of them -- 10s at the default -- exactly the way `syslog_out`'s `connect_timeout` bounds its own TCP connect and TLS handshake separately.\n\n**Not an idle timeout.** Once a connection has sent its first byte there is no bound on the gap before the next frame -- a long-lived, mostly-quiet sender is ordinary syslog traffic, not a fault. A connection that goes silent *after* that first byte holds its permit indefinitely; that is a known, deliberately separate gap (`docs/known-gaps.md`'s \"no idle-connection timeout on a TCP listener\" row).",
+              "default": "5s",
+              "type": "string"
+            },
             "tls": {
               "description": "Terminates TLS on this listener when present; plaintext when omitted. Requires `transport: tcp`. No ALPN -- like `logit_in`, and unlike `otlp_in`, this isn't an HTTP-shaped protocol with anything for a client to negotiate down to. See [`TlsServerConfig`].",
               "default": null,
@@ -217,6 +222,11 @@
           ],
           "properties": {
             "bind": {
+              "type": "string"
+            },
+            "handshake_timeout": {
+              "description": "How long one connection has to finish its **TLS accept** before this listener closes it and hands back its connection-cap permit. Only meaningful under `tls:`; a plaintext listener has no phase for it to bound.\n\n**Narrower here than on `syslog_in`/`logit_in`, deliberately.** On those two the same field also bounds the wait for the first byte *after* the handshake, because their accept loops read that byte themselves. This listener hands the accepted stream straight to `hyper`, whose `hyper_util::server::conn::auto::Builder` reads the first bytes itself to tell HTTP/1.1 from h2 -- a read this listener never sees and cannot wrap without reimplementing that sniff, and one `hyper`'s own `http1().header_read_timeout(..)` does not cover either (it starts only once the version is already known). Under `protocol: grpc` there is no such knob at all. So on `otlp_in` a handshaken-then-silent connection still holds its permit: the same open row as the post-handshake idle case (`docs/known-gaps.md`'s \"no idle-connection timeout on a TCP listener\").",
+              "default": "5s",
               "type": "string"
             },
             "protocol": {
@@ -397,6 +407,11 @@
           ],
           "properties": {
             "bind": {
+              "type": "string"
+            },
+            "handshake_timeout": {
+              "description": "How long one connection has, **per pre-`Hello` phase**, to get somewhere before this listener closes it and hands back its connection-cap permit: the TLS accept when `tls:` is set, and then the `Hello` read itself. Each phase gets its own budget of this length, so a TLS connection that sends no `Hello` costs up to two of them -- 10s at the default -- exactly the way `logit_out` races every step of its own connect against its single `request_timeout`.\n\n**Not an idle timeout.** Once a connection is handshaken, the gap before its next data frame is unbounded on purpose -- an idle `logit_out` peer with nothing to send is ordinary. Such a connection holds its permit indefinitely; that is a known, deliberately separate gap (`docs/known-gaps.md`'s \"no idle-connection timeout on a TCP listener\" row).",
+              "default": "5s",
               "type": "string"
             },
             "max_frame_bytes": {
