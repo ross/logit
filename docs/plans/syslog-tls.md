@@ -176,8 +176,9 @@ retargeted to `main` when it merges. `git merge origin/main` to update, never re
 | W3 | `syslog_out` TLS | `logit-outputs/src/{syslog,tls,logit}.rs`, `logit-config/src/lib.rs`, `graph.rs`, `pipeline.rs`, `schema/logit.schema.json`, both design docs | W0 (∥ W1/W2) |
 | W4 | Recorded rsyslog-over-TCP fixture | `script/record-fixtures`, `tools/record-fixtures/rsyslog-tcp.conf` (new), `testdata/interop/syslog/rsyslog-tcp-000.raw` + `README.md`, a framer test in `tcp.rs`, `docs/plans/recorded-interop-fixtures.md` | W1 (∥ W2/W3) |
 | W5 | Round-trip tests, example, closeout | `crates/logit-cli/tests/syslog_round_trip.rs`, `examples/syslog-relay.yaml` (new), `docs/known-gaps.md`, `docs/adr/syslog-output.md`, `docs/deploying.md`, `docs/design/internal-telemetry.md`, `AGENTS.md` | W2 + W3 (+ W4) |
+| W6 | Operator-configurable `handshake_timeout` on all three TCP listeners | `logit-config/src/lib.rs`, `logit-pipeline/src/graph.rs`, `logit-inputs/src/{tcp,logit,syslog,otlp}.rs`, `logit-cli/src/pipeline.rs`, `schema/logit.schema.json`, `docs/design/pipeline-graph.md`, `docs/deploying.md`, `docs/known-gaps.md`, both syslog/native ADRs, `examples/{syslog-relay,forwarder-central}.yaml` | W5 |
 
-Landing order: **W0 → (W1 ∥ W3) → (W2 ∥ W4) → W5.**
+Landing order: **W0 → (W1 ∥ W3) → (W2 ∥ W4) → W5 → W6.**
 
 ### Status (2026-09-13)
 
@@ -193,7 +194,12 @@ write failure is always `Fault::Ambiguous`, and `connect_timeout` bounds the TCP
 handshake as separate phases — see both syslog ADRs' 2026-09-13 amendments), which this workstream
 has merged in. **Nothing in this stack is merged** — landing order and timing are Ross's call, per
 this plan's "Execution instruction" above, not something this document or any workstream branch
-decides for itself.
+decides for itself. **W6** is a follow-on stacked on W5: the 5s pre-message timeout this plan's
+driver inherited from `logit_in` becomes an operator-facing `handshake_timeout:` field on
+`syslog_in`, `logit_in`, and `otlp_in` alike (graph rule 45; both syslog and native ADRs carry a
+2026-09-13 amendment), and `otlp_in`'s previously-unbounded TLS accept is wrapped at the same time,
+closing `docs/known-gaps.md`'s row for it. It deliberately adds no idle timeout -- that row is
+amended instead with the three design questions that make it its own effort.
 
 ### Per-workstream detail
 
@@ -238,6 +244,15 @@ refused + `Fault::Clean`), modelled on `logit_round_trip.rs` but using `bind()`+
 `ephemeral_addr()`+sleep. `examples/syslog-relay.yaml` in `statsd-relay.yaml` style, `tls:` blocks
 commented as in `examples/forwarder-*.yaml`. Done: `cibuild` + `script/validate` clean; no remaining
 "`syslog_in` is UDP-only" claim outside a closed `known-gaps.md` entry.
+
+**W6** -- Test list: config round-trip (default + set, all three kinds); rule 45's zero case per
+kind, the non-default-under-UDP rejection, and both accepting cases (a *deserialized* defaulted UDP
+`syslog_in`, so `graph.rs`'s hand-mirrored `DEFAULT_HANDSHAKE_TIMEOUT` can't drift unnoticed); a new
+`otlp_in` test that a TLS listener with a 50ms budget closes a silent connection inside 1s and still
+serves a real request after; `build_spec` tests per kind that the configured value reaches the built
+listener (asserted behaviourally -- `NodeSpec::Input` is a `Box<dyn Input>`, so there is nothing to
+read the field back off). Done: `cibuild` clean, `script/schema` no diff after commit,
+`script/validate` passes, no idle timeout added anywhere.
 
 ## Verification
 

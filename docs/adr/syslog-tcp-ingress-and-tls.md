@@ -139,6 +139,17 @@ handshake timeout, and the TLS accept happening inside the per-connection spawne
 the shared accept loop, so one slow or hostile handshake only ever stalls its own connection's
 concurrency-cap slot.
 
+**Amendment (2026-09-13):** that handshake timeout is operator-tunable now, not a constant.
+`SyslogIn` carries a `handshake_timeout: Duration` field (default 5s, the same number this section
+names, still applied *per* pre-message phase -- the TLS accept, then the wait for the first byte --
+rather than as one shared deadline), and `logit_in`/`otlp_in` gained the identically-named field at
+the same time so one number and one field name cover every TCP listener. Graph rule 45 keeps it
+non-zero and, on `transport: udp`, rejects a non-default value outright: a datagram listener has no
+connection to hand shake, so set-but-ignored would be the wrong outcome for the same reason rule 43
+refuses a `tls:` block there. What did *not* change: this is still a pre-message bound only, never
+an idle timeout on an established connection -- `docs/known-gaps.md`'s idle-connection row records
+why closing that gap is its own effort with its own ADR.
+
 **One simplification against the `logit_in` template.** `logit_in` writes a clean `Reject` control
 message to a past-the-cap connection, which means doing the TLS handshake first even for a
 connection that will be refused, so the reject can be written encrypted rather than looking like a

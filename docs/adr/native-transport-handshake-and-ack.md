@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-09-09
+updated: 2026-09-13
 ---
 
 # Native transport: handshake, implicit sequencing, and per-batch acknowledgement
@@ -122,3 +122,13 @@ idle keep-alive connection's `Fanout` clone open past shutdown — a real gap, t
   kinds. The credit-window, QUIC, and OTLP-passthrough-codec follow-ups this plan explicitly
   deferred are recorded there instead, alongside `otlp_in`'s shutdown gap this ADR names above and
   `logit_in`'s currently-fixed (not operator-tunable) 5s shutdown grace.
+- **Amendment (2026-09-13):** the pre-`Hello` timeout is operator-tunable now. `LogitIn` carries a
+  `handshake_timeout: Duration` field (default 5s, still applied *per* pre-`Hello` phase -- the TLS
+  accept, then the `Hello` read -- rather than as one shared deadline), set through
+  `LogitInput::with_handshake_timeout`, which is `pub` rather than `#[cfg(test)]`. `syslog_in` and
+  `otlp_in` gained the identically-named field at the same time, so one number and one field name
+  now cover every TCP listener in the tree; `otlp_in`'s accept loop also picked up the
+  `tokio::time::timeout` around its TLS accept that this ADR's own "Connection limit" section
+  describes here, closing `docs/known-gaps.md`'s "`otlp_in`'s TLS accept has no timeout" row.
+  Graph rule 45 keeps the value non-zero. The *shutdown grace* named just above is a different
+  knob and stays fixed at 5s -- still open, still tracked in `docs/known-gaps.md`.
