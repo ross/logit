@@ -268,6 +268,10 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `statsd_out` encode_into 100 events | **0** | measured through the same `FramedEncoder::encode_into` call as the syslog row (ADR `framed-encoder`), over 100 single-counter DogStatsD events: every per-metric buffer was a reused struct field from the start, and a statsd line has no timestamp to format, so a warm `MessageBuf` never touches the allocator |
 | `prometheus_out` encode 100 series (1 gauge family) | **414** | `events_to_families` + `text::write`, no `Encoder` trait (same ADR as the decode row above) -- ~4.1/series: one `String` label key/value pair, one `MetricFamily`/`Series` entry, and the rendered text line's own buffer growth per series; not yet optimized, tracked as follow-up work alongside the decode row above |
 | `collectd_out` encode_into 100 events, warm | **0** | fixed, was 300 (~3/event) -- `CollectdEncoder` (`crates/logit-proto/src/collectd/encode.rs`) already held its own reused `packet`/`list`/`values` scratch, but `pack_list`'s `last.clone_from(cur)` fell through to `Clone`'s *default* `clone_from` (`#[derive(Clone)]` only generates `clone()`), which is `*self = source.clone()` -- a fresh `Vec` allocation per non-empty identity field (host/plugin/type, here), every single list, with the old one dropped right behind it. A hand-written `clone_from` that clears and `extend_from_slice`s each field in place fixed it; `MessageBuf<usize>` (ADR `framed-encoder`) is unrelated to this and was already warm |
+| `graphite_out` encode_into 100 plaintext events | **0** | every per-record buffer (`tag_suffix`/`path`/`line`/...) is a reused struct field from the start (`crates/logit-proto/src/graphite/encode.rs`'s own doc comment), so a warm plaintext encode of 100 single-gauge events never touches the allocator |
+| `graphite_out` encode_into 100 pickle events | **0** | pickle packing writes into the same reused `frame`/`datapoint` `Vec<u8>` fields, patching the 4-byte length prefix in place rather than copying -- no additional cost over the plaintext row above |
+| `graphite_out` encode_into 100 `Distribution` events, `multi_value: expand` | **0** | expanding into `.count`/`.sum`/`.q*` sub-paths reads an already-built `DdSketch` in place (`expand_sketch`) -- no new sketch is built, so this costs exactly what the plaintext row above costs |
+| `graphite_out` encode_into 100 `Samples` events, `multi_value: expand` | **100** | not zero, and not meant to be: expanding a raw `Samples` record first calls `Samples::sketch()`, which builds a fresh `DdSketch` accumulator from the record's raw values -- inherent to re-summarizing on the way out, and the identical cost `influxdb_out`'s own `Samples` expansion already pays. `crate::graphite::encode`'s own module doc names this as one of its two deliberate per-record-allocation exceptions; the other, a `SetMembers` expansion's de-duplication `Vec`, has no pinned row here since nothing in this effort's fixtures exercises it, but is called out for the same reason a future fixture would need to account for it too |
 
 And the corresponding times:
 
@@ -322,7 +326,13 @@ accounting as is rather than moving both producers' weights for a reason unrelat
 > `collectd_decode_one_list_with_types_db_resolution` pin. The two `generate_in` render rows are
 > the newest one, also with no wall-clock figure -- pinned by `generate_render_literal_100_events`/
 > `generate_render_templated_100_events`, with matching `generate_render_literal`/
-> `generate_render_templated` arms in `benches/pipeline.rs` for anyone who wants the timing.
+> `generate_render_templated` arms in `benches/pipeline.rs` for anyone who wants the timing. The
+> four `graphite_out` rows are the same kind of exception again, no wall-clock figure -- their
+> counts are what `graphite_encode_into_100_plaintext_events`/
+> `graphite_encode_into_100_pickle_events`/
+> `graphite_encode_into_100_distribution_events_expanded`/
+> `graphite_encode_into_100_samples_events_expanded`
+> (`crates/logit-bench/tests/allocations.rs`) pin.
 
 ### Listener I/O decoupling: the `decode_into` buffer-reuse win (ADR `decoupled-listener-io`)
 

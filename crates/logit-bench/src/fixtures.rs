@@ -1216,6 +1216,80 @@ pub fn collectd_encoder() -> logit_proto::collectd::CollectdEncoder {
     logit_proto::collectd::CollectdEncoder::new()
 }
 
+/// A positive-timestamp gauge metric event -- `graphite_out`'s encoder drops any record whose
+/// timestamp floors to a non-positive second (`crates/logit-proto/src/graphite/encode.rs`'s own
+/// drop table), unlike e.g. `distribution_event`'s `ts: 0` (built to measure encoders with no such
+/// rule), so every graphite fixture below carries a real one.
+pub fn graphite_event() -> Event {
+    Event::metric(
+        1_700_000_000_000_000_000,
+        AttrMap::new(),
+        MetricRecord::new(logit_core::interner::intern("app.requests"), MetricKind::Gauge(42.0)),
+    )
+}
+
+/// `count` copies of [`graphite_event`] in one batch, for measuring `graphite_out`'s encoder
+/// (`graphite_out: encode_into 100 events`, `tests/allocations.rs`) in both wire protocols.
+pub fn graphite_batch(count: usize) -> EventBatch {
+    let event = graphite_event();
+    EventBatch {
+        resource: resource(),
+        scope: None,
+        events: (0..count).map(|_| event.clone()).collect(),
+    }
+}
+
+pub fn graphite_encoder() -> logit_proto::graphite::GraphiteEncoder {
+    logit_proto::graphite::GraphiteEncoder::new()
+}
+
+/// [`distribution_event`]'s shape with a positive timestamp -- see [`graphite_event`]'s doc
+/// comment for why a graphite fixture can't reuse `distribution_event` as-is.
+pub fn graphite_distribution_event() -> Event {
+    let mut sketch = DdSketch::new();
+    sketch.add(0.004);
+    Event::metric(
+        1_700_000_000_000_000_000,
+        AttrMap::new(),
+        MetricRecord::new(
+            logit_core::interner::intern("nginx.request_time"),
+            MetricKind::Distribution(sketch),
+        ),
+    )
+}
+
+/// `count` copies of [`graphite_distribution_event`], for measuring `graphite_out`'s
+/// `multi_value: expand` path against a kind whose expansion allocates nothing beyond the
+/// caller's own `Vec<Event>` (unlike [`graphite_samples_batch`]'s `Samples::sketch()`).
+pub fn graphite_distribution_batch(count: usize) -> EventBatch {
+    let event = graphite_distribution_event();
+    EventBatch {
+        resource: resource(),
+        scope: None,
+        events: (0..count).map(|_| event.clone()).collect(),
+    }
+}
+
+/// A positive-timestamp `MetricKind::Samples` event -- [`samples_event`]'s shape with a real
+/// timestamp (see [`graphite_event`]'s doc comment for why), for measuring `graphite_out`'s
+/// `multi_value: expand` path against the one kind whose expansion allocates a fresh `DdSketch`
+/// per record (`Samples::sketch()`, inherent -- shared with `influxdb_out`).
+pub fn graphite_samples_batch(count: usize) -> EventBatch {
+    let event = Event::metric(
+        1_700_000_000_000_000_000,
+        AttrMap::new(),
+        MetricRecord::new(
+            logit_core::interner::intern("nginx.request_time"),
+            MetricKind::Samples(Samples::new([0.004])),
+        ),
+    );
+    EventBatch {
+        resource: resource(),
+        scope: None,
+        events: (0..count).map(|_| event.clone()).collect(),
+    }
+}
+
 /// The nginx-shaped event template both `generate_in` fixtures below render, in its all-literal
 /// form: a JSON access-log body, one `host` attribute, one `requests` counter, and a
 /// `service.name` resource.

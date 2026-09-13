@@ -2381,6 +2381,73 @@ fn collectd_encode_into_100_events() {
     expect_allocs("collectd_out: encode_into 100 events", alloc_stats, 0);
 }
 
+/// Zero, the same shape as `collectd_out`/`statsd_out` above: every per-record buffer
+/// (`tag_suffix`/`path`/`line`/...) is a reused struct field
+/// (`crates/logit-proto/src/graphite/encode.rs`'s own module doc), so a warm plaintext encode of
+/// 100 single-gauge events touches the allocator not at all. `MessageBuf<usize>` (the per-line
+/// datapoint count is its `Meta`) was already warm after `measure_framed`'s own warm-up call.
+#[test]
+fn graphite_encode_into_100_plaintext_events() {
+    let mut encoder = fixtures::graphite_encoder();
+    let batch = fixtures::graphite_batch(100);
+    let mut out = MessageBuf::<usize>::default();
+
+    let (stats, alloc_stats) = measure_framed(&mut encoder, &batch, &mut out);
+    assert_eq!(out.len(), 100);
+    assert_eq!(stats.datapoints, 100);
+    expect_allocs("graphite_out: encode_into 100 plaintext events", alloc_stats, 0);
+}
+
+/// Zero as well: pickle packing writes straight into the same reused `frame`/`datapoint` `Vec<u8>`
+/// struct fields (`GraphiteEncoder`'s own doc comment), patching the length prefix in place rather
+/// than copying, so this pays no more than the plaintext row above.
+#[test]
+fn graphite_encode_into_100_pickle_events() {
+    let mut encoder =
+        fixtures::graphite_encoder().with_protocol(logit_proto::graphite::Protocol::Pickle);
+    let batch = fixtures::graphite_batch(100);
+    let mut out = MessageBuf::<usize>::default();
+
+    let (stats, alloc_stats) = measure_framed(&mut encoder, &batch, &mut out);
+    assert!(!out.is_empty());
+    assert_eq!(stats.datapoints, 100);
+    expect_allocs("graphite_out: encode_into 100 pickle events", alloc_stats, 0);
+}
+
+/// Zero: expanding a `Distribution` into its `.count`/`.sum`/`.q*` sub-paths reads an
+/// already-built `DdSketch` in place (`expand_sketch`) -- no new sketch is built, unlike the
+/// `Samples` row below, so this pays exactly what the plaintext row above pays.
+#[test]
+fn graphite_encode_into_100_distribution_events_expanded() {
+    let mut encoder =
+        fixtures::graphite_encoder().with_multi_value(logit_proto::graphite::MultiValue::Expand);
+    let batch = fixtures::graphite_distribution_batch(100);
+    let mut out = MessageBuf::<usize>::default();
+
+    let (stats, alloc_stats) = measure_framed(&mut encoder, &batch, &mut out);
+    assert_eq!(stats.degraded_expanded_kind, 100);
+    expect_allocs("graphite_out: encode_into 100 Distribution events (expand)", alloc_stats, 0);
+}
+
+/// Not zero, and not meant to be: expanding a raw `Samples` record first calls
+/// `Samples::sketch()`, which builds a fresh `DdSketch` accumulator from the record's raw values
+/// -- inherent to re-summarizing a `Samples` on the way out, and the identical cost
+/// `influxdb_out`'s own `Samples` expansion already pays (`crates/logit-proto/src/graphite/
+/// encode.rs`'s `expand` doc comment). Pinned so a *rise* here is still caught, exactly like every
+/// other row in this file -- see `docs/design/memory.md` §3 for the one-`DdSketch`-per-record
+/// accounting.
+#[test]
+fn graphite_encode_into_100_samples_events_expanded() {
+    let mut encoder =
+        fixtures::graphite_encoder().with_multi_value(logit_proto::graphite::MultiValue::Expand);
+    let batch = fixtures::graphite_samples_batch(100);
+    let mut out = MessageBuf::<usize>::default();
+
+    let (stats, alloc_stats) = measure_framed(&mut encoder, &batch, &mut out);
+    assert_eq!(stats.degraded_expanded_kind, 100);
+    expect_allocs("graphite_out: encode_into 100 Samples events (expand)", alloc_stats, 100);
+}
+
 /// `prometheus_out`'s encode path, like `prometheus_in`'s, is two plain functions rather than a
 /// `Decoder`/`Encoder` trait call (`docs/adr/prometheus-scrape-and-exposition.md`'s "No
 /// `logit_proto::Encoder`" section): `events_to_families` (a stateful sink's `send`) then
