@@ -17,6 +17,18 @@
 # writes, periodic checkpoints), so its wall time swings far more under contention from other disk
 # activity on the same machine than any in-memory scenario's does -- expect more run-to-run
 # variance here than elsewhere in this directory.
+#
+# The *dominant* source of that variance, confirmed by investigation (docs/design/performance.md's
+# `buffered` notes), isn't external contention at all: `DiskQueue::open`
+# (crates/logit-pipeline/src/disk_queue.rs) unconditionally reads and CRC-walks the entire *active*
+# segment file to validate it on every startup, an O(segment size) cost paid whether or not the
+# read cursor has anything left to replay. This scenario's spool (`../results/spool`, gitignored,
+# never cleared between runs or repeats) accumulates: one run's ~21MB doesn't trigger the default
+# 64MiB rotation, so each successive repeat/run re-validates a bigger file than the last, and
+# throughput degrades monotonically within a single `--repeat N` invocation as a direct result.
+# Delete `perf/results/spool/` before a solo before/after comparison. The real fix -- the harness
+# clearing a disk-backed scenario's spool before each `run`/`attribute` invocation -- is tracked as
+# follow-up work (docs/known-gaps.md), not done here.
 components:
   gen:
     type: generate_in

@@ -193,7 +193,20 @@ since the receiver resets its sticky state at every datagram edge and `max_packe
 where those edges fall) rather than the one-blob-per-batch `Encoder`. So `collectd_in ->
 collectd_out` is a fixed point modulo its own named normalization list
 ([ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md),
-[examples/collectd-relay.yaml](examples/collectd-relay.yaml)).
+[examples/collectd-relay.yaml](examples/collectd-relay.yaml)). `generate_in`/`null_out`
+(`crates/logit-inputs`/`crates/logit-outputs`) are two more real, unconditionally-shipped
+`ComponentKind`s, but not protocol work like everything above -- a declarative event generator
+(`event:` templates via `logit_core::template`, `{seq}`/`{seq%N}` placeholders) and a sink that
+discards, built for one purpose: driving `crates/logit-perf` (bin `logit-perf`, `script/perf
+run|compare|attribute|flamegraph|list`), the out-of-CI load-test harness that spawns the real
+release `logit run <config>` process against `perf/scenarios/*.yaml` and measures events/s, CPU
+µs/event (the regression gate), and peak RSS, with `attribute` decoding a temporary `internal`
+telemetry leg into a per-node time breakdown and `flamegraph` driving `perf`/`inferno` in a
+throwaway image. [ADR `load-test-harness`](docs/adr/load-test-harness.md),
+[docs/plans/load-test-harness.md](docs/plans/load-test-harness.md), and
+[docs/design/performance.md](docs/design/performance.md) (the first recorded run) have the full
+account; the harness is built and runnable by hand, deliberately not wired into `script/cibuild`
+or any schedule yet.
 
 ## Environment
 
@@ -325,12 +338,18 @@ crates/
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
-  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry)
-  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd
+  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry), generate_in (load-test event generator)
+  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, null_out (load-test discard sink)
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, logfmt, kv, regex
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
+  logit-perf        dev-only, publish = false: the load-test harness binary (`logit-perf`, `script/perf`) -- spawns the real logit-cli binary against perf/scenarios/*.yaml (docs/adr/load-test-harness.md, docs/design/performance.md)
 ```
+
+`perf/scenarios/*.yaml` are the harness's own shipped configs (ordinary `logit` YAML, a
+`generate_in` listener into `null_out` or a real sink), covered by `script/validate` and
+`every_shipped_config_loads_and_validates` alongside `demo/`/`examples/`; `perf/results/` is
+where `script/perf run`/`attribute`/`flamegraph` write their (gitignored) output.
 
 `logit-inputs`/`logit-outputs`/`logit-transforms` depend on `logit-pipeline` for their trait, not
 the other way around (`docs/design/pipeline-graph.md`'s "Crate layout" section) -- this is what

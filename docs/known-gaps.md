@@ -1330,3 +1330,44 @@ already built that have a known, accepted rough edge.
   `MAX_LOGS_PER_COMPONENT`'s bound-and-drop. Not built now — nothing shipped needs it, and the
   throttle already covers the actual hot path (a malformed line, a parse failure) this would
   otherwise protect.
+
+- **`generate_in`'s `rate:` pacing is millisecond-granular above roughly 1k batches/s.** The
+  wall-clock catch-up loop (`due = elapsed * rate`; sleep until `start + (sent+n)/rate` when
+  ahead) can't subdivide a single OS sleep below about 1ms, so a configured `rate` above roughly
+  1,000 batches/s (the default `batch: 100`, so above ~100k events/s) is accurate on average but
+  bursty within any one millisecond rather than smooth. Named as a risk at design time
+  ([ADR `load-test-harness`](adr/load-test-harness.md), `docs/plans/load-test-harness.md`), not
+  fixed: none of `perf/scenarios/*.yaml` sets `rate:` at all (every scenario measures unthrottled,
+  backpressure-only throughput), so nothing shipped is affected by it today.
+- **`script/perf compare` has no cross-run noise model.** It diffs two results files' medians
+  directly against `--threshold`, with no notion of how much run-to-run variance either file's own
+  `repeats:` already show. A scenario whose own repeats already spread more than `--threshold`
+  (`buffered` far more than any other, see below) can trip a "regression" on nothing but scheduling
+  luck, and a real regression smaller than that scenario's noise floor can pass silently. `compare`
+  already warns on a host/CPU-model mismatch between the two files; it has no equivalent warning
+  for "this scenario's own repeats disagree by more than the threshold you're gating on" — worth
+  closing before this harness ever gates anything automatically, not before ([ADR
+  `load-test-harness`](adr/load-test-harness.md)'s "when the harness runs" open question).
+- **`buffered`'s events/s is the least reproducible number this harness reports, and the mechanism
+  is now understood.** `crates/logit-pipeline/src/disk_queue.rs`'s `DiskQueue::open` unconditionally
+  reads and CRC-walks the *entire* active segment file to validate it for a torn tail, every time a
+  disk-backed sink starts up — an O(segment size) cost paid regardless of whether the read cursor
+  has anything left to replay. `perf/scenarios/buffered.yaml`'s spool
+  (`perf/results/spool/`, gitignored, never cleared by the harness) accumulates across every repeat
+  and every invocation that reuses it: the default `segment_bytes` (64MiB) means one run's ~21MB of
+  spooled frames doesn't trigger rotation, so each subsequent repeat's `DiskQueue::open` re-validates
+  an ever-larger file than the one before it. Measured directly: a solo `script/perf run --repeat 5
+  --scenario buffered` against a spool already left over from a prior run degraded monotonically,
+  134k → 75k → 53k → 38k → 27k events/s, with peak RSS climbing 56 → 110 MiB alongside it; deleting
+  `perf/results/spool/` first and re-running showed the same shape from a higher starting point
+  (615k → 939k → 289k → 126k → 80k) — still degrading within the one invocation, because the
+  harness's own repeats share the same spool directory and never reset it either. See
+  [`docs/design/performance.md`](design/performance.md)'s `buffered` notes for the full account.
+  The fix belongs to the harness, not the runtime — `script/perf run`/`attribute` should clear a
+  disk-backed scenario's spool directory before each invocation (and arguably between repeats) — and
+  is tracked as follow-up work, not done here.
+- **When and how the load-test harness runs in the ongoing development process is deliberately
+  undecided.** [ADR `load-test-harness`](adr/load-test-harness.md)'s own "Open question" section:
+  nightly, manually-triggered, gating a PR on a `compare --threshold` regression, or some other
+  cadence entirely is real future work this effort didn't answer, not an oversight — the harness is
+  built and runnable by hand, and nothing wires it into CI, a pre-merge gate, or a schedule yet.
