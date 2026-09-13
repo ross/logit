@@ -26,6 +26,7 @@ use logit_outputs::collectd::CollectdOutput;
 use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::logit::LogitOutput;
+use logit_outputs::null::NullOutput;
 use logit_outputs::otlp::{
     OtlpCompression as OtlpOutCompression, OtlpOutput, OtlpTransport as OtlpOutTransport,
     SignalPaths,
@@ -741,12 +742,12 @@ fn build_spec(
         }
 
         // The `generate_in` stub's twin -- `logit_outputs::null::NullOutput` and this arm are the
-        // perf harness's W3 (`docs/plans/load-test-harness.md`). It gets the same
-        // `queue_config`/`write_config` treatment as every other sink when it lands, so `buffer:`
-        // (disk included) works on it.
-        NullOut {} => todo!(
-            "null_out: build NullOutput with the usual queue/write config -- \
-             docs/plans/load-test-harness.md, workstream W3"
+        // perf harness's W3 (`docs/plans/load-test-harness.md`). Same `queue_config`/
+        // `write_config` treatment as every other sink, so `buffer:` (disk included) works on it.
+        NullOut {} => NodeSpec::Output(
+            Box::new(NullOutput),
+            queue_config(&component.buffer, base_dir),
+            write_config(&component.buffer),
         ),
     };
     Ok((spec, telemetry))
@@ -1396,6 +1397,21 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_builds_a_null_sink() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::NullOut {},
+        };
+        assert!(matches!(
+            build_spec("out", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    #[test]
     fn build_spec_builds_an_otlp_input() {
         for protocol in [logit_config::OtlpProtocol::Http, logit_config::OtlpProtocol::Grpc] {
             let component = ResolvedComponent {
@@ -1908,6 +1924,41 @@ mod tests {
         assert_eq!(disk_config.segment_bytes, 128 * 1024 * 1024);
         assert_eq!(disk_config.compression, NativeCompression::Lz4);
         assert_eq!(disk_config.checkpoint_interval, Duration::from_secs(5));
+    }
+
+    /// The load-test harness's `buffered` scenario (`docs/plans/load-test-harness.md`) is exactly
+    /// this shape: a `null_out` behind `buffer.disk`, proving a disk-backed spool builds and runs
+    /// with no real destination behind it -- `NullOutput` itself has nothing disk-related about
+    /// it, so this is really exercising `queue_config`'s disk branch for a sink that takes no
+    /// fields of its own.
+    #[test]
+    fn build_spec_builds_a_null_sink_behind_a_disk_buffer_and_resolves_a_disk_sinkstoreconfig() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig {
+                disk: Some(logit_config::DiskBufferConfig {
+                    path: "spool".to_string(),
+                    max_bytes: 2 * 1024 * 1024 * 1024,
+                    segment_bytes: 128 * 1024 * 1024,
+                    compression: logit_config::Compression::Lz4,
+                    checkpoint_interval: Duration::from_secs(5),
+                }),
+                ..logit_config::BufferConfig::default()
+            },
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::NullOut {},
+        };
+        let NodeSpec::Output(_, store_config, _) =
+            build_spec("out", &component, Path::new("/etc/logit"), None).unwrap().0
+        else {
+            panic!("expected NodeSpec::Output");
+        };
+        let SinkStoreConfig::Disk(disk_config) = store_config else {
+            panic!("expected SinkStoreConfig::Disk, buffer.disk was Some");
+        };
+        assert_eq!(disk_config.dir, Path::new("/etc/logit/spool"));
+        assert_eq!(disk_config.max_bytes, 2 * 1024 * 1024 * 1024);
     }
 
     #[test]
