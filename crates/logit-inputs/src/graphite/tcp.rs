@@ -61,10 +61,18 @@ pub struct ConnectionConfig {
 /// - **One connection's error is never fatal** -- only `accept` failing is. A client disconnecting
 ///   mid-line, a hostile pickle frame, a reset: all `connection_error`, exactly as `otlp_in` and
 ///   `logit_in` treat theirs.
-/// - **Shutdown waits for the connections.** Each serving task watches the same signal, flushes its
-///   accumulator and returns; this loop then joins them all rather than returning immediately, so
-///   `InputRuntimeConfig::shutdown_grace` (`logit_pipeline::runtime::run_input`'s backstop) is what
-///   actually bounds the drain -- which is the contract `crate::Input::run_until_shutdown` states.
+/// - **Teardown waits for the connections, and always reaches them.** Each serving task watches
+///   the component's own shutdown signal *and* a second, local one this loop owns; whichever way
+///   the loop ends it flips the local signal, then joins every task rather than returning
+///   immediately, so each connection finishes its current read, flushes its accumulator and
+///   returns. On the shutdown path the local signal is redundant (the task is already watching the
+///   component's). On the `accept`-error path it is the only thing that ever tells them: nothing
+///   flips the component's signal there, so without it a single idle client would park this drain
+///   forever and the error would never reach `run_input` -- which only arms its `shutdown_grace`
+///   backstop once shutdown has actually fired. `logit_in` propagates an accept error immediately
+///   for the same reason; this is that property, kept while still letting each connection flush.
+///   `InputRuntimeConfig::shutdown_grace` is what bounds the orderly drain -- the contract
+///   `crate::Input::run_until_shutdown` states.
 pub async fn run_accept_loop(
     listener: TcpListener,
     sink: Fanout,
@@ -77,6 +85,10 @@ pub async fn run_accept_loop(
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
     let live_connections = Arc::new(AtomicI64::new(0));
     let mut connections = JoinSet::new();
+    // This loop's own teardown signal, distinct from the component's -- see the "Teardown" bullet
+    // above. A local `watch` rather than a `CancellationToken` because `tokio-util` is not a
+    // dependency of this crate and this effort adds none.
+    let (cancel, cancel_rx) = watch::channel(false);
 
     let result = loop {
         let accepted = tokio::select! {
@@ -113,6 +125,7 @@ pub async fn run_accept_loop(
             .with_telemetry(telemetry.clone());
         let live_connections = Arc::clone(&live_connections);
         let conn_shutdown = shutdown.clone();
+        let conn_cancel = cancel_rx.clone();
         connections.spawn(async move {
             let _permit = permit; // held for the connection's lifetime; released on drop
             gauge_connections(&telemetry, &live_connections, 1);
@@ -124,6 +137,7 @@ pub async fn run_accept_loop(
                 &mut diag,
                 telemetry.clone(),
                 conn_shutdown,
+                conn_cancel,
             )
             .await;
             gauge_connections(&telemetry, &live_connections, -1);
@@ -133,9 +147,12 @@ pub async fn run_accept_loop(
         });
     };
 
-    // Shutdown, or a fatal `accept` error: every serving task holds its own copy of the signal and
-    // is already winding down, so this only has to wait for them. `run_input`'s grace backstop is
-    // what bounds the wait.
+    // Whichever way the loop ended, this component is going away -- so tell the serving tasks so
+    // themselves rather than assuming they already know. On the shutdown path they do (they watch
+    // the component's signal too) and this is a no-op; on the `accept`-error path nothing else
+    // ever would, and the drain below would never finish while any client stayed connected. Each
+    // task still runs its final flush either way; `run_input`'s grace backstop bounds the wait.
+    let _ = cancel.send(true);
     while connections.join_next().await.is_some() {}
     result
 }
@@ -156,10 +173,18 @@ fn gauge_connections(telemetry: &Telemetry, live: &AtomicI64, delta: i64) {
 /// `batch_flush_interval` mean the same thing on both. What differs is that the source is a socket
 /// read rather than a queue pop, so there is no separate read loop and no queue between them.
 ///
-/// Shutdown is checked before each read and raced against it, never *during* the decode/send that
-/// follows: an in-flight read's worth of lines is always finished and flushed, which is what makes
-/// "drains within grace" true rather than best-effort.
-#[allow(clippy::too_many_arguments)] // one helper is clearer than a params struct for 7 unrelated threaded-through values
+/// Both stop signals -- the component's `shutdown` and [`run_accept_loop`]'s own `cancel` -- are
+/// checked before each read and raced against it, never *during* the decode/send that follows: an
+/// in-flight read's worth of lines is always finished and flushed, which is what makes "drains
+/// within grace" true rather than best-effort.
+///
+/// **Every exit runs the final flush**, including a read error. Returning `?` straight out of the
+/// read would silently drop everything this connection had decoded since its last flush -- up to
+/// `batch_max_events` of it -- with no counter, and an abnormal close (a `SO_LINGER 0` RST from a
+/// carbon client, say) is exactly when that is most likely. So the read's error is *stored*, the
+/// loop breaks, the flush runs, and the stored outcome is what the caller sees and diagnoses as
+/// `connection_error`.
+#[allow(clippy::too_many_arguments)] // one helper is clearer than a params struct for 8 unrelated threaded-through values
 async fn serve_connection(
     mut stream: TcpStream,
     mut decoder: GraphiteDecoder,
@@ -168,6 +193,7 @@ async fn serve_connection(
     diag: &mut Diagnostics,
     telemetry: Telemetry,
     mut shutdown: watch::Receiver<bool>,
+    mut cancel: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut accumulator = BatchAccumulator::new(config.batch_max_events, config.batch_max_bytes);
     // Reused across every `decode_into` call and cleared (not replaced) between them, so its
@@ -183,6 +209,17 @@ async fn serve_connection(
     let has_interval = !config.batch_flush_interval.is_zero();
     let mut next_flush =
         has_interval.then(|| tokio::time::Instant::now() + config.batch_flush_interval);
+
+    // Why this connection stopped, which is what the final flush is tagged with. `Closed` is the
+    // default because it is what every *ordinary* exit is -- a clean FIN, a read error, an
+    // oversize pickle frame -- and `FlushReason::Closed` means exactly that: one source among
+    // several ended while the listener keeps running (`logit_pipeline::accumulator`'s own doc, and
+    // the split `logit_inputs::tail` already uses). `Shutdown` is the whole component going away,
+    // so only the stop-signal exits below claim it -- otherwise a healthy listener would report
+    // `receive.flushed{reason="shutdown"}` every time a client hung up.
+    let mut exit_reason = FlushReason::Closed;
+    // A read error, held until after the flush -- see this function's doc comment.
+    let mut outcome: anyhow::Result<()> = Ok(());
 
     loop {
         if let Some(deadline) = next_flush {
@@ -201,9 +238,10 @@ async fn serve_connection(
 
         // Checked explicitly rather than left to the `select!` below, for `logit_in`'s reason: a
         // `changed()` arm only fires on a transition this receiver hasn't observed yet, which
-        // would miss "already shutting down when this connection's loop started". The `Ref` from
-        // `borrow()` is dropped at the end of this statement, well before any `.await`.
-        if *shutdown.borrow() {
+        // would miss "already stopping when this connection's loop started". Both `Ref`s are
+        // dropped at the end of this statement, well before any `.await`.
+        if *shutdown.borrow() || *cancel.borrow() {
+            exit_reason = FlushReason::Shutdown;
             break;
         }
 
@@ -211,7 +249,8 @@ async fn serve_connection(
         let read = match next_flush {
             None => tokio::select! {
                 read = stream.read_buf(&mut buf) => read,
-                _ = shutdown.changed() => break,
+                _ = shutdown.changed() => { exit_reason = FlushReason::Shutdown; break }
+                _ = cancel.changed() => { exit_reason = FlushReason::Shutdown; break }
             },
             Some(deadline) => {
                 let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -220,13 +259,20 @@ async fn serve_connection(
                         Ok(read) => read,
                         Err(_elapsed) => continue,
                     },
-                    _ = shutdown.changed() => break,
+                    _ = shutdown.changed() => { exit_reason = FlushReason::Shutdown; break }
+                    _ = cancel.changed() => { exit_reason = FlushReason::Shutdown; break }
                 }
             }
         };
-        if read? == 0 {
+        match read {
             // Clean close -- the ordinary way a carbon sender ends a connection.
-            break;
+            Ok(0) => break,
+            Ok(_) => {}
+            // Stored rather than `?`d, so the flush below still runs -- see this function's doc.
+            Err(err) => {
+                outcome = Err(err.into());
+                break;
+            }
         }
 
         let received_at = now_nanos();
@@ -277,9 +323,9 @@ async fn serve_connection(
     }
 
     if let Some(batch) = accumulator.take() {
-        emit(&sink, &telemetry, batch, FlushReason::Shutdown).await;
+        emit(&sink, &telemetry, batch, exit_reason).await;
     }
-    Ok(())
+    outcome
 }
 
 /// One connection's read buffer and the bound that applies to it -- `max_line_bytes` under

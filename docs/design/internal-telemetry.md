@@ -452,7 +452,7 @@ point every datagram passes through:
 | `logit.component.receive.push.blocked.duration` | timing | only under `overflow: block`, only when a push actually waited |
 | `logit.component.receive.latency` | timing | arrival (`Datagram::received_at`) → dequeue, per datagram — the number that says whether event timestamps are trustworthy under load |
 | `logit.component.datagrams.dropped{reason=...}` / `.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction) |
-| `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown`/`closed` — a `BatchAccumulator` emission. `closed` (`tail_in`/`docker_in` only) is a single tracked file's own accumulator flushing because that file rotated away or was removed, while the listener itself keeps running — distinct from `shutdown`, the whole component stopping. |
+| `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown`/`closed` — a `BatchAccumulator` emission. `closed` is **a single tracked file or connection** ending and flushing its own accumulator on the way out: a `tail_in`/`docker_in` file that rotated away or was removed, or a `graphite_in` TCP connection the client closed or reset, or that was dropped for an oversize frame — in every case while the listener itself keeps running. Distinct from `shutdown`, the whole component stopping. An ordinary client disconnect shows up here as `closed`, never as `shutdown`. |
 | `logit.input.receive_buffer.bytes` / `.requested.bytes` | gauge | granted `SO_RCVBUF` after any kernel clamp, and what was actually requested (absent when unset) — sampled once at bind |
 
 Three naming choices worth calling out, since the obvious names collide with existing ones: drops
@@ -524,10 +524,15 @@ Worked examples, one per shipped component:
   The codec adds its own, under both transports:
   `logit.input.metrics.skipped{reason="bad_line"|"bad_tag"|"bad_timestamp"|"non_finite_value"|
   "bad_shape"}` and `logit.input.tags.normalized{reason="duplicate_key"}` (a repeated carbon tag
-  key collapsing to its last value, which is what carbon's own `TaggedSeries.parse` does). Two of
-  that family's reasons are the *listener's* rather than the codec's, because framing is:
+  key collapsing to its last value, which is what carbon's own `TaggedSeries.parse` does). Exactly
+  one of that family's reasons is the *listener's* rather than the codec's, because framing is:
   `{reason="oversize_line"}`, counted once when a TCP plaintext line passes `max_line_bytes` with
-  no newline in it (the reader then drains to the next one). `Diagnostics` keys, mirrored as
+  no newline in it (the reader then drains to the next one). The other framing failure,
+  `oversize_frame`, has no counter of its own at all -- it closes the connection, and the
+  datapoints lost with it were never framed, so there is no honest number to report; it is a
+  diagnostic only. Its per-connection accumulator flushes as `receive.flushed{reason="closed"}`
+  when a client hangs up and `{reason="shutdown"}` only when the component itself is going away.
+  `Diagnostics` keys, mirrored as
   `logit.component.diagnostics{key}` by the bridge: `bound`, the codec's `bad_line`/`bad_tag`/
   `bad_timestamp`/`non_finite_value`/`duplicate_tag_key`/`bad_pickle`, and this listener's own
   `oversize_line`, `oversize_frame` (a pickle frame declaring more than `max_frame_bytes` -- the
