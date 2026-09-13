@@ -69,6 +69,11 @@
 //!    isn't valid UTF-8 is simply not stamped as a `syslog.hostname` attribute -- reported
 //!    through a throttled `hostname_not_utf8` diagnostic -- rather than reaching the wire on the
 //!    far end at all.
+//!
+//! `mod tcp`/`mod tls` below add no new entry to this list -- `transport: tcp` (and TLS on top of
+//! it, RFC 5425) changes framing and, for TLS, transport security, never message content; every
+//! normalization above still applies unchanged, since both transports share the same
+//! `SyslogEncoder`/`SyslogDecoder` (`docs/adr/syslog-tcp-ingress-and-tls.md`).
 
 use bytes::Bytes;
 use logit_core::{Event, EventBatch, Value};
@@ -503,4 +508,436 @@ async fn opt_in_structured_data_lifts_non_syslog_attributes_into_syslog_sd() {
     // The opt-in element's PARAM-VALUEs always render as strings (module doc's "STRUCTURED-DATA"
     // section) -- `retries` comes back as `Value::Str("3")`, not `Value::U64(3)`.
     assert_eq!(params.get("retries").and_then(Value::as_str), Some("3"));
+}
+
+// ---- transport: tcp -----------------------------------------------------------------------
+
+/// `syslog_out(transport: tcp) -> syslog_in(transport: tcp)`, over the same fixture corpus the
+/// UDP tests above use, plus the two cases only a stream transport can exercise at all: a raw
+/// LF-framed client with no `syslog_out` involved, and an octet-counted MSG whose body contains an
+/// embedded newline. `docs/adr/syslog-tcp-ingress-and-tls.md`.
+mod tcp {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
+
+    /// TCP twin of the top-level [`Harness`]: same `bind()`-then-`local_addr()` readiness for the
+    /// live `syslog_in`, plus a raw TCP "capture" listener standing in for the UDP capture socket
+    /// above -- it accepts one connection per round trip and reads it to EOF, since a fresh
+    /// `SyslogOutput::tcp` per call closes its connection (and so EOFs the peer) the moment it is
+    /// dropped.
+    struct TcpHarness {
+        capture_addr: SocketAddr,
+        capture_rx: mpsc::Receiver<Vec<u8>>,
+        input_addr: SocketAddr,
+        rx: mpsc::Receiver<Delivered>,
+    }
+
+    impl TcpHarness {
+        async fn new() -> Self {
+            let capture =
+                TokioTcpListener::bind("127.0.0.1:0").await.expect("binding the capture listener");
+            let capture_addr =
+                capture.local_addr().expect("capture listener should have a local addr");
+            let (capture_tx, capture_rx) = mpsc::channel(16);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = capture.accept().await else { break };
+                    let tx = capture_tx.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let _ = stream.read_to_end(&mut buf).await;
+                        let _ = tx.send(buf).await;
+                    });
+                }
+            });
+
+            let mut input = SyslogInput::tcp("127.0.0.1:0");
+            input.bind().await.expect("binding the tcp syslog_in listener");
+            let input_addr = input.local_addr().expect("bind() should leave a real address behind");
+
+            let (tx, rx) = mpsc::channel(16);
+            let sink = Fanout::new(vec![tx]);
+            tokio::spawn(async move {
+                let _ = input.run(sink).await;
+            });
+
+            Self { capture_addr, capture_rx, input_addr, rx }
+        }
+
+        /// Sends `batch` through a fresh TCP [`SyslogOutput`] built from `encoder()` -- once at the
+        /// raw capture listener, once at the live `syslog_in` -- and returns the captured
+        /// octet-counted frame alongside the [`EventBatch`] the real input decoded from it
+        /// (receipt-time `timestamp` fields already normalized). Mirrors the UDP
+        /// [`Harness::round_trip`] exactly, modulo the transport.
+        async fn round_trip(
+            &mut self,
+            batch: &EventBatch,
+            encoder: impl Fn() -> SyslogEncoder,
+        ) -> (Vec<u8>, EventBatch) {
+            let mut to_capture =
+                SyslogOutput::tcp(self.capture_addr.to_string(), Duration::from_secs(2))
+                    .with_encoder(encoder());
+            to_capture.send(batch).await.expect("send to the capture listener");
+            drop(to_capture); // closes the connection, EOFing the capture task's read_to_end
+            let framed = tokio::time::timeout(Duration::from_millis(500), self.capture_rx.recv())
+                .await
+                .expect("capture listener should receive the frame")
+                .expect("the capture channel should not have closed");
+
+            let mut to_input =
+                SyslogOutput::tcp(self.input_addr.to_string(), Duration::from_secs(2))
+                    .with_encoder(encoder());
+            to_input.send(batch).await.expect("send to the live syslog_in");
+            drop(to_input);
+            let delivered = tokio::time::timeout(Duration::from_millis(500), self.rx.recv())
+                .await
+                .expect("syslog_in should decode and forward the batch")
+                .expect("the Fanout channel should not have closed");
+            let mut decoded = logit_pipeline::unwrap_batch(delivered);
+            normalize_receipt_time(&mut decoded);
+            (framed, decoded)
+        }
+    }
+
+    /// Splits an RFC 6587 section 3.4.1 octet-counted frame into `MSG-LEN` and `MSG`, asserting
+    /// the count matches the message's actual length -- `syslog_out`'s TCP transport emits no
+    /// other framing (`docs/adr/syslog-output.md`'s "Transport" section), so this is the one thing
+    /// a TCP round trip needs to check that the UDP path above doesn't.
+    fn split_octet_counted(frame: &[u8]) -> &[u8] {
+        let sp = frame.iter().position(|&b| b == b' ').expect("a leading MSG-LEN SP");
+        let len: usize =
+            std::str::from_utf8(&frame[..sp]).unwrap().parse().expect("a numeric MSG-LEN");
+        let msg = &frame[sp + 1..];
+        assert_eq!(msg.len(), len, "MSG-LEN must equal the actual message length");
+        msg
+    }
+
+    /// TCP twin of the top-level `assert_byte_for_byte`: same fixture, same `.expected` bytes, but
+    /// the captured wire bytes are an octet-counted frame around them rather than a bare UDP
+    /// datagram.
+    async fn assert_byte_for_byte_tcp(
+        harness: &mut TcpHarness,
+        fixture: &str,
+        format: Format,
+        raw: &[u8],
+    ) {
+        let batch = direct_batch(raw); // already receipt-time normalized
+        let expected = expected_bytes(fixture, raw);
+        let (framed, decoded) = harness.round_trip(&batch, || SyslogEncoder::new(format, 16)).await;
+        let msg = split_octet_counted(&framed);
+        assert_eq!(
+            msg,
+            expected.as_slice(),
+            "{fixture}: the octet-counted MSG should match .expected (modulo the module doc's \
+             permitted normalizations)"
+        );
+        assert_eq!(
+            decoded, batch,
+            "{fixture}: decode(sink_output) should equal the original decode, as a whole EventBatch"
+        );
+    }
+
+    /// `syslog_out(transport: tcp) -> syslog_in(transport: tcp)`, over the same corpus the UDP
+    /// tests above use -- the framing changes (RFC 6587 octet-counting), the content and
+    /// permitted normalizations don't (this file's module doc).
+    #[tokio::test]
+    async fn fixture_corpus_round_trips_over_tcp() {
+        let mut harness = TcpHarness::new().await;
+
+        let rfc5424_cases: &[&str] = &[
+            "rfc5424-example1",
+            "rfc5424-example2",
+            "rfc5424-example3",
+            "rfc5424-example4",
+            "rfc5424-sd-escapes",
+            "rfc5424-sd-repeated-param",
+            "rfc5424-sd-dotted-id",
+            "rfc5424-nil-timestamp-full",
+            "rfc5424-non-numeric-procid",
+            "rfc5424-non-utf8-msg",
+        ];
+        for name in rfc5424_cases {
+            let raw = read_fixture(name, "in");
+            assert_byte_for_byte_tcp(&mut harness, name, Format::Rfc5424, &raw).await;
+        }
+        let raw = read_testdata("logger-rfc5424-basic-000.raw");
+        assert_byte_for_byte_tcp(
+            &mut harness,
+            "interop-logger-rfc5424-basic",
+            Format::Rfc5424,
+            &raw,
+        )
+        .await;
+
+        let rfc3164_cases: &[&str] = &["rfc3164-nonnumeric-pid", "rfc3164-non-utf8-msg"];
+        for name in rfc3164_cases {
+            let raw = read_fixture(name, "in");
+            assert_byte_for_byte_tcp(&mut harness, name, Format::Rfc3164, &raw).await;
+        }
+        // Interop captures carrying their own well-formed RFC 3164 TIMESTAMP -- deterministic,
+        // exactly the UDP corpus's own "deterministic" list above.
+        let deterministic: &[(&str, &str)] = &[
+            ("logger-rfc3164-basic-000.raw", "interop-logger-rfc3164-basic"),
+            ("logger-rfc3164-unicode-000.raw", "interop-logger-rfc3164-unicode"),
+            ("rsyslog-000.raw", "interop-rsyslog"),
+        ];
+        for (testdata_name, fixture_name) in deterministic {
+            let raw = read_testdata(testdata_name);
+            assert_byte_for_byte_tcp(&mut harness, fixture_name, Format::Rfc3164, &raw).await;
+        }
+    }
+
+    /// A raw client speaking non-transparent (LF-delimited) framing -- rsyslog's `omfwd` default,
+    /// and the framing this listener falls back to whenever the first byte isn't an ASCII digit
+    /// (`docs/adr/syslog-tcp-ingress-and-tls.md`) -- decodes exactly like the UDP path, with no
+    /// `syslog_out` involved at all.
+    #[tokio::test]
+    async fn a_raw_lf_framed_client_is_decoded_like_udp() {
+        let mut input = SyslogInput::tcp("127.0.0.1:0");
+        input.bind().await.expect("binding the tcp syslog_in listener");
+        let addr = input.local_addr().expect("bind() should leave a real address behind");
+        let (tx, mut rx) = mpsc::channel(16);
+        let sink = Fanout::new(vec![tx]);
+        tokio::spawn(async move {
+            let _ = input.run(sink).await;
+        });
+
+        let mut stream = TcpStream::connect(addr).await.expect("connecting to syslog_in");
+        stream
+            .write_all(b"<13>1 2023-01-01T00:00:00Z myhost app - - - hello over raw tcp\n")
+            .await
+            .expect("writing the LF-framed message");
+        drop(stream); // a clean close is fine -- the message already ended in its own LF
+
+        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("syslog_in should decode and forward the message")
+            .expect("the Fanout channel should not have closed");
+        let batch = logit_pipeline::unwrap_batch(delivered);
+        assert_eq!(batch.events.len(), 1);
+        let event = &batch.events[0];
+        assert_eq!(event.attributes.get("syslog.hostname").and_then(Value::as_str), Some("myhost"));
+        assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("app"));
+        assert_eq!(event.log.as_ref().unwrap().message.as_str(), Some("hello over raw tcp"));
+    }
+
+    /// The framing case only TCP can exercise at all: an octet-counted MSG whose body contains a
+    /// literal embedded newline. The framer delimits by count, not by `\n`, and `SyslogInput::tcp`
+    /// turns off the decoder's own line splitting for exactly this reason (this file's module doc,
+    /// and `SyslogDecoder::with_line_splitting`'s own doc comment) -- so the whole two-line body
+    /// must land in one event's message, not be shredded into two.
+    #[tokio::test]
+    async fn a_multiline_octet_counted_message_arrives_as_one_event() {
+        let mut input = SyslogInput::tcp("127.0.0.1:0");
+        input.bind().await.expect("binding the tcp syslog_in listener");
+        let addr = input.local_addr().expect("bind() should leave a real address behind");
+        let (tx, mut rx) = mpsc::channel(16);
+        let sink = Fanout::new(vec![tx]);
+        tokio::spawn(async move {
+            let _ = input.run(sink).await;
+        });
+
+        let msg = b"<13>1 2023-01-01T00:00:00Z myhost app - - - line one\nline two";
+        let mut frame = format!("{} ", msg.len()).into_bytes();
+        frame.extend_from_slice(msg);
+
+        let mut stream = TcpStream::connect(addr).await.expect("connecting to syslog_in");
+        stream.write_all(&frame).await.expect("writing the octet-counted frame");
+        drop(stream);
+
+        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("syslog_in should decode and forward the message")
+            .expect("the Fanout channel should not have closed");
+        let batch = logit_pipeline::unwrap_batch(delivered);
+        assert_eq!(
+            batch.events.len(),
+            1,
+            "an embedded newline inside an octet-counted MSG must not split into two events"
+        );
+        assert_eq!(
+            batch.events[0].log.as_ref().unwrap().message.as_str(),
+            Some("line one\nline two")
+        );
+    }
+}
+
+// ---- transport: tls (RFC 5425) -------------------------------------------------------------
+
+/// `syslog_out`/`syslog_in` over TLS -- server TLS, mutual TLS, and the wrong-CA negative case,
+/// modelled on `logit_round_trip.rs`'s own `mod tls`, but using `bind()`+`local_addr()` for
+/// readiness (available here, unlike `LogitInput`) rather than `ephemeral_addr()` plus a sleep.
+/// `docs/adr/syslog-tcp-ingress-and-tls.md`.
+mod tls {
+    use super::*;
+    use logit_inputs::tcp::TlsServerSettings;
+    use logit_outputs::syslog::TlsClientSettings;
+    use logit_pipeline::{classify, Fault};
+
+    fn testdata_dir() -> std::path::PathBuf {
+        // `logit-cli` lives at `crates/logit-cli`; the fixtures live at the repo root's
+        // `testdata/tls` -- two levels up from `CARGO_MANIFEST_DIR`, exactly
+        // `logit_round_trip.rs`'s own `mod tls::testdata_dir`.
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
+    }
+
+    /// One log event with a message worth asserting on -- this file's TLS coverage is about the
+    /// transport, not about syslog decoding itself, which the UDP and `mod tcp` tests above
+    /// already exercise thoroughly.
+    fn sample_batch() -> EventBatch {
+        let mut attrs = logit_core::AttrMap::new();
+        attrs.insert("host", "tls-test-host");
+        let event = Event::log(
+            1_000,
+            attrs,
+            logit_core::LogRecord {
+                message: Value::str("hello over tls"),
+                severity: Some(logit_core::Severity::Info),
+                body_format: logit_core::BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        EventBatch {
+            resource: std::sync::Arc::new(logit_core::Resource::default()),
+            scope: None,
+            events: vec![event],
+        }
+    }
+
+    /// Stands up a TLS-terminating TCP `syslog_in` with `settings`, returning its bound address
+    /// and the `Fanout` receiver every decoded batch lands on -- `bind()`-then-`local_addr()`
+    /// readiness, the same idiom the UDP [`Harness`] and `mod tcp` above use, no sleep needed.
+    async fn spawn_tls_input(
+        settings: &TlsServerSettings,
+    ) -> (SocketAddr, mpsc::Receiver<Delivered>) {
+        let mut input = SyslogInput::tcp("127.0.0.1:0")
+            .with_tls(settings, &testdata_dir())
+            .expect("a tls: block is legal on a tcp syslog_in");
+        input.bind().await.expect("binding the tls syslog_in listener");
+        let addr = input.local_addr().expect("bind() should leave a real address behind");
+        let (tx, rx) = mpsc::channel(16);
+        let sink = Fanout::new(vec![tx]);
+        tokio::spawn(async move {
+            let _ = input.run(sink).await;
+        });
+        (addr, rx)
+    }
+
+    /// Server TLS only: `syslog_out` trusts `ca.pem`, `syslog_in` presents
+    /// `server.pem`/`server.key` with no `client_ca_file` -- any client is accepted once the
+    /// handshake itself completes.
+    #[tokio::test]
+    async fn server_tls_round_trips_a_batch() {
+        let (addr, mut rx) = spawn_tls_input(&TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: None,
+        })
+        .await;
+
+        let mut output =
+            SyslogOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
+                .with_tls(
+                    &TlsClientSettings {
+                        ca_file: Some("ca.pem".to_string()),
+                        ..Default::default()
+                    },
+                    &testdata_dir(),
+                )
+                .expect("a tls: block is legal on a tcp syslog_out");
+        let batch = sample_batch();
+        output.send(&batch).await.expect("send over server TLS should succeed");
+
+        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("syslog_in should decode and forward the batch")
+            .expect("the Fanout channel should not have closed");
+        let mut decoded = logit_pipeline::unwrap_batch(delivered);
+        normalize_receipt_time(&mut decoded);
+        assert_eq!(decoded.events.len(), 1);
+        assert_eq!(
+            decoded.events[0].log.as_ref().unwrap().message.as_str(),
+            Some("hello over tls")
+        );
+    }
+
+    /// Mutual TLS: `syslog_in` requires a client certificate chaining to `ca.pem`
+    /// (`client_ca_file`), `syslog_out` presents `client.pem`/`client.key` -- both signed by the
+    /// same test CA (`testdata/tls/regen.sh`).
+    #[tokio::test]
+    async fn mutual_tls_round_trips_a_batch() {
+        let (addr, mut rx) = spawn_tls_input(&TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: Some("ca.pem".to_string()),
+        })
+        .await;
+
+        let mut output =
+            SyslogOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
+                .with_tls(
+                    &TlsClientSettings {
+                        ca_file: Some("ca.pem".to_string()),
+                        cert_file: Some("client.pem".to_string()),
+                        key_file: Some("client.key".to_string()),
+                        insecure_skip_verify: false,
+                    },
+                    &testdata_dir(),
+                )
+                .expect("a client certificate is legal on the tcp transport");
+        let batch = sample_batch();
+        output.send(&batch).await.expect("mutual TLS should succeed");
+
+        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("syslog_in should decode and forward the batch")
+            .expect("the Fanout channel should not have closed");
+        let mut decoded = logit_pipeline::unwrap_batch(delivered);
+        normalize_receipt_time(&mut decoded);
+        assert_eq!(
+            decoded.events[0].log.as_ref().unwrap().message.as_str(),
+            Some("hello over tls")
+        );
+    }
+
+    /// The negative case: `syslog_out` trusts `other-ca.pem`, which never signed `server.pem`, so
+    /// *this* side's own certificate verification fails the handshake before a single byte of the
+    /// batch has left the host -- `Fault::Clean`, and deterministically so.
+    ///
+    /// This is the server-cert half of PR #159's finding, not the client-cert half: under TLS 1.3
+    /// the *server* sends its whole flight before it ever sees the client's certificate message, so
+    /// a client-cert rejection (`crates/logit-outputs/src/syslog.rs`'s
+    /// `tls_tcp_without_a_client_certificate_delivers_nothing_to_a_client_ca_requiring_collector`)
+    /// is invisible to this write-only sink -- `send` can report success even though the collector
+    /// rejected the connection. A *server*-cert rejection is the opposite: it happens inside the
+    /// client's own certificate verification, before `TlsConnector::connect` even completes, let
+    /// alone before any byte is written -- so it is always observable here, deterministically, as
+    /// `Fault::Clean`.
+    #[tokio::test]
+    async fn a_client_trusting_the_wrong_ca_is_refused_and_classified_clean() {
+        let (addr, _rx) = spawn_tls_input(&TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: None,
+        })
+        .await;
+
+        let mut output =
+            SyslogOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
+                .with_tls(
+                    &TlsClientSettings {
+                        ca_file: Some("other-ca.pem".to_string()),
+                        ..Default::default()
+                    },
+                    &testdata_dir(),
+                )
+                .expect("a tls: block is legal on the tcp transport");
+
+        let err = output.send(&sample_batch()).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Clean);
+    }
 }

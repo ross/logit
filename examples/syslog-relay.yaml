@@ -1,0 +1,95 @@
+# A syslog relay: receive over TCP, forward over TCP -- the topology RFC 5425 (syslog over TLS)
+# exists for once `tls:` is uncommented on both ends (docs/adr/syslog-tcp-ingress-and-tls.md).
+# Header fields (hostname, tag/app-name, PID, severity, structured data) round-trip through the
+# real decoder on the other end (docs/adr/syslog-output.md, docs/adr/syslog-structured-data-
+# convention.md); an event that never passed through `syslog_in` (a Lua-authored log line, a
+# tail_in/docker_in line) falls back to this file's configured defaults instead.
+#
+#   sender (TCP) --> syslog_in --> syslog_out --> receiver (TCP)
+#
+# `transport: tcp` on `syslog_in` runs the shared stream driver (`logit-inputs::tcp::TcpListener`)
+# instead of the default UDP one: each connection auto-detects RFC 6587 framing from its first
+# byte (an ASCII digit means octet-counting; anything else means non-transparent/LF-delimited --
+# there is no `framing:` field to get wrong). `syslog_out`'s own TCP transport always emits
+# octet-counting, the one framing transparent to a literal newline inside a message body.
+#
+# Config is a flat graph of components (docs/design/pipeline-graph.md,
+# docs/adr/component-graph-configuration.md): each names its own `sources`, rather than sitting in
+# a fixed inputs/transforms/outputs pipeline.
+components:
+  syslog_in:
+    type: syslog_in
+    bind: 0.0.0.0:6514
+    transport: tcp             # udp (the default) | tcp -- tls: below requires tcp
+    # Every field below defaults -- an omitted field is exactly the value shown here, commented
+    # out purely as a reference for tuning a real deployment.
+    # tls:                      # presence turns TLS on and makes it *required* -- there is no
+    #                             plaintext fallback once a tls: block is configured. RFC 5425 is
+    #                             syslog over TLS over TCP; DTLS (syslog over TLS over UDP) is out
+    #                             of scope, so tls: under transport: udp is a config error.
+    #   cert_file: server.pem   # required -- this listener's own certificate chain
+    #   key_file: server.key    # required -- server.pem's private key
+    #   client_ca_file: null    # set for mutual TLS -- every connecting client must then present
+    #                             a certificate chaining to this CA; omit for server-auth-only TLS
+    # handshake_timeout: 5s     # bounds each pre-message phase *separately* -- the TLS accept,
+    #                             then the wait for the connection's first byte -- so a TLS peer
+    #                             that connects and says nothing costs up to twice this before
+    #                             its connection-cap slot is released. Not an idle timeout: the
+    #                             gap before a *later* frame is unbounded. transport: tcp only.
+
+    # A TCP syslog_in has no receive *queue* -- the connection's own flow control is the
+    # backpressure -- so only the batch-assembly/shutdown fields below apply, scoped **per
+    # connection**: N concurrent connections can hold up to N times batch_max_events in flight.
+    # receive:
+    #   batch_max_events: 1000      # events accumulated per connection before one send downstream
+    #   batch_max_bytes: "1MiB"     # the other per-connection accumulation bound
+    #   batch_flush_interval: 100ms # longest an accumulated batch waits before being sent
+    #                               # regardless of size; 0s disables the timer
+    #   shutdown_grace: 5s          # how long a graceful shutdown waits to drain in-flight work
+
+  syslog_out:
+    type: syslog_out
+    sources: [syslog_in]
+    endpoint: collector.internal:6514   # RFC 5425's registered port for syslog over TLS
+    transport: tcp              # udp (the default) | tcp -- tls: below requires tcp
+    # Every field below defaults -- an omitted field is exactly the value shown here, commented
+    # out purely as a reference for tuning a real deployment.
+    # format: rfc5424            # rfc3164 | rfc5424 -- rfc3164's TIMESTAMP carries no year or
+    #                             # timezone, so rfc5424's unambiguous RFC 3339 stamp is the
+    #                             # better default; rfc3164 stays available for a receiver that
+    #                             # only understands it
+    # facility: local0           # PRI facility used only when the event carries no
+    #                             # syslog.facility attribute
+    # hostname: null              # HOSTNAME/APP-NAME fallbacks, used only when the event carries
+    # app_name: null              # no syslog.hostname/syslog.tag attribute at all -- e.g. an
+    #                             # event that never passed through syslog_in
+    # max_message_bytes: "8192"   # bounds one encoded message (PRI + header + MSG); matches
+    #                             # Grafana Alloy's loki.source.syslog default
+    # connect_timeout: 5s         # tcp only -- also bounds the tls: handshake below, same budget
+    # tls:                       # presence turns TLS on and makes it *required* -- endpoint here
+    #                             # is a bare host:port with no scheme to read a TLS signal from,
+    #                             # so even an empty tls: {} block means TLS with the bundled
+    #                             # Mozilla roots. transport: tcp only -- DTLS is out of scope.
+    #   ca_file: ca.pem           # trust this CA instead of the bundled Mozilla set
+    #   cert_file: client.pem     # cert_file/key_file together, for mutual TLS
+    #   key_file: client.key
+    #   insecure_skip_verify: false   # accepts any certificate -- encrypted, but not verified;
+    #                                 # never set together with ca_file
+    # structured_data: null       # opt-in RFC 5424 STRUCTURED-DATA element built from an event's
+    #                             # non-syslog.* attributes, e.g. { sd_id: "logit@32473" } -- a
+    #                             # syslog.sd attribute (round-tripped from syslog_in) still
+    #                             # renders regardless of this setting; ignored under
+    #                             # format: rfc3164 (no STRUCTURED-DATA field at all)
+
+    # buffer: (docs/adr/buffered-sink-delivery.md) tunes this sink's delivery queue and retry --
+    # shown commented out at its defaults:
+    # buffer:
+    #   max_batches: 1024
+    #   max_bytes: 64MiB
+    #   overflow: block
+    #   delivery: null             # null derives from duplicate_safe() -- syslog_out is false
+    #                                 (no destination-side idempotency), so at_most_once; explicit
+    #                                 at_least_once/at_most_once overrides it
+    #   retry_budget: 60s
+    #   retry_max_delay: 10s
+    #   shutdown_grace: 5s

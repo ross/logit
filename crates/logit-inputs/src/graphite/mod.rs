@@ -29,7 +29,7 @@
 //! same shape [`crate::collectd::CollectdInput`] is: the read/decode split, the receive queue, the
 //! datagram→batch assembly, `SO_RCVBUF`, multicast auto-join and the shutdown drain all come free
 //! from that driver (`docs/adr/decoupled-listener-io.md`), and the whole `receive:` block applies.
-//! `protocol: pickle` is rejected here by graph rule 43, not by this module: a 4-byte big-endian
+//! `protocol: pickle` is rejected here by graph rule 46, not by this module: a 4-byte big-endian
 //! length prefix has no meaning in a datagram that already delimits itself.
 //!
 //! **`tcp`** is the accept loop in [`tcp`], written here rather than shared because there is
@@ -163,7 +163,7 @@ pub struct GraphiteInput {
 
 impl GraphiteInput {
     /// A listener on `bind` speaking `protocol` over `transport`. `protocol: Pickle` with
-    /// `transport: Udp` is rejected by graph rule 43 before a config ever reaches here; a direct
+    /// `transport: Udp` is rejected by graph rule 46 before a config ever reaches here; a direct
     /// caller that builds one anyway gets a pickle decoder fed whole datagrams, which is a
     /// meaningful (if unused) thing to do rather than something worth a panic.
     pub fn new(bind: impl Into<String>, transport: Transport, protocol: Protocol) -> Self {

@@ -44,9 +44,11 @@ image. All three signals now flow through it end to end — logs, metrics, and t
 Loki, InfluxDB, and Tempo respectively
 ([docs/plans/demo-stack.md](docs/plans/demo-stack.md),
 [docs/plans/otlp-end-to-end.md](docs/plans/otlp-end-to-end.md)). `syslog_out` (RFC
-3164/5424 over UDP or TCP, header fields round-tripped from an event's `syslog.*` attributes,
-[ADR `syslog-output`](docs/adr/syslog-output.md)) is implemented and fully covered by its own
-unit/integration tests but no longer exercised by the demo, which moved its log leg onto
+3164/5424 over UDP, TCP, or TLS (RFC 5425), header fields round-tripped from an event's
+`syslog.*` attributes, [ADR `syslog-output`](docs/adr/syslog-output.md)/
+[ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md)) is implemented and
+fully covered by its own unit/integration tests but no longer exercised by the demo, which moved
+its log leg onto
 `otlp_out` straight to Loki ([docs/plans/otlp-logs-and-resource-identity.md](docs/plans/otlp-logs-and-resource-identity.md)'s
 workstream B) — the demo isn't meant to stay exhaustive over every component as more land.
 `otlp_in`/`otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`, OTLP for logs,
@@ -135,11 +137,15 @@ private CAs and mutual TLS included) on both transports, selected by the endpoin
 ([ADR `otlp-tls-and-pooled-grpc-client`](docs/adr/otlp-tls-and-pooled-grpc-client.md))); `otlp_in`
 is the mirror, implemented and tested but not yet exercised by the demo. `demo/`'s `trace_out` proves the whole chain against a
 real Tempo, exactly the way `log_out` proves `syslog_out` against a real Loki. `statsd_in`/`syslog_in`
-(`crates/logit-inputs/src/statsd.rs`/`syslog.rs`) are now thin wrappers over a shared
-`logit-inputs::udp::UdpListener` driver: a UDP listener's socket read and its decode/batch-assembly
-loop run decoupled through a `ReceiveQueue`, the listener-side mirror of `SinkQueue`'s sink-side
-decoupling, so a stalled downstream no longer stops the socket being read; see
-[ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) and the `receive:` config block it introduces.
+(`crates/logit-inputs/src/statsd.rs`/`syslog.rs`) are thin wrappers over a shared
+`logit-inputs::udp::UdpListener` driver for their (default) UDP transport: a UDP listener's socket
+read and its decode/batch-assembly loop run decoupled through a `ReceiveQueue`, the listener-side
+mirror of `SinkQueue`'s sink-side decoupling, so a stalled downstream no longer stops the socket
+being read; see [ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) and the `receive:`
+config block it introduces. `syslog_in` alone can instead run `transport: tcp` on a second, generic
+stream driver, `logit-inputs::tcp::TcpListener` (RFC 6587 framing, auto-detected per connection,
+plus a `tls:` block for RFC 5425 syslog over TLS) — see
+[ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md).
 `logit` now has an operator surface: leveled, structured self-logging through `tracing`
 (`--log-level`/`LOGIT_LOG`, `--log-format text|json`,
 [ADR `tracing-for-self-logging`](docs/adr/tracing-for-self-logging.md)); a top-level `admin:` block serving `/readyz`/
@@ -200,10 +206,25 @@ crate dependency) -- with a `multi_value: skip | expand` switch for the metric k
 one-number-per-datapoint wire can't carry natively and `tags: carbon | drop` for whether attributes
 render as carbon's own `;k=v` segment; `graphite_in`'s TCP listener has no receive queue at all
 (TCP's own flow control is the backpressure, unlike the UDP-only decoupled-listener-io queue every
-other datagram listener shares) since there is nothing yet to extract a shared TCP driver from. So
-`graphite_in -> graphite_out` is a fixed point modulo its own named normalization list
+other datagram listener shares) and runs its own accept loop rather than the shared stream driver
+`syslog_in` uses (`crates/logit-inputs/src/tcp.rs`) -- porting it onto that driver is follow-up
+work, not a decision. So `graphite_in -> graphite_out` is a fixed point modulo its own named
+normalization list
 ([ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md),
-[examples/graphite-relay.yaml](examples/graphite-relay.yaml)).
+[examples/graphite-relay.yaml](examples/graphite-relay.yaml)). `generate_in`/`null_out`
+(`crates/logit-inputs`/`crates/logit-outputs`) are two more real, unconditionally-shipped
+`ComponentKind`s, but not protocol work like everything above -- a declarative event generator
+(`event:` templates via `logit_core::template`, `{seq}`/`{seq%N}` placeholders) and a sink that
+discards, built for one purpose: driving `crates/logit-perf` (bin `logit-perf`, `script/perf
+run|compare|attribute|flamegraph|list`), the out-of-CI load-test harness that spawns the real
+release `logit run <config>` process against `perf/scenarios/*.yaml` and measures events/s, CPU
+µs/event (the regression gate), and peak RSS, with `attribute` decoding a temporary `internal`
+telemetry leg into a per-node time breakdown and `flamegraph` driving `perf`/`inferno` in a
+throwaway image. [ADR `load-test-harness`](docs/adr/load-test-harness.md),
+[docs/plans/load-test-harness.md](docs/plans/load-test-harness.md), and
+[docs/design/performance.md](docs/design/performance.md) (the first recorded run) have the full
+account; the harness is built and runnable by hand, deliberately not wired into `script/cibuild`
+or any schedule yet.
 
 ## Environment
 
@@ -335,12 +356,18 @@ crates/
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
-  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry)
-  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd
+  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry), generate_in (load-test event generator)
+  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, null_out (load-test discard sink)
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, logfmt, kv, regex
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
+  logit-perf        dev-only, publish = false: the load-test harness binary (`logit-perf`, `script/perf`) -- spawns the real logit-cli binary against perf/scenarios/*.yaml (docs/adr/load-test-harness.md, docs/design/performance.md)
 ```
+
+`perf/scenarios/*.yaml` are the harness's own shipped configs (ordinary `logit` YAML, a
+`generate_in` listener into `null_out` or a real sink), covered by `script/validate` and
+`every_shipped_config_loads_and_validates` alongside `demo/`/`examples/`; `perf/results/` is
+where `script/perf run`/`attribute`/`flamegraph` write their (gitignored) output.
 
 `logit-inputs`/`logit-outputs`/`logit-transforms` depend on `logit-pipeline` for their trait, not
 the other way around (`docs/design/pipeline-graph.md`'s "Crate layout" section) -- this is what

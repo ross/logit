@@ -110,6 +110,9 @@ pub fn attribute(root: &Path, args: AttributeArgs) -> anyhow::Result<()> {
     }
     let scenarios_dir = root.join("perf/scenarios");
     let scenario = scenario::find(&scenarios_dir, &args.scenario)?;
+    // Fresh spool before this leg's own spawn -- same reasoning as `run`'s per-repeat clear
+    // (`crate::spool`'s module doc).
+    crate::spool::clear(root, &scenario)?;
     let logit_bin = run::build_and_locate(root, &args.profile, args.no_build)?;
 
     let workdir = make_workdir()?;

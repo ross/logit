@@ -22,6 +22,11 @@ components:
     #                                present a certificate chaining to this CA
     # max_frame_bytes: 64MiB       # caps one frame's size (post- and pre-decompression alike),
     #                                echoed to every connecting client in HelloAck.max_frame_bytes
+    # handshake_timeout: 5s        # bounds each pre-Hello phase *separately* -- the TLS accept,
+    #                                then the Hello read -- so a TLS peer that connects and sends
+    #                                no Hello costs up to twice this before its connection-cap
+    #                                slot is released. Not an idle timeout: an established,
+    #                                quiet connection is never closed for being quiet.
 
   windowed:
     type: aggregate
