@@ -143,7 +143,8 @@ concurrency-cap slot.
 `SyslogIn` carries a `handshake_timeout: Duration` field (default 5s, the same number this section
 names, still applied *per* pre-message phase -- the TLS accept, then the wait for the first byte --
 rather than as one shared deadline), and `logit_in`/`otlp_in` gained the identically-named field at
-the same time so one number and one field name cover every TCP listener. Graph rule 45 keeps it
+the same time so one number and one field name cover every ingress listener kind (`syslog_in`,
+`logit_in`, `otlp_in`). Graph rule 45 keeps it
 non-zero and, on `transport: udp`, rejects a non-default value outright: a datagram listener has no
 connection to hand shake, so set-but-ignored would be the wrong outcome for the same reason rule 43
 refuses a `tls:` block there. What did *not* change: this is still a pre-message bound only, never

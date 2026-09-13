@@ -1518,11 +1518,16 @@ fn default_syslog_connect_timeout() -> Duration {
 
 /// The one default behind `syslog_in`/`logit_in`/`otlp_in`'s `handshake_timeout` -- deliberately
 /// one function for all three, since a per-phase pre-message budget is the same question on every
-/// TCP listener and one number is one thing for an operator to learn. Mirrors
+/// ingress listener kind and one number is one thing for an operator to learn. Mirrors
 /// `logit_inputs::tcp::HANDSHAKE_TIMEOUT` and `logit_inputs::logit::HANDSHAKE_TIMEOUT` (the
 /// listeners' own constants, still the default when no config value is threaded through) -- can't
 /// reference either directly, same reason as [`default_syslog_connect_timeout`].
-fn default_handshake_timeout() -> Duration {
+///
+/// `pub`, unlike every other `default_*` in this module: graph rule 45
+/// (`logit_pipeline::graph`) has to tell a *set* `handshake_timeout` from a defaulted one, and
+/// `logit-pipeline` already depends on this crate, so it imports this rather than hand-mirroring
+/// the number.
+pub fn default_handshake_timeout() -> Duration {
     Duration::from_secs(5)
 }
 

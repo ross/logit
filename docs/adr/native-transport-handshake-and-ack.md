@@ -127,7 +127,9 @@ idle keep-alive connection's `Fanout` clone open past shutdown — a real gap, t
   accept, then the `Hello` read -- rather than as one shared deadline), set through
   `LogitInput::with_handshake_timeout`, which is `pub` rather than `#[cfg(test)]`. `syslog_in` and
   `otlp_in` gained the identically-named field at the same time, so one number and one field name
-  now cover every TCP listener in the tree; `otlp_in`'s accept loop also picked up the
+  now cover every ingress listener kind (`syslog_in`, `logit_in`, `otlp_in`) -- not every TCP
+  listener in the tree: `prometheus_out`'s exposition server and the `admin:` endpoint have their
+  own, separately-decided budgets; `otlp_in`'s accept loop also picked up the
   `tokio::time::timeout` around its TLS accept that this ADR's own "Connection limit" section
   describes here, closing `docs/known-gaps.md`'s "`otlp_in`'s TLS accept has no timeout" row.
   Graph rule 45 keeps the value non-zero. The *shutdown grace* named just above is a different
