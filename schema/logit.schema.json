@@ -1330,7 +1330,7 @@
               ]
             },
             "connect_timeout": {
-              "description": "TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a dropped connection) is allowed to take before `send` reports it as a failure.",
+              "description": "TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a dropped connection) is allowed to take before `send` reports it as a failure. Also bounds the TLS handshake under `tls:`, on the same budget.",
               "default": "5s",
               "type": "string"
             },
@@ -1375,6 +1375,18 @@
               "anyOf": [
                 {
                   "$ref": "#/definitions/SyslogStructuredData"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "tls": {
+              "description": "Turns on TLS for this connection when present -- RFC 5425, syslog over TLS over TCP. Presence turns it on and makes it *required* (there is no plaintext fallback), the same shape as `logit_out`'s own `tls:`: a bare `host:port` `endpoint` has no scheme to read that signal from the way `otlp_out`'s URL does, so even an empty `tls: {}` means TLS with the bundled Mozilla roots. **`transport: tcp` only** -- DTLS is out of scope, and `tls:` alongside `transport: udp` is a config error (rule 44), not silently ignored. See [`TlsClientConfig`] for path resolution (relative to the config file's own directory) and `!env` compatibility, both identical here.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
                 },
                 {
                   "type": "null"
