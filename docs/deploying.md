@@ -329,13 +329,17 @@ two of them — 10s at the default — before it is closed and its permit releas
 |---|---|
 | `syslog_in` (`transport: tcp`) | the TLS accept (under `tls:`), then the wait for the connection's first byte — on the plaintext arm too |
 | `logit_in` | the TLS accept (under `tls:`), then the `Hello` read |
-| `otlp_in` | the TLS accept **only** |
+| `otlp_in` | the TLS accept **only** — and so nothing at all on a plaintext listener |
 
-`otlp_in` is the narrow one on purpose. It hands each accepted connection straight to `hyper`, whose
-connection builder reads the first bytes itself to tell HTTP/1.1 from an HTTP/2 preface — a read
-this listener never sees, and one `hyper`'s own HTTP/1 header-read timeout doesn't cover either
-(that starts only once the version is already decided). So on `otlp_in` this knob bounds the TLS
-handshake and nothing after it; a plaintext `otlp_in` has no phase for it to bound at all.
+`otlp_in` is the narrow one, and not by choice. It hands each accepted connection straight to
+`hyper`, whose connection builder reads the first bytes itself to tell HTTP/1.1 from an HTTP/2
+preface — a read this listener never sees, and one `hyper`'s own HTTP/1 header-read timeout
+doesn't cover either (that starts only once the version is already decided). So on `otlp_in` this
+knob bounds the TLS handshake and nothing after it, and a **plaintext `otlp_in` has no phase for
+it to bound at all** — which is why rule 45 rejects a non-default `handshake_timeout` on one
+rather than accepting a value that could never fire. A plaintext `otlp_in` therefore has *no*
+pre-message bound, which is a real gap and not a tuning choice: see `docs/known-gaps.md`'s
+"a plaintext `otlp_in` has no pre-first-byte bound" row.
 
 **It is not an idle timeout, on any of the three.** Once a connection has got past its pre-message
 phases, the gap before its next frame/request is deliberately unbounded — a long-lived,
@@ -754,7 +758,8 @@ TLS); omit it to accept any client once the handshake itself completes.
 
 `otlp_in.handshake_timeout` (default 5s) bounds that handshake: a client that completes the TCP
 connect and then never sends a ClientHello is closed and its concurrency-cap permit released. It
-bounds the TLS accept and nothing after it — see
+bounds the TLS accept and nothing after it, and it therefore only applies to a listener that has a
+`tls:` block at all (rule 45 rejects a non-default value on a plaintext one) — see
 ["`handshake_timeout` on a TCP listener"](#handshake_timeout-on-a-tcp-listener) above for why, and
 for what that leaves open.
 

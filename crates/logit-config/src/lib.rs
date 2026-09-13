@@ -428,8 +428,9 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: Option<TlsServerConfig>,
         /// How long one connection has to finish its **TLS accept** before this listener closes
-        /// it and hands back its connection-cap permit. Only meaningful under `tls:`; a
-        /// plaintext listener has no phase for it to bound.
+        /// it and hands back its connection-cap permit. **`tls:` only** -- a plaintext listener
+        /// has no phase for it to bound, so rule 45 rejects a non-default value on one rather
+        /// than accepting a guaranteed no-op.
         ///
         /// **Narrower here than on `syslog_in`/`logit_in`, deliberately.** On those two the same
         /// field also bounds the wait for the first byte *after* the handshake, because their

@@ -447,21 +447,26 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     `graph::resolve` isn't the only possible caller.
 
 45. A `handshake_timeout` must be greater than `0s` on every kind that has one — `syslog_in`,
-    `logit_in`, `otlp_in` — and on a `syslog_in` with `transport: udp` it must be left at its
-    default. `0s` is an impossible budget rather than a tight one: no TLS accept, first-byte read,
+    `logit_in`, `otlp_in` — and must be left at its default in the two places it could never take
+    effect: a `syslog_in` with `transport: udp`, and a plaintext `otlp_in` (no `tls:` block).
+    `0s` is an impossible budget rather than a tight one: no TLS accept, first-byte read,
     or `Hello` read completes in zero time, so a listener configured with it would accept
     connections only to close each one immediately and would receive nothing at all — the same
     "0 is impossible, not just small" call rules 9/15/18/28 make for a flush interval, a queue
-    bound, and a poll interval. The UDP half is rule 43's reasoning applied to this field instead
-    of `tls:`: a datagram listener has no connection, so nothing there could ever consult the
-    value, and an operator who set one meant it to take effect — set-but-ignored is an error, not
-    a silent no-op. Only a *non-default* value is rejected, so the field's own default stays legal
-    on every `syslog_in` and no pre-existing UDP config becomes invalid. `graph.rs`'s
-    `DEFAULT_HANDSHAKE_TIMEOUT` mirrors `logit_config`'s private `default_handshake_timeout` by
-    hand (this crate cannot name it); a drift there can only ever reject a defaulted config, never
-    accept a set one, which is what
-    `a_udp_syslog_in_at_the_default_handshake_timeout_resolves_fine` — which deserializes a real
-    config rather than constructing the variant — exists to catch.
+    bound, and a poll interval. The two context checks are rule 43's reasoning applied to this
+    field instead of `tls:`, in rule 33's "only means anything under X" shape: a UDP `syslog_in`
+    has no connection to hand shake, and a plaintext `otlp_in` has a connection but no phase this
+    field reaches — on that listener the budget bounds the TLS accept *alone* (hyper's own version
+    sniff, which follows it, is not wrapped; see `docs/known-gaps.md`'s plaintext-`otlp_in` row),
+    so with no `tls:` block it is inert. In both cases an operator who set a value meant it to take
+    effect, so set-but-ignored is an error rather than a silent no-op. Only a *non-default* value
+    is rejected, so the field's own default stays legal everywhere and no pre-existing config
+    becomes invalid; `graph.rs` imports `logit_config::default_handshake_timeout` to make that
+    distinction rather than mirroring the number, and
+    `a_udp_syslog_in_at_the_default_handshake_timeout_resolves_fine`/
+    `a_plaintext_otlp_in_at_the_default_handshake_timeout_resolves_fine` both deserialize a real
+    config rather than constructing the variant, so they exercise the `serde` defaulting path this
+    comparison has to agree with.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that
