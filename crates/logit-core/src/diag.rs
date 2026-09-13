@@ -83,6 +83,20 @@ impl Diagnostics {
         &self.component_id
     }
 
+    /// How many times `key` has been reported through [`Diagnostics::warn_throttled`] on *this*
+    /// value -- the running total the throttle itself keys on, including the occurrences it
+    /// suppressed.
+    ///
+    /// Mainly for tests, and not `#[cfg(test)]` for the same reason [`Diagnostics::component_id`]
+    /// isn't: the tests that need it live in dependent crates. Specifically, it is how
+    /// `logit_inputs::tcp` asserts that its per-frame keys throttle listener-wide -- a count that
+    /// stays at 1 no matter how many connections report is exactly the bug that the one shared
+    /// `Diagnostics` behind its connection tasks exists to prevent, and `warn_throttled`'s own
+    /// return value can't distinguish the two from outside.
+    pub fn occurrences(&self, key: &str) -> u64 {
+        self.counts.get(key).copied().unwrap_or(0)
+    }
+
     /// Reports the 1st, 2nd, 4th, 8th, ... occurrence of `key` (each naming the running total) and
     /// suppresses the rest -- bounded log volume under a flood of the same complaint (e.g. one
     /// malformed line per request) without needing a clock. A time-window limiter was the more

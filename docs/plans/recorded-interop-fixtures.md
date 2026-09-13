@@ -289,6 +289,28 @@ double as a fuzz seed corpus once that lands — real, minimal, protocol-diverse
 what a fuzzer seeds from — but building that integration now would be speculative against a
 toolchain gap this repo has already decided not to pay for yet. Noted here as intent, not started.
 
+## Amendment (2026-09-13): TCP-framed syslog, recorded (closes the follow-on above)
+
+`docs/plans/syslog-tls.md`'s W4 workstream closes the "TCP-framed syslog fixtures" follow-on
+noted above: `record_rsyslog_tcp` in `script/record-fixtures`, next to `record_rsyslog`, and
+`tools/record-fixtures/rsyslog-tcp.conf`, the same shape as `rsyslog.conf` with one line
+different — `omfwd`'s `target`/`protocol` point at `raw_capture.py`'s TCP listener instead of UDP.
+Reuses `rsyslog-entrypoint.sh` unchanged, since it only ever runs whatever config is mounted at
+`/etc/rsyslog-fixture.conf`. One new fixture, `testdata/interop/syslog/rsyslog-tcp-000.raw` — see
+that directory's `README.md` for its row — and one new test,
+`interop_fixture_rsyslog_tcp_non_transparent_frame` in `crates/logit-inputs/src/tcp.rs`, which
+reads the fixture, pushes it through `Framer`, and decodes the resulting frame with
+`SyslogDecoder`.
+
+Deliberately **not** octet-counted: `rsyslog-tcp.conf` sets `protocol="tcp"` with no
+`TCP_Framing` parameter, which is rsyslog's own default — RFC 6587 §3.4.2 non-transparent
+(LF-terminated) framing — and that stock default, not the opt-in octet-counting mode, is the
+framing a real rsyslog forwarder actually puts on the wire and the one `logit`'s auto-detecting
+TCP listener (`crates/logit-inputs/src/tcp.rs`'s `Framer`) most needs to be checked against.
+Octet-counted rsyslog (`TCP_Framing="octet-counted"`) and syslog-ng (over any transport) remain
+unstarted follow-on work — see `testdata/interop/syslog/README.md`'s own "what isn't covered here
+(yet)" section.
+
 ## Consuming tests, and what they assert
 
 `crates/logit-inputs/src/syslog.rs`'s `interop_fixture_*` tests (seven, one per syslog fixture)
