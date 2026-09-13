@@ -22,6 +22,11 @@ services:
       # (docs/adr/env-yaml-tag.md); matches the token influxdb seeds itself with below, and
       # is overridable from the host shell (`INFLUXDB_TOKEN=... script/server`).
       INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-logit-dev-token}
+      # script/perf computes these on the host, where `git` can actually answer for a worktree
+      # checkout, and forwards them here (crates/logit-perf/src/run.rs's `git_info` doc) -- the
+      # same host-computed/forwarded pattern INFLUXDB_TOKEN above uses. Empty outside script/perf.
+      LOGIT_PERF_GIT_SHA: ${LOGIT_PERF_GIT_SHA:-}
+      LOGIT_PERF_GIT_DIRTY: ${LOGIT_PERF_GIT_DIRTY:-}
     networks:
       # `aliases` gives `dev` a second DNS name on the `logit` network, decoupled from the
       # dev-only service name -- this is the name examples/nginx/nginx.conf's

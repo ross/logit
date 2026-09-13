@@ -11,10 +11,14 @@ use std::time::Duration;
 
 /// The commit the binary under test was built from, and whether the working tree had uncommitted
 /// changes at the time -- so a results file is never silently ambiguous about what it measured.
+/// Both fields are `None` (rendered as JSON `null`) rather than a confident-looking default when
+/// `git` itself couldn't answer -- a git-worktree checkout's dev container is one real case this
+/// happens in (`run.rs::git_info`'s doc), and a silent `false`/`"unknown"` string would read as a
+/// real answer instead of a gap.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GitInfo {
-    pub sha: String,
-    pub dirty: bool,
+    pub sha: Option<String>,
+    pub dirty: Option<bool>,
 }
 
 /// One `logit-perf run` invocation: the environment it ran in, plus every scenario it measured.
@@ -243,7 +247,7 @@ mod tests {
             },
         );
         let report = RunReport {
-            git: GitInfo { sha: "abc123".to_string(), dirty: false },
+            git: GitInfo { sha: Some("abc123".to_string()), dirty: Some(false) },
             timestamp: "2026-09-12T00:00:00Z".to_string(),
             hostname: "devbox".to_string(),
             cpu_model: "Some CPU".to_string(),
@@ -262,7 +266,7 @@ mod tests {
     #[test]
     fn run_report_label_is_omitted_from_json_when_absent() {
         let report = RunReport {
-            git: GitInfo { sha: "abc123".to_string(), dirty: true },
+            git: GitInfo { sha: Some("abc123".to_string()), dirty: Some(true) },
             timestamp: "2026-09-12T00:00:00Z".to_string(),
             hostname: "devbox".to_string(),
             cpu_model: "Some CPU".to_string(),

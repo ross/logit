@@ -6,11 +6,12 @@ use crate::result::{GitInfo, RunReport, Sample, ScenarioReport};
 use crate::rusage;
 use crate::scenario::{self, Scenario};
 use anyhow::{bail, Context};
-use std::collections::BTreeMap;
-use std::io::BufRead;
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct RunArgs {
@@ -21,17 +22,13 @@ pub struct RunArgs {
     pub settle: Duration,
     pub no_build: bool,
     pub profile: String,
+    /// How long to wait for a scenario's `generation complete` line before giving up on it as
+    /// hung.
+    pub timeout: Duration,
+    /// How long to wait for the process to actually exit after `--settle`/SIGTERM (or, for a
+    /// self-exiting scenario, after the completion line) before force-killing it.
+    pub shutdown_timeout: Duration,
 }
-
-/// How long to wait for a scenario's `generation complete` line before giving up on it as hung.
-/// Generous on purpose: scenarios target 5-10s (docs/plans/load-test-harness.md), so two minutes
-/// is a wide margin for a slow/loaded dev box, not a tight bound tuned to the fast case.
-const COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// The exact substring `--log-format json` renders `generate_in`'s completion log line as
-/// (docs/plans/load-test-harness.md: `tracing::info!(... "generation complete")`, and `--log-format
-/// json`'s `message` field is always top-level, per `main.rs`'s own doc on the format).
-const COMPLETION_MARKER: &str = "\"message\":\"generation complete\"";
 
 pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
     let scenarios_dir = root.join("perf/scenarios");
@@ -55,7 +52,9 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
     if !args.no_build {
         build(root, &args.profile)?;
     }
-    let logit_bin = logit_binary_path(root, &args.profile);
+    let target_dir_env = std::env::var_os("CARGO_TARGET_DIR");
+    let logit_bin =
+        logit_binary_path(root, &args.profile, target_dir_env.as_deref().map(Path::new));
     if !logit_bin.exists() {
         bail!(
             "{} does not exist -- build it first (drop --no-build) or check --profile",
@@ -76,7 +75,7 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         let mut samples = Vec::with_capacity(args.repeat as usize);
         let mut scenario_failed = false;
         for repeat in 1..=args.repeat {
-            match run_one(&logit_bin, scenario, args.settle) {
+            match run_one(&logit_bin, scenario, args.settle, args.timeout, args.shutdown_timeout) {
                 Ok(sample) => {
                     println!(
                         "   repeat {repeat}/{}: {:.0} events/s, {:.3} us/event, {:.1} MiB peak RSS",
@@ -110,9 +109,10 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         bail!("every scenario failed; nothing to write");
     }
 
+    let now = now_unix_seconds();
     let report = RunReport {
         git: git_info(root),
-        timestamp: format_rfc3339_utc_seconds(now_unix_seconds()),
+        timestamp: format_rfc3339_utc_seconds(now),
         hostname: hostname(),
         cpu_model: cpu_model(),
         nproc: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
@@ -125,14 +125,18 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
     let results_dir = root.join("perf/results");
     std::fs::create_dir_all(&results_dir)
         .with_context(|| format!("creating {}", results_dir.display()))?;
-    let short_sha: String = report.git.sha.chars().take(12).collect();
+    let short_sha: String = report
+        .git
+        .sha
+        .as_deref()
+        .map(|sha| sha.chars().take(12).collect())
+        .unwrap_or_else(|| "unknown".to_string());
     let label_suffix = report
         .label
         .as_deref()
         .map(|label| format!("-{}", sanitize_label(label)))
         .unwrap_or_default();
-    let filename =
-        format!("{}-{short_sha}{label_suffix}.json", compact_utc_now(now_unix_seconds()));
+    let filename = format!("{}-{short_sha}{label_suffix}.json", compact_utc_now(now));
     let path = results_dir.join(filename);
     std::fs::write(&path, serde_json::to_string_pretty(&report)?)
         .with_context(|| format!("writing {}", path.display()))?;
@@ -146,7 +150,89 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_one(logit_bin: &Path, scenario: &Scenario, settle: Duration) -> anyhow::Result<Sample> {
+/// One spawned scenario's completion signal: the instant its `generation complete` line arrived,
+/// and the `events` field that line carried (`None` if the line parsed as JSON but that field was
+/// missing or not an unsigned integer -- a format this harness can't trust).
+struct Completion {
+    at: Instant,
+    events: Option<u64>,
+}
+
+/// `None` if `line` isn't the completion line at all; `Some(events)` if it is -- `generate_in`'s
+/// own line (`docs/plans/load-test-harness.md`) is `{"message":"generation complete", "events":
+/// ..., "batches": ..., "elapsed": ...}` alongside `--log-format json`'s usual fields, so this
+/// parses the whole line as JSON and checks `message` for an *exact* match, not a substring: a
+/// human-readable field elsewhere in the line quoting the same words must never be mistaken for
+/// the real signal.
+fn parse_completion_line(line: &str) -> Option<Option<u64>> {
+    let json: serde_json::Value = serde_json::from_str(line).ok()?;
+    if json.get("message").and_then(serde_json::Value::as_str) != Some("generation complete") {
+        return None;
+    }
+    Some(json.get("events").and_then(serde_json::Value::as_u64))
+}
+
+/// Accumulates a child's stderr, capped to the last 64 KiB -- a hung or unexpectedly chatty
+/// scenario must never let one failed repeat's error message grow without bound. Trims whole
+/// lines from the front rather than truncating raw bytes, so what's kept is always valid UTF-8
+/// and never a fragment of a line.
+struct StderrCapture {
+    lines: VecDeque<String>,
+    total_bytes: usize,
+}
+
+impl StderrCapture {
+    const CAP_BYTES: usize = 64 * 1024;
+
+    fn new() -> Self {
+        StderrCapture { lines: VecDeque::new(), total_bytes: 0 }
+    }
+
+    fn push(&mut self, line: String) {
+        self.total_bytes += line.len() + 1; // +1: the newline `into_string` rejoins with.
+        self.lines.push_back(line);
+        while self.total_bytes > Self::CAP_BYTES {
+            match self.lines.pop_front() {
+                Some(removed) => self.total_bytes -= removed.len() + 1,
+                None => break,
+            }
+        }
+    }
+
+    fn into_string(self) -> String {
+        self.lines.into_iter().collect::<Vec<_>>().join("\n")
+    }
+}
+
+/// Kills and reaps a still-running child, then joins both reader threads -- every error path that
+/// bails before the ordinary settle/SIGTERM/`wait4` sequence has run (the completion timeout, a
+/// malformed or mismatched `events` count) calls this, so a failed repeat never leaves a live
+/// process, a zombie, or a detached reader thread behind.
+fn kill_and_reap(
+    child: &mut Child,
+    stdout_drain: JoinHandle<()>,
+    stderr_reader: JoinHandle<String>,
+) -> String {
+    let _ = child.kill();
+    let _ = child.wait();
+    drain_and_join(stdout_drain, stderr_reader)
+}
+
+/// Joins both reader threads -- used once the child is already known to have exited (reaped
+/// either by [`kill_and_reap`] or by `wait4` on the ordinary path), since each thread's own loop
+/// ends when its pipe's write end closes.
+fn drain_and_join(stdout_drain: JoinHandle<()>, stderr_reader: JoinHandle<String>) -> String {
+    let _ = stdout_drain.join();
+    stderr_reader.join().unwrap_or_default()
+}
+
+fn run_one(
+    logit_bin: &Path,
+    scenario: &Scenario,
+    settle: Duration,
+    timeout: Duration,
+    shutdown_timeout: Duration,
+) -> anyhow::Result<Sample> {
     let mut child = Command::new(logit_bin)
         .args(["--log-format", "json", "--log-level", "info", "run"])
         .arg(&scenario.path)
@@ -166,36 +252,52 @@ fn run_one(logit_bin: &Path, scenario: &Scenario, settle: Duration) -> anyhow::R
     });
 
     let stderr = child.stderr.take().expect("stderr was piped");
-    let (completion_tx, completion_rx) = mpsc::channel::<Instant>();
+    let (completion_tx, completion_rx) = mpsc::channel::<Completion>();
     let stderr_reader = std::thread::spawn(move || -> String {
-        let mut all_stderr = String::new();
+        let mut capture = StderrCapture::new();
         let mut sent = false;
-        for line in std::io::BufReader::new(stderr).lines() {
+        for line in io::BufReader::new(stderr).lines() {
             let Ok(line) = line else { break };
-            if !sent && line.contains(COMPLETION_MARKER) {
-                sent = true;
-                let _ = completion_tx.send(Instant::now());
+            if !sent {
+                if let Some(events) = parse_completion_line(&line) {
+                    sent = true;
+                    let _ = completion_tx.send(Completion { at: Instant::now(), events });
+                }
             }
-            all_stderr.push_str(&line);
-            all_stderr.push('\n');
+            capture.push(line);
         }
-        all_stderr
+        capture.into_string()
     });
 
-    let completion_at = match completion_rx.recv_timeout(COMPLETION_TIMEOUT) {
-        Ok(instant) => instant,
+    let completion = match completion_rx.recv_timeout(timeout) {
+        Ok(completion) => completion,
         Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let stderr_text = stderr_reader.join().unwrap_or_default();
-            let _ = stdout_drain.join();
+            let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
             bail!(
                 "no `generation complete` line within {}s; stderr:\n{stderr_text}",
-                COMPLETION_TIMEOUT.as_secs()
+                timeout.as_secs()
             );
         }
     };
-    let wall = completion_at - spawned_at;
+    let wall = completion.at - spawned_at;
+
+    let events = match completion.events {
+        Some(events) => events,
+        None => {
+            let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
+            bail!(
+                "`generation complete` line has no numeric `events` field; stderr:\n{stderr_text}"
+            );
+        }
+    };
+    if events != scenario.count {
+        let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
+        bail!(
+            "generate_in reported {events} events but the scenario's `count` is {} -- events/s \
+             and CPU us/event would be measured against the wrong denominator; stderr:\n{stderr_text}",
+            scenario.count
+        );
+    }
 
     if scenario.needs_sigterm {
         std::thread::sleep(settle);
@@ -208,9 +310,32 @@ fn run_one(logit_bin: &Path, scenario: &Scenario, settle: Duration) -> anyhow::R
         }
     }
 
-    let usage = rusage::wait4(pid, wall).with_context(|| format!("wait4({pid})"))?;
-    let stderr_text = stderr_reader.join().unwrap_or_default();
-    let _ = stdout_drain.join();
+    // `wait4` blocks with no timeout of its own, so it runs on its own thread; the main thread
+    // polls that thread's completion against `shutdown_timeout` and force-kills (SIGKILL) if the
+    // process is still alive past it -- a hung drain, or a scenario whose graceful-shutdown path
+    // is itself broken, would otherwise hang `logit-perf run` forever.
+    let wait_thread = std::thread::spawn(move || rusage::wait4(pid, wall));
+    let deadline = Instant::now() + shutdown_timeout;
+    while !wait_thread.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !wait_thread.is_finished() {
+        let _ = child.kill();
+        // The kill above should let the blocked `wait4` return promptly now; joined (not
+        // dropped) so the syscall still completes and the child is actually reaped rather than
+        // left a zombie.
+        let _ = wait_thread.join();
+        let stderr_text = drain_and_join(stdout_drain, stderr_reader);
+        bail!(
+            "process did not exit within {}s after SIGTERM/settle; stderr:\n{stderr_text}",
+            shutdown_timeout.as_secs()
+        );
+    }
+    let usage = wait_thread
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("wait4 thread panicked")))
+        .with_context(|| format!("wait4({pid})"))?;
+    let stderr_text = drain_and_join(stdout_drain, stderr_reader);
 
     match usage.exit_code() {
         Some(0) => {}
@@ -237,32 +362,67 @@ fn build(root: &Path, profile: &str) -> anyhow::Result<()> {
 /// Where `cargo build --profile <profile> -p logit-cli` puts the binary. `dev` is cargo's one
 /// irregular case (`target/debug`, not `target/dev`); every other profile name, `release`
 /// included, is used as its own directory name verbatim.
-fn logit_binary_path(root: &Path, profile: &str) -> PathBuf {
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("target"));
+///
+/// `target_dir_override` is `$CARGO_TARGET_DIR` when set, read once by the caller -- kept as a
+/// plain parameter rather than read from the environment in here so this stays a pure function
+/// tests can call directly, with no process-global env mutation needed to exercise the override.
+fn logit_binary_path(root: &Path, profile: &str, target_dir_override: Option<&Path>) -> PathBuf {
+    let target_dir =
+        target_dir_override.map(Path::to_path_buf).unwrap_or_else(|| root.join("target"));
     let profile_dir = if profile == "dev" { "debug" } else { profile };
     target_dir.join(profile_dir).join("logit")
 }
 
+/// The commit and dirty-state of the binary under test. Two sources, preferred in order:
+///
+/// 1. `LOGIT_PERF_GIT_SHA`/`LOGIT_PERF_GIT_DIRTY` -- set by `script/perf` itself, computed on the
+///    *host* before it execs into the dev container (`compose.yaml`'s `dev.environment` forwards
+///    them, the same pattern `INFLUXDB_TOKEN` already uses). This is the reliable path: a
+///    git-worktree checkout's `.git` file points at an absolute host path the dev container's
+///    bind mount doesn't include, so `git` run *inside* the container against a worktree checkout
+///    routinely can't answer at all.
+/// 2. Shelling out to `git` against `root` directly -- works for an ordinary (non-worktree)
+///    checkout, or when running `logit-perf` outside the dev container entirely.
+///
+/// `None` (rendered as JSON `null`, printed as "unknown") if neither source has an answer, rather
+/// than a confident-looking default.
 fn git_info(root: &Path) -> GitInfo {
-    let sha = Command::new("git")
+    let sha = non_empty_env("LOGIT_PERF_GIT_SHA").or_else(|| git_rev_parse_head(root));
+    let dirty = env_git_dirty().or_else(|| git_status_dirty(root));
+    GitInfo { sha, dirty }
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn env_git_dirty() -> Option<bool> {
+    match non_empty_env("LOGIT_PERF_GIT_DIRTY").as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
+}
+
+fn git_rev_parse_head(root: &Path) -> Option<String> {
+    Command::new("git")
         .current_dir(root)
         .args(["rev-parse", "HEAD"])
         .output()
         .ok()
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let dirty = Command::new("git")
+        .filter(|sha| !sha.is_empty())
+}
+
+fn git_status_dirty(root: &Path) -> Option<bool> {
+    Command::new("git")
         .current_dir(root)
         .args(["status", "--porcelain"])
         .output()
         .ok()
         .filter(|out| out.status.success())
         .map(|out| !out.stdout.is_empty())
-        .unwrap_or(false);
-    GitInfo { sha, dirty }
 }
 
 fn hostname() -> String {
@@ -361,10 +521,10 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 fn print_table(report: &RunReport) {
-    println!("\n{:<20} {:>12} {:>14} {:>12}", "scenario", "events/s", "us/event", "peak RSS");
+    println!("\n{:<22} {:>12} {:>14} {:>12}", "scenario", "events/s", "us/event", "peak RSS");
     for (name, scenario) in &report.scenarios {
         println!(
-            "{:<20} {:>12.0} {:>14.3} {:>10.1} MiB",
+            "{:<22} {:>12.0} {:>14.3} {:>9.1} MiB",
             name,
             scenario.median.events_per_s,
             scenario.median.cpu_us_per_event,
@@ -379,11 +539,58 @@ mod tests {
 
     #[test]
     fn logit_binary_path_maps_the_dev_profile_to_the_debug_directory() {
-        std::env::remove_var("CARGO_TARGET_DIR");
         let root = Path::new("/repo");
-        assert_eq!(logit_binary_path(root, "dev"), Path::new("/repo/target/debug/logit"));
-        assert_eq!(logit_binary_path(root, "release"), Path::new("/repo/target/release/logit"));
-        assert_eq!(logit_binary_path(root, "profiling"), Path::new("/repo/target/profiling/logit"));
+        assert_eq!(logit_binary_path(root, "dev", None), Path::new("/repo/target/debug/logit"));
+        assert_eq!(
+            logit_binary_path(root, "release", None),
+            Path::new("/repo/target/release/logit")
+        );
+        assert_eq!(
+            logit_binary_path(root, "profiling", None),
+            Path::new("/repo/target/profiling/logit")
+        );
+    }
+
+    #[test]
+    fn logit_binary_path_honors_an_explicit_target_dir_override() {
+        let root = Path::new("/repo");
+        let target_dir = Path::new("/custom/target");
+        assert_eq!(
+            logit_binary_path(root, "release", Some(target_dir)),
+            Path::new("/custom/target/release/logit")
+        );
+    }
+
+    #[test]
+    fn parse_completion_line_requires_an_exact_message_match() {
+        assert_eq!(
+            parse_completion_line(r#"{"message":"generation complete","events":5000000}"#),
+            Some(Some(5_000_000))
+        );
+        assert_eq!(parse_completion_line(r#"{"message":"starting up"}"#), None);
+        // A message that merely contains the phrase must not match -- exact equality only.
+        assert_eq!(
+            parse_completion_line(r#"{"message":"about to log generation complete soon"}"#),
+            None
+        );
+        assert_eq!(parse_completion_line("not json at all"), None);
+    }
+
+    #[test]
+    fn parse_completion_line_reports_a_missing_events_field_as_some_none() {
+        assert_eq!(parse_completion_line(r#"{"message":"generation complete"}"#), Some(None));
+    }
+
+    #[test]
+    fn stderr_capture_keeps_only_the_last_64_kib() {
+        let mut capture = StderrCapture::new();
+        let line = "x".repeat(1024);
+        for _ in 0..100 {
+            capture.push(line.clone());
+        }
+        let captured = capture.into_string();
+        assert!(captured.len() <= StderrCapture::CAP_BYTES, "{}", captured.len());
+        assert!(captured.ends_with(&line), "should keep the most recent lines");
     }
 
     #[test]
