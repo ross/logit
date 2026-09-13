@@ -15,6 +15,7 @@ use logit_config::{BufferConfig, Config, StdioTarget};
 use logit_core::{Diagnostics, Registry, Telemetry};
 use logit_inputs::collectd::CollectdInput;
 use logit_inputs::docker::{ContainerFilter, DockerInput};
+use logit_inputs::generate::{GenerateInput, GenerateMetricKind};
 use logit_inputs::internal::InternalInput;
 use logit_inputs::logit::LogitInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
@@ -288,11 +289,11 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<()> {
 /// `graph::resolve`'s rule 8 rejects every kind `is_implemented` doesn't recognize before this
 /// function is ever called. The exception is a kind that is *declared* (so that its config types
 /// and graph rules can land, and `logit validate`/`logit graph` can accept it) but whose
-/// implementation hasn't been built yet: `generate_in` and `null_out` today, until the perf
-/// harness's W2/W3 replace those two arms (`docs/plans/load-test-harness.md`). Each of those
-/// arms `bail!`s with a message naming the kind, so `logit run` fails startup with exit 1 and a
-/// clear error rather than panicking -- the same "reject a config referencing an unimplemented
-/// kind with a clear error" contract `AGENTS.md` states.
+/// implementation hasn't been built yet: `null_out` today, until the perf harness's W3 replaces
+/// that arm (`docs/plans/load-test-harness.md`). That arm `bail!`s with a message naming the
+/// kind, so `logit run` fails startup with exit 1 and a clear error rather than panicking -- the
+/// same "reject a config referencing an unimplemented kind with a clear error" contract
+/// `AGENTS.md` states.
 ///
 /// `id` attaches a [`Diagnostics`] to every component that emits one
 /// (`docs/adr/service-lifecycle-and-output-retry.md`) via each kind's own `with_diagnostics`
@@ -432,17 +433,33 @@ fn build_spec(
             )
         }
 
-        // Declared but not yet buildable: the kind, its config types, and graph rule 42 landed in
-        // the perf harness's W1 so that `logit validate`/`logit graph` accept a scenario config,
-        // but `logit_inputs::generate::GenerateInput` and this arm are W2
-        // (`docs/plans/load-test-harness.md`). Until then `logit run` must *fail* on such a
-        // config, not panic -- a startup error with exit 1, exactly as `AGENTS.md` promises for
-        // any config naming a kind this binary can't build. W2 replaces this arm with the real
-        // one; it does not add an error path to delete.
-        GenerateIn { .. } => anyhow::bail!(
-            "component `{id}`: `generate_in` is declared but not yet buildable -- its \
-             implementation lands in workstream W2 (docs/plans/load-test-harness.md)"
-        ),
+        // Every `?` below is unreachable in practice: graph rule 42 has already parsed every one
+        // of these template strings and checked every placeholder in it against the same
+        // predicate `logit_inputs::generate`'s resolver mirrors. They stay errors rather than
+        // `expect`s anyway -- this is the config boundary, and a rule and a resolver that drift
+        // apart should fail startup with the resolver's own message, not panic.
+        GenerateIn { count, batch, rate, event, resource } => {
+            let mut input = GenerateInput::new(*count, *batch)
+                .with_rate(*rate)
+                .with_resource(resource.clone())?
+                .with_diagnostics(Diagnostics::new(id))
+                .with_telemetry(telemetry.clone());
+            if let Some(log) = &event.log {
+                input = input.with_log(parse_generate_template(id, "event.log", log)?)?;
+            }
+            for (key, value) in &event.attributes {
+                let field = format!("event.attributes.{key}");
+                input = input.with_attribute(key, parse_generate_template(id, &field, value)?)?;
+            }
+            if let Some(metric) = &event.metric {
+                input = input.with_metric(
+                    parse_generate_template(id, "event.metric.name", &metric.name)?,
+                    generate_metric_kind(metric.kind),
+                    metric.value,
+                )?;
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
 
         Lua { script, interval } => NodeSpec::Lua { script: script.clone(), interval: *interval },
         LuaFile { lua_file, interval } => {
@@ -808,6 +825,31 @@ fn otlp_in_transport(protocol: logit_config::OtlpProtocol) -> OtlpInTransport {
     match protocol {
         logit_config::OtlpProtocol::Http => OtlpInTransport::Http,
         logit_config::OtlpProtocol::Grpc => OtlpInTransport::Grpc,
+    }
+}
+
+/// Parses one `generate_in` template string, naming the dotted config path it came from
+/// (`event.log`, `event.attributes.host`) in any error so an operator is told what to fix.
+///
+/// Graph rule 42 already parsed every one of these, so this never actually fails in a
+/// `logit run`; it stays fallible rather than `expect`ing because a rule and a registry that
+/// drift apart should surface as a startup error, not a panic.
+fn parse_generate_template(
+    id: &str,
+    field: &str,
+    raw: &str,
+) -> anyhow::Result<logit_core::template::Template> {
+    logit_core::template::parse(raw)
+        .map_err(|err| anyhow::anyhow!("component '{id}': '{field}' is not a template: {err}"))
+}
+
+/// Translates config's `GenerateMetricKind` into `logit-inputs`'s own copy of the same three-value
+/// choice -- same reasoning as [`otlp_in_transport`].
+fn generate_metric_kind(kind: logit_config::GenerateMetricKind) -> GenerateMetricKind {
+    match kind {
+        logit_config::GenerateMetricKind::Sum => GenerateMetricKind::Sum,
+        logit_config::GenerateMetricKind::Gauge => GenerateMetricKind::Gauge,
+        logit_config::GenerateMetricKind::Distribution => GenerateMetricKind::Distribution,
     }
 }
 
@@ -1428,13 +1470,13 @@ mod tests {
         }
     }
 
-    /// `generate_in`/`null_out` are declared kinds whose implementations land in the perf
-    /// harness's W2/W3, so `graph::resolve` accepts them today (that's what lets rule 42 and
-    /// `logit validate` exist ahead of the implementations) but `build_spec` can't build one.
-    /// That must be a clear startup *error* -- exit 1 from `logit run`, per `AGENTS.md` -- never
-    /// a panic, and never a silently-skipped node.
+    /// Every template string on a `generate_in` -- the log body, each attribute value, the metric
+    /// name, each resource value -- crosses into `logit_inputs::generate` here, and each one can
+    /// fail to parse or name a placeholder the resolver rejects. Exercising the fully-populated
+    /// shape, not the default one, is what makes this test cover those four `?`s rather than none
+    /// of them.
     #[test]
-    fn build_spec_rejects_generate_in_until_w2_lands() {
+    fn build_spec_builds_a_generate_input() {
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
@@ -1443,21 +1485,36 @@ mod tests {
             kind: ComponentKind::GenerateIn {
                 count: Some(1000),
                 batch: 100,
-                rate: None,
-                event: logit_config::GenerateEvent::default(),
-                resource: std::collections::BTreeMap::new(),
+                rate: Some(50_000),
+                event: logit_config::GenerateEvent {
+                    log: Some("path=/x/{seq%50}".to_string()),
+                    attributes: std::collections::BTreeMap::from([(
+                        "host".to_string(),
+                        "web-{seq%10}".to_string(),
+                    )]),
+                    metric: Some(logit_config::GenerateMetric {
+                        name: "requests".to_string(),
+                        kind: logit_config::GenerateMetricKind::Distribution,
+                        value: 1.0,
+                    }),
+                },
+                resource: std::collections::BTreeMap::from([(
+                    "service.name".to_string(),
+                    "web".to_string(),
+                )]),
             },
         };
-        let err = build_spec("gen", &component, Path::new(""), None)
-            .err()
-            .expect("generate_in isn't buildable yet, so this must be an error")
-            .to_string();
-        assert!(err.contains("`gen`"), "got: {err}");
-        assert!(err.contains("`generate_in`"), "got: {err}");
-        assert!(err.contains("W2"), "got: {err}");
+        assert!(matches!(
+            build_spec("gen", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
     }
 
-    /// [`build_spec_rejects_generate_in_until_w2_lands`]'s twin, for the sink side.
+    /// `null_out` is a declared kind whose implementation lands in the perf harness's W3, so
+    /// `graph::resolve` accepts it today (that's what lets rule 42 and `logit validate` exist
+    /// ahead of the implementation) but `build_spec` can't build one. That must be a clear
+    /// startup *error* -- exit 1 from `logit run`, per `AGENTS.md` -- never a panic, and never a
+    /// silently-skipped node.
     #[test]
     fn build_spec_rejects_null_out_until_w3_lands() {
         let component = ResolvedComponent {
