@@ -225,6 +225,8 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `collectd_in` decode a 25-list datagram | **1** | + 3 reallocs (`Vec<Event>` growing 4 → 8 → 16 → 32); a collectd datagram has no header naming its value-list count, so `decode_into` cannot size the `Vec` up front |
 | `collectd_in` decode 1 three-data-source list, `types_db` resolving its names | **2** | **the same as without a `types.db`** -- the lookup is one `HashMap::get` per Values part returning a borrowed slice, and resolved names go into the same reused scratch `String` before interning |
 | `prometheus_in` decode 1 scrape (11 series: 2 counter families, 1 gauge, 1 histogram, 1 summary) | **161** | `text::parse_with` + `families_to_events`, no `Decoder` trait (ADR `prometheus-scrape-and-exposition`'s "No `logit_proto::Encoder`") -- ~14.6/series, dominated by one `String`/`AttrMap` per label pair (labels are decoded as owned `String`s, not sliced from the scrape body, unlike syslog/statsd's zero-copy `Bytes` fields) plus one `Vec` per family's series list; not yet optimized the way syslog/statsd's decode paths were, tracked as follow-up work rather than fixed here |
+| `generate_in` render 100 events (all-literal template) | **1** | just the batch's `Vec<Event>` -- nothing at all per event. No placeholder anywhere means one prototype `Event` is rendered once at construction and `clone`d per event with only `timestamp` overwritten, and *this* shape's `Event::clone` is free: one attribute fits `AttrMap`'s 8-entry inline capacity, one metric fits `MetricList`'s inline capacity of 1, and the log body's `Bytes` is a refcount bump rather than a copy (contrast the `Event::clone (nginx shape)` row below, whose attributes have spilled). The generator is effectively free next to whatever a scenario puts downstream of it, which is the point of having this path at all |
+| `generate_in` render 100 events (2 templated fields) | **201** | 1 as above + exactly one `Bytes::copy_from_slice` per templated field per event (`{seq%50}` in the log body, `{seq%10}` in one attribute). Nothing else: the scratch `String` every rendering goes through never reallocates once warm (`logit_core::template::Compiled::render`'s own guarantee), and the literal fields alongside them -- the interned metric name, the `Arc`-shared resource -- still cost nothing. This is [ADR `load-test-harness`](../adr/load-test-harness.md)'s named risk, measured rather than feared: a placeholder is a cardinality knob, not decoration, and each one costs an allocation per event forever |
 | `json` parse + merge (nginx shape) | **1** | fixed -- see below, was 7 |
 | `json` parse + merge (wide-JSON, 28 keys) | **1** | same fix, confirmed to generalize past a small field count |
 | `logfmt` parse + merge (go-kit-style, 9 fields) | **1** | hand-rolled scanner, zero-copy by construction -- see `docs/adr/logfmt-and-kv-parsing.md`; the one allocation is `event.attributes` spilling its inline capacity, same shape as `json`'s |
@@ -317,7 +319,10 @@ accounting as is rather than moving both producers' weights for a reason unrelat
 > are the same kind of exception again, with no wall-clock figure -- their counts are what
 > `collectd_decode_one_list`/`collectd_decode_into_a_warm_reused_buffer_costs_nothing`/
 > `collectd_decode_one_three_value_list`/`collectd_decode_a_25_list_packet`/
-> `collectd_decode_one_list_with_types_db_resolution` pin.
+> `collectd_decode_one_list_with_types_db_resolution` pin. The two `generate_in` render rows are
+> the newest one, also with no wall-clock figure -- pinned by `generate_render_literal_100_events`/
+> `generate_render_templated_100_events`, with matching `generate_render_literal`/
+> `generate_render_templated` arms in `benches/pipeline.rs` for anyone who wants the timing.
 
 ### Listener I/O decoupling: the `decode_into` buffer-reuse win (ADR `decoupled-listener-io`)
 

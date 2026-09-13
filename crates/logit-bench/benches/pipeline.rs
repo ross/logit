@@ -50,6 +50,36 @@ fn statsd_decode(bencher: Bencher, lines: usize) {
     bencher.bench_local(|| decoder.decode(divan::black_box(datagram.clone())));
 }
 
+/// `generate_in`'s two render paths, called straight through `build_batch` -- no runtime, no
+/// channel, nothing between the measurement and the generator, so this file's "no cross-thread
+/// hop" rule holds and the allocation column is trustworthy. `tests/allocations.rs`'s
+/// `generate_render_literal_100_events`/`generate_render_templated_100_events` pin the exact
+/// counts; these two are their wall-clock view, and the gap between them is what two placeholders
+/// cost per event.
+#[divan::bench]
+fn generate_render_literal(bencher: Bencher) {
+    let mut input = fixtures::generate_literal();
+    // The first call settles the render path and renders the prototype; keeping it out of the
+    // timed region matches every other bench's warm-up here.
+    drop(input.build_batch(0, 0, 100, 1));
+    let mut batch_index = 0u64;
+    bencher.bench_local(move || {
+        batch_index += 1;
+        input.build_batch(batch_index, batch_index * 100, 100, 2)
+    });
+}
+
+#[divan::bench]
+fn generate_render_templated(bencher: Bencher) {
+    let mut input = fixtures::generate_templated();
+    drop(input.build_batch(0, 0, 100, 1));
+    let mut batch_index = 0u64;
+    bencher.bench_local(move || {
+        batch_index += 1;
+        input.build_batch(batch_index, batch_index * 100, 100, 2)
+    });
+}
+
 #[divan::bench]
 fn json_parse(bencher: Bencher) {
     let resource = fixtures::resource();

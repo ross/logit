@@ -512,6 +512,21 @@ Worked examples, one per shipped component:
   on every connect/disconnect) and `logit.input.connections.rejected{reason="limit"}` (count — the
   1024-connection cap actually binding, unlike `otlp_in`'s blocking-backpressure shape, which has
   nothing to count here since it never rejects outright).
+- `generate_in` (`crates/logit-inputs/src/generate.rs`,
+  [ADR `load-test-harness`](../adr/load-test-harness.md)): **layer 2 only, no layer-3 points at
+  all** — the runtime's own `logit.component.events.sent` on this node's fanout edge already *is*
+  the generated count, so a counter here would only restate it. (`collectd_in` above is the same
+  shape for a different reason: there, the shared `UdpListener` driver already records everything
+  only the listener can see.) The one thing it adds is a `Diagnostics` key, mirrored as
+  `logit.component.diagnostics{key}` by the bridge: `rate_behind`, reported once the generator
+  falls a whole second's worth of events behind the `rate` it was configured with — the signal
+  that a rate-limited scenario has quietly become a throughput one, which nothing else in the
+  picture can distinguish. Separately, and not telemetry at all: on finishing its `count` it logs
+  one `generation complete` line at `info` carrying `events`/`batches`/`elapsed`, which is what
+  the perf harness reads wall time and the divisor for events/s off (`docs/plans/
+  load-test-harness.md`) — the one component that emits a structured `tracing` event directly
+  rather than through `Diagnostics`, because the harness needs those as *fields*, not as a
+  rendered message.
 - `aggregate` (`crates/logit-transforms/src/aggregate.rs`): `logit.transform.series.active` and
   `logit.transform.resource.groups`, sampled at the top of `flush` before it touches its own state
   — the peak-of-window series count, which is the visible signal for the cardinality blow-up

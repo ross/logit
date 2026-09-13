@@ -65,6 +65,49 @@ fn a_port_already_in_use_exits_1() {
     assert_eq!(status.code(), Some(1));
 }
 
+/// The finish-and-cascade contract a perf scenario depends on, end to end against the real
+/// binary: `generate_in` returns after `count` events, its senders drop, the existing
+/// listener-exit cascade flushes downstream, and the process exits 0 with no signal and no
+/// timeout involved (`docs/plans/load-test-harness.md`,
+/// `crates/logit-pipeline/src/runtime.rs`'s `run_returns_once_the_only_input_finishes_instead_
+/// of_hanging`).
+///
+/// `stdio_out` to `/dev/null` rather than `null_out`, now that both exist: what this test claims
+/// is that the cascade *flushed downstream* before exiting, and a sink that really opens a file,
+/// writes to it, and flushes on close is evidence for that in a way a sink whose `send` returns
+/// `Ok(())` without doing anything cannot be. `examples/generate-to-null.yaml` is where the
+/// canonical `generate_in -> null_out` scenario shape lives.
+#[test]
+fn a_finite_generate_in_config_exits_0() {
+    let config = TempConfig::write(
+        "finite-generate",
+        b"components:\n  gen:\n    type: generate_in\n    count: 1000\n    batch: 100\n    event:\n      log: \"n={seq}\"\n  sink:\n    type: stdio_out\n    sources: [gen]\n    target: /dev/null\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_logit"))
+        .arg("--log-format")
+        .arg("json")
+        .arg("run")
+        .arg(&config.0)
+        .output()
+        .expect("spawning the logit binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr was: {stderr}");
+
+    // The harness reads exactly this line to derive events/s, so both the message and the count
+    // it carries are part of the contract, not just log noise.
+    let completion = stderr
+        .lines()
+        .find(|line| line.contains(r#""message":"generation complete""#))
+        .unwrap_or_else(|| panic!("no 'generation complete' line in stderr: {stderr}"));
+    assert!(completion.contains(r#""events":1000"#), "got: {completion}");
+
+    // `drain complete` is `run_with_telemetry`'s line, logged only when a shutdown signal or a
+    // node failure actually started a drain. A generator finishing its `count` is neither: the
+    // senders simply drop and the cascade runs to completion. Asserted so this stays the clean
+    // self-exit path it claims to be, rather than quietly turning into a shutdown.
+    assert!(!stderr.contains("drain complete"), "stderr was: {stderr}");
+}
+
 #[test]
 fn logit_validate_a_good_config_exits_0() {
     let config = TempConfig::write(
