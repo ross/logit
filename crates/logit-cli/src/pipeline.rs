@@ -27,6 +27,7 @@ use logit_outputs::collectd::CollectdOutput;
 use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::logit::LogitOutput;
+use logit_outputs::null::NullOutput;
 use logit_outputs::otlp::{
     OtlpCompression as OtlpOutCompression, OtlpOutput, OtlpTransport as OtlpOutTransport,
     SignalPaths,
@@ -287,13 +288,9 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<()> {
 /// runs. The single source of truth for which `ComponentKind`s this binary can build. The match
 /// is exhaustive over `ComponentKind` -- there is no fallback arm, and none is needed:
 /// `graph::resolve`'s rule 8 rejects every kind `is_implemented` doesn't recognize before this
-/// function is ever called. The exception is a kind that is *declared* (so that its config types
-/// and graph rules can land, and `logit validate`/`logit graph` can accept it) but whose
-/// implementation hasn't been built yet: `null_out` today, until the perf harness's W3 replaces
-/// that arm (`docs/plans/load-test-harness.md`). That arm `bail!`s with a message naming the
-/// kind, so `logit run` fails startup with exit 1 and a clear error rather than panicking -- the
-/// same "reject a config referencing an unimplemented kind with a clear error" contract
-/// `AGENTS.md` states.
+/// function is ever called. Every declared kind is buildable again as of the perf harness's
+/// W2/W3 (`generate_in`, `null_out`), so there is no "declared but not yet implemented" arm left
+/// here either.
 ///
 /// `id` attaches a [`Diagnostics`] to every component that emits one
 /// (`docs/adr/service-lifecycle-and-output-retry.md`) via each kind's own `with_diagnostics`
@@ -767,12 +764,13 @@ fn build_spec(
         }
 
         // The `generate_in` arm's twin, for the same reason -- `logit_outputs::null::NullOutput`
-        // and this arm are the perf harness's W3 (`docs/plans/load-test-harness.md`). It gets the
-        // same `queue_config`/`write_config` treatment as every other sink when it lands, so
-        // `buffer:` (disk included) works on it.
-        NullOut {} => anyhow::bail!(
-            "component `{id}`: `null_out` is declared but not yet buildable -- its \
-             implementation lands in workstream W3 (docs/plans/load-test-harness.md)"
+        // and this arm are the perf harness's W3 (`docs/plans/load-test-harness.md`). Same
+        // `queue_config`/`write_config` treatment as every other sink, so `buffer:` (disk
+        // included) works on it.
+        NullOut {} => NodeSpec::Output(
+            Box::new(NullOutput),
+            queue_config(&component.buffer, base_dir),
+            write_config(&component.buffer),
         ),
     };
     Ok((spec, telemetry))
@@ -941,24 +939,23 @@ fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::U
 /// 17 already guarantees a non-datagram-, non-tail-listener's `receive` is `ReceiveConfig::
 /// default()` by the time a resolved `Graph` reaches `build_spec`, so `internal` always gets
 /// `shutdown_grace: ReceiveConfig::default().shutdown_grace` here (5s today, not
-/// `Duration::ZERO`) regardless of what any `receive:` block would otherwise say. For `internal`
-/// that's harmless, not just unused, only because `InternalInput` never overrides `Input::
-/// run_until_shutdown`: the default impl's own `select!` always resolves at t=shutdown against a
-/// non-overriding input, so `run_input`'s grace backstop -- built from this value -- never gets a
-/// chance to matter. If `internal` ever gains a cooperative drain of its own, this stops being a
-/// harmless default and needs its own `receive.shutdown_grace`-shaped knob rather than inheriting
-/// whatever `ReceiveConfig::default` happens to say.
+/// `Duration::ZERO`) regardless of what any `receive:` block would otherwise say. That fixed 5s
+/// is load-bearing for `internal` rather than merely harmless: `InternalInput` overrides `Input::
+/// run_until_shutdown` to drain its buffered points one final time when shutdown fires
+/// (`crates/logit-inputs/src/internal.rs`), so `run_input`'s grace backstop is what bounds that
+/// drain. One `Registry::drain` plus one `Fanout::send` fits inside 5s with room to spare.
 ///
-/// `tail_in`/`docker_in` and, now, `logit_in` are the listeners where this value is genuinely
-/// load-bearing rather than incidentally harmless: `TailInput` (`crates/logit-inputs/src/tail/
-/// driver.rs`) overrides `run_until_shutdown` to flush every tracked file's accumulator and
-/// write a final checkpoint, and `LogitInput` (`crates/logit-inputs/src/logit.rs`) overrides it
-/// to close every idle connection with `Reject{GOING_AWAY}` -- either drain must fit inside
-/// `shutdown_grace` or `run_input`'s backstop cancels it by drop, losing whatever it hadn't
-/// flushed/closed yet. `logit_in` falls under rule 17's non-datagram, non-tail bucket, so unlike
-/// `tail_in`/`docker_in` it always gets the fixed 5s default here -- there is no
-/// `receive:`-shaped knob to override it with (`docs/known-gaps.md` tracks this as the one
-/// currently un-tunable case).
+/// `tail_in`/`docker_in`, `logit_in` and `internal` are the listeners where this value is
+/// genuinely load-bearing rather than incidentally harmless: `TailInput`
+/// (`crates/logit-inputs/src/tail/driver.rs`) overrides `run_until_shutdown` to flush every
+/// tracked file's accumulator and write a final checkpoint, `LogitInput`
+/// (`crates/logit-inputs/src/logit.rs`) overrides it to close every idle connection with
+/// `Reject{GOING_AWAY}`, and `InternalInput` overrides it for the final drain above -- each of
+/// those has to fit inside `shutdown_grace` or `run_input`'s backstop cancels it by drop, losing
+/// whatever it hadn't flushed/closed/drained yet. `logit_in` and `internal` fall under rule 17's
+/// non-datagram, non-tail bucket, so unlike `tail_in`/`docker_in` they always get the fixed 5s
+/// default here -- there is no `receive:`-shaped knob to override it with
+/// (`docs/known-gaps.md` tracks this as the currently un-tunable case).
 fn input_runtime_config(receive: &logit_config::ReceiveConfig) -> InputRuntimeConfig {
     InputRuntimeConfig { shutdown_grace: receive.shutdown_grace }
 }
@@ -1447,6 +1444,21 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_builds_a_null_sink() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::NullOut {},
+        };
+        assert!(matches!(
+            build_spec("out", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    #[test]
     fn build_spec_builds_an_otlp_input() {
         for protocol in [logit_config::OtlpProtocol::Http, logit_config::OtlpProtocol::Grpc] {
             let component = ResolvedComponent {
@@ -1474,7 +1486,8 @@ mod tests {
     /// name, each resource value -- crosses into `logit_inputs::generate` here, and each one can
     /// fail to parse or name a placeholder the resolver rejects. Exercising the fully-populated
     /// shape, not the default one, is what makes this test cover those four `?`s rather than none
-    /// of them.
+    /// of them. (`build_spec_builds_a_null_sink` above is W3's sink-side twin; neither kind has a
+    /// "declared but not buildable" test any more, because neither is.)
     #[test]
     fn build_spec_builds_a_generate_input() {
         let component = ResolvedComponent {
@@ -1508,29 +1521,6 @@ mod tests {
             build_spec("gen", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Input(..)
         ));
-    }
-
-    /// `null_out` is a declared kind whose implementation lands in the perf harness's W3, so
-    /// `graph::resolve` accepts it today (that's what lets rule 42 and `logit validate` exist
-    /// ahead of the implementation) but `build_spec` can't build one. That must be a clear
-    /// startup *error* -- exit 1 from `logit run`, per `AGENTS.md` -- never a panic, and never a
-    /// silently-skipped node.
-    #[test]
-    fn build_spec_rejects_null_out_until_w3_lands() {
-        let component = ResolvedComponent {
-            buffer: logit_config::BufferConfig::default(),
-            receive: logit_config::ReceiveConfig::default(),
-            sources: vec!["gen".to_string()],
-            consumers: vec![],
-            kind: ComponentKind::NullOut {},
-        };
-        let err = build_spec("sink", &component, Path::new(""), None)
-            .err()
-            .expect("null_out isn't buildable yet, so this must be an error")
-            .to_string();
-        assert!(err.contains("`sink`"), "got: {err}");
-        assert!(err.contains("`null_out`"), "got: {err}");
-        assert!(err.contains("W3"), "got: {err}");
     }
 
     #[test]
@@ -2022,6 +2012,41 @@ mod tests {
         assert_eq!(disk_config.segment_bytes, 128 * 1024 * 1024);
         assert_eq!(disk_config.compression, NativeCompression::Lz4);
         assert_eq!(disk_config.checkpoint_interval, Duration::from_secs(5));
+    }
+
+    /// The load-test harness's `buffered` scenario (`docs/plans/load-test-harness.md`) is exactly
+    /// this shape: a `null_out` behind `buffer.disk`, proving a disk-backed spool builds and runs
+    /// with no real destination behind it -- `NullOutput` itself has nothing disk-related about
+    /// it, so this is really exercising `queue_config`'s disk branch for a sink that takes no
+    /// fields of its own.
+    #[test]
+    fn build_spec_builds_a_null_sink_behind_a_disk_buffer_and_resolves_a_disk_sinkstoreconfig() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig {
+                disk: Some(logit_config::DiskBufferConfig {
+                    path: "spool".to_string(),
+                    max_bytes: 2 * 1024 * 1024 * 1024,
+                    segment_bytes: 128 * 1024 * 1024,
+                    compression: logit_config::Compression::Lz4,
+                    checkpoint_interval: Duration::from_secs(5),
+                }),
+                ..logit_config::BufferConfig::default()
+            },
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::NullOut {},
+        };
+        let NodeSpec::Output(_, store_config, _) =
+            build_spec("out", &component, Path::new("/etc/logit"), None).unwrap().0
+        else {
+            panic!("expected NodeSpec::Output");
+        };
+        let SinkStoreConfig::Disk(disk_config) = store_config else {
+            panic!("expected SinkStoreConfig::Disk, buffer.disk was Some");
+        };
+        assert_eq!(disk_config.dir, Path::new("/etc/logit/spool"));
+        assert_eq!(disk_config.max_bytes, 2 * 1024 * 1024 * 1024);
     }
 
     #[test]

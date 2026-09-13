@@ -17,8 +17,8 @@
 //! their own. See that function's doc for why each of the three steps is needed.
 //!
 //! **Not used by [`crate::internal::InternalInput`].** `internal` has no socket, no datagram, and
-//! no `receive:` block -- it keeps `Input::run_until_shutdown`'s default (cancel-by-drop,
-//! unchanged from ADR `service-lifecycle-and-output-retry`). Don't generalize this module toward it.
+//! no `receive:` block -- its own `Input::run_until_shutdown` override is a single final
+//! `Registry` drain, nothing queue-shaped. Don't generalize this module toward it.
 
 use bytes::Bytes;
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};

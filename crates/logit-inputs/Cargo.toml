@@ -64,3 +64,9 @@ logit-transforms.workspace = true
 # itself, which is what `tracing-subscriber` is needed for here. (`tracing` itself is a real
 # dependency now, for `generate_in`'s completion line -- see above.)
 tracing-subscriber.workspace = true
+# `test-util` (for `tokio::time::pause`/`#[tokio::test(start_paused = true)]`) for
+# `internal.rs`'s shutdown-drain tests, which advance a 60s drain interval by hand. Same shape
+# and same reason as `logit-pipeline`'s own override: it applies to test/bench/example builds
+# only, and it has to be declared here rather than inherited from a sibling, since
+# `cargo test -p logit-inputs` builds this package's feature set alone.
+tokio = { workspace = true, features = ["test-util"] }

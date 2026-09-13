@@ -1,9 +1,9 @@
 # A synthetic load: `generate_in` renders a fixed number of events from a template, an ordinary
-# `json` stage parses their bodies, and the result is written to a file sink. This is the shape
-# every perf scenario takes (docs/plans/load-test-harness.md) -- run it directly to see the
-# generator's own completion line:
+# `json` stage parses their bodies, and `null_out` drops the result. This is the shape every perf
+# scenario takes (docs/plans/load-test-harness.md) -- run it directly to see the generator's own
+# completion line:
 #
-#   logit --log-format json run examples/generate-to-file.yaml
+#   logit --log-format json run examples/generate-to-null.yaml
 #
 # ...which ends with `{"message":"generation complete","events":1000,...}` on stderr. `count` is
 # reached, `generate_in` returns, its senders drop, and the existing listener-exit cascade flushes
@@ -66,11 +66,11 @@ components:
     type: json
     sources: [gen]
 
-  # `/dev/null` so the example measures everything up to the sink's write without a real file's
-  # size or filesystem in the number. `stdio_out` with a path target is the non-rotating file
-  # sink; `file_out` is the same implementation with a rotation policy attached, which /dev/null
-  # has no use for.
+  # Drops everything as cheaply as the runtime allows, so the measurement covers everything
+  # *upstream* of a sink without an encoder, a socket, or a filesystem in the number -- the
+  # runtime's own layer-2 telemetry still counts what it received and how long delivery took, so
+  # the graph stays attributable per node. A scenario that wants an encoder measured swaps this
+  # for a `file_out` to /dev/null instead, which is a real sink doing real work.
   sink:
-    type: stdio_out
+    type: null_out
     sources: [parse]
-    target: /dev/null

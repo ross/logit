@@ -72,8 +72,11 @@ fn a_port_already_in_use_exits_1() {
 /// `crates/logit-pipeline/src/runtime.rs`'s `run_returns_once_the_only_input_finishes_instead_
 /// of_hanging`).
 ///
-/// `stdio_out` to `/dev/null` rather than `null_out`: that sink lands in the harness's W3, and
-/// what this test is about is the *listener's* exit, not the sink's cost.
+/// `stdio_out` to `/dev/null` rather than `null_out`, now that both exist: what this test claims
+/// is that the cascade *flushed downstream* before exiting, and a sink that really opens a file,
+/// writes to it, and flushes on close is evidence for that in a way a sink whose `send` returns
+/// `Ok(())` without doing anything cannot be. `examples/generate-to-null.yaml` is where the
+/// canonical `generate_in -> null_out` scenario shape lives.
 #[test]
 fn a_finite_generate_in_config_exits_0() {
     let config = TempConfig::write(
