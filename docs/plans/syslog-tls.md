@@ -185,9 +185,15 @@ PR numbers, per this plan's landing order: W1 (the generic TCP+TLS driver + fram
 (`syslog_out` TLS) is #159, W4 (the recorded rsyslog-over-TCP fixture) is #161, and W2 (`syslog_in`
 over TCP/TLS, stacked on W1) is #163. This document's own workstream, W5 (round-trip tests, the new
 `examples/syslog-relay.yaml`, and the closeout doc edits below), is built as a branch on top of all
-four but does not yet have a PR open. **Nothing in this stack is merged** — landing order and
-timing are Ross's call, per this plan's "Execution instruction" above, not something this document
-or any workstream branch decides for itself.
+four but does not yet have a PR open. Both W2 and W3 have since picked up review fixes on their own
+branches (W2/#163: a first-byte deadline on both accept arms, a shared throttle for framing
+diagnostics, truncated-frame accounting on an abrupt close; W3/#159: `syslog_out` now flushes
+before reporting a TLS batch delivered, the zero-byte reconnect-and-retry is plaintext-only, a TLS
+write failure is always `Fault::Ambiguous`, and `connect_timeout` bounds the TCP connect and TLS
+handshake as separate phases — see both syslog ADRs' 2026-09-13 amendments), which this workstream
+has merged in. **Nothing in this stack is merged** — landing order and timing are Ross's call, per
+this plan's "Execution instruction" above, not something this document or any workstream branch
+decides for itself.
 
 ### Per-workstream detail
 

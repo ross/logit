@@ -759,6 +759,11 @@ Mutual TLS adds a client certificate on `syslog_out`'s `tls:` block, exactly `lo
 above (`cert_file`/`key_file` together). `tls.insecure_skip_verify` (`syslog_out` only, same
 contradictory-with-`ca_file` rejection) behaves identically too.
 
+`syslog_out.connect_timeout` bounds the TCP connect and the TLS handshake as two separate phases,
+not one combined deadline — a TLS connect can therefore take up to twice the configured value
+([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)'s amendment). Size it
+accordingly if raising it from the default.
+
 **What to watch.** `syslog_out`: `logit.output.requests{class="ok"|"error"}` (one per attempt) and
 `logit.output.reconnects` (should stay near zero in steady state — a climbing count on a TLS
 connection means the peer or the network, not this sink, is unstable; counted identically on a

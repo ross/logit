@@ -1248,15 +1248,17 @@ already built that have a known, accepted rough edge.
   peer's post-handshake rejection.** Under TLS 1.3 the server sends its entire handshake flight,
   `Finished` included, before it ever sees the client's certificate message — so a client-cert
   rejection (a `client_ca_file`-requiring collector, no matching cert presented) arrives as an
-  alert *after* `TlsConnector::connect` has already returned success on this side, and after
-  `syslog_out`'s single `write()` has already landed its bytes in the local socket buffer: `send`
-  reports the batch delivered, and this sink never reads from the connection again to learn
-  otherwise (PR #159's finding;
-  [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)). `logit_out` is exposed to
-  the same window only up to its own ack read — once a batch's ack has actually been read back, a
-  rejection can no longer hide behind it. A *server*-certificate rejection is unaffected: that
-  verification happens inside the client's own handshake, before any write is attempted, so it
-  always surfaces as `Fault::Clean` (see
+  alert *after* `TlsConnector::connect` has already returned success on this side. `syslog_out`
+  now flushes before a batch may be reported delivered
+  ([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)'s 2026-09-13 amendment),
+  so the bytes are genuinely off this host by the time `send` reports success — but a local flush
+  only proves the write left this process, never that the peer accepted it: the server's rejection
+  alert is independent of, and unaffected by, whether this side has flushed. `send` still reports
+  the batch delivered, and this sink never reads from the connection again to learn otherwise (PR
+  #159's finding). `logit_out` is exposed to the same window only up to its own ack read — once a
+  batch's ack has actually been read back, a rejection can no longer hide behind it. A
+  *server*-certificate rejection is unaffected: that verification happens inside the client's own
+  handshake, before any write is attempted, so it always surfaces as `Fault::Clean` (see
   `crates/logit-cli/tests/syslog_round_trip.rs`'s `mod tls`). Closing the client-cert case would
   mean this sink reading and interpreting TLS alerts (or application-level acks) it currently
   never looks at — out of scope for either ADR that introduced these sinks.
