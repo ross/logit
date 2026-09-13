@@ -16,13 +16,18 @@ set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
 source "${SCRIPT_PATH}/common.sh"
 
-# Computed here, on the host, and forwarded into the dev container through compose.yaml's
-# `dev.environment` (the same pattern INFLUXDB_TOKEN already uses) -- `run()` execs directly with
-# no forwarding of its own otherwise. This is the reliable path for `git rev-parse`/`git status`:
-# a git-worktree checkout's `.git` file points at an absolute host path the dev container's bind
-# mount doesn't include, so `git` run *inside* the container against a worktree checkout routinely
-# can't answer at all (crates/logit-perf/src/run.rs's `git_info` doc has the full story, and falls
-# back to shelling out there too, for a non-worktree checkout or a run outside the container).
+# Computed here, on the host: a git-worktree checkout's `.git` file points at an absolute host
+# path the dev container's bind mount doesn't include, so `git` run *inside* the container against
+# a worktree checkout routinely can't answer at all (crates/logit-perf/src/run.rs's `git_info` doc
+# has the full story, and falls back to shelling out there too, for a non-worktree checkout or a
+# run outside the container).
+#
+# Handed to the container as argv to `env`, not through `compose.yaml`'s `environment:` block:
+# `run()`'s docker-compose path is `sudo docker compose run`, and `sudo` strips the calling shell's
+# environment before `docker compose` ever gets to interpolate a `${VAR}` there, so an
+# `environment:` entry can never see a value exported here. `run()`'s argv, by contrast, reaches
+# the container (or, in CI, the directly-exec'd process) unchanged either way -- `env` is what sets
+# these two vars for the `cargo run` that follows, in whichever process actually runs it.
 LOGIT_PERF_GIT_SHA="$(git rev-parse HEAD 2>/dev/null)" || LOGIT_PERF_GIT_SHA=""
 if LOGIT_PERF_GIT_PORCELAIN="$(git status --porcelain 2>/dev/null)"; then
     if [ -n "${LOGIT_PERF_GIT_PORCELAIN}" ]; then
@@ -33,6 +38,10 @@ if LOGIT_PERF_GIT_PORCELAIN="$(git status --porcelain 2>/dev/null)"; then
 else
     LOGIT_PERF_GIT_DIRTY=""
 fi
-export LOGIT_PERF_GIT_SHA LOGIT_PERF_GIT_DIRTY
 
-run cargo run -q -p logit-perf -- "$@"
+if [ -n "${LOGIT_PERF_GIT_SHA}" ]; then
+    run env "LOGIT_PERF_GIT_SHA=${LOGIT_PERF_GIT_SHA}" "LOGIT_PERF_GIT_DIRTY=${LOGIT_PERF_GIT_DIRTY}" \
+        cargo run -q -p logit-perf -- "$@"
+else
+    run cargo run -q -p logit-perf -- "$@"
+fi

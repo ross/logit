@@ -376,11 +376,15 @@ fn logit_binary_path(root: &Path, profile: &str, target_dir_override: Option<&Pa
 /// The commit and dirty-state of the binary under test. Two sources, preferred in order:
 ///
 /// 1. `LOGIT_PERF_GIT_SHA`/`LOGIT_PERF_GIT_DIRTY` -- set by `script/perf` itself, computed on the
-///    *host* before it execs into the dev container (`compose.yaml`'s `dev.environment` forwards
-///    them, the same pattern `INFLUXDB_TOKEN` already uses). This is the reliable path: a
-///    git-worktree checkout's `.git` file points at an absolute host path the dev container's
-///    bind mount doesn't include, so `git` run *inside* the container against a worktree checkout
-///    routinely can't answer at all.
+///    *host* and passed as `env VAR=... cargo run ...` argv ahead of the `cargo run` it execs
+///    into the dev container, not through `compose.yaml`'s `environment:` block: `run()`'s
+///    `sudo docker compose run` strips the calling shell's own environment before `docker
+///    compose` ever gets to interpolate a `${VAR}` there, so an `environment:` entry can never
+///    see a value exported in `script/perf`, while argv reaches the container (or, in CI, the
+///    directly-exec'd process) unchanged either way. This is the reliable path: a git-worktree
+///    checkout's `.git` file points at an absolute host path the dev container's bind mount
+///    doesn't include, so `git` run *inside* the container against a worktree checkout routinely
+///    can't answer at all.
 /// 2. Shelling out to `git` against `root` directly -- works for an ordinary (non-worktree)
 ///    checkout, or when running `logit-perf` outside the dev container entirely.
 ///
