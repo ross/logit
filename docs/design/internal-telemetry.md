@@ -644,8 +644,13 @@ Worked examples, one per shipped component:
   Plus detail neither of the other two sinks needs: `logit.output.events.skipped` (events with no
   `log` record — nothing to render as a syslog message, ADR `multi-payload-events`), `logit.output.messages.
   truncated` and `logit.output.messages.dropped{reason="oversize_header"|"oversize_datagram"}`
-  (per-message size handling, `docs/adr/syslog-output.md`'s "Sizing" section). Retry stays a
-  Layer 2 metric here too, for the same reason as `influxdb_out`.
+  (per-message size handling, `docs/adr/syslog-output.md`'s "Sizing" section). `logit.output.
+  reconnects` (count, TCP only) — incremented on every connect *after* the first, exactly as
+  `logit_out`'s own below: a climbing count in steady state means the peer or the network, not
+  this sink, is unstable. Counted on a plaintext and a TLS (RFC 5425) connection alike, since
+  both take the same connect path ([ADR
+  `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)); UDP is connectionless and
+  never reports it. Retry stays a Layer 2 metric here too, for the same reason as `influxdb_out`.
 - `statsd_out` (`crates/logit-outputs/src/statsd.rs`, `docs/adr/statsd-output.md`):
   `logit.output.batch.bytes`, `logit.output.request.duration`, `logit.output.requests{class="ok"|
   "error"}` — the same shape as `syslog_out`'s. `logit.output.messages` counts encoded messages —
