@@ -25,6 +25,7 @@ use logit_inputs::syslog::SyslogInput;
 use logit_inputs::tail::TailInput;
 use logit_outputs::collectd::CollectdOutput;
 use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
+use logit_outputs::graphite::{GraphiteOutput, Transport as GraphiteOutTransport};
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::logit::LogitOutput;
 use logit_outputs::null::NullOutput;
@@ -43,6 +44,10 @@ use logit_pipeline::{
 };
 use logit_proto::collectd::{CollectdEncoder, TypesDb};
 use logit_proto::frame::Compression as NativeCompression;
+use logit_proto::graphite::{
+    GraphiteEncoder, MultiValue as GraphiteWireMultiValue, Protocol as GraphiteWireProtocol,
+    Tags as GraphiteWireTags,
+};
 use logit_transforms::{
     AggregateTemporality as TransformTemporality, Aggregator, CsvParser,
     Distributions as TransformDistributions, DropAttributes as DropAttributesTransform,
@@ -746,6 +751,40 @@ fn build_spec(
             )
         }
 
+        GraphiteOut {
+            endpoint,
+            transport,
+            protocol,
+            tags,
+            multi_value,
+            max_packet_bytes,
+            max_frame_bytes,
+            connect_timeout,
+        } => {
+            // Eager for UDP, lazy for TCP -- the `StatsdOut` split above.
+            let output = match graphite_transport(*transport) {
+                GraphiteOutTransport::Udp => GraphiteOutput::udp(endpoint.clone())?,
+                GraphiteOutTransport::Tcp => {
+                    GraphiteOutput::tcp(endpoint.clone(), *connect_timeout)
+                }
+            };
+            let encoder = GraphiteEncoder::new()
+                .with_protocol(graphite_protocol(*protocol))
+                .with_tags(graphite_tags(*tags))
+                .with_multi_value(graphite_multi_value(*multi_value))
+                .with_max_frame_bytes(*max_frame_bytes as usize);
+            let output = output
+                .with_encoder(encoder)
+                .with_max_packet_bytes(*max_packet_bytes as usize)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
+
         PrometheusOut { bind, path, expire_after, max_series } => {
             // Nothing is bound here: `PrometheusOutput::bind` opens the listening socket in the
             // runtime's pre-spawn pass (`logit_pipeline::Output::bind`), which is what turns an
@@ -1015,6 +1054,50 @@ fn statsd_format(cfg: logit_config::StatsdFormat) -> logit_outputs::statsd::Form
     match cfg {
         logit_config::StatsdFormat::Dogstatsd => logit_outputs::statsd::Format::DogStatsd,
         logit_config::StatsdFormat::Statsd => logit_outputs::statsd::Format::Statsd,
+    }
+}
+
+/// The sole place `logit_config::GraphiteTransport` crosses into a transport choice --
+/// `statsd_format`'s shape. `graphite_in` (W2) needs the identical mapping for its own
+/// `UdpListener`-vs-accept-loop choice; named and given a stable one-argument-on-
+/// `logit_config::GraphiteTransport` signature (rather than inlined at `GraphiteOut`'s two call
+/// sites the way `StatsdOut` inlines its own match) specifically so the two stacked PRs can merge
+/// this function without a name collision surviving as a silent behavior difference -- see the W3
+/// worker report for the exact shape settled on here.
+fn graphite_transport(cfg: logit_config::GraphiteTransport) -> GraphiteOutTransport {
+    match cfg {
+        logit_config::GraphiteTransport::Udp => GraphiteOutTransport::Udp,
+        logit_config::GraphiteTransport::Tcp => GraphiteOutTransport::Tcp,
+    }
+}
+
+/// The sole place `logit_config::GraphiteProtocol` crosses into `logit_proto::graphite::Protocol`
+/// -- shared, unmodified, by `graphite_in` (W2), which needs the identical mapping for its own
+/// decoder. Same reasoning as [`graphite_transport`].
+fn graphite_protocol(cfg: logit_config::GraphiteProtocol) -> GraphiteWireProtocol {
+    match cfg {
+        logit_config::GraphiteProtocol::Plaintext => GraphiteWireProtocol::Plaintext,
+        logit_config::GraphiteProtocol::Pickle => GraphiteWireProtocol::Pickle,
+    }
+}
+
+/// The sole place `logit_config::GraphiteTags` crosses into `logit_proto::graphite::Tags` --
+/// `graphite_out`-only, unlike [`graphite_transport`]/[`graphite_protocol`] (`graphite_in` has no
+/// `tags:` field).
+fn graphite_tags(cfg: logit_config::GraphiteTags) -> GraphiteWireTags {
+    match cfg {
+        logit_config::GraphiteTags::Carbon => GraphiteWireTags::Carbon,
+        logit_config::GraphiteTags::Drop => GraphiteWireTags::Drop,
+    }
+}
+
+/// The sole place `logit_config::GraphiteMultiValue` crosses into
+/// `logit_proto::graphite::MultiValue` -- `graphite_out`-only, same reasoning as
+/// [`graphite_tags`].
+fn graphite_multi_value(cfg: logit_config::GraphiteMultiValue) -> GraphiteWireMultiValue {
+    match cfg {
+        logit_config::GraphiteMultiValue::Skip => GraphiteWireMultiValue::Skip,
+        logit_config::GraphiteMultiValue::Expand => GraphiteWireMultiValue::Expand,
     }
 }
 
@@ -1414,6 +1497,63 @@ mod tests {
                 max_packet_bytes: 1452,
                 hostname: Some("logit-relay".to_string()),
             },
+        };
+        assert!(matches!(
+            build_spec("out", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    fn graphite_out_kind(
+        transport: logit_config::GraphiteTransport,
+        protocol: logit_config::GraphiteProtocol,
+    ) -> ComponentKind {
+        ComponentKind::GraphiteOut {
+            endpoint: "127.0.0.1:2003".to_string(),
+            transport,
+            protocol,
+            tags: logit_config::GraphiteTags::default(),
+            multi_value: logit_config::GraphiteMultiValue::default(),
+            max_packet_bytes: 1432,
+            max_frame_bytes: 1 << 20,
+            connect_timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// `#[tokio::test]`, `CollectdOutput::udp`'s own precedent: `GraphiteOutput::udp` binds an
+    /// ephemeral local UDP socket eagerly, which needs an active tokio runtime to register with.
+    #[tokio::test]
+    async fn build_spec_builds_a_graphite_udp_sink() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: graphite_out_kind(
+                logit_config::GraphiteTransport::Udp,
+                logit_config::GraphiteProtocol::Plaintext,
+            ),
+        };
+        assert!(matches!(
+            build_spec("out", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    /// TCP does not bind eagerly -- `GraphiteOutput::tcp` never touches a socket at construction
+    /// (`Conn::Tcp`'s own doc comment), so this needs no runtime either, unlike the UDP variant
+    /// above.
+    #[test]
+    fn build_spec_builds_a_graphite_tcp_sink_without_binding_eagerly() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: graphite_out_kind(
+                logit_config::GraphiteTransport::Tcp,
+                logit_config::GraphiteProtocol::Pickle,
+            ),
         };
         assert!(matches!(
             build_spec("out", &component, Path::new(""), None).unwrap().0,
