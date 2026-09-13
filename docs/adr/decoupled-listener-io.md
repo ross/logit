@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-11
+updated: 2026-09-12
 ---
 
 # Decoupled listener I/O
@@ -299,8 +299,11 @@ across listeners (queue bounding/overflow, accumulator flush decisions and their
 already runtime-owned by the generic types above; what's left in `logit-inputs` is genuinely
 impl-shaped: socket mechanics and the loop wiring them together.
 
-`InternalInput` is untouched — no socket, no `receive:` block, keeps the default
-`run_until_shutdown` (cancel-by-drop, unchanged). Not generalized toward `UdpListener`.
+`InternalInput` is untouched by this ADR — no socket, no `receive:` block, and not generalized
+toward `UdpListener`. It no longer keeps the default `run_until_shutdown`, though: ADR
+`load-test-harness` gives it an override of its own — a single final `Registry` drain on shutdown,
+so the last partial interval of buffered self-telemetry isn't lost. The trait method this ADR
+introduced, used for the one thing `internal` has to flush.
 
 ### `SO_RCVBUF`, and the Linux doubling trap
 
