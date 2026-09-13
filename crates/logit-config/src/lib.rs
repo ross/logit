@@ -996,7 +996,9 @@ pub enum ComponentKind {
         max_message_bytes: u64,
         /// TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a
         /// dropped connection) is allowed to take before `send` reports it as a failure. Also
-        /// bounds the TLS handshake under `tls:`, on the same budget.
+        /// bounds the TLS handshake under `tls:`, but *each phase separately* -- so a TLS
+        /// connect can take up to twice this value, the same way `logit_out` races every step of
+        /// its own connect against its single `request_timeout`.
         #[serde(default = "default_syslog_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,

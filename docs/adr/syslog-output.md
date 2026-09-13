@@ -87,6 +87,14 @@ a reset before any byte of this attempt lands means the peer discarded its prior
 so the duplicate risk is exactly a `Clean` retry's (zero) — the batch has provably not been
 partially delivered twice.
 
+**Amendment (2026-09-13):** this bounded reconnect is **plaintext-only**. Since `syslog_out`
+gained TLS ([ADR `syslog-tcp-ingress-and-tls`](syslog-tcp-ingress-and-tls.md)), the proof it rests
+on — one `write(2)` failing means zero bytes of that call were accepted — holds for a raw
+`TcpStream` and not for a `tokio_rustls` one, whose failing write may already have put complete
+records (complete octet-counted messages) on the socket. On a TLS connection there is no internal
+retry: once an application write has been attempted, every failure is `Fault::Ambiguous` and the
+frame is never resent. That ADR's `syslog_out` section has the details.
+
 ### `duplicate_safe()` is `false` for both transports
 
 Unlike `influxdb_out` (idempotent-overwrite semantics on the destination), syslog has no

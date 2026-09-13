@@ -184,6 +184,13 @@
 //! fallback. DTLS is out of scope, so `tls:` under `transport: udp` is a config error
 //! (`logit-pipeline::graph::resolve`'s rule 44) as well as an error here. A connect *after* the
 //! first counts `logit.output.reconnects`, on TLS and plaintext alike.
+//!
+//! TLS is **not** transparent to this sink's fault classification: a `tokio_rustls` stream's
+//! `Ok` from a write means "the session accepted these bytes", not "the kernel has them", and its
+//! `Err` is never proof that nothing left the host. [`SyslogOutput::send_tcp`]'s doc comment
+//! states the per-transport invariants and what changes because of them (no internal retry and
+//! no `Fault::Clean` after an application write on TLS, and a mandatory flush before any batch is
+//! called delivered).
 
 use crate::stdio::render_value;
 // The TLS pieces this sink shares with `logit_out` (`crates/logit-outputs/src/logit.rs`), which
@@ -1406,10 +1413,16 @@ impl Output for SyslogOutput {
     }
 
     /// Implemented explicitly (rather than relying on the default no-op) so the contract is
-    /// spelled out rather than assumed: `send` already performs one write per batch and retains
-    /// nothing between calls, so there is nothing buffered here at shutdown -- for TCP, this
-    /// simply flushes the underlying stream, which is cheap and correct even though it should
-    /// already be a no-op in practice.
+    /// spelled out rather than assumed: `send` already performs one write per batch and flushes
+    /// before reporting it delivered, so in the normal case there is nothing left here at
+    /// shutdown.
+    ///
+    /// It is still load-bearing rather than decorative, and not only defensively: on a TLS
+    /// connection "flushed" is a property of the stream, not of the socket alone -- finished
+    /// records live in the rustls session's own buffer until something drains them
+    /// ([`SyslogOutput::send_tcp`]'s doc comment). Anything that reached that buffer outside
+    /// `send`'s own flush (a cancelled attempt handing back a partially drained stream, say)
+    /// leaves the process here or not at all.
     async fn flush(&mut self) -> anyhow::Result<()> {
         if let Conn::Tcp { stream: Some(stream), .. } = &mut self.conn {
             stream.flush().await.context("flushing syslog_out TCP stream")?;
@@ -1515,6 +1528,37 @@ impl SyslogOutput {
     ///   `write_all` cannot support: it can complete several of its own inner writes, including
     ///   an entire earlier *message* in a multi-message batch, before a later one fails.
     ///
+    /// **What "written" proves is per transport, and TLS is the weaker of the two** (review of
+    /// the RFC 5425 work, 2026-09-13; `docs/adr/syslog-tcp-ingress-and-tls.md`'s `syslog_out`
+    /// section). [`Conn::Tcp`]'s stream is a `Box<dyn AsyncStream>`, so the two cases are no
+    /// longer distinguishable from the write calls themselves and the code asks [`TcpDial`]
+    /// which one it is:
+    ///
+    /// - **Plaintext.** One `write()` is one `write(2)`: `Ok(n)` means the kernel owns `n`
+    ///   bytes, and `Err` means zero bytes of *this* call were accepted (tokio only loops on
+    ///   `WouldBlock`). Both halves of the invariant above hold as written, and this transport's
+    ///   behaviour is unchanged: one internal reconnect-and-retry after a zero-byte failure, and
+    ///   `Fault::Clean` if that retry fails too.
+    /// - **TLS.** `tokio_rustls`' `poll_write` copies plaintext into the rustls session and then
+    ///   loops socket writes until one returns `Pending`, at which point it returns `Ok(n)` with
+    ///   finished TLS records still queued in userspace -- so `Ok` proves only that the *session*
+    ///   accepted the bytes, never that they reached the peer, and `flush` is what makes them
+    ///   the kernel's. A failing `poll_write`, symmetrically, may already have completed several
+    ///   socket writes (rustls fragments at 16 KiB, and each record is a complete, length-
+    ///   prefixed syslog message under octet-counting, which a receiver keeps), so `Err` is
+    ///   never proof of a zero-byte attempt. Therefore, on TLS: no internal retry and no resend
+    ///   once an application write has been attempted at all, every such failure is
+    ///   `Fault::Ambiguous`, and `Fault::Clean` survives only for failures inside
+    ///   [`TcpDial::connect`], which genuinely precede every byte of the frame.
+    ///
+    /// **The success path always `flush`es**, on both transports, before the connection goes back
+    /// into `*stream` and this returns `Ok`. Without it a TLS batch could be reported delivered
+    /// (and committed off the sink queue, `docs/adr/buffered-sink-delivery.md`) with its records
+    /// still in the rustls buffer, to be discarded with the boxed stream by the next reconnect or
+    /// cancelled attempt. A failed flush is `Fault::Ambiguous` -- some earlier record may well
+    /// have landed -- and the connection is dropped rather than reused. On plaintext this is a
+    /// no-op that costs a function call.
+    ///
     /// [`AsyncWriteExt::write_all`]: tokio::io::AsyncWriteExt::write_all
     /// [`AsyncWriteExt::write`]: tokio::io::AsyncWriteExt::write
     async fn send_tcp(
@@ -1536,7 +1580,9 @@ impl SyslogOutput {
 
             // `Ok(0)` from `write()` on a non-empty buffer is, in practice, as good as an error
             // here (the stream is not accepting writes) -- normalized to a real `io::Error` so
-            // the rest of this match only has one "nothing was written" case to handle.
+            // the rest of this match only has one "nothing was written" case to handle. A
+            // plaintext-only case: `tokio_rustls`' `poll_write` maps its own zero-progress
+            // outcome to `Pending`, so a TLS stream never surfaces `Ok(0)` here at all.
             let first_write = match conn.write(frame_buf).await {
                 Ok(0) if !frame_buf.is_empty() => {
                     Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "wrote zero bytes"))
@@ -1552,6 +1598,14 @@ impl SyslogOutput {
                     } else {
                         Ok(())
                     };
+                    // Then always flush, on both transports, before this batch may be called
+                    // delivered -- see this function's doc comment's flush paragraph. On a TLS
+                    // stream this is what moves finished records out of the rustls buffer and
+                    // into the kernel's; on a plaintext one it is a no-op.
+                    let rest_result = match rest_result {
+                        Ok(()) => conn.flush().await,
+                        Err(err) => Err(err),
+                    };
                     return match rest_result {
                         Ok(()) => {
                             *stream = Some(conn);
@@ -1563,14 +1617,19 @@ impl SyslogOutput {
                         Err(err) => Err(anyhow::Error::new(err).context(Fault::Ambiguous)),
                     };
                 }
-                Err(_) if !retried_after_a_zero_byte_failure => {
-                    // Nothing left this host on this attempt -- `*stream` is already `None`
-                    // (taken above), so the next loop iteration connects fresh and retries the
-                    // whole frame exactly once.
+                // Plaintext only: an `Err` from one `write(2)` proves zero bytes of this attempt
+                // were accepted, so `*stream` is already `None` (taken above) and the next loop
+                // iteration connects fresh and retries the whole frame exactly once. A TLS
+                // `poll_write` gives no such proof (doc comment above), so it never reaches this
+                // arm -- it falls straight through to `Ambiguous` with no resend.
+                Err(_) if !dial.is_tls() && !retried_after_a_zero_byte_failure => {
                     retried_after_a_zero_byte_failure = true;
                     continue;
                 }
-                Err(err) => return Err(anyhow::Error::new(err).context(Fault::Clean)),
+                Err(err) => {
+                    let fault = if dial.is_tls() { Fault::Ambiguous } else { Fault::Clean };
+                    return Err(anyhow::Error::new(err).context(fault));
+                }
             }
         }
     }
@@ -1590,10 +1649,18 @@ struct TcpDial<'a> {
 }
 
 impl TcpDial<'_> {
+    /// Whether this sink's connections are TLS-wrapped -- which decides what a write's outcome
+    /// proves, and so how [`SyslogOutput::send_tcp`] classifies a failure. See that function's
+    /// doc comment.
+    fn is_tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
     /// One fresh connection: TCP connect, then -- when `tls` is set -- the RFC 5425 TLS
-    /// handshake, both raced against the same `connect_timeout` (one operator knob for "how long
-    /// may getting a usable connection take") and both `Fault::Clean` for the same reason:
-    /// nothing of this batch can have left the host while a connection is still being
+    /// handshake. Each phase is raced against `connect_timeout` *separately*, exactly as
+    /// `logit_out` races every step of its own connect against `self.timeout`, so a TLS connect
+    /// can take up to twice the configured value. Both phases fault `Fault::Clean` for the same
+    /// reason: nothing of this batch can have left the host while a connection is still being
     /// established. Copied from `logit_out`'s `connect_and_handshake`
     /// (`crates/logit-outputs/src/logit.rs`), which dials the identical bare-`host:port`-plus-SNI
     /// shape.
@@ -2613,6 +2680,335 @@ mod tests {
             received.lock().unwrap().is_empty(),
             "a TLS listener must never surface cleartext bytes as a message"
         );
+    }
+
+    // -- Sink: TCP over TLS, write/flush semantics --------------------------------------------
+    //
+    // The invariants `send_tcp` is built around are per transport (its own doc comment), and the
+    // TLS ones can't be provoked over a real socket without depending on kernel buffer sizes:
+    // the interesting state is "the rustls session accepted the frame but the socket took only
+    // part of it", which needs a backpressured socket, which needs a known send-buffer size.
+    // These tests drive `send_tcp` against a scripted [`FakeTlsStream`] instead -- the same thing
+    // `udp_send_fault_is_clean_only_before_anything_in_the_batch_has_sent` does for the UDP
+    // classification it can't provoke either. The real-TLS tests above and below cover the
+    // socket-level behaviour.
+
+    /// An [`AsyncStream`] with `tokio_rustls`' write semantics rather than a socket's: `write`
+    /// accepts bytes into a userspace buffer and reports them written (what `poll_write` does
+    /// once the socket is backpressured and finished records stay in the session), and only
+    /// `flush` hands them to the notional wire. Failures are scripted per call so each of
+    /// `send_tcp`'s arms can be reached exactly.
+    #[derive(Clone, Default)]
+    struct FakeTlsStream(Arc<Mutex<FakeState>>);
+
+    #[derive(Default)]
+    struct FakeState {
+        /// Accepted by `write`, not yet flushed -- `tokio_rustls`' `sendable_tls`.
+        buffered: Vec<u8>,
+        /// What `flush` has actually put on the wire.
+        sent: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+        /// `write` fails on this 1-based call number.
+        fail_write_on: Option<usize>,
+        fail_flush: bool,
+    }
+
+    impl FakeTlsStream {
+        fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
+            self.0.lock().unwrap()
+        }
+
+        fn failing_write(call: usize) -> Self {
+            let fake = Self::default();
+            fake.state().fail_write_on = Some(call);
+            fake
+        }
+
+        fn failing_flush() -> Self {
+            let fake = Self::default();
+            fake.state().fail_flush = true;
+            fake
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FakeTlsStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let mut state = self.state();
+            state.writes += 1;
+            if state.fail_write_on == Some(state.writes) {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "scripted write failure",
+                )));
+            }
+            state.buffered.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let mut state = self.state();
+            state.flushes += 1;
+            if state.fail_flush {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "scripted flush failure",
+                )));
+            }
+            let buffered = std::mem::take(&mut state.buffered);
+            state.sent.extend_from_slice(&buffered);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncRead for FakeTlsStream {
+        /// `syslog_out` never reads -- immediate EOF, so this can't accidentally be depended on.
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// An `Arc<rustls::ClientConfig>` for a [`TcpDial`] that should report `is_tls()` -- built
+    /// from default settings (the bundled roots), since no handshake ever happens in these tests.
+    fn any_client_config() -> Arc<rustls::ClientConfig> {
+        Arc::new(
+            crate::tls::build_client_config(&TlsClientSettings::default(), &testdata_dir())
+                .expect("the default settings always build"),
+        )
+    }
+
+    fn one_message_frame() -> (MessageBuf, Vec<u8>) {
+        let mut messages = MessageBuf::default();
+        messages.push("hello");
+        (messages, Vec::new())
+    }
+
+    #[tokio::test]
+    async fn a_tls_batch_is_reported_delivered_only_once_the_stream_has_been_flushed() {
+        let fake = FakeTlsStream::default();
+        let mut stream: Option<Box<dyn AsyncStream>> = Some(Box::new(fake.clone()));
+        let cfg = any_client_config();
+        let telemetry = Telemetry::default();
+        let mut connected = true;
+        let mut dial = TcpDial {
+            endpoint: "127.0.0.1:1",
+            connect_timeout: Duration::from_secs(1),
+            tls: Some(&cfg),
+            telemetry: &telemetry,
+            has_connected_once: &mut connected,
+        };
+        let (messages, mut frame_buf) = one_message_frame();
+
+        let sent = SyslogOutput::send_tcp(&mut stream, &mut dial, &messages, &mut frame_buf)
+            .await
+            .expect("the write and the flush both succeed");
+
+        assert_eq!(sent, 1);
+        let state = fake.state();
+        assert_eq!(state.flushes, 1, "the success path must flush exactly once");
+        assert!(state.buffered.is_empty(), "nothing may be left in the session buffer");
+        assert_eq!(state.sent, b"5 hello".to_vec(), "the whole frame must be on the wire");
+        drop(state);
+        assert!(stream.is_some(), "a flushed connection is reusable");
+    }
+
+    #[tokio::test]
+    async fn a_tls_flush_failure_is_ambiguous_and_discards_the_connection() {
+        let fake = FakeTlsStream::failing_flush();
+        let mut stream: Option<Box<dyn AsyncStream>> = Some(Box::new(fake.clone()));
+        let cfg = any_client_config();
+        let telemetry = Telemetry::default();
+        let mut connected = true;
+        let mut dial = TcpDial {
+            endpoint: "127.0.0.1:1",
+            connect_timeout: Duration::from_secs(1),
+            tls: Some(&cfg),
+            telemetry: &telemetry,
+            has_connected_once: &mut connected,
+        };
+        let (messages, mut frame_buf) = one_message_frame();
+
+        let err = SyslogOutput::send_tcp(&mut stream, &mut dial, &messages, &mut frame_buf)
+            .await
+            .expect_err("a failed flush must fail the send");
+
+        // `Ambiguous`, not `Clean`: whatever the session already managed to push to the socket
+        // before the flush failed is gone with it, and there is no way to know how much that was.
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+        assert!(stream.is_none(), "a stream whose flush failed must not be reused");
+        assert_eq!(fake.state().writes, 1, "and must not be rewritten either");
+    }
+
+    /// The TLS half of `send_tcp`'s classification split: an error from a write on a TLS stream
+    /// may have landed whole records already (rustls fragments at 16 KiB, each fragment a
+    /// complete octet-counted message a receiver keeps), so it is `Ambiguous` and the frame is
+    /// never resent -- where the identical failure on plaintext is `Clean` after one
+    /// reconnect-and-retry (the test below).
+    #[tokio::test]
+    async fn a_tls_write_failure_is_ambiguous_and_never_resent() {
+        let fake = FakeTlsStream::failing_write(1);
+        let mut stream: Option<Box<dyn AsyncStream>> = Some(Box::new(fake.clone()));
+        let cfg = any_client_config();
+        let telemetry = Telemetry::default();
+        let mut connected = true;
+        let mut dial = TcpDial {
+            // Nothing listens here: were the TLS arm to take plaintext's reconnect-and-retry
+            // path, it would dial this and report the connect failure as `Clean` instead.
+            endpoint: "127.0.0.1:1",
+            connect_timeout: Duration::from_millis(200),
+            tls: Some(&cfg),
+            telemetry: &telemetry,
+            has_connected_once: &mut connected,
+        };
+        let (messages, mut frame_buf) = one_message_frame();
+
+        let err = SyslogOutput::send_tcp(&mut stream, &mut dial, &messages, &mut frame_buf)
+            .await
+            .expect_err("a failed write must fail the send");
+
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+        assert!(stream.is_none());
+        let state = fake.state();
+        assert_eq!(state.writes, 1, "exactly one write attempt -- no resend");
+        assert!(state.sent.is_empty());
+    }
+
+    /// The plaintext half, unchanged by the TLS work: one `write(2)` failing proves zero bytes
+    /// were accepted, so `send_tcp` reconnects once, retries the whole frame, and reports
+    /// `Fault::Clean` if that fails too. Drives the same scripted stream through the plaintext
+    /// arm (`tls: None`) so the two classifications are pinned side by side.
+    #[tokio::test]
+    async fn a_plaintext_write_failure_still_reconnects_once_and_stays_clean() {
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap().to_string();
+        drop(dead); // now nothing is listening there
+
+        let fake = FakeTlsStream::failing_write(1);
+        let mut stream: Option<Box<dyn AsyncStream>> = Some(Box::new(fake.clone()));
+        let telemetry = Telemetry::default();
+        let mut connected = true;
+        let mut dial = TcpDial {
+            endpoint: &dead_addr,
+            connect_timeout: Duration::from_millis(500),
+            tls: None,
+            telemetry: &telemetry,
+            has_connected_once: &mut connected,
+        };
+        let (messages, mut frame_buf) = one_message_frame();
+
+        let err = SyslogOutput::send_tcp(&mut stream, &mut dial, &messages, &mut frame_buf)
+            .await
+            .expect_err("the retry's connect is refused");
+
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+        assert_eq!(fake.state().writes, 1);
+        assert!(
+            format!("{err:#}").contains("connecting to syslog_out endpoint"),
+            "the failure must come from the retry's fresh connect, proving one happened: {err:#}"
+        );
+    }
+
+    /// The socket-level companion to
+    /// `a_tls_batch_is_reported_delivered_only_once_the_stream_has_been_flushed`: once `send`
+    /// returns, the receiver can read the whole frame with no further write from this sink and
+    /// without the sink being dropped (which would flush and close it on the way out). That is
+    /// the contract `Delivered` implies, and the explicit flush is what makes it hold when the
+    /// socket is backpressured and records would otherwise sit in the rustls session.
+    #[tokio::test]
+    async fn after_a_tls_send_returns_the_whole_frame_is_readable_without_dropping_the_sink() {
+        let batch = batch_with(vec![log_event(0, "one", None), log_event(0, "two", None)]);
+        let expected = plaintext_frame_for(&batch).await;
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls_config(false));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let want = expected.len();
+        let collector = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls_stream = acceptor.accept(stream).await.unwrap();
+            use tokio::io::AsyncReadExt;
+            let mut got = vec![0u8; want];
+            // Exactly `want` bytes, no EOF involved -- this returns only if the frame really is
+            // on the wire while the sink is still alive and holding the connection open.
+            tls_stream.read_exact(&mut got).await.unwrap();
+            got
+        });
+
+        let mut output =
+            SyslogOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
+                .with_tls(
+                    &tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
+                    &testdata_dir(),
+                )
+                .expect("a tls: block on the TCP transport is legal");
+        output.send(&batch).await.expect("send over TLS should succeed");
+
+        let got = tokio::time::timeout(Duration::from_secs(2), collector)
+            .await
+            .expect("the frame must already be readable once send has returned")
+            .unwrap();
+        assert_eq!(got, expected);
+        drop(output);
+    }
+
+    /// A TLS peer that takes one frame and then goes away: whatever the second `send` reports, it
+    /// must never put that frame on the wire a second time. Under the pre-review code the TLS
+    /// stream went through plaintext's reconnect-and-retry arm, so a write error there rewrote
+    /// the whole frame on a fresh connection -- a duplicated log line at the receiver, reported
+    /// as `Fault::Clean`. The collector keeps accepting, so a resend would be recorded.
+    #[tokio::test]
+    async fn a_tls_frame_is_never_resent_after_the_peer_goes_away() {
+        let (addr, received, _handshakes) = tls_tcp_collector(false).await;
+        let mut output =
+            SyslogOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
+                .with_tls(
+                    &tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
+                    &testdata_dir(),
+                )
+                .expect("a tls: block on the TCP transport is legal");
+
+        let batch = batch_with(vec![log_event(0, "once", None)]);
+        output.send(&batch).await.expect("the first send should succeed");
+        // Close this sink's own end of the connection so the next write on it fails
+        // deterministically, the same trick (and the same reasoning) as
+        // `tcp_reconnects_after_the_peer_resets_an_inherited_connection`.
+        if let Conn::Tcp { stream: Some(stream), .. } = &mut output.conn {
+            let _ = stream.shutdown().await;
+        }
+        if let Err(err) = output.send(&batch).await {
+            assert_eq!(
+                logit_pipeline::classify(&err),
+                Fault::Ambiguous,
+                "a TLS write failure is never Clean -- it can't prove nothing landed"
+            );
+        }
+
+        drop(output);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let got = received.lock().unwrap();
+        // Occurrences across every connection, not connections containing one: a resend could
+        // land on a fresh connection (the reconnect arm) or, in principle, on this one.
+        let deliveries: usize =
+            got.iter().map(|b| String::from_utf8_lossy(b).matches("once").count()).sum();
+        assert_eq!(deliveries, 1, "the frame must reach the receiver exactly once: {got:?}");
     }
 
     /// Belt-and-braces for `graph::resolve`'s rule 44: DTLS is out of scope, so a `tls:` block on
