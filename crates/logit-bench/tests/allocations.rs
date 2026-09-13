@@ -24,10 +24,10 @@ use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::statsd::{Format as StatsdFormat, StatsdEncoder};
 use logit_outputs::stdio::{EventDump, Format};
 use logit_outputs::syslog::{Format as SyslogFormat, SyslogEncoder};
-use logit_pipeline::runtime::drain_inbox;
+use logit_pipeline::runtime::{drain_inbox, route_batch};
 use logit_pipeline::{
-    process_batch, send_batch, unwrap_batch, BatchContext, Delivered, Fanout, SinkQueue,
-    SinkQueueConfig, SinkStore, Transform,
+    process_batch, send_batch, unwrap_batch, BatchContext, Delivered, Fanout, RouterScratch,
+    SinkQueue, SinkQueueConfig, SinkStore, Transform,
 };
 use logit_proto::{Decoder, Encoder, FramedEncoder, MessageBuf};
 use logit_script::{ProcessOutcome, ScriptWorker};
@@ -1342,6 +1342,176 @@ fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
     });
 
     expect_allocs("drain_inbox: single-consumer Delivered::Owned batch (the Arc::new)", stats, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Routing (docs/adr/target-components.md)
+// ---------------------------------------------------------------------------------------------
+
+/// A `route` switching on `stream`, `host`/`app` each naming one of two targets --
+/// `fixtures::nginx_batch_alternating_stream`'s own split, and the ADR's headline
+/// central-collector shape (`examples/fan-out-central.yaml`).
+fn route_by_stream() -> logit_transforms::Route {
+    logit_transforms::Route::new(
+        logit_config::RouteBy::Attribute("stream".to_string()),
+        &[
+            ("host".to_string(), "host_stream".to_string()),
+            ("app".to_string(), "app_stream".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        &["host_stream".to_string(), "app_stream".to_string()],
+    )
+}
+
+/// The partition pass's whole allocation story, pinned exactly (`crates/logit-pipeline/src/
+/// router.rs`'s own `RouterScratch`/`route_batch` doc comments): **one `Vec::with_capacity` for
+/// the returned partition list, plus exactly one `reserve_exact` per destination that actually
+/// received an event this batch** -- never per event, and never for a destination nothing was
+/// routed to. 64 events split evenly host/app: both targets are used, so `1 + 2 = 3`.
+///
+/// Warmed once first so `RouterScratch`'s `marks`/`counts` buffers are already grown to this
+/// batch's size -- see `RouterScratch`'s own doc comment for why that's a one-time cost and the
+/// per-destination `reserve_exact` isn't (`dests[n]` is always handed out by `mem::take`, which
+/// leaves capacity 0 behind, so every batch pays its `reserve_exact` again by design).
+#[test]
+fn route_batch_two_targets_costs_one_vec_per_used_destination() {
+    let mut route = route_by_stream();
+    let telemetry = Telemetry::default();
+    let mut scratch = RouterScratch::new(2);
+
+    let warm = fixtures::nginx_batch_alternating_stream(64);
+    drop(route_batch(&mut route, &mut scratch, warm, &telemetry));
+
+    let batch = fixtures::nginx_batch_alternating_stream(64);
+    let (out, stats) = measure(|| route_batch(&mut route, &mut scratch, batch, &telemetry));
+    assert_eq!(out.len(), 2, "both host_stream and app_stream should receive events");
+    let total: usize = out.iter().map(|(_, batch)| batch.events.len()).sum();
+    assert_eq!(total, 64);
+    expect_allocs("route_batch: 64 events, 2 targets both used", stats, 3);
+}
+
+/// The same partition, but every event resolves to the *same* target (`route`'s `routes:` maps
+/// both `host` and `app` onto one target, the many-to-one case) -- one destination used, `1 + 1
+/// = 2`.
+#[test]
+fn route_batch_all_to_one_target_costs_two() {
+    let mut route = logit_transforms::Route::new(
+        logit_config::RouteBy::Attribute("stream".to_string()),
+        &[("host".to_string(), "t".to_string()), ("app".to_string(), "t".to_string())]
+            .into_iter()
+            .collect(),
+        &["t".to_string()],
+    );
+    let telemetry = Telemetry::default();
+    let mut scratch = RouterScratch::new(1);
+
+    let warm = fixtures::nginx_batch_alternating_stream(64);
+    drop(route_batch(&mut route, &mut scratch, warm, &telemetry));
+
+    let batch = fixtures::nginx_batch_alternating_stream(64);
+    let (out, stats) = measure(|| route_batch(&mut route, &mut scratch, batch, &telemetry));
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].1.events.len(), 64);
+    expect_allocs("route_batch: 64 events, 1 target used (many-to-one)", stats, 2);
+}
+
+/// The other one-destination case: nothing matches, so every event lands on the router's own
+/// `Forward` partition (`Destination::Forward` is a destination too, slot 0) -- `1 + 1 = 2`, the
+/// same cost as the all-matched case above, because the cost is "destinations used," not "events
+/// routed to a target."
+#[test]
+fn route_batch_all_unrouted_costs_two() {
+    let mut route = logit_transforms::Route::new(
+        logit_config::RouteBy::Attribute("stream".to_string()),
+        &[("db".to_string(), "t".to_string())].into_iter().collect(),
+        &["t".to_string()],
+    );
+    let telemetry = Telemetry::default();
+    let mut scratch = RouterScratch::new(1);
+
+    let warm = fixtures::nginx_batch_alternating_stream(64);
+    drop(route_batch(&mut route, &mut scratch, warm, &telemetry));
+
+    let batch = fixtures::nginx_batch_alternating_stream(64);
+    let (out, stats) = measure(|| route_batch(&mut route, &mut scratch, batch, &telemetry));
+    assert_eq!(out.len(), 1, "only the Forward partition should be non-empty");
+    assert_eq!(out[0].0, 0, "slot 0 is Destination::Forward");
+    assert_eq!(out[0].1.events.len(), 64);
+    expect_allocs("route_batch: 64 events, all unrouted (Forward only)", stats, 2);
+}
+
+/// The comparison the ADR cites (`docs/adr/target-components.md`'s "Two costs are structural to
+/// this shape"): the *same* 64-event host/app split, expressed the way it has to be without
+/// targets -- a `Fanout` to two ordinary `Transform` consumers, each running its own
+/// `has_attributes` over the *whole* batch to keep its one-half. **324**, composed of three
+/// directly-measured pieces (each confirmed independently, not assumed from the one-event
+/// numbers elsewhere in this file):
+///
+/// - **1 `Arc::new`.** `Fanout::deliver`'s once-per-send wrap for a >1-consumer edge
+///   (`fanout_send_two_consumers_costs_one_clone_plus_one_arc`'s own "+1 for the Arc").
+/// - **321 for the forced `EventBatch` deep clone.** The branch that unwraps first (`a`, while
+///   `b`'s handle is still alive) can't take the `Arc`, so it deep-clones: 1 for the clone's own
+///   `Vec<Event>` backing allocation, plus 64 * 5 for the events themselves. That per-event **5**
+///   is measured directly against *this* fixture (`fixtures::nginx_batch_alternating_stream`),
+///   not assumed from [`clone_one_event`]'s plain-nginx **4** -- one more than the reference
+///   pipeline's own nginx shape, because this fixture's event is `nginx_event` plus one `stream`
+///   attribute inserted afterward (`fixtures::nginx_event_with_stream`), which changes the
+///   already-spilled `AttrMap`'s own capacity growth on top of what `kv_metrics` left it with.
+///   The other branch (`b`, unwrapping last with nothing else holding the `Arc`) is free, exactly
+///   as in the one-event case.
+/// - **2 for the two `has_attributes` passes.** `process_batch_through_has_attributes` pins a
+///   `has_attributes` pass at 1 allocation *per batch* (its own output `Vec::with_capacity`),
+///   regardless of how many events it keeps or drops -- paid once per branch, so twice here
+///   (host_stream's filter, then app_stream's), each over the *whole* 64-event batch since
+///   neither filter narrows what the other has to scan.
+///
+/// `1 + 321 + 2 = 324`. The point isn't the exact total -- it's that this shape's cost scales with
+/// `branches * events`, while
+/// [`route_batch_two_targets_costs_one_vec_per_used_destination`]'s scales with `destinations
+/// used` alone, flat in both event count and branch count.
+#[test]
+fn fan_out_plus_two_has_attributes_for_the_same_split() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
+    let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(1);
+    let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(1);
+    let fanout = Fanout::new(vec![tx_a, tx_b]);
+    let telemetry = Telemetry::default();
+    let mut host_filter = fixtures::has_attributes_stream("host");
+    let mut app_filter = fixtures::has_attributes_stream("app");
+
+    // Warm: one full round trip through the exact same Fanout/filters, same reasoning as every
+    // other `fanout_send_*` test in this file.
+    let warm = fixtures::nginx_batch_alternating_stream(64);
+    rt.block_on(async {
+        fanout.send(warm).await;
+        let a = unwrap_delivered(rx_a.recv().await.expect("a should receive"));
+        let b = unwrap_delivered(rx_b.recv().await.expect("b should receive"));
+        drop(process_batch(&mut host_filter, a, &telemetry));
+        drop(process_batch(&mut app_filter, b, &telemetry));
+    });
+
+    let batch = fixtures::nginx_batch_alternating_stream(64);
+    let ((host_out, app_out), stats) = measure(|| {
+        rt.block_on(async {
+            fanout.send(batch).await;
+            // `a` unwraps first, while `b`'s handle is still alive -- forces `a`'s clone; `b`
+            // unwraps last, free -- the deterministic case, exactly
+            // `fanout_send_two_consumers_costs_one_clone_plus_one_arc`'s own ordering.
+            let a = unwrap_delivered(rx_a.recv().await.expect("a should receive"));
+            let b = unwrap_delivered(rx_b.recv().await.expect("b should receive"));
+            let host_out = process_batch(&mut host_filter, a, &telemetry);
+            let app_out = process_batch(&mut app_filter, b, &telemetry);
+            (host_out, app_out)
+        })
+    });
+    assert_eq!(host_out.expect("host events should match").events.len(), 32);
+    assert_eq!(app_out.expect("app events should match").events.len(), 32);
+    expect_allocs(
+        "today: fan-out (1 Arc + 1 clone of 64 events) + 2 has_attributes passes, same split",
+        stats,
+        324,
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

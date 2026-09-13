@@ -13,6 +13,7 @@ description = "Allocation measurement and throughput benchmarks for logit. Dev-o
 # `docs/design/memory.md`.
 
 [dependencies]
+logit-config.workspace = true
 logit-core.workspace = true
 logit-pipeline.workspace = true
 logit-inputs.workspace = true

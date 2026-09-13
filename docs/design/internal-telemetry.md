@@ -391,8 +391,8 @@ receive/processing side from their own loops, which already see every batch and 
 
 | Name | Kind | Recorded in |
 |---|---|---|
-| `logit.component.batches.received` / `.events.received` | count | `run_transform`, `run_output`, `run_lua` |
-| `logit.component.process.duration` | timing | `run_transform`, `run_lua` (whole batch) |
+| `logit.component.batches.received` / `.events.received` | count | `run_transform`, `run_output`, `run_lua`, `run_router` |
+| `logit.component.process.duration` | timing | `run_transform`, `run_lua`, `run_router` (whole batch — for a router this spans `route_batch`'s partition, not any one destination's send) |
 | `logit.component.events.dropped{reason="absorbed"}` | count | `Transform::process` returned `None` |
 | `logit.component.events.dropped{reason="script_drop"}` | count | Lua `ProcessOutcome::Drop` |
 | `logit.component.events.dropped{reason="unrouted"}` | count | `run_router`: events no route claimed, at a router with targets and no ordinary consumers ([ADR `target-components`](../adr/target-components.md)). Counted explicitly rather than left to `Fanout`, which returns early on zero consumers and counts nothing — "unrouted events are dropped and counted, never silently" is the ADR's rule. A router *with* ordinary consumers never emits this: its unrouted events go to them. |
@@ -554,6 +554,14 @@ Worked examples, one per shipped component:
   load-test-harness.md`) — the one component that emits a structured `tracing` event directly
   rather than through `Diagnostics`, because the harness needs those as *fields*, not as a
   rendered message.
+- `route` (`crates/logit-transforms/src/route.rs`, [ADR
+  `target-components`](../adr/target-components.md)): **layer 2 only, no layer-3 points at all** —
+  same reasoning as `generate_in` above, extended to a `Router` node: `run_router`/`route_batch`
+  already record `batches.received`/`events.received`/`process.duration` generically (the table
+  above), and every destination's own `Fanout` already counts what it sent, so a native equality
+  match has nothing further worth a counter of its own. Its one telemetry-adjacent effect is
+  indirect: an event `route` can't place lands on its router's `Forward` partition, which is what
+  `events.dropped{reason="unrouted"}` (above) counts when that router has no ordinary consumers.
 - `aggregate` (`crates/logit-transforms/src/aggregate.rs`): `logit.transform.series.active` and
   `logit.transform.resource.groups`, sampled at the top of `flush` before it touches its own state
   — the peak-of-window series count, which is the visible signal for the cardinality blow-up

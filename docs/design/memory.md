@@ -900,6 +900,44 @@ hop and one `Vec` allocation per batch per node. Nothing is lost — the trait a
 more than one event per input. Deserves its own ADR; gets more expensive to make with every
 transform that lands (§8 item 14).
 
+### Routing: a partition pass instead of N clones (ADR `target-components`)
+
+[ADR `target-components`](../adr/target-components.md) gives the graph a second way to fork a
+batch besides `Fanout`'s unconditional fan-out: a `Router` node (`route`, or `lua`/`lua_file` with
+`targets:`) moves each event into exactly one of `1 + targets.len()` destination buffers in one
+pass over the batch (`crate::runtime::route_batch`, `crates/logit-pipeline/src/router.rs`), then
+sends every non-empty one under a single child `BatchContext`. The rule this buys, measured exactly
+(`crates/logit-bench/tests/allocations.rs`'s `// Routing` section, all zero per-event allocations,
+one `reserve_exact` per used destination):
+
+| Shape (`route`, 64 events, `by: {attribute: stream}`) | Allocations |
+|---|---:|
+| 2 targets, evenly split (both used) | **3** |
+| All 64 to one target (many-to-one `routes:`) | **2** |
+| All 64 unrouted (no match — the router's own `Forward` edge) | **2** |
+
+**The rule is `1 + (destinations that received events)`, never per event and never for a
+destination nothing was routed to**: 1 for the returned partition list itself
+(`Vec::with_capacity(used)`), plus exactly one `reserve_exact` per non-empty destination —
+`RouterScratch`'s `marks`/`counts` buffers amortize to zero after warm-up, but each destination's
+`Vec<Event>` is handed out by `mem::take` (leaving capacity 0 behind), so its `reserve_exact` is
+paid again every batch, by design — that's the whole partition cost, and it's an integer, not a
+logarithm.
+
+Against that, the shape a router replaces — an N-way `Fanout` plus N `has_attributes` filters, each
+scanning the *whole* batch to keep its own slice — costs `fan_out_plus_two_has_attributes_for_the_
+same_split`'s **324** for the identical 64-event, 2-way `stream: host`/`stream: app` split: 1
+`Arc::new` (`Fanout::deliver`'s once-per-send wrap) + 321 for the forced `EventBatch` deep clone
+that a fan-out with no `Output` branch always pays (1 for the clone's own `Vec<Event>`, plus 64 × 5
+for this fixture's own per-event clone cost — see the test's doc comment for why that's 5, not the
+reference nginx shape's 4) + 2 for the two `has_attributes` passes (1 allocation per batch each,
+`process_batch_through_has_attributes`'s own number). The two numbers aren't directly comparable
+per-event (`route`'s inputs are borrowed, never cloned, and its output partition is exactly sized
+to the split; the fan-out's cost is paid whether or not that branch's filter keeps anything) — the
+comparison that matters is scaling: routing costs `1 + destinations used`, flat in event count and
+branch count; the filter-chain shape costs `branches × events` (the fan-out clone) plus `branches ×
+1` (the filter passes), rising with both.
+
 ## 4. Interning: the bargain, and its bounds
 
 `logit_core::interner` maps every attribute key and metric name through a process-global

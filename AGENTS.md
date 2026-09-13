@@ -193,7 +193,12 @@ since the receiver resets its sticky state at every datagram edge and `max_packe
 where those edges fall) rather than the one-blob-per-batch `Encoder`. So `collectd_in ->
 collectd_out` is a fixed point modulo its own named normalization list
 ([ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md),
-[examples/collectd-relay.yaml](examples/collectd-relay.yaml)).
+[examples/collectd-relay.yaml](examples/collectd-relay.yaml)). `target`/`route` are real,
+implemented `ComponentKind`s too: a `target` is a named, zero-cost destination a router directs
+events into, and `route` is the native equality-only router that fills it, closing the two
+structural costs (a filter chain paid by every branch, and the deep clone an all-mutating fan-out
+can't avoid) the central-collector split-apart topology had no better answer for
+([ADR `target-components`](docs/adr/target-components.md)).
 
 ## Environment
 
@@ -327,7 +332,7 @@ crates/
   logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, logfmt, kv, regex
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, logfmt, kv, regex, route (implements logit-pipeline::Router)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
 ```

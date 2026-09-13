@@ -430,6 +430,8 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::PrometheusOut { .. }
             | ComponentKind::GenerateIn { .. }
             | ComponentKind::NullOut { .. }
+            | ComponentKind::Target { .. }
+            | ComponentKind::Route { .. }
     )
 }
 
@@ -3927,31 +3929,50 @@ mod tests {
         assert_eq!(kind_name(&sink()), "influxdb_out");
     }
 
-    /// `target`/`route` are real `ComponentKind` variants (`docs/adr/target-components.md`) with
-    /// correct roles as of W1, but `is_implemented` deliberately leaves both out until W4
-    /// (`docs/plans/target-components.md`) -- rule 8 must reject them the same way it would any
-    /// other kind that isn't built yet.
+    /// `target`/`route` are real, *implemented* `ComponentKind` variants as of W4
+    /// (`docs/plans/target-components.md`) -- `is_implemented` now recognizes both, so an
+    /// otherwise-valid config (rules 43-47) resolves instead of being rejected by rule 8.
     #[test]
-    fn a_target_component_is_rejected_as_not_implemented() {
-        // Otherwise valid under rules 43-47: a real router directs at `t`, and `t` has a consumer.
-        let err = expect_err(cfg_with_targets(vec![
+    fn a_target_and_its_router_resolve() {
+        let graph = resolve(cfg_with_targets(vec![
             ("in", vec![], vec![], listener()),
             ("r", vec!["in"], vec!["t"], lua()),
             ("t", vec![], vec![], target()),
             ("out", vec!["t", "r"], vec![], sink()),
-        ]));
-        assert!(err.contains("is not implemented yet"), "got: {err}");
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["t"].role(), Role::Target);
+        assert_eq!(graph.components["r"].targets, vec!["t".to_string()]);
+        let at = |id: &str| {
+            graph.topological_order.iter().position(|other| other == id).expect("placed")
+        };
+        assert!(
+            at("r") < at("t"),
+            "the router must sort before its target: {:?}",
+            graph.topological_order
+        );
     }
 
     #[test]
-    fn a_route_component_is_rejected_as_not_implemented() {
-        let err = expect_err(cfg_with_targets(vec![
+    fn a_route_component_and_its_target_resolve() {
+        let graph = resolve(cfg_with_targets(vec![
             ("in", vec![], vec![], listener()),
             ("r", vec!["in"], vec![], route(by_attribute("stream"), &[("host", "t")])),
             ("t", vec![], vec![], target()),
             ("out", vec!["r", "t"], vec![], sink()),
-        ]));
-        assert!(err.contains("is not implemented yet"), "got: {err}");
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["r"].role(), Role::Transform);
+        assert_eq!(graph.components["t"].role(), Role::Target);
+        assert_eq!(graph.components["r"].targets, vec!["t".to_string()]);
+        let at = |id: &str| {
+            graph.topological_order.iter().position(|other| other == id).expect("placed")
+        };
+        assert!(
+            at("r") < at("t"),
+            "the router must sort before its target: {:?}",
+            graph.topological_order
+        );
     }
 
     // Rules 43-47 (`docs/adr/target-components.md`). Every *success* path below is asserted by
@@ -4078,18 +4099,18 @@ mod tests {
 
     /// Rule 46: a router whose every event is routed has no ordinary consumers, and that is a
     /// real config -- its unrouted events are dropped and counted at runtime, not silently lost.
-    /// It must therefore reach rule 8 (still "not implemented" until W4) rather than being
-    /// rejected by rule 7.
+    /// It must therefore resolve rather than being rejected by rule 7.
     #[test]
-    fn a_router_with_targets_but_no_consumers_is_not_a_black_hole() {
-        let err = expect_err(cfg_with_targets(vec![
+    fn a_router_with_targets_but_no_consumers_resolves() {
+        let graph = resolve(cfg_with_targets(vec![
             ("in", vec![], vec![], listener()),
             ("r", vec!["in"], vec!["t"], lua()),
             ("t", vec![], vec![], target()),
             ("out", vec!["t"], vec![], sink()),
-        ]));
-        assert!(!err.contains("has no consumers"), "rule 7 should not fire, got: {err}");
-        assert!(err.contains("is not implemented yet"), "got: {err}");
+        ]))
+        .expect("rule 46 should let a targets-only router resolve");
+        assert!(graph.components["r"].consumers.is_empty(), "r has no ordinary consumers");
+        assert_eq!(graph.components["r"].targets, vec!["t".to_string()]);
     }
 
     #[test]

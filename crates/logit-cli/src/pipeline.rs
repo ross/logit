@@ -51,8 +51,9 @@ use logit_transforms::{
     HasSignal as HasSignalTransform, JsonParser, Keep as KeepTransform,
     KeepSignals as KeepSignalsTransform, Kv as KvTransform, KvMetrics as KvMetricsTransform,
     Logfmt as LogfmtTransform, MatchMode as TransformMatchMode, RegexParser,
-    Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets,
-    SignalSet, SpanLift, TraceContext as TraceContextTransform,
+    Remove as RemoveTransform, Route as RouteTransform, Scale as ScaleTransform,
+    Set as SetTransform, Sets as TransformSets, SignalSet, SpanLift,
+    TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -781,17 +782,19 @@ fn build_spec(
             write_config(&component.buffer),
         ),
 
-        // W4 (docs/plans/target-components.md) replaces this arm.
-        Target {} => anyhow::bail!(
-            "component '{id}': `target` is not implemented yet (rule 8 rejects it before this \
-             point)"
-        ),
+        // A target is a zero-cost alias -- nothing to build (`docs/adr/target-components.md`'s
+        // "Runtime: a target is a zero-cost alias"). `logit_pipeline::run_with_telemetry`'s
+        // pre-spawn pass is what gives it a real `Fanout`; `NodeSpec::Target` exists purely so
+        // the registry stays one spec per component.
+        Target {} => NodeSpec::Target,
 
-        // W4 (docs/plans/target-components.md) replaces this arm.
-        Route { .. } => anyhow::bail!(
-            "component '{id}': `route` is not implemented yet (rule 8 rejects it before this \
-             point)"
-        ),
+        // `Route::new` resolves every `routes:` value to its target's slot once, here, against
+        // this router's own slot-ordered `component.targets` (`graph::targets_of`'s output,
+        // rules 44/47 guaranteeing every value resolves). No `with_telemetry`: `route` records no
+        // layer-3 points of its own (see `logit_transforms::route`'s module doc).
+        Route { by, routes } => {
+            NodeSpec::Router(Box::new(RouteTransform::new(by.clone(), routes, &component.targets)))
+        }
     };
     Ok((spec, telemetry))
 }
@@ -1487,6 +1490,46 @@ mod tests {
         assert!(matches!(
             build_spec("out", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_target() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Target {},
+        };
+        assert!(matches!(
+            build_spec("t", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Target
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_route_router() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: vec!["host_stream".to_string(), "app_stream".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::Route {
+                by: logit_config::RouteBy::Attribute("stream".to_string()),
+                routes: [
+                    ("host".to_string(), "host_stream".to_string()),
+                    ("app".to_string(), "app_stream".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        };
+        assert!(matches!(
+            build_spec("r", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Router(_)
         ));
     }
 
