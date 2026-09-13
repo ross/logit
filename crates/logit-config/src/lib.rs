@@ -366,6 +366,50 @@ pub enum ComponentKind {
         #[serde(default)]
         types_db: Vec<PathBuf>,
     },
+    /// Graphite/Carbon metric ingress -- carbon's plaintext line protocol or its pickle batch
+    /// protocol, over TCP or UDP (`docs/adr/graphite-carbon-relay.md`;
+    /// `crates/logit-inputs/src/graphite/` is the listener, `crates/logit-proto/src/graphite/` the
+    /// codec). The listener half of the `graphite_in -> graphite_out` lossless pair.
+    ///
+    /// `bind` is an ordinary `host:port` -- carbon's own plaintext port is `2003` and its pickle
+    /// port is `2004`. There is deliberately no `prefix:`/`template:` field and no `graphite.*`
+    /// attribute namespace: a datapoint's dotted path **is** the metric name and its `;k=v` tags
+    /// **are** event attributes, so a `lua`/`set` stage that renames the metric renames the wire
+    /// path. See `docs/deploying.md`'s `graphite_in` section.
+    ///
+    /// `transport: tcp` (the default, matching carbon's own default listener) runs an accept loop
+    /// with no receive queue -- TCP's own flow control is the backpressure -- so unlike a datagram
+    /// listener only `receive:`'s batch-assembly and `shutdown_grace` fields apply to it (rule
+    /// 17). `transport: udp` runs the shared datagram listener and takes the whole `receive:`
+    /// block. `protocol: pickle` requires `transport: tcp` (rule 43): the 4-byte big-endian length
+    /// prefix carbon frames a pickle batch with has no meaning in a self-delimiting datagram.
+    GraphiteIn {
+        bind: String,
+        #[serde(default)]
+        transport: GraphiteTransport,
+        #[serde(default)]
+        protocol: GraphiteProtocol,
+        /// The longest plaintext line this listener will assemble before giving up on it and
+        /// draining to the next newline (counted once as `logit.input.metrics.skipped
+        /// {reason="oversize_line"}`; the line *after* it still decodes). Defaults to `"8192"` --
+        /// carbon itself sets no such bound and Twisted's `LineReceiver` defaults to 16384, so
+        /// 8 KiB is comfortably past any real tagged path while keeping one hostile connection
+        /// from growing an unbounded read buffer. A string via [`human_bytes`], exactly like
+        /// `TailOptions::max_line_bytes`. Rule 43 rejects `0`. TCP plaintext only -- a UDP
+        /// datagram is already its own frame.
+        #[serde(default = "default_graphite_max_line_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_line_bytes: u64,
+        /// The largest pickle frame this listener will accept. A frame declaring more than this
+        /// closes the connection (diagnostic `oversize_frame`): a length-framed stream has no
+        /// resync point, so there is nothing to skip forward to. Defaults to `"1MiB"`, Twisted's
+        /// `Int32StringReceiver.MAX_LENGTH`, which is what carbon's own pickle receiver inherits
+        /// -- so a `logit` relay refuses exactly the frames carbon would. Rule 43 rejects `0` and
+        /// anything outside `1024..=16MiB`. `protocol: pickle` only.
+        #[serde(default = "default_graphite_max_frame_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_frame_bytes: u64,
+    },
     /// RFC 3164 / RFC 5424 syslog over UDP. **Not** TCP, despite this doc comment's old claim --
     /// `crates/logit-inputs/src/syslog.rs`'s own module doc has always said UDP-only (nginx's
     /// `syslog:` writer is UDP-only, so a TCP accept loop would buy this listener nothing;
@@ -1450,6 +1494,19 @@ fn default_collectd_max_packet_bytes() -> u64 {
     1452
 }
 
+/// Mirrors `logit_proto::graphite::DEFAULT_MAX_LINE_BYTES` -- can't reference it directly, same
+/// reason as [`default_syslog_connect_timeout`]; kept in sync by hand.
+fn default_graphite_max_line_bytes() -> u64 {
+    8192
+}
+
+/// Mirrors `logit_proto::graphite::DEFAULT_MAX_FRAME_BYTES` -- Twisted's
+/// `Int32StringReceiver.MAX_LENGTH`, which carbon's own pickle receiver inherits. Can't reference
+/// it directly, same reason as [`default_syslog_connect_timeout`].
+fn default_graphite_max_frame_bytes() -> u64 {
+    1 << 20
+}
+
 /// `PrometheusIn::interval`'s default -- Prometheus's own server ships the same 15s default scrape
 /// interval.
 fn default_prometheus_scrape_interval() -> Duration {
@@ -1597,6 +1654,32 @@ pub enum StatsdFormat {
     #[default]
     Dogstatsd,
     Statsd,
+}
+
+/// `graphite_in`'s transport. TCP is the default, matching carbon's own default listener
+/// (plaintext on port 2003); UDP is carbon's other plaintext mode. Deliberately its own enum
+/// rather than a reused `StatsdTransport`, for the reason that type's own doc comment gives:
+/// schemars publishes a type's name into the schema's `$defs`, so sharing one would make
+/// `graphite_in` document its transport by pointing at a statsd-named type.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphiteTransport {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+/// Which carbon wire protocol a `graphite_in` speaks: `plaintext`
+/// (`path[;k=v...] value timestamp`, one line per datapoint, carbon's port 2003) or `pickle` (a
+/// 4-byte big-endian length prefix then a pickled `[(path, (timestamp, value)), ...]`, carbon's
+/// port 2004). `pickle` requires `transport: tcp` (rule 43). Its own enum for
+/// [`GraphiteTransport`]'s reason.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphiteProtocol {
+    #[default]
+    Plaintext,
+    Pickle,
 }
 
 /// The syslog PRI facility, named rather than a bare `0..=23` integer so schemars publishes a
@@ -2891,6 +2974,90 @@ mod tests {
                 );
             }
             other => panic!("expected CollectdIn, got {other:?}"),
+        }
+    }
+
+    /// Every `graphite_in` field but `bind` is optional, and the defaults are carbon's own:
+    /// TCP plaintext (its default listener is plaintext on 2003), an 8 KiB line bound and
+    /// Twisted's 1 MiB `Int32StringReceiver.MAX_LENGTH` frame bound.
+    #[test]
+    fn graphite_in_component_defaults_to_tcp_plaintext_with_carbons_bounds() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "graphite_in", "bind": "0.0.0.0:2003"}"#).unwrap();
+        match component.kind {
+            ComponentKind::GraphiteIn {
+                bind,
+                transport,
+                protocol,
+                max_line_bytes,
+                max_frame_bytes,
+            } => {
+                assert_eq!(bind, "0.0.0.0:2003");
+                assert_eq!(transport, GraphiteTransport::Tcp);
+                assert_eq!(protocol, GraphiteProtocol::Plaintext);
+                assert_eq!(max_line_bytes, 8192);
+                assert_eq!(max_frame_bytes, 1 << 20);
+            }
+            other => panic!("expected GraphiteIn, got {other:?}"),
+        }
+    }
+
+    /// Both enums are `snake_case` on the wire, like every other config enum -- and the pickle
+    /// listener is the TCP-only combination rule 43 is the gate for.
+    #[test]
+    fn graphite_in_component_parses_snake_case_transport_and_protocol() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "graphite_in", "bind": "0.0.0.0:2004",
+                "transport": "tcp", "protocol": "pickle"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::GraphiteIn { transport, protocol, .. } => {
+                assert_eq!(transport, GraphiteTransport::Tcp);
+                assert_eq!(protocol, GraphiteProtocol::Pickle);
+            }
+            other => panic!("expected GraphiteIn, got {other:?}"),
+        }
+
+        let udp: Component = serde_json::from_str(
+            r#"{"type": "graphite_in", "bind": "0.0.0.0:2003", "transport": "udp"}"#,
+        )
+        .unwrap();
+        match udp.kind {
+            ComponentKind::GraphiteIn { transport, protocol, .. } => {
+                assert_eq!(transport, GraphiteTransport::Udp);
+                assert_eq!(protocol, GraphiteProtocol::Plaintext);
+            }
+            other => panic!("expected GraphiteIn, got {other:?}"),
+        }
+    }
+
+    /// Both byte bounds go through [`human_bytes`], so `"16KiB"` and a bare `"16384"` are the same
+    /// setting -- the property `StatsdOut::max_packet_bytes`'s own test pins for that field.
+    #[test]
+    fn graphite_in_component_parses_human_byte_sizes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "graphite_in", "bind": "0.0.0.0:2003",
+                "max_line_bytes": "16KiB", "max_frame_bytes": "2MiB"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::GraphiteIn { max_line_bytes, max_frame_bytes, .. } => {
+                assert_eq!(max_line_bytes, 16 * 1024);
+                assert_eq!(max_frame_bytes, 2 * 1024 * 1024);
+            }
+            other => panic!("expected GraphiteIn, got {other:?}"),
+        }
+
+        let plain: Component = serde_json::from_str(
+            r#"{"type": "graphite_in", "bind": "0.0.0.0:2003", "max_line_bytes": "16384"}"#,
+        )
+        .unwrap();
+        match plain.kind {
+            ComponentKind::GraphiteIn { max_line_bytes, .. } => {
+                assert_eq!(max_line_bytes, 16 * 1024, "a bare digit string is bytes");
+            }
+            other => panic!("expected GraphiteIn, got {other:?}"),
         }
     }
 
