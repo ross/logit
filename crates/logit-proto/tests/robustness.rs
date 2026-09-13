@@ -657,6 +657,26 @@ fn graphite_pickle_rejects_inflated_long_and_frame_lengths() {
     assert!(decode_graphite(&Bytes::from(frame), Protocol::Pickle));
 }
 
+/// `PROTO 2, EMPTY_LIST, LONG_BINPUT 499999, STOP` -- 9 bytes. Before the memo-key ordinal check,
+/// this `resize`d the reader's memo to 500,000 `Option<PValue>` slots (~8 MB) from a key with
+/// nothing behind it, the one `Vec` in the reader sized from a declared index rather than input
+/// actually consumed. It must now be rejected, and cost no more peak memory than the sibling
+/// pickle cases above.
+#[test]
+fn graphite_pickle_never_allocates_from_a_hostile_memo_key() {
+    let hostile = vec![0x80, 0x02, 0x5d, 0x72, 0x1f, 0xa1, 0x07, 0x00, 0x2e];
+    let bytes = Bytes::from(hostile);
+    assert!(
+        decode_graphite(&bytes, Protocol::Pickle),
+        "a memo key skipping ahead must be rejected"
+    );
+
+    let peak = peak_live_bytes(|| {
+        let _ = decode_graphite(&bytes, Protocol::Pickle);
+    });
+    assert!(peak < 4096, "peak live bytes {peak} suggests the memo key sized the memo");
+}
+
 /// Every opcode byte that is not on the allowlist must be refused, one at a time -- the property
 /// the allowlist exists for, asserted exhaustively rather than on a handful of samples.
 #[test]

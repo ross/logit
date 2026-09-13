@@ -171,9 +171,14 @@ intern order — prometheus ADR `:220-224`):
 
 | Field | Forbidden → `_` |
 |---|---|
-| path | ASCII whitespace, `char::is_control`, `;`, `/`, `\` |
+| path | whitespace (`char::is_whitespace`, matching carbon's `str.split()`), `char::is_control`, `;`, `/`, `\` |
 | tag name | `;` `!` `^` `=`, whitespace, control |
 | tag value | `;`, whitespace, control; a **leading** `~` only |
+
+The path field forbids Unicode whitespace rather than ASCII-only because carbon's plaintext
+receiver splits a decoded Python `str` with `str.split()`, which is Unicode-aware; sanitizing only
+ASCII would let a U+00A0 survive encode and re-split into a spurious fourth field on decode,
+breaking the pair's fixed point.
 
 **`multi_value: expand` sub-paths** (every expanded kind adds ≥1 suffix, so it can never collide
 with a skip-mode path):
