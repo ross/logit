@@ -49,18 +49,7 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         bail!("no scenarios to run");
     }
 
-    if !args.no_build {
-        build(root, &args.profile)?;
-    }
-    let target_dir_env = std::env::var_os("CARGO_TARGET_DIR");
-    let logit_bin =
-        logit_binary_path(root, &args.profile, target_dir_env.as_deref().map(Path::new));
-    if !logit_bin.exists() {
-        bail!(
-            "{} does not exist -- build it first (drop --no-build) or check --profile",
-            logit_bin.display()
-        );
-    }
+    let logit_bin = build_and_locate(root, &args.profile, args.no_build)?;
 
     let mut reports: BTreeMap<String, ScenarioReport> = BTreeMap::new();
     let mut any_failed = false;
@@ -226,6 +215,34 @@ fn drain_and_join(stdout_drain: JoinHandle<()>, stderr_reader: JoinHandle<String
     stderr_reader.join().unwrap_or_default()
 }
 
+/// One spawn-measure-shutdown cycle's inputs. A struct rather than seven positional parameters
+/// because three callers now share it: [`run_one`] (a scenario as it ships), `crate::attribute`
+/// (the same scenario rewritten into a temp directory with an `internal` dump leg appended), and
+/// `crate::flamegraph` (the scenario as it ships, under `perf record`).
+pub(crate) struct SpawnConfig<'a> {
+    pub logit_bin: &'a Path,
+    /// An argv prefix to run `logit` *under*, with the `logit run <config>` command line appended
+    /// to it -- `["perf", "record", .., "--"]` for `flamegraph`. Empty for a plain run, which is
+    /// what `run` and `attribute` both use.
+    ///
+    /// When it isn't empty the spawned process is the wrapper, not `logit`: the reported rusage
+    /// covers both, and a SIGTERM on the settle path goes to the wrapper (which is what `perf
+    /// record` wants -- it finalizes `perf.data` and stops its workload).
+    pub wrapper: &'a [String],
+    /// The config to hand `logit run` -- a scenario file, or a rewritten copy of one.
+    pub config: &'a Path,
+    /// The `count` the `generation complete` line must report, so a mis-measured denominator is
+    /// caught rather than silently divided by.
+    pub count: u64,
+    /// Whether this graph will still be running after the generator finishes -- when true the
+    /// completion line is followed by `settle`, then SIGTERM, rather than waiting for the process
+    /// to exit on its own.
+    pub needs_sigterm: bool,
+    pub settle: Duration,
+    pub timeout: Duration,
+    pub shutdown_timeout: Duration,
+}
+
 fn run_one(
     logit_bin: &Path,
     scenario: &Scenario,
@@ -233,13 +250,49 @@ fn run_one(
     timeout: Duration,
     shutdown_timeout: Duration,
 ) -> anyhow::Result<Sample> {
-    let mut child = Command::new(logit_bin)
+    spawn_and_measure(SpawnConfig {
+        logit_bin,
+        wrapper: &[],
+        config: &scenario.path,
+        count: scenario.count,
+        needs_sigterm: scenario.needs_sigterm,
+        settle,
+        timeout,
+        shutdown_timeout,
+    })
+}
+
+/// Spawns one `logit run <config>`, waits for the generator's completion line, shuts the process
+/// down, and reports its `wait4` rusage as a [`Sample`]. The whole spawn/reader-thread/SIGTERM/
+/// `wait4` lifecycle lives here, once, for every subcommand that needs to run a scenario.
+pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Sample> {
+    let SpawnConfig {
+        logit_bin,
+        wrapper,
+        config,
+        count,
+        needs_sigterm,
+        settle,
+        timeout,
+        shutdown_timeout,
+    } = spawn;
+    let mut command = match wrapper.split_first() {
+        Some((program, rest)) => {
+            let mut command = Command::new(program);
+            command.args(rest).arg(logit_bin);
+            command
+        }
+        None => Command::new(logit_bin),
+    };
+    let mut child = command
         .args(["--log-format", "json", "--log-level", "info", "run"])
-        .arg(&scenario.path)
+        .arg(config)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("spawning {}", logit_bin.display()))?;
+        .with_context(|| {
+            format!("spawning {}", wrapper.first().map(String::as_str).unwrap_or("logit"))
+        })?;
     let spawned_at = Instant::now();
     let pid = child.id() as libc::pid_t;
 
@@ -290,16 +343,16 @@ fn run_one(
             );
         }
     };
-    if events != scenario.count {
+    if events != count {
         let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
         bail!(
-            "generate_in reported {events} events but the scenario's `count` is {} -- events/s \
-             and CPU us/event would be measured against the wrong denominator; stderr:\n{stderr_text}",
-            scenario.count
+            "generate_in reported {events} events but the scenario's `count` is {count} -- \
+             events/s and CPU us/event would be measured against the wrong denominator; \
+             stderr:\n{stderr_text}"
         );
     }
 
-    if scenario.needs_sigterm {
+    if needs_sigterm {
         std::thread::sleep(settle);
         // SAFETY: `pid` is this scenario's own child, spawned above and not yet reaped (neither
         // `child.wait()` nor `rusage::wait4` below has run yet), so it is a valid, still-live
@@ -343,7 +396,29 @@ fn run_one(
         None => bail!("terminated by signal (raw status {}); stderr:\n{stderr_text}", usage.status),
     }
 
-    Ok(Sample::from_usage(scenario.count, usage.wall, usage.user, usage.sys, usage.max_rss_bytes))
+    Ok(Sample::from_usage(count, usage.wall, usage.user, usage.sys, usage.max_rss_bytes))
+}
+
+/// Builds `logit` under `profile` (unless `no_build`) and returns the path to the binary,
+/// failing loudly if it isn't there afterwards. Shared by `run`, `attribute`, and `flamegraph` --
+/// all three measure the *same* binary and must agree on which one that is.
+pub(crate) fn build_and_locate(
+    root: &Path,
+    profile: &str,
+    no_build: bool,
+) -> anyhow::Result<PathBuf> {
+    if !no_build {
+        build(root, profile)?;
+    }
+    let target_dir_env = std::env::var_os("CARGO_TARGET_DIR");
+    let logit_bin = logit_binary_path(root, profile, target_dir_env.as_deref().map(Path::new));
+    if !logit_bin.exists() {
+        bail!(
+            "{} does not exist -- build it first (drop --no-build) or check --profile",
+            logit_bin.display()
+        );
+    }
+    Ok(logit_bin)
 }
 
 fn build(root: &Path, profile: &str) -> anyhow::Result<()> {

@@ -1,10 +1,13 @@
 #!/bin/bash
 # Usage: script/perf run [--scenario NAME]... [--repeat N] [--label TEXT] [--settle 1s] [--no-build] [--profile release]
 #        script/perf compare <a.json> <b.json> [--threshold 5.0] [--rss-threshold PCT]
+#        script/perf attribute --scenario NAME [--interval 1s] [--settle 1s] [--no-build] [--profile release]
+#        script/perf flamegraph --scenario NAME [--out perf/results/NAME.svg] [--freq 999] [--no-build]
 #        script/perf list
 # Out-of-CI load-test harness (crates/logit-perf, docs/adr/load-test-harness.md): spawns the real
 # release `logit` binary against perf/scenarios/*.yaml and measures throughput, CPU per event, and
-# peak RSS.
+# peak RSS. `attribute` adds a temporary `internal` telemetry leg and decodes its native dump into
+# a per-node breakdown; `flamegraph` profiles a scenario with `perf record` and renders an SVG.
 #
 # Deliberately NOT part of script/cibuild, for the same reason script/bench is not: this loads the
 # machine heavily (a release build plus several million-event runs) and its numbers describe a
@@ -37,6 +40,46 @@ if LOGIT_PERF_GIT_PORCELAIN="$(git status --porcelain 2>/dev/null)"; then
     fi
 else
     LOGIT_PERF_GIT_DIRTY=""
+fi
+
+# `flamegraph` is the one subcommand the dev image can't serve: `perf`/`inferno` live only in the
+# throwaway profiling image (crates/logit-perf/Dockerfile), and `perf record` needs capabilities
+# `compose.yaml`'s `dev` service neither has nor should have. Routed through a plain `docker run`
+# rather than a second compose service, the same way script/protogen runs its own throwaway image
+# -- with the `dev` service's own mounts named explicitly (the bind mount, and the two named
+# volumes compose.yaml gives fixed `name:`s precisely so something outside compose can reuse the
+# warm caches).
+#
+# Three security relaxations, each verified necessary on this repo's own dev box (Fedora, SELinux
+# Enforcing) rather than copied from a blog post:
+#   --cap-add SYS_ADMIN          perf_event_open is refused outright at the host's default
+#                                kernel.perf_event_paranoid=2 without CAP_SYS_ADMIN/CAP_PERFMON.
+#   --security-opt label=disable SELinux's container_t denies the perf_event class regardless of
+#                                capabilities -- with the default label, `perf record` writes a
+#                                zero-sample perf.data and the paranoid-setting advice above,
+#                                which reads like a capability problem but isn't.
+#   --security-opt seccomp=...   docker's default seccomp profile gates perf_event_open on
+#                                CAP_PERFMON, which not every docker/kernel pair grants alongside
+#                                CAP_SYS_ADMIN.
+# No `:z` on the bind mount: with SELinux labeling off for this container there is nothing to
+# relabel for, and `:z` would recursively relabel the whole checkout (target/ included) each run.
+if [ "${1:-}" = "flamegraph" ] && ! in_project_environment; then
+    ${DOCKER} build -t logit-perf:local -f crates/logit-perf/Dockerfile crates/logit-perf
+    exec ${DOCKER} run --rm \
+        --cap-add SYS_ADMIN \
+        --security-opt seccomp=unconfined \
+        --security-opt label=disable \
+        -u 1000:1000 -w /work \
+        -v "${ROOT}:/work" \
+        -v logit_cargo_home:/home/dev/.cargo \
+        -v logit_target_cache:/work/target \
+        -e CARGO_HOME=/home/dev/.cargo \
+        -e CARGO_TARGET_DIR=/work/target \
+        -e LOGIT_DEV_CONTAINER=1 \
+        -e "LOGIT_PERF_GIT_SHA=${LOGIT_PERF_GIT_SHA}" \
+        -e "LOGIT_PERF_GIT_DIRTY=${LOGIT_PERF_GIT_DIRTY}" \
+        logit-perf:local \
+        cargo run -q -p logit-perf -- "$@"
 fi
 
 if [ -n "${LOGIT_PERF_GIT_SHA}" ]; then

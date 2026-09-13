@@ -60,6 +60,17 @@ pub fn discover(dir: &Path) -> anyhow::Result<Vec<Scenario>> {
     Ok(scenarios)
 }
 
+/// The one scenario named `name`, or an error naming every scenario there is -- what the
+/// single-scenario subcommands (`attribute`, `flamegraph`) resolve `--scenario` through, so a typo
+/// reports the available names instead of a bare "not found".
+pub fn find(dir: &Path, name: &str) -> anyhow::Result<Scenario> {
+    let scenarios = discover(dir)?;
+    let known = scenarios.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
+    scenarios.into_iter().find(|scenario| scenario.name == name).with_context(|| {
+        format!("no such scenario `{name}` under {} -- have: {known}", dir.display())
+    })
+}
+
 /// The parsing logic proper, split out from [`discover`] so it's testable against inline YAML
 /// strings with no filesystem involved.
 fn parse(yaml: &str) -> anyhow::Result<(u64, bool)> {
