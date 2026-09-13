@@ -1025,6 +1025,7 @@ dependencies = [
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",
+ "tracing-subscriber",
  "webpki-roots",
 ]
 

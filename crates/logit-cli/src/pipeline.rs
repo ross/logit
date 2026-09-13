@@ -671,6 +671,7 @@ fn build_spec(
             max_message_bytes,
             connect_timeout,
             structured_data,
+            tls,
         } => {
             // Eager for UDP (a bad local bind is a config error, `StreamOutput::open_path`'s
             // precedent) -- requires an active tokio runtime, which holds here since `build_spec`
@@ -700,6 +701,13 @@ fn build_spec(
                 .with_encoder(encoder)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
+            // TCP only -- RFC 5425 is syslog over TLS over TCP, and `graph::resolve`'s rule 44
+            // already rejected a `tls:` block under `transport: udp` (`with_tls` errors on the
+            // UDP arm anyway). After `with_diagnostics`, so the `insecure_skip_verify` warning
+            // lands on this component's own diagnostics -- the `otlp_out` arm's ordering above.
+            if let (logit_config::SyslogTransport::Tcp, Some(tls)) = (transport, tls) {
+                output = output.with_tls(&to_tls_client_settings(tls), base_dir)?;
+            }
             NodeSpec::Output(
                 Box::new(output),
                 queue_config(&component.buffer, base_dir),
