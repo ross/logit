@@ -188,7 +188,12 @@ the tag's literal argument string instead of failing.
 | Listener (`statsd_in`, `collectd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
-| Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rules 43-47, W2) |
+| Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 45) |
+
+Rule 7's "≥1 consumer" column is relaxed for *routers* only (rule 46): a component that directs at
+a target may have no ordinary consumers at all, since its consumers are only where its *unrouted*
+events go — those are dropped and counted rather than silently lost
+([ADR `target-components`](../adr/target-components.md)).
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
 considered and rejected (ADR `component-graph-configuration`): a typo'd source reference would silently turn a real sink into
@@ -431,6 +436,39 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     resolver can mirror it exactly without depending on `logit-config` (this document's own
     "Crate layout" section). `receive:` on a `generate_in` is rejected by rule 17's own allowlist
     — it is a listener by role, with no socket, queue, or decoder for `receive:` to configure.
+43. A non-empty `targets:` is legal only on a `lua`/`lua_file` component
+    ([ADR `target-components`](../adr/target-components.md)). On any other kind it is rejected by
+    name — rule 14's shape: a `route` declares its targets through `routes:`' values, and no other
+    kind has any way to direct an event anywhere, so a set-but-ignored list is a config error
+    rather than a setting silently doing nothing.
+44. Every id in `graph::targets_of` — a `lua`/`lua_file`'s `targets:` entries, a `route`'s
+    `routes:` values — must resolve to a defined component, must not be the router itself, and must
+    name a `target` kind: a router may never direct at an ordinary component, which would be a
+    `sources:` entry written on the wrong side of the edge (the inversion ADR
+    `component-graph-configuration`'s "named outlets" rejection was about), so the message says so.
+    A `lua`/`lua_file` `targets:` list may not repeat an id — rule 4's reasoning, one hop over: two
+    `Fanout`s into the same target would deliver every routed batch to it twice. A `route` mapping
+    several `routes:` values onto one target is legal by contrast and collapses to one slot — that
+    is the many-to-one the kind is for. Rule 47's `routes:` shape checks deliberately run *before*
+    this rule, so an empty `routes:` value is reported as the empty value it is rather than as an
+    unresolved target id.
+45. A `target` declares no `sources` — it is fed by direction, from a router that names it, never
+    by naming anything itself (checked in rule 6's own arity match, where the rest of the table
+    lives). Rule 7 still requires it to have at least one consumer, and it must also be directed to
+    by at least one router: rule 7's mirror, since a target nothing routes to is the same black
+    hole seen from the other end — its consumers would wait on it forever.
+46. Rule 7 is relaxed for routers only: a component with a non-empty `graph::targets_of` is exempt
+    from the "no consumers" rejection. A router's ordinary consumers are where its *unrouted*
+    events go, so a router without any is a legal config — those events are dropped and counted
+    (`logit.component.events.dropped{reason="unrouted"}`), never silently.
+47. A `route` needs a non-empty `routes:` map — an empty one can only ever be a no-op, rules
+    10/20's reasoning — with no empty key (it could never match a real value) and no empty value
+    (it could never name a real target), and, under `by: {attribute: k}`/`{resource: k}`, a
+    non-empty `k`: rule 19/20's empty-field-name rejection, applied to the one key a `route` reads
+    per event.
+
+**Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
+graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that
@@ -446,7 +484,9 @@ no special-casing needed, and no restriction to state.
 - Each component is a node: one inbox (`mpsc::Receiver<EventBatch>`, capacity `CHANNEL_CAPACITY`,
   unchanged from today) and a `Fanout` — one `mpsc::Sender` per consumer, resolved from the inverted
   `sources` relation.
-- **Fan-in is free**: N sources into one component is N cloned `Sender`s feeding the same inbox.
+- **Fan-in is free**: N sources into one component is N cloned `Sender`s feeding the same inbox. A
+  `target` several routers direct at is fan-in at the target by exactly the same mechanism — each
+  router holds a clone of that target's senders ([ADR `target-components`](../adr/target-components.md)).
 - **Fan-out costs a clone per extra consumer**: exactly the `output_txs.split_last()` pattern
   `send_batch` already uses (`crates/logit-cli/src/pipeline.rs`), generalized from "per output" to
   "per downstream consumer of any node."
@@ -682,6 +722,12 @@ config is a graph rather than a list of linear pipelines.
 - Styles nodes by role (listener / transform / sink) so the shape of the data flow — where it
   enters, where it forks, where it lands — reads at a glance without cross-referencing the arity
   table.
+- Renders a `target` as a dashed box, and every router → target edge dashed too, labelled with the
+  `routes:` key that directs an event down it (a `lua`/`lua_file` `targets:` entry carries no
+  label — its destination is chosen in the script, by `event:to("..")`). These edges come from
+  `graph::target_edges`, which reads the raw `Config` like everything else here, so a router whose
+  target id resolves to nothing still renders as a visibly dangling dashed edge rather than
+  blocking output ([ADR `target-components`](../adr/target-components.md)).
 - Still needs every `!env` reference in the config to resolve, though ("Environment substitution"
   above) — a missing variable fails to load before `render` is ever called, same as `run`/
   `validate`, even for a field this command never reads.

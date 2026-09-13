@@ -158,6 +158,41 @@
 //!     `logit-config` (`docs/design/pipeline-graph.md`'s crate layout). `receive:` on a
 //!     `generate_in` is rejected by rule 17's own allowlist -- it is a listener by role, with no
 //!     socket, queue, or decoder for `receive:` to configure (`docs/plans/load-test-harness.md`).
+//! 43. A non-empty `targets:` is legal only on a `lua`/`lua_file` component
+//!     (`docs/adr/target-components.md`). On any other kind it is rejected by name -- rule 14's
+//!     shape: a `route` declares its targets through `routes:`' values, and no other kind has any
+//!     way to direct an event anywhere, so a set-but-ignored list is a config error rather than a
+//!     setting silently doing nothing.
+//! 44. Every id in [`targets_of`] -- a `lua`/`lua_file`'s `targets:` entries, a `route`'s
+//!     `routes:` values -- must resolve to a defined component, must not be the router itself, and
+//!     must name a `target` kind: a router may never direct at an ordinary component, which would
+//!     be a `sources:` entry written on the wrong side of the edge (the inversion
+//!     `docs/adr/component-graph-configuration.md`'s "named outlets" rejection was about), so the
+//!     message says so. A `lua`/`lua_file` `targets:` list may not repeat an id -- rule 4's
+//!     reasoning, one hop over: two `Fanout`s into the same target would deliver every routed
+//!     batch to it twice. A `route` mapping several `routes:` values onto one target is legal by
+//!     contrast and collapses to one slot -- that is the many-to-one the kind exists for. Rule
+//!     47's `routes:` shape checks deliberately run *before* this rule, so an empty `routes:`
+//!     value is reported as the empty value it is rather than as an unresolved target id.
+//! 45. A `target` declares no `sources` -- it is fed by direction, from a router that names it,
+//!     never by naming anything itself (checked in rule 6's own arity match, where the rest of
+//!     the table lives). Rule 7 still requires it to have at least one consumer, and it must also
+//!     be directed to by at least one router: rule 7's mirror, since a target nothing routes to
+//!     is the same black hole seen from the other end -- its consumers would wait on it forever.
+//! 46. Rule 7 is relaxed for routers only: a component with a non-empty [`targets_of`] is exempt
+//!     from the "no consumers" rejection. A router's ordinary consumers are where its *unrouted*
+//!     events go, so a router without any is a legal config -- those events are dropped and
+//!     counted (`logit.component.events.dropped{reason="unrouted"}`), never silently
+//!     (`docs/adr/target-components.md`).
+//! 47. A `route` needs a non-empty `routes:` map -- an empty one can only ever be a no-op, rules
+//!     10/20's reasoning -- with no empty key (it could never match a real value) and no empty
+//!     value (it could never name a real target), and, under `by: {attribute: k}`/
+//!     `{resource: k}`, a non-empty `k`: rule 19/20's empty-field-name rejection, applied to the
+//!     one key a `route` reads per event.
+//!
+//! Deliberately not validated: that a `by: {provenance: ..}` route key names a component in
+//! *this* graph -- rule 37's reasoning; the key is as likely to name a component relayed from
+//! another process.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -304,6 +339,50 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
     }
 }
 
+/// Every router -> target edge one component declares, paired with the route key that produced it
+/// (`None` for a `lua`/`lua_file` `targets:` entry, which has no key -- the key lives in the
+/// script, on `event:to("..")`). Duplicates are preserved: this is the *edge* list, where
+/// [`targets_of`] is the slot list, so a `route` mapping two values onto one target appears here
+/// twice and there once. Every other kind declares no target edges at all -- a non-empty
+/// `targets:` on one is rejected by rule 43 rather than silently honored here.
+///
+/// Public for the same reason [`role`] is: `logit graph` (`logit-cli`'s `dot.rs`) renders these
+/// edges straight off a raw `Config`, without a resolved [`Graph`]
+/// (`docs/design/pipeline-graph.md`'s "`logit graph`" section).
+pub fn target_edges(component: &Component) -> Vec<(Option<&str>, &str)> {
+    match &component.kind {
+        ComponentKind::Route { routes, .. } => {
+            routes.iter().map(|(key, target)| (Some(key.as_str()), target.as_str())).collect()
+        }
+        ComponentKind::Lua { .. } | ComponentKind::LuaFile { .. } => {
+            component.targets.iter().map(|target| (None, target.as_str())).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The slot-ordered, de-duplicated list of `target` ids one component directs events into: a
+/// `route`'s `routes:` values in map (key) order with the first occurrence of each winning, a
+/// `lua`/`lua_file`'s `targets:` as written, and nothing at all for every other kind. This order
+/// is what a router's slot index *means* everywhere downstream -- the `Vec<Fanout>` the node
+/// runtime hands a router, and the name -> slot table a Lua worker resolves `event:to("..")`
+/// against (`docs/adr/target-components.md`) -- so it is derived here, once, rather than
+/// re-derived per caller.
+///
+/// A `route` ignores `Component.targets` entirely: its edges *are* its `routes:` values, and rule
+/// 43 rejects a `targets:` written on one anyway.
+///
+/// Public for the same reason [`target_edges`] and [`role`] are.
+pub fn targets_of(component: &Component) -> Vec<&str> {
+    let mut slots: Vec<&str> = Vec::new();
+    for (_, target) in target_edges(component) {
+        if !slots.contains(&target) {
+            slots.push(target);
+        }
+    }
+    slots
+}
+
 /// The single source of truth for which `ComponentKind`s the runtime can actually build --
 /// mirrors the pre-graph `require_implemented_input`/`require_implemented_output`/
 /// `require_implemented_transform` trio, now unified over one enum.
@@ -379,6 +458,11 @@ fn names_all_three(signals: &[logit_config::Signal]) -> bool {
 pub struct ResolvedComponent {
     pub sources: Vec<String>,
     pub consumers: Vec<String>,
+    /// The `target` components this one directs events into, in slot order -- [`targets_of`]'s
+    /// output, owned (`docs/adr/target-components.md`). Empty for everything that isn't a router;
+    /// validated by rules 43-45, so once resolution has succeeded every id here names a defined
+    /// `target` component and appears exactly once.
+    pub targets: Vec<String>,
     pub kind: ComponentKind,
     /// Per-sink delivery buffer config (`docs/adr/buffered-sink-delivery.md`). Validated as
     /// sink-only by [`resolve`] (rule 14); meaningless on any other role, so a non-sink component's
@@ -517,6 +601,16 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             Role::Transform if component.sources.is_empty() => {
                 anyhow::bail!("component '{id}' is a transform and requires at least one source");
             }
+            // Rule 45's first clause lives here, with the rest of the arity table: a `target` is
+            // fed by *direction* (`docs/adr/target-components.md`), from a router that names it,
+            // so it never names anything itself -- the one role whose inbound edges aren't in its
+            // own config.
+            Role::Target if !component.sources.is_empty() => {
+                anyhow::bail!(
+                    "component '{id}' is a target and cannot declare sources -- a target is fed \
+                     by a router that names it"
+                );
+            }
             Role::Sink => {
                 if component.sources.is_empty() {
                     anyhow::bail!("component '{id}' is a sink and requires at least one source");
@@ -532,10 +626,128 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 7: every non-sink component needs at least one consumer.
+    // Rule 7: every non-sink component needs at least one consumer -- including a `target`, whose
+    // consumers are the ordinary `sources:` entries naming it, so the message reads the same way
+    // for one.
+    //
+    // Rule 46 is the one exemption: a router (anything with a non-empty `targets_of`) may have no
+    // ordinary consumers at all. Its consumers are where its *unrouted* events go, and a config
+    // that routes everything it produces is a real shape, not a black hole -- an event no route
+    // claimed is dropped and counted, `logit.component.events.dropped{reason="unrouted"}`
+    // (`docs/adr/target-components.md`), never silently discarded the way rule 7 exists to catch.
     for (id, component) in &components {
-        if role(&component.kind) != Role::Sink && consumers.get(id).is_none_or(Vec::is_empty) {
+        if role(&component.kind) != Role::Sink
+            && consumers.get(id).is_none_or(Vec::is_empty)
+            && targets_of(component).is_empty()
+        {
             anyhow::bail!("component '{id}' has no consumers -- nothing reads what it produces");
+        }
+    }
+
+    // Rule 43: `targets:` is a `lua`/`lua_file`-only concept -- rule 14's shape, for rule 14's
+    // reason. A `route` declares its targets through `routes:`' values (so repeating them here
+    // would be a second place to keep in sync), and no other kind has any way to direct an event
+    // anywhere at all, so a `targets:` on one is a misplaced block silently doing nothing rather
+    // than a setting that would be honored.
+    for (id, component) in &components {
+        if !component.targets.is_empty()
+            && !matches!(component.kind, ComponentKind::Lua { .. } | ComponentKind::LuaFile { .. })
+        {
+            anyhow::bail!(
+                "component '{id}': 'targets' is only meaningful on a lua/lua_file component (a \
+                 route's targets are its routes: values)"
+            );
+        }
+    }
+
+    // Rule 47: `route`-specific validation. Deliberately *before* rule 44, which reads the same
+    // `routes:` values as target ids: an empty value is reported as the empty value it is, rather
+    // than as an unresolved target named `''`. An empty `routes:` map can only ever be a no-op
+    // (rules 10/20's reasoning); an empty key could never match a real value, and an empty
+    // `by:` key name could never name a real attribute or resource key (rule 19/20's reasoning,
+    // applied to the one key a `route` reads per event).
+    for (id, component) in &components {
+        if let ComponentKind::Route { by, routes } = &component.kind {
+            if routes.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a route with no 'routes' configured can only ever be a \
+                     no-op"
+                );
+            }
+            if routes.keys().any(|value| value.is_empty()) {
+                anyhow::bail!(
+                    "component '{id}': a route 'routes' key must not be empty -- it could never \
+                     match a real value"
+                );
+            }
+            if routes.values().any(|target| target.is_empty()) {
+                anyhow::bail!(
+                    "component '{id}': a route 'routes' value must not be empty -- it could \
+                     never name a real target"
+                );
+            }
+            let by_key = match by {
+                logit_config::RouteBy::Attribute(key) => Some(("attribute", key)),
+                logit_config::RouteBy::Resource(key) => Some(("resource", key)),
+                logit_config::RouteBy::Provenance(_) => None,
+            };
+            if let Some((field, key)) = by_key {
+                if key.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': a route 'by: {{{field}: ..}}' key name must not be \
+                         empty -- it could never name a real {field} key"
+                    );
+                }
+            }
+        }
+    }
+
+    // Rule 44: every router -> target reference resolves, isn't the router itself, and names a
+    // `target` kind; a `lua`/`lua_file` may not repeat one. The unresolved case is checked first
+    // so a typo'd id is reported as a typo rather than as whatever kind it happened to collide
+    // with. Directing at an ordinary component is the inversion
+    // `docs/adr/component-graph-configuration.md`'s "named outlets" rejection was about -- a
+    // `sources:` entry written on the wrong side of the edge -- so the message names that fix.
+    // The duplicate clause is rule 4's, one hop over: two `Fanout`s into the same target would
+    // deliver every routed batch to it twice. A `route` naming one target from several `routes:`
+    // values is *not* a duplicate -- many-to-one is what the kind is for, and `targets_of`
+    // collapses it to a single slot -- so only the keyless (`lua`/`lua_file`) edges are checked.
+    for (id, component) in &components {
+        let mut seen = std::collections::HashSet::new();
+        for (key, target) in target_edges(component) {
+            let Some(referenced) = components.get(target) else {
+                anyhow::bail!("component '{id}' references unknown target '{target}'");
+            };
+            if target == id.as_str() {
+                anyhow::bail!("component '{id}' directs at itself as a target");
+            }
+            if role(&referenced.kind) != Role::Target {
+                anyhow::bail!(
+                    "component '{id}': target '{target}' is a {}, not a target -- a router may \
+                     only direct at a 'target' kind; did you mean to list '{id}' in the \
+                     'sources' of '{target}'?",
+                    kind_name(&referenced.kind)
+                );
+            }
+            if key.is_none() && !seen.insert(target) {
+                anyhow::bail!(
+                    "component '{id}' lists target '{target}' more than once -- two fanouts into \
+                     the same target would deliver every routed batch to it twice"
+                );
+            }
+        }
+    }
+
+    // Rule 45's last clause: a `target` no router directs to is rule 7's black hole seen from the
+    // other end. The directed-to set is computed once over every component's `targets_of` rather
+    // than per target.
+    let directed_to: BTreeSet<&str> = components.values().flat_map(targets_of).collect();
+    for (id, component) in &components {
+        if role(&component.kind) == Role::Target && !directed_to.contains(id.as_str()) {
+            anyhow::bail!(
+                "component '{id}': is a target that no router directs to -- its consumers would \
+                 wait on it forever"
+            );
         }
     }
 
@@ -1658,13 +1870,23 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
-        // `targets` isn't carried onto `ResolvedComponent` until W2
-        // (`docs/plans/target-components.md`); rules 43-47 land with it.
+        // Slot order is decided here, once, from the raw `Component` -- a `route`'s `routes:`
+        // values collapse to one slot per distinct target, a `lua`/`lua_file`'s `targets:` are
+        // its slots as written (`docs/adr/target-components.md`).
+        let node_targets: Vec<String> =
+            targets_of(&component).into_iter().map(String::from).collect();
         let Component { sources, buffer, receive, kind, targets: _ } = component;
         let node_consumers = consumers.remove(&id).unwrap_or_default();
         resolved.insert(
             id,
-            ResolvedComponent { sources, consumers: node_consumers, kind, buffer, receive },
+            ResolvedComponent {
+                sources,
+                consumers: node_consumers,
+                targets: node_targets,
+                kind,
+                buffer,
+                receive,
+            },
         );
     }
 
@@ -1795,17 +2017,40 @@ fn check_tail_glob(id: &str, path: &str) -> anyhow::Result<()> {
 /// it (a node fed by a cycle never reaches indegree 0 either), so it is walked back down to a
 /// single cycle rather than reported as-is.
 fn topological_order(components: &HashMap<String, Component>) -> anyhow::Result<Vec<String>> {
-    let mut indegree: HashMap<&str, usize> =
-        components.iter().map(|(id, c)| (id.as_str(), c.sources.len())).collect();
+    // Two kinds of edge feed this: a `sources` entry (consumer -> source, walked here as source
+    // -> consumer) and a router -> target direction (`docs/adr/target-components.md`). Both are
+    // real data flow, so both count: a target's indegree counts the routers that direct at it,
+    // which is what makes `router -> target -> .. -> router` the deadlock it would be at runtime
+    // rather than a graph this function silently accepts. `incoming` is built alongside
+    // `outgoing` (rather than indegree being read off `sources.len()`) because the cycle-recovery
+    // walk below has to traverse *both* edge kinds backwards -- `sources` alone dead-ends at a
+    // target, which has none.
+    //
+    // An id that names no defined component is skipped on both sides: rule 2 has already
+    // rejected an unresolved `sources` entry by the time this runs, but an unresolved *target*
+    // id is rule 44's, which runs later -- as is a router naming itself, skipped here for the
+    // same reason (rule 44's message says what is wrong; a self-loop reported as a cycle would
+    // not).
+    let mut incoming: HashMap<&str, Vec<&str>> =
+        components.keys().map(|id| (id.as_str(), Vec::new())).collect();
     let mut outgoing: HashMap<&str, Vec<&str>> =
         components.keys().map(|id| (id.as_str(), Vec::new())).collect();
     for (id, c) in components {
-        for source in &c.sources {
-            if let Some(out) = outgoing.get_mut(source.as_str()) {
-                out.push(id.as_str());
+        for producer in c.sources.iter().map(String::as_str) {
+            if components.contains_key(producer) {
+                incoming.get_mut(id.as_str()).expect("every id is in incoming").push(producer);
+                outgoing.get_mut(producer).expect("checked above").push(id.as_str());
+            }
+        }
+        for target in targets_of(c) {
+            if components.contains_key(target) && target != id.as_str() {
+                incoming.get_mut(target).expect("checked above").push(id.as_str());
+                outgoing.get_mut(id.as_str()).expect("every id is in outgoing").push(target);
             }
         }
     }
+    let mut indegree: HashMap<&str, usize> =
+        incoming.iter().map(|(&id, sources)| (id, sources.len())).collect();
 
     let mut ready: Vec<&str> =
         indegree.iter().filter(|(_, &deg)| deg == 0).map(|(&id, _)| id).collect();
@@ -1830,7 +2075,7 @@ fn topological_order(components: &HashMap<String, Component>) -> anyhow::Result<
     if order.len() != components.len() {
         // Residual indegree marks the cycle *and* everything downstream of it -- a node fed by a
         // cycle never reaches indegree 0 either. Naming that whole set would blame components
-        // that are merely downstream victims, so walk `sources` backwards inside it to recover
+        // that are merely downstream victims, so walk `incoming` backwards inside it to recover
         // one real cycle instead. Every stuck node has a stuck source (that's what non-zero
         // residual indegree means), so the walk can't dead-end, and it must revisit a node within
         // `stuck.len()` steps.
@@ -1845,10 +2090,9 @@ fn topological_order(components: &HashMap<String, Component>) -> anyhow::Result<
             }
             seen.insert(current, path.len());
             path.push(current);
-            current = components[current]
-                .sources
+            current = incoming[current]
                 .iter()
-                .map(String::as_str)
+                .copied()
                 .filter(|s| stuck.contains(s))
                 .min()
                 .expect("a stuck node always has a stuck source");
@@ -1931,8 +2175,61 @@ mod tests {
         Config { components: map, ..Default::default() }
     }
 
+    /// One raw `Component`, for the tests that call a pure function
+    /// ([`targets_of`]/[`target_edges`]/[`topological_order`]) directly instead of going through
+    /// [`resolve`] -- which is how a *success* path involving a `target`/`route` is asserted at
+    /// all while rule 8 still rejects both kinds as unimplemented (W4,
+    /// `docs/plans/target-components.md`).
+    fn component(sources: Vec<&str>, targets: Vec<&str>, kind: ComponentKind) -> Component {
+        Component {
+            sources: sources.into_iter().map(String::from).collect(),
+            targets: targets.into_iter().map(String::from).collect(),
+            buffer: BufferConfig::default(),
+            receive: ReceiveConfig::default(),
+            kind,
+        }
+    }
+
+    /// The `components` map [`topological_order`] takes, from `(id, sources, targets, kind)`
+    /// tuples -- `cfg`'s shape with a `targets:` list, since `cfg` always builds an empty one.
+    fn components_map(
+        components: Vec<(&str, Vec<&str>, Vec<&str>, ComponentKind)>,
+    ) -> HashMap<String, Component> {
+        components
+            .into_iter()
+            .map(|(id, sources, targets, kind)| (id.to_string(), component(sources, targets, kind)))
+            .collect()
+    }
+
+    /// [`cfg`] for a config whose components carry `targets:`.
+    fn cfg_with_targets(components: Vec<(&str, Vec<&str>, Vec<&str>, ComponentKind)>) -> Config {
+        Config { components: components_map(components), ..Default::default() }
+    }
+
     fn listener() -> ComponentKind {
         ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }
+    }
+
+    fn target() -> ComponentKind {
+        ComponentKind::Target {}
+    }
+
+    fn keep(fields: Vec<&str>) -> ComponentKind {
+        ComponentKind::Keep { fields: fields.into_iter().map(String::from).collect() }
+    }
+
+    fn route(by: logit_config::RouteBy, routes: &[(&str, &str)]) -> ComponentKind {
+        ComponentKind::Route {
+            by,
+            routes: routes
+                .iter()
+                .map(|(value, target)| (value.to_string(), target.to_string()))
+                .collect(),
+        }
+    }
+
+    fn by_attribute(key: &str) -> logit_config::RouteBy {
+        logit_config::RouteBy::Attribute(key.to_string())
     }
 
     fn tail_in(paths: Vec<&str>) -> ComponentKind {
@@ -3636,31 +3933,265 @@ mod tests {
     /// other kind that isn't built yet.
     #[test]
     fn a_target_component_is_rejected_as_not_implemented() {
-        let err = expect_err(cfg(vec![
-            ("t", vec![], ComponentKind::Target {}),
-            ("out", vec!["t"], sink()),
+        // Otherwise valid under rules 43-47: a real router directs at `t`, and `t` has a consumer.
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec!["t"], lua()),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["t", "r"], vec![], sink()),
         ]));
         assert!(err.contains("is not implemented yet"), "got: {err}");
     }
 
     #[test]
     fn a_route_component_is_rejected_as_not_implemented() {
-        let err = expect_err(cfg(vec![
-            ("in", vec![], listener()),
-            (
-                "r",
-                vec!["in"],
-                ComponentKind::Route {
-                    by: logit_config::RouteBy::Attribute("stream".to_string()),
-                    routes: std::collections::BTreeMap::from([(
-                        "host".to_string(),
-                        "t".to_string(),
-                    )]),
-                },
-            ),
-            ("out", vec!["r"], sink()),
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec![], route(by_attribute("stream"), &[("host", "t")])),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["r", "t"], vec![], sink()),
         ]));
         assert!(err.contains("is not implemented yet"), "got: {err}");
+    }
+
+    // Rules 43-47 (`docs/adr/target-components.md`). Every *success* path below is asserted by
+    // calling the pure function directly rather than through `resolve`: rule 8 still rejects
+    // `target`/`route` as unimplemented until W4, so a config that reaches the end of validation
+    // is not something `resolve` can return `Ok` for yet.
+
+    #[test]
+    fn targets_on_a_non_router_kind_is_rejected() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("k", vec!["in"], vec!["t"], keep(vec!["a"])),
+            ("r", vec!["in"], vec!["t"], lua()),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["t", "k", "r"], vec![], sink()),
+        ]));
+        assert!(err.contains("'k'") && err.contains("'targets' is only meaningful"), "got: {err}");
+    }
+
+    #[test]
+    fn targets_on_a_route_is_rejected() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec!["t"], route(by_attribute("stream"), &[("host", "t")])),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["t"], vec![], sink()),
+        ]));
+        assert!(
+            err.contains("'r'") && err.contains("a route's targets are its routes: values"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_target_ref_must_resolve() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec!["typo"], lua()),
+            ("out", vec!["r"], vec![], sink()),
+        ]));
+        assert!(err.contains("unknown target 'typo'"), "got: {err}");
+    }
+
+    /// A router directing at an ordinary component is a `sources:` entry written on the wrong
+    /// side of the edge, so the message says so rather than only naming the kind.
+    #[test]
+    fn a_target_ref_must_name_a_target_kind() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec!["k"], lua()),
+            ("k", vec!["in"], vec![], keep(vec!["a"])),
+            ("out", vec!["r", "k"], vec![], sink()),
+        ]));
+        assert!(err.contains("target 'k' is a keep, not a target"), "got: {err}");
+        assert!(err.contains("'sources'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_router_may_not_target_itself() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec!["r"], lua()),
+            ("out", vec!["r"], vec![], sink()),
+        ]));
+        assert!(err.contains("'r' directs at itself as a target"), "got: {err}");
+    }
+
+    #[test]
+    fn a_duplicate_lua_target_is_rejected() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec!["t", "t"], lua()),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["t"], vec![], sink()),
+        ]));
+        assert!(err.contains("lists target 't' more than once"), "got: {err}");
+    }
+
+    /// Many-to-one is what `routes:` is for, so it is legal and collapses to a single slot --
+    /// asserted on `targets_of` directly, since rule 8 would reject the config as unimplemented.
+    #[test]
+    fn a_many_to_one_route_map_is_legal_and_collapses_to_one_slot() {
+        let router = component(
+            vec!["in"],
+            vec![],
+            route(by_attribute("stream"), &[("host", "t"), ("node", "t"), ("app", "other")]),
+        );
+        // `routes:` is a `BTreeMap`, so slot order follows the *key* order: app, host, node.
+        assert_eq!(targets_of(&router), vec!["other", "t"]);
+    }
+
+    #[test]
+    fn a_target_may_not_declare_sources() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec!["t"], lua()),
+            ("t", vec!["in"], vec![], target()),
+            ("out", vec!["t"], vec![], sink()),
+        ]));
+        assert!(err.contains("'t' is a target and cannot declare sources"), "got: {err}");
+    }
+
+    #[test]
+    fn a_target_needs_a_consumer() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec!["t"], lua()),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["r"], vec![], sink()),
+        ]));
+        assert!(err.contains("'t' has no consumers"), "got: {err}");
+    }
+
+    #[test]
+    fn a_target_needs_a_directing_router() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("k", vec!["in"], vec![], keep(vec!["a"])),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["k", "t"], vec![], sink()),
+        ]));
+        assert!(err.contains("'t': is a target that no router directs to"), "got: {err}");
+    }
+
+    /// Rule 46: a router whose every event is routed has no ordinary consumers, and that is a
+    /// real config -- its unrouted events are dropped and counted at runtime, not silently lost.
+    /// It must therefore reach rule 8 (still "not implemented" until W4) rather than being
+    /// rejected by rule 7.
+    #[test]
+    fn a_router_with_targets_but_no_consumers_is_not_a_black_hole() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec!["t"], lua()),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["t"], vec![], sink()),
+        ]));
+        assert!(!err.contains("has no consumers"), "rule 7 should not fire, got: {err}");
+        assert!(err.contains("is not implemented yet"), "got: {err}");
+    }
+
+    #[test]
+    fn a_route_with_empty_routes_is_rejected() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec![], route(by_attribute("stream"), &[])),
+            ("out", vec!["r"], vec![], sink()),
+        ]));
+        assert!(err.contains("no 'routes' configured can only ever be a no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_route_with_an_empty_routes_key_is_rejected() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec![], route(by_attribute("stream"), &[("", "t")])),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["t"], vec![], sink()),
+        ]));
+        assert!(err.contains("a route 'routes' key must not be empty"), "got: {err}");
+    }
+
+    /// Rule 47 runs before rule 44 precisely so this reads as an empty value rather than as an
+    /// unresolved target id named `''`.
+    #[test]
+    fn a_route_with_an_empty_routes_value_is_rejected() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec![], route(by_attribute("stream"), &[("host", "")])),
+            ("out", vec!["r"], vec![], sink()),
+        ]));
+        assert!(err.contains("a route 'routes' value must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn a_route_by_attribute_with_an_empty_key_name_is_rejected() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec![], route(by_attribute(""), &[("host", "t")])),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["t"], vec![], sink()),
+        ]));
+        assert!(err.contains("'by: {attribute: ..}' key name must not be empty"), "got: {err}");
+    }
+
+    /// Router -> target edges are real edges, so a loop closed through a target is the deadlock
+    /// rule 5 exists to catch. Rule 5 runs well before rule 8, so `resolve` reports it even
+    /// though both kinds are still unimplemented.
+    #[test]
+    fn a_cycle_through_a_target_is_detected() {
+        let err = expect_err(cfg_with_targets(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in", "x"], vec!["t"], lua()),
+            ("t", vec![], vec![], target()),
+            ("x", vec!["t"], vec![], keep(vec!["a"])),
+        ]));
+        assert_eq!(err, "component graph has a cycle: r -> t -> x -> r");
+    }
+
+    #[test]
+    fn topological_order_places_a_target_after_its_router() {
+        let components = components_map(vec![
+            ("in", vec![], vec![], listener()),
+            ("r", vec!["in"], vec!["t"], lua()),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["t"], vec![], sink()),
+        ]);
+        let order = topological_order(&components).expect("acyclic");
+        assert_eq!(order, vec!["in", "r", "t", "out"]);
+    }
+
+    /// Fan-in at a target: two routers directing at one target is two inbound edges, so the
+    /// target sorts after *both* -- an indegree of 1 would emit it as soon as the first router
+    /// was visited (and underflow on the second).
+    #[test]
+    fn a_target_fed_by_two_routers_has_indegree_two() {
+        let components = components_map(vec![
+            ("in", vec![], vec![], listener()),
+            ("r1", vec!["in"], vec!["t"], lua()),
+            ("r2", vec!["in"], vec!["t"], lua()),
+            ("t", vec![], vec![], target()),
+            ("out", vec!["t"], vec![], sink()),
+        ]);
+        let order = topological_order(&components).expect("acyclic");
+        let at = |id: &str| order.iter().position(|other| other == id).expect("every id is placed");
+        assert_eq!(order.len(), 5);
+        assert!(at("t") > at("r1") && at("t") > at("r2"), "got: {order:?}");
+    }
+
+    #[test]
+    fn target_edges_keeps_the_route_key_and_duplicates() {
+        let router = component(
+            vec!["in"],
+            vec![],
+            route(by_attribute("stream"), &[("host", "t"), ("node", "t")]),
+        );
+        assert_eq!(target_edges(&router), vec![(Some("host"), "t"), (Some("node"), "t")]);
+        // A `lua` target list has no route key: the destination is chosen in the script.
+        let script = component(vec!["in"], vec!["a", "b"], lua());
+        assert_eq!(target_edges(&script), vec![(None, "a"), (None, "b")]);
+        assert_eq!(targets_of(&script), vec!["a", "b"]);
     }
 
     #[test]
