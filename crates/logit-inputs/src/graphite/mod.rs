@@ -772,11 +772,162 @@ mod tests {
         running.shutdown.send(true).expect("the receiver is alive");
         let batch = running.next_batch("the shutdown drain").await;
         assert_eq!(resolve(batch.events[0].metrics[0].name), "drained.path");
+        let drained = running.registry.drain(0);
+        assert_eq!(
+            metric_sum(&drained, "logit.component.receive.flushed", Some(("reason", "shutdown"))),
+            1.0,
+            "the component going away is the one thing that is really a shutdown"
+        );
 
         let joined = tokio::time::timeout(Duration::from_secs(5), running.handle)
             .await
             .expect("run_until_shutdown must return, not hang, once the signal fires");
         joined.expect("the task should not panic").expect("and the listener should exit cleanly");
+    }
+
+    /// A client hanging up is **not** a component shutdown, and the connection's final flush has
+    /// to say so: `FlushReason::Closed` is "one source among several ended while the listener
+    /// keeps running" (`logit_pipeline::accumulator`), which is exactly this. Without the split a
+    /// healthy listener reports `receive.flushed{reason="shutdown"}` on every disconnect, and an
+    /// operator watching for a real shutdown sees nothing but noise.
+    #[tokio::test]
+    async fn a_clean_disconnect_flushes_as_closed_not_shutdown() {
+        let mut running = start(
+            |input| input.with_receive(no_flush_timer()),
+            Transport::Tcp,
+            Protocol::Plaintext,
+        )
+        .await;
+        let mut stream = running.connect().await;
+        stream.write_all(line("closed.path").as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(stream); // a clean FIN, the ordinary way a carbon sender ends a connection
+
+        let batch = running.next_batch("the end-of-connection flush").await;
+        assert_eq!(resolve(batch.events[0].metrics[0].name), "closed.path");
+
+        let drained = running.registry.drain(0);
+        assert_eq!(
+            metric_sum(&drained, "logit.component.receive.flushed", Some(("reason", "closed"))),
+            1.0
+        );
+        assert_eq!(
+            metric_sum(&drained, "logit.component.receive.flushed", Some(("reason", "shutdown"))),
+            0.0,
+            "the listener is still running -- nothing here is a shutdown"
+        );
+
+        running.shutdown.send(true).ok();
+        running.handle.abort();
+    }
+
+    /// The regression test for the one exit that used to skip the final flush. A read **error**
+    /// (not a clean FIN) has to reach the same `accumulator.take()` every other exit does, or
+    /// everything decoded since the last flush is lost silently -- up to `batch_max_events` of it,
+    /// and with no flush timer that is the only bound.
+    ///
+    /// `SO_LINGER 0` makes the close a TCP RST rather than a FIN, which is what turns the server's
+    /// next read into `ECONNRESET` instead of `Ok(0)`. The sleep is load-bearing: it lets the
+    /// listener actually read and accumulate the line before the reset arrives, since an RST
+    /// discards whatever is still sitting in the receive buffer -- which is a real property of
+    /// RST, not something this listener could recover from.
+    #[tokio::test]
+    async fn a_read_error_still_flushes_what_the_connection_accumulated() {
+        let mut running = start(
+            |input| input.with_receive(no_flush_timer()),
+            Transport::Tcp,
+            Protocol::Plaintext,
+        )
+        .await;
+        let stream = running.connect().await;
+        let mut stream = stream;
+        stream.write_all(line("reset.path").as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        #[allow(deprecated)]
+        stream.set_linger(Some(Duration::ZERO)).expect("SO_LINGER should be settable on loopback");
+        drop(stream); // RST, not FIN
+
+        let batch = running.next_batch("the flush after a reset connection").await;
+        assert_eq!(
+            resolve(batch.events[0].metrics[0].name),
+            "reset.path",
+            "a read error must not swallow what was already decoded"
+        );
+
+        running.shutdown.send(true).ok();
+        running.handle.abort();
+    }
+
+    /// Rule: a fatal `accept` error has to reach `run_input` **promptly**, even with clients still
+    /// connected. Before the accept loop grew its own teardown signal, the post-loop drain waited
+    /// on serving tasks that were parked in a read race nothing would ever flip -- so one idle
+    /// carbon relay was enough to make the listener silently stop accepting while the process kept
+    /// reporting healthy.
+    ///
+    /// Driven through a real `accept` failure rather than a simulated one. `shutdown(fd, SHUT_RD)`
+    /// on a *listening* socket is Linux's documented way to break an in-flight `accept`: it wakes
+    /// the poll immediately and every subsequent `accept` fails with `EINVAL`. Deliberately not
+    /// `close(fd)` -- the `TcpListener` still owns that descriptor and would close it again on
+    /// drop, and in between another thread could have been handed the same number. Linux-only
+    /// because the behaviour is: `libc` is already this crate's Linux-only dependency (`tail_in`'s
+    /// inotify), and no new one is added for this.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_accept_error_returns_promptly_with_an_idle_connection_open() {
+        use std::os::fd::AsRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("ephemeral bind");
+        let addr = listener.local_addr().expect("a bound listener has an address");
+        let fd = listener.as_raw_fd();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let fanout = Fanout::new(vec![tx]);
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        let config = tcp::ConnectionConfig {
+            protocol: Protocol::Plaintext,
+            max_line_bytes: 8192,
+            max_frame_bytes: 1 << 20,
+            batch_max_events: 1000,
+            batch_max_bytes: 1024 * 1024,
+            batch_flush_interval: Duration::from_millis(50),
+            max_connections: MAX_CONCURRENT_CONNECTIONS,
+        };
+        let handle = tokio::spawn(tcp::run_accept_loop(
+            listener,
+            fanout,
+            config,
+            Arc::new(logit_core::Resource::default()),
+            Diagnostics::new("graphite_in"),
+            Telemetry::default(),
+            shutdown_rx,
+        ));
+
+        // A connection that is live and then goes *idle* -- the shape that used to park the drain
+        // forever. Waiting for its batch is what proves the serving task really is sitting in its
+        // read race by the time `accept` breaks.
+        let mut idle = TcpStream::connect(addr).await.expect("the listener should accept");
+        idle.write_all(line("idle.path").as_bytes()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the idle connection's line should be delivered")
+            .expect("the channel should not have closed");
+
+        // SAFETY: `fd` is this listener's own descriptor, still owned and kept open by the
+        // `TcpListener` the accept loop holds -- `shutdown` only changes its state, never closes
+        // it, so the owner's eventual `close` stays correct and no descriptor is ever reused
+        // out from under anyone.
+        let rc = unsafe { libc::shutdown(fd, libc::SHUT_RD) };
+        assert_eq!(rc, 0, "shutdown(SHUT_RD) on a listening socket should succeed on Linux");
+
+        let joined = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("an accept error must reach run_input promptly, not wait for the last client");
+        let result = joined.expect("the accept loop should not panic");
+        assert!(result.is_err(), "a broken accept is a fatal, reported error: {result:?}");
+
+        drop(idle);
     }
 
     // -- TCP: pickle framing ----------------------------------------------------------------
