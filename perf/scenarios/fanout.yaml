@@ -4,10 +4,13 @@
 # already covers.
 #
 #   script/perf run --scenario fanout
+#
+# `count` bumped 25M -> 55M (docs/design/performance.md's first recorded run): on an otherwise-idle
+# box this graph clears 25M events in ~3.2s, under this directory's 5-10s target band.
 components:
   gen:
     type: generate_in
-    count: 25000000
+    count: 55000000
     event:
       attributes:
         host: web-{seq%20}

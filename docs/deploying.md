@@ -304,6 +304,56 @@ batch-assembly fields apply; see "Tailing files and Docker logs" below) — see 
 in [`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml). Every field defaults,
 so an omitted `receive:` is the values below.
 
+### `handshake_timeout` on a TCP listener
+
+A stream listener has no receive queue (its connection's own flow control is the backpressure), but
+it does have something a datagram listener doesn't: a connection that can be opened and then left
+saying nothing, holding one of the listener's 1024 concurrency-cap permits. `syslog_in`
+(`transport: tcp`), `logit_in`, and `otlp_in` each bound that with a `handshake_timeout:` field —
+**5s by default**, a humantime string like `connect_timeout`:
+
+```yaml
+components:
+  syslog_in:
+    type: syslog_in
+    bind: 0.0.0.0:6514
+    transport: tcp
+    handshake_timeout: 5s        # the default; per pre-message phase, not a total
+```
+
+**It is a per-phase budget, not one deadline for the connection.** Each pre-message phase gets its
+own budget of the configured length, so a TLS connection that says nothing at all can cost up to
+two of them — 10s at the default — before it is closed and its permit released. The phases are:
+
+| Kind | Phases bounded |
+|---|---|
+| `syslog_in` (`transport: tcp`) | the TLS accept (under `tls:`), then the wait for the connection's first byte — on the plaintext arm too |
+| `logit_in` | the TLS accept (under `tls:`), then the `Hello` read |
+| `otlp_in` | the TLS accept **only** — and so nothing at all on a plaintext listener |
+
+`otlp_in` is the narrow one, and not by choice. It hands each accepted connection straight to
+`hyper`, whose connection builder reads the first bytes itself to tell HTTP/1.1 from an HTTP/2
+preface — a read this listener never sees, and one `hyper`'s own HTTP/1 header-read timeout
+doesn't cover either (that starts only once the version is already decided). So on `otlp_in` this
+knob bounds the TLS handshake and nothing after it, and a **plaintext `otlp_in` has no phase for
+it to bound at all** — which is why rule 45 rejects a non-default `handshake_timeout` on one
+rather than accepting a value that could never fire. A plaintext `otlp_in` therefore has *no*
+pre-message bound, which is a real gap and not a tuning choice: see `docs/known-gaps.md`'s
+"a plaintext `otlp_in` has no pre-first-byte bound" row.
+
+**It is not an idle timeout, on any of the three.** Once a connection has got past its pre-message
+phases, the gap before its next frame/request is deliberately unbounded — a long-lived,
+mostly-quiet sender is ordinary traffic, not a fault. A connection that goes silent *after* that
+point holds its permit indefinitely, which is a known, separately-tracked gap (see
+`docs/known-gaps.md`'s "no idle-connection timeout on a TCP listener" row for why closing it is its
+own piece of work). Lowering `handshake_timeout` does not help with that case; it only tightens how
+fast a connection that never said anything at all is given up on.
+
+`handshake_timeout` must be greater than `0s` (rule 45 — `0` would close every connection before
+its handshake could start), and on a `syslog_in` with `transport: udp` it must be left at its
+default: a datagram listener has no connection to hand shake, so a value set there is rejected at
+validation time rather than silently ignored.
+
 ### Failure semantics: `drop_oldest`, not `block` — the opposite default from `buffer:`
 
 `buffer:`'s default is `block`, and that's the right call there: the producer being backpressured
@@ -755,6 +805,13 @@ components:
 `client_ca_file` requires every connecting client to present a certificate chaining to it (mutual
 TLS); omit it to accept any client once the handshake itself completes.
 
+`otlp_in.handshake_timeout` (default 5s) bounds that handshake: a client that completes the TCP
+connect and then never sends a ClientHello is closed and its concurrency-cap permit released. It
+bounds the TLS accept and nothing after it, and it therefore only applies to a listener that has a
+`tls:` block at all (rule 45 rejects a non-default value on a plaintext one) — see
+["`handshake_timeout` on a TCP listener"](#handshake_timeout-on-a-tcp-listener) above for why, and
+for what that leaves open.
+
 **`tls.insecure_skip_verify`** (`otlp_out` only) disables server-certificate verification — the
 connection is still encrypted, but any certificate is accepted. `logit` logs a startup warning
 whenever it's set; it's meant for a throwaway or pre-production endpoint, not a real deployment,
@@ -767,6 +824,73 @@ listener-side `logit.component.diagnostics` counters as any other transport fail
 -specific to watch beyond that. `docs/known-gaps.md` tracks two open items: certificates are read
 once at startup (a renewed cert needs a restart, not a live reload), and `otlp_out` has no
 `server_name` override for an endpoint reached by IP or through a proxy.
+
+### syslog (RFC 5425)
+
+`syslog_in`/`syslog_out` can speak TLS too — RFC 5425, syslog framed per RFC 6587 carried over TLS
+over TCP — see [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md). Same shape as
+`logit_in`/`logit_out` just above: both `bind` and `endpoint` are bare `host:port` strings with no
+URL scheme to read a TLS signal from, so a `tls:` block's mere **presence turns TLS on and makes it
+required** — there is no plaintext fallback once one is configured — and it applies to
+`transport: tcp` only; DTLS (syslog over TLS over UDP) is out of scope, so `tls:` under
+`transport: udp` is a config error rather than a silently ignored block. The fields are the same
+`TlsServerConfig`/`TlsClientConfig` pair every other TLS-capable component uses:
+
+```yaml
+# sender
+components:
+  syslog_out:
+    type: syslog_out
+    sources: [enrich]
+    endpoint: collector.internal:6514   # RFC 5425's registered port
+    transport: tcp
+    tls:
+      ca_file: /etc/logit/tls/ca.pem    # trust this CA instead of the bundled Mozilla set
+```
+
+```yaml
+# collector
+components:
+  syslog_in:
+    type: syslog_in
+    bind: 0.0.0.0:6514
+    transport: tcp
+    tls:
+      cert_file: /etc/logit/tls/server.pem
+      key_file: /etc/logit/tls/server.key
+      client_ca_file: /etc/logit/tls/ca.pem   # omit for server-auth-only TLS
+```
+
+Mutual TLS adds a client certificate on `syslog_out`'s `tls:` block, exactly `logit_out`'s example
+above (`cert_file`/`key_file` together). `tls.insecure_skip_verify` (`syslog_out` only, same
+contradictory-with-`ca_file` rejection) behaves identically too.
+
+`syslog_out.connect_timeout` bounds the TCP connect and the TLS handshake as two separate phases,
+not one combined deadline — a TLS connect can therefore take up to twice the configured value
+([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)'s amendment). Size it
+accordingly if raising it from the default.
+
+`syslog_in.handshake_timeout` (default 5s) is the receiving side's own version of the same
+arrangement: one budget of that length for the TLS accept, then a fresh one for the wait for the
+connection's first byte, so a TLS peer that connects and then goes quiet is dropped after at most
+10s. It applies on the plaintext TCP arm too (where only the first-byte phase exists), and not at
+all under `transport: udp`. See
+["`handshake_timeout` on a TCP listener"](#handshake_timeout-on-a-tcp-listener) above.
+
+**What to watch.** `syslog_out`: `logit.output.requests{class="ok"|"error"}` (one per attempt) and
+`logit.output.reconnects` (should stay near zero in steady state — a climbing count on a TLS
+connection means the peer or the network, not this sink, is unstable; counted identically on a
+plaintext and a TLS connection, since both take the same connect path). `syslog_in`:
+`logit.input.connections` (a gauge — should match the number of `syslog_out` peers actually
+connected) and `logit.input.connections.rejected{reason="limit"}` (nonzero means the 1024
+-connection cap is binding). Both: a handshake failure, a framing violation, or an oversize/
+malformed frame all surface through
+`logit.component.diagnostics{key="connection_error"|"framing_error"}` and
+`logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}` — there is no separate
+TLS-specific counter, the same call this section's `otlp_in`/`otlp_out` paragraphs already make.
+`docs/known-gaps.md` tracks what's still open: DTLS, certificates read once at startup, no
+`server_name` override, and no idle-connection timeout once a connection has handshaken (or, on
+plaintext, sent its first byte).
 
 ## Forwarding between `logit` nodes
 
@@ -822,9 +946,12 @@ comfortably under `retry_budget` -- a `request_timeout` close to or above the re
 room for at most one attempt before the budget itself expires, which defeats retry's purpose.
 `request_timeout` also bounds `logit_in`'s own handshake grace on the far end only loosely: a
 `logit_out` configured with a shorter `request_timeout` than its peer's handshake patience just
-means *this* side gives up first, not that the connection is unsafe. That far-end grace is 5s per
-pre-`Hello` phase, applied independently to the TLS accept and to the `Hello` read that follows
-it -- so a TLS peer that connects and then goes silent is dropped after at most 10s, not 5s.
+means *this* side gives up first, not that the connection is unsafe. That far-end grace is
+`logit_in.handshake_timeout` (default 5s) and it is *per pre-`Hello` phase*, applied independently
+to the TLS accept and to the `Hello` read that follows it -- so a TLS peer that connects and then
+goes silent is dropped after at most 10s, not 5s. See
+["`handshake_timeout` on a TCP listener"](#handshake_timeout-on-a-tcp-listener) above; it is a
+pre-`Hello` bound only, never an idle timeout on an established connection.
 A peer that gets `Reject{code: REJECT_INTERNAL}` from a `logit_in` at its connection cap never
 classifies it `permanent`: at the handshake (nothing of the batch written yet) it's `clean` and
 the batch is retried within `retry_budget`; once a frame has already left on that connection it's

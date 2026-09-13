@@ -236,19 +236,26 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` — a config error, not
     something to clamp silently.
 17. A non-default `receive:` block is rejected on any kind that is not a **datagram listener**
-    (`docs/adr/decoupled-listener-io.md`, `statsd_in`/`collectd_in`/`syslog_in`) or a **tail
+    (`docs/adr/decoupled-listener-io.md`, `statsd_in`/`collectd_in`/a UDP `syslog_in`), a
+    **stream listener** (`docs/adr/syslog-tcp-ingress-and-tls.md`, a TCP `syslog_in`) or a **tail
     listener** (`docs/adr/file-tailing-and-docker-json-logs.md`, `tail_in`/`docker_in`). Deliberately not
     "any non-listener": `internal` and `generate_in` are listeners by role but have no socket, no
     queue, and no decoder, so `receive:` on either would be exactly the silently-ignored-setting
     failure rule 14 guards against on the sink side. A tail listener has no receive *queue* at all (the tailed
     file is its own durable buffer) — only `receive.batch_max_events`, `batch_max_bytes`,
     `batch_flush_interval`, and `shutdown_grace` are meaningful on one; a queue-bounding field
-    (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) is rejected by name.
+    (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) is rejected by name. A
+    stream listener has no receive queue either, for a different reason — the TCP connection's own
+    flow control *is* the backpressure, so a blocked `Fanout::send` just stops the socket being
+    read and the peer's window closes — so the same four queue fields are rejected by name on one,
+    with a message that says so, and the same four batch/shutdown fields apply, scoped **per
+    connection** rather than per listener (N live connections can hold up to N ×
+    `batch_max_events` in flight).
 18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, or `receive.batch_max_events`
     of `0` is rejected — the twin of rule 15. `receive.batch_flush_interval: 0s` is **not**
-    rejected — it means "no flush timer," a meaningful setting, unlike the count bounds. A tail
-    listener's `receive.batch_max_events`/`batch_max_bytes` of `0` is rejected the same way (the
-    queue-only bounds don't apply to it at all — see rule 17).
+    rejected — it means "no flush timer," a meaningful setting, unlike the count bounds. A tail or
+    stream listener's `receive.batch_max_events`/`batch_max_bytes` of `0` is rejected the same way
+    (the queue-only bounds don't apply to either at all — see rule 17).
 19. (Also since drifted into the code's numbering, see the note on 12 above.) A `set` with both
     `resource` and `attributes` empty is rejected, as is an empty key in either map (added
     alongside `has_attributes`/`drop_attributes` below, so `set`'s own validation matches what its
@@ -421,7 +428,49 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     resolver can mirror it exactly without depending on `logit-config` (this document's own
     "Crate layout" section). `receive:` on a `generate_in` is rejected by rule 17's own allowlist
     — it is a listener by role, with no socket, queue, or decoder for `receive:` to configure.
-43. `protocol: pickle` requires `transport: tcp` on `graphite_in`/`graphite_out`
+43. A `syslog_in` carrying a `tls:` block must be `transport: tcp`
+    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)). Syslog over TLS
+    (RFC 5425) is RFC 6587-framed syslog carried over TLS over TCP, and DTLS (RFC 6012), its
+    UDP-carried sibling, is out of scope — so a `tls:` block under `transport: udp` could never
+    take effect. Rejected rather than ignored, the same call rule 22 makes for a `tls:` block
+    under a plaintext `otlp_out` endpoint: an operator who wrote one meant the connection
+    encrypted, and running it in the clear anyway is the worst of the available outcomes. Nothing
+    here constrains a plaintext TCP listener, which stays perfectly ordinary.
+44. A `syslog_out` `tls:` block must be internally consistent — `cert_file`/`key_file` set
+    together, no `insecure_skip_verify` alongside `ca_file` — the same two checks rule 34 makes
+    for `logit_out`'s own `tls:` block (and rule 24 for `otlp_out`'s), for the same reason: both
+    of those sinks dial a bare `host:port` endpoint, so `tls:`'s mere presence is the only signal
+    that TLS is wanted and there is no "wrong scheme" case to catch. Plus one check this rule
+    alone makes: a `tls:` block together with `transport: udp` is rejected
+    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)). Syslog over TLS is
+    RFC 5425 — TLS over *TCP* — and DTLS is out of scope, so accepting the block and ignoring it
+    would leave an operator who asked for encryption on a plaintext datagram socket.
+    `logit_outputs::syslog::SyslogOutput::with_tls` re-checks that last one itself, since
+    `graph::resolve` isn't the only possible caller.
+
+45. A `handshake_timeout` must be greater than `0s` on every kind that has one — `syslog_in`,
+    `logit_in`, `otlp_in` — and must be left at its default in the two places it could never take
+    effect: a `syslog_in` with `transport: udp`, and a plaintext `otlp_in` (no `tls:` block).
+    `0s` is an impossible budget rather than a tight one: no TLS accept, first-byte read,
+    or `Hello` read completes in zero time, so a listener configured with it would accept
+    connections only to close each one immediately and would receive nothing at all — the same
+    "0 is impossible, not just small" call rules 9/15/18/28 make for a flush interval, a queue
+    bound, and a poll interval. The two context checks are rule 43's reasoning applied to this
+    field instead of `tls:`, in rule 33's "only means anything under X" shape: a UDP `syslog_in`
+    has no connection to hand shake, and a plaintext `otlp_in` has a connection but no phase this
+    field reaches — on that listener the budget bounds the TLS accept *alone* (hyper's own version
+    sniff, which follows it, is not wrapped; see `docs/known-gaps.md`'s plaintext-`otlp_in` row),
+    so with no `tls:` block it is inert. In both cases an operator who set a value meant it to take
+    effect, so set-but-ignored is an error rather than a silent no-op. Only a *non-default* value
+    is rejected, so the field's own default stays legal everywhere and no pre-existing config
+    becomes invalid; `graph.rs` imports `logit_config::default_handshake_timeout` to make that
+    distinction rather than mirroring the number, and
+    `a_udp_syslog_in_at_the_default_handshake_timeout_resolves_fine`/
+    `a_plaintext_otlp_in_at_the_default_handshake_timeout_resolves_fine` both deserialize a real
+    config rather than constructing the variant, so they exercise the `serde` defaulting path this
+    comparison has to agree with.
+
+46. `protocol: pickle` requires `transport: tcp` on `graphite_in`/`graphite_out`
     (`docs/adr/graphite-carbon-relay.md`) — Twisted's length-prefixed pickle framing has no meaning
     in a datagram, so the combination is a config error rather than a silent reinterpretation. A
     zero `max_line_bytes`/`max_frame_bytes`/`connect_timeout` is rejected, the same impossible-

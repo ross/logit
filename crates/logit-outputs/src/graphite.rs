@@ -35,7 +35,7 @@
 //! `endpoint` (`host:port`, resolved once per batch, never at config-load time -- same
 //! `statsd_out`/`collectd_out` precedent), `transport` (`tcp`, the default, or `udp`), `protocol`
 //! (`plaintext`, the default, or `pickle` -- TCP only, rejected on UDP by
-//! `crates/logit-pipeline/src/graph.rs` rule 43), `tags`/`multi_value` (forwarded straight to the
+//! `crates/logit-pipeline/src/graph.rs` rule 46), `tags`/`multi_value` (forwarded straight to the
 //! encoder, no sink-level meaning), `max_packet_bytes` (default `1432`, `statsd_out`'s own figure
 //! -- UDP only, ignored on TCP, which has no datagram to overflow), `max_frame_bytes` (default
 //! `1MiB`, Twisted's own `Int32StringReceiver.MAX_LENGTH`), and `connect_timeout` (TCP only,
@@ -308,7 +308,7 @@ impl Output for GraphiteOutput {
 /// attributes its **datapoint** count (Σ `meta`), not just its entry count, to
 /// `logit.output.messages.dropped` -- the two coincide for plaintext (every line's meta is `1`)
 /// but this is written generically so the same counting logic would still be correct if this sink
-/// ever packed pickle frames into a UDP datagram (it never legally does -- graph rule 43 -- but the
+/// ever packed pickle frames into a UDP datagram (it never legally does -- graph rule 46 -- but the
 /// counting code itself makes no such assumption).
 #[derive(Default)]
 struct UdpSendCounts {

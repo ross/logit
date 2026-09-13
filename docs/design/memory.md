@@ -1135,7 +1135,12 @@ matters is **no cross-thread hop** (a `tokio::spawn`, a multi-thread runtime, a 
 tests (thread-local `CountingAlloc`, same reasoning) independently confirm the same numbers this
 module reports. What a full multi-node graph costs end to end, spread across the real worker
 threads and OS threads `run_with_shutdown` actually spawns, is still a separate question needing a
-load generator, not a microbenchmark.
+load generator, not a microbenchmark — **answered now** by the out-of-CI load-test harness
+(`crates/logit-perf`, `script/perf`): see [`performance.md`](performance.md) for methodology and
+the first recorded run against the real release binary. That closes the end-to-end *measurement*
+gap this section describes; it says nothing about capacity planning for a given deployment's real
+traffic shape, which is a different, still-open question (this document's own "Open questions",
+below).
 
 **Spans are the one live-registry cost only partly covered by either of the two layers above.**
 Most of `crates/logit-bench/tests/allocations.rs`'s span-adjacent constants (`fanout_send_*`) use
@@ -1351,6 +1356,10 @@ traffic, which doesn't exist yet and can't be synthesized honestly.
 
 ## Open questions
 
+- **What does a full multi-node graph cost end to end, on the real runtime?** Answered — see §7's
+  pointer to [`performance.md`](performance.md), the out-of-CI load-test harness's methodology and
+  first recorded run. What stays open is *capacity planning* against a real deployment's traffic
+  shape, not the measurement mechanism: the two questions immediately below.
 - **What is the real attribute/metric-count distribution** across the inputs `logit` will
   actually see? Partly answered: four representative shapes are now measured (statsd 0-4, nginx
   10, logs-only 6, wide-JSON 32), enough to rule out shrinking `AttrMap`'s inline capacity (§1, §8
