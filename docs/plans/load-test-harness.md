@@ -42,12 +42,22 @@ established for the `collectd`/`lossless-transit` efforts.
 | W6 | **Landed** (#153). **`attribute` + `flamegraph` + `[profile.profiling]` + perf image.** The temp-scenario-copy + `internal`/`file_out` append, SIGTERM-after-settle, native-frame decode + per-node grouping/sort; the `[profile.profiling]` root profile; `crates/logit-perf/Dockerfile` and the `perf record`/`inferno` pipeline. | `crates/logit-perf/src/{attribute.rs,flamegraph.rs}`; root `Cargo.toml` (`[profile.profiling]`); `crates/logit-perf/Dockerfile` (new, `FROM logit-dev:local`); `docs/design/internal-telemetry.md` (both kinds are layer-2 only; `internal`'s final drain) | `script/perf attribute --scenario json-parse` shows per-node received/sent summing to the scenario's `count`, with `json` showing the largest Σ process time; `script/perf flamegraph --scenario passthrough` writes an SVG with resolved symbols; `Dockerfile.dev` diff is empty. The `[profile.profiling]`/validate-loop parts get `pr-review --comment`; the perf-image plumbing gets lighter lead review. |
 | W7 | **Landed as two PRs, W7a/W7b** (#154 W7a; this PR W7b). **Remaining scenarios + `performance.md` + docs closeout.** `aggregate`, `lua`, `native-relay`, `encode-human-devnull`/`encode-native-devnull`, `buffered`; first recorded results; the rest of the docs sweep. | `perf/scenarios/{aggregate,lua,native-relay,encode-human-devnull,encode-native-devnull,buffered}.yaml`; `docs/design/performance.md` (new: methodology, reproduction table, first results table with host/sha/cpu preamble, before/after workflow, reading `attribute` output); `docs/design/memory.md` (§7/open-questions pointer to `performance.md`); `docs/known-gaps.md` (rate granularity above ~1k batches/s; no cross-run noise model); `docs/OVERVIEW.md`/`AGENTS.md` (where-things-live + current-state blurbs) | All scenarios in `script/validate` and the shipped-config test; `script/perf run` covers every scenario in one pass in the 5-10s/scenario range on the dev box; `performance.md` carries one real recorded run. Lighter lead review (delegated read-through + `script/cibuild`). |
 
-Landing order: **W0 → W1 → (W2, W3) → W5 → W6 → W7**, with W4 branching independently from `main`
-and landing whenever it's ready — before W6, which depends on it. W2 and W3 both branch from
+Planned landing order: **W0 → W1 → (W2, W3) → W5 → W6 → W7**, with W4 branching independently from
+`main` and landing whenever it's ready — before W6, which depends on it. W2 and W3 both branch from
 `feat/perf-w1` and can proceed in parallel since neither touches the other's files. Each PR targets
 its parent workstream's branch and is retargeted to `main` once that parent merges, the same
-convention `collectd-binary-relay.md`
-uses, so later workstreams aren't blocked on every earlier PR landing first.
+convention `collectd-binary-relay.md` uses, so later workstreams aren't blocked on every earlier PR
+landing first.
+
+**Actual landing order** (by merge time, not PR number): #147 (W0) → #149 (W1) → #148 (W4) → #150
+(W3) → #151 (W2) → #152 (W5) → #154 (W7a) → #153 (W6) → this PR (W7b). W4 did land independently
+and early, as planned — right after W1, well ahead of W6, the workstream that depends on it. W2 and
+W3 landed in the opposite order from the table above (W3 first) but both still branched from
+`feat/perf-w1` and stayed parallel, so that reordering cost nothing. W6 and W7a did not land in
+their planned order: W7a (the remaining scenarios + this doc closeout's groundwork) merged before
+W6 (`attribute`/`flamegraph`) did, even though W6 was scoped and reviewed first — a queuing
+artifact of the stacked-PR/retarget mechanics, not a dependency violation (W7a's own scenarios
+don't need anything W6 built).
 
 **This PR (W0) is docs only** — no code, no `script/cibuild` run, per the ADR's own scope. W1
 onward touch code and follow the review cadence above: `pr-review --comment` on every workstream

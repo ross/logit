@@ -106,7 +106,10 @@ A few readings, cross-referencing `perf/scenarios/*.yaml`'s own comments for wha
   network hop and an ack wait, but still cheaper than a parse-heavy or Lua-heavy graph.
 - **`aggregate`** (0.296 µs/event) is nearly as cheap as `passthrough` per event despite sketching a
   1000-series distribution and running a 1s flush tick — see §2 for why: almost all of it is one
-  node's `DdSketch::add`, and the flush tick's own cost is amortized over a 20-second run.
+  node's `DdSketch::add`, and the flush tick's own cost is amortized over several ticks a run (the
+  recorded run above took 5.88s wall, ~5-6 ticks at this scenario's 1s interval; §2's attribution
+  run is a separate invocation with the `internal` leg attached and took roughly 11.2s wall, hence
+  its 12 flush-tick batches).
 - **`buffered`** — see §3. Its number above is real but should not be read the same way the other
   eight are; the note there explains why.
 
@@ -191,26 +194,32 @@ repeat 5/5:  79,711 events/s  13.008 µs/event   69.9 MiB peak RSS
 
 Both runs degrade monotonically after their first repeat or two, and peak RSS climbs in lockstep —
 that's the signature of the same thing happening both times, just from a different starting point.
-The cause: `DiskQueue::open` (`crates/logit-pipeline/src/disk_queue.rs`) unconditionally reads and
-CRC-walks the **entire active segment file** to validate it for a torn tail, on every startup — an
-O(segment size) cost paid whether or not the read cursor actually has anything left to replay
-(`cursor.json` was caught up to end-of-segment in every case here: zero real records replayed, only
-the validation scan). `buffered.yaml`'s spool is never cleared between repeats or between separate
-`script/perf` invocations, and its segments are ~21 MB per 1.2M-event run against a default
-`segment_bytes` rotation threshold of 64 MiB — so consecutive repeats keep appending to, and
-re-validating, the *same, growing* active segment until it finally rotates. This is not the
-real-disk-I/O-contention explanation the scenario's comment carried before this investigation; it's
-a harness artifact, reproducible solo, with no contention required at all.
+**One real, identified contributor:** `DiskQueue::open` (`crates/logit-pipeline/src/disk_queue.rs`)
+pays an un-cleared spool's cost twice at every startup, not once. It reads and CRC-walks the
+*active* segment in full to validate it for a torn tail (`disk_queue.rs` ~427-441) — an O(segment
+size) cost, but a *bounded* one: the active segment can't grow past roughly the default
+`segment_bytes` rotation threshold (64 MiB) before a new one starts, so this pass alone is capped
+and, on its own, is not obviously large enough to explain a multi-second-scale swing. It then reads
+every segment at or after the read cursor a *second* time, this run's own included, to count what's
+left to replay (`disk_queue.rs` ~481-497) — real work only when the cursor hasn't caught up to the
+end of what's on disk, i.e. exactly what a spool the harness never clears between repeats or
+invocations leaves behind. So the un-cleared spool makes every repeat pay a bounded startup
+validation scan *plus* a replay of whatever the last checkpoint hadn't covered — one real
+contributor to the spread above, not a full accounting of it. This is not the real-disk-I/O-contention
+explanation the scenario's comment carried before this investigation, and it is reproducible solo
+with no contention required — but whether it explains the *entire* observed spread (including
+W7a's 16k-790k range) is not yet established.
 
 **What this means for the number in §1's table:** `535,735` events/s is a real median of three
-repeats run back-to-back against a growing spool, exactly the condition that produces this
-degradation — it is not a steady-state number, and re-running `buffered` alone will very likely
-reproduce a different value depending on how much that run's spool has already accumulated. Deleting
-`perf/results/spool/` before a solo `buffered` comparison is the practical workaround today. The real
-fix — `script/perf run`/`attribute` clearing a disk-backed scenario's spool directory before each
-invocation — is filed as follow-up work in `docs/known-gaps.md`, not built here: it's a harness
-change, not a `crates/` one, and this workstream is docs-plus-one-count-nudge only. `buffered`'s own
-comment in `perf/scenarios/buffered.yaml` now carries this same account.
+repeats run back-to-back against a spool the harness never clears, a condition now known to add
+real, if only partly quantified, startup cost on top of whatever else is going on — it is not a
+steady-state number, and re-running `buffered` alone may well reproduce a different value depending
+on that spool's prior state. Deleting `perf/results/spool/` before a solo `buffered` comparison is
+the practical workaround today. **W8 (in flight)** is the harness-side follow-up that clears a
+disk-backed scenario's spool before each `run`/`attribute` invocation (filed in
+`docs/known-gaps.md`, not built in this docs-only workstream) — it's also what will show whether
+clearing the spool actually closes most of this gap or only a part of it. `buffered`'s own comment
+in `perf/scenarios/buffered.yaml` now carries this same, softened account.
 
 ## 4. Before/after: the regression workflow
 

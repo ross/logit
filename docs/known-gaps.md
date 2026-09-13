@@ -1348,24 +1348,26 @@ already built that have a known, accepted rough edge.
   for "this scenario's own repeats disagree by more than the threshold you're gating on" — worth
   closing before this harness ever gates anything automatically, not before ([ADR
   `load-test-harness`](adr/load-test-harness.md)'s "when the harness runs" open question).
-- **`buffered`'s events/s is the least reproducible number this harness reports, and the mechanism
-  is now understood.** `crates/logit-pipeline/src/disk_queue.rs`'s `DiskQueue::open` unconditionally
-  reads and CRC-walks the *entire* active segment file to validate it for a torn tail, every time a
-  disk-backed sink starts up — an O(segment size) cost paid regardless of whether the read cursor
-  has anything left to replay. `perf/scenarios/buffered.yaml`'s spool
-  (`perf/results/spool/`, gitignored, never cleared by the harness) accumulates across every repeat
-  and every invocation that reuses it: the default `segment_bytes` (64MiB) means one run's ~21MB of
-  spooled frames doesn't trigger rotation, so each subsequent repeat's `DiskQueue::open` re-validates
-  an ever-larger file than the one before it. Measured directly: a solo `script/perf run --repeat 5
-  --scenario buffered` against a spool already left over from a prior run degraded monotonically,
-  134k → 75k → 53k → 38k → 27k events/s, with peak RSS climbing 56 → 110 MiB alongside it; deleting
-  `perf/results/spool/` first and re-running showed the same shape from a higher starting point
-  (615k → 939k → 289k → 126k → 80k) — still degrading within the one invocation, because the
-  harness's own repeats share the same spool directory and never reset it either. See
-  [`docs/design/performance.md`](design/performance.md)'s `buffered` notes for the full account.
-  The fix belongs to the harness, not the runtime — `script/perf run`/`attribute` should clear a
-  disk-backed scenario's spool directory before each invocation (and arguably between repeats) — and
-  is tracked as follow-up work, not done here.
+- **`buffered`'s events/s is the least reproducible number this harness reports, and one real
+  contributor is now identified — not the full explanation.** `crates/logit-pipeline/src/disk_queue.rs`'s
+  `DiskQueue::open` pays an un-cleared spool's cost twice at every startup: it reads and CRC-walks
+  the *active* segment in full to validate it for a torn tail (a cost bounded by the default
+  `segment_bytes` rotation threshold, 64MiB — on its own, not obviously large enough to explain a
+  multi-second swing), then reads every segment at or after the read cursor a *second* time to
+  count what's left to replay — real work whenever the cursor hasn't caught up to the end of what's
+  on disk. `perf/scenarios/buffered.yaml`'s spool (`perf/results/spool/`, gitignored, never cleared
+  by the harness) leaves exactly that behind across every repeat and every invocation that reuses
+  it. Measured directly: a solo `script/perf run --repeat 5 --scenario buffered` against a spool
+  already left over from a prior run degraded monotonically, 134k → 75k → 53k → 38k → 27k events/s,
+  with peak RSS climbing 56 → 110 MiB alongside it; deleting `perf/results/spool/` first and
+  re-running showed the same shape from a higher starting point (615k → 939k → 289k → 126k → 80k) —
+  still degrading within the one invocation, because the harness's own repeats share the same spool
+  directory and never reset it either. See [`docs/design/performance.md`](design/performance.md)'s
+  `buffered` notes for the full account. What isn't yet established is whether this fully accounts
+  for the spread (including W7a's 16k-790k range) or is only part of it. The fix belongs to the
+  harness, not the runtime — `script/perf run`/`attribute` should clear a disk-backed scenario's
+  spool directory before each invocation (and arguably between repeats) — and is in flight as **W8**,
+  which will also settle how much of the spread this actually explains.
 - **When and how the load-test harness runs in the ongoing development process is deliberately
   undecided.** [ADR `load-test-harness`](adr/load-test-harness.md)'s own "Open question" section:
   nightly, manually-triggered, gating a PR on a `compare --threshold` regression, or some other
