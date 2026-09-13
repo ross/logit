@@ -11,6 +11,7 @@ members = [
     "crates/logit-transforms",
     "crates/logit-cli",
     "crates/logit-bench",
+    "crates/logit-perf",
 ]
 
 [workspace.package]

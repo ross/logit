@@ -1,0 +1,46 @@
+# The parse-into-attributes path (docs/plans/load-test-harness.md's scenario table): generate_in
+# renders a JSON log body, `json` merges it into attributes, `kv_metrics` derives metrics from
+# those attributes, then null_out discards. Measures the decode/parse cost `syslog_in -> json ->
+# kv_metrics` pays in the reference nginx pipeline (examples/nginx-to-influxdb.yaml), without the
+# syslog framing or the network hop around it.
+#
+#   script/perf run --scenario json-parse
+#
+# `gen`'s `log:` template is the JSON portion of `NGINX_SYSLOG_LINE`
+# (crates/logit-bench/src/fixtures.rs), copied verbatim so this scenario parses the exact same
+# shape logit-bench's own allocation tests and throughput benches already measure at the decoder
+# level -- `{{`/`}}` are the template engine's brace-escape (logit_core::template), needed here
+# because the JSON body itself is nothing but braces. No `{seq}` substitution inside it: the point
+# is measuring the parse of one representative line as fast as the runtime allows, the same
+# reasoning `fixtures.rs`'s own module doc gives for not varying it either.
+components:
+  gen:
+    type: generate_in
+    count: 2000000
+    event:
+      log: '{{"host":"static.local","request_method":"GET","status":200,"body_bytes_sent":612,"request_time":0.001,"upstream_response_time":"0.004"}}'
+
+  parsed:
+    type: json
+    sources: [gen]
+
+  # The exact metric specs from examples/nginx-to-influxdb.yaml / fixtures::kv_metrics(), so this
+  # scenario's `kv_metrics` cost matches the reference pipeline's.
+  metrics:
+    type: kv_metrics
+    sources: [parsed]
+    counters:
+      - name: nginx.requests
+      - name: nginx.bytes_sent
+        field: body_bytes_sent
+    distributions:
+      - name: nginx.request_time
+        field: request_time
+        unit: s
+      - name: nginx.upstream_response_time
+        field: upstream_response_time
+        unit: s
+
+  out:
+    type: null_out
+    sources: [metrics]
