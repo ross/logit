@@ -1732,6 +1732,42 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 45: every TCP listener's `handshake_timeout` must be non-zero, and on a UDP
+    // `syslog_in` it must be left at its default. `0s` is an impossible budget, not a tight one --
+    // the phase it bounds (a TLS accept, a first-byte read, a `Hello` read) cannot complete in
+    // zero time, so every connection would be closed the instant it was accepted and the listener
+    // would accept nothing at all: the same "0 is impossible, not just small" call rules 9/15/18/28
+    // already make for a flush interval, a queue bound, and a poll interval.
+    //
+    // The UDP check is rule 43's spirit applied to this field instead of `tls:`: a datagram
+    // listener has no connection, so nothing there could ever consult the value, and an operator
+    // who set one meant it to take effect. Set-but-ignored is an error, not a silent no-op. Only a
+    // *non-default* value is rejected, so the field can carry its default on every `syslog_in`
+    // without making `transport: udp` a config error.
+    for (id, component) in &components {
+        let handshake_timeout = match &component.kind {
+            ComponentKind::SyslogIn { handshake_timeout, .. }
+            | ComponentKind::LogitIn { handshake_timeout, .. }
+            | ComponentKind::OtlpIn { handshake_timeout, .. } => *handshake_timeout,
+            _ => continue,
+        };
+        if handshake_timeout.is_zero() {
+            anyhow::bail!(
+                "component '{id}': 'handshake_timeout' must be greater than 0s -- 0 would close \
+                 every connection before its handshake could start"
+            );
+        }
+        if let ComponentKind::SyslogIn { transport: SyslogTransport::Udp, .. } = &component.kind {
+            if handshake_timeout != DEFAULT_HANDSHAKE_TIMEOUT {
+                anyhow::bail!(
+                    "component '{id}': 'handshake_timeout' needs 'transport: tcp' -- a UDP \
+                     syslog_in has no connection to hand shake, so the value could never take \
+                     effect"
+                );
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         let Component { sources, buffer, receive, kind } = component;
@@ -1744,6 +1780,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     Ok(Graph { components: resolved, topological_order })
 }
+
+/// Rule 45's "left at its default" comparison for a UDP `syslog_in`. Mirrors `logit_config`'s own
+/// private `default_handshake_timeout`, which this crate cannot name -- kept in sync by hand, the
+/// same arrangement `logit_config` itself documents for the listener constants it mirrors. A drift
+/// here can only ever reject a config `logit_config` defaulted, never accept a set value, and
+/// `a_udp_syslog_in_at_the_default_handshake_timeout_resolves_fine` is what catches it.
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The predicate rule 17 needs: which `ComponentKind`s the UDP listener driver
 /// (`docs/adr/decoupled-listener-io.md`, `logit-inputs::udp::UdpListener`) actually backs.
@@ -4039,6 +4082,23 @@ mod tests {
     /// A `syslog_in` on either transport, with or without a `tls:` block -- the three-way shape
     /// rules 17/18/43 all key on (`docs/adr/syslog-tcp-ingress-and-tls.md`).
     fn syslog_in(transport: SyslogTransport, tls: bool) -> ComponentKind {
+        syslog_in_with_handshake_timeout(transport, tls, default_handshake_timeout())
+    }
+
+    /// `syslog_in`'s own default `handshake_timeout` -- `logit_config`'s `default_handshake_
+    /// timeout` is private to that crate, so rule 45's tests say the number here instead. If the
+    /// two ever disagree, `handshake_timeout_at_the_default_is_accepted_under_udp` below fails.
+    fn default_handshake_timeout() -> Duration {
+        Duration::from_secs(5)
+    }
+
+    /// [`syslog_in`] with rule 45's knob exposed -- both the zero case and the
+    /// set-but-ignored-under-UDP case need to name it.
+    fn syslog_in_with_handshake_timeout(
+        transport: SyslogTransport,
+        tls: bool,
+        handshake_timeout: Duration,
+    ) -> ComponentKind {
         ComponentKind::SyslogIn {
             bind: "127.0.0.1:0".to_string(),
             transport,
@@ -4047,6 +4107,7 @@ mod tests {
                 key_file: "server.key".to_string(),
                 client_ca_file: None,
             }),
+            handshake_timeout,
         }
     }
 
@@ -4478,7 +4539,32 @@ mod tests {
     }
 
     fn logit_in_with_max_frame_bytes(max_frame_bytes: Option<u64>) -> ComponentKind {
-        ComponentKind::LogitIn { bind: "0.0.0.0:5140".to_string(), tls: None, max_frame_bytes }
+        ComponentKind::LogitIn {
+            bind: "0.0.0.0:5140".to_string(),
+            tls: None,
+            max_frame_bytes,
+            handshake_timeout: default_handshake_timeout(),
+        }
+    }
+
+    /// Rule 45's `logit_in` shape -- the only field that rule looks at.
+    fn logit_in_with_handshake_timeout(handshake_timeout: Duration) -> ComponentKind {
+        ComponentKind::LogitIn {
+            bind: "0.0.0.0:5140".to_string(),
+            tls: None,
+            max_frame_bytes: None,
+            handshake_timeout,
+        }
+    }
+
+    /// Rule 45's `otlp_in` shape -- likewise.
+    fn otlp_in_with_handshake_timeout(handshake_timeout: Duration) -> ComponentKind {
+        ComponentKind::OtlpIn {
+            bind: "0.0.0.0:4317".to_string(),
+            protocol: logit_config::OtlpProtocol::Http,
+            tls: None,
+            handshake_timeout,
+        }
     }
 
     // ---- Rule 44: `syslog_out`'s `tls:` block -------------------------------------------------
@@ -4545,6 +4631,93 @@ mod tests {
             ),
         ]));
         assert!(err.contains("DTLS") && err.contains("transport: tcp"), "got: {err}");
+    }
+
+    // ---- Rule 45: `handshake_timeout` on the three TCP listeners --------------------------------
+
+    /// `0s` cannot be met by any handshake, so a listener configured with it would accept
+    /// connections only to close each one immediately -- an impossible bound, rejected the way
+    /// rules 9/15/18/28 reject theirs. One test per kind, because the rule reads the field off
+    /// three separate variants.
+    #[test]
+    fn a_zero_handshake_timeout_is_rejected_on_a_tcp_syslog_in() {
+        let err = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                syslog_in_with_handshake_timeout(SyslogTransport::Tcp, false, Duration::ZERO),
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("handshake_timeout") && err.contains("0s"), "got: {err}");
+    }
+
+    #[test]
+    fn a_zero_handshake_timeout_is_rejected_on_a_logit_in() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], logit_in_with_handshake_timeout(Duration::ZERO)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("handshake_timeout") && err.contains("0s"), "got: {err}");
+    }
+
+    #[test]
+    fn a_zero_handshake_timeout_is_rejected_on_an_otlp_in() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], otlp_in_with_handshake_timeout(Duration::ZERO)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("handshake_timeout") && err.contains("0s"), "got: {err}");
+    }
+
+    /// Rule 43's spirit on this field: a UDP `syslog_in` has no connection, so a
+    /// `handshake_timeout` there could never take effect. Set-but-ignored is an error.
+    #[test]
+    fn a_non_default_handshake_timeout_under_transport_udp_is_rejected() {
+        let err = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                syslog_in_with_handshake_timeout(
+                    SyslogTransport::Udp,
+                    false,
+                    Duration::from_secs(30),
+                ),
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("handshake_timeout") && err.contains("transport: tcp"), "got: {err}");
+    }
+
+    /// The other side of that check, and what keeps every existing UDP `syslog_in:` config in the
+    /// wild valid: the field's own default is not a set value, so it resolves fine under UDP. Also
+    /// the guard on [`DEFAULT_HANDSHAKE_TIMEOUT`] drifting from `logit_config`'s own default --
+    /// this deserializes a real config rather than constructing the variant by hand.
+    #[test]
+    fn a_udp_syslog_in_at_the_default_handshake_timeout_resolves_fine() {
+        let component: logit_config::Component =
+            serde_json::from_str(r#"{"type": "syslog_in", "bind": "127.0.0.1:0"}"#)
+                .expect("should deserialize");
+        resolve(cfg(vec![("in", vec![], component.kind), ("out", vec!["in"], sink())]))
+            .expect("a defaulted handshake_timeout under UDP should resolve");
+    }
+
+    /// And a non-default value on the transport that actually has a handshake is ordinary.
+    #[test]
+    fn a_non_default_handshake_timeout_on_a_tcp_syslog_in_resolves_fine() {
+        resolve(cfg(vec![
+            (
+                "in",
+                vec![],
+                syslog_in_with_handshake_timeout(
+                    SyslogTransport::Tcp,
+                    true,
+                    Duration::from_secs(30),
+                ),
+            ),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("a TCP syslog_in with a real handshake_timeout should resolve");
     }
 
     #[test]
@@ -5596,6 +5769,7 @@ mod tests {
             bind: "127.0.0.1:19001".to_string(),
             tls: None,
             max_frame_bytes: None,
+            handshake_timeout: default_handshake_timeout(),
         };
         let graph = resolve(cfg(vec![
             ("gen", vec![], generate_in_with_counts(Some(2_000_000), 100, None)),
