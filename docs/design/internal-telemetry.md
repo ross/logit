@@ -485,12 +485,15 @@ Worked examples, one per shipped component:
   on **either** framing — a connection that ended without one at all, a peer RST mid-message or
   this listener shutting down before the sender finished. (Under non-transparent framing a clean
   EOF is *not* truncation: a terminator-less remainder is an ordinary final message and is
-  emitted.) All three report on one `framing_error` diagnostic key, distinct from the driver's
-  `bad_frame` (a frame the decoder itself rejected, connection kept) and `connection_error` (I/O,
-  a TLS handshake that failed or timed out, or a connection that sent no first byte inside the
-  handshake budget and so gave its permit back). Those two frame keys share one listener-wide
-  throttle rather than a per-connection one, so a peer looping connect / bad-frame / close is
-  throttled like any other repeated failure instead of warning once per TCP handshake. No
+  emitted.) All three report on one `framing_error` diagnostic key, distinct from
+  `connection_error` (I/O, a TLS handshake that failed or timed out, or a connection that sent no
+  first byte inside the handshake budget and so gave its permit back). A frame that *parses*
+  badly is not a framing error at all: `SyslogDecoder::decode_into` is infallible, so a rejected
+  syslog message reports as the decoder's own `bad_line` on either transport, and the driver's
+  `bad_frame` key — for a decoder that can fail a whole frame — stays unused here.
+  `framing_error` and `bad_frame` share one listener-wide throttle rather than a per-connection
+  one, so a peer looping connect / bad-frame / close is throttled like any other repeated failure
+  instead of warning once per TCP handshake. No
   `ReceiveQueue` and so none of the `receive_buffer.*` table above on this path — the connection's
   own flow control is the queue (graph rule 17). There is no TLS-specific metric on either
   transport: a handshake failure surfaces through the same connection-error diagnostics any other

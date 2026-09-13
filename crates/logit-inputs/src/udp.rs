@@ -205,6 +205,14 @@ impl<D: Decoder + Send> UdpListener<D> {
 
     /// Test-only: lets `StatsdInput`/`SyslogInput`'s own tests confirm a `with_diagnostics` call
     /// actually reached the wrapped decoder, not just `UdpListener`'s own `diag` field.
+    /// This listener's own diagnostics -- test-only, the driver-half counterpart of
+    /// [`Self::decoder`]: a wrapper's `with_diagnostics` has to set both, and only an accessor on
+    /// each can prove it did (`crate::syslog`'s own regression test).
+    #[cfg(test)]
+    pub(crate) fn diag(&self) -> &Diagnostics {
+        &self.diag
+    }
+
     #[cfg(test)]
     pub(crate) fn decoder(&self) -> &D {
         &self.decoder
