@@ -203,7 +203,9 @@ impl Framer {
         self.framing
     }
 
-    /// Bytes held but not yet formed into a frame -- for tests and for the EOF accounting.
+    /// Bytes held but not yet formed into a frame. Read by `report_buffered_tail` on the paths
+    /// that end a connection without ever reaching [`Framer::finish`] -- a peer RST mid-message,
+    /// or shutdown -- so a discarded partial frame is still counted rather than vanishing.
     pub fn buffered(&self) -> usize {
         self.buf.len()
     }
@@ -788,6 +790,7 @@ where
         // already true when this iteration started". The `Ref` temporary is dropped at the end of
         // this statement, well before any `.await`.
         if *shutdown.borrow() {
+            report_buffered_tail(&framer, &telemetry, &frame_diag);
             if let Some(batch) = accumulator.take() {
                 emit(&sink, &telemetry, batch, FlushReason::Shutdown).await;
             }
@@ -837,6 +840,7 @@ where
         match step {
             ReadStep::Bytes => {}
             ReadStep::Shutdown => {
+                report_buffered_tail(&framer, &telemetry, &frame_diag);
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Shutdown).await;
                 }
@@ -872,6 +876,7 @@ where
             ReadStep::Failed(err) => {
                 // The connection broke, but whatever was already decoded is still good -- deliver
                 // it before surfacing the error as this connection's `connection_error`.
+                report_buffered_tail(&framer, &telemetry, &frame_diag);
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Closed).await;
                 }
@@ -956,6 +961,29 @@ fn report_frame_error(
 ) -> bool {
     telemetry.count("logit.input.frames.dropped", 1.0, &[("reason", err.reason())]);
     warn_frame_throttled(frame_diag, "framing_error", err)
+}
+
+/// A partial frame still held by the [`Framer`] when a connection ends *without* a clean EOF --
+/// a peer RST mid-message, or this listener shutting down before the sender finished one.
+///
+/// Dropping those bytes is correct (nobody ever sent a complete message, and on shutdown the
+/// sender has not finished), but dropping them *silently* is the gap: the identical bytes followed
+/// by a FIN would be emitted by [`Framer::finish`] under non-transparent framing or counted
+/// `truncated` under octet counting, and `logit.input.frames.dropped{reason="truncated"}` exists
+/// precisely to make this class visible. A no-op when nothing is buffered, which is the ordinary
+/// case on both paths.
+fn report_buffered_tail(framer: &Framer, telemetry: &Telemetry, frame_diag: &Mutex<Diagnostics>) {
+    let held = framer.buffered();
+    if held == 0 {
+        return;
+    }
+    report_frame_error(
+        &FrameError::Truncated(format!(
+            "the connection ended abruptly with {held} byte(s) of an incomplete frame buffered"
+        )),
+        telemetry,
+        frame_diag,
+    );
 }
 
 /// Reports one per-frame diagnostic through the listener-wide throttle -- see the `frame_diag`
@@ -1644,6 +1672,89 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    /// The `ReadStep::Failed` path -- the one way a connection ends without `Framer::finish` ever
+    /// running, so a buffered partial frame would otherwise be discarded with no
+    /// `logit.input.frames.dropped` count and no diagnostic, while the identical bytes followed by
+    /// a FIN would be emitted as a final message.
+    ///
+    /// `SO_LINGER 0` is what makes it deterministic: it turns the client's `close` into an RST
+    /// rather than a FIN, so the server's blocked read fails with `ECONNRESET` instead of
+    /// reporting a clean EOF. The two writes are separate, with the first one's delivery awaited
+    /// in between, so the server has demonstrably consumed the tail into its framer before the RST
+    /// arrives -- an RST landing while bytes are still queued would discard them unread, which is
+    /// a different (and uncountable) case.
+    #[tokio::test]
+    async fn an_abrupt_close_with_a_buffered_partial_frame_counts_it_truncated() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener.with_telemetry(telemetry);
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>complete\n").await.unwrap();
+        // Awaiting the delivery proves the server finished that read and is back blocked in the
+        // next one, so the write below is what it picks up.
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>complete"]);
+
+        client.write_all(b"<13>unterminated").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        socket2::SockRef::from(&client)
+            .set_linger(Some(Duration::ZERO))
+            .expect("SO_LINGER should be settable on a loopback socket");
+        drop(client);
+
+        // The count lands on the connection's own task, after its read fails.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            sum_of(&registry.drain(0), "logit.input.frames.dropped", Some(("reason", "truncated"))),
+            Some(1.0),
+            "the partial frame the RST discarded must still be counted"
+        );
+
+        handle.abort();
+    }
+
+    /// The shutdown twin of the test above: a connection mid-message when the listener stops has
+    /// its partial frame counted too, rather than dropped in silence.
+    #[tokio::test]
+    async fn shutdown_mid_message_counts_the_buffered_partial_frame() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener.with_telemetry(telemetry);
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>complete\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>complete"]);
+
+        // Half a message, then shut the listener down: the sender never finished it, so dropping
+        // it is right -- being quiet about it is not.
+        client.write_all(b"<13>half a mes").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown_tx.send(true).expect("the receiver should still be alive");
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            closed.expect("the fanout should close within 2s").is_none(),
+            "nothing complete was pending, so no batch should follow"
+        );
+        assert_eq!(
+            sum_of(&registry.drain(0), "logit.input.frames.dropped", Some(("reason", "truncated"))),
+            Some(1.0)
+        );
+
+        handle.await.expect("the task should not panic").expect("shutdown should be clean");
     }
 
     /// A framing error is fatal to *its* connection and to nothing else -- neither framing can
