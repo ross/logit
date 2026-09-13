@@ -458,12 +458,20 @@ fn build_spec(
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
 
-        Lua { script, interval } => NodeSpec::Lua { script: script.clone(), interval: *interval },
+        // `component.targets` (`docs/adr/target-components.md`) rides through the spec here for
+        // W5 to use -- `run_lua` ignores it for now. Not `graph::targets_of(component)`: this
+        // function takes a `ResolvedComponent`, whose `targets` field *is* that call's output,
+        // already slot-ordered and de-duplicated by `graph::resolve`.
+        Lua { script, interval } => NodeSpec::Lua {
+            script: script.clone(),
+            interval: *interval,
+            targets: component.targets.clone(),
+        },
         LuaFile { lua_file, interval } => {
             let script_path = base_dir.join(lua_file);
             let script = std::fs::read_to_string(&script_path)
                 .with_context(|| format!("reading lua_file {}", script_path.display()))?;
-            NodeSpec::Lua { script, interval: *interval }
+            NodeSpec::Lua { script, interval: *interval, targets: component.targets.clone() }
         }
         Aggregate {
             interval,

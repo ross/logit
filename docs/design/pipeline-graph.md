@@ -501,6 +501,27 @@ no special-casing needed, and no restriction to state.
   delivery one for `write_loop`'s retry to absorb
   (`docs/adr/prometheus-scrape-and-exposition.md`'s "`Output::bind`"). Sorted, sequential order is
   what makes "which one failed" reproducible instead of a race between binds.
+- **A `target` is not a node.** It gets no task, no inbox, and no channel at all — a listener's
+  inbox exists but is dropped unread (nothing can name a listener as a source), while a target's is
+  never created, one step stronger: a target declares no `sources:` and nothing may name *it* as a
+  source either, so there is nothing to create. What a target actually is at runtime is **one
+  `Fanout`**, built in a pass *before* the spawn loop (ids are sorted, so a router can precede its
+  own targets), wired to that target's consumers' inboxes and carrying the target's own id
+  (`with_component`) and telemetry handle (`with_telemetry`). Each of its routers gets a clone, and
+  its readiness state is `NodeState::Alias` for the life of the run. That map of target `Fanout`s is
+  **dropped alongside the construction-only `senders` map**: a live clone left behind would be an
+  extra outstanding `Sender` on every one of that target's consumers' channels, so the shutdown
+  cascade below could never reach past the target — a hang, not a failed assertion, which is why
+  `a_router_exiting_closes_its_targets_consumers_inboxes` pins it under a timeout.
+  ([ADR `target-components`](../adr/target-components.md)).
+- **A router is an ordinary node with one extra edge set.** It owns its own `Fanout` (slot 0, the
+  unrouted/forward edge) plus a slot-ordered `Vec<Fanout>`, one per `graph::targets_of` entry. Per
+  incoming batch it routes every event *borrowing* it, counts per destination, `reserve_exact`s,
+  moves each event into its destination's buffer (`route_batch`), and sends **one batch per
+  non-empty destination under one child `BatchContext` and one span** — one incoming batch is one
+  hop however many ways it forks, exactly the rule an ordinary fan-out already follows. A router
+  with targets and no ordinary consumers is legal; its forward partition is dropped and counted
+  `logit.component.events.dropped{reason="unrouted"}`, never silently.
 - **Build in reverse topological order** — from sinks back toward listeners — so every node's
   outbound `Fanout` is fully wired (every consumer's inbox already exists) before that node can
   start producing. This generalizes what `run_config` already does today (build outputs, then the
@@ -519,9 +540,12 @@ entire pipeline's transform chain serially, because chain adjacency was guarante
 sources and consumers can be arbitrary other components — so **each Lua component gets its own
 thread**, communicating with its neighbors over the same `mpsc` channels every other node uses.
 
-Everything else — listeners, sinks, and native `Send` transforms (`aggregate` today via
-`logit-transforms::Aggregator`; `json`/`filter`/etc. as they land in the same crate) — runs as an
-ordinary tokio task, no dedicated thread required. This is a strict generalization of today's split
+Everything else — listeners, sinks, native `Send` transforms (`aggregate` today via
+`logit-transforms::Aggregator`; `json`/`filter`/etc. as they land in the same crate), and **native
+`Router`s** (`route`, [ADR `target-components`](../adr/target-components.md); a `Router` is `Send`
+for the same reason a `Transform` is, and `run_router` is `run_transform` minus the flush-deadline
+race) — runs as an ordinary tokio task, no dedicated thread required. A `target` runs as nothing at
+all — see the runtime model above. This is a strict generalization of today's split
 (input/output tasks vs. one worker thread per pipeline), not a new idea — it just now applies per
 node instead of per pipeline.
 
@@ -631,6 +655,13 @@ previous = Some(self.component)              // rewritten on every send
   becomes *both* `origin` and `previous`, the honest statement for a batch built from accumulated
   state rather than a re-emission of anything that passed through unchanged.
 - A real fan-out gives every branch the identical provenance, same as it does for trace context.
+- **`previous` downstream of a `target` is the target's id, never the router's** — and `origin` is
+  untouched. No special case makes this true: a target's one `Fanout` is built
+  `with_component(<target id>)` like every other node's, so the rule above applies unchanged and a
+  `has_provenance{previous: [host_stream]}` reads naturally
+  ([ADR `target-components`](../adr/target-components.md)). A router's own forward edge stamps the
+  *router's* id, as any other node would. Which router fed a target is deliberately not recoverable
+  from provenance; if that ever matters it is a router-side metric, not a provenance change.
 
 `logit_in`'s relay (`Fanout::send_relayed`) uses a different rule, `stamp_relayed`: it back-fills
 (`or`, not overwrite) only whatever the wire didn't carry, so a v2 `logit_out` peer's own

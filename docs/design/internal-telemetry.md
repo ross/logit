@@ -395,6 +395,7 @@ receive/processing side from their own loops, which already see every batch and 
 | `logit.component.process.duration` | timing | `run_transform`, `run_lua` (whole batch) |
 | `logit.component.events.dropped{reason="absorbed"}` | count | `Transform::process` returned `None` |
 | `logit.component.events.dropped{reason="script_drop"}` | count | Lua `ProcessOutcome::Drop` |
+| `logit.component.events.dropped{reason="unrouted"}` | count | `run_router`: events no route claimed, at a router with targets and no ordinary consumers ([ADR `target-components`](../adr/target-components.md)). Counted explicitly rather than left to `Fanout`, which returns early on zero consumers and counts nothing — "unrouted events are dropped and counted, never silently" is the ADR's rule. A router *with* ordinary consumers never emits this: its unrouted events go to them. |
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |
 | `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`) |
 | `logit.component.retries` | count | a retried delivery attempt, `deliver_with_retry` (`write_loop`) |
@@ -402,6 +403,13 @@ receive/processing side from their own loops, which already see every batch and 
 | `logit.component.diagnostics{key=...}` | count | every `Diagnostics::warn_throttled` occurrence, throttled or not |
 | `logit.script.vm.memory` | gauge | `run_lua`, once per batch — the strongest signal a stateful script is leaking Lua-side state |
 | `logit.script.events.emitted{outcome="emit"\|"emit_many"}` | count | `run_lua`, per `ProcessOutcome` — distinguishes a 1:1 script from a fan-out one |
+
+**A `target` emits the layer-2 *producer* set and nothing else.** It has no task, no inbox, and no
+receive side at all — it is one `Fanout` carrying the target's own id and telemetry handle
+([ADR `target-components`](../adr/target-components.md)) — so `batches.sent`/`events.sent`/
+`send.blocked.duration`/`events.dropped{reason="closed_consumer"}` appear under the target's id
+(per-stream volume, with no new metric), and none of the `*.received`/`process.duration` rows above
+ever do. The batches a target "sends" were counted `received` by its routers, not by it.
 
 **Every sink also gets a `SinkStore`** (`crates/logit-pipeline/src/queue.rs`,
 `docs/adr/buffered-sink-delivery.md`) sitting between its inbox drain and delivery — its own
