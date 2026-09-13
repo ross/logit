@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-09-12
+updated: 2026-09-13
 ---
 
 # `FramedEncoder`: a third codec trait for sinks that need per-message framing, over a shared `MessageBuf`
@@ -135,9 +135,13 @@ warm-then-measure call.
   amendment): `Packets` is gone, `CollectdEncoder` implements `FramedEncoder<Meta = usize>`.
 - `prometheus_out` remains the one sink outside all three traits, by design (its ADR's "No
   `logit_proto::Encoder`" section).
-- A fourth framed sink (a Graphite/Carbon line sink, a per-record Kafka/NATS producer) gets the
+- ~~A fourth framed sink (a Graphite/Carbon line sink, a per-record Kafka/NATS producer) gets the
   buffer, the trait, and the bench harness for free; what it still writes by hand is its own
-  `Stats` and the `send`-side telemetry mapping, which this ADR deliberately leaves per sink.
+  `Stats` and the `send`-side telemetry mapping, which this ADR deliberately leaves per sink.~~
+  The Graphite/Carbon half is now designed, not yet built: [ADR `graphite-carbon-relay`](graphite-carbon-relay.md)'s
+  `graphite_out` implements `FramedEncoder<Meta = usize>` exactly as anticipated here (`docs/plans/graphite-carbon-relay.md`'s
+  W1/W3), reusing `MessageBuf<usize>` the same way `collectd_out` does. A per-record Kafka/NATS
+  producer remains the second, unbuilt anticipation.
 - [ADR `syslog-output`](syslog-output.md), [ADR `statsd-output`](statsd-output.md), and
   [ADR `prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md) each carry an
   amendment pointing here; `docs/known-gaps.md`'s entry and `docs/plans/lossless-transit.md`'s
