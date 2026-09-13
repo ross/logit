@@ -289,11 +289,11 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<()> {
 /// `graph::resolve`'s rule 8 rejects every kind `is_implemented` doesn't recognize before this
 /// function is ever called. The exception is a kind that is *declared* (so that its config types
 /// and graph rules can land, and `logit validate`/`logit graph` can accept it) but whose
-/// implementation hasn't been built yet: `generate_in` and `null_out` today, until the perf
-/// harness's W2/W3 replace those two arms (`docs/plans/load-test-harness.md`). Each of those
-/// arms `bail!`s with a message naming the kind, so `logit run` fails startup with exit 1 and a
-/// clear error rather than panicking -- the same "reject a config referencing an unimplemented
-/// kind with a clear error" contract `AGENTS.md` states.
+/// implementation hasn't been built yet: `generate_in` today, until the perf harness's W2 replaces
+/// that arm (`docs/plans/load-test-harness.md`). That arm `bail!`s with a message naming the kind,
+/// so `logit run` fails startup with exit 1 and a clear error rather than panicking -- the same
+/// "reject a config referencing an unimplemented kind with a clear error" contract `AGENTS.md`
+/// states.
 ///
 /// `id` attaches a [`Diagnostics`] to every component that emits one
 /// (`docs/adr/service-lifecycle-and-output-retry.md`) via each kind's own `with_diagnostics`
