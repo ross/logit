@@ -101,9 +101,10 @@ fn a_finite_generate_in_config_exits_0() {
         .unwrap_or_else(|| panic!("no 'generation complete' line in stderr: {stderr}"));
     assert!(completion.contains(r#""events":1000"#), "got: {completion}");
 
-    // `drain complete` is `internal`'s final-drain line (the harness's W4), which this config
-    // has no `internal` component to produce -- asserted so a future change that starts logging
-    // it unconditionally doesn't quietly make the harness's line matching ambiguous.
+    // `drain complete` is `run_with_telemetry`'s line, logged only when a shutdown signal or a
+    // node failure actually started a drain. A generator finishing its `count` is neither: the
+    // senders simply drop and the cascade runs to completion. Asserted so this stays the clean
+    // self-exit path it claims to be, rather than quietly turning into a shutdown.
     assert!(!stderr.contains("drain complete"), "stderr was: {stderr}");
 }
 
