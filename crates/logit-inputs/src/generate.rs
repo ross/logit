@@ -44,10 +44,12 @@
 //!
 //! The **resource** is a third case, because it is batch-level rather than per event: an
 //! all-literal resource is built once at construction and `Arc`-shared by every batch forever,
-//! and a templated one is rebuilt once per batch from that batch's *first* sequence number. So
-//! `resource: { host: "h{seq%10}" }` is a real multi-resource cardinality knob costing one
-//! `AttrMap` and one `Arc<Resource>` per batch and nothing per event -- with `batch` as its
-//! granularity. See [`GenerateInput::with_resource`].
+//! and a templated one is rebuilt once per batch. **In resource position `seq` is the batch
+//! ordinal** (0, 1, 2, ...), not the event counter -- rendering from the event counter would
+//! advance by `batch` each time and collapse `{seq%10}` under `batch: 100` to a single value. So
+//! `resource: { host: "h{seq%10}" }` really is ten resources cycling per batch, costing one
+//! `AttrMap` and one `Arc<Resource>` per batch and nothing per event. See
+//! [`GenerateInput::with_resource`].
 //!
 //! # Rate pacing
 //!
@@ -251,9 +253,9 @@ enum ResourceSpec {
     /// batch would re-intern every key and reallocate an `AttrMap` for a value that cannot
     /// change; `InternalInput::resource` carries the same reasoning.
     Fixed(Arc<Resource>),
-    /// At least one value has a placeholder: rebuilt once per batch from that batch's *first*
-    /// sequence number, so one `AttrMap` and one `Arc<Resource>` per batch and nothing per event.
-    /// See [`GenerateInput::with_resource`] for what that buys and what it means for `batch`.
+    /// At least one value has a placeholder: rebuilt once per batch from that batch's *ordinal*,
+    /// so one `AttrMap` and one `Arc<Resource>` per batch and nothing per event. See
+    /// [`GenerateInput::with_resource`] for why the ordinal and not the event counter.
     Templated(Vec<(Symbol, Field)>),
 }
 
@@ -357,17 +359,23 @@ impl GenerateInput {
     /// The resource every batch carries. Values may name placeholders, and the unit a resource
     /// template renders at is **one batch**, not one event: the resource is batch-level and
     /// `Arc`-shared by every event in the batch (`logit_core::EventBatch::resource`), so a
-    /// per-event rendering would have nowhere to go. Each batch's resource is rendered from that
-    /// batch's *first* sequence number.
+    /// per-event rendering would have nowhere to go.
     ///
-    /// That makes `resource: { host: "h{seq%10}" }` a real multi-resource cardinality knob at
-    /// zero per-event cost -- one `AttrMap` and one `Arc<Resource>` per batch, nothing per event
-    /// -- which is what a scenario measuring resource grouping (`aggregate`'s
-    /// `logit.transform.resource.groups`, a sink that keys on the resource) actually needs. Two
-    /// consequences worth knowing: `batch` is the granularity, so a modulus finer than the number
-    /// of batches a run produces is silently coarser than it looks; and an all-literal resource
-    /// keeps the strictly cheaper path, built once at construction and `Arc`-shared by every
-    /// batch forever ([`ResourceSpec`]).
+    /// **In resource position `seq` is the batch ordinal** -- 0, 1, 2, ... -- not the event
+    /// counter. That distinction is the whole feature: the event counter advances by `batch` per
+    /// batch, so `{seq%N}` over it would only ever produce `N / gcd(N, batch)` distinct values,
+    /// and for the overwhelmingly common case of a `batch` that is a multiple of `N` (`batch:
+    /// 100`, `{seq%10}`) that is exactly one -- a "cardinality knob" silently stuck on its first
+    /// setting. Rendering from the ordinal instead makes `resource: { host: "h{seq%10}" }` mean
+    /// what it reads as: ten distinct resources, cycling per batch.
+    ///
+    /// So this is a real multi-resource cardinality knob at zero per-event cost -- one `AttrMap`
+    /// and one `Arc<Resource>` per batch, nothing per event -- which is what a scenario measuring
+    /// resource grouping (`aggregate`'s `logit.transform.resource.groups`, a sink that keys on
+    /// the resource) actually needs. Two consequences worth knowing: a batch is the granularity,
+    /// so every event in one batch shares one resource no matter how large `batch` is; and an
+    /// all-literal resource keeps the strictly cheaper path, built once at construction and
+    /// `Arc`-shared by every batch forever ([`ResourceSpec`]).
     ///
     /// Takes raw strings rather than parsed [`Template`]s, unlike every other builder here: a
     /// resource value's parse is startup-only either way, so there is nothing for a caller to
@@ -412,7 +420,13 @@ impl GenerateInput {
     }
 
     /// Builds one batch of `n` events numbered `first_seq..first_seq + n`, every one stamped
-    /// `now` (Unix nanoseconds).
+    /// `now` (Unix nanoseconds), under batch ordinal `batch_index` (0 for a run's first batch).
+    ///
+    /// `batch_index` is what a resource template's `{seq}`/`{seq%N}` renders from, and it is a
+    /// separate argument rather than derived from `first_seq` deliberately: `first_seq / batch`
+    /// would be a second, silently-wrong definition the moment a caller drove `build_batch`
+    /// with anything but exact multiples of `batch` -- which `logit-bench` and this module's own
+    /// tests both do.
     ///
     /// Public so `logit-bench` can drive both render paths directly -- no runtime, no channel,
     /// nothing between the measurement and the code it is measuring, which is what keeps that
@@ -420,13 +434,19 @@ impl GenerateInput {
     /// doc, `docs/design/memory.md`'s "Fixtures" section). The first call also settles which
     /// render path applies, and (on the prototype path) renders the prototype -- so a caller
     /// measuring allocations must warm it, exactly like every other measurement in that crate.
-    pub fn build_batch(&mut self, first_seq: u64, n: usize, now: i64) -> EventBatch {
+    pub fn build_batch(
+        &mut self,
+        batch_index: u64,
+        first_seq: u64,
+        n: usize,
+        now: i64,
+    ) -> EventBatch {
         self.settle_render_path();
         // Taken out and put back so the renders below can borrow it mutably while everything they
         // render *from* is borrowed immutably -- and so its grown capacity survives across
         // batches, which is what makes a warm scratch allocate nothing.
         let mut scratch = std::mem::take(&mut self.scratch);
-        let resource = self.render_resource(first_seq, &mut scratch);
+        let resource = self.render_resource(batch_index, &mut scratch);
         let mut events = Vec::with_capacity(n);
         if let RenderPath::Prototype(prototype) = &self.path {
             for _ in 0..n {
@@ -447,15 +467,16 @@ impl GenerateInput {
     }
 
     /// This batch's resource: the one shared `Arc` when every value is literal, or a fresh one
-    /// rendered from `first_seq` when any value is templated. See
-    /// [`GenerateInput::with_resource`].
-    fn render_resource(&self, first_seq: u64, scratch: &mut String) -> Arc<Resource> {
+    /// rendered from the **batch ordinal** when any value is templated. See
+    /// [`GenerateInput::with_resource`] for why that, and not the event counter, is what `{seq}`
+    /// means in resource position.
+    fn render_resource(&self, batch_index: u64, scratch: &mut String) -> Arc<Resource> {
         match &self.resource {
             ResourceSpec::Fixed(resource) => resource.clone(),
             ResourceSpec::Templated(fields) => {
                 let mut attributes = AttrMap::new();
                 for (key, field) in fields {
-                    attributes.insert_sym(*key, Value::Str(field.render(first_seq, scratch)));
+                    attributes.insert_sym(*key, Value::Str(field.render(batch_index, scratch)));
                 }
                 Arc::new(Resource { attributes, ..Default::default() })
             }
@@ -551,7 +572,7 @@ impl Input for GenerateInput {
             if let Some(rate) = self.rate {
                 self.pace(started, sent, rate).await;
             }
-            let batch = self.build_batch(sent, n, now_nanos());
+            let batch = self.build_batch(batches, sent, n, now_nanos());
             sink.send(batch).await;
             sent += n as u64;
             batches += 1;
@@ -664,8 +685,8 @@ mod tests {
     #[tokio::test]
     async fn the_prototype_path_overwrites_the_timestamp_per_batch() {
         let mut input = GenerateInput::new(Some(4), 2).with_log(parse("fixed").unwrap()).unwrap();
-        let first = input.build_batch(0, 2, 111);
-        let second = input.build_batch(2, 2, 222);
+        let first = input.build_batch(0, 0, 2, 111);
+        let second = input.build_batch(1, 2, 2, 222);
         assert!(first.events.iter().all(|event| event.timestamp == 111));
         assert!(second.events.iter().all(|event| event.timestamp == 222));
     }
@@ -796,43 +817,50 @@ mod tests {
         );
     }
 
-    /// A **templated** resource renders once per batch, from that batch's first sequence number
-    /// -- the multi-resource cardinality knob `with_resource` documents. Two consecutive batches
-    /// must therefore get genuinely different resources, and must *not* share an `Arc` the way
-    /// the literal case above does.
+    /// A **templated** resource renders once per batch, from the batch *ordinal* -- so
+    /// `h{seq%10}` really does cycle through ten resources, one per batch, and comes back round
+    /// on the eleventh. Driven through a whole real run at the shipped example's own `batch: 100`
+    /// specifically because that is the shape the event counter gets wrong: `sent` advances by
+    /// 100 per batch, so `sent % 10` would be `0` forever and the knob would be silently stuck.
     #[tokio::test]
-    async fn a_templated_resource_is_rendered_once_per_batch_from_its_first_seq() {
-        let input = GenerateInput::new(Some(4), 2)
-            .with_resource(BTreeMap::from([("shard".to_string(), "s{seq%4}".to_string())]))
+    async fn a_templated_resource_cycles_per_batch_on_the_batch_ordinal() {
+        let input = GenerateInput::new(Some(1100), 100)
+            .with_resource(BTreeMap::from([("host".to_string(), "h{seq%10}".to_string())]))
             .unwrap();
         let batches = run_to_completion(input).await;
-        assert_eq!(batches.len(), 2);
+        assert_eq!(batches.len(), 11);
 
-        let shard = |batch: &EventBatch| {
-            batch.resource.attributes.get("shard").and_then(|v| v.as_str()).unwrap().to_string()
+        let host = |batch: &EventBatch| {
+            batch.resource.attributes.get("host").and_then(|v| v.as_str()).unwrap().to_string()
         };
-        // Batch 0 covers seq 0..2 and batch 1 covers seq 2..4, so each renders its own first seq.
-        assert_eq!(shard(&batches[0]), "s0");
-        assert_eq!(shard(&batches[1]), "s2");
+        let hosts: Vec<String> = batches.iter().map(host).collect();
+        assert_eq!(
+            hosts,
+            vec!["h0", "h1", "h2", "h3", "h4", "h5", "h6", "h7", "h8", "h9", "h0"],
+            "a resource template renders from the batch ordinal, not the event counter"
+        );
         assert!(
             !Arc::ptr_eq(&batches[0].resource, &batches[1].resource),
             "a templated resource is a fresh Arc per batch, not the shared one"
         );
+        // ...and the eleventh batch renders the same *text* as the first without being the same
+        // `Arc`: this knob is a fresh resource per batch, not a cache keyed on the rendering.
+        assert!(!Arc::ptr_eq(&batches[0].resource, &batches[10].resource));
     }
 
     /// The cost side of the same rule: a templated resource is rendered once per *batch*, never
     /// once per event -- every event in a batch reads the very same `Arc`, which is what keeps
     /// this knob free on the per-event path.
     #[test]
-    fn a_templated_resource_costs_nothing_per_event() {
+    fn a_templated_resource_is_rendered_once_for_a_whole_batch() {
         let mut input = GenerateInput::new(None, 100)
             .with_resource(BTreeMap::from([("host".to_string(), "h{seq%10}".to_string())]))
             .unwrap();
-        let batch = input.build_batch(30, 4, 1);
+        let batch = input.build_batch(3, 300, 4, 1);
         assert_eq!(
             batch.resource.attributes.get("host").and_then(|v| v.as_str()),
-            Some("h0"),
-            "seq 30 modulo 10"
+            Some("h3"),
+            "batch ordinal 3 modulo 10 -- not the first_seq of 300"
         );
         assert_eq!(batch.events.len(), 4);
     }
@@ -924,7 +952,7 @@ mod tests {
             .unwrap()
             .with_attribute("host", parse("web-1").unwrap())
             .unwrap();
-        let batch = input.build_batch(10, 3, 42);
+        let batch = input.build_batch(0, 10, 3, 42);
         assert_eq!(batch.events.len(), 3);
         assert!(batch.events.iter().all(|event| event.timestamp == 42));
         let messages: Vec<&str> = batch

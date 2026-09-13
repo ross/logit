@@ -31,11 +31,11 @@ components:
     rate: 5000
 
     # Batch-level resource attributes. All-literal here, which is the cheapest case: built once at
-    # startup and Arc-shared by every event, a refcount bump rather than a map. A `{seq}`/`{seq%N}`
-    # placeholder is legal too, and renders once per *batch* from that batch's first sequence
-    # number -- `host: "h{seq%10}"` would give this scenario ten distinct resources at no per-event
-    # cost, which is how you measure resource grouping. Per-*event* cardinality goes in
-    # `event.attributes` below.
+    # startup and Arc-shared by every event, a refcount bump rather than a map. A placeholder is
+    # legal too, and renders once per *batch* -- and in resource position `seq` is the batch
+    # ordinal (0, 1, 2, ...), not the event counter, so `host: "h{seq%10}"` really would give this
+    # scenario ten distinct resources cycling one per batch, at no per-event cost. That's how you
+    # measure resource grouping. Per-*event* cardinality goes in `event.attributes` below.
     resource:
       service.name: synthetic
 

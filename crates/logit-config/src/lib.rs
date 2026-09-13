@@ -1120,14 +1120,15 @@ pub enum ComponentKind {
         /// rejected (rule 42).
         ///
         /// A resource is **batch-level**, not per event, so the unit a placeholder here renders
-        /// at is one batch: each batch's resource is rendered from that batch's *first* sequence
-        /// number. `resource: { host: "h{seq%10}" }` is therefore a real multi-resource
-        /// cardinality knob -- what a scenario measuring resource grouping wants -- costing one
-        /// attribute map per batch and nothing per event, with `batch` as its granularity (a
-        /// modulus finer than the number of batches a run produces is silently coarser than it
-        /// looks). An all-literal resource, the usual case, keeps the cheaper path still: built
-        /// once at startup and `Arc`-shared by every batch forever, one refcount bump per event
-        /// rather than a map.
+        /// at is one batch -- and **in resource position `seq` is the batch ordinal** (0, 1,
+        /// 2, ...), not the event counter. That distinction is the feature: the event counter
+        /// advances by `batch` each batch, so `{seq%10}` over it under `batch: 100` would render
+        /// `0` forever. Over the ordinal, `resource: { host: "h{seq%10}" }` means what it reads
+        /// as -- ten distinct resources cycling one per batch, which is what a scenario measuring
+        /// resource grouping wants -- costing one attribute map per batch and nothing per event.
+        /// An all-literal resource, the usual case, keeps the cheaper path still: built once at
+        /// startup and `Arc`-shared by every batch forever, one refcount bump per event rather
+        /// than a map.
         #[serde(default)]
         resource: std::collections::BTreeMap<String, String>,
     },

@@ -61,22 +61,22 @@ fn generate_render_literal(bencher: Bencher) {
     let mut input = fixtures::generate_literal();
     // The first call settles the render path and renders the prototype; keeping it out of the
     // timed region matches every other bench's warm-up here.
-    drop(input.build_batch(0, 100, 1));
-    let mut seq = 0u64;
+    drop(input.build_batch(0, 0, 100, 1));
+    let mut batch_index = 0u64;
     bencher.bench_local(move || {
-        seq += 100;
-        input.build_batch(seq, 100, 2)
+        batch_index += 1;
+        input.build_batch(batch_index, batch_index * 100, 100, 2)
     });
 }
 
 #[divan::bench]
 fn generate_render_templated(bencher: Bencher) {
     let mut input = fixtures::generate_templated();
-    drop(input.build_batch(0, 100, 1));
-    let mut seq = 0u64;
+    drop(input.build_batch(0, 0, 100, 1));
+    let mut batch_index = 0u64;
     bencher.bench_local(move || {
-        seq += 100;
-        input.build_batch(seq, 100, 2)
+        batch_index += 1;
+        input.build_batch(batch_index, batch_index * 100, 100, 2)
     });
 }
 

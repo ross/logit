@@ -488,9 +488,9 @@ fn prometheus_decode_one_scrape() {
 #[test]
 fn generate_render_literal_100_events() {
     let mut input = fixtures::generate_literal();
-    drop(input.build_batch(0, 100, 1));
+    drop(input.build_batch(0, 0, 100, 1));
 
-    let (batch, stats) = measure(|| input.build_batch(100, 100, 2));
+    let (batch, stats) = measure(|| input.build_batch(1, 100, 100, 2));
     assert_eq!(batch.events.len(), 100);
     expect_allocs("generate_in: render 100 events (literal)", stats, 1);
 }
@@ -511,9 +511,9 @@ fn generate_render_literal_100_events() {
 #[test]
 fn generate_render_templated_100_events() {
     let mut input = fixtures::generate_templated();
-    drop(input.build_batch(0, 100, 1));
+    drop(input.build_batch(0, 0, 100, 1));
 
-    let (batch, stats) = measure(|| input.build_batch(100, 100, 2));
+    let (batch, stats) = measure(|| input.build_batch(1, 100, 100, 2));
     assert_eq!(batch.events.len(), 100);
     expect_allocs("generate_in: render 100 events (2 templated fields)", stats, 201);
 }
