@@ -661,15 +661,19 @@ already built that have a known, accepted rough edge.
   (`sanitize_msg_bytes`), never lossy-decoded. See
   [ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md).
 
-  **UTF-8 rejection was never the only thing standing between a syslog line and an arbitrary-binary
-  payload, and closing it above doesn't change that.** `SyslogDecoder::decode_into`
-  (`crates/logit-inputs/src/syslog.rs`) still splits a datagram on `\n` *before* any UTF-8 check
-  runs, so a binary payload containing a `0x0A` byte is still cut mid-value by the framing — see the
-  HAProxy CBOR entry below, where this framing gap is what actually blocks the case that motivated
-  writing it down. `Value::Bytes` MSG closes the UTF-8 half of the gap; a binary payload that isn't
-  newline-safe by construction (nginx's `escape=json` output happens to be; not every binary format
-  is) still needs an escaped-binary encoding or an opt-out of `syslog_in`'s newline splitting to
-  round-trip.
+  **Narrowed: UTF-8 rejection was never the only thing standing between a syslog line and an
+  arbitrary-binary payload, and closing it above didn't fully close this one either — though the
+  framing half has since caught up on one transport.** `SyslogDecoder::decode_into`
+  (`crates/logit-inputs/src/syslog.rs`) still splits on `\n` *before* any UTF-8 check runs on
+  `syslog_in`'s UDP transport, so a binary payload containing a `0x0A` byte is still cut mid-value
+  by the framing there — see the HAProxy CBOR entry below. Over `transport: tcp`, though, this is
+  no longer true: `SyslogInput::tcp` turns line splitting off
+  (`SyslogDecoder::with_line_splitting(false)`) and hands framing to
+  `logit-inputs::tcp::TcpListener`'s octet-counting `Framer`
+  ([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)), which delimits by
+  declared length, not `\n` — a `0x0A` inside an octet-counted MSG now survives intact end to end.
+  `Value::Bytes` MSG (closed above) plus this framing clear the "reachable" bar on TCP; see the
+  HAProxy CBOR entry for what's still missing there (a decoder, not a transport).
 - **HAProxy's native CBOR log output (`%{+cbor}o`/`%{+cbor+bin}o`) was evaluated as a cheaper way to
   source its access logs and deliberately not pursued** — a considered "not now," not an
   unexplored idea, recorded here so the investigation doesn't get redone. Three findings, each
@@ -679,15 +683,23 @@ already built that have a known, accepted rough edge.
     indefinite-length map rendered as hex text, ~2 bytes on the wire per payload byte. Only
     `%{+cbor+bin}o` emits raw binary, which is the mode that would actually be more compact than
     the demo's hand-rolled JSON — but see the next point.
-  - **Binary CBOR cannot reach `logit` over any transport it has today.** Beyond the non-UTF-8
-    rejection above, `syslog_in` splits every datagram on `\n` before any UTF-8 check runs at all
-    (`crates/logit-inputs/src/syslog.rs:190-197`), and `0x0A` occurs freely inside CBOR — it's the
-    encoding of the integer 10, and turns up throughout length headers and float payloads — so a
-    binary payload is chopped mid-value by the framing itself, independent of the UTF-8 question.
-    `tail_in`/`docker_in` are line-framed too, and Docker's json-file driver wraps each line in a
-    JSON string that can't carry arbitrary octets at all. Nothing in the tree offers
-    length-delimited framing, which is the actual prerequisite; a `cbor_in` listener, a unix-socket
-    input, or an opt-out of `syslog_in`'s newline splitting would each qualify.
+  - **Narrowed: binary CBOR can now reach `logit` intact over one transport, just not decode once
+    it arrives.** `syslog_in`'s UDP transport still splits every datagram on `\n` before any UTF-8
+    check runs at all (`crates/logit-inputs/src/syslog.rs`), and `0x0A` occurs freely inside CBOR —
+    it's the encoding of the integer 10, and turns up throughout length headers and float payloads
+    — so a binary payload sent over UDP is still chopped mid-value by the framing itself,
+    independent of the UTF-8 question. `tail_in`/`docker_in` are line-framed too, and Docker's
+    json-file driver wraps each line in a JSON string that can't carry arbitrary octets at all.
+    `transport: tcp` no longer has this problem, though:
+    `logit-inputs::tcp::TcpListener`'s octet-counting `Framer` delimits by declared length rather
+    than `\n`, and `SyslogInput::tcp` turns off the decoder's own line splitting to match
+    ([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)) — length-delimited
+    framing, the prerequisite this finding originally said nothing in the tree offered, now exists
+    for that one transport. What remains missing isn't a transport but a decoder: nothing parses
+    CBOR itself, so a binary payload that made it through intact would land as an opaque
+    `Value::Bytes` MSG, not `trace.*`/`span.*` attributes — a `cbor_in`-shaped codec (or a
+    `syslog_in` opt-in decode path) is the piece this entry is really about, and it remains
+    unbuilt.
   - **HAProxy's log-format item-name grammar rejects a literal `.` in a custom name, and `%{+json}o`
     and `%{+cbor}o` share that grammar** (already recorded at `demo/haproxy/haproxy.cfg:99-117`,
     confirmed empirically against `haproxy -c`) — but the two encodings aren't equally stuck by it.
@@ -702,7 +714,7 @@ already built that have a known, accepted rough edge.
     arbitrary UTF-8 and handle dots fine — every constraint above belongs to HAProxy's log-format
     grammar or to `logit`'s current transports, not to CBOR as a format.
 
-  If length-delimited framing ever lands and this is revisited, three design constraints are
+  If a CBOR decoder is ever built and this is revisited, three design constraints are
   already known and don't need rediscovering: `Value::as_str` **panics** on an invalid-UTF-8
   `Value::Str` (`crates/logit-core/src/value.rs:33-41`), so CBOR's only-nominally-UTF-8 text-string
   type would need validation before becoming one; a hand-rolled decoder needs an explicit recursion
