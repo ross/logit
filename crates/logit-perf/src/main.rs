@@ -88,9 +88,10 @@ fn main() {
     let root = repo_root();
 
     let result = match cli.command {
-        Command::Run { scenario, repeat, label, settle, no_build, profile } => {
-            run::run(&root, run::RunArgs { scenarios: scenario, repeat, label, settle, no_build, profile })
-        }
+        Command::Run { scenario, repeat, label, settle, no_build, profile } => run::run(
+            &root,
+            run::RunArgs { scenarios: scenario, repeat, label, settle, no_build, profile },
+        ),
         Command::Compare { before, after, threshold, rss_threshold } => {
             run_compare(&before, &after, threshold, rss_threshold)
         }
@@ -136,7 +137,8 @@ fn run_compare(
     rss_threshold: Option<f64>,
 ) -> anyhow::Result<()> {
     let a: result::RunReport = serde_json::from_str(
-        &std::fs::read_to_string(before).with_context(|| format!("reading {}", before.display()))?,
+        &std::fs::read_to_string(before)
+            .with_context(|| format!("reading {}", before.display()))?,
     )
     .with_context(|| format!("parsing {}", before.display()))?;
     let b: result::RunReport = serde_json::from_str(
@@ -149,10 +151,7 @@ fn run_compare(
         eprintln!("warning: {warning}");
     }
 
-    println!(
-        "{:<22} {:>12} {:>12} {:>12}",
-        "scenario", "events/s", "us/event", "peak RSS"
-    );
+    println!("{:<22} {:>12} {:>12} {:>12}", "scenario", "events/s", "us/event", "peak RSS");
     for scenario in &report.scenarios {
         match scenario.deltas {
             Some(deltas) => println!(
@@ -169,7 +168,9 @@ fn run_compare(
     if report.has_regression(threshold, rss_threshold) {
         anyhow::bail!(
             "regression: events/s dropped or CPU us/event rose by more than {threshold}%{}",
-            rss_threshold.map(|t| format!(", or peak RSS grew by more than {t}%")).unwrap_or_default()
+            rss_threshold
+                .map(|t| format!(", or peak RSS grew by more than {t}%"))
+                .unwrap_or_default()
         );
     }
     Ok(())
@@ -186,7 +187,9 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         "s" => value,
         "ms" => value / 1_000.0,
         "m" => value * 60.0,
-        other => return Err(format!("unknown duration unit `{other}` (expected `s`, `ms`, or `m`)")),
+        other => {
+            return Err(format!("unknown duration unit `{other}` (expected `s`, `ms`, or `m`)"))
+        }
     };
     Ok(Duration::from_secs_f64(seconds))
 }

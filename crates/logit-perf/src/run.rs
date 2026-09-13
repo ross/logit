@@ -126,9 +126,13 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&results_dir)
         .with_context(|| format!("creating {}", results_dir.display()))?;
     let short_sha: String = report.git.sha.chars().take(12).collect();
-    let label_suffix =
-        report.label.as_deref().map(|label| format!("-{}", sanitize_label(label))).unwrap_or_default();
-    let filename = format!("{}-{short_sha}{label_suffix}.json", compact_utc_now(now_unix_seconds()));
+    let label_suffix = report
+        .label
+        .as_deref()
+        .map(|label| format!("-{}", sanitize_label(label)))
+        .unwrap_or_default();
+    let filename =
+        format!("{}-{short_sha}{label_suffix}.json", compact_utc_now(now_unix_seconds()));
     let path = results_dir.join(filename);
     std::fs::write(&path, serde_json::to_string_pretty(&report)?)
         .with_context(|| format!("writing {}", path.display()))?;
@@ -277,9 +281,13 @@ fn cpu_model() -> String {
     std::fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|contents| {
-            contents.lines().find_map(|line| {
-                line.strip_prefix("model name").and_then(|rest| rest.trim_start().strip_prefix(':'))
-            }).map(|value| value.trim().to_string())
+            contents
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("model name")
+                        .and_then(|rest| rest.trim_start().strip_prefix(':'))
+                })
+                .map(|value| value.trim().to_string())
         })
         .unwrap_or_else(|| "unknown".to_string())
 }
@@ -353,10 +361,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 fn print_table(report: &RunReport) {
-    println!(
-        "\n{:<20} {:>12} {:>14} {:>12}",
-        "scenario", "events/s", "us/event", "peak RSS"
-    );
+    println!("\n{:<20} {:>12} {:>14} {:>12}", "scenario", "events/s", "us/event", "peak RSS");
     for (name, scenario) in &report.scenarios {
         println!(
             "{:<20} {:>12.0} {:>14.3} {:>10.1} MiB",

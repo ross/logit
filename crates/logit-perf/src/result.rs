@@ -62,7 +62,13 @@ pub struct Sample {
 }
 
 impl Sample {
-    pub fn from_usage(count: u64, wall: Duration, user: Duration, sys: Duration, max_rss_bytes: u64) -> Self {
+    pub fn from_usage(
+        count: u64,
+        wall: Duration,
+        user: Duration,
+        sys: Duration,
+        max_rss_bytes: u64,
+    ) -> Self {
         let wall_s = wall.as_secs_f64();
         let cpu_s = user.as_secs_f64() + sys.as_secs_f64();
         let count_f = count as f64;
@@ -127,7 +133,9 @@ pub fn median_sample(samples: &[Sample]) -> Sample {
         sys_s: median_f64(&samples.iter().map(|s| s.sys_s).collect::<Vec<_>>()),
         max_rss_bytes: median_u64(&samples.iter().map(|s| s.max_rss_bytes).collect::<Vec<_>>()),
         events_per_s: median_f64(&samples.iter().map(|s| s.events_per_s).collect::<Vec<_>>()),
-        cpu_us_per_event: median_f64(&samples.iter().map(|s| s.cpu_us_per_event).collect::<Vec<_>>()),
+        cpu_us_per_event: median_f64(
+            &samples.iter().map(|s| s.cpu_us_per_event).collect::<Vec<_>>(),
+        ),
     }
 }
 
@@ -170,7 +178,12 @@ mod tests {
 
     #[test]
     fn median_of_an_even_number_of_samples_averages_the_two_middle_values() {
-        let samples = vec![sample(1.0, 10.0, 100), sample(2.0, 20.0, 200), sample(3.0, 30.0, 300), sample(4.0, 40.0, 400)];
+        let samples = vec![
+            sample(1.0, 10.0, 100),
+            sample(2.0, 20.0, 200),
+            sample(3.0, 30.0, 300),
+            sample(4.0, 40.0, 400),
+        ];
         let median = median_sample(&samples);
         assert_eq!(median.wall_s, 2.5);
         assert_eq!(median.cpu_us_per_event, 25.0);
@@ -214,7 +227,12 @@ mod tests {
     #[test]
     fn run_report_round_trips_through_json() {
         let mut scenarios = BTreeMap::new();
-        let repeats = vec![sample(1.0, 10.0, 100), sample(1.2, 11.0, 110)];
+        // `wall_s` values chosen so every derived field is exactly representable in binary
+        // (1.0, 2.0, 0.5, ...) -- serde_json's default float parser (without its
+        // `float_roundtrip` feature, not enabled here) isn't guaranteed to recover every f64 bit
+        // for bit from its shortest decimal rendering, only ones like these; the point of this
+        // test is the JSON *shape* round-tripping, not pinning that parser behavior.
+        let repeats = vec![sample(1.0, 10.0, 100), sample(2.0, 12.0, 110)];
         scenarios.insert(
             "passthrough".to_string(),
             ScenarioReport {

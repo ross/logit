@@ -130,12 +130,20 @@ mod tests {
         }
     }
 
-    fn scenario_report(events_per_s: f64, cpu_us_per_event: f64, max_rss_bytes: u64) -> ScenarioReport {
+    fn scenario_report(
+        events_per_s: f64,
+        cpu_us_per_event: f64,
+        max_rss_bytes: u64,
+    ) -> ScenarioReport {
         let sample = sample(events_per_s, cpu_us_per_event, max_rss_bytes);
         ScenarioReport { count: 1_000_000, repeats: vec![sample], median: sample, min: sample }
     }
 
-    fn report(hostname: &str, cpu_model: &str, scenarios: BTreeMap<String, ScenarioReport>) -> RunReport {
+    fn report(
+        hostname: &str,
+        cpu_model: &str,
+        scenarios: BTreeMap<String, ScenarioReport>,
+    ) -> RunReport {
         RunReport {
             git: GitInfo { sha: "sha".to_string(), dirty: false },
             timestamp: "2026-09-12T00:00:00Z".to_string(),
@@ -226,14 +234,20 @@ mod tests {
     #[test]
     fn a_hostname_or_cpu_mismatch_warns_but_does_not_fail() {
         let scenarios = BTreeMap::new();
-        let cmp = compare(&report("box-a", "cpu-a", scenarios.clone()), &report("box-b", "cpu-a", scenarios));
+        let cmp = compare(
+            &report("box-a", "cpu-a", scenarios.clone()),
+            &report("box-b", "cpu-a", scenarios),
+        );
         assert!(cmp.environment_warning.is_some());
     }
 
     #[test]
     fn matching_environments_have_no_warning() {
         let scenarios = BTreeMap::new();
-        let cmp = compare(&report("box-a", "cpu-a", scenarios.clone()), &report("box-a", "cpu-a", scenarios));
+        let cmp = compare(
+            &report("box-a", "cpu-a", scenarios.clone()),
+            &report("box-a", "cpu-a", scenarios),
+        );
         assert!(cmp.environment_warning.is_none());
     }
 }

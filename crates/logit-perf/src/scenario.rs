@@ -51,10 +51,9 @@ pub fn discover(dir: &Path) -> anyhow::Result<Vec<Scenario>> {
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .with_context(|| format!("{}: no file stem", path.display()))?;
-        let yaml = fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let (count, needs_sigterm) =
-            parse(&yaml).with_context(|| format!("{}", path.display()))?;
+        let yaml =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let (count, needs_sigterm) = parse(&yaml).with_context(|| format!("{}", path.display()))?;
         scenarios.push(Scenario { name, path, count, needs_sigterm });
     }
     scenarios.sort_by(|a, b| a.name.cmp(&b.name));
