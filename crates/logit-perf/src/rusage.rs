@@ -48,6 +48,15 @@ impl Usage {
     pub fn exit_code(&self) -> Option<i32> {
         libc::WIFEXITED(self.status).then(|| libc::WEXITSTATUS(self.status))
     }
+
+    /// `Some(signal)` if the child was killed by one (`WIFSIGNALED`) -- the complement of
+    /// [`Usage::exit_code`]. The caller needs this to tell its *own* SIGTERM apart from any other
+    /// signal death: `perf record` (the only wrapper this harness runs `logit` under) forwards
+    /// SIGTERM to its workload, waits for it, finalizes `perf.data`, and then dies by that same
+    /// signal itself, which is a completed capture rather than a failure.
+    pub fn termination_signal(&self) -> Option<i32> {
+        libc::WIFSIGNALED(self.status).then(|| libc::WTERMSIG(self.status))
+    }
 }
 
 /// Blocks until `pid` exits, reaping it and its resource usage in one call. `pid` must name a
@@ -145,5 +154,21 @@ mod tests {
             status,
         };
         assert_eq!(usage.exit_code(), None);
+    }
+
+    #[test]
+    fn usage_termination_signal_names_the_signal_and_is_none_for_a_normal_exit() {
+        let signalled = Usage {
+            wall: Duration::ZERO,
+            user: Duration::ZERO,
+            sys: Duration::ZERO,
+            max_rss_bytes: 0,
+            status: libc::SIGTERM,
+        };
+        assert_eq!(signalled.termination_signal(), Some(libc::SIGTERM));
+
+        let exited = Usage { status: 0 << 8, ..signalled };
+        assert_eq!(exited.termination_signal(), None);
+        assert_eq!(exited.exit_code(), Some(0));
     }
 }

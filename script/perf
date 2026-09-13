@@ -64,6 +64,10 @@ fi
 # No `:z` on the bind mount: with SELinux labeling off for this container there is nothing to
 # relabel for, and `:z` would recursively relabel the whole checkout (target/ included) each run.
 if [ "${1:-}" = "flamegraph" ] && ! in_project_environment; then
+    # `FROM logit-dev:local`, so the dev image has to exist first -- on a fresh checkout nothing
+    # has built it yet, and `docker build` would fail on the FROM line rather than on anything to
+    # do with profiling.
+    build_image
     ${DOCKER} build -t logit-perf:local -f crates/logit-perf/Dockerfile crates/logit-perf
     exec ${DOCKER} run --rm \
         --cap-add SYS_ADMIN \

@@ -290,8 +290,12 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Sample
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| {
-            format!("spawning {}", wrapper.first().map(String::as_str).unwrap_or("logit"))
+        // Both halves named: which program actually failed to spawn (the wrapper, when there is
+        // one) and which binary it was going to run, since "no such file" is equally plausible
+        // for either and the message has to say which.
+        .with_context(|| match wrapper.first() {
+            Some(program) => format!("spawning {program} around {}", logit_bin.display()),
+            None => format!("spawning {}", logit_bin.display()),
         })?;
     let spawned_at = Instant::now();
     let pid = child.id() as libc::pid_t;
@@ -393,6 +397,16 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Sample
     match usage.exit_code() {
         Some(0) => {}
         Some(code) => bail!("exited with status {code}; stderr:\n{stderr_text}"),
+        // A wrapper dying by the SIGTERM this harness itself sent is a completed run, not a
+        // failure -- verified against `perf record --scenario native-relay`, where perf forwards
+        // the signal to `logit` (which drains and exits 0 on its own), waits for it, writes
+        // `perf.data`, and then re-raises SIGTERM on itself, which is how a signal-terminated
+        // process is *supposed* to report that it stopped on request. Deliberately not extended
+        // to the no-wrapper case: `logit` installs its own SIGTERM handler and exits 0, so a
+        // signal death there is a real regression in the shutdown path and must stay loud.
+        None if !wrapper.is_empty()
+            && needs_sigterm
+            && usage.termination_signal() == Some(libc::SIGTERM) => {}
         None => bail!("terminated by signal (raw status {}); stderr:\n{stderr_text}", usage.status),
     }
 

@@ -14,10 +14,16 @@
 //!    `generation complete` line rather than at some arbitrary wall-clock cutoff. `--call-graph
 //!    dwarf`, not the default frame-pointer walk: this profile doesn't force
 //!    `force-frame-pointers`, and an optimized Rust binary without them gives `-g` almost nothing
-//!    to unwind.
-//! 3. `perf script | inferno-collapse-perf | inferno-flamegraph > <out>`, run as a real three-
-//!    process pipeline rather than buffered through this process -- a `perf script` dump of a
-//!    multi-million-event scenario is hundreds of megabytes.
+//!    to unwind. For a scenario that doesn't self-exit (`native-relay`), the settle-then-SIGTERM
+//!    goes to `perf`, which forwards it to `logit` (draining and exiting 0 on its own), waits,
+//!    writes `perf.data`, and then re-raises SIGTERM on itself -- verified end to end, and why
+//!    `spawn_and_measure` accepts a wrapper's SIGTERM death as a completed run.
+//! 3. `perf script | inferno-collapse-perf | inferno-flamegraph`, run as a real three-process
+//!    pipeline rather than buffered through this process -- a `perf script` dump of a
+//!    multi-million-event scenario is hundreds of megabytes. The SVG lands on a staging file and
+//!    is `rename`d onto `--out` only once all three stages have exited 0 and the result is
+//!    non-empty, so a failed re-render leaves the previous good flamegraph intact rather than
+//!    truncating it.
 //!
 //! **The tooling is not in the dev image.** `perf` and `inferno` live only in
 //! `crates/logit-perf/Dockerfile`, a throwaway image built from `logit-dev:local` and run with
@@ -28,7 +34,7 @@
 //! clear error naming `script/perf flamegraph`, not a confusing failure three steps in.
 
 use crate::run::{self, SpawnConfig};
-use crate::scenario;
+use crate::scenario::{self, Scenario};
 use anyhow::{bail, Context};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -63,6 +69,7 @@ pub fn flamegraph(root: &Path, args: FlamegraphArgs) -> anyhow::Result<()> {
 
     let out = args
         .out
+        .clone()
         .unwrap_or_else(|| root.join("perf/results").join(format!("{}.svg", scenario.name)));
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -72,10 +79,38 @@ pub fn flamegraph(root: &Path, args: FlamegraphArgs) -> anyhow::Result<()> {
 
     let workdir =
         std::env::temp_dir().join(format!("logit-perf-flamegraph-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&workdir);
     fs::create_dir_all(&workdir).with_context(|| format!("creating {}", workdir.display()))?;
     let perf_data = workdir.join("perf.data");
+    // A leftover capture from an earlier run at this pid would be rendered as if it were this
+    // run's -- caught rather than silently overwritten, the same reasoning `attribute` applies to
+    // its own dump.
+    if perf_data.exists() {
+        bail!(
+            "{} already exists -- a previous `flamegraph` run left it behind; remove it (or its \
+             whole directory) and try again",
+            perf_data.display()
+        );
+    }
 
+    let outcome = record_and_render(&logit_bin, &scenario, &args, &perf_data, &out);
+    match &outcome {
+        // Only on success: a failed render's `perf.data` is a multi-minute capture worth keeping
+        // to retry the (fast) render against, not something to throw away on the way out.
+        Ok(()) => {
+            let _ = fs::remove_dir_all(&workdir);
+        }
+        Err(_) => eprintln!("note: the capture is left at {}", perf_data.display()),
+    }
+    outcome
+}
+
+fn record_and_render(
+    logit_bin: &Path,
+    scenario: &Scenario,
+    args: &FlamegraphArgs,
+    perf_data: &Path,
+    out: &Path,
+) -> anyhow::Result<()> {
     println!(
         "-- {} (count={}, {} Hz, {})",
         scenario.name,
@@ -83,9 +118,9 @@ pub fn flamegraph(root: &Path, args: FlamegraphArgs) -> anyhow::Result<()> {
         args.freq,
         if scenario.needs_sigterm { "needs SIGTERM" } else { "self-exits" }
     );
-    let wrapper = record_argv(args.freq, &perf_data);
+    let wrapper = record_argv(args.freq, perf_data);
     let sample = run::spawn_and_measure(SpawnConfig {
-        logit_bin: &logit_bin,
+        logit_bin,
         wrapper: &wrapper,
         config: &scenario.path,
         count: scenario.count,
@@ -98,18 +133,46 @@ pub fn flamegraph(root: &Path, args: FlamegraphArgs) -> anyhow::Result<()> {
     println!(
         "   captured {:.1}s of wall time ({:.1} MiB of samples)",
         sample.wall_s,
-        fs::metadata(&perf_data).map(|m| m.len()).unwrap_or(0) as f64 / (1024.0 * 1024.0),
+        fs::metadata(perf_data).map(|m| m.len()).unwrap_or(0) as f64 / (1024.0 * 1024.0),
     );
 
-    collapse_to_svg(&perf_data, &out)?;
-    let _ = fs::remove_dir_all(&workdir);
+    // Rendered into a staging file first and moved onto `out` only once every stage has exited 0
+    // and the result is non-empty -- a failed re-render must never leave the previous good SVG
+    // truncated, which is exactly what redirecting straight onto `out` does the moment the shell
+    // creates the file. Staged in `out`'s *own* directory rather than the temp workdir: `rename`
+    // is only atomic (and only succeeds at all) within one filesystem, and the workdir is `/tmp`
+    // while `out` is under the bind-mounted checkout.
+    let staged = staging_path(out);
+    let _cleanup = RemoveOnDrop(staged.clone());
+    collapse_to_svg(perf_data, &staged)?;
 
-    let bytes = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    let bytes = fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
     if bytes == 0 {
-        bail!("{} is empty -- the capture produced no resolvable stacks", out.display());
+        bail!("the capture produced no resolvable stacks -- {} left unchanged", out.display());
     }
+    fs::rename(&staged, out)
+        .with_context(|| format!("moving {} onto {}", staged.display(), out.display()))?;
+
     println!("\nwrote {} ({bytes} bytes)", out.display());
     Ok(())
+}
+
+/// `<out>.<pid>.partial` -- beside `out`, so [`fs::rename`] onto it is a same-filesystem move,
+/// and pid-suffixed so two concurrent runs writing the same `--out` can't share a staging file.
+fn staging_path(out: &Path) -> PathBuf {
+    let mut name = out.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.partial", std::process::id()));
+    out.with_file_name(name)
+}
+
+/// Removes a path when dropped, so a failure anywhere between rendering and the final `rename`
+/// takes the half-written staging file with it instead of leaving it beside the real output.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 /// `perf record`'s own argv, up to and including the `--` that separates it from the workload.
