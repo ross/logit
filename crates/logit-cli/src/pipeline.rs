@@ -425,6 +425,16 @@ fn build_spec(
             )
         }
 
+        // Stub, and says so (`AGENTS.md`): the kind, its config types, and graph rule 42 landed
+        // in the perf harness's W1; `logit_inputs::generate::GenerateInput` and this arm are W2
+        // (`docs/plans/load-test-harness.md`). Reachable only via `logit run` on a config that
+        // names `generate_in` -- `graph::resolve` accepts one already, since rule 42's validation
+        // is what W1 exists to provide.
+        GenerateIn { .. } => todo!(
+            "generate_in: build GenerateInput from count/batch/rate/event/resource -- \
+             docs/plans/load-test-harness.md, workstream W2"
+        ),
+
         Lua { script, interval } => NodeSpec::Lua { script: script.clone(), interval: *interval },
         LuaFile { lua_file, interval } => {
             let script_path = base_dir.join(lua_file);
@@ -729,6 +739,15 @@ fn build_spec(
                 write_config(&component.buffer),
             )
         }
+
+        // The `generate_in` stub's twin -- `logit_outputs::null::NullOutput` and this arm are the
+        // perf harness's W3 (`docs/plans/load-test-harness.md`). It gets the same
+        // `queue_config`/`write_config` treatment as every other sink when it lands, so `buffer:`
+        // (disk included) works on it.
+        NullOut {} => todo!(
+            "null_out: build NullOutput with the usual queue/write config -- \
+             docs/plans/load-test-harness.md, workstream W3"
+        ),
     };
     Ok((spec, telemetry))
 }

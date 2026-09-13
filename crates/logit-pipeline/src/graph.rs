@@ -39,11 +39,11 @@
 //!     tail listener has no such queue (the tailed file is its own durable buffer), so it may
 //!     only set `receive`'s batch-assembly/shutdown-grace fields -- a queue-bounding field
 //!     (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) is rejected by name on
-//!     one. Deliberately **not** `role(&kind) != Role::Listener`: `internal` is a listener by
-//!     role but has no socket, no queue, and no decoder, so `receive:` on it would be a
-//!     silently-ignored setting -- exactly what this rule exists to catch on the sink side (rule
-//!     14). A future listener kind rejects `receive:` until it is actually wired to one of these
-//!     two drivers.
+//!     one. Deliberately **not** `role(&kind) != Role::Listener`: `internal` and `generate_in`
+//!     are listeners by role but have no socket, no queue, and no decoder, so `receive:` on
+//!     either would be a silently-ignored setting -- exactly what this rule exists to catch on
+//!     the sink side (rule 14). A future listener kind rejects `receive:` until it is actually
+//!     wired to one of these two drivers.
 //! 18. A datagram listener's `receive.max_datagrams` or `receive.max_bytes` of `0` is rejected;
 //!     a datagram or tail listener's `receive.batch_max_events` or `receive.batch_max_bytes` of
 //!     `0` is rejected -- each an impossible bound, the twin of rule 15.
@@ -139,6 +139,22 @@
 //!     so anything else could never be scraped), and `max_series` must be >= 1 -- rule 38's
 //!     impossible-bound shape again: `0` would evict every series the instant it arrived
 //!     (`docs/adr/prometheus-scrape-and-exposition.md`).
+//! 42. A `generate_in`'s bounds and templates. `count`, `batch`, and `rate` must each be at
+//!     least 1 where set -- `0` generates nothing at all, the impossible bound of rules
+//!     9/15/18/38 rather than a small one, and omitting `count`/`rate` is already how
+//!     "unbounded"/"unthrottled" is spelled. A `metric` must carry a non-empty `name` and a
+//!     finite `value`. No `event.attributes` or `resource` key may be empty. And every template
+//!     string -- `event.log`, every `event.attributes` value, every `resource` value, and
+//!     `event.metric.name` -- must parse as a `logit_core::template` and may name only the
+//!     placeholders `generate_in` actually substitutes: `seq`, or `seq%N` with `N >= 1`. An
+//!     unknown placeholder is rejected here rather than rendered literally or as nothing: a
+//!     mistyped `{seg}` would otherwise silently collapse a scenario's intended cardinality to a
+//!     single series, which is the difference between measuring an aggregation window and
+//!     measuring nothing. The var-name check lives in [`generate_var_is_valid`] so that
+//!     `logit-inputs`' own `compile` resolver can mirror it exactly without depending on
+//!     `logit-config` (`docs/design/pipeline-graph.md`'s crate layout). `receive:` on a
+//!     `generate_in` is rejected by rule 17's own allowlist -- it is a listener by role, with no
+//!     socket, queue, or decoder for `receive:` to configure (`docs/plans/load-test-harness.md`).
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -188,7 +204,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | DockerIn { .. }
         | LogitIn { .. }
         | Internal { .. }
-        | PrometheusIn { .. } => Role::Listener,
+        | PrometheusIn { .. }
+        | GenerateIn { .. } => Role::Listener,
         Lua { .. }
         | LuaFile { .. }
         | Aggregate { .. }
@@ -218,7 +235,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | SyslogOut { .. }
         | StatsdOut { .. }
         | CollectdOut { .. }
-        | PrometheusOut { .. } => Role::Sink,
+        | PrometheusOut { .. }
+        | NullOut { .. } => Role::Sink,
     }
 }
 
@@ -241,6 +259,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         LogitIn { .. } => "logit_in",
         Internal { .. } => "internal",
         PrometheusIn { .. } => "prometheus_in",
+        GenerateIn { .. } => "generate_in",
         Lua { .. } => "lua",
         LuaFile { .. } => "lua_file",
         Aggregate { .. } => "aggregate",
@@ -271,6 +290,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         StatsdOut { .. } => "statsd_out",
         CollectdOut { .. } => "collectd_out",
         PrometheusOut { .. } => "prometheus_out",
+        NullOut { .. } => "null_out",
     }
 }
 
@@ -319,6 +339,8 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::StatsdOut { .. }
             | ComponentKind::CollectdOut { .. }
             | ComponentKind::PrometheusOut { .. }
+            | ComponentKind::GenerateIn { .. }
+            | ComponentKind::NullOut { .. }
     )
 }
 
@@ -1550,6 +1572,73 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 42: a `generate_in`'s own bounds and templates. The three counts are the
+    // impossible-bound shape rules 9/15/18/38 already apply elsewhere -- `0` here means "generate
+    // nothing", never "as little/slow as possible", and `None` is how unbounded/unthrottled is
+    // actually spelled. The template checks are what keep a mistyped placeholder from silently
+    // collapsing a scenario's cardinality instead of failing `logit validate`; the parse happens
+    // here and the result is dropped, matching how rule 30 compiles a `regex` `pattern` it also
+    // throws away (`build_spec` re-derives from the raw `ComponentKind` like every other kind).
+    for (id, component) in &components {
+        let ComponentKind::GenerateIn { count, batch, rate, event, resource } = &component.kind
+        else {
+            continue;
+        };
+        if *count == Some(0) {
+            anyhow::bail!(
+                "component '{id}': count: 0 would generate nothing -- omit 'count' for an \
+                 unbounded run, or name a positive number of events"
+            );
+        }
+        if *batch == 0 {
+            anyhow::bail!(
+                "component '{id}': batch: 0 would generate nothing -- use a positive batch size"
+            );
+        }
+        if *rate == Some(0) {
+            anyhow::bail!(
+                "component '{id}': rate: 0 would generate nothing -- omit 'rate' to generate as \
+                 fast as backpressure allows"
+            );
+        }
+        if let Some(log) = &event.log {
+            check_generate_template(id, "event.log", log)?;
+        }
+        for (key, value) in &event.attributes {
+            if key.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': 'event.attributes' has an empty key -- an attribute with \
+                     no name could never be read back"
+                );
+            }
+            check_generate_template(id, &format!("event.attributes.{key}"), value)?;
+        }
+        for (key, value) in resource {
+            if key.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': 'resource' has an empty key -- a resource attribute with \
+                     no name could never be read back"
+                );
+            }
+            check_generate_template(id, &format!("resource.{key}"), value)?;
+        }
+        if let Some(metric) = &event.metric {
+            if metric.name.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': 'event.metric.name' is empty -- a generated metric needs a \
+                     name, the same reason rule 12 requires one of every kv_metrics entry"
+                );
+            }
+            if !metric.value.is_finite() {
+                anyhow::bail!(
+                    "component '{id}': 'event.metric.value' must be a finite number, got {}",
+                    metric.value
+                );
+            }
+            check_generate_template(id, "event.metric.name", &metric.name)?;
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         let Component { sources, buffer, receive, kind } = component;
@@ -1587,6 +1676,42 @@ fn is_datagram_listener(kind: &ComponentKind) -> bool {
 ///
 fn is_tail_listener(kind: &ComponentKind) -> bool {
     matches!(kind, ComponentKind::TailIn { .. } | ComponentKind::DockerIn { .. })
+}
+
+/// Whether `name` is a placeholder `generate_in` substitutes: `seq` (the 0-based event counter)
+/// or `seq%N` with `N >= 1` (that counter modulo `N`, a scenario's cardinality knob).
+///
+/// Pure, and public within this crate's rule 42 only in the sense that it takes a bare `&str`:
+/// `logit-inputs`' own `Template::compile` resolver needs the *same* verdict on the *same*
+/// spelling, and it cannot reach `logit-config` (`docs/design/pipeline-graph.md`'s crate layout),
+/// so keeping the rule a one-argument string predicate is what lets the two stay in step by
+/// inspection rather than by a shared type. `N == 0` is rejected here rather than left to panic
+/// on a modulo by zero at render time.
+fn generate_var_is_valid(name: &str) -> bool {
+    if name == "seq" {
+        return true;
+    }
+    match name.strip_prefix("seq%") {
+        Some(modulus) => modulus.parse::<u64>().is_ok_and(|modulus| modulus >= 1),
+        None => false,
+    }
+}
+
+/// Rule 42's per-field template check: it must parse, and every placeholder in it must be one
+/// [`generate_var_is_valid`] recognizes. `field` is the dotted config path (`event.log`,
+/// `resource.service.name`) so the error names what to go and fix.
+fn check_generate_template(id: &str, field: &str, raw: &str) -> anyhow::Result<()> {
+    let template = logit_core::template::parse(raw)
+        .map_err(|err| anyhow::anyhow!("component '{id}': '{field}' is not a template: {err}"))?;
+    for var in template.vars() {
+        if !generate_var_is_valid(var) {
+            anyhow::bail!(
+                "component '{id}': '{field}' names the placeholder '{{{var}}}', which generate_in \
+                 doesn't substitute -- only '{{seq}}' and '{{seq%N}}' (N at least 1)"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Rule 26: rejects a `*` anywhere in `path` except its final `/`-separated component --
@@ -1887,6 +2012,76 @@ mod tests {
             format,
             compression,
         }
+    }
+
+    /// The perf harness's generator, at its own defaults: unbounded, `batch: 100`, unthrottled,
+    /// and no event template at all -- the cheapest event `generate_in` can produce.
+    fn generate_in() -> ComponentKind {
+        generate_in_full(None, 100, None, logit_config::GenerateEvent::default(), Vec::new())
+    }
+
+    /// Rule 42's three count bounds, with an otherwise-default generator.
+    fn generate_in_with_counts(
+        count: Option<u64>,
+        batch: usize,
+        rate: Option<u64>,
+    ) -> ComponentKind {
+        generate_in_full(count, batch, rate, logit_config::GenerateEvent::default(), Vec::new())
+    }
+
+    /// Rule 42's template and metric checks, with otherwise-default counts.
+    fn generate_in_with_event(event: logit_config::GenerateEvent) -> ComponentKind {
+        generate_in_full(None, 100, None, event, Vec::new())
+    }
+
+    /// Rule 42's `resource` key/template checks.
+    fn generate_in_with_resource(resource: Vec<(&str, &str)>) -> ComponentKind {
+        generate_in_full(None, 100, None, logit_config::GenerateEvent::default(), resource)
+    }
+
+    fn generate_in_full(
+        count: Option<u64>,
+        batch: usize,
+        rate: Option<u64>,
+        event: logit_config::GenerateEvent,
+        resource: Vec<(&str, &str)>,
+    ) -> ComponentKind {
+        ComponentKind::GenerateIn {
+            count,
+            batch,
+            rate,
+            event,
+            resource: resource.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+
+    /// A [`logit_config::GenerateEvent`] spelled out field by field, so a rule-42 test reads as
+    /// the config it rejects.
+    fn generate_event(
+        log: Option<&str>,
+        attributes: Vec<(&str, &str)>,
+        metric: Option<logit_config::GenerateMetric>,
+    ) -> logit_config::GenerateEvent {
+        logit_config::GenerateEvent {
+            log: log.map(String::from),
+            attributes: attributes
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            metric,
+        }
+    }
+
+    fn generate_metric(name: &str, value: f64) -> logit_config::GenerateMetric {
+        logit_config::GenerateMetric {
+            name: name.to_string(),
+            kind: logit_config::GenerateMetricKind::default(),
+            value,
+        }
+    }
+
+    fn null_out() -> ComponentKind {
+        ComponentKind::NullOut {}
     }
 
     /// `Graph` isn't `Debug` (it embeds `ComponentKind`, which isn't either), so
@@ -4727,5 +4922,274 @@ mod tests {
             ("out", vec!["in"], prometheus_out("/metrics", 0)),
         ]));
         assert!(err.contains("'out'") && err.contains("max_series: 0"), "got: {err}");
+    }
+
+    // ---- rule 42: generate_in / null_out ------------------------------------------------------
+
+    #[test]
+    fn generate_in_is_a_listener_and_null_out_is_a_sink_and_both_are_implemented() {
+        assert_eq!(kind_name(&generate_in()), "generate_in");
+        assert_eq!(role(&generate_in()), Role::Listener);
+        assert_eq!(kind_name(&null_out()), "null_out");
+        assert_eq!(role(&null_out()), Role::Sink);
+    }
+
+    /// The perf harness's minimal scenario: a finite generator straight into a sink that drops
+    /// everything, with nothing else in the graph at all.
+    #[test]
+    fn a_generate_in_and_a_null_out_alone_resolve() {
+        let graph = resolve(cfg(vec![
+            ("gen", vec![], generate_in_with_counts(Some(2_000_000), 100, Some(50_000))),
+            ("sink", vec!["gen"], null_out()),
+        ]))
+        .expect("a finite generator into a null sink is the whole perf scenario shape");
+        assert_eq!(graph.components["gen"].role(), Role::Listener);
+        assert_eq!(graph.components["sink"].kind_name(), "null_out");
+    }
+
+    /// Rule 6, reached through the new listener: `generate_in` produces events, it never reads
+    /// any.
+    #[test]
+    fn a_generate_in_with_sources_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("gen", vec!["in"], generate_in()),
+            ("sink", vec!["gen"], null_out()),
+        ]));
+        assert!(err.contains("'gen'") && err.contains("listener"), "got: {err}");
+    }
+
+    /// Rule 6 again, from the sink side.
+    #[test]
+    fn a_null_out_with_no_sources_is_rejected() {
+        let err = expect_err(cfg(vec![("sink", vec![], null_out())]));
+        assert!(err.contains("'sink'") && err.contains("sink"), "got: {err}");
+    }
+
+    #[test]
+    fn a_zero_generate_in_count_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("gen", vec![], generate_in_with_counts(Some(0), 100, None)),
+            ("sink", vec!["gen"], null_out()),
+        ]));
+        assert!(err.contains("'gen'") && err.contains("count: 0"), "got: {err}");
+    }
+
+    #[test]
+    fn a_zero_generate_in_batch_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("gen", vec![], generate_in_with_counts(None, 0, None)),
+            ("sink", vec!["gen"], null_out()),
+        ]));
+        assert!(err.contains("'gen'") && err.contains("batch: 0"), "got: {err}");
+    }
+
+    #[test]
+    fn a_zero_generate_in_rate_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("gen", vec![], generate_in_with_counts(None, 100, Some(0))),
+            ("sink", vec!["gen"], null_out()),
+        ]));
+        assert!(err.contains("'gen'") && err.contains("rate: 0"), "got: {err}");
+    }
+
+    /// Omitting `count`/`rate` is how unbounded and unthrottled are spelled -- the check above is
+    /// about `0` specifically, not about the field being absent.
+    #[test]
+    fn an_unbounded_unthrottled_generate_in_resolves() {
+        resolve(cfg(vec![
+            ("gen", vec![], generate_in_with_counts(None, 100, None)),
+            ("sink", vec!["gen"], null_out()),
+        ]))
+        .expect("omitted count/rate mean unbounded and unthrottled, not zero");
+    }
+
+    #[test]
+    fn an_empty_generate_in_metric_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            (
+                "gen",
+                vec![],
+                generate_in_with_event(generate_event(
+                    None,
+                    vec![],
+                    Some(generate_metric("", 1.0)),
+                )),
+            ),
+            ("sink", vec!["gen"], null_out()),
+        ]));
+        assert!(
+            err.contains("'gen'") && err.contains("'event.metric.name' is empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_finite_generate_in_metric_value_is_rejected() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = expect_err(cfg(vec![
+                (
+                    "gen",
+                    vec![],
+                    generate_in_with_event(generate_event(
+                        None,
+                        vec![],
+                        Some(generate_metric("requests", value)),
+                    )),
+                ),
+                ("sink", vec!["gen"], null_out()),
+            ]));
+            assert!(err.contains("'gen'") && err.contains("must be a finite number"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn an_empty_generate_in_attribute_key_is_rejected() {
+        let err = expect_err(cfg(vec![
+            (
+                "gen",
+                vec![],
+                generate_in_with_event(generate_event(None, vec![("", "web-1")], None)),
+            ),
+            ("sink", vec!["gen"], null_out()),
+        ]));
+        assert!(
+            err.contains("'gen'") && err.contains("'event.attributes' has an empty key"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_generate_in_resource_key_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("gen", vec![], generate_in_with_resource(vec![("", "web")])),
+            ("sink", vec!["gen"], null_out()),
+        ]));
+        assert!(err.contains("'gen'") && err.contains("'resource' has an empty key"), "got: {err}");
+    }
+
+    /// Rule 42's parse check, reached through each of the four templated config paths in turn --
+    /// a malformed template must be caught wherever it is written, not just in `event.log`.
+    #[test]
+    fn a_malformed_generate_in_template_is_rejected_in_every_templated_field() {
+        let cases: Vec<(ComponentKind, &str)> = vec![
+            (generate_in_with_event(generate_event(Some("host-{seq"), vec![], None)), "event.log"),
+            (
+                generate_in_with_event(generate_event(None, vec![("host", "web-{}")], None)),
+                "event.attributes.host",
+            ),
+            (
+                generate_in_with_event(generate_event(
+                    None,
+                    vec![],
+                    Some(generate_metric("requests}", 1.0)),
+                )),
+                "event.metric.name",
+            ),
+            (generate_in_with_resource(vec![("service.name", "{seq")]), "resource.service.name"),
+        ];
+        for (kind, field) in cases {
+            let err =
+                expect_err(cfg(vec![("gen", vec![], kind), ("sink", vec!["gen"], null_out())]));
+            assert!(
+                err.contains("'gen'") && err.contains(field) && err.contains("is not a template"),
+                "got: {err}"
+            );
+        }
+    }
+
+    /// Rule 42's var-name check: a placeholder `generate_in` can't substitute is a config error,
+    /// not something rendered literally or as nothing -- a mistyped `{seg}` would otherwise
+    /// silently collapse a scenario's cardinality to one series.
+    #[test]
+    fn an_unknown_generate_in_placeholder_is_rejected() {
+        for name in ["seg", "SEQ", "seq%", "seq%0", "seq%x", "seq%-1", "seq-1", "hostname", "seq "]
+        {
+            let err = expect_err(cfg(vec![
+                (
+                    "gen",
+                    vec![],
+                    generate_in_with_event(generate_event(
+                        Some(&format!("host-{{{name}}}")),
+                        vec![],
+                        None,
+                    )),
+                ),
+                ("sink", vec!["gen"], null_out()),
+            ]));
+            assert!(
+                err.contains("'gen'") && err.contains("doesn't substitute"),
+                "{name}: got: {err}"
+            );
+        }
+    }
+
+    /// The other side of the same rule: the two names `generate_in` does substitute, in every
+    /// templated field, alongside the `{{`/`}}` escape a JSON log body needs.
+    #[test]
+    fn the_seq_placeholders_and_escaped_braces_resolve_in_every_templated_field() {
+        resolve(cfg(vec![
+            (
+                "gen",
+                vec![],
+                generate_in_full(
+                    Some(1000),
+                    10,
+                    Some(100),
+                    generate_event(
+                        Some(r#"{{"path":"/x/{seq%50}","n":{seq}}}"#),
+                        vec![("host", "web-{seq%10}")],
+                        Some(generate_metric("requests.{seq%4}", 1.0)),
+                    ),
+                    vec![("service.name", "web-{seq%2}")],
+                ),
+            ),
+            ("sink", vec!["gen"], null_out()),
+        ]))
+        .expect("{seq} and {seq%N} are exactly what generate_in substitutes");
+    }
+
+    /// Rule 17: `generate_in` is a listener by role, but it has no socket, no queue, and no
+    /// decoder -- the same reason `internal` rejects a `receive:` block.
+    #[test]
+    fn a_non_default_receive_on_generate_in_is_rejected() {
+        let err = expect_err(cfg_with_receive(vec![
+            ("gen", vec![], generate_in(), non_default_receive()),
+            ("sink", vec!["gen"], null_out(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'gen'"), "got: {err}");
+        assert!(
+            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            "got: {err}"
+        );
+    }
+
+    /// Nothing in `resolve` requires the graph to be connected, and nothing objects to one
+    /// component dialling an address another binds -- which is what lets the harness's
+    /// `native-relay` scenario put both ends of a `logit_out`/`logit_in` hop in a single config,
+    /// as two disconnected chains. Rules 2/5/7 are satisfied per chain, not graph-wide.
+    #[test]
+    fn a_logit_out_and_logit_in_in_one_graph_resolve() {
+        let relay_out = ComponentKind::LogitOut {
+            endpoint: "127.0.0.1:19001".to_string(),
+            compression: Compression::None,
+            tls: None,
+            request_timeout: Duration::from_secs(10),
+        };
+        let relay_in = ComponentKind::LogitIn {
+            bind: "127.0.0.1:19001".to_string(),
+            tls: None,
+            max_frame_bytes: None,
+        };
+        let graph = resolve(cfg(vec![
+            ("gen", vec![], generate_in_with_counts(Some(2_000_000), 100, None)),
+            ("relay_out", vec!["gen"], relay_out),
+            ("relay_in", vec![], relay_in),
+            ("sink", vec!["relay_in"], null_out()),
+        ]))
+        .expect("two disconnected chains in one graph are a perfectly good pipeline");
+        assert_eq!(graph.topological_order.len(), 4);
+        assert!(graph.components["relay_out"].consumers.is_empty());
+        assert_eq!(graph.components["sink"].sources, vec!["relay_in".to_string()]);
     }
 }
