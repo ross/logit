@@ -8,7 +8,9 @@
 //! same reason `script/bench` gives): this loads the machine heavily and its numbers are only
 //! meaningful uncontended.
 
+mod attribute;
 mod compare;
+mod flamegraph;
 mod result;
 mod run;
 mod rusage;
@@ -78,19 +80,50 @@ enum Command {
     },
     /// List discovered scenarios with their `count` and whether they need SIGTERM to stop.
     List,
-    /// Per-node time attribution -- lands in W6 (docs/plans/load-test-harness.md).
+    /// Run one scenario with a temporary `internal` telemetry leg attached, then decode the dump
+    /// into a per-node breakdown of where its time went.
     Attribute {
         #[arg(long)]
-        scenario: Option<String>,
+        scenario: String,
+        /// The appended `internal` component's drain cadence -- shorter captures more of the run
+        /// but does more work inside the process being measured.
+        #[arg(long, default_value = "1s", value_parser = parse_duration)]
+        interval: Duration,
+        /// How long to wait after the completion line before SIGTERM. An `internal` leg never
+        /// self-exits, so this path is always taken.
+        #[arg(long, default_value = "1s", value_parser = parse_duration)]
+        settle: Duration,
+        /// How long to wait for the `generation complete` line before giving up on the run as
+        /// hung -- see `run --timeout`.
+        #[arg(long, default_value = "120s", value_parser = parse_duration)]
+        timeout: Duration,
+        #[arg(long = "shutdown-timeout", default_value = "30s", value_parser = parse_duration)]
+        shutdown_timeout: Duration,
         #[arg(long)]
-        interval: Option<String>,
+        no_build: bool,
+        #[arg(long, default_value = "release")]
+        profile: String,
     },
-    /// `perf`/`inferno` flamegraph generation -- lands in W6 (docs/plans/load-test-harness.md).
+    /// Profile one scenario with `perf record` and render the capture as a flamegraph SVG. Needs
+    /// the profiling image (`script/perf flamegraph ...`), which is where `perf`/`inferno` live.
     Flamegraph {
         #[arg(long)]
-        scenario: Option<String>,
+        scenario: String,
+        /// Defaults to `perf/results/<scenario>.svg`.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// `perf record -F` sampling frequency, in Hz.
+        #[arg(long, default_value_t = 999)]
+        freq: u32,
+        #[arg(long, default_value = "1s", value_parser = parse_duration)]
+        settle: Duration,
+        #[arg(long, default_value = "120s", value_parser = parse_duration)]
+        timeout: Duration,
+        #[arg(long = "shutdown-timeout", default_value = "30s", value_parser = parse_duration)]
+        shutdown_timeout: Duration,
+        /// Skip the `cargo build --profile profiling` step -- use an already-built binary as is.
+        #[arg(long)]
+        no_build: bool,
     },
 }
 
@@ -124,14 +157,46 @@ fn main() {
             run_compare(&before, &after, threshold, rss_threshold)
         }
         Command::List => run_list(&repo_root()),
-        Command::Attribute { .. } => {
-            eprintln!("logit-perf attribute: lands in W6 (docs/plans/load-test-harness.md)");
-            std::process::exit(2);
-        }
-        Command::Flamegraph { .. } => {
-            eprintln!("logit-perf flamegraph: lands in W6 (docs/plans/load-test-harness.md)");
-            std::process::exit(2);
-        }
+        Command::Attribute {
+            scenario,
+            interval,
+            settle,
+            timeout,
+            shutdown_timeout,
+            no_build,
+            profile,
+        } => attribute::attribute(
+            &repo_root(),
+            attribute::AttributeArgs {
+                scenario,
+                interval,
+                settle,
+                timeout,
+                shutdown_timeout,
+                no_build,
+                profile,
+            },
+        ),
+        Command::Flamegraph {
+            scenario,
+            out,
+            freq,
+            settle,
+            timeout,
+            shutdown_timeout,
+            no_build,
+        } => flamegraph::flamegraph(
+            &repo_root(),
+            flamegraph::FlamegraphArgs {
+                scenario,
+                out,
+                freq,
+                settle,
+                timeout,
+                shutdown_timeout,
+                no_build,
+            },
+        ),
     };
 
     if let Err(err) = result {
