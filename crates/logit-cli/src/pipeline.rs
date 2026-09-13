@@ -345,15 +345,26 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        SyslogIn { bind } => NodeSpec::Input(
-            Box::new(
-                SyslogInput::new(bind.clone())
-                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                    .with_telemetry(telemetry.clone())
-                    .with_receive(receive_config(&component.receive)),
-            ),
-            input_runtime_config(&component.receive),
-        ),
+        // The transport picks both the constructor and the matching `receive:` translation:
+        // a TCP listener has no receive queue, so it takes `tcp_receive_config`'s four
+        // batching/shutdown fields, not `receive_config`'s eight (graph rule 17,
+        // `docs/adr/syslog-tcp-ingress-and-tls.md`). `tls:` is TCP-only -- rule 43 has already
+        // rejected it under UDP, and `SyslogInput::with_tls` refuses it again on that arm.
+        SyslogIn { bind, transport, tls } => {
+            let mut input = match transport {
+                logit_config::SyslogTransport::Udp => {
+                    SyslogInput::new(bind.clone()).with_receive(receive_config(&component.receive))
+                }
+                logit_config::SyslogTransport::Tcp => SyslogInput::tcp(bind.clone())
+                    .with_tcp_receive(tcp_receive_config(&component.receive)),
+            }
+            .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry.clone());
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
         OtlpIn { bind, protocol, tls } => {
             let mut input = OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -927,6 +938,23 @@ fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::U
         max_bytes: receive.max_bytes,
         overflow: overflow_policy(receive.overflow),
         receive_buffer_bytes: receive.receive_buffer_bytes,
+        batch_max_events: receive.batch_max_events,
+        batch_max_bytes: receive.batch_max_bytes,
+        batch_flush_interval: receive.batch_flush_interval,
+        shutdown_grace: receive.shutdown_grace,
+    }
+}
+
+/// [`receive_config`]'s stream-transport sibling: a TCP listener's `TcpListenerConfig` from the
+/// same `receive:` block (`docs/adr/syslog-tcp-ingress-and-tls.md`). The queue fields
+/// (`max_datagrams`/`max_bytes`/`overflow`/`receive_buffer_bytes`) are deliberately *not*
+/// carried across -- a TCP listener has no receive queue at all, the connection's own flow
+/// control being the backpressure, which is exactly why graph rule 17 rejects those four by name
+/// on one. The four that do cross over are scoped per connection there, not per listener.
+fn tcp_receive_config(
+    receive: &logit_config::ReceiveConfig,
+) -> logit_inputs::tcp::TcpListenerConfig {
+    logit_inputs::tcp::TcpListenerConfig {
         batch_max_events: receive.batch_max_events,
         batch_max_bytes: receive.batch_max_bytes,
         batch_flush_interval: receive.batch_flush_interval,
@@ -1837,6 +1865,78 @@ mod tests {
             build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0,
             NodeSpec::Input(..)
         ));
+    }
+
+    /// A `syslog_in` component at whichever transport, with or without TLS -- the three shapes
+    /// the `SyslogIn` arm branches on.
+    fn syslog_in_component(
+        transport: logit_config::SyslogTransport,
+        tls: Option<logit_config::TlsServerConfig>,
+    ) -> ResolvedComponent {
+        ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::SyslogIn { bind: "127.0.0.1:0".to_string(), transport, tls },
+        }
+    }
+
+    #[test]
+    fn build_spec_builds_a_tcp_syslog_input() {
+        let component = syslog_in_component(logit_config::SyslogTransport::Tcp, None);
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    /// The TLS arm actually loads `testdata/tls/server.{pem,key}` -- `graph::resolve`'s rule 43
+    /// never touches the filesystem, so `build_spec` is where a bad path would first fail (the
+    /// same division of labour `build_spec_reports_a_missing_tls_ca_file_clearly` documents).
+    #[test]
+    fn build_spec_wires_a_tls_server_config_into_a_tcp_syslog_input() {
+        let component = syslog_in_component(
+            logit_config::SyslogTransport::Tcp,
+            Some(logit_config::TlsServerConfig {
+                cert_file: "server.pem".to_string(),
+                key_file: "server.key".to_string(),
+                client_ca_file: None,
+            }),
+        );
+        assert!(matches!(
+            build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    /// The default transport still builds the UDP listener, `receive:` and all.
+    #[test]
+    fn build_spec_builds_a_udp_syslog_input() {
+        let component = syslog_in_component(logit_config::SyslogTransport::Udp, None);
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    /// `tcp_receive_config` carries the four batch/shutdown fields and drops the four queue ones
+    /// -- a TCP listener has no receive queue for them to configure (graph rule 17).
+    #[test]
+    fn tcp_receive_config_carries_only_the_batch_and_shutdown_fields() {
+        let receive = logit_config::ReceiveConfig {
+            max_datagrams: 4096,
+            batch_max_events: 7,
+            batch_max_bytes: 99,
+            batch_flush_interval: Duration::from_millis(25),
+            shutdown_grace: Duration::from_secs(3),
+            ..logit_config::ReceiveConfig::default()
+        };
+        let cfg = tcp_receive_config(&receive);
+        assert_eq!(cfg.batch_max_events, 7);
+        assert_eq!(cfg.batch_max_bytes, 99);
+        assert_eq!(cfg.batch_flush_interval, Duration::from_millis(25));
+        assert_eq!(cfg.shutdown_grace, Duration::from_secs(3));
     }
 
     #[test]

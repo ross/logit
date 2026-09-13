@@ -366,15 +366,41 @@ pub enum ComponentKind {
         #[serde(default)]
         types_db: Vec<PathBuf>,
     },
-    /// RFC 3164 / RFC 5424 syslog over UDP. **Not** TCP, despite this doc comment's old claim --
-    /// `crates/logit-inputs/src/syslog.rs`'s own module doc has always said UDP-only (nginx's
-    /// `syslog:` writer is UDP-only, so a TCP accept loop would buy this listener nothing;
-    /// `docs/known-gaps.md`'s "`syslog_in` is UDP-only" entry tracks it as future, additive
-    /// work; RFC 5424 STRUCTURED-DATA is parsed into `syslog.sd`, see
-    /// `docs/adr/syslog-structured-data-convention.md`). `syslog_out` (the egress side,
-    /// `docs/adr/syslog-output.md`) supports
-    /// both UDP and TCP -- that asymmetry is deliberate, not a sign this needs fixing to match.
-    SyslogIn { bind: String },
+    /// RFC 3164 / RFC 5424 syslog, over UDP (the default) or TCP. RFC 5424 STRUCTURED-DATA is
+    /// parsed into `syslog.sd` either way -- see
+    /// `docs/adr/syslog-structured-data-convention.md`.
+    ///
+    /// Under `transport: tcp` each connection's framing is **auto-detected from its first byte**
+    /// and latched for that connection's life: an ASCII digit means RFC 6587 section 3.4.1
+    /// octet-counting (`MSG-LEN SP MSG`, the framing `syslog_out` emits, and the only one that
+    /// can carry a message containing a newline), anything else means non-transparent,
+    /// LF-delimited framing (rsyslog's `omfwd` default, and what a well-formed message's leading
+    /// `<` gives away). There is no `framing:` field to get wrong; a frame over 64 KiB, or a
+    /// malformed octet count, closes that one connection. See
+    /// `docs/adr/syslog-tcp-ingress-and-tls.md`.
+    ///
+    /// `tls:`'s mere presence turns TLS on **and makes it required** -- there is no plaintext
+    /// fallback on a TLS listener. It applies to `transport: tcp` only: DTLS is out of scope, so
+    /// `tls:` under `transport: udp` is a config error (rule 43) rather than a silently ignored
+    /// block.
+    ///
+    /// A TCP listener has no receive *queue* -- the connection's own flow control is the
+    /// backpressure -- so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
+    /// `receive_buffer_bytes`) are rejected on one (rule 17). Its batch-assembly fields
+    /// (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` do
+    /// apply, scoped **per connection**: N live connections can hold up to N times
+    /// `batch_max_events` in flight, not one shared bound.
+    SyslogIn {
+        bind: String,
+        #[serde(default)]
+        transport: SyslogTransport,
+        /// Terminates TLS on this listener when present; plaintext when omitted. Requires
+        /// `transport: tcp`. No ALPN -- like `logit_in`, and unlike `otlp_in`, this isn't an
+        /// HTTP-shaped protocol with anything for a client to negotiate down to. See
+        /// [`TlsServerConfig`].
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+    },
     /// OpenTelemetry Protocol (logs, metrics, and/or traces).
     OtlpIn {
         bind: String,
@@ -1537,11 +1563,20 @@ pub enum SpanKindConfig {
     Consumer,
 }
 
-/// `syslog_out`'s transport. UDP (the default) mirrors `syslog_in` and needs no ordering
-/// guarantee against the receiver's startup -- a fire-and-forget `send_to` before the receiver is
-/// up just loses that line, the same honest limit `syslog_in`'s own UDP intake accepts on the way
-/// in. TCP is what makes `Fault` classification (`docs/adr/buffered-sink-delivery.md`)
-/// meaningful for this sink: a connect failure is unambiguously `Fault::Clean`.
+/// The transport `syslog_in` listens on and `syslog_out` sends over -- one enum shared by both
+/// directions of the one protocol (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+///
+/// UDP is the default on both sides: it is what nginx's `syslog:` writer and most senders speak,
+/// and it needs no ordering guarantee against the receiver's startup -- a fire-and-forget
+/// `send_to` before the receiver is up just loses that line, the same honest limit `syslog_in`'s
+/// own UDP intake accepts on the way in.
+///
+/// TCP is the reliable, framed transport. On the way out it is what makes `Fault` classification
+/// (`docs/adr/buffered-sink-delivery.md`) meaningful for the sink -- a connect failure is
+/// unambiguously `Fault::Clean`; on the way in it is what a `tls:` block needs underneath it,
+/// since syslog-over-TLS (RFC 5425) is RFC 6587-framed syslog carried over TLS over TCP.
+/// `syslog_out` always emits octet-counted frames; `syslog_in` accepts either RFC 6587 framing,
+/// detected per connection.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SyslogTransport {
@@ -2976,6 +3011,57 @@ mod tests {
                 assert_eq!(paths.traces, None);
             }
             other => panic!("expected OtlpOut, got {other:?}"),
+        }
+    }
+
+    /// The default shape every pre-TCP `syslog_in:` config in the wild already has -- UDP, no
+    /// TLS -- must keep deserializing unchanged now that two fields sit behind `#[serde(default)]`
+    /// (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+    #[test]
+    fn syslog_in_defaults_to_udp_with_no_tls() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "syslog_in", "bind": "0.0.0.0:5514"}"#).unwrap();
+        match component.kind {
+            ComponentKind::SyslogIn { bind, transport, tls } => {
+                assert_eq!(bind, "0.0.0.0:5514");
+                assert_eq!(transport, SyslogTransport::Udp);
+                assert_eq!(tls, None);
+            }
+            other => panic!("expected SyslogIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn syslog_in_with_transport_tcp_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "syslog_in", "bind": "0.0.0.0:5514", "transport": "tcp"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::SyslogIn { transport, tls, .. } => {
+                assert_eq!(transport, SyslogTransport::Tcp);
+                assert_eq!(tls, None, "transport alone must not imply TLS");
+            }
+            other => panic!("expected SyslogIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn syslog_in_with_tls_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "syslog_in", "bind": "0.0.0.0:6514", "transport": "tcp",
+                "tls": {"cert_file": "server.pem", "key_file": "server.key",
+                        "client_ca_file": "ca.pem"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::SyslogIn { transport, tls: Some(tls), .. } => {
+                assert_eq!(transport, SyslogTransport::Tcp);
+                assert_eq!(tls.cert_file, "server.pem");
+                assert_eq!(tls.key_file, "server.key");
+                assert_eq!(tls.client_ca_file, Some("ca.pem".to_string()));
+            }
+            other => panic!("expected SyslogIn with tls set, got {other:?}"),
         }
     }
 
