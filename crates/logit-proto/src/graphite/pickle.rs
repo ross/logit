@@ -54,7 +54,10 @@
 //! - no string is ever copied: a string value is a `Range` into the caller's buffer, so a frame
 //!   declaring a gigabyte allocates nothing at all, it just fails the bound;
 //! - [`super::MAX_PICKLE_DEPTH`] bounds open `MARK`s, [`super::MAX_PICKLE_ITEMS`] bounds the stack,
-//!   each arena and the memo independently;
+//!   each arena and the memo independently; the memo is additionally bounded by opcodes actually
+//!   consumed, not only by that cap -- a memo key must be ordinal (one new slot per
+//!   `BINPUT`/`LONG_BINPUT`/`MEMOIZE`; `key <= self.memo.len()`), so a single `LONG_BINPUT` cannot
+//!   grow the memo to an attacker-chosen size the way a declared length could;
 //! - `LONG1`/`LONG4` accept a magnitude of at most 8 bytes -- carbon's timestamps are seconds, and
 //!   a 2 GB `LONG4` is an attack, not a datapoint;
 //! - the stack must hold **exactly one** value at `STOP`, and it must be a list.
@@ -667,13 +670,24 @@ impl PickleReader {
                 "pickle memo key {key} exceeds the {MAX_PICKLE_ITEMS}-entry cap"
             )));
         }
+        // A memo key must be ordinal: CPython's pickler hands out keys sequentially, one per
+        // `BINPUT`/`LONG_BINPUT`/`MEMOIZE`, so a real stream only ever overwrites an existing slot
+        // (`key < self.memo.len()`) or appends the next one (`key == self.memo.len()`). Anything
+        // past that sizes the memo from an attacker-chosen index rather than opcodes actually
+        // consumed -- see the module doc's "Bounds" section.
+        if key > self.memo.len() {
+            return Err(malformed(format!(
+                "pickle memo key {key} skips ahead of the {} entries written so far",
+                self.memo.len()
+            )));
+        }
         let value =
             *self.stack.last().ok_or_else(|| malformed("pickle memo put on an empty stack"))?;
         if matches!(value, PValue::Mark) {
             return Err(malformed("pickle memo put of a MARK"));
         }
-        if self.memo.len() <= key {
-            self.memo.resize(key + 1, None);
+        if key == self.memo.len() {
+            self.memo.push(None);
         }
         self.memo[key] = Some(value);
         Ok(())
@@ -1040,6 +1054,114 @@ mod tests {
         let payload = [OP_PROTO, 2, OP_BINGET, 7, OP_STOP];
         let err = read(&payload).expect_err("an unset memo key must be rejected");
         assert!(err.to_string().contains("was never set"), "{err}");
+    }
+
+    /// `PROTO 2, EMPTY_LIST, LONG_BINPUT 499999, STOP` -- the exact 9-byte frame from the review
+    /// finding this test exists to close: a `LONG_BINPUT` key with nothing behind it in the memo
+    /// used to `resize` the memo to 500,000 slots (~8 MB of `Option<PValue>`) before failing later
+    /// (or not at all). Now the ordinal check in `memo_put` rejects it immediately, so the memo
+    /// never grows past what `EMPTY_LIST` itself put on the stack -- asserted at the byte-peak
+    /// level by `graphite_pickle_never_allocates_from_a_hostile_memo_key` in
+    /// `crates/logit-proto/tests/robustness.rs`.
+    #[test]
+    fn a_memo_key_that_skips_ahead_is_rejected() {
+        let payload = [OP_PROTO, 2, OP_EMPTY_LIST, OP_LONG_BINPUT, 0x1f, 0xa1, 0x07, 0x00, OP_STOP];
+        let err = read(&payload).expect_err("a memo key past the entries written so far must fail");
+        assert!(err.to_string().contains("skips ahead"), "{err}");
+    }
+
+    /// A key at or below the memo's current length is exactly what CPython's own pickler emits --
+    /// `BINPUT`/`LONG_BINPUT`/`MEMOIZE` only ever overwrite an existing slot or append the next
+    /// one. This drives a `BINPUT` at key 0 twice: once to memoize the path string (append), once
+    /// more after building the full tuple (overwrite) -- the datapoint must still decode correctly
+    /// even though its memo slot's value changed identity partway through.
+    #[test]
+    fn a_memo_key_overwriting_an_existing_slot_still_decodes() {
+        let payload = [
+            OP_PROTO,
+            2,
+            OP_EMPTY_LIST,
+            OP_MARK,
+            OP_BINUNICODE,
+            0x03,
+            0x00,
+            0x00,
+            0x00,
+            b'a',
+            b'.',
+            b'b',
+            OP_BINPUT,
+            0x00, // memo[0] = "a.b" (append: key == memo.len() == 0)
+            OP_BININT1,
+            0x01,
+            OP_BINFLOAT,
+            0x3f,
+            0xf0,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00, // 1.0
+            OP_TUPLE2,
+            OP_TUPLE2,
+            OP_BINPUT,
+            0x00, // memo[0] = the full tuple (overwrite: key 0 < memo.len() 1)
+            OP_APPENDS,
+            OP_STOP,
+        ];
+        let (points, skipped) = read(&payload).expect("overwriting an existing memo slot decodes");
+        assert_eq!(skipped, 0);
+        assert_eq!(points, vec![point("a.b", 1.0, 1.0)]);
+    }
+
+    /// The ordinary shape a real batch takes: each new memoized value's key is exactly the memo's
+    /// current length, via `LONG_BINPUT` specifically -- the same opcode the hostile frame above
+    /// abuses, shown here appending two slots in sequence rather than skipping ahead.
+    #[test]
+    fn a_memo_key_appending_the_next_slot_still_decodes() {
+        let payload = [
+            OP_PROTO,
+            2,
+            OP_EMPTY_LIST,
+            OP_MARK,
+            OP_BINUNICODE,
+            0x03,
+            0x00,
+            0x00,
+            0x00,
+            b'x',
+            b'.',
+            b'y',
+            OP_LONG_BINPUT,
+            0x00,
+            0x00,
+            0x00,
+            0x00, // memo[0] = "x.y" (append: key == memo.len() == 0)
+            OP_BININT1,
+            0x05,
+            OP_BINFLOAT,
+            0x40,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00, // 2.0
+            OP_TUPLE2,
+            OP_TUPLE2,
+            OP_LONG_BINPUT,
+            0x01,
+            0x00,
+            0x00,
+            0x00, // memo[1] = the full tuple (append: key == memo.len() == 1)
+            OP_APPENDS,
+            OP_STOP,
+        ];
+        let (points, skipped) = read(&payload).expect("appending the next memo slot decodes");
+        assert_eq!(skipped, 0);
+        assert_eq!(points, vec![point("x.y", 5.0, 2.0)]);
     }
 
     /// Every prefix of every fixture, valid or hostile: the reader must return, never panic.
