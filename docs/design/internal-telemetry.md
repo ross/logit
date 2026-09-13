@@ -711,6 +711,11 @@ Worked examples, one per shipped component:
   `gauge_delta_unresolved` key `influxdb_out`/`statsd_out` use, `prometheus_exponential_histogram_
   skipped`, and `prometheus_accept_failed` from the scrape listener's accept loop. Retry stays a
   Layer 2 metric, though for a pull sink `send` is an in-memory upsert that has nothing to retry.
+- `null_out` (`crates/logit-outputs/src/null.rs`, `docs/plans/load-test-harness.md`): **Layer 2
+  only** -- `send` does no encoding and no I/O, so it has nothing of its own to report. The generic
+  write loop's `logit.component.batches.received`/`events.received`/`send.duration` already say
+  everything there is to say about a sink that never fails and never varies; a dedicated counter
+  here would just duplicate `events.received`.
 
 ## Metrics from Lua scripts
 
