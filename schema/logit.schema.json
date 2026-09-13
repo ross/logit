@@ -1505,7 +1505,7 @@
               "type": "string"
             },
             "max_packet_bytes": {
-              "description": "Bounds one UDP datagram's worth of packed plaintext lines (several lines newline-joined per send) -- not a single line's length, and ignored under `transport: tcp`, which has no datagram to overflow. Defaults to `\"1432\"`, the same \"commodity Ethernet LAN\" figure `statsd_out`'s own `max_packet_bytes` uses. A string via [`human_bytes`]. Rule 43 rejects `0`.",
+              "description": "Bounds one UDP datagram's worth of packed plaintext lines (several lines newline-joined per send) -- not a single line's length, and ignored under `transport: tcp`, which has no datagram to overflow. Defaults to `\"1432\"`, the same \"commodity Ethernet LAN\" figure `statsd_out`'s own `max_packet_bytes` uses. A string via [`human_bytes`]. Rule 38 rejects `0`.",
               "default": "1432",
               "type": "string"
             },

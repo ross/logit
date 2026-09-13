@@ -112,11 +112,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{lookup_host, TcpStream, UdpSocket};
 
 /// Which transport a `graphite_out` component was configured with -- the target of
-/// [`crate`]'s CLI-side `graphite_transport` converter
+/// [`crate`]'s CLI-side `graphite_out_transport` converter
 /// (`crates/logit-cli/src/pipeline.rs`), kept as its own small public enum (rather than matching
-/// `logit_config::GraphiteTransport` directly there) purely so that conversion has a named,
-/// stable signature `graphite_in` (W2)'s own converter can mirror -- see the W3 worker report for
-/// the exact shape both sides settled on. Not used internally beyond selecting
+/// `logit_config::GraphiteTransport` directly there) so that conversion has a named, stable
+/// signature. Namespaced `graphite_out_*` on the CLI side specifically because `graphite_in`
+/// converts the same `logit_config::GraphiteTransport` onto its own, different type -- a bare
+/// `graphite_transport` name would collide. Not used internally beyond selecting
 /// [`GraphiteOutput::udp`]/[`GraphiteOutput::tcp`]; [`Conn`] is this module's own internal choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
