@@ -720,6 +720,27 @@ Worked examples, one per shipped component:
   being-attempted or out of `{1, 2, 4}`), `empty_message`, `oversize_notification`, and
   `message_truncated` (an over-255-byte message). Retry stays a
   Layer 2 metric here too.
+- `graphite_out` (`crates/logit-outputs/src/graphite.rs`, `docs/adr/graphite-carbon-relay.md`):
+  **the codec emits its own counters and diagnostics directly**, `collectd_out`'s model rather than
+  `statsd_out`'s -- `logit_proto::graphite`'s module doc has the full mapping-to-counter table:
+  `logit.output.metrics.skipped{reason|metric_kind}`, `logit.output.metrics.degraded{metric_kind}`
+  (a multi-value kind expanded, once per record), `logit.output.metrics.normalized{reason=
+  "path_sanitized"|"tag_sanitized"}`, `logit.output.tags.dropped{reason="dialect"|
+  "unrepresentable"|"empty"|"collision"}`, `logit.output.tags.normalized{reason="multi_value"}` --
+  fed by this sink's `with_telemetry`/`with_diagnostics`, so both halves of one `send` show up
+  under one component id exactly as `collectd_out`'s do. This sink adds only what a socket send can
+  produce that the codec has no way to know about: `logit.output.batch.bytes`,
+  `logit.output.request.duration`, `logit.output.requests{class="ok"|"error"}` -- the same shape
+  every other sink's. `logit.output.messages` counts entries actually sent (one plaintext line, or
+  one already-length-prefixed pickle frame) and `logit.output.datapoints` counts Σ each sent
+  entry's own datapoint count (`MessageBuf<usize>`'s `meta`) -- the two coincide for plaintext
+  (every line's meta is `1`) and can differ for pickle, whose frames each carry several datapoints;
+  `logit.output.datagrams` (UDP only) counts datagrams actually sent, `collectd_out`'s identical
+  concept. `logit.output.messages.dropped{reason="oversize_datagram"}` plus a throttled
+  `oversize_datagram` diagnostic cover `EMSGSIZE` on one already-packed UDP datagram, mirroring
+  `statsd_out`'s/`collectd_out`'s identical case -- the datagram's own datapoints are dropped, not
+  the whole batch, and sending continues with the next datagram. Retry stays a Layer 2 metric here
+  too.
 - `logit_out` (`crates/logit-outputs/src/logit.rs`, [ADR
   `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md)):
   `logit.proto.frames{direction="out",codec,compression}` and `logit.proto.frame.bytes` — the
