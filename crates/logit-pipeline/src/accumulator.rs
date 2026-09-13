@@ -23,10 +23,14 @@ pub enum FlushReason {
     /// diagnosing unexpectedly small OTLP batches than an undifferentiated one.
     ScopeChange,
     Shutdown,
-    /// A tailed file is being closed (rotated away, removed, or drained past EOF) --
-    /// `logit_inputs::tail`'s only caller. Distinct from `Shutdown`: this fires while the
-    /// listener keeps running, for one file among several it may be tracking, not for the whole
-    /// component's own shutdown.
+    /// **A single tracked file or connection** is ending, and its own accumulator is flushing on
+    /// the way out: a tailed file rotated away, removed, or drained past EOF
+    /// (`logit_inputs::tail`), or a `graphite_in` TCP connection the client closed or reset, or
+    /// that was dropped for an oversize frame (`logit_inputs::graphite::tcp`). Distinct from
+    /// [`FlushReason::Shutdown`]: this fires while the listener keeps running, for one source
+    /// among several it may be tracking, not for the whole component's own shutdown. Keeping the
+    /// two apart is what stops a healthy listener from reporting
+    /// `receive.flushed{reason="shutdown"}` every time a client hangs up.
     Closed,
 }
 

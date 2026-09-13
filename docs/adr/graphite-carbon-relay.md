@@ -114,14 +114,17 @@ Substitute `_`, never delete; collisions resolved on rendered names, never on in
 
 | Field | Forbidden → `_` |
 |---|---|
-| path | ASCII whitespace, `char::is_control`, `;`, `/`, `\` |
+| path | whitespace (`char::is_whitespace`, matching carbon's `str.split()`), `char::is_control`, `;`, `/`, `\` |
 | tag name | `;` `!` `^` `=`, whitespace, control |
 | tag value | `;`, whitespace, control; a **leading** `~` only |
 
 `/` and `\` are substituted in paths specifically because Whisper stores a path's dot-separated
 segments as filesystem directory components — the same reasoning `collectd_out`'s
 `escape_slashes`-derived sanitization already applies to identity fields, applied here to the one
-field Graphite's own wire format treats the same way.
+field Graphite's own wire format treats the same way. The path field forbids Unicode whitespace
+rather than ASCII-only because carbon's plaintext receiver splits a decoded Python `str` with
+`str.split()`, which is Unicode-aware; sanitizing only ASCII would let a U+00A0 survive encode and
+re-split into a spurious fourth field on decode, breaking the pair's fixed point.
 
 ### `multi_value: expand` sub-paths
 
