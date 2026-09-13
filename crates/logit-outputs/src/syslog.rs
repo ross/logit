@@ -1657,9 +1657,10 @@ impl TcpDial<'_> {
     }
 
     /// One fresh connection: TCP connect, then -- when `tls` is set -- the RFC 5425 TLS
-    /// handshake, both raced against the same `connect_timeout` (one operator knob for "how long
-    /// may getting a usable connection take") and both `Fault::Clean` for the same reason:
-    /// nothing of this batch can have left the host while a connection is still being
+    /// handshake. Each phase is raced against `connect_timeout` *separately*, exactly as
+    /// `logit_out` races every step of its own connect against `self.timeout`, so a TLS connect
+    /// can take up to twice the configured value. Both phases fault `Fault::Clean` for the same
+    /// reason: nothing of this batch can have left the host while a connection is still being
     /// established. Copied from `logit_out`'s `connect_and_handshake`
     /// (`crates/logit-outputs/src/logit.rs`), which dials the identical bare-`host:port`-plus-SNI
     /// shape.
