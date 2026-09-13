@@ -249,6 +249,24 @@ impl SyslogInput {
         self
     }
 
+    /// Overrides a **TCP** listener's per-phase pre-message budget (`handshake_timeout:` in
+    /// config): the TLS accept when `tls:` is set, and the wait for the connection's first byte.
+    /// Delegates straight to [`TcpListener::with_handshake_timeout`], whose own doc comment and
+    /// this module's driver ("Pre-handshake timeout") describe what each phase covers.
+    ///
+    /// A UDP listener is left untouched rather than failing, exactly like [`Self::with_receive`]/
+    /// [`Self::with_tcp_receive`]: there is no connection on that transport for the value to
+    /// bound, so there is nothing to apply and nothing to refuse. Graph rule 45 is what tells an
+    /// operator who set a non-default value under `transport: udp` that it could never take
+    /// effect -- unlike `tls:`, whose [`Self::with_tls`] arm does fail, because `tls:` has no
+    /// default and its mere presence is an instruction.
+    pub fn with_handshake_timeout(mut self, handshake_timeout: std::time::Duration) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_handshake_timeout(handshake_timeout));
+        }
+        self
+    }
+
     /// Terminates TLS on a TCP listener (`tls:` in config, RFC 5425) -- delegates straight to
     /// [`TcpListener::with_tls`], which resolves every path in `settings` against `base_dir`.
     ///

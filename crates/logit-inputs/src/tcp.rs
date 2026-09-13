@@ -37,7 +37,9 @@
 //! any TLS accept, and counted as `logit.input.connections.rejected{reason="limit"}`. The
 //! `logit.input.connections` gauge correspondingly counts permit holders only.
 //!
-//! **Pre-handshake timeout.** [`HANDSHAKE_TIMEOUT`] bounds each of a connection's two pre-message
+//! **Pre-handshake timeout.** [`HANDSHAKE_TIMEOUT`] -- the default behind `syslog_in`'s
+//! operator-facing `handshake_timeout:` field, which overrides it via
+//! [`TcpListener::with_handshake_timeout`] -- bounds each of a connection's two pre-message
 //! phases *independently*, exactly as `logit_in` bounds its own two: the TLS accept (in the accept
 //! loop's `Some` arm, when TLS is configured) and then the wait for the connection's very first
 //! byte, inside [`serve_connection`], which starts a fresh budget of the same length rather than
@@ -81,6 +83,10 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 /// arms, plaintext included -- the wait for the connection's first byte. Each phase gets its own
 /// budget of this length, so a TLS connection that says nothing at all costs two of them. See this
 /// module's "Pre-handshake timeout" doc section.
+///
+/// The *default* only: `syslog_in`'s `handshake_timeout:` config field overrides it through
+/// [`TcpListener::with_handshake_timeout`]. `logit_config`'s own `default_handshake_timeout`
+/// mirrors this number by hand (it cannot depend on this crate).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The largest single frame this driver will assemble, in bytes, for either framing.
@@ -564,11 +570,12 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
         self
     }
 
-    /// Test-only override of [`HANDSHAKE_TIMEOUT`] -- shortens both pre-message budgets (the TLS
-    /// accept and the first-byte wait, on either arm) so a test can observe a permit actually
-    /// coming back without a multi-second sleep.
-    #[cfg(test)]
-    fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
+    /// Overrides [`HANDSHAKE_TIMEOUT`] for both pre-message budgets (the TLS accept and the
+    /// first-byte wait, on either arm) -- what `syslog_in`'s `handshake_timeout:` config field
+    /// sets, through `SyslogInput::with_handshake_timeout`. The constant stays the default when
+    /// this is never called; a test uses it to observe a permit actually coming back without a
+    /// multi-second sleep. Graph rule 45 rejects `0s` before it can reach here.
+    pub fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
         self.handshake_timeout = handshake_timeout;
         self
     }
