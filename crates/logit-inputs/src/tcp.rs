@@ -1322,11 +1322,18 @@ mod tests {
     /// Reads one byte, expecting the peer to have closed instead.
     async fn expect_closed<S: AsyncRead + Unpin>(stream: &mut S, what: &str) {
         let mut buf = [0u8; 1];
-        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+        let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
             .await
-            .unwrap_or_else(|_| panic!("{what}: expected a close within 2s"))
-            .expect("read should not fail outright");
-        assert_eq!(n, 0, "{what}: expected a close, got a byte");
+            .unwrap_or_else(|_| panic!("{what}: expected a close within 2s"));
+        match result {
+            Ok(n) => assert_eq!(n, 0, "{what}: expected a close, got a byte"),
+            // A close with bytes still unread in the peer's receive queue is an RST, not a FIN
+            // (Linux `tcp_close`), and a read after RST is `ECONNRESET` -- still a close. The
+            // oversize-frame test writes more than the server ever reads, so which of the two it
+            // gets depends on socket-buffer sizes rather than on anything under test.
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(err) => panic!("{what}: read failed outright: {err}"),
+        }
     }
 
     /// The value of `metric`'s `Sum` in a drained `Registry` snapshot, optionally restricted to
