@@ -1189,7 +1189,7 @@ pub enum ComponentKind {
     /// path, tags, value and timestamp round-trip through the real `GraphiteDecoder` on the
     /// other end. See `docs/adr/graphite-carbon-relay.md` and
     /// `docs/plans/graphite-carbon-relay.md`. Unlike `collectd_out`, both transports are
-    /// supported (carbon's own plaintext listener speaks either); pickle is TCP-only (rule 43).
+    /// supported (carbon's own plaintext listener speaks either); pickle is TCP-only (rule 46).
     GraphiteOut {
         /// `host:port`. Resolved at send time, never at config-load time -- the same
         /// `statsd_out`/`collectd_out` precedent.
@@ -1220,7 +1220,7 @@ pub enum ComponentKind {
         /// The longest pickle payload this sink will pack into one length-prefixed frame.
         /// Defaults to `"1MiB"`, Twisted's own `Int32StringReceiver.MAX_LENGTH` -- the same bound
         /// carbon's own pickle receiver enforces, so a relay never writes a frame the far end
-        /// would refuse. A string via [`human_bytes`]. Rule 43 bounds it `1024..=16MiB` and
+        /// would refuse. A string via [`human_bytes`]. Rule 46 bounds it `1024..=16MiB` and
         /// rejects `0`.
         #[serde(default = "default_graphite_max_frame_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
@@ -1831,7 +1831,7 @@ pub enum StatsdFormat {
 }
 
 /// `graphite_in`'s and `graphite_out`'s transport. TCP is the default, matching carbon's own
-/// default listener (plaintext on port 2003); UDP is carbon's other plaintext mode -- rule 43
+/// default listener (plaintext on port 2003); UDP is carbon's other plaintext mode -- rule 46
 /// rejects `protocol: pickle` under `transport: udp`, since Twisted's length-prefixed pickle
 /// framing has no meaning in a datagram. Deliberately its own enum rather than a reused
 /// `StatsdTransport`, for the reason that type's own doc comment gives: schemars publishes a

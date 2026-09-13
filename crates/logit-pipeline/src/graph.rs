@@ -5270,7 +5270,7 @@ mod tests {
         assert!(err.contains("'out'") && err.contains("sink"), "got: {err}");
     }
 
-    /// Rule 43: pickle over UDP is rejected -- Twisted's length-prefixed framing has no meaning
+    /// Rule 46: pickle over UDP is rejected -- Twisted's length-prefixed framing has no meaning
     /// in a datagram.
     #[test]
     fn a_pickle_graphite_out_on_udp_is_rejected() {
@@ -5335,7 +5335,7 @@ mod tests {
         assert!(err.contains("'out'") && err.contains("max_packet_bytes: 0"), "got: {err}");
     }
 
-    /// Rule 43: `max_frame_bytes` outside `1024..=16 MiB` is rejected, both below and above.
+    /// Rule 46: `max_frame_bytes` outside `1024..=16 MiB` is rejected, both below and above.
     #[test]
     fn a_max_frame_bytes_outside_its_range_is_rejected() {
         for bad in [0u64, 1023, 16 * 1024 * 1024 + 1] {
@@ -5379,7 +5379,7 @@ mod tests {
         }
     }
 
-    /// Rule 43: a zero `connect_timeout` could never establish a TCP connection.
+    /// Rule 46: a zero `connect_timeout` could never establish a TCP connection.
     #[test]
     fn a_zero_connect_timeout_graphite_out_is_rejected() {
         let err = expect_err(cfg(vec![

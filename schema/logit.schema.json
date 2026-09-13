@@ -1575,7 +1575,7 @@
           }
         },
         {
-          "description": "Carbon plaintext or pickle egress -- the mirror of `graphite_in`, and a real relay: path, tags, value and timestamp round-trip through the real `GraphiteDecoder` on the other end. See `docs/adr/graphite-carbon-relay.md` and `docs/plans/graphite-carbon-relay.md`. Unlike `collectd_out`, both transports are supported (carbon's own plaintext listener speaks either); pickle is TCP-only (rule 43).",
+          "description": "Carbon plaintext or pickle egress -- the mirror of `graphite_in`, and a real relay: path, tags, value and timestamp round-trip through the real `GraphiteDecoder` on the other end. See `docs/adr/graphite-carbon-relay.md` and `docs/plans/graphite-carbon-relay.md`. Unlike `collectd_out`, both transports are supported (carbon's own plaintext listener speaks either); pickle is TCP-only (rule 46).",
           "type": "object",
           "required": [
             "endpoint",
@@ -1592,7 +1592,7 @@
               "type": "string"
             },
             "max_frame_bytes": {
-              "description": "The longest pickle payload this sink will pack into one length-prefixed frame. Defaults to `\"1MiB\"`, Twisted's own `Int32StringReceiver.MAX_LENGTH` -- the same bound carbon's own pickle receiver enforces, so a relay never writes a frame the far end would refuse. A string via [`human_bytes`]. Rule 43 bounds it `1024..=16MiB` and rejects `0`.",
+              "description": "The longest pickle payload this sink will pack into one length-prefixed frame. Defaults to `\"1MiB\"`, Twisted's own `Int32StringReceiver.MAX_LENGTH` -- the same bound carbon's own pickle receiver enforces, so a relay never writes a frame the far end would refuse. A string via [`human_bytes`]. Rule 46 bounds it `1024..=16MiB` and rejects `0`.",
               "default": "1048576",
               "type": "string"
             },
@@ -2041,7 +2041,7 @@
       ]
     },
     "GraphiteTransport": {
-      "description": "`graphite_in`'s and `graphite_out`'s transport. TCP is the default, matching carbon's own default listener (plaintext on port 2003); UDP is carbon's other plaintext mode -- rule 43 rejects `protocol: pickle` under `transport: udp`, since Twisted's length-prefixed pickle framing has no meaning in a datagram. Deliberately its own enum rather than a reused `StatsdTransport`, for the reason that type's own doc comment gives: schemars publishes a type's name into the schema's `$defs`, so sharing one would make `graphite_in`/`graphite_out` document their transport by pointing at a statsd-named type.",
+      "description": "`graphite_in`'s and `graphite_out`'s transport. TCP is the default, matching carbon's own default listener (plaintext on port 2003); UDP is carbon's other plaintext mode -- rule 46 rejects `protocol: pickle` under `transport: udp`, since Twisted's length-prefixed pickle framing has no meaning in a datagram. Deliberately its own enum rather than a reused `StatsdTransport`, for the reason that type's own doc comment gives: schemars publishes a type's name into the schema's `$defs`, so sharing one would make `graphite_in`/`graphite_out` document their transport by pointing at a statsd-named type.",
       "type": "string",
       "enum": [
         "tcp",
