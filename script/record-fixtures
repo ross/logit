@@ -1,6 +1,6 @@
 #!/bin/bash
 # Usage: script/record-fixtures [producer ...]
-#   Producers: logger, python-syslog-handler, rsyslog, collectd, otlp
+#   Producers: logger, python-syslog-handler, rsyslog, collectd, otlp, graphite
 #   With no arguments, records every producer in `all` below.
 #
 # Captures real wire traffic from real third-party producers (syslog senders, OTel SDKs) into
@@ -226,9 +226,68 @@ record_otlp() {
     ${DOCKER} rm -f otelcol >/dev/null 2>&1 || true
 }
 
+# Graphite/Carbon, via two real producers speaking carbon's two wire protocols, both captured
+# through raw_capture.py's `--proto tcp` mode (one file per accepted connection): W4a of
+# `docs/plans/graphite-carbon-relay.md`.
+#
+# **Plaintext, via collectd's `write_graphite` plugin** -- the same `load`/`memory`/`interface`
+# read plugins `collectd.conf` uses (see that file's comments), but a different output plugin
+# entirely: `write_graphite` is a real carbon plaintext *sender*, exercising
+# `crates/logit-proto/src/graphite/decode.rs`'s line grammar against something other than this
+# codec's own encoder. One connection, not several, on purpose: `write_graphite`'s `<Node>` block
+# opens one TCP connection at startup and keeps writing every flush cycle's lines to it,
+# reconnecting only on a write error -- unlike collectd's `network` plugin (which flushes
+# complete, self-contained UDP datagrams), there is exactly one natural capture unit here: the
+# whole connection's byte stream, spanning several one-second read cycles.
+# `crates/logit-inputs/src/graphite/mod.rs`'s `interop_fixture_write_graphite_plaintext_decodes`
+# feeds the file to the decoder as one buffer of complete `\n`-terminated lines for exactly this
+# reason. 90s timeout matches `record_collectd`'s, for the same reason: an `apt-get install
+# collectd-core` has to finish first.
+#
+# **Pickle, via `tools/record-fixtures/python_graphite_pickle_producer.py`** -- a stdlib-only
+# (`pickle`, `struct`, `socket`) sender exercising the *other* carbon wire protocol, the
+# length-prefixed pickle batch, at `protocol=2` and `protocol=-1` (Python's "highest available",
+# which resolves to protocol 5 on `python:3.12-slim`). Two separate captures, not one: each
+# protocol needs its own fixture file so a consuming test can pin down which opcodes it is
+# checking against (protocol -1 is the one that emits FRAME/SHORT_BINUNICODE/MEMOIZE -- see that
+# script's own docstring). `python3 --version` is printed alongside the script's own
+# `pickle.HIGHEST_PROTOCOL` line so `testdata/interop/graphite/README.md`'s provenance table can
+# record both.
+record_graphite() {
+    echo "== recording: collectd write_graphite plugin (plaintext TCP, debian:bookworm-slim) =="
+    local out="${OUT_ROOT}/graphite"
+    start_capture tcp 2003 "${out}" write-graphite 1 90
+    # RUN_SECONDS=3, not collectd-entrypoint.sh's default 10: write_graphite holds one TCP
+    # connection open for as long as collectd runs (unlike `network`'s UDP datagrams, which flush
+    # and stop well before the default elapses), so the fixture size is directly proportional to
+    # this -- three read cycles at `Interval 1` is already "several", per this function's own
+    # top comment, and keeps the capture in the same size class as this corpus's other fixtures.
+    ${DOCKER} run --rm --network "${NET}" -e RUN_SECONDS=3 \
+        -v "${TOOLS_DIR}/collectd-write-graphite.conf:/etc/collectd-fixture.conf:ro,z" \
+        -v "${TOOLS_DIR}/collectd-entrypoint.sh:/entrypoint.sh:ro,z" \
+        debian:bookworm-slim bash /entrypoint.sh
+    finish_capture
+
+    echo "== recording: stdlib pickle producer (protocol 2) =="
+    start_capture tcp 2004 "${out}" graphite-pickle-p2 1
+    ${DOCKER} run --rm --network "${NET}" \
+        -v "${TOOLS_DIR}/python_graphite_pickle_producer.py:/producer/run.py:ro,z" \
+        -w /producer python:3.12-slim \
+        bash -c "python3 --version && python3 run.py --host capture --port 2004 --protocol 2"
+    finish_capture
+
+    echo "== recording: stdlib pickle producer (protocol -1, highest) =="
+    start_capture tcp 2004 "${out}" graphite-pickle-p5 1
+    ${DOCKER} run --rm --network "${NET}" \
+        -v "${TOOLS_DIR}/python_graphite_pickle_producer.py:/producer/run.py:ro,z" \
+        -w /producer python:3.12-slim \
+        bash -c "python3 --version && python3 run.py --host capture --port 2004 --protocol -1"
+    finish_capture
+}
+
 # ---- entry point ----------------------------------------------------------------------------------
 
-all=(logger python-syslog-handler rsyslog collectd otlp)
+all=(logger python-syslog-handler rsyslog collectd otlp graphite)
 
 producers=("$@")
 if [ "${#producers[@]}" -eq 0 ]; then
@@ -245,6 +304,7 @@ for p in "${producers[@]}"; do
     rsyslog) record_rsyslog ;;
     collectd) record_collectd ;;
     otlp) record_otlp ;;
+    graphite) record_graphite ;;
     *)
         echo "record-fixtures: unknown producer '${p}'" >&2
         exit 1
