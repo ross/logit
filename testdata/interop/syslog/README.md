@@ -1,8 +1,9 @@
 # Syslog interop fixtures
 
-Raw UDP datagrams, captured verbatim by `tools/record-fixtures/raw_capture.py` -- **no parsing, no
-re-encoding.** Each file is exactly the bytes a real sender put on the wire; `logit`'s own encoder
-never touches these. Regenerate with `script/record-fixtures logger python-syslog-handler rsyslog rsyslog-tcp`
+Raw wire bytes -- one UDP datagram, or one TCP connection's byte stream -- captured verbatim by
+`tools/record-fixtures/raw_capture.py` -- **no parsing, no re-encoding.** Each file is exactly the
+bytes a real sender put on the wire; `logit`'s own encoder never touches these. Regenerate with
+`script/record-fixtures logger python-syslog-handler rsyslog rsyslog-tcp`
 (see `../README.md` and `script/record-fixtures`'s own header comment).
 
 | File | Producer | Invocation | Captured | Construct exercised |
