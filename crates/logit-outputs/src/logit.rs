@@ -57,6 +57,11 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (both sinks share the one definition in `crate::tls`).
 pub use crate::tls::TlsClientSettings;
 
+/// The TLS-adjacent pieces every raw-TCP sink shares, defined once in `crate::tls`:
+/// `AsyncStream` erases "plain or TLS-wrapped stream" behind one object-safe trait, and
+/// `host_only` derives the SNI name from a bare `host:port` endpoint.
+use crate::tls::{host_only, AsyncStream};
+
 /// A live, handshaken connection -- everything about it that only exists once the handshake has
 /// actually happened.
 struct Conn {
@@ -81,12 +86,6 @@ struct Conn {
     /// itself.
     seq: u64,
 }
-
-/// A plain `TcpStream` or a TLS-wrapped one, behind one object-safe trait so [`Conn`] doesn't
-/// need to be generic (a sink field can't be, without boxing the whole [`LogitOutput`] itself
-/// generic in a way `logit-cli::pipeline::build_spec` would have to know about).
-trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
 
 pub struct LogitOutput {
     endpoint: String,
@@ -312,20 +311,6 @@ fn reject_is_permanent(code: u16) -> bool {
             | control::REJECT_NO_COMMON_CODEC
             | control::REJECT_FRAME_TOO_LARGE
     )
-}
-
-/// The host part of a bare `host:port` endpoint -- `rsplit_once` so a bracketed IPv6 literal's
-/// own colons don't confuse this (an IPv6 endpoint here would need brackets, `[::1]:1234`, the
-/// same convention `syslog_out`/every other bare `host:port` field in this codebase leaves to the
-/// operator to write correctly; this only avoids splitting on the wrong colon, not validating the
-/// address itself).
-fn host_only(endpoint: &str) -> &str {
-    endpoint
-        .rsplit_once(':')
-        .map(|(host, _port)| host)
-        .unwrap_or(endpoint)
-        .trim_start_matches('[')
-        .trim_end_matches(']')
 }
 
 #[async_trait::async_trait]
