@@ -1,0 +1,29 @@
+# Aggregation + flush-tick cost (docs/plans/load-test-harness.md's scenario table): generate_in
+# stamps a distribution metric with 1000 distinct series (`host: h{seq%1000}`), aggregate sketches
+# each series into a 1s tumbling window, null_out discards the flushed windows. Measures both the
+# per-event `DdSketch::add` cost and the periodic flush-tick cost across a wide series cardinality
+# -- unlike passthrough/json-parse's handful of attribute values, 1000 live `SeriesKey`s is enough
+# for the flush tick's own work (walking the series map, building one output batch per window) to
+# show up in the numbers, not just the per-event insert.
+#
+#   script/perf run --scenario aggregate
+components:
+  gen:
+    type: generate_in
+    count: 20000000
+    event:
+      attributes:
+        host: "h{seq%1000}"
+      metric:
+        name: req.latency
+        kind: distribution
+        value: 12.5
+
+  windowed:
+    type: aggregate
+    sources: [gen]
+    interval: 1s
+
+  out:
+    type: null_out
+    sources: [windowed]
