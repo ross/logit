@@ -1085,6 +1085,17 @@ already built that have a known, accepted rough edge.
   qualification stated plainly, and `crates/logit-proto/src/otlp/metrics.rs`'s module doc for the
   full encode/decode tables this summarizes.
 
+- **`prometheus_out`'s "a sketch has no sum" claim is stale.** The `encode (Prometheus)`
+  `MetricKind::Distribution`/`Samples` row above says the rendered OpenMetrics `summary` omits
+  `_sum` because "a `DDSketch` has no sum to report" — that was true when the row was written, but
+  `logit_core::DdSketch::sum` (`crates/logit-core/src/metric.rs`) is exact now (the inner crate
+  accumulates it as a plain `f64` alongside the bins, and adds the two sums on `merge`), a fact
+  `crates/logit-proto/src/graphite/mod.rs`'s module doc leans on directly: `graphite_out`'s own
+  `multi_value: expand` **does** emit `.sum` for the identical sketch. So `prometheus_out` could
+  emit a real `_sum` line for the same summary today with no new computation, only a changed
+  `write!`. Filed here rather than fixed as part of the Graphite/Carbon relay effort that noticed
+  it (`docs/plans/graphite-carbon-relay.md`'s W4b closeout) — a candidate follow-up for whoever
+  next touches `crates/logit-proto/src/prometheus/mod.rs`, not a bug in this effort's own scope.
 - **`otlp_in`'s `partial_success` response is always empty.** OTLP's
   `Export*ServiceResponse.partial_success` field exists so a receiver can accept most of a request
   while reporting which records it rejected — `otlp_out` (`crates/logit-outputs/src/otlp.rs`) fully

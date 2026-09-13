@@ -405,6 +405,10 @@ tag set and a timestamp.
 `graphite_in` ([ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md)) is a carbon receiver:
 point a `write_graphite` plugin, a StatsD backend, a `carbon-relay` or anything else that speaks
 carbon at it. It is one component with two settings that change a great deal about how it behaves.
+[`examples/graphite-relay.yaml`](../examples/graphite-relay.yaml) is the like-for-like runnable
+topology (`graphite_in` straight into `graphite_out`, every default present as a commented
+reference); [`examples/statsd-to-graphite.yaml`](../examples/statsd-to-graphite.yaml) is the
+cross-protocol one, `statsd_in` through an `aggregate` window into `graphite_out`.
 
 - **`transport:` picks the driver.** `tcp` is the default, matching carbon's own default listener
   (plaintext on port 2003). A TCP listener serves up to 1024 connections at once; one arriving past
@@ -510,7 +514,8 @@ reference. Three things worth knowing before deploying one:
 are supported — carbon's own plaintext listener (port 2003) speaks either UDP or TCP — and there is
 a second wire protocol entirely, carbon's length-prefixed pickle batch format (port 2004, **TCP
 only**: a length prefix has no meaning in a datagram, and `logit validate` rejects `protocol:
-pickle` under `transport: udp`). Four things worth knowing before deploying one:
+pickle` under `transport: udp`). See `graphite_in`'s own section above for the two runnable
+examples pointing at this sink. Four things worth knowing before deploying one:
 
 - **There is no `graphite.*` carrier, unlike `collectd_out`'s `collectd.*` or `syslog_out`'s
   `syslog.*`.** The wire path *is* [`MetricRecord::name`](design/data-model.md) — there is no
