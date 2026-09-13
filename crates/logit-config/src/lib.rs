@@ -440,9 +440,10 @@ pub enum ComponentKind {
         /// wrap without reimplementing that sniff, and one `hyper`'s own
         /// `http1().header_read_timeout(..)` does not cover either (it starts only once the
         /// version is already known). Under `protocol: grpc` there is no such knob at all.
-        /// So on `otlp_in` a handshaken-then-silent connection still holds its permit: the same
-        /// open row as the post-handshake idle case (`docs/known-gaps.md`'s "no idle-connection
-        /// timeout on a TCP listener").
+        /// So on `otlp_in` a handshaken-then-silent connection still holds its permit (the same
+        /// open row as the post-handshake idle case, `docs/known-gaps.md`'s "no idle-connection
+        /// timeout on a TCP listener"), and a plaintext one is not bounded at any point at all
+        /// (`docs/known-gaps.md`'s "a plaintext `otlp_in` has no pre-first-byte bound").
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,

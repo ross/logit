@@ -49,9 +49,15 @@
 //! `http1().header_read_timeout(..)` is not that bound either: it starts only once the version is
 //! already decided, so a connection that says *nothing* never reaches it (and under
 //! `protocol: grpc`, served by `hyper::server::conn::http2::Builder`, there is no such knob at
-//! all). So a handshaken-then-silent connection here still holds its permit, which is the same
-//! open row as the post-handshake idle case -- `docs/known-gaps.md`'s "no idle-connection timeout
-//! on a TCP listener," deliberately left to its own effort rather than half-built per transport.
+//! all). So a handshaken-then-silent TLS connection here still holds its permit, the same open
+//! question as the post-handshake idle case (`docs/known-gaps.md`'s "no idle-connection timeout on
+//! a TCP listener," deliberately left to its own effort rather than half-built per transport) --
+//! and a **plaintext** listener, which has no TLS accept for this field to bound, has no
+//! pre-message bound at any point: `docs/known-gaps.md`'s "a plaintext `otlp_in` has no
+//! pre-first-byte bound" row, which also records why that one is worse here than on
+//! `logit_in`/`syslog_in` (this loop *blocks* on `acquire_owned` rather than rejecting at the cap)
+//! and what closing it would take. Graph rule 45 rejects a non-default `handshake_timeout` on a
+//! plaintext `otlp_in` rather than letting it look as though it does something.
 //!
 //! **Gzip is supported; nothing else is.** `Content-Encoding: gzip` (HTTP) and a gRPC frame's own
 //! compressed flag plus `grpc-encoding: gzip` are both decoded via [`inflate`]; any other declared
