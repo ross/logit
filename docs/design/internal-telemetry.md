@@ -478,15 +478,23 @@ Worked examples, one per shipped component:
   `logit.input.frames` / `logit.input.frame.bytes` (count/sum), the stream twin of
   `logit.input.datagrams`/`.datagram.bytes` at the transport's own unit, an RFC 6587 frame; and
   `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}` (count) — the same
-  per-reason shape `logit.proto.errors{reason}` uses, for a frame over the 64 KiB ceiling, an
-  octet count RFC 6587 §3.4.1's grammar doesn't permit, and a peer that closed mid-frame under
-  octet counting. Each of the three ends that one connection (neither framing can resynchronize)
-  and is diagnosed on its own `framing_error` key, distinct from the driver's `bad_frame` (a frame
-  the decoder rejected, connection kept) and `connection_error` (I/O, or a TLS handshake that
-  failed or timed out). No `ReceiveQueue` and so none of the `receive_buffer.*` table above on
-  this path — the connection's own flow control is the queue (graph rule 17). There is no
-  TLS-specific metric on either transport: a handshake failure surfaces through the same
-  connection-error diagnostics any other transport failure would.
+  per-reason shape `logit.proto.errors{reason}` uses. `oversize` is a frame over the 64 KiB
+  ceiling and `malformed` an octet count RFC 6587 §3.4.1's grammar doesn't permit; either ends
+  that connection, since neither framing can resynchronize past one. `truncated` is every way a
+  partial frame gets dropped instead of emitted: a clean EOF mid-frame under octet counting, and —
+  on **either** framing — a connection that ended without one at all, a peer RST mid-message or
+  this listener shutting down before the sender finished. (Under non-transparent framing a clean
+  EOF is *not* truncation: a terminator-less remainder is an ordinary final message and is
+  emitted.) All three report on one `framing_error` diagnostic key, distinct from the driver's
+  `bad_frame` (a frame the decoder itself rejected, connection kept) and `connection_error` (I/O,
+  a TLS handshake that failed or timed out, or a connection that sent no first byte inside the
+  handshake budget and so gave its permit back). Those two frame keys share one listener-wide
+  throttle rather than a per-connection one, so a peer looping connect / bad-frame / close is
+  throttled like any other repeated failure instead of warning once per TCP handshake. No
+  `ReceiveQueue` and so none of the `receive_buffer.*` table above on this path — the connection's
+  own flow control is the queue (graph rule 17). There is no TLS-specific metric on either
+  transport: a handshake failure surfaces through the same connection-error diagnostics any other
+  transport failure would.
 - `collectd_in` (`crates/logit-inputs/src/collectd.rs`,
   [ADR `collectd-binary-relay`](../adr/collectd-binary-relay.md)): **no layer-3 counters of its
   own** — the same `logit.input.datagrams`/`.datagram.bytes` pair and the whole `ReceiveQueue`/
