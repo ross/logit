@@ -126,7 +126,9 @@ fields.
   `crates/logit-outputs/src/tls.rs` as `pub(crate)`; `logit.rs` uses them from there (own,
   behavior-preserving commit).
 - `SyslogOutput` gains `tls: Option<Arc<rustls::ClientConfig>>` + `has_connected_once: bool`;
-  `with_tls(&TlsClientSettings, base_dir)` with an `is_empty()` early return and the
+  `with_tls(&TlsClientSettings, base_dir)` -- no `is_empty()` early return (presence is decided by
+  the `Option<TlsClientConfig>` at the call site, the same as `logit_out`'s own `with_tls`, so an
+  empty `tls: {}` block still means TLS with the bundled Mozilla roots) -- plus the
   `insecure_skip_verify` warning `otlp_out` already logs (`logit_out` omits it today; don't copy
   that omission here).
 - `send_tcp`: only the `None =>` connect branch changes, to `logit.rs`'s path (TCP connect, then

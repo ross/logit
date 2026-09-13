@@ -60,11 +60,11 @@ publishes -- see "Config surface" below) and `#[serde(default)] tls: Option<TlsS
 ### Framing is auto-detected per connection, not configured
 
 There is no `framing:` field. Each accepted connection peeks its first byte: an ASCII digit means
-RFC 6587 §3.4.1 octet-counting (`MSG-LEN SP SYSLOG-MSG`, MSG-LEN a decimal byte count with no
-leading zero); anything else means non-transparent (LF-delimited) framing, because a well-formed
-syslog message always begins with `<`PRI`>` -- never a digit. The result is latched for the
-connection's whole life; a sender does not switch framing mid-connection, and there is no
-in-band signal that would let one.
+RFC 6587 §3.4.1 octet-counting (`MSG-LEN SP SYSLOG-MSG`, where MSG-LEN is that section's own
+`NONZERO-DIGIT *DIGIT` production -- a decimal byte count with no leading zero); anything else means
+non-transparent (LF-delimited) framing, because a well-formed syslog message always begins with
+`<`PRI`>` -- never a digit. The result is latched for the connection's whole life; a sender does not
+switch framing mid-connection, and there is no in-band signal that would let one.
 
 This is not a novel heuristic invented for this ADR -- it is the same detection Grafana Alloy's
 `loki.source.syslog` receiver already performs (`go-syslog`'s `syslogparser.ParseStream` peeks the
@@ -201,12 +201,16 @@ reconnect once and retry the whole frame) while any failure after that proves at
 landed (`Fault::Ambiguous`, never resent). Only the `None =>` connect arm changes; the invariants
 that make the rest of the function correct are transport-agnostic and untouched.
 
-`SyslogOutput` gains `with_tls(&TlsClientSettings, base_dir)` (an `is_empty()` early return, and
-the `insecure_skip_verify` startup warning `otlp_out` already logs -- `logit_out` omits that
-warning today, which this decision does not copy) and a `logit.output.reconnects` counter,
-incremented on every connect after the first -- the same signal `logit_out` already publishes for
-its own reconnects, giving `syslog_out` parity rather than a differently-shaped metric for the same
-event.
+`SyslogOutput` gains `with_tls(&TlsClientSettings, base_dir)`. Because `tls` is
+`Option<TlsClientConfig>` here -- presence itself is what turns TLS on, decided at the call site in
+`crates/logit-cli/src/pipeline.rs`, not inside the builder -- `with_tls` has no `is_empty()` early
+return of its own: like `logit_out`'s own `with_tls`, it always builds a `rustls::ClientConfig` from
+whatever `settings` it's given, so an explicit but otherwise-empty `tls: {}` block still means TLS,
+with the bundled Mozilla root set as trust. It does gain the `insecure_skip_verify` startup warning
+`otlp_out` already logs -- `logit_out` omits that warning today, which this decision does not copy
+-- and a `logit.output.reconnects` counter, incremented on every connect after the first -- the same
+signal `logit_out` already publishes for its own reconnects, giving `syslog_out` parity rather than
+a differently-shaped metric for the same event.
 
 ## Alternatives considered
 
