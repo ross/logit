@@ -441,6 +441,89 @@ fn collectd_decode_one_list_with_types_db_resolution() {
     expect_allocs("collectd_in: decode 1 list with types.db", stats, 2);
 }
 
+// -- graphite_in (docs/adr/graphite-carbon-relay.md) --------------------------------------------
+
+/// One allocation, matching `syslog_in`/`collectd_in`: the `Vec<Event>` the batch is collected
+/// into. The path is interned (warmed below), the value is an `f64` in the record, and a single
+/// `Gauge` fits `MetricList`'s inline capacity -- so the line itself costs nothing.
+#[test]
+fn graphite_decode_one_plaintext_line() {
+    let mut decoder = fixtures::graphite_decoder();
+    let datagram = fixtures::graphite_datagram(1);
+    drop(decoder.decode(datagram.clone())); // warm: interns the path exactly once
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.events[0].metrics.len(), 1);
+    expect_allocs("graphite_in: decode 1 plaintext line", stats, 1);
+}
+
+/// **The same count with two carbon tags on the line.** Every tag value is a zero-copy
+/// `Bytes::slice` of the datagram (`logit_proto::graphite::decode`'s `slice_of`), so the
+/// attributes share the receive buffer's allocation instead of copying out of it, and two entries
+/// still fit `AttrMap`'s inline capacity -- the `Vec<Event>` is all that is left.
+#[test]
+fn graphite_decode_one_tagged_line() {
+    let mut decoder = fixtures::graphite_decoder();
+    let datagram = fixtures::graphite_tagged_datagram();
+    drop(decoder.decode(datagram.clone())); // warm: interns the path and both tag keys
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events[0].attributes.len(), 2, "or this measures the wrong thing");
+    expect_allocs("graphite_in: decode 1 tagged line (2 tags)", stats, 1);
+}
+
+/// The listener's actual hot path: `decode_into` against a buffer the read loop reuses across
+/// datagrams (`crate::udp`'s `decode_loop`, and `graphite/tcp.rs`'s per-connection `scratch`).
+/// Zero -- there is nothing left to allocate once the caller's `Vec<Event>` keeps its capacity,
+/// which is the strongest statement this codec can make.
+#[test]
+fn graphite_decode_into_a_warm_reused_buffer_costs_nothing() {
+    let mut decoder = fixtures::graphite_decoder();
+    let datagram = fixtures::graphite_datagram(1);
+    let mut out = Vec::new();
+    decoder.decode_into(datagram.clone(), 0, &mut out).expect("should decode");
+    out.clear(); // capacity intact -- this is the property under test
+
+    let (_resource, stats) =
+        measure(|| decoder.decode_into(datagram.clone(), 0, &mut out).expect("should decode"));
+    assert_eq!(out.len(), 1);
+    expect_allocs("graphite_in: decode_into into a warm buffer", stats, 0);
+}
+
+/// A 25-line datagram -- what a UDP carbon sender packs into one MTU-sized packet. Still one
+/// allocation, not 25: the per-line cost is the `Vec<Event>`'s own growth, which shows up as
+/// *reallocs* rather than allocs because a carbon datagram has no header saying how many lines it
+/// holds, so `decode_into` cannot size the `Vec` up front.
+#[test]
+fn graphite_decode_a_25_line_datagram() {
+    let mut decoder = fixtures::graphite_decoder();
+    let datagram = fixtures::graphite_datagram(25);
+    drop(decoder.decode(datagram.clone()));
+
+    let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 25);
+    assert_eq!(stats.reallocs, 3, "the events Vec grows 4 -> 8 -> 16 -> 32");
+    expect_allocs("graphite_in: decode a 25-line datagram", stats, 1);
+}
+
+/// The other wire, same claim: a 100-datapoint pickle payload costs one allocation plus the
+/// `Vec<Event>`'s growth. The restricted reader's stack, arenas and memo are decoder fields
+/// cleared per frame rather than rebuilt (`logit_proto::graphite::pickle::PickleReader`), so
+/// walking a hundred datapoints through the stack machine allocates nothing of its own -- which is
+/// the whole reason those are fields and not locals.
+#[test]
+fn graphite_decode_a_100_datapoint_pickle_frame() {
+    let mut decoder = fixtures::graphite_pickle_decoder();
+    let frame = fixtures::graphite_pickle_frame(100);
+    drop(decoder.decode(frame.clone())); // warm: interns 100 paths and grows the reader's arenas
+
+    let (batch, stats) = measure(|| decoder.decode(frame.clone()).expect("should decode"));
+    assert_eq!(batch.events.len(), 100);
+    assert_eq!(stats.reallocs, 5, "the events Vec grows 4 -> 8 -> ... -> 128");
+    expect_allocs("graphite_in: decode a 100-datapoint pickle frame", stats, 1);
+}
+
 /// `prometheus_in`'s decode path has no `Decoder` trait to go through (`docs/adr/
 /// prometheus-scrape-and-exposition.md`'s "No `logit_proto::Encoder`" section) -- it's the two
 /// plain functions a real scrape tick calls in sequence: `text::parse_with` (bytes -> families)

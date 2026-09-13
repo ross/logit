@@ -27,6 +27,7 @@ use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
 use logit_proto::collectd::types_db::TEST_TYPES_DB;
 use logit_proto::collectd::{CollectdDecoder, TypesDb};
+use logit_proto::graphite::{GraphiteDecoder, Protocol as GraphiteProtocol};
 use logit_proto::prometheus::{PrometheusDecoder, PrometheusEncoder};
 use logit_proto::Decoder;
 use logit_transforms::{
@@ -273,6 +274,78 @@ fn collectd_values_part(out: &mut Vec<u8>, values: &[(u8, [u8; 8])]) {
     }
     collectd_part_header(out, 0x0006, payload.len());
     out.extend_from_slice(&payload);
+}
+
+pub fn graphite_decoder() -> GraphiteDecoder {
+    GraphiteDecoder::new(resource())
+}
+
+/// The same decoder reading carbon's pickle batch protocol instead of its plaintext lines. Pairs
+/// with [`graphite_pickle_frame`] to show what the *other* wire costs for the same datapoints
+/// (`docs/design/memory.md` §2).
+pub fn graphite_pickle_decoder() -> GraphiteDecoder {
+    GraphiteDecoder::new(resource()).with_protocol(GraphiteProtocol::Pickle)
+}
+
+/// A carbon plaintext datagram of `lines` datapoints -- `path value timestamp\n`, the whole of the
+/// wire format. `graphite_in` hands `decode_into` exactly this shape under both transports: a UDP
+/// datagram, or a TCP read's worth of complete lines.
+pub fn graphite_datagram(lines: usize) -> Bytes {
+    let mut text = String::new();
+    for index in 0..lines {
+        text.push_str(&format!("servers.web-1.cpu.core{index} 0.5 1700000000\n"));
+    }
+    Bytes::from(text)
+}
+
+/// One tagged line, carbon 1.1+'s `;k=v` syntax -- the shape whose tag values the decoder slices
+/// zero-copy out of this very buffer, which is the property the measurement exists to pin.
+pub fn graphite_tagged_datagram() -> Bytes {
+    Bytes::from_static(b"servers.web-1.cpu;env=prod;region=us-east 0.5 1700000000\n")
+}
+
+/// One carbon pickle **payload** of `datapoints` datapoints: `[(path, (timestamp, value)), ...]` at
+/// protocol 2, with no 4-byte length prefix.
+///
+/// Unframed on purpose -- that is exactly what [`GraphiteDecoder`] is handed. Carbon's framing (a
+/// big-endian `u32` payload length, Twisted's `Int32StringReceiver`) belongs to the *listener*,
+/// which validates and strips it before calling `decode_into`
+/// (`crates/logit-inputs/src/graphite/tcp.rs`), so a fixture carrying one would measure a prefix no
+/// decoder ever sees.
+///
+/// The opcodes are written out by hand rather than through
+/// `logit_proto::graphite::pickle::write_datapoints`, for [`collectd_part_header`]'s reason: a
+/// fixture the codec built for itself stops being an independent statement of the wire format the
+/// moment that code changes. Protocol 2, matching what `pickle.dumps(..., protocol=2)` -- carbon's
+/// own documented example -- emits.
+pub fn graphite_pickle_frame(datapoints: usize) -> Bytes {
+    const PROTO: u8 = 0x80;
+    const EMPTY_LIST: u8 = 0x5d;
+    const MARK: u8 = 0x28;
+    const BINUNICODE: u8 = 0x58;
+    const BININT: u8 = 0x4a;
+    const BINFLOAT: u8 = 0x47;
+    const TUPLE2: u8 = 0x86;
+    const APPENDS: u8 = 0x65;
+    const STOP: u8 = 0x2e;
+
+    let mut out = vec![PROTO, 2, EMPTY_LIST, MARK];
+    for index in 0..datapoints {
+        let path = format!("servers.web-1.cpu.core{index}");
+        out.push(BINUNICODE);
+        // Every length field in pickle is little-endian; only BINFLOAT is big-endian.
+        out.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        out.extend_from_slice(path.as_bytes());
+        out.push(BININT);
+        out.extend_from_slice(&1_700_000_000i32.to_le_bytes());
+        out.push(BINFLOAT);
+        out.extend_from_slice(&0.5f64.to_be_bytes());
+        out.push(TUPLE2); // (timestamp, value)
+        out.push(TUPLE2); // (path, (timestamp, value))
+    }
+    out.push(APPENDS);
+    out.push(STOP);
+    Bytes::from(out)
 }
 
 /// `skip_to_brace` off, matching `examples/nginx-to-influxdb.yaml` -- the syslog decoder has
