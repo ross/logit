@@ -25,7 +25,7 @@ fi
 cargo build --quiet -p logit-cli
 LOGIT_BIN="${CARGO_TARGET_DIR:-${ROOT}/target}/debug/logit"
 
-for config in demo/logit.yaml examples/*.yaml; do
+for config in demo/logit.yaml examples/*.yaml perf/scenarios/*.yaml; do
     echo "-- ${config}"
     "${LOGIT_BIN}" validate "${config}"
 done

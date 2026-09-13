@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-09-12
+updated: 2026-09-13
 ---
 
 # A load-test harness: the real binary, a declarative event template, and CPU per event as the signal
@@ -162,6 +162,17 @@ needs — precedent for a purpose-built, non-default container exists already in
 `Dockerfile.dev`, the image every other `script/*` command runs in, is untouched: nothing about the
 ordinary edit/check/test loop should carry `perf`'s extra tooling or its elevated container
 capabilities.
+
+Three flags turned out to be necessary, not two: `--cap-add SYS_ADMIN` and `--security-opt
+seccomp=unconfined` were predicted (`perf_event_open`'s `CAP_SYS_ADMIN`/`CAP_PERFMON` requirement
+and docker's default seccomp profile gating it), but this repo's own dev box (Fedora, SELinux
+Enforcing) needed a third: `--security-opt label=disable`. With the default container label,
+SELinux denies the `perf_event` class outright regardless of capabilities — `perf record` still
+runs and still exits 0, but writes a zero-sample `perf.data`, which reads exactly like the
+`kernel.perf_event_paranoid` capability problem the first two flags exist for and isn't. Nothing
+in this ADR's "Alternatives considered" or `docs/plans/load-test-harness.md`'s risk list predicted
+an SELinux-specific denial; `script/perf`'s own comment on the `flamegraph` path now carries the
+full account, verified on this repo's actual dev box rather than assumed from precedent.
 
 ### A workspace member under `crates/`, not a `tools/*` standalone workspace
 

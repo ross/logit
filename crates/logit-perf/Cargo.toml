@@ -1,0 +1,35 @@
+[package]
+name = "logit-perf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Out-of-CI load-test harness: spawns the real `logit` binary against perf/scenarios/*.yaml and measures throughput, CPU per event, and peak RSS (docs/adr/load-test-harness.md). Dev-only; ships in nothing."
+
+[[bin]]
+name = "logit-perf"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+anyhow.workspace = true
+# `wait4` (rusage.rs) and SIGTERM (run.rs's settle-then-signal path for a scenario that doesn't
+# self-exit) -- already a workspace dependency (logit-cli's own dev-dependency for the same
+# SIGTERM reason, logit-inputs' inotify wake source).
+libc.workspace = true
+# `attribute` decodes the `internal -> file_out format: native` dump it appends to a scenario with
+# the very same codec the runtime wrote it with -- `logit_proto::frame::read_frame` +
+# `logit_proto::native::decode_batch` -- rather than re-deriving the format or parsing a
+# human-readable render (docs/adr/load-test-harness.md's "Per-node attribution" section). This is
+# the dependency that made `logit-perf` a workspace member under `crates/` instead of a `tools/*`
+# standalone workspace.
+logit-proto.workspace = true
+# The `Event`/`MetricKind`/`DdSketch` types the decoded batches are made of, and
+# `interner::resolve` for a `MetricRecord`'s `Symbol` name.
+logit-core.workspace = true
+# `Bytes` is `read_frame`'s cursor type -- the whole dump file is read into one and each frame
+# split off its front.
+bytes.workspace = true

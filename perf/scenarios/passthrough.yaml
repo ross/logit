@@ -1,0 +1,28 @@
+# Runtime-floor scenario (docs/plans/load-test-harness.md's scenario table): a generate_in with
+# no log body and six plain attributes straight into null_out. No parsing, no encoding -- the only
+# cost measured is scheduling, the fanout channel hop, and the sink's own layer-2 telemetry, so
+# every other scenario's numbers are read relative to this one.
+#
+# An ordinary logit config, like anything under examples/ -- no `!env`, run the same way an
+# operator would (`logit run perf/scenarios/passthrough.yaml`), or through the harness:
+#
+#   script/perf run --scenario passthrough
+#
+# `{seq%N}` in `path`/`host` gives the event stream some attribute cardinality rather than
+# generating byte-identical events forever, which no real traffic shape looks like.
+components:
+  gen:
+    type: generate_in
+    count: 20000000
+    event:
+      attributes:
+        method: GET
+        path: /x/{seq%50}
+        status: "200"
+        host: web-{seq%10}
+        region: us-east-1
+        service: web
+
+  out:
+    type: null_out
+    sources: [gen]

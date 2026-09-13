@@ -1,0 +1,35 @@
+# The human-readable encoder in situ (docs/plans/load-test-harness.md's scenario table):
+# generate_in straight into file_out at /dev/null under the default `format: human`
+# (logit_outputs::stdio::EventDump), rather than null_out -- a real sink doing real encode-and-write
+# work, unlike every other scenario here. Pairs with encode-native-devnull to compare the two
+# encoders' cost against the identical event stream; the gap between this scenario's numbers and
+# passthrough's is the encoder's own cost.
+#
+#   script/perf run --scenario encode-human-devnull
+#
+# `rotate:` is required -- graph rule 29 rejects a `file_out` whose rotation block would never
+# rotate at all (`stdio_out` already covers that case). `max_bytes: "100GiB"` is comfortably above
+# anything this scenario's count could ever encode, so it's a config-validity formality here, not
+# a real rotation trigger -- rotating `/dev/null` mid-run would be nonsensical, and calendar
+# rotation (`interval:`) risks tripping for real if a run happens to straddle an hour/day boundary,
+# which a byte bound this large never will.
+components:
+  gen:
+    type: generate_in
+    count: 8000000
+    event:
+      attributes:
+        method: GET
+        path: /x/{seq%50}
+        status: "200"
+        host: web-{seq%10}
+        region: us-east-1
+        service: web
+
+  out:
+    type: file_out
+    sources: [gen]
+    path: /dev/null
+    format: human
+    rotate:
+      max_bytes: "100GiB"
