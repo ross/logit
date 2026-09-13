@@ -11,6 +11,7 @@ members = [
     "crates/logit-transforms",
     "crates/logit-cli",
     "crates/logit-bench",
+    "crates/logit-perf",
 ]
 
 [workspace.package]
@@ -151,3 +152,18 @@ proptest = "1"
 [profile.release]
 lto = true
 codegen-units = 1
+
+# What `script/perf flamegraph` builds against (crates/logit-perf/src/flamegraph.rs,
+# docs/adr/load-test-harness.md's "Profiling" section). A stripped release binary has no symbols
+# for `perf record` to resolve and no unwind information for `--call-graph dwarf` to walk, so a
+# flamegraph taken against it is a wall of hex addresses. This keeps `[profile.release]`'s
+# optimization settings verbatim -- profiling anything else would be profiling a different program
+# -- and adds back only what the profiler needs to name what it sampled. `line-tables-only` rather
+# than full debug info: `perf`/`inferno` resolve frames by function and line, which is exactly what
+# line tables carry, at a fraction of the build time and binary size of full DWARF. Nothing builds
+# this profile unless asked (`cargo build --profile profiling`); `script/image` and every ordinary
+# `script/*` command still build `release`/`dev` untouched.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = false

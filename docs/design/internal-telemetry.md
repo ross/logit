@@ -337,6 +337,25 @@ separately from `points.emitted` for the same reason `spans.emitted` already is:
 carries neither `metrics` nor `span`, so it would otherwise be miscounted as a point
 (`crates/logit-inputs/src/internal.rs::tick`'s fold checks `event.log.is_some()` first).
 
+### Reading an attribution dump
+
+The load-test harness ([ADR `load-test-harness`](../adr/load-test-harness.md)) is the first
+consumer to read these points back mechanically rather than send them to a backend, and it's worth
+knowing about as a debugging tool in its own right: `script/perf attribute --scenario NAME`
+(`crates/logit-perf/src/attribute.rs`) copies a `perf/scenarios/*.yaml` to a temp directory,
+appends an `internal` component and a `file_out` sink with `format: native`, runs it, SIGTERMs
+after the generator finishes, then decodes the resulting file with `logit_proto`'s own frame reader
+and native decoder. Grouping the decoded points by their `component` attribute turns the tables
+above into a per-node table — events in/out, Σ `process.duration`, Σ `send.blocked.duration`,
+Σ `send.duration`, peak `buffer.utilization`, drops by `reason` — and a one-line verdict naming
+the node with the largest Σ process time, plus each node that spent time blocked in `send` (where
+the constraint is that node's *consumer*, not the node reporting the time). It needs exactly two
+things from this document to be true, and nothing else: the `component`/`kind`/`role` identity on
+every point, and the shutdown drain above — without that final tick a short scenario loses its last
+partial `interval`, which on a five-second run is a fifth of the measurement. A scenario that
+already carries its own `internal` component is refused rather than rewritten, since graph rule 13
+allows at most one. See `docs/design/performance.md` for the methodology around it.
+
 ## Naming
 
 Dotted, lowercase, namespaced by where it comes from:
