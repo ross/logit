@@ -47,6 +47,15 @@ pub fn discover(dir: &Path) -> anyhow::Result<Vec<Scenario>> {
         if !path.extension().is_some_and(|extension| extension == "yaml") {
             continue;
         }
+        // Dotfiles are not scenarios: `attribute` writes its rewritten copy here as
+        // `.<name>.attribute.<pid>.yaml` so relative paths inside it still resolve against this
+        // directory (crates/logit-perf/src/attribute.rs's `rewritten_config_path`). It removes it
+        // on every exit path, but a killed process could leave one, and discovering it as a
+        // scenario in its own right would be a confusing way to find that out. Shell globs
+        // (`script/validate`'s `perf/scenarios/*.yaml`) skip these for free; `read_dir` doesn't.
+        if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.')) {
+            continue;
+        }
         let name = path
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())

@@ -32,6 +32,17 @@
 //! config, so a scenario that already has one is refused rather than rewritten into a config the
 //! binary would reject.
 //!
+//! **The rewritten scenario is written next to the original**, as
+//! `perf/scenarios/.<name>.attribute.<pid>.yaml`, and removed on every exit path -- not into the
+//! temp directory the dump goes to. Relative paths in a config resolve against that config file's
+//! own directory, so moving it would silently repoint `lua`'s `script_file`, a sink's
+//! `buffer.disk.path` (`perf/scenarios/buffered.yaml` has one), and any relative file target. See
+//! [`rewritten_config_path`].
+//!
+//! **The harness's own two nodes are in the table.** `__perf_internal` and `__perf_dump` appear as
+//! ordinary rows -- what attribution costs is worth seeing, not hiding -- but are excluded from
+//! the verdict and the count check, which are about the graph under test.
+//!
 //! **A graph with an `internal` in it never self-exits** -- the drain ticker runs until shutdown
 //! -- so this always takes `run`'s settle-then-SIGTERM path, never the wait-for-exit one. That
 //! SIGTERM is also what makes the numbers whole: `InternalInput::run_until_shutdown` drains once
@@ -102,32 +113,78 @@ pub fn attribute(root: &Path, args: AttributeArgs) -> anyhow::Result<()> {
     let logit_bin = run::build_and_locate(root, &args.profile, args.no_build)?;
 
     let workdir = make_workdir()?;
-    let outcome = attribute_in(&logit_bin, &scenario, &args, &workdir);
+    let dump_path = workdir.join("attribute.native");
+    // A stale dump from an earlier run at this pid would decode as this run's frames and silently
+    // inflate every total. Checked rather than deleted: something already sitting here means an
+    // assumption this code makes is wrong, which is worth surfacing rather than papering over.
+    if dump_path.exists() {
+        bail!(
+            "{} already exists -- a previous `attribute` run left it behind; remove it (or its \
+             whole directory) and try again",
+            dump_path.display()
+        );
+    }
+
+    let outcome = attribute_in(&logit_bin, &scenario, &args, &dump_path);
     match &outcome {
-        // Only on success: a failed run's rewritten config and partial dump are the two things
-        // anyone debugging the failure would want to look at, so they're left in place and named.
+        // Only on success: a failed run's partial dump is the one thing anyone debugging the
+        // failure would want to look at, so it's left in place and named. (The rewritten scenario
+        // is not -- it's deterministic from the original, and its own `Drop` removes it either
+        // way, so leaving it next to the shipped scenarios would be litter, not evidence.)
         Ok(()) => {
             let _ = fs::remove_dir_all(&workdir);
         }
-        Err(_) => {
-            eprintln!("note: the rewritten scenario and its dump are left in {}", workdir.display())
-        }
+        Err(_) => eprintln!("note: the dump is left at {}", dump_path.display()),
     }
     outcome
+}
+
+/// A path removed when this guard drops -- so every early return (a failed `validate`, a failed
+/// run, an undecodable dump, a panic) takes the rewritten scenario with it. That file sits in
+/// `perf/scenarios/` alongside the real ones (see [`rewritten_config_path`]), which is exactly
+/// where a leftover would do the most harm.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Where the rewritten scenario is written: **next to the original**, not in the temp directory
+/// with the dump.
+///
+/// Every relative path in a config resolves against that config file's own directory
+/// (`logit_cli::pipeline`'s `base_dir`) -- `lua`'s `script_file`, a sink's `buffer.disk.path`, a
+/// `file_out`/`stdio_out` file target. `perf/scenarios/buffered.yaml`'s
+/// `buffer.disk.path: ../results/spool` is the live example: run from `/tmp`, that config spools
+/// to `/results/spool` instead of `perf/results/spool`, so the scenario under attribution is not
+/// the scenario that ships. Keeping the rewrite in the same directory keeps `base_dir` identical
+/// and every relative path pointing where the author meant.
+///
+/// Dot-prefixed and pid-suffixed: `script/validate`'s `perf/scenarios/*.yaml` glob doesn't match
+/// a leading dot, `scenario::discover` skips dotfiles for the same reason, and two concurrent
+/// runs can't collide.
+fn rewritten_config_path(scenario: &Scenario) -> anyhow::Result<PathBuf> {
+    let dir = scenario
+        .path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", scenario.path.display()))?;
+    Ok(dir.join(format!(".{}.attribute.{}.yaml", scenario.name, std::process::id())))
 }
 
 fn attribute_in(
     logit_bin: &Path,
     scenario: &Scenario,
     args: &AttributeArgs,
-    workdir: &Path,
+    dump_path: &Path,
 ) -> anyhow::Result<()> {
     let source = fs::read_to_string(&scenario.path)
         .with_context(|| format!("reading {}", scenario.path.display()))?;
-    let dump_path = workdir.join("attribute.native");
-    let rewritten = rewrite_scenario(&source, args.interval, &dump_path)
+    let rewritten = rewrite_scenario(&source, args.interval, dump_path)
         .with_context(|| format!("rewriting {}", scenario.path.display()))?;
-    let config_path = workdir.join(format!("{}.yaml", scenario.name));
+    let config_path = rewritten_config_path(scenario)?;
+    let _cleanup = RemoveOnDrop(config_path.clone());
     fs::write(&config_path, &rewritten)
         .with_context(|| format!("writing {}", config_path.display()))?;
 
@@ -158,7 +215,7 @@ fn attribute_in(
         sample.max_rss_bytes as f64 / (1024.0 * 1024.0),
     );
 
-    let events = decode_dump(&dump_path)?;
+    let events = decode_dump(dump_path)?;
     let nodes = aggregate(&events);
     if nodes.is_empty() {
         bail!(
@@ -200,12 +257,11 @@ fn validate(logit_bin: &Path, config: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A private scratch directory for one `attribute` run: the rewritten scenario and the dump it
-/// writes. Named by pid so two concurrent runs can't share one, created fresh (removed first if a
-/// previous run at the same pid left one behind).
+/// A private scratch directory for one `attribute` run's native dump -- and nothing else; the
+/// rewritten scenario deliberately stays next to the original (see [`rewritten_config_path`]).
+/// Named by pid so two concurrent runs can't share one.
 fn make_workdir() -> anyhow::Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("logit-perf-attribute-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
 }
@@ -267,7 +323,38 @@ fn rewrite_scenario(yaml: &str, interval: Duration, dump_path: &Path) -> anyhow:
          rotate: {{ max_bytes: \"{ROTATE_MAX_BYTES}\" }} }}\n",
         yaml_double_quoted(&dump_path.to_string_lossy())
     ));
+
+    // The append is two-space-indented text, which is right for every scenario in this repo and
+    // wrong for any other layout: a four-space-indented scenario makes the result a YAML syntax
+    // error (the new keys are less indented than their siblings), and other layouts could nest
+    // them somewhere unintended instead. Re-reading the result and checking both components
+    // actually landed turns either outcome into a harness-worded error naming the harness as the
+    // thing at fault, rather than a `serde_norway` position report or a puzzling `logit validate`
+    // complaint about somebody else's component.
+    check_append_landed(&out).context(
+        "this rewrite indents its two appended components by two spaces, so a scenario laid out \
+         differently needs the harness taught about it \
+         (crates/logit-perf/src/attribute.rs's `rewrite_scenario`)",
+    )?;
     Ok(out)
+}
+
+/// Re-parses a rewritten scenario and confirms both appended components are where they were meant
+/// to go. Split out from [`rewrite_scenario`] so the one `context` above covers every way this
+/// can fail -- a parse error and a mis-nested key are the same problem wearing two hats.
+fn check_append_landed(rewritten: &str) -> anyhow::Result<()> {
+    let value: serde_norway::Value = serde_norway::from_str(rewritten)
+        .context("the rewritten scenario is not valid YAML any more")?;
+    let components = value
+        .get("components")
+        .and_then(serde_norway::Value::as_mapping)
+        .context("the rewritten scenario has no top-level `components` mapping")?;
+    for id in [INTERNAL_ID, DUMP_ID] {
+        if !components.contains_key(serde_norway::Value::from(id)) {
+            bail!("appending `{id}` did not land under `components:`");
+        }
+    }
+    Ok(())
 }
 
 /// A `humantime` duration literal for the appended `internal`'s `interval:` --
@@ -499,33 +586,38 @@ fn add_distribution(total: &mut Total, kind: &MetricKind) {
 }
 
 fn print_table(nodes: &BTreeMap<String, NodeStats>) {
+    let rows = by_process_time(nodes);
     println!(
-        "\n{:<18} {:<14} {:<10} {:>12} {:>12} {:>11} {:>11} {:>11} {:>8}",
+        "\n{:<18} {:<14} {:<10} {:>11} {:>11} {:>9} {:>9} {:>10} {:>10} {:>10} {:>8}",
         "node",
         "kind",
         "role",
         "events in",
         "events out",
+        "batch in",
+        "batch out",
         "process s",
         "blocked s",
         "send s",
         "buf max"
     );
-    for (id, node) in by_process_time(nodes) {
+    for (id, node) in &rows {
         println!(
-            "{:<18} {:<14} {:<10} {:>12.0} {:>12.0} {:>11.4} {:>11.4} {:>11.4} {:>8}",
+            "{:<18} {:<14} {:<10} {:>11.0} {:>11.0} {:>9.0} {:>9.0} {:>10.4} {:>10.4} {:>10.4} {:>8}",
             id,
             node.kind,
             node.role,
             node.events_received,
             node.events_sent,
+            node.batches_received,
+            node.batches_sent,
             node.process.secs,
             node.send_blocked.secs,
             node.send.secs,
             node.buffer_utilization.map(|v| format!("{v:.2}")).unwrap_or_else(|| "-".to_string()),
         );
     }
-    for (id, node) in by_process_time(nodes) {
+    for (id, node) in &rows {
         for (reason, count) in node.events_dropped.iter().filter(|(_, n)| **n > 0.0) {
             println!("   DROPPED {count:.0} events at `{id}` (reason={reason})");
         }
@@ -655,7 +747,10 @@ pub fn check_counts(nodes: &BTreeMap<String, NodeStats>, count: u64) -> Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::{AttrMap, DdSketch, MetricRecord, Sum, Temporality};
+    use logit_core::{AttrMap, DdSketch, EventBatch, MetricRecord, Resource, Sum, Temporality};
+    use logit_proto::frame::{write_frame, Compression};
+    use logit_proto::native::encode_batch;
+    use std::sync::Arc;
 
     const SCENARIO: &str = "components:\n  gen:\n    type: generate_in\n    count: 100\n  out:\n    type: null_out\n    sources: [gen]\n";
 
@@ -718,6 +813,31 @@ mod tests {
         let err = rewrite_scenario(&yaml, Duration::from_secs(1), &dump_path())
             .expect_err("appending at the end would land under the wrong key");
         assert!(format!("{err:#}").contains("top-level `admin:` key"), "{err:#}");
+    }
+
+    #[test]
+    fn rewrite_refuses_a_layout_its_two_space_indent_does_not_fit() {
+        // Four-space indentation is valid YAML the harness's own append doesn't match -- appending
+        // two-space-indented keys under it isn't even parseable. Reported as the harness's own
+        // limitation, with the file and function to fix, rather than as a bare parser position.
+        let yaml = "components:\n    gen:\n        type: generate_in\n        count: 100\n    out:\n        type: null_out\n        sources: [gen]\n";
+        let err = rewrite_scenario(yaml, Duration::from_secs(1), &dump_path())
+            .expect_err("a four-space-indented scenario doesn't fit this rewrite");
+        let err = format!("{err:#}");
+        assert!(err.contains("appended components by two spaces"), "{err}");
+        assert!(err.contains("not valid YAML any more"), "{err}");
+    }
+
+    #[test]
+    fn check_append_landed_rejects_a_rewrite_that_nested_the_new_keys() {
+        // The other shape of the same problem: parseable, but the two appended components ended
+        // up inside another component instead of beside it.
+        let nested = "components:\n  gen:\n    type: generate_in\n    count: 1\n    __perf_internal: { type: internal, interval: 1s }\n    __perf_dump: { type: null_out }\n";
+        let err = check_append_landed(nested).expect_err("both keys are nested under `gen`");
+        assert!(
+            format!("{err:#}").contains("`__perf_internal` did not land under `components:`"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -986,5 +1106,77 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert!(lines[1].contains("does not equal the scenario's count"), "{}", lines[1]);
         assert!(lines[2].contains("no node received all 100 events"), "{}", lines[2]);
+    }
+
+    /// One frame's worth of bytes, built exactly the way `format: native` builds it:
+    /// `write_frame(CODEC_NATIVE_V1, compression, &encode_batch(batch))`
+    /// (`logit_outputs::stdio::StreamEncoder::Native` -> `NativeEncoder::encode`). Building the
+    /// fixture through the real encoder rather than a hand-written byte string is the point --
+    /// it's what makes this a test of the reader against the writer, not against a transcription
+    /// of the format.
+    fn native_frame(component: &str, events: f64) -> Vec<u8> {
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![point(
+                component,
+                "null_out",
+                "sink",
+                EVENTS_RECEIVED,
+                MetricKind::counter(events),
+            )],
+        };
+        write_frame(CODEC_NATIVE_V1, Compression::None, &encode_batch(&batch)).unwrap().to_vec()
+    }
+
+    /// Writes `bytes` to a uniquely-named file in the temp directory and returns the path. No
+    /// cleanup guard: these are a few hundred bytes each, and a test that fails mid-way leaving
+    /// its fixture behind is easier to debug than one that deletes it.
+    fn temp_dump(name: &str, bytes: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("logit-perf-decode-{}-{name}.native", std::process::id()));
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn decode_dump_reads_every_frame_a_native_file_concatenates() {
+        let mut bytes = native_frame("a", 10.0);
+        bytes.extend(native_frame("b", 20.0));
+        let path = temp_dump("whole", &bytes);
+
+        let events = decode_dump(&path).unwrap();
+        let nodes = aggregate(&events);
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes["a"].events_received, 10.0);
+        assert_eq!(nodes["b"].events_received, 20.0);
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn decode_dump_keeps_the_whole_frames_before_a_torn_final_one() {
+        // What a SIGTERM landing mid-write actually leaves: two complete frames, then a prefix of
+        // a third. The prefix is dropped with a warning; neither whole frame is lost.
+        let mut bytes = native_frame("a", 10.0);
+        bytes.extend(native_frame("b", 20.0));
+        let third = native_frame("c", 30.0);
+        bytes.extend(&third[..third.len() / 2]);
+        let path = temp_dump("torn", &bytes);
+
+        let events = decode_dump(&path).unwrap();
+        let nodes = aggregate(&events);
+        assert_eq!(nodes.len(), 2, "the torn frame contributes nothing: {nodes:?}");
+        assert_eq!(nodes["a"].events_received, 10.0);
+        assert_eq!(nodes["b"].events_received, 20.0);
+        assert!(!nodes.contains_key("c"));
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn decode_dump_rejects_an_empty_dump_rather_than_reporting_nothing() {
+        let path = temp_dump("empty", b"");
+        let err = decode_dump(&path).expect_err("an empty dump means no drain ever landed");
+        assert!(format!("{err:#}").contains("is empty"), "{err:#}");
+        fs::remove_file(&path).unwrap();
     }
 }
