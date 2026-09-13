@@ -174,9 +174,9 @@ the tag's literal argument string instead of failing.
 
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
-| Listener (`statsd_in`, `collectd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`) | must be empty | required (≥1 consumer) |
+| Listener (`statsd_in`, `collectd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
-| Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `prometheus_out`) | ≥1 required | must not be |
+| Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
 considered and rejected (ADR `component-graph-configuration`): a typo'd source reference would silently turn a real sink into
@@ -238,9 +238,9 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 17. A non-default `receive:` block is rejected on any kind that is not a **datagram listener**
     (`docs/adr/decoupled-listener-io.md`, `statsd_in`/`collectd_in`/`syslog_in`) or a **tail
     listener** (`docs/adr/file-tailing-and-docker-json-logs.md`, `tail_in`/`docker_in`). Deliberately not
-    "any non-listener": `internal` is a listener by role but has no socket, no queue, and no
-    decoder, so `receive:` on it would be exactly the silently-ignored-setting failure rule 14
-    guards against on the sink side. A tail listener has no receive *queue* at all (the tailed
+    "any non-listener": `internal` and `generate_in` are listeners by role but have no socket, no
+    queue, and no decoder, so `receive:` on either would be exactly the silently-ignored-setting
+    failure rule 14 guards against on the sink side. A tail listener has no receive *queue* at all (the tailed
     file is its own durable buffer) — only `receive.batch_max_events`, `batch_max_bytes`,
     `batch_flush_interval`, and `shutdown_grace` are meaningful on one; a queue-bounding field
     (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) is rejected by name.
@@ -398,6 +398,21 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     relative or empty `path:` could never match one — every scrape would 404 against an endpoint
     that looks configured. `max_series: 0` is rule 38's impossible bound in another shape: every
     series would be evicted the instant it arrived, so the endpoint would always be empty.
+42. A `generate_in`'s bounds and templates (`docs/plans/load-test-harness.md`). `count`, `batch`,
+    and `rate` must each be at least 1 where set — `0` generates nothing at all, the impossible
+    bound of rules 9/15/18/38 rather than a small one, and omitting `count`/`rate` is already how
+    "unbounded"/"unthrottled" is spelled. A `metric` must carry a non-empty `name` and a finite
+    `value`. No `event.attributes` or `resource` key may be empty. And every template string —
+    `event.log`, every `event.attributes` value, every `resource` value, and `event.metric.name` —
+    must parse as a `logit_core::template` and may name only the placeholders `generate_in`
+    actually substitutes: `seq`, or `seq%N` with `N >= 1`. An unknown placeholder is rejected here
+    rather than rendered literally or as nothing: a mistyped `{seg}` would otherwise silently
+    collapse a scenario's intended cardinality to a single series, which is the difference between
+    measuring an aggregation window and measuring nothing. The var-name check lives in a small
+    pure `generate_var_is_valid` helper in `graph.rs` so that `logit-inputs`' own `compile`
+    resolver can mirror it exactly without depending on `logit-config` (this document's own
+    "Crate layout" section). `receive:` on a `generate_in` is rejected by rule 17's own allowlist
+    — it is a listener by role, with no socket, queue, or decoder for `receive:` to configure.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

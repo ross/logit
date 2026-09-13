@@ -1538,6 +1538,69 @@
           }
         },
         {
+          "description": "A synthetic event source for load testing -- the listener end of the perf harness (`docs/plans/load-test-harness.md`). No socket, no decoder: it renders a declarative [`GenerateEvent`] template as fast as `count`/`rate` allow, so a scenario measures the runtime and the components under test rather than a generator process and a kernel socket buffer. Costs nothing unless configured, exactly like every other kind.\n\nDeliberately no \"shape\" enum (`nginx`, `statsd`, ...): the template plus an ordinary `json`/`regex`/`kv_metrics` stage downstream already composes any shape a scenario needs, and each shape baked in here would be a second, drifting copy of a fixture.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "batch": {
+              "description": "Events per generated batch -- one `EventBatch` down the fanout, the same unit a real listener's batch assembly produces. Defaults to 100. Bigger amortizes the per-batch runtime cost (channel send, telemetry point, span) over more events, which is why a scenario measuring a *per-batch* cost lowers it rather than raising `count`. Rejected at `0` (rule 42).",
+              "default": 100,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "count": {
+              "description": "Total events to generate, after which the input returns and the existing listener-exit cascade shuts the process down cleanly (`crates/logit-pipeline/src/ runtime.rs`). **Exact**: the last batch is short (`count % batch`) rather than rounded up to a whole batch, so a scenario's derived events/s and CPU-per-event are computed against the number actually produced. Omitted means unbounded -- a soak run, or one a profiler attaches to. Rejected at `0` (rule 42): a generator that generates nothing is the black-hole shape graph rule 7 exists to catch, not a small run.",
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "event": {
+              "description": "What each generated event carries. See [`GenerateEvent`] -- every field defaults, so an omitted block generates a bare timestamped event.",
+              "default": {
+                "attributes": {},
+                "log": null,
+                "metric": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GenerateEvent"
+                }
+              ]
+            },
+            "rate": {
+              "description": "Target events per second, paced against wall clock: `generate_in` sends while it is behind the pace `rate` implies and sleeps until the next batch is due otherwise, so the *average* rate holds over a run rather than drifting the way a fixed `interval(batch/rate)` timer would. Above roughly a thousand batches per second the sleep granularity makes it bursty within any given millisecond -- the average is still right (`docs/known-gaps.md`). Omitted means unthrottled: generate as fast as downstream backpressure allows, which is what a throughput scenario wants. Rejected at `0` (rule 42) -- a rate of zero would generate nothing at all, never \"as slow as possible\".",
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "resource": {
+              "description": "Resource attributes for every generated event: literal keys, templated values (`{seq}` / `{seq%N}`, the same substitution [`GenerateEvent`] documents). An all-literal resource -- the usual case -- is built once and `Arc`-shared by every event, so it costs one refcount bump per event rather than a map. An empty key is rejected (rule 42).",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "generate_in"
+              ]
+            }
+          }
+        },
+        {
           "description": "A Prometheus/OpenMetrics **exposition** endpoint: a stateful sink holding a registry of current series that an HTTP handler renders on demand, rather than one that writes anywhere. The mirror of `PrometheusIn` (scrape). Both text dialects are served, negotiated on the scraping client's `Accept`. See `docs/adr/prometheus-scrape-and-exposition.md` and `logit_outputs::prometheus`'s module doc (the spec).\n\nA future remote-write **sender** is an optional `endpoint:` on this same variant, with a graph rule requiring exactly one of `bind`/`endpoint` -- purely additive, so a config written today keeps working.",
           "type": "object",
           "required": [
@@ -1570,6 +1633,21 @@
               "type": "string",
               "enum": [
                 "prometheus_out"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A sink that drops everything, as cheaply as the runtime allows -- the sink end of the perf harness (`docs/plans/load-test-harness.md`). Its point is measuring everything *upstream* of a sink without a real one's encoder, socket, or filesystem in the number; the runtime's own layer-2 telemetry still counts what it received and how long delivery took, so a scenario ending here is still attributable per node.\n\nNo fields -- and no `format:`/`path:` to grow later: a scenario that wants an encoder in the measurement uses `file_out` to `/dev/null` instead, which is a real sink doing real work rather than a special case here.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "null_out"
               ]
             }
           }
@@ -1690,6 +1768,89 @@
           "type": "string",
           "enum": [
             "samples"
+          ]
+        }
+      ]
+    },
+    "GenerateEvent": {
+      "description": "The event template [`ComponentKind::GenerateIn`] renders per generated event. Every field defaults, so an omitted `event:` block generates the cheapest event there is: a timestamp, the configured resource, and nothing else -- which is exactly what a \"runtime floor\" scenario wants to measure.\n\n`log` and every value in `attributes` (and [`GenerateMetric::name`]) are **templates**: `{seq}` renders the generator's 0-based event counter and `{seq%N}` renders it modulo `N`, the knob that gives a scenario a chosen attribute or series cardinality. `{{`/`}}` write a literal brace, which a JSON log body needs (`docs/plans/load-test-harness.md`, `logit_core::template`). A field with no placeholder in it is rendered **once**, at construction, and the resulting bytes are cloned onto every event -- a refcount bump, not a copy -- so placeholders are for cardinality, never decoration: each one costs a rendering and a copy per event.",
+      "type": "object",
+      "properties": {
+        "attributes": {
+          "description": "Event attributes: literal keys (interned once, at construction), templated values. An empty key is rejected (rule 42).",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "log": {
+          "description": "The generated log body, as a template. Omitted means the event carries no log record at all (a metrics-only scenario).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metric": {
+          "description": "The metric to stamp on every event. Omitted means the event carries no metrics (a logs-only scenario).",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GenerateMetric"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "GenerateMetric": {
+      "description": "The metric [`ComponentKind::GenerateIn`] stamps onto every event it generates, when `event.metric` is set at all. One metric per event: a scenario that needs more than one exercises a `set`/`kv_metrics` stage downstream rather than growing this block.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Which metric kind to produce. Defaults to `sum`.",
+          "default": "sum",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GenerateMetricKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "The metric's name. A template like every other `generate_in` string field: `{seq}` / `{seq%N}` substitute here too, which is how a scenario generates a wide *metric-name* cardinality rather than a wide attribute cardinality. Required and non-empty (rule 42).",
+          "type": "string"
+        },
+        "value": {
+          "description": "The value carried on every generated point -- constant, deliberately: a varying value would measure the generator's own arithmetic rather than the pipeline's. Defaults to `1`, the natural increment for the default `sum`. Must be finite (rule 42).",
+          "default": 1.0,
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GenerateMetricKind": {
+      "description": "Which metric kind a [`GenerateMetric`] produces. Named after the three `logit_core::MetricKind`s a load-test scenario actually wants to exercise, not the full set: `Sum` for a counter, `Gauge` for a level, and `Distribution` for the sketch-merging path (as raw `Samples`, the shape a real listener produces -- never pre-sketched, per `docs/adr/lossless-transit.md`'s \"a decoder never pre-summarizes\" rule, which `generate_in` stands in for here).",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "gauge",
+            "distribution"
+          ]
+        },
+        {
+          "description": "A delta counter -- the default, and the cheapest shape to generate.",
+          "type": "string",
+          "enum": [
+            "sum"
           ]
         }
       ]

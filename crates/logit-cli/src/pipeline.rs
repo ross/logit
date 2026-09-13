@@ -283,9 +283,16 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<()> {
 }
 
 /// Turns one resolved component's kind into the boxed implementation the node runtime actually
-/// runs. The single source of truth for which `ComponentKind`s this binary can build --
-/// `graph::resolve` already rejected every kind `is_implemented` doesn't recognize (rule 8), so
-/// the fallback arm below is unreachable in practice, not a silent gap.
+/// runs. The single source of truth for which `ComponentKind`s this binary can build. The match
+/// is exhaustive over `ComponentKind` -- there is no fallback arm, and none is needed:
+/// `graph::resolve`'s rule 8 rejects every kind `is_implemented` doesn't recognize before this
+/// function is ever called. The exception is a kind that is *declared* (so that its config types
+/// and graph rules can land, and `logit validate`/`logit graph` can accept it) but whose
+/// implementation hasn't been built yet: `generate_in` and `null_out` today, until the perf
+/// harness's W2/W3 replace those two arms (`docs/plans/load-test-harness.md`). Each of those
+/// arms `bail!`s with a message naming the kind, so `logit run` fails startup with exit 1 and a
+/// clear error rather than panicking -- the same "reject a config referencing an unimplemented
+/// kind with a clear error" contract `AGENTS.md` states.
 ///
 /// `id` attaches a [`Diagnostics`] to every component that emits one
 /// (`docs/adr/service-lifecycle-and-output-retry.md`) via each kind's own `with_diagnostics`
@@ -424,6 +431,18 @@ fn build_spec(
                 input_runtime_config(&component.receive),
             )
         }
+
+        // Declared but not yet buildable: the kind, its config types, and graph rule 42 landed in
+        // the perf harness's W1 so that `logit validate`/`logit graph` accept a scenario config,
+        // but `logit_inputs::generate::GenerateInput` and this arm are W2
+        // (`docs/plans/load-test-harness.md`). Until then `logit run` must *fail* on such a
+        // config, not panic -- a startup error with exit 1, exactly as `AGENTS.md` promises for
+        // any config naming a kind this binary can't build. W2 replaces this arm with the real
+        // one; it does not add an error path to delete.
+        GenerateIn { .. } => anyhow::bail!(
+            "component `{id}`: `generate_in` is declared but not yet buildable -- its \
+             implementation lands in workstream W2 (docs/plans/load-test-harness.md)"
+        ),
 
         Lua { script, interval } => NodeSpec::Lua { script: script.clone(), interval: *interval },
         LuaFile { lua_file, interval } => {
@@ -729,6 +748,15 @@ fn build_spec(
                 write_config(&component.buffer),
             )
         }
+
+        // The `generate_in` arm's twin, for the same reason -- `logit_outputs::null::NullOutput`
+        // and this arm are the perf harness's W3 (`docs/plans/load-test-harness.md`). It gets the
+        // same `queue_config`/`write_config` treatment as every other sink when it lands, so
+        // `buffer:` (disk included) works on it.
+        NullOut {} => anyhow::bail!(
+            "component `{id}`: `null_out` is declared but not yet buildable -- its \
+             implementation lands in workstream W3 (docs/plans/load-test-harness.md)"
+        ),
     };
     Ok((spec, telemetry))
 }
@@ -1397,6 +1425,54 @@ mod tests {
                 "protocol {protocol:?}"
             );
         }
+    }
+
+    /// `generate_in`/`null_out` are declared kinds whose implementations land in the perf
+    /// harness's W2/W3, so `graph::resolve` accepts them today (that's what lets rule 42 and
+    /// `logit validate` exist ahead of the implementations) but `build_spec` can't build one.
+    /// That must be a clear startup *error* -- exit 1 from `logit run`, per `AGENTS.md` -- never
+    /// a panic, and never a silently-skipped node.
+    #[test]
+    fn build_spec_rejects_generate_in_until_w2_lands() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::GenerateIn {
+                count: Some(1000),
+                batch: 100,
+                rate: None,
+                event: logit_config::GenerateEvent::default(),
+                resource: std::collections::BTreeMap::new(),
+            },
+        };
+        let err = build_spec("gen", &component, Path::new(""), None)
+            .err()
+            .expect("generate_in isn't buildable yet, so this must be an error")
+            .to_string();
+        assert!(err.contains("`gen`"), "got: {err}");
+        assert!(err.contains("`generate_in`"), "got: {err}");
+        assert!(err.contains("W2"), "got: {err}");
+    }
+
+    /// [`build_spec_rejects_generate_in_until_w2_lands`]'s twin, for the sink side.
+    #[test]
+    fn build_spec_rejects_null_out_until_w3_lands() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["gen".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::NullOut {},
+        };
+        let err = build_spec("sink", &component, Path::new(""), None)
+            .err()
+            .expect("null_out isn't buildable yet, so this must be an error")
+            .to_string();
+        assert!(err.contains("`sink`"), "got: {err}");
+        assert!(err.contains("`null_out`"), "got: {err}");
+        assert!(err.contains("W3"), "got: {err}");
     }
 
     #[test]
