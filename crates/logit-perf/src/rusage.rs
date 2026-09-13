@@ -8,6 +8,15 @@
 //! folding a multi-second compile into the first repeat's CPU time. `wait4` is attributed by pid,
 //! so it can only ever report the one child it reaped.
 
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "crates/logit-perf/src/rusage.rs hard-codes ru_maxrss as kibibytes, true on Linux but not \
+     POSIX-guaranteed (BSD reports bytes there instead) -- see Usage::max_rss_bytes's doc. This \
+     harness only ever runs in this project's Linux dev container / CI image \
+     (docs/adr/containerized-development.md), so this guard exists to fail a build loudly rather \
+     than silently mis-scale RSS on some other target."
+);
+
 use std::io;
 use std::time::Duration;
 
@@ -50,13 +59,25 @@ pub fn wait4(pid: libc::pid_t, wall: Duration) -> io::Result<Usage> {
     // zero bytes, and `wait4` overwrites every field it defines before returning success.
     let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
 
-    // SAFETY: `pid` names a live child of this process per the caller's contract above, and
-    // `&mut status`/`&mut rusage` are valid, correctly-sized, uniquely-owned out-parameters for
-    // the duration of this call -- exactly what `wait4(2)` requires. The call blocks this thread
-    // until the child exits (no `WNOHANG`); it does not touch any other process's state.
-    let ret = unsafe { libc::wait4(pid, &mut status, 0, &mut rusage) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
+    // Retried on EINTR: a signal delivered to this process (e.g. this harness's own process
+    // group receiving Ctrl-C, or any other handler-bearing signal) can interrupt a blocking
+    // `wait4` before the child has actually exited -- that's not a real failure, just this
+    // syscall's ordinary contract, so it's retried rather than surfaced as an error.
+    loop {
+        // SAFETY: `pid` names a live child of this process per the caller's contract above, and
+        // `&mut status`/`&mut rusage` are valid, correctly-sized, uniquely-owned out-parameters
+        // for the duration of this call -- exactly what `wait4(2)` requires. The call blocks this
+        // thread until the child exits (no `WNOHANG`); it does not touch any other process's
+        // state.
+        let ret = unsafe { libc::wait4(pid, &mut status, 0, &mut rusage) };
+        if ret >= 0 {
+            break;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
     }
 
     let user = timeval_to_duration(rusage.ru_utime);
