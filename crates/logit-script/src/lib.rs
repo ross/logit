@@ -98,6 +98,12 @@ pub struct ScriptWorker {
     /// Shared with the installed `provenance` global's userdata -- same reasoning as
     /// `resource_state`. See `crate::provenance`'s module doc.
     provenance_state: Rc<RefCell<provenance::ProvenanceState>>,
+    /// This component's `targets:` (`docs/adr/target-components.md`), as the name -> slot table
+    /// `event:to(id)` resolves against -- built **once**, here, and shared by `Rc` with every
+    /// [`EventProxy`] this worker mints, never rebuilt per event. Empty (the shared,
+    /// allocation-free empty table -- see `proxy::no_targets`) unless
+    /// [`ScriptWorker::with_targets`] was called.
+    targets: Rc<proxy::TargetTable>,
     _not_send_sync: PhantomData<*const ()>,
 }
 
@@ -105,11 +111,16 @@ pub struct ScriptWorker {
 ///
 /// `Emit` is boxed: `Event`'s inline attribute storage (`docs/design/data-model.md`'s small-map
 /// layout) makes it large enough that clippy flags the size gap against `Drop` otherwise.
+///
+/// Every emitted event carries its own `Option<u16>` routing mark -- the target slot
+/// `event:to(id)` set on *that* event's handle, in `graph::targets_of` order, or `None` for an
+/// unrouted one. Per-event rather than per-call on purpose: `return {a:to("x"), b}` is a single
+/// `EmitMany` whose two events go two different ways (`docs/adr/target-components.md`).
 pub enum ProcessOutcome {
-    /// Pass the (possibly mutated) event through.
-    Emit(Box<Event>),
-    /// The script returned multiple events (fan-out).
-    EmitMany(Vec<Event>),
+    /// Pass the (possibly mutated) event through, to the slot it was marked for.
+    Emit(Box<Event>, Option<u16>),
+    /// The script returned multiple events (fan-out), each with its own mark.
+    EmitMany(Vec<(Event, Option<u16>)>),
     /// The script returned `nil`: drop the event.
     Drop,
 }
@@ -173,6 +184,7 @@ impl ScriptWorker {
             resource_state,
             scope_state,
             provenance_state,
+            targets: proxy::TargetTable::empty(),
             _not_send_sync: PhantomData,
         })
     }
@@ -263,6 +275,27 @@ impl ScriptWorker {
         self
     }
 
+    /// Declares the `target` ids this component may direct events into, in
+    /// `logit_pipeline::graph::targets_of` slot order -- what `event:to(id)` resolves against, and
+    /// the list an unknown id's error message names (`docs/adr/target-components.md`).
+    ///
+    /// A builder, not a `new()` parameter, for the same "don't touch every existing call site"
+    /// reason as `with_telemetry`/`with_component`, and safe to call at any point after `new`
+    /// returns for the same reason `with_component` is: nothing a script's top-level code can
+    /// capture refers to this table -- it is reached only from a live `EventProxy`, minted per
+    /// `process()` call. The table is built **once**, here, and shared by `Rc` with every proxy
+    /// this worker goes on to mint.
+    ///
+    /// Calling this with an empty slice is the same as never calling it: `event:to(..)` is then a
+    /// script error whatever id it names, never a silent forward.
+    pub fn with_targets(mut self, targets: &[String]) -> Self {
+        self.targets = match targets.is_empty() {
+            true => proxy::TargetTable::empty(),
+            false => Rc::new(proxy::TargetTable::new(targets)),
+        };
+        self
+    }
+
     /// Bytes currently in use by this worker's Lua VM -- the strongest single signal a stateful
     /// script is leaking state (e.g. accumulating something across `flush()` calls) has, since
     /// nothing else in the process can see inside the VM. Wraps `mlua::Lua::used_memory`.
@@ -272,14 +305,21 @@ impl ScriptWorker {
 
     /// Runs this worker's `process(event)` once. See `docs/design/lua-api.md` for the
     /// proxy-vs-table-conversion tradeoff [`EventProxy`] exists to avoid.
+    ///
+    /// The event reaches the script through a proxy carrying this worker's target table, so
+    /// `event:to(id)` inside `process()` resolves against the component's own `targets:` -- the
+    /// mark comes back out on the emitted event(s), never on the `Event` itself
+    /// (`docs/adr/target-components.md`).
     pub fn process(&self, event: Event) -> Result<ProcessOutcome, ScriptError> {
         let process: mlua::Function = self.lua.registry_value(&self.process)?;
-        let result: LuaValue =
-            process.call(EventProxy::new(event)).map_err(proxy::clarify_destructed_handle_use)?;
+        let result: LuaValue = process
+            .call(EventProxy::with_targets(event, self.targets.clone()))
+            .map_err(proxy::clarify_destructed_handle_use)?;
         Ok(match result {
             LuaValue::Nil => ProcessOutcome::Drop,
             LuaValue::UserData(ud) => {
-                ProcessOutcome::Emit(Box::new(proxy::take_event(&self.lua, ud)?))
+                let (event, target) = proxy::take_event(&self.lua, ud)?;
+                ProcessOutcome::Emit(Box::new(event), target)
             }
             LuaValue::Table(table) => {
                 ProcessOutcome::EmitMany(events_from_table(&self.lua, table, "process")?)
@@ -295,7 +335,12 @@ impl ScriptWorker {
 
     /// Runs this worker's `flush()`, if the script defines one (the stateful-processor contract,
     /// e.g. the built-in `aggregate` transform). Returns an empty `Vec` if the script has none.
-    pub fn flush(&self) -> Result<Vec<Event>, ScriptError> {
+    ///
+    /// Each flushed event carries its own routing mark, exactly as a `process()`-emitted one does:
+    /// "a `flush()`-built event honours its mark like any other" (`docs/adr/target-components.md`).
+    /// A flush-built event is typically a `event:clone()` stashed from `process()`, and `clone`
+    /// copies both the mark and the target table, so `e:to("x")` works inside `flush()` too.
+    pub fn flush(&self) -> Result<Vec<(Event, Option<u16>)>, ScriptError> {
         let Some(flush_key) = self.flush.as_ref() else {
             return Ok(Vec::new());
         };
@@ -314,8 +359,8 @@ impl ScriptWorker {
     }
 }
 
-/// Extracts a `Vec<Event>` from a table a script returned from `process()` or `flush()`.
-/// `caller` names which, for the error message.
+/// Extracts the events, each with its own `event:to(..)` routing mark, from a table a script
+/// returned from `process()` or `flush()`. `caller` names which, for the error message.
 ///
 /// Validates the table is a proper contiguous `1..=n` sequence first, rather than reaching
 /// straight for `Table::sequence_values`, which stops at the first gap and never notices
@@ -327,7 +372,7 @@ fn events_from_table(
     lua: &Lua,
     table: mlua::Table,
     caller: &str,
-) -> Result<Vec<Event>, ScriptError> {
+) -> Result<Vec<(Event, Option<u16>)>, ScriptError> {
     let Some(len) = value::validated_sequence_len(&table)? else {
         return Err(ScriptError::Lua(mlua::Error::RuntimeError(format!(
             "{caller}() must return a contiguous array-like table of events (found non-sequence keys)"
@@ -376,7 +421,7 @@ mod tests {
 
     fn emitted(outcome: ProcessOutcome) -> Event {
         match outcome {
-            ProcessOutcome::Emit(e) => *e,
+            ProcessOutcome::Emit(e, _) => *e,
             _ => panic!("expected Emit"),
         }
     }
@@ -1284,8 +1329,14 @@ mod tests {
         match w.process(counter_event("hits", 1.0)).unwrap() {
             ProcessOutcome::EmitMany(events) => {
                 assert_eq!(events.len(), 2);
-                assert_eq!(events[0].attributes.get("variant").and_then(|v| v.as_str()), Some("a"));
-                assert_eq!(events[1].attributes.get("variant").and_then(|v| v.as_str()), Some("b"));
+                assert_eq!(
+                    events[0].0.attributes.get("variant").and_then(|v| v.as_str()),
+                    Some("a")
+                );
+                assert_eq!(
+                    events[1].0.attributes.get("variant").and_then(|v| v.as_str()),
+                    Some("b")
+                );
             }
             _ => panic!("expected EmitMany"),
         }
@@ -1757,5 +1808,196 @@ mod tests {
             resource.schema_url,
             Some(bytes::Bytes::from_static(b"https://example.com/schema"))
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Routing to a target (`docs/adr/target-components.md`, `docs/design/lua-api.md`)
+    // ---------------------------------------------------------------------------------------
+
+    /// A worker whose component declares `targets:`, the way `run_lua` builds one from
+    /// `ResolvedComponent::targets` -- slot order is the declaration order here exactly as it is
+    /// there.
+    fn routing_worker(source: &str, targets: &[&str]) -> ScriptWorker {
+        let targets: Vec<String> = targets.iter().map(|t| (*t).to_string()).collect();
+        worker(source).with_targets(&targets)
+    }
+
+    /// As `emitted`, keeping the routing mark `event:to(..)` set (a slot, or `None` for an
+    /// unrouted event) instead of discarding it.
+    fn emitted_with_mark(outcome: ProcessOutcome) -> (Event, Option<u16>) {
+        match outcome {
+            ProcessOutcome::Emit(e, target) => (*e, target),
+            _ => panic!("expected Emit"),
+        }
+    }
+
+    #[test]
+    fn to_marks_the_returned_event() {
+        let w = routing_worker(
+            r#"
+            function process(event)
+                return event:to("b")
+            end
+            "#,
+            &["a", "b"],
+        );
+        let (event, mark) = emitted_with_mark(w.process(counter_event("hits", 1.0)).unwrap());
+        // A slot, not the id: `Destination::To(1)` and `targets[1]` are the same thing, and
+        // nothing on this path ever compares a string.
+        assert_eq!(mark, Some(1));
+        // The mark is the *only* thing `to` does -- the event itself comes back untouched.
+        assert_eq!(event.metrics.len(), 1);
+    }
+
+    #[test]
+    fn to_nil_clears_the_mark() {
+        let w = routing_worker(
+            r#"
+            function process(event)
+                event:to("a")
+                event:to(nil)
+                return event
+            end
+            "#,
+            &["a"],
+        );
+        let (_, mark) = emitted_with_mark(w.process(counter_event("hits", 1.0)).unwrap());
+        assert_eq!(mark, None, "to(nil) must send the event back to the ordinary consumers");
+    }
+
+    /// "An id not in `targets:` is a script error, counted like every other script error, never a
+    /// silent forward" (`docs/adr/target-components.md`) -- and the message names the list the
+    /// operator actually configured, since the likeliest cause is a typo in one of them.
+    #[test]
+    fn to_an_unknown_target_is_a_script_error_naming_the_configured_targets() {
+        let w = routing_worker(
+            r#"
+            function process(event)
+                return event:to("nope")
+            end
+            "#,
+            &["host_stream", "app_stream"],
+        );
+        let err = process_err(&w, counter_event("hits", 1.0));
+        assert!(err.contains(r#"no target named "nope""#), "got: {err}");
+        assert!(
+            err.contains("this component's targets are [host_stream, app_stream]"),
+            "the error must name the configured targets, got: {err}"
+        );
+    }
+
+    /// The same mistake on a component that declares no `targets:` at all -- by far the most
+    /// likely form of it (an `event:to(..)` copied into a plain `lua` component) -- says exactly
+    /// that, rather than printing an empty list.
+    #[test]
+    fn to_on_a_component_with_no_targets_says_so() {
+        let w = worker(
+            r#"
+            function process(event)
+                return event:to("a")
+            end
+            "#,
+        );
+        let err = process_err(&w, counter_event("hits", 1.0));
+        assert!(err.contains("this component declares no targets"), "got: {err}");
+    }
+
+    /// `return event:to("x")` has to work as one expression -- so `to` returns the *same* handle,
+    /// not a copy: mutating through the returned value is visible on the original, and the event
+    /// that comes back is the one that went in.
+    #[test]
+    fn to_returns_the_handle_for_chaining() {
+        let w = routing_worker(
+            r#"
+            function process(event)
+                local same = event:to("a")
+                same.attributes.marked = "yes"
+                return same
+            end
+            "#,
+            &["a"],
+        );
+        let (event, mark) = emitted_with_mark(w.process(counter_event("hits", 1.0)).unwrap());
+        assert_eq!(mark, Some(0));
+        assert_eq!(event.attributes.get("marked").and_then(|v| v.as_str()), Some("yes"));
+    }
+
+    /// "A script fanning out a routed event gets two events headed the same way, and `b:to(nil)`
+    /// is how they diverge" (`docs/adr/target-components.md`): `clone` copies the mark, and the
+    /// copy shares the same target table, so it can be re-routed on its own.
+    #[test]
+    fn clone_copies_the_mark() {
+        let w = routing_worker(
+            r#"
+            function process(event)
+                event:to("b")
+                local copy = event:clone()
+                return {event, copy}
+            end
+            "#,
+            &["a", "b"],
+        );
+        match w.process(counter_event("hits", 1.0)).unwrap() {
+            ProcessOutcome::EmitMany(events) => {
+                assert_eq!(events.len(), 2);
+                assert_eq!(events[0].1, Some(1));
+                assert_eq!(events[1].1, Some(1), "the clone should inherit its source's mark");
+            }
+            _ => panic!("expected EmitMany"),
+        }
+    }
+
+    /// The mark rides on the *handle*, so one `return {a, b}` can fork two ways -- the whole
+    /// reason `ProcessOutcome` carries a mark per event rather than one per call.
+    #[test]
+    fn a_table_return_carries_independent_marks() {
+        let w = routing_worker(
+            r#"
+            function process(event)
+                local b = event:clone():to(nil)
+                return {event:to("x"), b}
+            end
+            "#,
+            &["x", "y"],
+        );
+        match w.process(counter_event("hits", 1.0)).unwrap() {
+            ProcessOutcome::EmitMany(events) => {
+                assert_eq!(events.len(), 2);
+                assert_eq!(events[0].1, Some(0), "the first event was marked for x");
+                assert_eq!(events[1].1, None, "the second was cleared and stays unrouted");
+            }
+            _ => panic!("expected EmitMany"),
+        }
+    }
+
+    /// "A `flush()`-built event honours its mark like any other" -- including one stashed as an
+    /// `event:clone()` during `process()` and routed at flush time, which is the stateful-router
+    /// shape the ADR describes. The clone shares its source's target table, which is what makes
+    /// `e:to("a")` resolvable from inside `flush()` at all.
+    #[test]
+    fn flush_output_carries_marks() {
+        let w = routing_worker(
+            r#"
+            local pending = nil
+            function process(event)
+                pending = event:clone()
+                return nil
+            end
+            function flush()
+                if pending then
+                    local e = pending
+                    pending = nil
+                    return {e:to("a")}
+                end
+                return {}
+            end
+            "#,
+            &["a", "b"],
+        );
+        assert!(matches!(w.process(counter_event("hits", 1.0)).unwrap(), ProcessOutcome::Drop));
+
+        let flushed = w.flush().unwrap();
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].1, Some(0), "a flushed event carries the mark it was given");
     }
 }

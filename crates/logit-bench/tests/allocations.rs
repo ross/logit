@@ -2621,7 +2621,7 @@ fn lua_process_one_event() {
 
     let event = fixtures::nginx_event();
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
-    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
     expect_allocs("lua: process 1 event", stats, 9);
 }
 
@@ -2646,7 +2646,7 @@ fn lua_process_one_event_with_resource_hooks_but_no_write_costs_the_same_as_proc
         assert!(worker.take_resource().is_none(), "the script never writes resource");
         outcome
     });
-    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
     expect_allocs("lua: set_resource + process + take_resource, no write", stats, 9);
 }
 
@@ -2673,7 +2673,7 @@ fn lua_process_one_event_writing_resource() {
     let (committed, stats) = measure(|| {
         worker.set_resource(&resource);
         let outcome = worker.process(event).expect("script should run");
-        assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+        assert!(matches!(outcome, ProcessOutcome::Emit(..)));
         worker.take_resource()
     });
     let committed = committed.expect("the script writes resource on every call");
@@ -2701,7 +2701,7 @@ fn lua_process_one_event_reading_log_trace() {
     event.log.as_mut().unwrap().trace =
         Some(TraceRef { trace_id: [1; 16], span_id: None, flags: 0 });
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
-    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
     expect_allocs("lua: process 1 event, reading event.log.trace_id", stats, 9);
 }
 
@@ -2743,7 +2743,7 @@ fn lua_process_one_event_reading_metric_value() {
 
     let event = fixtures::sum_metric_event();
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
-    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
     expect_allocs("lua: process 1 event, reading event.metrics[1].value", stats, 11);
 }
 
@@ -2782,7 +2782,7 @@ fn lua_process_one_event_reading_metric_value_on_a_spilled_event() {
 
     let event = fixtures::sum_metric_event_with_spilled_attributes();
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
-    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
     expect_allocs(
         "lua: process 1 event (spilled attrs), reading event.metrics[1].value",
         stats,
@@ -2805,7 +2805,7 @@ fn lua_process_one_event_passthrough_on_a_spilled_event() {
 
     let event = fixtures::sum_metric_event_with_spilled_attributes();
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
-    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
     expect_allocs("lua: process 1 event (spilled attrs), passthrough", stats, 5);
 }
 
@@ -2823,7 +2823,7 @@ fn lua_process_one_event_reading_metric_len() {
 
     let event = fixtures::sum_metric_event();
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
-    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
     expect_allocs("lua: process 1 event, reading #event.metrics", stats, 8);
 }
 
@@ -2843,7 +2843,7 @@ fn lua_process_one_event_reading_span_name() {
 
     let event = fixtures::span_event();
     let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
-    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
     expect_allocs("lua: process 1 event, reading event.span.name", stats, 8);
 }
 
@@ -2869,7 +2869,7 @@ fn lua_process_one_event_with_scope_hooks_but_no_write_costs_the_same_as_process
         assert!(worker.take_scope().is_none(), "the script never writes scope");
         outcome
     });
-    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
     expect_allocs("lua: set_scope + process + take_scope, no write", stats, 9);
 }
 
@@ -2896,7 +2896,7 @@ fn lua_process_one_event_reading_scope_name() {
         drop(worker.take_scope());
         outcome
     });
-    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
     expect_allocs("lua: set_scope + process (reading scope.name) + take_scope", stats, 5);
 }
 
@@ -2925,7 +2925,7 @@ fn lua_process_one_event_writing_scope_attribute() {
     let (committed, stats) = measure(|| {
         worker.set_scope(&scope);
         let outcome = worker.process(event).expect("script should run");
-        assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+        assert!(matches!(outcome, ProcessOutcome::Emit(..)));
         worker.take_scope()
     });
     let committed = committed.expect("the script writes scope on every call");
@@ -2957,7 +2957,7 @@ fn lua_process_one_event_writing_resource_schema_url() {
     let (committed, stats) = measure(|| {
         worker.set_resource(&resource);
         let outcome = worker.process(event).expect("script should run");
-        assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+        assert!(matches!(outcome, ProcessOutcome::Emit(..)));
         worker.take_resource()
     });
     let committed = committed.expect("the script writes resource.schema_url on every call");
@@ -2992,7 +2992,7 @@ fn lua_process_one_event_identity_write_to_scope_name_is_free() {
         assert!(worker.take_scope().is_none(), "an identity write must not count as a write");
         outcome
     });
-    assert!(matches!(outcome, ProcessOutcome::Emit(_)));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
     expect_allocs("lua: set_scope + process (scope.name = scope.name) + take_scope", stats, 5);
 }
 

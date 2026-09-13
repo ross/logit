@@ -459,10 +459,11 @@ fn build_spec(
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
 
-        // `component.targets` (`docs/adr/target-components.md`) rides through the spec here for
-        // W5 to use -- `run_lua` ignores it for now. Not `graph::targets_of(component)`: this
-        // function takes a `ResolvedComponent`, whose `targets` field *is* that call's output,
-        // already slot-ordered and de-duplicated by `graph::resolve`.
+        // `component.targets` (`docs/adr/target-components.md`) is what `run_lua` turns into
+        // `event:to("..")`'s name -> slot table inside the VM, and what it resolves its
+        // slot-ordered target `Fanout`s from. Not `graph::targets_of(component)`: this function
+        // takes a `ResolvedComponent`, whose `targets` field *is* that call's output, already
+        // slot-ordered and de-duplicated by `graph::resolve`.
         Lua { script, interval } => NodeSpec::Lua {
             script: script.clone(),
             interval: *interval,

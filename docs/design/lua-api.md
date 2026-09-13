@@ -154,6 +154,82 @@ unlikely to change real behavior, but it is a real (if narrow) restriction worth
 missing `process` — not silently treated as "no `flush()`" and left to quietly emit nothing at
 every tick.
 
+## Routing to a target
+
+A `lua`/`lua_file` component that declares `targets:` is a **router** ([ADR
+`target-components`](../adr/target-components.md)): each event it emits can name *one* of those
+targets as where it goes, and downstream components read a target by listing it in `sources:` like
+anything else.
+
+```yaml
+components:
+  central_in:
+    type: logit_in
+    bind: 0.0.0.0:5150
+
+  split:
+    type: lua
+    sources: [central_in]
+    targets: [host_stream, app_stream]
+    script: |
+      function process(event)
+        if event.attributes.stream == "host" then
+          return event:to("host_stream")
+        elseif event.attributes.stream == "app" then
+          return event:to("app_stream")
+        end
+        return event
+      end
+
+  host_stream: {type: target}
+  app_stream:  {type: target}
+
+  windowed:
+    type: aggregate
+    sources: [host_stream]
+    interval: 60s
+
+  untagged_out:
+    type: stdio_out
+    sources: [split]        # the component's own consumers: everything no `to` claimed
+    target: stderr
+```
+
+`event:to(id)` **marks** an event; it doesn't emit it. The event still has to be returned from
+`process()` (or included in a `flush()` table) exactly as an unrouted one does — `to` returns the
+same handle it was called on, so `return event:to("host_stream")` is the idiomatic one-liner, and
+`local e = event:to("x")` leaves `e` and `event` as the same event, not two.
+
+- **`event:to(nil)` clears the mark** — an event marked earlier in `process()` goes back to being
+  unrouted.
+- **An id not in this component's `targets:` is a script error**, counted like every other script
+  error (`logit.component.errors{reason="process"}`) and naming the ids that *are* configured —
+  never a silent forward. The same goes for `event:to("x")` on a component with no `targets:` at
+  all.
+- **An unmarked event goes to the component's own consumers** — whoever lists the component in
+  `sources:`. That is how the else-branch is spelled: not a chain of complementary filters, but the
+  component's ordinary outbound edge. A router with targets and **no** ordinary consumers is a
+  legal config, and its unmarked events are dropped and counted
+  `logit.component.events.dropped{reason="unrouted"}` (`docs/design/internal-telemetry.md`), never
+  silently — including unmarked events a `flush()` produced, so an `interval:`-bearing router whose
+  `flush()` emits anything unmarked and which has no ordinary consumers loses exactly that output.
+- **`event:clone()` copies the mark**, so a script fanning a routed event out gets two events
+  headed the same way; `copy:to(nil)` (or `copy:to("other")`) is how they diverge. The mark is
+  per-*event*, not per-call: `return {a:to("x"), b}` sends `a` to `x` and `b` to the component's
+  own consumers, from one return.
+- **`flush()` honours marks like `process()` does.** A flush-built event is usually an
+  `event:clone()` stashed during `process()`, and a clone carries the target list with it, so
+  `e:to("x")` works inside `flush()` too.
+
+One incoming batch is one hop however many ways it forks: the events are partitioned by mark and
+one batch is sent per destination that received any, all under the same trace context and the same
+`process` span. Downstream of a target, `provenance.previous` is the **target's** id, not this
+component's (`docs/design/pipeline-graph.md`); `provenance.origin` is untouched.
+
+Routing on an equality check alone needs no script at all — the native `route` component covers
+`{attribute: ..}`/`{resource: ..}`/`{provenance: ..}` equality without a VM in the path. Reach for
+a `lua` router when the decision needs something `route`'s deliberately narrow `by:` can't say.
+
 ## Emitting telemetry from a script
 
 A script can emit its own metrics via a `telemetry` global, callable from `process()` or
@@ -667,6 +743,12 @@ A `lua`/`lua_file` component's `interval` is optional and drives that component'
 same way `aggregate`'s does (see `docs/adr/aggregation-window-semantics.md`) -- omitted, the
 common case, the component never ticks, same as a script with no `flush()` at all. A zero interval
 is rejected at config-validation time, on either kind of component.
+
+`targets:` is optional too, and lists the `target` components this one may direct events into --
+what `event:to(id)` resolves against ("Routing to a target" above). It sits beside `sources:` on
+the component, not inside the `script:`/`lua_file:` field set, and is the only kind of component
+besides `route` that may carry one. Omitted, the component has no targets and every event it emits
+goes to its own consumers.
 
 Built-in native processors (no Lua involved) handle the common structured-parsing cases without
 per-event VM overhead: `json`, `logfmt`, `kv`, `regex`/`grok`, `csv`, `rename`/`remove`/`copy`,

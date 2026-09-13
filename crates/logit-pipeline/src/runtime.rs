@@ -17,7 +17,7 @@ use crate::readiness::NodeState;
 use crate::router::{Destination, Router, RouterScratch};
 use crate::{Fanout, Input, InputRuntimeConfig, Output, Readiness, Transform};
 use anyhow::Context;
-use logit_core::{Diagnostics, EventBatch, Resource, Scope, SpanKind, Telemetry};
+use logit_core::{Diagnostics, Event, EventBatch, Resource, Scope, SpanKind, Telemetry};
 use logit_script::{ProcessOutcome, ScriptWorker};
 use std::collections::HashMap;
 use std::future::Future;
@@ -84,11 +84,10 @@ pub enum NodeSpec {
         script: String,
         interval: Option<Duration>,
         /// The `target` ids this Lua component may direct events into, in
-        /// [`crate::graph::targets_of`] slot order -- `event:to("..")`'s name -> slot table.
-        /// Carried through the spec layer as of W3 and *unused* until W5
-        /// (`docs/plans/target-components.md`): `run_lua` has no routing path to hand it to yet,
-        /// so the spawn arm below binds and discards it with a comment rather than passing a
-        /// permanently-ignored argument into `run_lua`'s already-long signature.
+        /// [`crate::graph::targets_of`] slot order -- `event:to("..")`'s name -> slot table
+        /// (`ScriptWorker::with_targets`), and the same slot order `run_lua` resolves its target
+        /// `Fanout`s in. Empty for an ordinary `lua`/`lua_file` component, which then has exactly
+        /// one destination and behaves as it always has.
         targets: Vec<String>,
     },
 }
@@ -377,18 +376,7 @@ pub async fn run_with_telemetry(
                 // `routes[n]` here and in the Lua name -> slot table alike. Cloning a
                 // `Fanout` clones its `Sender`s, so two routers directing at one target is
                 // fan-in at that target for free, exactly as `sources:` fan-in is.
-                let routes: Vec<Fanout> = component
-                    .targets
-                    .iter()
-                    .map(|target| {
-                        target_fanouts.get(target.as_str()).cloned().unwrap_or_else(|| {
-                            panic!(
-                                "component '{id}': target '{target}' has no Fanout -- rules 44/45 \
-                                 guarantee every target reference resolves to a defined `target`"
-                            )
-                        })
-                    })
-                    .collect();
+                let routes = resolve_target_fanouts(&id, &component.targets, &target_fanouts);
                 let handle = tasks.spawn(run_router(router, inbox, fanout, routes, node_telemetry));
                 node_ids.insert(handle.id(), id.clone());
                 readiness.set_node(&id, NodeState::Running);
@@ -402,13 +390,13 @@ pub async fn run_with_telemetry(
                 // outcome, not a panic. Nothing is spawned for a target by design.
             }
             NodeSpec::Lua { script, interval, targets } => {
-                // W5 (`docs/plans/target-components.md`) is what gives a Lua node its targets:
-                // `event:to("..")`, a name -> slot table on the `ScriptWorker`, and one send per
-                // non-empty destination on both the batch path and `flush_now`. Until then a
-                // `targets:` on a `lua`/`lua_file` component is carried all the way through
-                // config, graph, and spec -- and stops here, because `run_lua` has no routing
-                // path to hand it to yet.
-                let _ = targets;
+                // A Lua node is a router too (`docs/adr/target-components.md`): the ids in
+                // `targets` become `event:to("..")`'s name -> slot table inside the VM, and these
+                // `Fanout`s are the same slots on the Rust side -- resolved exactly as the
+                // `Router` arm above resolves its own, from the same pre-spawn map, so
+                // `Destination::To(n)` and the script's n-th target id mean the same thing.
+                let target_routes =
+                    resolve_target_fanouts(&id, &component.targets, &target_fanouts);
                 let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
                 let handle = runtime_handle.clone();
                 let thread_id = id.clone();
@@ -419,9 +407,11 @@ pub async fn run_with_telemetry(
                             thread_id,
                             script,
                             interval,
+                            targets,
                             ready_tx,
                             inbox,
                             fanout,
+                            target_routes,
                             node_telemetry,
                             handle,
                         )
@@ -1578,6 +1568,33 @@ pub fn route_batch(
     out
 }
 
+/// The slot-ordered target `Fanout`s one routing node owns, cloned out of the pre-spawn map
+/// [`run_with_telemetry`] built -- shared by the two node kinds that route, `NodeSpec::Router` and
+/// a `NodeSpec::Lua` whose component declares `targets:`.
+///
+/// Slot order *is* `ResolvedComponent::targets`' order, which is `graph::targets_of`'s order --
+/// the one place that order is derived (`docs/adr/target-components.md`), so `Destination::To(n)`
+/// (a native `Router`) and the n-th id in a Lua component's `targets:` (`event:to("..")`'s name ->
+/// slot table) mean the same target. Cloning a `Fanout` clones its `Sender`s, so two routers
+/// directing at one target is fan-in at that target for free, exactly as `sources:` fan-in is.
+fn resolve_target_fanouts(
+    id: &str,
+    targets: &[String],
+    built: &HashMap<String, Fanout>,
+) -> Vec<Fanout> {
+    targets
+        .iter()
+        .map(|target| {
+            built.get(target.as_str()).cloned().unwrap_or_else(|| {
+                panic!(
+                    "component '{id}': target '{target}' has no Fanout -- rules 44/45 guarantee \
+                     every target reference resolves to a defined `target`"
+                )
+            })
+        })
+        .collect()
+}
+
 /// `Destination` -> index into [`RouterScratch`]'s per-destination buffers: slot 0 is the router's
 /// own outbound edge, slot `n + 1` is `Destination::To(n)`.
 fn slot_of(destination: Destination) -> usize {
@@ -1661,20 +1678,33 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 /// `crates/logit-script/src/scope.rs`, `docs/adr/operator-declared-resource-attributes.md`)
 /// overrides that default explicitly -- see `flush_now`'s `take_resource`/`take_scope` calls
 /// below.
+///
+/// **A Lua node is also a router** (`docs/adr/target-components.md`): `targets` is the component's
+/// `targets:` list in `graph::targets_of` slot order -- handed to the VM as `event:to("..")`'s
+/// name -> slot table -- and `target_fanouts` is the matching slot-ordered set of target `Fanout`s.
+/// Every emitted event carries its own `Option<u16>` mark, so one incoming batch is partitioned
+/// into at most `target_fanouts.len() + 1` outgoing ones (slot 0 being this component's own
+/// outbound edge, the unrouted else-branch) and sent under the **one** `BatchContext` this node
+/// mints for that batch -- one incoming batch is one hop however many ways it forks, exactly the
+/// rule `run_router` and `Fanout` already apply. A component with no `targets:` has a single
+/// destination and behaves exactly as it did before any of this existed.
 #[allow(clippy::too_many_arguments)]
 fn run_lua(
     id: String,
     script: String,
     configured_interval: Option<Duration>,
+    targets: Vec<String>,
     ready_tx: oneshot::Sender<Result<(), String>>,
     mut inbox: mpsc::Receiver<Delivered>,
     fanout: Fanout,
+    target_fanouts: Vec<Fanout>,
     telemetry: Telemetry,
     runtime: tokio::runtime::Handle,
 ) {
     let worker = match ScriptWorker::new(&script)
         .and_then(|w| w.with_telemetry(telemetry.clone()))
         .map(|w| w.with_component(&id))
+        .map(|w| w.with_targets(&targets))
     {
         Ok(worker) => worker,
         Err(err) => {
@@ -1701,6 +1731,13 @@ fn run_lua(
     // `take_scope` call below.
     let mut last_scope: Option<Arc<Scope>> = None;
 
+    // The same node-owned, reused per-destination buffers a native `Router` uses
+    // (`RouterScratch`'s own doc comment has the allocation accounting) -- shared by the batch
+    // path and `flush_now` alike. Only `dests` is used here: a script hands back its verdict *with*
+    // each event (an `Option<u16>` mark on `ProcessOutcome`), so there is nothing for this node to
+    // route-then-count-then-move the way `route_batch`'s borrowing `Router::route` forces.
+    let mut scratch = RouterScratch::new(target_fanouts.len());
+
     // Mints its own root and records this node's `flush` span directly (rather than going
     // through `fanout.send_blocking`, which now only ever mints a root for a genuine listener --
     // `fanout.rs`'s own doc comment), same reasoning as `run_flush`'s: a Lua `flush()`'s emission
@@ -1712,12 +1749,15 @@ fn run_lua(
     //
     // Takes `diag` as a parameter rather than capturing it: the loop body below also needs its
     // own `&mut diag` (for `script_error`), and a closure capturing it by unique reference would
-    // hold that borrow for the closure's entire lifetime, conflicting with every other use.
+    // hold that borrow for the closure's entire lifetime, conflicting with every other use. The
+    // same goes for `scratch`, whose per-destination buffers the batch path below also fills.
     let flush_now = |diag: &mut Diagnostics,
                      worker: &ScriptWorker,
                      resource: &mut Arc<Resource>,
                      scope: &mut Option<Arc<Scope>>,
-                     fanout: &Fanout| {
+                     fanout: &Fanout,
+                     target_fanouts: &[Fanout],
+                     scratch: &mut RouterScratch| {
         // Empty provenance in, same reasoning as `run_flush`'s own doc comment: a Lua `flush()`
         // is a fresh emission with no single incoming batch to inherit `origin`/`previous` from,
         // so `Fanout::stamp` fills in both as this component's own id.
@@ -1758,11 +1798,25 @@ fn run_lua(
         match result {
             Ok(events) if !events.is_empty() => {
                 telemetry.count("logit.component.flush.events", events.len() as f64, &[]);
-                span.events(events.len() as u64);
-                fanout.send_blocking_with_own_context(
-                    EventBatch { resource: resource.clone(), scope: scope.clone(), events },
+                // "A `flush()`-built event honours its mark like any other"
+                // (`docs/adr/target-components.md`) -- the same partition-and-send-per-destination
+                // the batch path below does, under this flush's one root context. A flushed event
+                // is typically an `event:clone()` stashed during `process()`, and `clone` copies
+                // both the mark and the target table, so `e:to("x")` is resolvable from `flush()`.
+                for (event, mark) in events {
+                    let slot = lua_slot_of(mark, scratch.dests.len());
+                    scratch.dests[slot].push(event);
+                }
+                let sent = send_lua_partitions(
+                    &mut scratch.dests,
+                    fanout,
+                    target_fanouts,
+                    resource,
+                    scope,
                     ctx,
+                    &telemetry,
                 );
+                span.events(sent);
             }
             Ok(_) => {}
             Err(err) => {
@@ -1777,7 +1831,15 @@ fn run_lua(
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
-                flush_now(&mut diag, &worker, &mut last_resource, &mut last_scope, &fanout);
+                flush_now(
+                    &mut diag,
+                    &worker,
+                    &mut last_resource,
+                    &mut last_scope,
+                    &fanout,
+                    &target_fanouts,
+                    &mut scratch,
+                );
                 let interval = configured_interval
                     .expect("next_flush is only ever Some for a component with an interval");
                 next_flush = Some(advance_flush_deadline(deadline, now_instant, interval));
@@ -1801,7 +1863,15 @@ fn run_lua(
         };
         let Some(batch) = batch else {
             if next_flush.is_some() {
-                flush_now(&mut diag, &worker, &mut last_resource, &mut last_scope, &fanout);
+                flush_now(
+                    &mut diag,
+                    &worker,
+                    &mut last_resource,
+                    &mut last_scope,
+                    &fanout,
+                    &target_fanouts,
+                    &mut scratch,
+                );
             }
             return;
         };
@@ -1851,13 +1921,22 @@ fn run_lua(
         telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
 
         let process_timer = telemetry.timer("logit.component.process.duration");
-        let mut out = Vec::with_capacity(batch.events.len());
+        // One allocation, exactly as the single `Vec::with_capacity(batch.events.len())` this
+        // replaced was: every `scratch.dests` entry was left empty *with capacity 0* by the
+        // previous batch's `std::mem::take`, and slot 0 -- this component's own outbound edge --
+        // is where every event of a component with no `targets:` goes, and the great majority of
+        // events even on one that has them. A destination a script actually routes to grows
+        // normally instead: unlike `route_batch`, whose `Router::route` borrows and so can count
+        // every verdict before moving anything, a script hands its verdict back *with* the event,
+        // so there is no count to reserve from until the events have already been handed over.
+        scratch.dests[0].reserve_exact(batch.events.len());
         let mut dropped: u64 = 0;
         let mut errors: u64 = 0;
+        let slots = scratch.dests.len();
         for event in batch.events {
             match worker.process(event) {
-                Ok(ProcessOutcome::Emit(e)) => {
-                    out.push(*e);
+                Ok(ProcessOutcome::Emit(e, mark)) => {
+                    scratch.dests[lua_slot_of(mark, slots)].push(*e);
                     telemetry.count("logit.script.events.emitted", 1.0, &[("outcome", "emit")]);
                 }
                 Ok(ProcessOutcome::EmitMany(es)) => {
@@ -1866,7 +1945,11 @@ fn run_lua(
                         es.len() as f64,
                         &[("outcome", "emit_many")],
                     );
-                    out.extend(es);
+                    // Each event in a `return {a, b}` carries its own mark, so one fan-out can
+                    // fork several ways (`docs/adr/target-components.md`).
+                    for (event, mark) in es {
+                        scratch.dests[lua_slot_of(mark, slots)].push(event);
+                    }
                 }
                 Ok(ProcessOutcome::Drop) => dropped += 1,
                 Err(err) => {
@@ -1911,11 +1994,101 @@ fn run_lua(
         let scope = worker.take_scope().or_else(|| batch.scope.clone());
         last_resource = resource.clone();
         last_scope = scope.clone();
-        if !out.is_empty() {
-            span.events(out.len() as u64);
-            fanout.send_blocking_with_own_context(EventBatch { resource, scope, events: out }, ctx);
+        // One send per non-empty destination, all under the one `ctx` minted above -- one
+        // incoming batch is one hop however many ways it forks, the same rule `run_router`
+        // applies.
+        let sent = send_lua_partitions(
+            &mut scratch.dests,
+            &fanout,
+            &target_fanouts,
+            &resource,
+            &scope,
+            ctx,
+            &telemetry,
+        );
+        if sent > 0 {
+            span.events(sent);
         }
     }
+}
+
+/// An `event:to(..)` mark -> index into `run_lua`'s per-destination buffers, the same slot
+/// numbering [`slot_of`] gives a native router's [`Destination`]: 0 is the component's own
+/// outbound edge (an unrouted event), `n + 1` is target slot `n`.
+///
+/// An out-of-range slot cannot happen: the only thing that can set a mark is `event:to(id)`, and
+/// that resolves `id` against the very `targets:` list these buffers were sized from -- an
+/// unknown id is a script error, never a mark (`crates/logit-script/src/proxy.rs`'s
+/// `TargetTable`). `debug_assert!` anyway, and in release treat it as unrouted rather than
+/// panicking or indexing out of bounds, exactly as `route_batch` treats a buggy `Router`.
+fn lua_slot_of(mark: Option<u16>, slots: usize) -> usize {
+    let Some(target) = mark else {
+        return 0;
+    };
+    let slot = usize::from(target) + 1;
+    debug_assert!(
+        slot < slots,
+        "a script marked an event for target slot {target} with only {} target(s) configured",
+        slots - 1
+    );
+    match slot < slots {
+        true => slot,
+        false => 0,
+    }
+}
+
+/// Sends one Lua node's per-destination partition: one `EventBatch` per non-empty buffer, every
+/// one of them under the *same* [`BatchContext`] its caller minted, with `std::mem::take` handing
+/// each exactly-sized buffer out and leaving a capacity-0 `Vec` behind for the next batch (see
+/// [`RouterScratch`]). Returns the total number of events handed over, for the caller's span.
+///
+/// Shared by `run_lua`'s batch path and its `flush_now`, which partition identically.
+///
+/// The `unrouted` rule is `run_router`'s, unchanged: `Fanout::deliver` returns early on zero
+/// consumers and counts *nothing*, so a router with targets and no ordinary consumers (a legal
+/// config, rule 46) has to count its own forward partition explicitly --
+/// `logit.component.events.dropped{reason="unrouted"}`, never silently
+/// (`docs/adr/target-components.md`, `docs/design/internal-telemetry.md`).
+fn send_lua_partitions(
+    dests: &mut [Vec<Event>],
+    fanout: &Fanout,
+    target_fanouts: &[Fanout],
+    resource: &Arc<Resource>,
+    scope: &Option<Arc<Scope>>,
+    ctx: BatchContext,
+    telemetry: &Telemetry,
+) -> u64 {
+    let mut sent = 0u64;
+    for (slot, dest) in dests.iter_mut().enumerate() {
+        if dest.is_empty() {
+            continue;
+        }
+        sent += dest.len() as u64;
+        let events = std::mem::take(dest);
+        // Slot 0 is this component's own outbound edge; slot n + 1 is target slot n.
+        let destination = match slot {
+            0 => fanout,
+            n => match target_fanouts.get(n - 1) {
+                Some(fanout) => fanout,
+                // Unreachable: `lua_slot_of` never produces a slot these buffers -- sized from
+                // `target_fanouts` itself -- weren't built for.
+                None => continue,
+            },
+        };
+        if slot == 0 && destination.is_empty() {
+            telemetry.count(
+                "logit.component.events.dropped",
+                events.len() as f64,
+                &[("reason", "unrouted")],
+            );
+            continue;
+        }
+        destination.send_blocking_with_own_context(
+            EventBatch { resource: resource.clone(), scope: scope.clone(), events },
+            ctx,
+        );
+    }
+    sent
 }
 
 /// Turns the channel payload back into an owned `EventBatch`, right before handing it to a
@@ -6907,6 +7080,371 @@ mod tests {
         assert!(
             scratch.dests.iter().all(|dest| dest.is_empty() && dest.capacity() == 0),
             "the scratch must come back empty and capacity-free for the next batch"
+        );
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Lua routers (`docs/adr/target-components.md`, `docs/plans/target-components.md` W5)
+    // -------------------------------------------------------------------------------------------
+
+    /// As `FiniteInput`, for the tests that need to prove a node is still alive *after* something
+    /// went wrong on an earlier batch: sends each batch in turn, then finishes.
+    struct FiniteBatches {
+        batches: Vec<EventBatch>,
+    }
+
+    #[async_trait::async_trait]
+    impl Input for FiniteBatches {
+        async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
+            for batch in self.batches.drain(..) {
+                sink.send(batch).await;
+            }
+            Ok(())
+        }
+    }
+
+    /// The script every Lua-router test below runs: the ADR's own example, an `event:to(..)` per
+    /// branch and a plain `return event` for anything else.
+    const SPLIT_SCRIPT: &str = r#"
+        function process(event)
+            if event.attributes.stream == "a" then
+                return event:to("a")
+            elseif event.attributes.stream == "b" then
+                return event:to("b")
+            end
+            return event
+        end
+    "#;
+
+    /// `a_router_partitions_a_batch_across_two_targets`'s Lua twin: the same one-batch, three-way
+    /// split, driven by `event:to(..)` marks on the handle rather than by a native `Router`. Each
+    /// event has exactly one right place to end up -- target `a`'s consumer, target `b`'s
+    /// consumer, or (the unmarked ones) the Lua component's *own* consumer -- and nothing is
+    /// duplicated or lost.
+    #[tokio::test]
+    async fn a_lua_router_splits_a_batch_two_ways() {
+        let g = routed_graph(vec![
+            ("in", vec![], vec![], ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }),
+            (
+                "split",
+                vec!["in"],
+                vec!["a", "b"],
+                ComponentKind::Lua { script: SPLIT_SCRIPT.to_string(), interval: None },
+            ),
+            ("a", vec![], vec![], ComponentKind::Target {}),
+            ("b", vec![], vec![], ComponentKind::Target {}),
+            ("sink_a", vec!["a"], vec![], influxdb_out()),
+            ("sink_b", vec!["b"], vec![], influxdb_out()),
+            ("sink_fwd", vec!["split"], vec![], influxdb_out()),
+        ]);
+
+        let (tx_a, rx_a) = std::sync::mpsc::channel();
+        let (tx_b, rx_b) = std::sync::mpsc::channel();
+        let (tx_fwd, rx_fwd) = std::sync::mpsc::channel();
+
+        let batch = one_batch(vec![
+            tagged_event("hits_a", Some("a")),
+            tagged_event("hits_none", None),
+            tagged_event("hits_b", Some("b")),
+            tagged_event("hits_a2", Some("a")),
+            tagged_event("hits_other", Some("zzz")),
+        ]);
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "split".to_string(),
+            NodeSpec::Lua {
+                script: SPLIT_SCRIPT.to_string(),
+                interval: None,
+                targets: vec!["a".to_string(), "b".to_string()],
+            },
+        );
+        specs.insert("a".to_string(), NodeSpec::Target);
+        specs.insert("b".to_string(), NodeSpec::Target);
+        specs.insert("sink_a".to_string(), recording_sink(tx_a));
+        specs.insert("sink_b".to_string(), recording_sink(tx_b));
+        specs.insert("sink_fwd".to_string(), recording_sink(tx_fwd));
+
+        tokio::time::timeout(Duration::from_secs(5), run(g, specs))
+            .await
+            .expect("run should return once the only input finishes, not hang forever")
+            .expect("run should complete without error");
+
+        let received_a = rx_a.recv_timeout(Duration::from_secs(1)).expect("sink_a gets a batch");
+        let received_b = rx_b.recv_timeout(Duration::from_secs(1)).expect("sink_b gets a batch");
+        let received_fwd =
+            rx_fwd.recv_timeout(Duration::from_secs(1)).expect("sink_fwd gets a batch");
+
+        assert_eq!(
+            received_a.events.iter().map(stream_tag).collect::<Vec<_>>(),
+            vec![Some("a"), Some("a")],
+            "target a's consumer should see exactly the events the script marked for it, in order"
+        );
+        assert_eq!(received_b.events.iter().map(stream_tag).collect::<Vec<_>>(), vec![Some("b")]);
+        assert_eq!(
+            received_fwd.events.iter().map(stream_tag).collect::<Vec<_>>(),
+            vec![None, Some("zzz")],
+            "an event the script never marked is unrouted, not routed to slot 0's target"
+        );
+        assert!(rx_a.recv_timeout(Duration::from_millis(50)).is_err(), "no duplicate batch");
+        assert!(rx_b.recv_timeout(Duration::from_millis(50)).is_err(), "no duplicate batch");
+        assert!(rx_fwd.recv_timeout(Duration::from_millis(50)).is_err(), "no duplicate batch");
+    }
+
+    /// The else-branch, for a Lua router: an event no `event:to(..)` ever touched goes to whoever
+    /// lists the *component* in `sources:` -- the same rule `unrouted_events_reach_the_routers_
+    /// ordinary_consumers` pins for a native one, asserted on its own rather than only as part of
+    /// the three-way split above.
+    #[tokio::test]
+    async fn an_unmarked_event_reaches_the_lua_routers_ordinary_consumers() {
+        let g = routed_graph(vec![
+            ("in", vec![], vec![], ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }),
+            (
+                "split",
+                vec!["in"],
+                vec!["a", "b"],
+                ComponentKind::Lua { script: SPLIT_SCRIPT.to_string(), interval: None },
+            ),
+            ("a", vec![], vec![], ComponentKind::Target {}),
+            ("b", vec![], vec![], ComponentKind::Target {}),
+            ("sink_a", vec!["a"], vec![], influxdb_out()),
+            ("sink_fwd", vec!["split"], vec![], influxdb_out()),
+        ]);
+
+        let (tx_a, rx_a) = std::sync::mpsc::channel();
+        let (tx_fwd, rx_fwd) = std::sync::mpsc::channel();
+        let batch =
+            one_batch(vec![tagged_event("one", None), tagged_event("two", Some("nothing"))]);
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "split".to_string(),
+            NodeSpec::Lua {
+                script: SPLIT_SCRIPT.to_string(),
+                interval: None,
+                targets: vec!["a".to_string(), "b".to_string()],
+            },
+        );
+        specs.insert("a".to_string(), NodeSpec::Target);
+        specs.insert("b".to_string(), NodeSpec::Target);
+        specs.insert("sink_a".to_string(), recording_sink(tx_a));
+        specs.insert("sink_fwd".to_string(), recording_sink(tx_fwd));
+
+        tokio::time::timeout(Duration::from_secs(5), run(g, specs))
+            .await
+            .expect("run should return once the only input finishes, not hang forever")
+            .expect("run should complete without error");
+
+        let forwarded =
+            rx_fwd.recv_timeout(Duration::from_secs(1)).expect("sink_fwd gets the whole batch");
+        assert_eq!(forwarded.events.len(), 2);
+        assert!(
+            rx_a.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the script marked nothing for target a, so its consumer must see no batch at all"
+        );
+    }
+
+    /// "An id not in `targets:` is a script error, counted like every other script error, never a
+    /// silent forward" (`docs/adr/target-components.md`) -- so the event is lost exactly the way
+    /// any other `process()` error loses one, the error is counted under the component the same
+    /// `logit.component.errors{reason="process"}` way, and the node carries on: the batch after it
+    /// still flows, and `run` still returns cleanly.
+    #[tokio::test]
+    async fn an_unknown_target_in_lua_counts_a_script_error_and_does_not_kill_the_node() {
+        let script = r#"
+            function process(event)
+                if event.attributes.stream == "bad" then
+                    return event:to("nope")
+                end
+                return event
+            end
+        "#;
+        let g = routed_graph(vec![
+            ("in", vec![], vec![], ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }),
+            (
+                "split",
+                vec!["in"],
+                vec!["a"],
+                ComponentKind::Lua { script: script.to_string(), interval: None },
+            ),
+            ("a", vec![], vec![], ComponentKind::Target {}),
+            ("sink_a", vec!["a"], vec![], influxdb_out()),
+            ("sink_fwd", vec!["split"], vec![], influxdb_out()),
+        ]);
+
+        let (tx_a, _rx_a) = std::sync::mpsc::channel();
+        let (tx_fwd, rx_fwd) = std::sync::mpsc::channel();
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteBatches {
+                    batches: vec![
+                        one_batch(vec![
+                            tagged_event("boom", Some("bad")),
+                            tagged_event("fine", None),
+                        ]),
+                        one_batch(vec![tagged_event("later", None)]),
+                    ],
+                }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "split".to_string(),
+            NodeSpec::Lua {
+                script: script.to_string(),
+                interval: None,
+                targets: vec!["a".to_string()],
+            },
+        );
+        specs.insert("a".to_string(), NodeSpec::Target);
+        specs.insert("sink_a".to_string(), recording_sink(tx_a));
+        specs.insert("sink_fwd".to_string(), recording_sink(tx_fwd));
+
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = ["in", "split", "a", "sink_a", "sink_fwd"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, telemetry, Readiness::disabled(), std::future::pending()),
+        )
+        .await
+        .expect("a script error must not park or kill the node")
+        .expect("run should complete without error");
+
+        let mut forwarded: Vec<String> = Vec::new();
+        while let Ok(batch) = rx_fwd.recv_timeout(Duration::from_millis(500)) {
+            for event in &batch.events {
+                forwarded.push(
+                    event
+                        .metrics
+                        .first()
+                        .map(|m| logit_core::interner::resolve(m.name).to_string())
+                        .expect("a counter event"),
+                );
+            }
+        }
+        assert_eq!(
+            forwarded,
+            vec!["fine".to_string(), "later".to_string()],
+            "the erroring event is lost, but its batch-mate and the whole next batch still flow"
+        );
+
+        let events = registry.drain(0);
+        let errors = events
+            .iter()
+            .filter(|e| e.attributes.get("component").and_then(|v| v.as_str()) == Some("split"))
+            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("process"))
+            .find_map(|e| {
+                e.metrics.iter().find_map(|m| match &m.kind {
+                    MetricKind::Sum(s)
+                        if logit_core::interner::resolve(m.name) == "logit.component.errors" =>
+                    {
+                        Some(s.value)
+                    }
+                    _ => None,
+                })
+            });
+        assert_eq!(
+            errors,
+            Some(1.0),
+            "the unknown target should be counted as an ordinary script error, got: {events:?}"
+        );
+    }
+
+    /// A `flush()`-built event honours its mark like any other (`docs/adr/target-components.md`):
+    /// the script stashes an `event:clone()` -- which copies the target table, the only reason
+    /// `e:to("a")` resolves from inside `flush()` at all -- and routes it at flush time. The
+    /// close-time flush (the inbox closing is enough, no deadline has to elapse) is what fires it,
+    /// exactly as in `a_flush_with_no_batch_ever_received_still_records_vm_memory`.
+    #[tokio::test]
+    async fn lua_flush_output_honours_marks() {
+        let script = r#"
+            local pending = nil
+            function process(event)
+                pending = event:clone()
+                return nil
+            end
+            function flush()
+                if pending then
+                    local e = pending
+                    pending = nil
+                    return {e:to("a")}
+                end
+                return {}
+            end
+        "#;
+        let g = routed_graph(vec![
+            ("in", vec![], vec![], ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }),
+            (
+                "windowed",
+                vec!["in"],
+                vec!["a"],
+                ComponentKind::Lua {
+                    script: script.to_string(),
+                    interval: Some(Duration::from_secs(3600)),
+                },
+            ),
+            ("a", vec![], vec![], ComponentKind::Target {}),
+            ("sink_a", vec!["a"], vec![], influxdb_out()),
+            ("sink_fwd", vec!["windowed"], vec![], influxdb_out()),
+        ]);
+
+        let (tx_a, rx_a) = std::sync::mpsc::channel();
+        let (tx_fwd, rx_fwd) = std::sync::mpsc::channel();
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput {
+                    batch: Some(one_batch(vec![tagged_event("stashed", None)])),
+                }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "windowed".to_string(),
+            NodeSpec::Lua {
+                script: script.to_string(),
+                interval: Some(Duration::from_secs(3600)),
+                targets: vec!["a".to_string()],
+            },
+        );
+        specs.insert("a".to_string(), NodeSpec::Target);
+        specs.insert("sink_a".to_string(), recording_sink(tx_a));
+        specs.insert("sink_fwd".to_string(), recording_sink(tx_fwd));
+
+        tokio::time::timeout(Duration::from_secs(5), run(g, specs))
+            .await
+            .expect("run should return once the only input finishes, not hang forever")
+            .expect("run should complete without error");
+
+        let flushed =
+            rx_a.recv_timeout(Duration::from_secs(1)).expect("the flushed event should reach a");
+        assert_eq!(flushed.events.len(), 1);
+        assert!(
+            rx_fwd.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the flush marked its event for a, so the component's own consumer sees nothing"
         );
     }
 }

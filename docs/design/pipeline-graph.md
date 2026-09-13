@@ -545,7 +545,10 @@ Everything else — listeners, sinks, native `Send` transforms (`aggregate` toda
 `Router`s** (`route`, [ADR `target-components`](../adr/target-components.md); a `Router` is `Send`
 for the same reason a `Transform` is, and `run_router` is `run_transform` minus the flush-deadline
 race) — runs as an ordinary tokio task, no dedicated thread required. A `target` runs as nothing at
-all — see the runtime model above. This is a strict generalization of today's split
+all — see the runtime model above. A **Lua router** (a `lua`/`lua_file` component with `targets:`)
+is not a further exception: it is the same one OS thread it would be without them, partitioning
+each batch by the `event:to(..)` mark its script set and sending one batch per destination from
+that thread. This is a strict generalization of today's split
 (input/output tasks vs. one worker thread per pipeline), not a new idea — it just now applies per
 node instead of per pipeline.
 
