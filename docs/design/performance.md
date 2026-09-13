@@ -238,21 +238,13 @@ script/perf flamegraph --scenario passthrough
 
 Builds `-p logit-cli --profile profiling` (a new root profile: `inherits = "release"`, plus
 `line-tables-only` debug info and an unstripped symbol table `perf` needs — see the profile's own
-comment in the root `Cargo.toml`), runs `perf record -F <freq> -g --call-graph dwarf` against it
-through the same spawn/settle/SIGTERM machinery `run` uses, then pipes `perf script |
-inferno-collapse-perf | inferno-flamegraph` into an SVG. An ordinary `script/perf flamegraph
---scenario passthrough` run (default `-F 999`) captured 6.6s of `passthrough`, wrote
-`perf/results/passthrough.svg` at 1,179,979 bytes (~1.13 MiB) — gitignored, `/perf/results/` is
-per-run/per-machine output, not source — and symbols resolved cleanly: real, demangled Rust paths
-throughout (`logit_core::event::EventBatch`, `logit_inputs::generate::GenerateInput`,
-`logit_core::interner::resolve`, …), not hex addresses. **A worked example is checked in** at
-[`perf/passthrough-flamegraph.svg`](perf/passthrough-flamegraph.svg) — the same scenario, `-F 499`
-to keep the file small (1,111,808 bytes), from this same recorded run
-(`c75399d8bcccf1ef6ba5b7b2411b1b6b6876aa09`, 2026-09-13). It's a static render for browsing in a
-repo viewer or a PR; open it locally (or regenerate with `script/perf flamegraph`) for the live,
-clickable, searchable original — inferno's SVGs are self-contained interactive documents, not flat
-images, and a browser or the GitHub file view renders that interactivity, while an embedded
-`<img>`/Markdown image render does not.
+comment in the root `Cargo.toml`), runs `perf record -F 999 -g --call-graph dwarf` against it through
+the same spawn/settle/SIGTERM machinery `run` uses, then pipes `perf script | inferno-collapse-perf |
+inferno-flamegraph` into an SVG. This run captured 6.6s of `passthrough` at 999 Hz, wrote
+`perf/results/passthrough.svg` at **1,179,979 bytes** (~1.13 MiB, kept out of git — `/perf/results/`
+is gitignored), and symbols resolve cleanly: real, demangled Rust paths throughout
+(`logit_core::event::EventBatch`, `logit_inputs::generate::GenerateInput`,
+`logit_core::interner::resolve`, …), not hex addresses.
 
 **The container needs three flags, not two.** `--cap-add SYS_ADMIN` and `--security-opt
 seccomp=unconfined` were predicted by the ADR (`perf_event_open`'s capability requirement, and
