@@ -1030,6 +1030,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "logit-perf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "libc",
+ "logit-core",
+ "logit-proto",
+ "serde",
+ "serde_json",
+ "serde_norway",
+]
+
+[[package]]
 name = "logit-pipeline"
 version = "0.1.0"
 dependencies = [
