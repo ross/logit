@@ -1127,6 +1127,26 @@ already built that have a known, accepted rough edge.
   `write!`. Filed here rather than fixed as part of the Graphite/Carbon relay effort that noticed
   it (`docs/plans/graphite-carbon-relay.md`'s W4b closeout) — a candidate follow-up for whoever
   next touches `crates/logit-proto/src/prometheus/mod.rs`, not a bug in this effort's own scope.
+- **`graphite_in` over TCP has no `handshake_timeout`; a peer that connects and sends nothing holds
+  one of its 1024 connection permits indefinitely.** The shared TCP driver
+  (`crates/logit-inputs/src/tcp.rs`) bounds the first byte with `handshake_timeout` (graph rule 45)
+  for `syslog_in`/`otlp_in`/`logit_in` alike, but `graphite_in` runs its own accept loop
+  (`crates/logit-inputs/src/graphite/tcp.rs`), written concurrently before the shared driver
+  existed — [ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md)'s "`graphite_in`'s TCP
+  listener: no `ReceiveQueue`, and no shared driver yet" section names the extraction trigger (a
+  second line-oriented TCP listener, which `syslog_in` over TCP has since become,
+  [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)) without `graphite_in`
+  having been ported onto it yet. The intended fix is porting `graphite_in` onto the shared
+  driver, not a second, listener-local timeout: plaintext adopts the driver's newline framing
+  as-is, and pickle needs a 4-byte big-endian length-prefix mode added to `tcp::Framer` (carbon's
+  own `Int32StringReceiver` framing — the constant already exists as
+  `crates/logit-proto/src/graphite/pickle.rs`'s `LENGTH_PREFIX_BYTES`, just not wired into
+  `tcp::Framer` yet) — porting also brings TLS along, since `graphite_in` has none today. A
+  listener-local timeout is deliberately not being added first, to avoid implementing the same
+  bound twice. What porting would not change: the post-first-byte idle gap is the same accepted
+  one every TCP listener has — this file's "No idle-connection timeout on a TCP listener after a
+  successful handshake" entry below.
+
 - **`otlp_in`'s `partial_success` response is always empty.** OTLP's
   `Export*ServiceResponse.partial_success` field exists so a receiver can accept most of a request
   while reporting which records it rejected — `otlp_out` (`crates/logit-outputs/src/otlp.rs`) fully

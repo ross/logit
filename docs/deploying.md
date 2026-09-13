@@ -467,6 +467,9 @@ cross-protocol one, `statsd_in` through an `aggregate` window into `graphite_out
   "try later" and a sender holding an accepted-but-unread connection would look healthy while
   delivering nothing. `udp` runs the same shared datagram listener `statsd_in`/`collectd_in`/
   `syslog_in` do, so everything in the receive-queue section above applies to it unchanged.
+  **Known gap:** unlike `syslog_in`/`otlp_in`/`logit_in`, `graphite_in` has no `handshake_timeout`
+  field at all, so a TCP peer that connects and sends nothing holds one of those 1024 permits
+  indefinitely — see `docs/known-gaps.md`'s "`graphite_in` over TCP has no `handshake_timeout`" row.
 - **`receive:` means different halves on the two transports.** A UDP `graphite_in` takes the whole
   block. A TCP one has **no receive queue at all** — TCP's own flow control is the backpressure,
   and the queue exists (ADR `decoupled-listener-io`) for a UDP socket's *silent* drops, which a
