@@ -515,11 +515,15 @@ already built that have a known, accepted rough edge.
   substituted a placeholder for a missing variable was tried and reverted (ADR `env-yaml-tag`'s
   Alternatives) — visualizing a config's shape without its production secrets set needs a copy of
   the config with dummy values filled in, not a feature of `logit graph` itself.
-- **`syslog_in` is UDP-only** — nginx's `syslog:` writer is UDP-only, so a TCP accept loop would
-  buy the driving integration nothing. `syslog_out` (the egress side, `docs/adr/syslog-output.md`)
-  supports both UDP and TCP, and that asymmetry is deliberate, not a sign this entry needs closing
-  to match. Stays additive-later on the *input* side specifically. **Closed: `syslog_in` no longer
-  skips RFC 5424 STRUCTURED-DATA** — `parse_structured_data`
+- ~~**`syslog_in` is UDP-only**~~ — **closed as of 2026-09-13.** `syslog_in` gains
+  `transport: tcp`, running on the same generic stream driver (`logit-inputs::tcp::TcpListener`)
+  `syslog_out`'s own TCP transport already used from the egress side — RFC 6587 framing
+  (octet-counting or non-transparent, auto-detected per connection), and `tls:` on top of it for
+  RFC 5425 syslog over TLS. The asymmetry this entry and
+  [ADR `syslog-output`](adr/syslog-output.md)'s "that asymmetry is deliberate" note both called
+  out no longer holds; see
+  [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md). **Closed: `syslog_in` no
+  longer skips RFC 5424 STRUCTURED-DATA** — `parse_structured_data`
   (`crates/logit-inputs/src/syslog.rs`) is a real, quote-aware parser into `syslog.sd`; see
   [ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md).
 - **Closed: `syslog_out` now emits RFC 5424 STRUCTURED-DATA** — every `syslog.sd` element an
@@ -557,13 +561,14 @@ already built that have a known, accepted rough edge.
   JSON message body and break a `| json` LogQL filter on every line). Consequence: a message that
   genuinely contained the literal two characters `\`/`n` is indistinguishable on the wire from one
   that contained a real newline. Accepted in `docs/adr/syslog-output.md`.
-- **`syslog_out` has no TLS** — plaintext UDP/TCP only; RFC 5425 (syslog over TLS) and RFC 6012
-  (DTLS) are both out of scope. A `logit -> remote collector` hop over an untrusted network has no
-  transport security today. `otlp_out`/`otlp_in` gained `tls:` config
-  ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)) via a
-  `TlsClientConfig`/`TlsServerConfig` pair in `logit-config` designed to be reusable by any other
-  protocol — `syslog_out`'s own TLS support, if it lands, is a config-plumbing exercise against
-  those same types, not a design decision to redo.
+- ~~**`syslog_out` has no TLS**~~ — **closed as of 2026-09-13** for RFC 5425 (syslog over TLS over
+  TCP): `syslog_out` gains `tls:` (`TlsClientConfig`), and `syslog_in` gains the matching
+  `transport: tcp`/`tls:` (`TlsServerConfig`) on the ingress side, both against the same
+  `logit_out`/`otlp_in`-shaped config-plumbing this entry already named as the fix; see
+  [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md). **Still open: RFC 6012
+  (DTLS, syslog over TLS over UDP)** — out of scope for that ADR (see its Alternatives); a `tls:`
+  block under `transport: udp` is a config error on both `syslog_in` and `syslog_out` rather than
+  silently ignored, so this remains a real gap, not a documentation one.
 - ~~**`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
   per-message framing**~~ — **closed as of 2026-09-12.** `syslog_out` needs one UDP datagram or
   one octet-counted TCP frame per *message*, and `statsd_out` needs one statsd line per metric
@@ -640,9 +645,12 @@ already built that have a known, accepted rough edge.
   and count `logit.output.{tags,labels}.normalized{reason="multi_value"}` once per attribute. See
   [ADR `statsd-output`](adr/statsd-output.md)'s amendment and
   [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing assessment.
-- **`statsd_out` has no TLS/DTLS** — plaintext UDP/TCP only, same gap as `syslog_out`'s above, and
-  the same `TlsClientConfig`/`TlsServerConfig` pair would be the config-plumbing exercise if it
-  lands.
+- **`statsd_out` has no TLS/DTLS** — plaintext UDP/TCP only. `syslog_out`'s own TLS support closed
+  against `crates/logit-outputs/src/tls.rs::build_client_config` and the boxed-`AsyncStream`
+  `Conn::Tcp` shape (`docs/adr/syslog-tcp-ingress-and-tls.md`); the same generic TCP driver
+  (`logit-inputs::tcp::TcpListener`) `syslog_in` now runs on would carry `statsd_in`'s ingress side
+  too, per that ADR's Consequences. That's the adoption path here as well, not a design decision to
+  redo — DTLS stays out of scope on both sinks either way.
 - **Closed: a non-UTF-8 syslog MSG decodes to a `Value::Bytes` event instead of being rejected** —
   RFC 5424's `MSG-ANY` permits arbitrary octets, and `logit-core::Value`'s `Bytes` variant now
   carries it. `parse_line`/`parse_5424`/`parse_3164` (`crates/logit-inputs/src/syslog.rs`) parse
@@ -1198,21 +1206,60 @@ already built that have a known, accepted rough edge.
   operator configuring the pipeline declares one" (fine, same category as `syslog_out`'s existing
   `hostname`/`app_name` fields) — plus the demo-stack workstreams (B, C, D) it would unblock.
 
-- **TLS certificates (`otlp_out`'s `tls:`, `otlp_in`'s `tls:`) are loaded once at startup; rotation
-  needs a restart.** `OtlpOutput::with_tls`/`OtlpInput::with_tls`
-  (`crates/logit-outputs/`/`crates/logit-inputs/src/otlp.rs`) read every PEM file at construction
-  time (`logit run` startup) and build a static `rustls::ClientConfig`/`ServerConfig` from it — a
-  renewed certificate (a 90-day Let's Encrypt cert, a `cert-manager`-issued one) has no effect until
-  the process restarts. [ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)
-  files this as deliberately out of scope; closing it means `rustls::ServerConfig`'s
-  `ResolvesServerCert` (a file-watcher hook) on the server side, or an equivalent reload on the
-  client side, either behind a SIGHUP or a poll.
-- **`otlp_out`'s TLS client has no `server_name` override.** Useful when an endpoint is reached by
-  IP or through a proxy whose certificate names something else (OTel's own
-  `tls.server_name_override` knob). Cheap to add via `hyper-rustls`'s
-  `HttpsConnectorBuilder::with_server_name_resolver` and an equivalent override on the `reqwest`
-  side; left out of the initial TLS work to keep it small
-  ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)).
+- **Every TLS-capable component's certificates are loaded once at startup; rotation needs a
+  restart.** `otlp_in`/`otlp_out`, `logit_in`/`logit_out`, `syslog_in`/`syslog_out`, and
+  `prometheus_in` alike (`with_tls`, one per component, all built on
+  `crates/logit-inputs/src/tls.rs::build_server_config`/`crates/logit-outputs/src/tls.rs::
+  build_client_config`) read every PEM file at construction time (`logit run` startup) and build a
+  static `rustls::ClientConfig`/`ServerConfig` (or, for `prometheus_in`'s `reqwest` client, its
+  equivalent) from it — a renewed certificate (a 90-day Let's Encrypt cert, a `cert-manager`-issued
+  one) has no effect until the process restarts. Originally filed against `otlp_in`/`otlp_out` alone
+  ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)) as deliberately
+  out of scope; every TLS component built since shares the same construction-time-only shape, so the
+  gap generalizes rather than needing a fresh entry per component
+  ([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)). Closing it means
+  `rustls::ServerConfig`'s `ResolvesServerCert` (a file-watcher hook) on the server side, or an
+  equivalent reload on the client side, either behind a SIGHUP or a poll.
+- **No TLS client on any sink has a `server_name` override.** `otlp_out`, `logit_out`, and
+  `syslog_out` alike derive the `ServerName` a peer's certificate is checked against from the
+  configured `endpoint`'s own host — useful to override when an endpoint is reached by IP or
+  through a proxy whose certificate names something else (OTel's own `tls.server_name_override`
+  knob). Cheap to add per sink via `hyper-rustls`'s
+  `HttpsConnectorBuilder::with_server_name_resolver` (`otlp_out`), an equivalent override on the
+  `reqwest` side (`prometheus_in`, the one TLS *client* on the input side), and a plain
+  `ServerName` override ahead of `host_only(endpoint)` (`logit_out`/`syslog_out`, both built on
+  `crates/logit-outputs/src/tls.rs`); left out of the initial TLS work on each to keep it small
+  ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md),
+  [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)).
+- **No idle-connection timeout on a TCP listener after a successful handshake (or, on plaintext,
+  after the first byte).** `logit_in` and `syslog_in` (`transport: tcp`) both bound the
+  *pre*-handshake window (`HANDSHAKE_TIMEOUT`, 5s — a client that opens a connection and never
+  sends a ClientHello is dropped and its connection-cap permit released; `otlp_in`'s own TLS accept
+  has no such bound at all, tracked separately above), but none of the three bounds what happens
+  *after*: a connection that completes its handshake (or, on a plaintext listener, delivers at
+  least one byte and then stops) goes silent forever and holds its connection-cap permit
+  indefinitely, right up to the cap itself (1024 for `logit_in`/`syslog_in`;
+  [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)'s "Pre-handshake timeout"
+  section names this explicitly as a known gap `syslog_in` shares with `otlp_in`, not one it
+  introduces fresh). A slow-loris-shaped client can exhaust the cap with connections that will
+  never send another byte. Closing it means an idle-read timeout per connection, reset on every
+  frame/line/request actually read — no such timer exists on any of the three listeners today.
+- **A write-only TLS sink (`syslog_out`, and `logit_out` before its per-batch ack) cannot observe a
+  peer's post-handshake rejection.** Under TLS 1.3 the server sends its entire handshake flight,
+  `Finished` included, before it ever sees the client's certificate message — so a client-cert
+  rejection (a `client_ca_file`-requiring collector, no matching cert presented) arrives as an
+  alert *after* `TlsConnector::connect` has already returned success on this side, and after
+  `syslog_out`'s single `write()` has already landed its bytes in the local socket buffer: `send`
+  reports the batch delivered, and this sink never reads from the connection again to learn
+  otherwise (PR #159's finding;
+  [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)). `logit_out` is exposed to
+  the same window only up to its own ack read — once a batch's ack has actually been read back, a
+  rejection can no longer hide behind it. A *server*-certificate rejection is unaffected: that
+  verification happens inside the client's own handshake, before any write is attempted, so it
+  always surfaces as `Fault::Clean` (see
+  `crates/logit-cli/tests/syslog_round_trip.rs`'s `mod tls`). Closing the client-cert case would
+  mean this sink reading and interpreting TLS alerts (or application-level acks) it currently
+  never looks at — out of scope for either ADR that introduced these sinks.
 
 - **`docker_in` never notices a `docker rename` after a container's log file is first opened.**
   `container.name` is read once, from `config.v2.json`, at open time, and never re-read for the
