@@ -1,0 +1,38 @@
+# Disk-backed sink-buffer spool cost (docs/plans/load-test-harness.md's scenario table):
+# passthrough's exact graph, with `buffer.disk:` turned on for the sink
+# (docs/adr/disk-backed-sink-buffer.md) -- so the gap between this scenario's numbers and
+# passthrough's is the disk spool's own cost (native-frame encode into a segment file, the
+# periodic checkpoint write) rather than anything passthrough already measures.
+#
+#   script/perf run --scenario buffered
+#
+# `path` is resolved against *this config file's own directory* (perf/scenarios/,
+# crates/logit-cli/src/pipeline.rs's `queue_config`/`base_dir`), so `../results/spool` lands at
+# `perf/results/spool` -- alongside the harness's own results files, under the same
+# `/perf/results/` `.gitignore` entry, rather than inside perf/scenarios/ itself. The directory is
+# created on demand (`DiskQueue::open`'s `create_dir_all`); nothing needs to exist beforehand.
+#
+# `count` is tuned lower than every other scenario's, and to the *median* of a noisy spread rather
+# than a tight one: this is the one scenario whose cost is dominated by real disk I/O (segment
+# writes, periodic checkpoints), so its wall time swings far more under contention from other disk
+# activity on the same machine than any in-memory scenario's does -- expect more run-to-run
+# variance here than elsewhere in this directory.
+components:
+  gen:
+    type: generate_in
+    count: 1200000
+    event:
+      attributes:
+        method: GET
+        path: /x/{seq%50}
+        status: "200"
+        host: web-{seq%10}
+        region: us-east-1
+        service: web
+
+  out:
+    type: null_out
+    sources: [gen]
+    buffer:
+      disk:
+        path: ../results/spool
