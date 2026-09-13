@@ -174,7 +174,7 @@ the tag's literal argument string instead of failing.
 
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
-| Listener (`statsd_in`, `collectd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
+| Listener (`statsd_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 
@@ -236,19 +236,23 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` — a config error, not
     something to clamp silently.
 17. A non-default `receive:` block is rejected on any kind that is not a **datagram listener**
-    (`docs/adr/decoupled-listener-io.md`, `statsd_in`/`collectd_in`/`syslog_in`) or a **tail
+    (`docs/adr/decoupled-listener-io.md`, `statsd_in`/`collectd_in`/`syslog_in`, and `graphite_in`
+    under `transport: udp`), a **stream listener**
+    (`docs/adr/graphite-carbon-relay.md`, `graphite_in` under `transport: tcp`), or a **tail
     listener** (`docs/adr/file-tailing-and-docker-json-logs.md`, `tail_in`/`docker_in`). Deliberately not
     "any non-listener": `internal` and `generate_in` are listeners by role but have no socket, no
     queue, and no decoder, so `receive:` on either would be exactly the silently-ignored-setting
-    failure rule 14 guards against on the sink side. A tail listener has no receive *queue* at all (the tailed
-    file is its own durable buffer) — only `receive.batch_max_events`, `batch_max_bytes`,
-    `batch_flush_interval`, and `shutdown_grace` are meaningful on one; a queue-bounding field
+    failure rule 14 guards against on the sink side. Neither a tail listener (the tailed
+    file is its own durable buffer) nor a stream listener (TCP's own flow control is the
+    backpressure, so there are no silent drops for a queue to absorb) has a receive *queue* at all
+    — only `receive.batch_max_events`, `batch_max_bytes`,
+    `batch_flush_interval`, and `shutdown_grace` are meaningful on either; a queue-bounding field
     (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) is rejected by name.
 18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, or `receive.batch_max_events`
     of `0` is rejected — the twin of rule 15. `receive.batch_flush_interval: 0s` is **not**
-    rejected — it means "no flush timer," a meaningful setting, unlike the count bounds. A tail
-    listener's `receive.batch_max_events`/`batch_max_bytes` of `0` is rejected the same way (the
-    queue-only bounds don't apply to it at all — see rule 17).
+    rejected — it means "no flush timer," a meaningful setting, unlike the count bounds. A stream
+    or tail listener's `receive.batch_max_events`/`batch_max_bytes` of `0` is rejected the same way
+    (the queue-only bounds don't apply to either at all — see rule 17).
 19. (Also since drifted into the code's numbering, see the note on 12 above.) A `set` with both
     `resource` and `attributes` empty is rejected, as is an empty key in either map (added
     alongside `has_attributes`/`drop_attributes` below, so `set`'s own validation matches what its
@@ -419,6 +423,19 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     resolver can mirror it exactly without depending on `logit-config` (this document's own
     "Crate layout" section). `receive:` on a `generate_in` is rejected by rule 17's own allowlist
     — it is a listener by role, with no socket, queue, or decoder for `receive:` to configure.
+43. A `graphite_in`'s protocol/transport pair and size bounds
+    ([ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md)). `protocol: pickle` requires
+    `transport: tcp`: carbon frames a pickle batch with a 4-byte big-endian length prefix
+    (Twisted's `Int32StringReceiver`), which has no meaning in a datagram that already delimits
+    itself, so the combination could only ever mis-frame rather than work slightly worse.
+    `max_line_bytes` and `max_frame_bytes` of `0` are rejected — the impossible bound of rules
+    9/15/18/38 again: every line, or every frame, would exceed it. `max_frame_bytes` is
+    additionally held to `1024..=16 MiB`: below 1024 no real carbon batch fits, and above 16 MiB a
+    frame's *declared* length is a larger allocation than any sender has a reason to ask for —
+    rule 38's "a bound the transport cannot honestly carry is a silent failure, not a generous
+    setting" applied to a length-prefixed frame. `graphite_out`'s half of this rule (its own
+    `protocol`/`transport` pair, its `max_frame_bytes`, and a `connect_timeout` of `0`) lands with
+    that component and is checked in the same block.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

@@ -168,7 +168,7 @@ alert on directly:
 | Event | Level | When |
 |---|---|---|
 | `starting` | info | Config loaded, before graph resolution — named even if the config goes on to fail. |
-| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`collectd_in`/`otlp_in`; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
+| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`collectd_in`/`graphite_in`/`otlp_in`; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped mid-drain. |
@@ -293,7 +293,7 @@ thing, sized against `buffer.disk.max_bytes`; `batches.dropped` gains `frame_too
 
 ## Listener intake
 
-Every UDP listener (`statsd_in`, `collectd_in`, `syslog_in`) sits in front of a per-component, in-memory receive
+Every UDP listener (`statsd_in`, `collectd_in`, `syslog_in`, and a `graphite_in` with `transport: udp`) sits in front of a per-component, in-memory receive
 queue that decouples reading the socket from decoding and batching what it received
 ([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md)) — the listener-side sibling of the sink delivery
 buffering above. This is what lets a slow or backed-up destination downstream be ridden out without
@@ -399,6 +399,63 @@ would average averages and re-stamp them with the flush time. The file's header 
 that cross-protocol hop costs: the `collectd.*` attributes become ordinary InfluxDB tags rather than
 wire identity, and one N-data-source list becomes N measurements named `plugin.type.ds` sharing a
 tag set and a timestamp.
+
+### `graphite_in`: carbon plaintext and pickle, TCP or UDP
+
+`graphite_in` ([ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md)) is a carbon receiver:
+point a `write_graphite` plugin, a StatsD backend, a `carbon-relay` or anything else that speaks
+carbon at it. It is one component with two settings that change a great deal about how it behaves.
+
+- **`transport:` picks the driver.** `tcp` is the default, matching carbon's own default listener
+  (plaintext on port 2003). A TCP listener serves up to 1024 connections at once; one arriving past
+  that cap is closed immediately and counted
+  (`logit.input.connections.rejected{reason="limit"}`), because carbon's wire has no way to say
+  "try later" and a sender holding an accepted-but-unread connection would look healthy while
+  delivering nothing. `udp` runs the same shared datagram listener `statsd_in`/`collectd_in`/
+  `syslog_in` do, so everything in the receive-queue section above applies to it unchanged.
+- **`receive:` means different halves on the two transports.** A UDP `graphite_in` takes the whole
+  block. A TCP one has **no receive queue at all** — TCP's own flow control is the backpressure,
+  and the queue exists (ADR `decoupled-listener-io`) for a UDP socket's *silent* drops, which a
+  stream cannot have — so only `batch_max_events`, `batch_max_bytes`, `batch_flush_interval` and
+  `shutdown_grace` apply to it. A queue-bounding field (`max_datagrams`, `max_bytes`, `overflow`,
+  `receive_buffer_bytes`) on a TCP `graphite_in` is a `logit validate` error naming the field, not
+  a setting that is silently ignored. A stalled TCP `graphite_in` therefore shows up as
+  backpressure at the *sender*, which is what you want, rather than as a drop counter here.
+- **`protocol: pickle` requires `transport: tcp`.** Carbon's pickle batch protocol (port 2004) is a
+  4-byte big-endian length prefix around each batch — Twisted's `Int32StringReceiver` — which has
+  no meaning in a datagram that already delimits itself, so the combination is rejected at
+  validation time rather than mis-framing at runtime. The pickle reader is a **restricted** one: it
+  accepts the opcodes real senders emit (`pickle.dumps(..., protocol=2)` and `protocol=-1`) and
+  rejects everything capable of constructing an object, with bounded depth, memo and item counts
+  and every declared length validated before anything is allocated. It is deliberately not a
+  general unpickler.
+- **The two size bounds are the ones you may need to raise.** `max_line_bytes` (default `"8192"`)
+  bounds one TCP plaintext line: past it, with no newline in sight, the line is abandoned and
+  counted once (`logit.input.metrics.skipped{reason="oversize_line"}`, diagnostic `oversize_line`)
+  and the reader drains to the next newline — so the line *after* an oversize one still decodes.
+  `max_frame_bytes` (default `"1MiB"`, Twisted's own `MAX_LENGTH`) bounds one pickle frame, and a
+  frame declaring more closes the connection (`oversize_frame`), because a length-framed stream has
+  no resync point to skip forward to. `logit validate` holds it to `1024..=16MiB`.
+
+**The path is the metric name, and there is no `graphite.*` namespace.** Unlike `collectd_in` and
+`syslog_in`, which park their wire identity in attributes a matching sink reads back,
+`graphite_in` maps the four facts carbon carries straight onto the model: the dotted path *is*
+`MetricRecord.name`, the `;k=v` tags *are* event attributes, the number is a `Gauge`, the second is
+the event timestamp. Nothing is duplicated, and nothing is reserved. State that plainly because it
+cuts both ways: **a `lua`/`set` stage that renames the metric silently changes the wire path** a
+downstream `graphite_out` writes. That is the intended way to rename a series — there is no
+`prefix:` or `template:` field on either component — but it means a rename transform in the middle
+of a relay is a wire-visible change, not a display one.
+
+Two smaller behaviours worth knowing before deploying one:
+
+- **A `-1` timestamp means receipt time**, carbon's own rule. Any other non-positive timestamp
+  rejects the line (`bad_timestamp`), rather than being quietly stamped with "now".
+- **A malformed tag rejects the whole line**, not just that tag — carbon's own
+  `TaggedSeries.parse` raises too, and dropping one tag would silently change the series identity
+  the receiver keys on. A repeated tag key keeps its **last** value, counted
+  `logit.input.tags.normalized{reason="duplicate_key"}`, which is again what carbon does (it
+  builds a `dict`).
 
 ### `collectd_out`: relaying back onto the wire
 

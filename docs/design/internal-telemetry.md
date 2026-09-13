@@ -504,6 +504,35 @@ Worked examples, one per shipped component:
   message, or no host set — the same shape `incomplete_identity` reports for a value list). A type
   simply *missing* from `types_db` is deliberately not reported: that is routine, not a
   misconfiguration.
+- `graphite_in` (`crates/logit-inputs/src/graphite/`,
+  [ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md)): **what it reports depends on
+  its `transport:`**, because the two transports genuinely run different drivers. Under
+  `transport: udp` it is `collectd_in`'s shape exactly -- no layer-3 counters of its own, with
+  `logit.input.datagrams`/`.datagram.bytes`, the `ReceiveQueue` table and `receive_buffer.*` all
+  coming free from the shared `UdpListener`. Under `transport: tcp` there is no such driver (and
+  deliberately no receive queue at all -- TCP's own flow control is the backpressure), so the
+  listener records the stream's own facts itself: `logit.input.connections` (gauge, sampled on
+  every connect and disconnect) and `logit.input.connections.rejected{reason="limit"}` (count --
+  the 1024-connection cap actually binding, `logit_in`'s shape rather than `otlp_in`'s blocking
+  one, since carbon's wire has no way to say "try later"); `logit.input.lines` / `.line.bytes`
+  under `protocol: plaintext` and `logit.input.frames` / `.frame.bytes` under `protocol: pickle`
+  (each counted as it arrived on the wire, length prefix included) -- the per-read parity with
+  `statsd_in`'s per-datagram pair, at whichever unit the protocol actually frames in; and
+  `logit.component.receive.flushed{reason}` from the per-connection `BatchAccumulator`, which is
+  the same layer-2 point a datagram listener's shared `decode_loop` records.
+
+  The codec adds its own, under both transports:
+  `logit.input.metrics.skipped{reason="bad_line"|"bad_tag"|"bad_timestamp"|"non_finite_value"|
+  "bad_shape"}` and `logit.input.tags.normalized{reason="duplicate_key"}` (a repeated carbon tag
+  key collapsing to its last value, which is what carbon's own `TaggedSeries.parse` does). Two of
+  that family's reasons are the *listener's* rather than the codec's, because framing is:
+  `{reason="oversize_line"}`, counted once when a TCP plaintext line passes `max_line_bytes` with
+  no newline in it (the reader then drains to the next one). `Diagnostics` keys, mirrored as
+  `logit.component.diagnostics{key}` by the bridge: `bound`, the codec's `bad_line`/`bad_tag`/
+  `bad_timestamp`/`non_finite_value`/`duplicate_tag_key`/`bad_pickle`, and this listener's own
+  `oversize_line`, `oversize_frame` (a pickle frame declaring more than `max_frame_bytes` -- the
+  connection is closed, since a length-framed stream has no resync point) and `connection_error`
+  (one connection's I/O failing, never fatal to the listener or its siblings).
 - `tail_in`/`docker_in` (`crates/logit-inputs/src/tail/driver.rs`, `docker.rs` — one shared
   `Tailer<D, F>` driver, [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)):
   `logit.input.lines` / `.line.bytes` — the read-side parity with `statsd_in`'s per-datagram pair,
