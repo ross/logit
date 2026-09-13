@@ -13,7 +13,7 @@
 components:
   gen:
     type: generate_in
-    count: 5000000
+    count: 20000000
     event:
       attributes:
         method: GET

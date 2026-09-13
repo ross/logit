@@ -60,22 +60,32 @@ harness crate, W6's perf-image plumbing, W7's scenarios and `performance.md`).
 `perf/scenarios/*.yaml` are ordinary, shipped `logit` configs — no `!env`, inline `script:` for any
 Lua a scenario needs — validated the same way every other example config is.
 
-| Scenario | Graph | Measures | Count |
-|---|---|---|---|
-| `passthrough` | `generate_in` (6 attributes, no log) → `null_out` | Runtime floor: scheduling, channel hops, no parsing | 5M |
-| `json-parse` | `generate_in` (JSON body) → `json` → `kv_metrics` → `null_out` | The parse-into-attributes path | 2M |
-| `aggregate` | `generate_in` (distribution metric, `host: h{seq%1000}`) → `aggregate` (1s window) → `null_out` | Aggregation + flush-tick cost | 3M |
-| `lua` | `generate_in` → `lua` (inline enrichment script) → `null_out` | The Lua hop and its event proxy | 1M |
-| `fanout` | `generate_in` → 3 × `null_out` | `Arc`-based fan-out to multiple sinks | 3M |
-| `native-relay` | `generate_in` → `logit_out` → `logit_in` → `null_out` (one graph, one process) | Native encode + decode + per-batch ack round trip | 2M |
-| `encode-human-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: human`) | The human-readable encoder in situ | 2M |
-| `encode-native-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: native`) | The native encoder in situ | 2M |
-| `buffered` | `passthrough`'s graph with `buffer: { disk: ... }` on the sink | Disk-backed sink-buffer spool cost | 2M |
+| Scenario | Graph | Measures | Count | events/s (measured) |
+|---|---|---|---|---|
+| `passthrough` | `generate_in` (6 attributes, no log) → `null_out` | Runtime floor: scheduling, channel hops, no parsing | 20M | ~2.5M/s |
+| `json-parse` | `generate_in` (JSON body) → `json` → `kv_metrics` → `null_out` | The parse-into-attributes path | 7M | ~0.78M/s |
+| `aggregate` | `generate_in` (distribution metric, `host: h{seq%1000}`) → `aggregate` (1s window) → `null_out` | Aggregation + flush-tick cost | 20M | ~2.8-3.6M/s |
+| `lua` | `generate_in` → `lua` (inline enrichment script) → `null_out` | The Lua hop and its event proxy | 4M | ~0.48-0.50M/s |
+| `fanout` | `generate_in` → 3 × `null_out` | `Arc`-based fan-out to multiple sinks | 25M | ~4.4-5.2M/s |
+| `native-relay` | `generate_in` → `logit_out` → `logit_in` → `null_out` (one graph, one process) | Native encode + decode + per-batch ack round trip | 7M | ~0.79-1.37M/s |
+| `encode-human-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: human`) | The human-readable encoder in situ | 8M | ~0.83-1.24M/s |
+| `encode-native-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: native`) | The native encoder in situ | 8M | ~0.97-1.57M/s |
+| `buffered` | `passthrough`'s graph with `buffer: { disk: ... }` on the sink | Disk-backed sink-buffer spool cost | 1.2M | ~0.16M/s (median; see note) |
 
-Counts target roughly 5-10 seconds of wall time each on the dev box; tuned on first run once real
-numbers exist, not fixed in advance. `native-relay` never self-exits (`logit_in` is a socket
-listener), so it's the scenario that exercises the harness's settle-then-SIGTERM path rather than
-the plain wait-for-exit path every other scenario takes.
+Counts target roughly 5-10 seconds of wall time each on the dev box; tuned against a first real
+`script/perf run --repeat 1 --profile release` pass per scenario, as recorded in this table, rather
+than fixed in advance. `native-relay` never self-exits (`logit_in` is a socket listener), so it's
+the scenario that exercises the harness's settle-then-SIGTERM path rather than the plain
+wait-for-exit path every other scenario takes.
+
+`events/s` above is the range (or single value) actually observed while tuning, not a formal
+benchmark result -- this machine was running other disk- and CPU-heavy `script/perf` work
+concurrently at tuning time, so most scenarios show some run-to-run spread. `buffered` is the
+outlier by far: real disk I/O (segment writes, periodic checkpoints) makes it far more sensitive to
+that contention than any in-memory scenario -- observed throughput ranged from roughly 16k to 790k
+events/s across repeated runs at the same count, a swing no other scenario came close to. Its count
+is tuned to the median of that spread (roughly 5-10s under typical, not worst-case, contention);
+expect its wall time to vary more than every other scenario's when re-run.
 
 ## Verification
 
