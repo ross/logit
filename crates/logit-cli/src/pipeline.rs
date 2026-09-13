@@ -762,14 +762,14 @@ fn build_spec(
             connect_timeout,
         } => {
             // Eager for UDP, lazy for TCP -- the `StatsdOut` split above.
-            let output = match graphite_transport(*transport) {
+            let output = match graphite_out_transport(*transport) {
                 GraphiteOutTransport::Udp => GraphiteOutput::udp(endpoint.clone())?,
                 GraphiteOutTransport::Tcp => {
                     GraphiteOutput::tcp(endpoint.clone(), *connect_timeout)
                 }
             };
             let encoder = GraphiteEncoder::new()
-                .with_protocol(graphite_protocol(*protocol))
+                .with_protocol(graphite_out_protocol(*protocol))
                 .with_tags(graphite_tags(*tags))
                 .with_multi_value(graphite_multi_value(*multi_value))
                 .with_max_frame_bytes(*max_frame_bytes as usize);
@@ -1057,14 +1057,13 @@ fn statsd_format(cfg: logit_config::StatsdFormat) -> logit_outputs::statsd::Form
     }
 }
 
-/// The sole place `logit_config::GraphiteTransport` crosses into a transport choice --
-/// `statsd_format`'s shape. `graphite_in` (W2) needs the identical mapping for its own
-/// `UdpListener`-vs-accept-loop choice; named and given a stable one-argument-on-
-/// `logit_config::GraphiteTransport` signature (rather than inlined at `GraphiteOut`'s two call
-/// sites the way `StatsdOut` inlines its own match) specifically so the two stacked PRs can merge
-/// this function without a name collision surviving as a silent behavior difference -- see the W3
-/// worker report for the exact shape settled on here.
-fn graphite_transport(cfg: logit_config::GraphiteTransport) -> GraphiteOutTransport {
+/// The sole place `logit_config::GraphiteTransport` crosses into `graphite_out`'s own transport
+/// choice -- `statsd_format`'s shape. Namespaced `graphite_out_*`, not bare `graphite_transport`:
+/// `graphite_in` (W2) needs the identical mapping onto its own, different (`logit_inputs`-side)
+/// transport type, and a same-named free function returning an incompatible type is a hard
+/// collision at merge, not a dedupe-able duplicate the way the shared `GraphiteTransport`/
+/// `GraphiteProtocol` config enums are -- so each side names its own.
+fn graphite_out_transport(cfg: logit_config::GraphiteTransport) -> GraphiteOutTransport {
     match cfg {
         logit_config::GraphiteTransport::Udp => GraphiteOutTransport::Udp,
         logit_config::GraphiteTransport::Tcp => GraphiteOutTransport::Tcp,
@@ -1072,9 +1071,9 @@ fn graphite_transport(cfg: logit_config::GraphiteTransport) -> GraphiteOutTransp
 }
 
 /// The sole place `logit_config::GraphiteProtocol` crosses into `logit_proto::graphite::Protocol`
-/// -- shared, unmodified, by `graphite_in` (W2), which needs the identical mapping for its own
-/// decoder. Same reasoning as [`graphite_transport`].
-fn graphite_protocol(cfg: logit_config::GraphiteProtocol) -> GraphiteWireProtocol {
+/// for `graphite_out`. `graphite_in` (W2) needs the identical mapping for its own decoder, but
+/// through its own namespaced converter -- same reasoning as [`graphite_out_transport`].
+fn graphite_out_protocol(cfg: logit_config::GraphiteProtocol) -> GraphiteWireProtocol {
     match cfg {
         logit_config::GraphiteProtocol::Plaintext => GraphiteWireProtocol::Plaintext,
         logit_config::GraphiteProtocol::Pickle => GraphiteWireProtocol::Pickle,
@@ -1082,8 +1081,8 @@ fn graphite_protocol(cfg: logit_config::GraphiteProtocol) -> GraphiteWireProtoco
 }
 
 /// The sole place `logit_config::GraphiteTags` crosses into `logit_proto::graphite::Tags` --
-/// `graphite_out`-only, unlike [`graphite_transport`]/[`graphite_protocol`] (`graphite_in` has no
-/// `tags:` field).
+/// `graphite_out`-only, unlike [`graphite_out_transport`]/[`graphite_out_protocol`] (`graphite_in`
+/// has no `tags:` field), so no namespacing collision is possible here.
 fn graphite_tags(cfg: logit_config::GraphiteTags) -> GraphiteWireTags {
     match cfg {
         logit_config::GraphiteTags::Carbon => GraphiteWireTags::Carbon,
