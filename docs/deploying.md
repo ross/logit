@@ -719,6 +719,61 @@ listener-side `logit.component.diagnostics` counters as any other transport fail
 once at startup (a renewed cert needs a restart, not a live reload), and `otlp_out` has no
 `server_name` override for an endpoint reached by IP or through a proxy.
 
+### syslog (RFC 5425)
+
+`syslog_in`/`syslog_out` can speak TLS too — RFC 5425, syslog framed per RFC 6587 carried over TLS
+over TCP — see [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md). Same shape as
+`logit_in`/`logit_out` just above: both `bind` and `endpoint` are bare `host:port` strings with no
+URL scheme to read a TLS signal from, so a `tls:` block's mere **presence turns TLS on and makes it
+required** — there is no plaintext fallback once one is configured — and it applies to
+`transport: tcp` only; DTLS (syslog over TLS over UDP) is out of scope, so `tls:` under
+`transport: udp` is a config error rather than a silently ignored block. The fields are the same
+`TlsServerConfig`/`TlsClientConfig` pair every other TLS-capable component uses:
+
+```yaml
+# sender
+components:
+  syslog_out:
+    type: syslog_out
+    sources: [enrich]
+    endpoint: collector.internal:6514   # RFC 5425's registered port
+    transport: tcp
+    tls:
+      ca_file: /etc/logit/tls/ca.pem    # trust this CA instead of the bundled Mozilla set
+```
+
+```yaml
+# collector
+components:
+  syslog_in:
+    type: syslog_in
+    bind: 0.0.0.0:6514
+    transport: tcp
+    tls:
+      cert_file: /etc/logit/tls/server.pem
+      key_file: /etc/logit/tls/server.key
+      client_ca_file: /etc/logit/tls/ca.pem   # omit for server-auth-only TLS
+```
+
+Mutual TLS adds a client certificate on `syslog_out`'s `tls:` block, exactly `logit_out`'s example
+above (`cert_file`/`key_file` together). `tls.insecure_skip_verify` (`syslog_out` only, same
+contradictory-with-`ca_file` rejection) behaves identically too.
+
+**What to watch.** `syslog_out`: `logit.output.requests{class="ok"|"error"}` (one per attempt) and
+`logit.output.reconnects` (should stay near zero in steady state — a climbing count on a TLS
+connection means the peer or the network, not this sink, is unstable; counted identically on a
+plaintext and a TLS connection, since both take the same connect path). `syslog_in`:
+`logit.input.connections` (a gauge — should match the number of `syslog_out` peers actually
+connected) and `logit.input.connections.rejected{reason="limit"}` (nonzero means the 1024
+-connection cap is binding). Both: a handshake failure, a framing violation, or an oversize/
+malformed frame all surface through
+`logit.component.diagnostics{key="connection_error"|"framing_error"}` and
+`logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}` — there is no separate
+TLS-specific counter, the same call this section's `otlp_in`/`otlp_out` paragraphs already make.
+`docs/known-gaps.md` tracks what's still open: DTLS, certificates read once at startup, no
+`server_name` override, and no idle-connection timeout once a connection has handshaken (or, on
+plaintext, sent its first byte).
+
 ## Forwarding between `logit` nodes
 
 `logit_out`/`logit_in` are the native `logit`-to-`logit` transport
