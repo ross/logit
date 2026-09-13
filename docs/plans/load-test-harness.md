@@ -42,11 +42,11 @@ established for the `collectd`/`lossless-transit` efforts.
 | W6 | **`attribute` + `flamegraph` + `[profile.profiling]` + perf image.** The temp-scenario-copy + `internal`/`file_out` append, SIGTERM-after-settle, native-frame decode + per-node grouping/sort; the `[profile.profiling]` root profile; `crates/logit-perf/Dockerfile` and the `perf record`/`inferno` pipeline. | `crates/logit-perf/src/{attribute.rs,flamegraph.rs}`; root `Cargo.toml` (`[profile.profiling]`); `crates/logit-perf/Dockerfile` (new, `FROM logit-dev:local`); `docs/design/internal-telemetry.md` (both kinds are layer-2 only; `internal`'s final drain) | `script/perf attribute --scenario json-parse` shows per-node received/sent summing to the scenario's `count`, with `json` showing the largest Σ process time; `script/perf flamegraph --scenario passthrough` writes an SVG with resolved symbols; `Dockerfile.dev` diff is empty. The `[profile.profiling]`/validate-loop parts get `pr-review --comment`; the perf-image plumbing gets lighter lead review. |
 | W7 | **Remaining scenarios + `performance.md` + docs closeout.** `aggregate`, `lua`, `native-relay`, `encode-human-devnull`/`encode-native-devnull`, `buffered`; first recorded results; the rest of the docs sweep. | `perf/scenarios/{aggregate,lua,native-relay,encode-human-devnull,encode-native-devnull,buffered}.yaml`; `docs/design/performance.md` (new: methodology, reproduction table, first results table with host/sha/cpu preamble, before/after workflow, reading `attribute` output); `docs/design/memory.md` (§7/open-questions pointer to `performance.md`); `docs/known-gaps.md` (rate granularity above ~1k batches/s; no cross-run noise model); `docs/OVERVIEW.md`/`AGENTS.md` (where-things-live + current-state blurbs) | All scenarios in `script/validate` and the shipped-config test; `script/perf run` covers every scenario in one pass in the 5-10s/scenario range on the dev box; `performance.md` carries one real recorded run. Lighter lead review (delegated read-through + `script/cibuild`). |
 
-Landing order: **W0 → W1 → (W2, W3) → W4 → W5 → W6 → W7.** W2 and W3 both branch from `feat/perf-w1`
-and can proceed in parallel since neither touches the other's files; W4 is independent of both but
-is sequenced after them so `crates/logit-inputs` changes land as one coherent stack rather than
-three interleaved diffs against the same crate. Each PR targets its parent workstream's branch and
-is retargeted to `main` once that parent merges, the same convention `collectd-binary-relay.md`
+Landing order: **W0 → W1 → (W2, W3) → W5 → W6 → W7**, with W4 branching independently from `main`
+and landing whenever it's ready — before W6, which depends on it. W2 and W3 both branch from
+`feat/perf-w1` and can proceed in parallel since neither touches the other's files. Each PR targets
+its parent workstream's branch and is retargeted to `main` once that parent merges, the same
+convention `collectd-binary-relay.md`
 uses, so later workstreams aren't blocked on every earlier PR landing first.
 
 **This PR (W0) is docs only** — no code, no `script/cibuild` run, per the ADR's own scope. W1

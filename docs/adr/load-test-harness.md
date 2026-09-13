@@ -15,7 +15,7 @@ Accepted
 `crates/logit-core/tests/type_sizes.rs` pins `Event`'s exact layout — both documented and
 cross-referenced from [`docs/design/memory.md`](../design/memory.md). What's missing sits one
 level up. `memory.md` §7 draws the boundary precisely: `crates/logit-bench/benches/pipeline.rs`'s
-own module doc (lines 1-20) states that almost every bench there calls decoders, transforms, and
+own module doc states that almost every bench there calls decoders, transforms, and
 encoders **directly**, sidestepping the tokio runtime and the channels between nodes entirely,
 because `divan::AllocProfiler` only counts allocations on threads it controls — and the one
 exception (`mod runtime`) stays trustworthy only by never spawning a task or a thread, running
