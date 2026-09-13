@@ -26,6 +26,7 @@ use logit_outputs::collectd::CollectdOutput;
 use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::logit::LogitOutput;
+use logit_outputs::null::NullOutput;
 use logit_outputs::otlp::{
     OtlpCompression as OtlpOutCompression, OtlpOutput, OtlpTransport as OtlpOutTransport,
     SignalPaths,
@@ -288,11 +289,11 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<()> {
 /// `graph::resolve`'s rule 8 rejects every kind `is_implemented` doesn't recognize before this
 /// function is ever called. The exception is a kind that is *declared* (so that its config types
 /// and graph rules can land, and `logit validate`/`logit graph` can accept it) but whose
-/// implementation hasn't been built yet: `generate_in` and `null_out` today, until the perf
-/// harness's W2/W3 replace those two arms (`docs/plans/load-test-harness.md`). Each of those
-/// arms `bail!`s with a message naming the kind, so `logit run` fails startup with exit 1 and a
-/// clear error rather than panicking -- the same "reject a config referencing an unimplemented
-/// kind with a clear error" contract `AGENTS.md` states.
+/// implementation hasn't been built yet: `generate_in` today, until the perf harness's W2 replaces
+/// that arm (`docs/plans/load-test-harness.md`). That arm `bail!`s with a message naming the kind,
+/// so `logit run` fails startup with exit 1 and a clear error rather than panicking -- the same
+/// "reject a config referencing an unimplemented kind with a clear error" contract `AGENTS.md`
+/// states.
 ///
 /// `id` attaches a [`Diagnostics`] to every component that emits one
 /// (`docs/adr/service-lifecycle-and-output-retry.md`) via each kind's own `with_diagnostics`
@@ -750,12 +751,13 @@ fn build_spec(
         }
 
         // The `generate_in` arm's twin, for the same reason -- `logit_outputs::null::NullOutput`
-        // and this arm are the perf harness's W3 (`docs/plans/load-test-harness.md`). It gets the
-        // same `queue_config`/`write_config` treatment as every other sink when it lands, so
-        // `buffer:` (disk included) works on it.
-        NullOut {} => anyhow::bail!(
-            "component `{id}`: `null_out` is declared but not yet buildable -- its \
-             implementation lands in workstream W3 (docs/plans/load-test-harness.md)"
+        // and this arm are the perf harness's W3 (`docs/plans/load-test-harness.md`). Same
+        // `queue_config`/`write_config` treatment as every other sink, so `buffer:` (disk
+        // included) works on it.
+        NullOut {} => NodeSpec::Output(
+            Box::new(NullOutput),
+            queue_config(&component.buffer, base_dir),
+            write_config(&component.buffer),
         ),
     };
     Ok((spec, telemetry))
@@ -1404,6 +1406,21 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_builds_a_null_sink() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::NullOut {},
+        };
+        assert!(matches!(
+            build_spec("out", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    #[test]
     fn build_spec_builds_an_otlp_input() {
         for protocol in [logit_config::OtlpProtocol::Http, logit_config::OtlpProtocol::Grpc] {
             let component = ResolvedComponent {
@@ -1427,11 +1444,12 @@ mod tests {
         }
     }
 
-    /// `generate_in`/`null_out` are declared kinds whose implementations land in the perf
-    /// harness's W2/W3, so `graph::resolve` accepts them today (that's what lets rule 42 and
-    /// `logit validate` exist ahead of the implementations) but `build_spec` can't build one.
-    /// That must be a clear startup *error* -- exit 1 from `logit run`, per `AGENTS.md` -- never
-    /// a panic, and never a silently-skipped node.
+    /// `generate_in` is a declared kind whose implementation lands in the perf harness's W2, so
+    /// `graph::resolve` accepts it today (that's what lets rule 42 and `logit validate` exist
+    /// ahead of the implementation) but `build_spec` can't build one yet. That must be a clear
+    /// startup *error* -- exit 1 from `logit run`, per `AGENTS.md` -- never a panic, and never a
+    /// silently-skipped node. `null_out`'s own version of this test retired once W3 (this same
+    /// module's `NullOut` arm) landed -- see `build_spec_builds_a_null_sink` above instead.
     #[test]
     fn build_spec_rejects_generate_in_until_w2_lands() {
         let component = ResolvedComponent {
@@ -1454,25 +1472,6 @@ mod tests {
         assert!(err.contains("`gen`"), "got: {err}");
         assert!(err.contains("`generate_in`"), "got: {err}");
         assert!(err.contains("W2"), "got: {err}");
-    }
-
-    /// [`build_spec_rejects_generate_in_until_w2_lands`]'s twin, for the sink side.
-    #[test]
-    fn build_spec_rejects_null_out_until_w3_lands() {
-        let component = ResolvedComponent {
-            buffer: logit_config::BufferConfig::default(),
-            receive: logit_config::ReceiveConfig::default(),
-            sources: vec!["gen".to_string()],
-            consumers: vec![],
-            kind: ComponentKind::NullOut {},
-        };
-        let err = build_spec("sink", &component, Path::new(""), None)
-            .err()
-            .expect("null_out isn't buildable yet, so this must be an error")
-            .to_string();
-        assert!(err.contains("`sink`"), "got: {err}");
-        assert!(err.contains("`null_out`"), "got: {err}");
-        assert!(err.contains("W3"), "got: {err}");
     }
 
     #[test]
@@ -1964,6 +1963,41 @@ mod tests {
         assert_eq!(disk_config.segment_bytes, 128 * 1024 * 1024);
         assert_eq!(disk_config.compression, NativeCompression::Lz4);
         assert_eq!(disk_config.checkpoint_interval, Duration::from_secs(5));
+    }
+
+    /// The load-test harness's `buffered` scenario (`docs/plans/load-test-harness.md`) is exactly
+    /// this shape: a `null_out` behind `buffer.disk`, proving a disk-backed spool builds and runs
+    /// with no real destination behind it -- `NullOutput` itself has nothing disk-related about
+    /// it, so this is really exercising `queue_config`'s disk branch for a sink that takes no
+    /// fields of its own.
+    #[test]
+    fn build_spec_builds_a_null_sink_behind_a_disk_buffer_and_resolves_a_disk_sinkstoreconfig() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig {
+                disk: Some(logit_config::DiskBufferConfig {
+                    path: "spool".to_string(),
+                    max_bytes: 2 * 1024 * 1024 * 1024,
+                    segment_bytes: 128 * 1024 * 1024,
+                    compression: logit_config::Compression::Lz4,
+                    checkpoint_interval: Duration::from_secs(5),
+                }),
+                ..logit_config::BufferConfig::default()
+            },
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::NullOut {},
+        };
+        let NodeSpec::Output(_, store_config, _) =
+            build_spec("out", &component, Path::new("/etc/logit"), None).unwrap().0
+        else {
+            panic!("expected NodeSpec::Output");
+        };
+        let SinkStoreConfig::Disk(disk_config) = store_config else {
+            panic!("expected SinkStoreConfig::Disk, buffer.disk was Some");
+        };
+        assert_eq!(disk_config.dir, Path::new("/etc/logit/spool"));
+        assert_eq!(disk_config.max_bytes, 2 * 1024 * 1024 * 1024);
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod collectd;
 pub mod file;
 pub mod influxdb;
 pub mod logit;
+pub mod null;
 pub mod otlp;
 pub mod prometheus;
 pub mod statsd;
