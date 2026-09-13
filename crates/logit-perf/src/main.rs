@@ -45,6 +45,17 @@ enum Command {
         /// scenario whose graph doesn't self-exit (`scenario::Scenario::needs_sigterm`).
         #[arg(long, default_value = "1s", value_parser = parse_duration)]
         settle: Duration,
+        /// How long to wait for a scenario's `generation complete` line before giving up on it as
+        /// hung. Generous by default: scenarios target 5-10s
+        /// (docs/plans/load-test-harness.md), so two minutes is a wide margin for a slow/loaded
+        /// dev box, not a tight bound tuned to the fast case.
+        #[arg(long, default_value = "120s", value_parser = parse_duration)]
+        timeout: Duration,
+        /// How long to wait for the process to actually exit -- after `--settle`/SIGTERM for a
+        /// scenario that needs it, or after the completion line for one that self-exits -- before
+        /// force-killing it. A hung drain must not hang `logit-perf run` forever.
+        #[arg(long = "shutdown-timeout", default_value = "30s", value_parser = parse_duration)]
+        shutdown_timeout: Duration,
         /// Skip the `cargo build` step -- use an already-built binary as is.
         #[arg(long)]
         no_build: bool,
@@ -85,17 +96,34 @@ enum Command {
 
 fn main() {
     let cli = Cli::parse();
-    let root = repo_root();
 
     let result = match cli.command {
-        Command::Run { scenario, repeat, label, settle, no_build, profile } => run::run(
-            &root,
-            run::RunArgs { scenarios: scenario, repeat, label, settle, no_build, profile },
+        Command::Run {
+            scenario,
+            repeat,
+            label,
+            settle,
+            timeout,
+            shutdown_timeout,
+            no_build,
+            profile,
+        } => run::run(
+            &repo_root(),
+            run::RunArgs {
+                scenarios: scenario,
+                repeat,
+                label,
+                settle,
+                timeout,
+                shutdown_timeout,
+                no_build,
+                profile,
+            },
         ),
         Command::Compare { before, after, threshold, rss_threshold } => {
             run_compare(&before, &after, threshold, rss_threshold)
         }
-        Command::List => run_list(&root),
+        Command::List => run_list(&repo_root()),
         Command::Attribute { .. } => {
             eprintln!("logit-perf attribute: lands in W6 (docs/plans/load-test-harness.md)");
             std::process::exit(2);
@@ -130,38 +158,71 @@ fn run_list(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn read_report(path: &Path) -> anyhow::Result<result::RunReport> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Renders an optional field the way every "unknown" value in this CLI's output reads -- never a
+/// bare Rust `None`/`null`.
+fn display_optional<T: std::fmt::Display>(value: &Option<T>) -> String {
+    value.as_ref().map(T::to_string).unwrap_or_else(|| "unknown".to_string())
+}
+
 fn run_compare(
     before: &Path,
     after: &Path,
     threshold: f64,
     rss_threshold: Option<f64>,
 ) -> anyhow::Result<()> {
-    let a: result::RunReport = serde_json::from_str(
-        &std::fs::read_to_string(before)
-            .with_context(|| format!("reading {}", before.display()))?,
-    )
-    .with_context(|| format!("parsing {}", before.display()))?;
-    let b: result::RunReport = serde_json::from_str(
-        &std::fs::read_to_string(after).with_context(|| format!("reading {}", after.display()))?,
-    )
-    .with_context(|| format!("parsing {}", after.display()))?;
+    let a = read_report(before)?;
+    let b = read_report(after)?;
+
+    println!(
+        "before: {} (sha {}, {}, {})",
+        before.display(),
+        display_optional(&a.git.sha),
+        a.profile,
+        a.rustc
+    );
+    println!(
+        "after:  {} (sha {}, {}, {})",
+        after.display(),
+        display_optional(&b.git.sha),
+        b.profile,
+        b.rustc
+    );
 
     let report = compare::compare(&a, &b);
-    if let Some(warning) = &report.environment_warning {
+    for warning in &report.warnings {
         eprintln!("warning: {warning}");
     }
 
-    println!("{:<22} {:>12} {:>12} {:>12}", "scenario", "events/s", "us/event", "peak RSS");
+    println!("\n{:<22} {:>12} {:>12} {:>12}", "scenario", "events/s", "us/event", "peak RSS");
     for scenario in &report.scenarios {
-        match scenario.deltas {
-            Some(deltas) => println!(
-                "{:<22} {:>+11.1}% {:>+11.1}% {:>+11.1}%",
-                scenario.name,
-                deltas.events_per_s_pct,
-                deltas.cpu_us_per_event_pct,
-                deltas.max_rss_bytes_pct,
-            ),
-            None => println!("{:<22} {:>12}", scenario.name, "only in one file"),
+        match &scenario.deltas {
+            Some(deltas) => {
+                let regressed = deltas.is_regression(threshold, rss_threshold);
+                println!(
+                    "{:<22} {:>+11.1}% {:>+11.1}% {:>+11.1}%{}",
+                    scenario.name,
+                    deltas.events_per_s_pct,
+                    deltas.cpu_us_per_event_pct,
+                    deltas.max_rss_bytes_pct,
+                    if regressed { "  REGRESSED" } else { "" },
+                );
+            }
+            None => {
+                let only_in = match scenario.presence {
+                    compare::Presence::BeforeOnly => before,
+                    compare::Presence::AfterOnly => after,
+                    compare::Presence::Both => {
+                        unreachable!("Presence::Both always carries deltas")
+                    }
+                };
+                println!("{:<22} only in {}", scenario.name, only_in.display());
+            }
         }
     }
 
@@ -178,8 +239,11 @@ fn run_compare(
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
+    // `-` is allowed in the numeric portion (not just digits/`.`) purely so a negative value
+    // parses through to `Duration::try_from_secs_f64` below and fails there with a clear message,
+    // instead of being rejected here as "no unit" and hiding what was actually wrong with it.
     let (number, unit) = s
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
         .map(|idx| s.split_at(idx))
         .ok_or_else(|| format!("`{s}` has no unit (expected e.g. `1s`, `500ms`)"))?;
     let value: f64 = number.parse().map_err(|_| format!("`{number}` is not a number"))?;
@@ -191,13 +255,16 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
             return Err(format!("unknown duration unit `{other}` (expected `s`, `ms`, or `m`)"))
         }
     };
-    Ok(Duration::from_secs_f64(seconds))
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|err| format!("`{s}` is not a valid duration: {err}"))
 }
 
 /// The repository root, resolved from this crate's own manifest directory at compile time
 /// (`crates/logit-perf` -> repo root) rather than the process's current directory -- `script/perf`
 /// already `cd`s to the repo root before running (`script/common.sh`), but resolving it this way
-/// means `logit-perf` behaves the same run from anywhere.
+/// means `logit-perf` behaves the same run from anywhere. Only `run`/`list` need it (both walk
+/// `perf/scenarios/` relative to it); `compare` takes two explicit file paths and never touches
+/// it, so it's resolved lazily at each call site rather than once up front in `main`.
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -221,5 +288,17 @@ mod tests {
     fn parse_duration_rejects_no_unit_and_unknown_units() {
         assert!(parse_duration("5").is_err());
         assert!(parse_duration("5h").is_err());
+    }
+
+    #[test]
+    fn parse_duration_rejects_a_negative_value_without_panicking() {
+        let err = parse_duration("-1s").expect_err("a negative duration is invalid");
+        assert!(err.contains("not a valid duration"), "{err}");
+    }
+
+    #[test]
+    fn display_optional_reads_unknown_for_none() {
+        assert_eq!(display_optional::<String>(&None), "unknown");
+        assert_eq!(display_optional(&Some(42)), "42");
     }
 }

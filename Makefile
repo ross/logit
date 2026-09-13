@@ -26,8 +26,8 @@ test:       ## cargo nextest run --workspace
 bench:      ## Throughput + allocation benchmarks (docs/design/memory.md)
 	./script/bench
 
-perf:       ## Load-test harness: run/compare/list against perf/scenarios/ (docs/adr/load-test-harness.md)
-	./script/perf
+perf:       ## Load-test harness (default: run every scenario) -- override: make perf PERF_ARGS="compare a.json b.json"
+	./script/perf $(if $(PERF_ARGS),$(PERF_ARGS),run)
 
 lint:       ## cargo clippy, warnings denied
 	./script/lint

@@ -77,7 +77,7 @@ fn parse(yaml: &str) -> anyhow::Result<(u64, bool)> {
         let kind = component
             .get("type")
             .and_then(Value::as_str)
-            .with_context(|| format!("component `{id:?}` has no `type`"))?;
+            .with_context(|| format!("component `{}` has no `type`", describe_key(id)))?;
 
         if kind == "generate_in" {
             if found_generate_in {
@@ -102,6 +102,14 @@ fn parse(yaml: &str) -> anyhow::Result<(u64, bool)> {
     }
 
     Ok((count, needs_sigterm))
+}
+
+/// Renders a YAML mapping key for an error message -- the key is almost always a plain string
+/// (a component id), so this prints it the way a reader typed it rather than `serde_norway`'s
+/// `Debug` form (`String("gen")`); only a non-string key (a YAML oddity no shipped scenario
+/// produces) falls back to `Debug`.
+fn describe_key(key: &Value) -> String {
+    key.as_str().map(str::to_string).unwrap_or_else(|| format!("{key:?}"))
 }
 
 #[cfg(test)]

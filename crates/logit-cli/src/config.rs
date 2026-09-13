@@ -231,9 +231,10 @@ mod tests {
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
         );
+        let perf_scenarios_dir = root.join("perf/scenarios");
         configs.extend(
-            std::fs::read_dir(root.join("perf/scenarios"))
-                .unwrap()
+            std::fs::read_dir(&perf_scenarios_dir)
+                .unwrap_or_else(|err| panic!("reading {}: {err}", perf_scenarios_dir.display()))
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
         );
