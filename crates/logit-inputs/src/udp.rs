@@ -611,7 +611,9 @@ async fn emit(sink: &Fanout, telemetry: &Telemetry, batch: EventBatch, reason: F
     sink.send(batch).await;
 }
 
-fn now_nanos() -> i64 {
+/// `pub(crate)` rather than private: [`crate::tcp`]'s connection loop stamps `received_at` the
+/// same way, and one shared clock reader is better than two copies that could drift apart.
+pub(crate) fn now_nanos() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64
 }
 
