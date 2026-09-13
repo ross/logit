@@ -150,7 +150,7 @@
 //!     unknown placeholder is rejected here rather than rendered literally or as nothing: a
 //!     mistyped `{seg}` would otherwise silently collapse a scenario's intended cardinality to a
 //!     single series, which is the difference between measuring an aggregation window and
-//!     measuring nothing. The var-name check lives in [`generate_var_is_valid`] so that
+//!     measuring nothing. The var-name check lives in `generate_var_is_valid` so that
 //!     `logit-inputs`' own `compile` resolver can mirror it exactly without depending on
 //!     `logit-config` (`docs/design/pipeline-graph.md`'s crate layout). `receive:` on a
 //!     `generate_in` is rejected by rule 17's own allowlist -- it is a listener by role, with no
