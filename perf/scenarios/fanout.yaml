@@ -1,0 +1,28 @@
+# Arc-based fan-out to multiple sinks (docs/plans/load-test-harness.md's scenario table): one
+# generate_in feeding three null_out sinks, so the measurement is the Fanout's per-edge clone/
+# refcount cost (crates/logit-pipeline/src/runtime.rs) rather than anything a single-sink scenario
+# already covers.
+#
+#   script/perf run --scenario fanout
+#
+# `count` bumped 25M -> 55M (docs/design/performance.md's first recorded run): on an otherwise-idle
+# box this graph clears 25M events in ~3.2s, under this directory's 5-10s target band.
+components:
+  gen:
+    type: generate_in
+    count: 55000000
+    event:
+      attributes:
+        host: web-{seq%20}
+
+  out_a:
+    type: null_out
+    sources: [gen]
+
+  out_b:
+    type: null_out
+    sources: [gen]
+
+  out_c:
+    type: null_out
+    sources: [gen]
