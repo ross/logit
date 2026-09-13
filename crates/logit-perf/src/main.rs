@@ -15,6 +15,7 @@ mod result;
 mod run;
 mod rusage;
 mod scenario;
+mod spool;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -277,6 +278,18 @@ fn run_compare(
                     deltas.max_rss_bytes_pct,
                     if regressed { "  REGRESSED" } else { "" },
                 );
+                // Warned, never gated (`Deltas::startup_regressed`'s own doc has why): startup is
+                // spawn -> ready process bring-up, not the graph's own per-event cost, so it's
+                // worth a human's attention without failing a `compare --threshold` gate meant for
+                // throughput/CPU/RSS.
+                if deltas.startup_regressed(threshold) {
+                    eprintln!(
+                        "warning: scenario `{}`: startup_s rose {:+.1}% (spawn -> ready; not \
+                         gated)",
+                        scenario.name,
+                        deltas.startup_s_pct.expect("startup_regressed implies Some"),
+                    );
+                }
             }
             None => {
                 let only_in = match scenario.presence {
