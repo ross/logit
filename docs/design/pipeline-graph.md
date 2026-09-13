@@ -236,19 +236,26 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` — a config error, not
     something to clamp silently.
 17. A non-default `receive:` block is rejected on any kind that is not a **datagram listener**
-    (`docs/adr/decoupled-listener-io.md`, `statsd_in`/`collectd_in`/`syslog_in`) or a **tail
+    (`docs/adr/decoupled-listener-io.md`, `statsd_in`/`collectd_in`/a UDP `syslog_in`), a
+    **stream listener** (`docs/adr/syslog-tcp-ingress-and-tls.md`, a TCP `syslog_in`) or a **tail
     listener** (`docs/adr/file-tailing-and-docker-json-logs.md`, `tail_in`/`docker_in`). Deliberately not
     "any non-listener": `internal` and `generate_in` are listeners by role but have no socket, no
     queue, and no decoder, so `receive:` on either would be exactly the silently-ignored-setting
     failure rule 14 guards against on the sink side. A tail listener has no receive *queue* at all (the tailed
     file is its own durable buffer) — only `receive.batch_max_events`, `batch_max_bytes`,
     `batch_flush_interval`, and `shutdown_grace` are meaningful on one; a queue-bounding field
-    (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) is rejected by name.
+    (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) is rejected by name. A
+    stream listener has no receive queue either, for a different reason — the TCP connection's own
+    flow control *is* the backpressure, so a blocked `Fanout::send` just stops the socket being
+    read and the peer's window closes — so the same four queue fields are rejected by name on one,
+    with a message that says so, and the same four batch/shutdown fields apply, scoped **per
+    connection** rather than per listener (N live connections can hold up to N ×
+    `batch_max_events` in flight).
 18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, or `receive.batch_max_events`
     of `0` is rejected — the twin of rule 15. `receive.batch_flush_interval: 0s` is **not**
-    rejected — it means "no flush timer," a meaningful setting, unlike the count bounds. A tail
-    listener's `receive.batch_max_events`/`batch_max_bytes` of `0` is rejected the same way (the
-    queue-only bounds don't apply to it at all — see rule 17).
+    rejected — it means "no flush timer," a meaningful setting, unlike the count bounds. A tail or
+    stream listener's `receive.batch_max_events`/`batch_max_bytes` of `0` is rejected the same way
+    (the queue-only bounds don't apply to either at all — see rule 17).
 19. (Also since drifted into the code's numbering, see the note on 12 above.) A `set` with both
     `resource` and `attributes` empty is rejected, as is an empty key in either map (added
     alongside `has_attributes`/`drop_attributes` below, so `set`'s own validation matches what its
@@ -419,6 +426,14 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     resolver can mirror it exactly without depending on `logit-config` (this document's own
     "Crate layout" section). `receive:` on a `generate_in` is rejected by rule 17's own allowlist
     — it is a listener by role, with no socket, queue, or decoder for `receive:` to configure.
+43. A `syslog_in` carrying a `tls:` block must be `transport: tcp`
+    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)). Syslog over TLS
+    (RFC 5425) is RFC 6587-framed syslog carried over TLS over TCP, and DTLS (RFC 6012), its
+    UDP-carried sibling, is out of scope — so a `tls:` block under `transport: udp` could never
+    take effect. Rejected rather than ignored, the same call rule 22 makes for a `tls:` block
+    under a plaintext `otlp_out` endpoint: an operator who wrote one meant the connection
+    encrypted, and running it in the clear anyway is the worst of the available outcomes. Nothing
+    here constrains a plaintext TCP listener, which stays perfectly ordinary.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that
