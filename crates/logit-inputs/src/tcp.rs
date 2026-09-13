@@ -60,7 +60,7 @@ use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
 use logit_proto::Decoder;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -567,6 +567,21 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
         let live_connections = Arc::new(AtomicI64::new(0));
         let handshake_timeout = self.handshake_timeout;
         let config = self.config;
+        // One shared `Diagnostics` for the two per-frame keys, so their throttle is listener-wide
+        // rather than per connection. `logit_core::Diagnostics` derives a plain `Clone` over its
+        // own per-key counts, so the per-connection clone below starts every connection back at
+        // zero -- and since a framing error is fatal to its connection, `framing_error` would then
+        // sit at count 1 forever and warn on every single occurrence, one log line per TCP
+        // handshake from a peer looping connect / send-a-bad-frame / close. `udp.rs` gets
+        // listener-wide `bad_datagram` throttling for free by handing one clone to its single
+        // `decode_loop`; a stream listener has one task per connection, so it takes a real shared
+        // handle. `with_diagnostics`'s own doc already describes these keys as listener-scoped.
+        //
+        // A `std::sync::Mutex`, not tokio's: it is locked only on an error branch, never on the
+        // happy path, and never held across an `.await`. `connection_error` deliberately keeps the
+        // per-connection clone below -- it is inherited verbatim from `logit_in`/`otlp_in`, and
+        // forking that convention here is not this driver's call to make.
+        let frame_diag = Arc::new(std::sync::Mutex::new(self.diag.clone()));
 
         loop {
             let (stream, _peer) = tokio::select! {
@@ -598,6 +613,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
             let conn_shutdown = shutdown.clone();
             let live_connections = Arc::clone(&live_connections);
             let decoder = self.decoder.clone();
+            let frame_diag = Arc::clone(&frame_diag);
 
             tokio::spawn(async move {
                 // Held for exactly as long as this task runs -- a TLS accept that fails or times
@@ -622,7 +638,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                                     handshake_timeout,
                                     sink,
                                     telemetry.clone(),
-                                    diag.clone(),
+                                    frame_diag,
                                     conn_shutdown,
                                 )
                                 .await
@@ -644,7 +660,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                             handshake_timeout,
                             sink,
                             telemetry.clone(),
-                            diag.clone(),
+                            frame_diag,
                             conn_shutdown,
                         )
                         .await
@@ -725,7 +741,7 @@ async fn serve_connection<S, D>(
     handshake_timeout: Duration,
     sink: Fanout,
     telemetry: Telemetry,
-    mut diag: Diagnostics,
+    frame_diag: Arc<Mutex<Diagnostics>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()>
 where
@@ -839,12 +855,14 @@ where
                             &mut accumulator,
                             &sink,
                             &telemetry,
-                            &mut diag,
+                            &frame_diag,
                         )
                         .await;
                     }
                     Ok(None) => {}
-                    Err(err) => report_frame_error(&err, &telemetry, &mut diag),
+                    Err(err) => {
+                        report_frame_error(&err, &telemetry, &frame_diag);
+                    }
                 }
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Closed).await;
@@ -876,7 +894,7 @@ where
                         &mut accumulator,
                         &sink,
                         &telemetry,
-                        &mut diag,
+                        &frame_diag,
                     )
                     .await;
                 }
@@ -885,7 +903,7 @@ where
                     // Neither framing can resynchronize past one of these (see [`FrameError`]), so
                     // this connection ends here -- diagnosed on its own key rather than bubbling
                     // up as a `connection_error`, since the cause is the peer's framing, not I/O.
-                    report_frame_error(&err, &telemetry, &mut diag);
+                    report_frame_error(&err, &telemetry, &frame_diag);
                     if let Some(batch) = accumulator.take() {
                         emit(&sink, &telemetry, batch, FlushReason::Closed).await;
                     }
@@ -908,7 +926,7 @@ async fn absorb_frame<D: Decoder + Send>(
     accumulator: &mut BatchAccumulator,
     sink: &Fanout,
     telemetry: &Telemetry,
-    diag: &mut Diagnostics,
+    frame_diag: &Mutex<Diagnostics>,
 ) {
     telemetry.count("logit.input.frames", 1.0, &[]);
     telemetry.count("logit.input.frame.bytes", frame.len() as f64, &[]);
@@ -922,17 +940,37 @@ async fn absorb_frame<D: Decoder + Send>(
             }
         }
         Err(err) => {
-            diag.warn_throttled("bad_frame", err);
+            warn_frame_throttled(frame_diag, "bad_frame", err);
         }
     }
 }
 
 /// Counts and diagnoses a framing failure. Its own diagnostic key, not `connection_error`: an
 /// operator triaging "my sender's frames are being rejected" is looking at something quite
-/// different from "a peer's socket broke".
-fn report_frame_error(err: &FrameError, telemetry: &Telemetry, diag: &mut Diagnostics) {
+/// different from "a peer's socket broke". Returns whether the diagnostic actually reported (i.e.
+/// was not throttled), so a test can assert the listener-wide cadence directly.
+fn report_frame_error(
+    err: &FrameError,
+    telemetry: &Telemetry,
+    frame_diag: &Mutex<Diagnostics>,
+) -> bool {
     telemetry.count("logit.input.frames.dropped", 1.0, &[("reason", err.reason())]);
-    diag.warn_throttled("framing_error", err);
+    warn_frame_throttled(frame_diag, "framing_error", err)
+}
+
+/// Reports one per-frame diagnostic through the listener-wide throttle -- see the `frame_diag`
+/// handle's own comment in `run_until_shutdown` for why these two keys need a shared
+/// [`Diagnostics`] rather than the per-connection clone `connection_error` uses. The guard never
+/// outlives this call, so it is never held across an `.await`.
+fn warn_frame_throttled(
+    frame_diag: &Mutex<Diagnostics>,
+    key: &'static str,
+    msg: impl std::fmt::Display,
+) -> bool {
+    // A poisoned lock means some other connection panicked mid-report; the counts themselves are
+    // still perfectly usable, and losing the throttle entirely would be the worse outcome.
+    let mut diag = frame_diag.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    diag.warn_throttled(key, msg)
 }
 
 /// `sink.send` mints a fresh [`logit_pipeline::TraceContext::new_root`] here -- once per
@@ -1538,6 +1576,71 @@ mod tests {
                 Some(("reason", "limit"))
             ),
             Some(1.0)
+        );
+
+        handle.abort();
+    }
+
+    /// The throttle `report_frame_error` reports through has to be shared across connections to
+    /// work at all: a framing error is fatal to its connection, so against a per-connection
+    /// `Diagnostics` clone the count would sit at 1 forever and every single occurrence would
+    /// warn. Asserted on `warn_throttled`'s own return value, since the `tracing` output itself is
+    /// only capturable on the emitting thread and these reports come from spawned tasks.
+    #[test]
+    fn the_per_frame_diagnostic_throttle_is_shared_not_per_connection() {
+        let frame_diag = Mutex::new(Diagnostics::new("syslog_in"));
+        let telemetry = Telemetry::default();
+        let err = FrameError::Malformed("an octet count of zero".to_string());
+
+        assert!(
+            report_frame_error(&err, &telemetry, &frame_diag),
+            "the 1st occurrence across the listener reports"
+        );
+        assert!(
+            report_frame_error(&err, &telemetry, &frame_diag),
+            "the 2nd reports too -- 2 is a power of two"
+        );
+        assert!(
+            !report_frame_error(&err, &telemetry, &frame_diag),
+            "the 3rd is suppressed, which a per-connection clone could never manage"
+        );
+    }
+
+    /// The wiring half of the test above: two separate connections' framing errors both land on
+    /// the one listener-wide handle, so both are counted on
+    /// `logit.component.diagnostics{key="framing_error"}` rather than each starting a fresh count.
+    #[tokio::test]
+    async fn two_connections_report_their_framing_errors_through_one_throttle() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener
+            .with_telemetry(telemetry.clone())
+            // Attached so `warn_throttled`'s own occurrence counter is observable -- see
+            // `Diagnostics`' `telemetry` field.
+            .with_diagnostics(Diagnostics::new("syslog_in").with_telemetry(telemetry));
+        let (sink, _rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        for attempt in 0..2 {
+            // A zero octet count: malformed, and fatal to its connection.
+            let mut client = connect(&addr).await;
+            client.write_all(b"0 nope").await.unwrap();
+            expect_closed(&mut client, &format!("connection {attempt} after a malformed count"))
+                .await;
+        }
+
+        let events = registry.drain(0);
+        assert_eq!(
+            sum_of(&events, "logit.input.frames.dropped", Some(("reason", "malformed"))),
+            Some(2.0)
+        );
+        assert_eq!(
+            sum_of(&events, "logit.component.diagnostics", Some(("key", "framing_error"))),
+            Some(2.0),
+            "both connections must report through the one listener-wide Diagnostics"
         );
 
         handle.abort();
