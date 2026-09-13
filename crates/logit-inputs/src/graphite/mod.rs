@@ -345,10 +345,12 @@ impl Input for GraphiteInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use logit_core::interner::resolve;
     use logit_core::telemetry::Registry;
     use logit_core::{Event, MetricKind, Value};
     use logit_pipeline::unwrap_batch;
+    use logit_proto::Decoder as _;
     use std::net::SocketAddr;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -838,5 +840,206 @@ mod tests {
 
         running.shutdown.send(true).ok();
         running.handle.abort();
+    }
+
+    // ---- recorded interop fixtures (testdata/interop/graphite/) --------------------------------
+    //
+    // Real bytes from real producers -- not this codec's own encoder, not a hand-built socket
+    // write -- recorded by `script/record-fixtures graphite`: W4a of
+    // `docs/plans/graphite-carbon-relay.md`. See testdata/interop/graphite/README.md for the
+    // provenance table and docs/plans/recorded-interop-fixtures.md for why this corpus exists at
+    // all.
+    //
+    // Both producers write `logit-fixture.`-prefixed paths (the collectd config's `Hostname`, and
+    // the Python producer's own hard-coded prefix), so every assertion below can check that
+    // prefix without caring which producer wrote a given fixture. `crates/logit-inputs/src/
+    // collectd.rs`'s own interop tests are the model this follows: assert on **decoded,
+    // identifiable values**, never on the fixture's raw bytes.
+    //
+    // These live here rather than in `logit-proto` beside `GraphiteDecoder`'s own unit tests for
+    // the same reason `collectd.rs`'s do: this is the component an operator actually points a
+    // real collectd or a real carbon pickle sender at.
+
+    /// Well past the 2038 problem and nothing like these fixtures' own real capture-time
+    /// timestamps, so every assertion below is really reading the wire's own `ts` field, not a
+    /// receipt-time fallback.
+    const INTEROP_RECEIVED_AT: i64 = 1_700_000_000_000_000_000;
+
+    fn interop_fixture(name: &str) -> Bytes {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/interop/graphite")
+            .join(name);
+        let raw = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("reading interop fixture {}: {e}", path.display()));
+        Bytes::from(raw)
+    }
+
+    /// Every `logit.component.diagnostics{key}` the registry saw. Drains, so call it once -- the
+    /// same helper shape as `crates/logit-inputs/src/collectd.rs`'s `diagnostic_keys`.
+    fn interop_diagnostic_keys(registry: &Registry) -> Vec<String> {
+        let drained = registry.drain(0);
+        drained
+            .iter()
+            .filter(|event| {
+                event.metrics.iter().any(|m| resolve(m.name) == "logit.component.diagnostics")
+            })
+            .filter_map(|event| {
+                event.attributes.get("key").and_then(Value::as_str).map(str::to_owned)
+            })
+            .collect()
+    }
+
+    fn interop_decoder(protocol: Protocol) -> (GraphiteDecoder, Arc<Registry>) {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("graphite_in", "graphite_in", "listener");
+        let diag = Diagnostics::new("graphite_in").with_telemetry(telemetry.clone());
+        let decoder = GraphiteDecoder::new(Arc::new(Resource::default()))
+            .with_protocol(protocol)
+            .with_diagnostics(diag)
+            .with_telemetry(telemetry);
+        (decoder, registry)
+    }
+
+    /// Decodes a whole recorded TCP connection's plaintext stream as **one buffer**, exactly as
+    /// `crates/logit-inputs/src/graphite/tcp.rs`'s connection loop hands `decode_into` everything
+    /// read so far up through the last complete `\n`: `decode_plaintext` (`logit_proto::graphite::
+    /// decode`) splits on `\n` internally, so one recorded connection holding many
+    /// `write_graphite` flush cycles is exactly one call, not one call per line. That is also why
+    /// this fixture is committed whole rather than split into one file per line -- a raw capture
+    /// records what actually arrived on the wire, and what arrived was one connection's stream.
+    fn decode_interop_plaintext(name: &str) -> (Vec<Event>, Arc<Registry>) {
+        let (mut decoder, registry) = interop_decoder(Protocol::Plaintext);
+        let mut events = Vec::new();
+        decoder
+            .decode_into(interop_fixture(name), INTEROP_RECEIVED_AT, &mut events)
+            .unwrap_or_else(|e| {
+                panic!("{name} is a real carbon plaintext stream and must decode: {e}")
+            });
+        (events, registry)
+    }
+
+    /// Decodes every length-prefixed pickle frame a recorded connection holds.
+    ///
+    /// `GraphiteDecoder::decode_into`'s pickle path expects one already-**unframed** payload per
+    /// call -- framing is the listener's job (`logit_proto::graphite::decode`'s module doc) -- so
+    /// this strips each 4-byte big-endian length prefix itself, the same way
+    /// `crates/logit-inputs/src/graphite/tcp.rs`'s `consume_frames` does on a live connection.
+    /// Looping rather than assuming exactly one frame is what makes this correct even if a future
+    /// re-record's connection ever carries more than one (today's fixtures each hold exactly one).
+    fn decode_interop_pickle(name: &str) -> (Vec<Event>, Arc<Registry>) {
+        let (mut decoder, registry) = interop_decoder(Protocol::Pickle);
+        let raw = interop_fixture(name);
+        let mut events = Vec::new();
+        let mut offset = 0;
+        while offset < raw.len() {
+            assert!(raw.len() - offset >= 4, "{name}: a truncated pickle length prefix");
+            let mut prefix = [0u8; 4];
+            prefix.copy_from_slice(&raw[offset..offset + 4]);
+            let frame_len = u32::from_be_bytes(prefix) as usize;
+            offset += 4;
+            assert!(raw.len() - offset >= frame_len, "{name}: a truncated pickle frame payload");
+            let payload = raw.slice(offset..offset + frame_len);
+            offset += frame_len;
+            decoder
+                .decode_into(payload, INTEROP_RECEIVED_AT, &mut events)
+                .unwrap_or_else(|e| panic!("{name} is a real pickle frame and must decode: {e}"));
+        }
+        (events, registry)
+    }
+
+    /// `tools/record-fixtures/collectd-write-graphite.conf`'s real collectd, sending real carbon
+    /// plaintext lines through its `write_graphite` plugin -- not this codec's own encoder.
+    /// `write_graphite`'s lines are `\r\n`-terminated (Twisted's `LineReceiver` default
+    /// delimiter), so this also exercises normalization 9 (CRLF -> LF) against a real sender
+    /// rather than a hand-built one.
+    #[test]
+    fn interop_fixture_write_graphite_plaintext_decodes() {
+        let (events, registry) = decode_interop_plaintext("write-graphite-000.raw");
+        assert!(!events.is_empty(), "a recorded write_graphite connection carries datapoints");
+        assert_eq!(
+            interop_diagnostic_keys(&registry),
+            Vec::<String>::new(),
+            "a real collectd write_graphite connection must decode with no bad_line/bad_tag/\
+             bad_timestamp/non_finite_value diagnostic"
+        );
+        for event in &events {
+            assert_eq!(event.metrics.len(), 1, "one line is one event with one metric");
+            let name = resolve(event.metrics[0].name);
+            assert!(
+                name.starts_with("logit-fixture."),
+                "tools/record-fixtures/collectd-write-graphite.conf sets `Hostname \
+                 \"logit-fixture\"`, got {name:?}"
+            );
+            assert!(
+                matches!(event.metrics[0].kind, MetricKind::Gauge(_)),
+                "carbon's wire has no type, so every datapoint decodes to a bare Gauge, got {:?}",
+                event.metrics[0].kind
+            );
+        }
+    }
+
+    /// Both pickle fixtures pickle the exact same `tools/record-fixtures/
+    /// python_graphite_pickle_producer.py::DATAPOINTS` list, just at a different protocol -- so
+    /// both must decode to identical events whether the wire opcodes are protocol 2's plain
+    /// `BINUNICODE`/`BININT`/`BINFLOAT` or protocol 5's `FRAME`/`SHORT_BINUNICODE`/`MEMOIZE`
+    /// wrapping the same values. Asserting the exact decoded datapoints (not just "some events
+    /// arrived") is what actually checks the restricted reader against real CPython pickle output
+    /// rather than against this crate's own writer.
+    fn assert_pickle_fixture_decodes(name: &str) {
+        let (events, registry) = decode_interop_pickle(name);
+        assert_eq!(
+            interop_diagnostic_keys(&registry),
+            Vec::<String>::new(),
+            "{name}: a real CPython pickle frame must decode with no bad_shape/non_finite_value/\
+             bad_timestamp diagnostic"
+        );
+        let got: Vec<(&str, i64, MetricKind)> = events
+            .iter()
+            .map(|e| {
+                assert_eq!(e.metrics.len(), 1, "one pickle datapoint is one event with one metric");
+                (resolve(e.metrics[0].name), e.timestamp, e.metrics[0].kind.clone())
+            })
+            .collect();
+        // Exactly `python_graphite_pickle_producer.py`'s `DATAPOINTS`, in order (pickle's own
+        // list preserves send order, and `graphite_in` never reorders within one frame): an `int`
+        // timestamp/value pair, a fractional timestamp with a float value, a negative float
+        // value, and a large float value -- covering the int/float encoding split pickle itself
+        // makes (`BININT`/`LONG1` vs. `BINFLOAT`) on both fields independently.
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "logit-fixture.pickle.int_value",
+                    1_700_000_000_000_000_000,
+                    MetricKind::Gauge(42.0)
+                ),
+                (
+                    "logit-fixture.pickle.float_value",
+                    1_700_000_001_500_000_000,
+                    MetricKind::Gauge(12.75)
+                ),
+                (
+                    "logit-fixture.pickle.negative_value",
+                    1_700_000_002_000_000_000,
+                    MetricKind::Gauge(-17.5)
+                ),
+                (
+                    "logit-fixture.pickle.large_value",
+                    1_700_000_003_000_000_000,
+                    MetricKind::Gauge(1_234_567.0)
+                ),
+            ],
+            "{name}: must decode to exactly python_graphite_pickle_producer.py's DATAPOINTS"
+        );
+    }
+
+    #[test]
+    fn interop_fixture_pickle_protocol_2_decodes() {
+        assert_pickle_fixture_decodes("graphite-pickle-p2-000.raw");
+    }
+
+    #[test]
+    fn interop_fixture_pickle_protocol_5_decodes() {
+        assert_pickle_fixture_decodes("graphite-pickle-p5-000.raw");
     }
 }
