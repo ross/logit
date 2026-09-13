@@ -419,6 +419,17 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     resolver can mirror it exactly without depending on `logit-config` (this document's own
     "Crate layout" section). `receive:` on a `generate_in` is rejected by rule 17's own allowlist
     — it is a listener by role, with no socket, queue, or decoder for `receive:` to configure.
+44. A `syslog_out` `tls:` block must be internally consistent — `cert_file`/`key_file` set
+    together, no `insecure_skip_verify` alongside `ca_file` — the same two checks rule 34 makes
+    for `logit_out`'s own `tls:` block (and rule 24 for `otlp_out`'s), for the same reason: both
+    of those sinks dial a bare `host:port` endpoint, so `tls:`'s mere presence is the only signal
+    that TLS is wanted and there is no "wrong scheme" case to catch. Plus one check this rule
+    alone makes: a `tls:` block together with `transport: udp` is rejected
+    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)). Syslog over TLS is
+    RFC 5425 — TLS over *TCP* — and DTLS is out of scope, so accepting the block and ignoring it
+    would leave an operator who asked for encryption on a plaintext datagram socket.
+    `logit_outputs::syslog::SyslogOutput::with_tls` re-checks that last one itself, since
+    `graph::resolve` isn't the only possible caller.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

@@ -158,6 +158,14 @@
 //!     `logit-config` (`docs/design/pipeline-graph.md`'s crate layout). `receive:` on a
 //!     `generate_in` is rejected by rule 17's own allowlist -- it is a listener by role, with no
 //!     socket, queue, or decoder for `receive:` to configure (`docs/plans/load-test-harness.md`).
+//! 44. A `syslog_out` `tls:` block must be internally consistent -- `cert_file`/`key_file` set
+//!     together, no `insecure_skip_verify` alongside `ca_file` -- the same two checks rule 34
+//!     makes for `logit_out`'s own `tls:`, and for the same reason: both sinks dial a bare
+//!     `host:port` where `tls:`'s mere presence is the only "TLS is wanted" signal there is.
+//!     Plus one check of its own: `tls:` together with `transport: udp` is rejected. Syslog over
+//!     TLS is RFC 5425, which is TLS over TCP; DTLS is out of scope
+//!     (`docs/adr/syslog-tcp-ingress-and-tls.md`), so silently ignoring the block would leave an
+//!     operator who asked for encryption on a plaintext datagram socket.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -1644,6 +1652,37 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 );
             }
             check_generate_template(id, "event.metric.name", &metric.name, Rendering::Interned)?;
+        }
+    }
+
+    // Rule 44: `syslog_out`'s `tls:` block -- the twin of rule 34's for `logit_out`, since both
+    // sinks dial the same bare `host:port` shape where `tls:`'s mere presence is the only signal
+    // that TLS is wanted. `cert_file`/`key_file` must be set together, and `insecure_skip_verify`
+    // together with `ca_file` is contradictory; the messages are rule 34's verbatim, so one grep
+    // finds every sink that makes the same two checks. The third check is this rule's own:
+    // `tls:` under `transport: udp` is rejected rather than silently ignored -- syslog over TLS
+    // is RFC 5425, which is TLS over *TCP*, and DTLS is out of scope
+    // (`docs/adr/syslog-tcp-ingress-and-tls.md`). `SyslogOutput::with_tls` re-checks that last
+    // one itself, since `graph::resolve` isn't the only possible caller.
+    for (id, component) in &components {
+        let ComponentKind::SyslogOut { tls: Some(tls), transport, .. } = &component.kind else {
+            continue;
+        };
+        if tls.cert_file.is_some() != tls.key_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
+                 mutual TLS, or both omitted -- one alone can't be used"
+            );
+        }
+        if tls.insecure_skip_verify && tls.ca_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both be \
+                 set -- 'insecure_skip_verify' trusts any certificate, which makes a specific \
+                 trusted CA meaningless"
+            );
+        }
+        if *transport == logit_config::SyslogTransport::Udp {
+            anyhow::bail!("component '{id}': DTLS is out of scope; 'tls:' needs 'transport: tcp'");
         }
     }
 
@@ -4269,6 +4308,87 @@ mod tests {
 
     fn logit_in_with_max_frame_bytes(max_frame_bytes: Option<u64>) -> ComponentKind {
         ComponentKind::LogitIn { bind: "0.0.0.0:5140".to_string(), tls: None, max_frame_bytes }
+    }
+
+    // ---- Rule 44: `syslog_out`'s `tls:` block -------------------------------------------------
+
+    fn syslog_out_with_tls(
+        transport: logit_config::SyslogTransport,
+        tls: Option<logit_config::TlsClientConfig>,
+    ) -> ComponentKind {
+        ComponentKind::SyslogOut {
+            endpoint: "relay:6514".to_string(),
+            transport,
+            format: logit_config::SyslogFormat::default(),
+            facility: logit_config::SyslogFacility::default(),
+            hostname: None,
+            app_name: None,
+            max_message_bytes: 8192,
+            connect_timeout: Duration::from_secs(5),
+            structured_data: None,
+            tls,
+        }
+    }
+
+    #[test]
+    fn a_syslog_out_with_cert_file_but_no_key_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            cert_file: Some("client.pem".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], syslog_out_with_tls(logit_config::SyslogTransport::Tcp, Some(tls))),
+        ]));
+        assert!(err.contains("cert_file") && err.contains("key_file"), "got: {err}");
+    }
+
+    #[test]
+    fn a_syslog_out_with_insecure_skip_verify_and_ca_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            ca_file: Some("ca.pem".to_string()),
+            insecure_skip_verify: true,
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], syslog_out_with_tls(logit_config::SyslogTransport::Tcp, Some(tls))),
+        ]));
+        assert!(err.contains("insecure_skip_verify") && err.contains("ca_file"), "got: {err}");
+    }
+
+    /// Rule 44's own third check, which rule 34 has no counterpart for: syslog over TLS is RFC
+    /// 5425, TLS over *TCP*. A `tls:` block under `transport: udp` would otherwise be silently
+    /// ignored, leaving an operator who asked for encryption with a plaintext datagram socket.
+    #[test]
+    fn a_syslog_out_with_tls_under_transport_udp_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                syslog_out_with_tls(
+                    logit_config::SyslogTransport::Udp,
+                    Some(logit_config::TlsClientConfig::default()),
+                ),
+            ),
+        ]));
+        assert!(err.contains("DTLS") && err.contains("transport: tcp"), "got: {err}");
+    }
+
+    #[test]
+    fn a_syslog_out_with_a_consistent_tls_block_over_tcp_validates_fine() {
+        let tls = logit_config::TlsClientConfig {
+            ca_file: Some("ca.pem".to_string()),
+            cert_file: Some("client.pem".to_string()),
+            key_file: Some("client.key".to_string()),
+            ..Default::default()
+        };
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], syslog_out_with_tls(logit_config::SyslogTransport::Tcp, Some(tls))),
+        ]))
+        .expect("a paired cert_file/key_file over TCP should validate fine");
     }
 
     #[test]
