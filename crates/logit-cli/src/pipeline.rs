@@ -363,8 +363,8 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        PrometheusIn { targets, interval, timeout, headers, tls } => {
-            let input = PrometheusInput::new(targets.clone(), *interval)
+        PrometheusIn { scrape_targets, interval, timeout, headers, tls } => {
+            let input = PrometheusInput::new(scrape_targets.clone(), *interval)
                 .with_timeout(*timeout)
                 .with_headers(headers)?
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -771,6 +771,18 @@ fn build_spec(
             Box::new(NullOutput),
             queue_config(&component.buffer, base_dir),
             write_config(&component.buffer),
+        ),
+
+        // W4 (docs/plans/target-components.md) replaces this arm.
+        Target {} => anyhow::bail!(
+            "component '{id}': `target` is not implemented yet (rule 8 rejects it before this \
+             point)"
+        ),
+
+        // W4 (docs/plans/target-components.md) replaces this arm.
+        Route { .. } => anyhow::bail!(
+            "component '{id}': `route` is not implemented yet (rule 8 rejects it before this \
+             point)"
         ),
     };
     Ok((spec, telemetry))
@@ -1200,6 +1212,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
+            targets: Vec::new(),
             kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
         }
     }
@@ -1209,6 +1222,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: sources.into_iter().map(String::from).collect(),
+            targets: Vec::new(),
             kind: ComponentKind::InfluxDbOut {
                 url: "http://localhost:8086".to_string(),
                 org: "org".to_string(),
@@ -1258,6 +1272,7 @@ mod tests {
                     buffer: logit_config::BufferConfig::default(),
                     receive: logit_config::ReceiveConfig::default(),
                     sources: vec!["in".to_string()],
+                    targets: Vec::new(),
                     kind: ComponentKind::Lua { script: "".to_string(), interval: None },
                 },
             ),
@@ -1267,6 +1282,7 @@ mod tests {
                     buffer: logit_config::BufferConfig::default(),
                     receive: logit_config::ReceiveConfig::default(),
                     sources: vec!["in".to_string()],
+                    targets: Vec::new(),
                     kind: ComponentKind::Lua { script: "".to_string(), interval: None },
                 },
             ),
@@ -1285,6 +1301,7 @@ mod tests {
                     buffer: logit_config::BufferConfig::default(),
                     receive: logit_config::ReceiveConfig::default(),
                     sources: vec!["in".to_string()],
+                    targets: Vec::new(),
                     kind: ComponentKind::LuaFile {
                         lua_file: "does-not-exist.lua".to_string(),
                         interval: None,
@@ -1317,6 +1334,7 @@ mod tests {
                     buffer: logit_config::BufferConfig::default(),
                     receive: logit_config::ReceiveConfig::default(),
                     sources: vec![],
+                    targets: Vec::new(),
                     kind: ComponentKind::Internal {
                         interval: Duration::from_secs(10),
                         span_sample_rate: logit_core::DEFAULT_SPAN_SAMPLE_RATE,
@@ -1531,7 +1549,7 @@ mod tests {
             sources: vec![],
             consumers: vec!["out".to_string()],
             kind: ComponentKind::PrometheusIn {
-                targets: vec!["http://127.0.0.1:0/metrics".to_string()],
+                scrape_targets: vec!["http://127.0.0.1:0/metrics".to_string()],
                 interval: Duration::from_secs(15),
                 timeout: Duration::from_secs(10),
                 headers: HashMap::new(),

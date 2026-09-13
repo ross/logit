@@ -21,6 +21,9 @@ pub fn render(config: &Config) -> String {
             Role::Listener => ("box", "filled,rounded"),
             Role::Transform => ("ellipse", "filled"),
             Role::Sink => ("box", "filled,bold"),
+            // Dashed router -> target edges are W2 (`docs/plans/target-components.md`); only the
+            // node style lands now.
+            Role::Target => ("box", "filled,dashed"),
         };
         out.push_str(&format!("  {id:?} [shape={shape}, style=\"{style}\", label={id:?}];\n"));
     }
@@ -49,6 +52,7 @@ mod tests {
                 buffer: logit_config::BufferConfig::default(),
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
+                targets: Vec::new(),
                 kind: ComponentKind::StatsdIn { bind: "x".to_string() },
             },
         );
@@ -58,6 +62,7 @@ mod tests {
                 buffer: logit_config::BufferConfig::default(),
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
+                targets: Vec::new(),
                 kind: ComponentKind::InfluxDbOut {
                     url: "u".to_string(),
                     org: "o".to_string(),
@@ -85,6 +90,7 @@ mod tests {
                 buffer: logit_config::BufferConfig::default(),
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["missing".to_string()],
+                targets: Vec::new(),
                 kind: ComponentKind::InfluxDbOut {
                     url: "u".to_string(),
                     org: "o".to_string(),

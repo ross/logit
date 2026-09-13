@@ -220,7 +220,13 @@ what the component does to an event, the way `set`/`keep`/`scale` do. `event:to(
 ## Consequences
 
 - **Config.** `ComponentKind::Target {}` and `ComponentKind::Route { by, routes }`; `RouteBy`/
-  `ProvenanceField` enums; `Component.targets: Vec<String>`. Schema regenerated.
+  `ProvenanceField` enums; `Component.targets: Vec<String>`. Schema regenerated. A `Component`
+  field shares one flattened key namespace with every `ComponentKind` variant's fields, so
+  `targets` is now reserved the way `sources`/`buffer`/`receive` already are -- and
+  `prometheus_in`'s scrape-URL list, which was named `targets`, is renamed `scrape_targets`
+  (amendment in [`prometheus-scrape-and-exposition`](prometheus-scrape-and-exposition.md)). A
+  breaking config change, accepted pre-release: the routing concept is the more general use of the
+  word.
 - **Graph.** `Role::Target`; `graph::targets_of`/`target_edges`; `ResolvedComponent.targets`
   (slot order); `topological_order` over `sources` plus target edges; rules 43-47; `dot.rs`
   styling. Rule 6's arity table gains a row; rule 7 is relaxed for routers only.

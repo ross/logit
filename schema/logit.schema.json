@@ -998,6 +998,33 @@
           }
         },
         {
+          "description": "Equality-only routing: one key read per event, one target per matching value (`docs/adr/target-components.md`). Deliberately no predicate language -- the same posture `has_attributes`/`has_provenance` take (`docs/adr/routing-by-condition-is-lua.md`). An event whose key is absent, or whose value no route names, is *unrouted*: it goes to this component's ordinary consumers, or is dropped and counted if it has none.",
+          "type": "object",
+          "required": [
+            "by",
+            "routes",
+            "type"
+          ],
+          "properties": {
+            "by": {
+              "$ref": "#/definitions/RouteBy"
+            },
+            "routes": {
+              "description": "Value -> target id. Several values may name one target. The graph's router->target edges derive from these values, so there is no separate `targets:` list to keep in sync.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "route"
+              ]
+            }
+          }
+        },
+        {
           "description": "Parses a log record's message as logfmt (`level=info msg=\"hello world\" dur=3ms`), merging the resulting key/values into the event's attributes. Additive and pass-through-on-failure, exactly like `json`. See `docs/adr/logfmt-and-kv-parsing.md`.",
           "type": "object",
           "required": [
@@ -1483,10 +1510,10 @@
           }
         },
         {
-          "description": "Scrapes Prometheus `/metrics` endpoints on `interval`, the way Prometheus's own server does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each target's response declares via its own `Content-Type`. Always synthesizes `up`, `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. See `docs/adr/prometheus-scrape-and-exposition.md`. A future `bind:` field on this same variant (a remote-write receiver) is planned as an additive, non-breaking change -- \"exactly one of `targets`/`bind`\" would become a graph rule once it lands, not a new kind.",
+          "description": "Scrapes Prometheus `/metrics` endpoints on `interval`, the way Prometheus's own server does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each target's response declares via its own `Content-Type`. Always synthesizes `up`, `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. See `docs/adr/prometheus-scrape-and-exposition.md`. A future `bind:` field on this same variant (a remote-write receiver) is planned as an additive, non-breaking change -- \"exactly one of `scrape_targets`/`bind`\" would become a graph rule once it lands, not a new kind.\n\nNamed `scrape_targets`, not `targets` -- `Component.targets` (`docs/adr/ target-components.md`) claims the bare name at the flattened top level, and `#[serde(flatten)]` can't have two fields answer to the same key.",
           "type": "object",
           "required": [
-            "targets",
+            "scrape_targets",
             "type"
           ],
           "properties": {
@@ -1503,7 +1530,7 @@
               "default": "15s",
               "type": "string"
             },
-            "targets": {
+            "scrape_targets": {
               "description": "Absolute `http://`/`https://` scrape URLs. Required, non-empty (rule 40).",
               "type": "array",
               "items": {
@@ -1651,6 +1678,21 @@
               ]
             }
           }
+        },
+        {
+          "description": "A named destination a router directs events into (`docs/adr/target-components.md`). No fields, and no `sources:` -- a target is fed by *direction*, from a router that names it, never by naming anything itself. Downstream components read it exactly like any other component, by listing it in their own `sources:`.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "target"
+              ]
+            }
+          }
         }
       ],
       "properties": {
@@ -1691,6 +1733,14 @@
           ]
         },
         "sources": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "targets": {
+          "description": "The `target` components this router directs events into, in slot order (`docs/adr/target-components.md`). Legal only on `lua`/`lua_file`; a `route` derives its targets from `routes:`' values instead, and every other kind must leave this empty -- enforced at validation time (`logit-pipeline`'s graph rules), not here, for the same reason `buffer:` and `receive:` are validated there.",
           "default": [],
           "type": "array",
           "items": {
@@ -1980,6 +2030,14 @@
         "drop_newest"
       ]
     },
+    "ProvenanceField": {
+      "description": "Which half of a batch's provenance a `route` switches on (`docs/adr/batch-provenance-on-delivered.md`).",
+      "type": "string",
+      "enum": [
+        "origin",
+        "previous"
+      ]
+    },
     "ReadFrom": {
       "description": "Where a tailed file starts reading the first time it's seen, when no checkpoint entry names it -- meaningless once a checkpoint entry exists (that always wins; see [`TailOptions:: checkpoint_path`]) and meaningless for a file discovered after startup, which always starts at [`ReadFrom::Beginning`] regardless of this setting (a file that didn't exist yet has no \"before `logit` started\" to skip).",
       "oneOf": [
@@ -2095,6 +2153,47 @@
       "enum": [
         "hourly",
         "daily"
+      ]
+    },
+    "RouteBy": {
+      "description": "What one `route` reads from each event. Externally tagged, so config reads `by: {provenance: origin}`, `by: {attribute: stream}`, or `by: {resource: service.name}`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "provenance"
+          ],
+          "properties": {
+            "provenance": {
+              "$ref": "#/definitions/ProvenanceField"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "attribute"
+          ],
+          "properties": {
+            "attribute": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "resource"
+          ],
+          "properties": {
+            "resource": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
       ]
     },
     "SetValue": {

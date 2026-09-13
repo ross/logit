@@ -122,7 +122,7 @@
 //!     wrong for the consumer that mode exists for. `series_retention: 0` stays legal under the
 //!     default `temporality: delta` (`docs/adr/aggregation-window-semantics.md`'s cumulative
 //!     amendment).
-//! 40. A `prometheus_in` `targets` must be non-empty, and every entry must parse as an
+//! 40. A `prometheus_in` `scrape_targets` must be non-empty, and every entry must parse as an
 //!     absolute `http://`/`https://` URL with a non-empty authority -- `logit-pipeline` doesn't
 //!     depend on `reqwest`/`url` (`docs/design/pipeline-graph.md`'s crate layout), so this is a
 //!     small hand-rolled scheme/authority check, not a real URL parse. A `tls:` block must be
@@ -178,6 +178,8 @@ pub enum Role {
     Listener,
     Transform,
     Sink,
+    /// A `target`: no sources, fed by direction from a router (`docs/adr/target-components.md`).
+    Target,
 }
 
 impl Role {
@@ -188,6 +190,7 @@ impl Role {
             Role::Listener => "listener",
             Role::Transform => "transform",
             Role::Sink => "sink",
+            Role::Target => "target",
         }
     }
 }
@@ -229,7 +232,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | DropProvenance { .. }
         | Logfmt { .. }
         | Kv { .. }
-        | Regex { .. } => Role::Transform,
+        | Regex { .. }
+        | Route { .. } => Role::Transform,
         InfluxDbOut { .. }
         | OtlpOut { .. }
         | LogitOut { .. }
@@ -240,6 +244,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | CollectdOut { .. }
         | PrometheusOut { .. }
         | NullOut { .. } => Role::Sink,
+        Target { .. } => Role::Target,
     }
 }
 
@@ -284,6 +289,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         Logfmt { .. } => "logfmt",
         Kv { .. } => "kv",
         Regex { .. } => "regex",
+        Route { .. } => "route",
         InfluxDbOut { .. } => "influxdb_out",
         OtlpOut { .. } => "otlp_out",
         LogitOut { .. } => "logit_out",
@@ -294,6 +300,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         CollectdOut { .. } => "collectd_out",
         PrometheusOut { .. } => "prometheus_out",
         NullOut { .. } => "null_out",
+        Target { .. } => "target",
     }
 }
 
@@ -438,7 +445,7 @@ const RESERVED_PROMETHEUS_HEADERS: &[&str] = &[
     "connection",
 ];
 
-/// Rule 40's URL check: `targets` must be absolute `http://`/`https://` URLs with a non-empty
+/// Rule 40's URL check: `scrape_targets` must be absolute `http://`/`https://` URLs with a non-empty
 /// authority. `logit-pipeline` doesn't depend on `reqwest`/`url` (`docs/design/pipeline-graph.md`'s
 /// crate layout keeps this crate free of any concrete protocol's dependencies), so this is a small
 /// hand-rolled scheme/authority check rather than a real URL parse -- good enough to catch a typo'd
@@ -1477,21 +1484,22 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 40: `prometheus_in`'s `targets`/`timeout`/`tls`/`headers` -- see this module's own doc
-    // comment for the full rule text.
+    // Rule 40: `prometheus_in`'s `scrape_targets`/`timeout`/`tls`/`headers` -- see this module's
+    // own doc comment for the full rule text.
     for (id, component) in &components {
-        if let ComponentKind::PrometheusIn { targets, timeout, headers, tls, .. } = &component.kind
+        if let ComponentKind::PrometheusIn { scrape_targets, timeout, headers, tls, .. } =
+            &component.kind
         {
-            if targets.is_empty() {
+            if scrape_targets.is_empty() {
                 anyhow::bail!(
-                    "component '{id}': 'targets' must name at least one scrape URL -- an empty \
-                     list would never scrape anything"
+                    "component '{id}': 'scrape_targets' must name at least one scrape URL -- an \
+                     empty list would never scrape anything"
                 );
             }
-            for target in targets {
+            for target in scrape_targets {
                 if !is_absolute_http_url(target) {
                     anyhow::bail!(
-                        "component '{id}': 'targets' entry {target:?} isn't an absolute \
+                        "component '{id}': 'scrape_targets' entry {target:?} isn't an absolute \
                          'http://' or 'https://' URL"
                     );
                 }
@@ -1515,12 +1523,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      specific trusted CA meaningless"
                 );
             }
-            let any_https = targets.iter().any(|t| t.to_ascii_lowercase().starts_with("https://"));
+            let any_https =
+                scrape_targets.iter().any(|t| t.to_ascii_lowercase().starts_with("https://"));
             if !tls.is_empty() && !any_https {
                 anyhow::bail!(
-                    "component '{id}': 'tls' is set, but no 'targets' entry is 'https://' -- \
-                     TLS is selected per-target by its own scheme, so a 'tls:' block here would \
-                     have no effect"
+                    "component '{id}': 'tls' is set, but no 'scrape_targets' entry is 'https://' \
+                     -- TLS is selected per-target by its own scheme, so a 'tls:' block here \
+                     would have no effect"
                 );
             }
             let mut seen_lowercase = BTreeSet::new();
@@ -1649,7 +1658,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
-        let Component { sources, buffer, receive, kind } = component;
+        // `targets` isn't carried onto `ResolvedComponent` until W2
+        // (`docs/plans/target-components.md`); rules 43-47 land with it.
+        let Component { sources, buffer, receive, kind, targets: _ } = component;
         let node_consumers = consumers.remove(&id).unwrap_or_default();
         resolved.insert(
             id,
@@ -1871,6 +1882,7 @@ mod tests {
                 id.to_string(),
                 Component {
                     sources: sources.into_iter().map(String::from).collect(),
+                    targets: Vec::new(),
                     buffer: BufferConfig::default(),
                     receive: ReceiveConfig::default(),
                     kind,
@@ -1888,6 +1900,7 @@ mod tests {
                 id.to_string(),
                 Component {
                     sources: sources.into_iter().map(String::from).collect(),
+                    targets: Vec::new(),
                     buffer,
                     receive: ReceiveConfig::default(),
                     kind,
@@ -1908,6 +1921,7 @@ mod tests {
                 id.to_string(),
                 Component {
                     sources: sources.into_iter().map(String::from).collect(),
+                    targets: Vec::new(),
                     buffer: BufferConfig::default(),
                     receive,
                     kind,
@@ -1996,7 +2010,7 @@ mod tests {
 
     fn prometheus_in(targets: Vec<&str>) -> ComponentKind {
         ComponentKind::PrometheusIn {
-            targets: targets.into_iter().map(String::from).collect(),
+            scrape_targets: targets.into_iter().map(String::from).collect(),
             interval: Duration::from_secs(15),
             timeout: Duration::from_secs(10),
             headers: Map::new(),
@@ -2006,7 +2020,7 @@ mod tests {
 
     fn prometheus_in_with_headers(targets: Vec<&str>, headers: Vec<(&str, &str)>) -> ComponentKind {
         ComponentKind::PrometheusIn {
-            targets: targets.into_iter().map(String::from).collect(),
+            scrape_targets: targets.into_iter().map(String::from).collect(),
             interval: Duration::from_secs(15),
             timeout: Duration::from_secs(10),
             headers: headers.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -2019,7 +2033,7 @@ mod tests {
         tls: logit_config::TlsClientConfig,
     ) -> ComponentKind {
         ComponentKind::PrometheusIn {
-            targets: targets.into_iter().map(String::from).collect(),
+            scrape_targets: targets.into_iter().map(String::from).collect(),
             interval: Duration::from_secs(15),
             timeout: Duration::from_secs(10),
             headers: Map::new(),
@@ -3616,6 +3630,39 @@ mod tests {
         assert_eq!(kind_name(&sink()), "influxdb_out");
     }
 
+    /// `target`/`route` are real `ComponentKind` variants (`docs/adr/target-components.md`) with
+    /// correct roles as of W1, but `is_implemented` deliberately leaves both out until W4
+    /// (`docs/plans/target-components.md`) -- rule 8 must reject them the same way it would any
+    /// other kind that isn't built yet.
+    #[test]
+    fn a_target_component_is_rejected_as_not_implemented() {
+        let err = expect_err(cfg(vec![
+            ("t", vec![], ComponentKind::Target {}),
+            ("out", vec!["t"], sink()),
+        ]));
+        assert!(err.contains("is not implemented yet"), "got: {err}");
+    }
+
+    #[test]
+    fn a_route_component_is_rejected_as_not_implemented() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "r",
+                vec!["in"],
+                ComponentKind::Route {
+                    by: logit_config::RouteBy::Attribute("stream".to_string()),
+                    routes: std::collections::BTreeMap::from([(
+                        "host".to_string(),
+                        "t".to_string(),
+                    )]),
+                },
+            ),
+            ("out", vec!["r"], sink()),
+        ]));
+        assert!(err.contains("is not implemented yet"), "got: {err}");
+    }
+
     #[test]
     fn internal_resolves_as_a_listener() {
         let graph = resolve(cfg(vec![("self", vec![], internal()), ("out", vec!["self"], sink())]))
@@ -4653,12 +4700,12 @@ mod tests {
     }
 
     #[test]
-    fn a_prometheus_in_with_empty_targets_is_rejected() {
+    fn a_prometheus_in_with_empty_scrape_targets_is_rejected() {
         let err = expect_err(cfg(vec![
             ("in", vec![], prometheus_in(vec![])),
             ("out", vec!["in"], sink()),
         ]));
-        assert!(err.contains("'in'") && err.contains("'targets'"), "got: {err}");
+        assert!(err.contains("'in'") && err.contains("'scrape_targets'"), "got: {err}");
     }
 
     #[test]
@@ -4716,7 +4763,7 @@ mod tests {
             ("in", vec![], prometheus_in_with_tls(vec!["http://node-exporter:9100/metrics"], tls)),
             ("out", vec!["in"], sink()),
         ]));
-        assert!(err.contains("no 'targets' entry is 'https://'"), "got: {err}");
+        assert!(err.contains("no 'scrape_targets' entry is 'https://'"), "got: {err}");
     }
 
     #[test]

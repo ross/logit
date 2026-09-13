@@ -55,6 +55,10 @@ pub struct Config {
 pub struct Component {
     #[serde(default)]
     pub sources: Vec<String>,
+    // The `target` components a router directs events into, in slot order
+    // (docs/adr/target-components.md). Legal only on `lua`/`lua_file`.
+    #[serde(default)]
+    pub targets: Vec<String>,
     #[serde(flatten)]
     pub kind: ComponentKind,
 }
@@ -107,6 +111,10 @@ pub enum ComponentKind {
     // Splits each row of a delimited line into positional attributes named by a configured
     // `columns` list (docs/adr/csv-positional-columns.md).
     Csv { columns: Vec<String>, delimiter: char },
+    // Equality-only routing: one key read per event, one target per matching value
+    // (docs/adr/target-components.md). An unrouted event goes to this component's ordinary
+    // consumers.
+    Route { by: RouteBy, routes: BTreeMap<String, String> },
     // as each lands in logit-transforms, same shape: a `ComponentKind` variant, no `sources`
     // opinion of its own (that lives on `Component`, uniformly). `rename`/`filter`/`sample`/
     // `throttle`/`dedup` used to be sketched here too -- retired before landing, not merely
@@ -117,6 +125,9 @@ pub enum ComponentKind {
     InfluxDbOut { url: String, org: String, bucket: String, token: String },
     OtlpOut { endpoint: String },
     LogitOut { endpoint: String },
+    // A named destination a router directs events into (docs/adr/target-components.md). No
+    // fields, and no `sources` -- fed by direction, never by naming anything itself.
+    Target {},
 }
 ```
 
@@ -175,8 +186,9 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `collectd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
+| Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rules 43-47, W2) |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
 considered and rejected (ADR `component-graph-configuration`): a typo'd source reference would silently turn a real sink into

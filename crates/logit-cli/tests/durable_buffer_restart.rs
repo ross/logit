@@ -128,6 +128,7 @@ fn graph_and_topology(disk_dir: std::path::PathBuf) -> (graph::Graph, DiskQueueC
             buffer: BufferConfig::default(),
             receive: ReceiveConfig::default(),
             sources: vec![],
+            targets: Vec::new(),
             kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
         },
     );
@@ -137,6 +138,7 @@ fn graph_and_topology(disk_dir: std::path::PathBuf) -> (graph::Graph, DiskQueueC
             buffer: BufferConfig::default(),
             receive: ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             kind: ComponentKind::InfluxDbOut {
                 url: "http://localhost:8086".to_string(),
                 org: "org".to_string(),

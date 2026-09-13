@@ -417,6 +417,7 @@ mod tests {
                 buffer: BufferConfig::default(),
                 receive: ReceiveConfig::default(),
                 sources: vec![],
+                targets: Vec::new(),
                 kind: statsd_in(),
             },
         );
@@ -426,6 +427,7 @@ mod tests {
                 buffer: BufferConfig::default(),
                 receive: ReceiveConfig::default(),
                 sources: vec![],
+                targets: Vec::new(),
                 kind: statsd_in(),
             },
         );
@@ -435,6 +437,7 @@ mod tests {
                 buffer: BufferConfig::default(),
                 receive: ReceiveConfig::default(),
                 sources: vec!["web_in".to_string(), "api_in".to_string()],
+                targets: Vec::new(),
                 kind: ComponentKind::HasProvenance {
                     origin: vec!["web_in".to_string()],
                     previous: vec![],
@@ -447,6 +450,7 @@ mod tests {
                 buffer: BufferConfig::default(),
                 receive: ReceiveConfig::default(),
                 sources: vec!["filter".to_string()],
+                targets: Vec::new(),
                 kind: ComponentKind::InfluxDbOut {
                     url: "http://localhost:8086".to_string(),
                     org: "org".to_string(),
