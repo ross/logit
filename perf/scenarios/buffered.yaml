@@ -17,6 +17,20 @@
 # writes, periodic checkpoints), so its wall time swings far more under contention from other disk
 # activity on the same machine than any in-memory scenario's does -- expect more run-to-run
 # variance here than elsewhere in this directory.
+#
+# Investigation (docs/design/performance.md's `buffered` notes) found one real contributor to that
+# variance that isn't external contention at all -- not yet shown to be the full explanation.
+# `DiskQueue::open` (crates/logit-pipeline/src/disk_queue.rs) pays an un-cleared spool's cost twice
+# at every startup: it reads and CRC-walks the *active* segment in full to validate it (bounded by
+# the default 64MiB rotation threshold, so this pass alone isn't obviously large enough on its own
+# to explain a multi-second swing), then reads every segment at or after the read cursor a *second*
+# time to count what's left to replay -- real work whenever the cursor hasn't caught up. This
+# scenario's spool (`../results/spool`, gitignored, never cleared between runs or repeats) leaves
+# exactly that behind, and throughput degrades monotonically within a single `--repeat N`
+# invocation as a measured result. Delete `perf/results/spool/` before a solo before/after
+# comparison. The real fix -- the harness clearing a disk-backed scenario's spool before each
+# `run`/`attribute` invocation, and confirming how much of the spread that actually closes -- is
+# tracked as follow-up work (docs/known-gaps.md) and in flight as W8, not done here.
 components:
   gen:
     type: generate_in

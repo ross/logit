@@ -11,7 +11,7 @@ New ADR checklist: copy `TEMPLATE.md` to `docs/adr/<slug>.md`, fill in `created`
 
 | ADR | Created | Updated |
 |---|---|---|
-| [A load-test harness: the real binary, a declarative event template, and CPU per event as the signal](load-test-harness.md) | 2026-09-12 | 2026-09-12 |
+| [A load-test harness: the real binary, a declarative event template, and CPU per event as the signal](load-test-harness.md) | 2026-09-12 | 2026-09-13 |
 | [`FramedEncoder`: a third codec trait for sinks that need per-message framing, over a shared `MessageBuf`](framed-encoder.md) | 2026-09-12 | 2026-09-12 |
 | [collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder](collectd-binary-relay.md) | 2026-09-12 | 2026-09-12 |
 | [Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping](prometheus-scrape-and-exposition.md) | 2026-09-11 | 2026-09-12 |
