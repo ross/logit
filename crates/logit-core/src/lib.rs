@@ -7,6 +7,11 @@ pub mod diag;
 pub mod interner;
 pub mod provenance;
 pub mod telemetry;
+/// `{name}` placeholder templates -- see the module's own doc comment. Deliberately left as a
+/// namespaced module with no flattened re-exports here: `Template`/`Segment`/`Compiled` are
+/// generic enough names that `template::Template` reads better at a call site than a bare
+/// `Template` would.
+pub mod template;
 pub mod time;
 pub mod value;
 
