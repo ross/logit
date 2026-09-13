@@ -1417,12 +1417,14 @@ impl Output for SyslogOutput {
     /// before reporting it delivered, so in the normal case there is nothing left here at
     /// shutdown.
     ///
-    /// It is still load-bearing rather than decorative, and not only defensively: on a TLS
-    /// connection "flushed" is a property of the stream, not of the socket alone -- finished
-    /// records live in the rustls session's own buffer until something drains them
-    /// ([`SyslogOutput::send_tcp`]'s doc comment). Anything that reached that buffer outside
-    /// `send`'s own flush (a cancelled attempt handing back a partially drained stream, say)
-    /// leaves the process here or not at all.
+    /// Belt-and-braces, then, rather than load-bearing: every state a connection can actually be
+    /// in here has already been flushed, because `*stream` is only ever repopulated after a
+    /// successful flush and a cancelled attempt drops its local `conn` instead of handing it back
+    /// ([`SyslogOutput::send_tcp`]'s doc comment). Kept anyway because it costs a function call
+    /// on an idle stream and spells the contract out where a default no-op would leave it
+    /// implicit -- which matters more here than it looks: on a TLS connection "flushed" is a
+    /// property of the stream rather than of the socket alone, since finished records live in the
+    /// rustls session's own buffer until something drains them.
     async fn flush(&mut self) -> anyhow::Result<()> {
         if let Conn::Tcp { stream: Some(stream), .. } = &mut self.conn {
             stream.flush().await.context("flushing syslog_out TCP stream")?;
@@ -1611,9 +1613,12 @@ impl SyslogOutput {
                             *stream = Some(conn);
                             Ok(messages.len())
                         }
-                        // At least one byte of this frame reached the peer -- resending would
-                        // duplicate it, and `*stream` is deliberately left `None` (this
-                        // now-partially-written connection is not reusable).
+                        // Part of this frame may already be at the peer -- on plaintext at least
+                        // one byte reached the kernel, on TLS some earlier record may have (the
+                        // `Ok(n)` above proves only that the session accepted `n` bytes). Either
+                        // way resending could duplicate, so `Ambiguous`, and `*stream` is
+                        // deliberately left `None` (this now-partially-written connection is not
+                        // reusable).
                         Err(err) => Err(anyhow::Error::new(err).context(Fault::Ambiguous)),
                     };
                 }
@@ -2711,6 +2716,10 @@ mod tests {
         flushes: usize,
         /// `write` fails on this 1-based call number.
         fail_write_on: Option<usize>,
+        /// The first `write` accepts one byte instead of the whole buffer, so `send_tcp` goes on
+        /// to `write_all` the remainder -- the partial-write path a real stream reaches whenever
+        /// the socket (or, on TLS, the session's send buffer) has less room than the frame needs.
+        short_first_write: bool,
         fail_flush: bool,
     }
 
@@ -2730,6 +2739,16 @@ mod tests {
             fake.state().fail_flush = true;
             fake
         }
+
+        /// One byte accepted, then the `write_all` of the remainder fails.
+        fn short_then_failing_write() -> Self {
+            let fake = Self::default();
+            let mut state = fake.state();
+            state.short_first_write = true;
+            state.fail_write_on = Some(2);
+            drop(state);
+            fake
+        }
     }
 
     impl tokio::io::AsyncWrite for FakeTlsStream {
@@ -2746,8 +2765,13 @@ mod tests {
                     "scripted write failure",
                 )));
             }
-            state.buffered.extend_from_slice(buf);
-            std::task::Poll::Ready(Ok(buf.len()))
+            let accepted = if state.short_first_write && state.writes == 1 {
+                buf.len().min(1)
+            } else {
+                buf.len()
+            };
+            state.buffered.extend_from_slice(&buf[..accepted]);
+            std::task::Poll::Ready(Ok(accepted))
         }
 
         fn poll_flush(
@@ -2888,6 +2912,38 @@ mod tests {
         assert!(stream.is_none());
         let state = fake.state();
         assert_eq!(state.writes, 1, "exactly one write attempt -- no resend");
+        assert!(state.sent.is_empty());
+    }
+
+    /// The partial-write path: the first `write` takes only part of the frame, and the
+    /// `write_all` of the remainder fails. `Ambiguous` on either transport -- part of the frame
+    /// is already gone (or, on TLS, may be) -- and never resent, which is the one classification
+    /// this arm has always made and the TLS work did not change.
+    #[tokio::test]
+    async fn a_failure_after_a_partial_write_is_ambiguous_and_never_resent() {
+        let fake = FakeTlsStream::short_then_failing_write();
+        let mut stream: Option<Box<dyn AsyncStream>> = Some(Box::new(fake.clone()));
+        let cfg = any_client_config();
+        let telemetry = Telemetry::default();
+        let mut connected = true;
+        let mut dial = TcpDial {
+            endpoint: "127.0.0.1:1",
+            connect_timeout: Duration::from_millis(200),
+            tls: Some(&cfg),
+            telemetry: &telemetry,
+            has_connected_once: &mut connected,
+        };
+        let (messages, mut frame_buf) = one_message_frame();
+
+        let err = SyslogOutput::send_tcp(&mut stream, &mut dial, &messages, &mut frame_buf)
+            .await
+            .expect_err("a failed write_all must fail the send");
+
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+        assert!(stream.is_none());
+        let state = fake.state();
+        assert_eq!(state.writes, 2, "the short write, then the failing remainder -- no resend");
+        assert_eq!(state.flushes, 0, "a failed write never reaches the flush");
         assert!(state.sent.is_empty());
     }
 
