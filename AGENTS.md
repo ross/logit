@@ -44,9 +44,11 @@ image. All three signals now flow through it end to end — logs, metrics, and t
 Loki, InfluxDB, and Tempo respectively
 ([docs/plans/demo-stack.md](docs/plans/demo-stack.md),
 [docs/plans/otlp-end-to-end.md](docs/plans/otlp-end-to-end.md)). `syslog_out` (RFC
-3164/5424 over UDP or TCP, header fields round-tripped from an event's `syslog.*` attributes,
-[ADR `syslog-output`](docs/adr/syslog-output.md)) is implemented and fully covered by its own
-unit/integration tests but no longer exercised by the demo, which moved its log leg onto
+3164/5424 over UDP, TCP, or TLS (RFC 5425), header fields round-tripped from an event's
+`syslog.*` attributes, [ADR `syslog-output`](docs/adr/syslog-output.md)/
+[ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md)) is implemented and
+fully covered by its own unit/integration tests but no longer exercised by the demo, which moved
+its log leg onto
 `otlp_out` straight to Loki ([docs/plans/otlp-logs-and-resource-identity.md](docs/plans/otlp-logs-and-resource-identity.md)'s
 workstream B) — the demo isn't meant to stay exhaustive over every component as more land.
 `otlp_in`/`otlp_out` (`crates/logit-inputs`/`crates/logit-outputs`, OTLP for logs,
@@ -135,11 +137,15 @@ private CAs and mutual TLS included) on both transports, selected by the endpoin
 ([ADR `otlp-tls-and-pooled-grpc-client`](docs/adr/otlp-tls-and-pooled-grpc-client.md))); `otlp_in`
 is the mirror, implemented and tested but not yet exercised by the demo. `demo/`'s `trace_out` proves the whole chain against a
 real Tempo, exactly the way `log_out` proves `syslog_out` against a real Loki. `statsd_in`/`syslog_in`
-(`crates/logit-inputs/src/statsd.rs`/`syslog.rs`) are now thin wrappers over a shared
-`logit-inputs::udp::UdpListener` driver: a UDP listener's socket read and its decode/batch-assembly
-loop run decoupled through a `ReceiveQueue`, the listener-side mirror of `SinkQueue`'s sink-side
-decoupling, so a stalled downstream no longer stops the socket being read; see
-[ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) and the `receive:` config block it introduces.
+(`crates/logit-inputs/src/statsd.rs`/`syslog.rs`) are thin wrappers over a shared
+`logit-inputs::udp::UdpListener` driver for their (default) UDP transport: a UDP listener's socket
+read and its decode/batch-assembly loop run decoupled through a `ReceiveQueue`, the listener-side
+mirror of `SinkQueue`'s sink-side decoupling, so a stalled downstream no longer stops the socket
+being read; see [ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) and the `receive:`
+config block it introduces. `syslog_in` alone can instead run `transport: tcp` on a second, generic
+stream driver, `logit-inputs::tcp::TcpListener` (RFC 6587 framing, auto-detected per connection,
+plus a `tls:` block for RFC 5425 syslog over TLS) — see
+[ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md).
 `logit` now has an operator surface: leveled, structured self-logging through `tracing`
 (`--log-level`/`LOGIT_LOG`, `--log-format text|json`,
 [ADR `tracing-for-self-logging`](docs/adr/tracing-for-self-logging.md)); a top-level `admin:` block serving `/readyz`/

@@ -34,7 +34,9 @@
 //! no `Reject` at all when TLS is on) reintroduces exactly the opaque failure a clean `Reject` is
 //! for.
 //!
-//! **Pre-`Hello` timeout.** [`LogitInput::handshake_timeout`] (field, defaulted to 5s) bounds each
+//! **Pre-`Hello` timeout.** [`LogitInput::handshake_timeout`] (a field, defaulted to
+//! [`HANDSHAKE_TIMEOUT`] and set from config by
+//! [`LogitInput::with_handshake_timeout`]) bounds each
 //! of the two pre-`Hello` phases *independently*: the TLS accept itself (wrapped in
 //! `tokio::time::timeout` in the accept loop) and, after it, the `Hello` read inside
 //! [`handshake`], which starts a fresh timeout of the same length rather than inheriting a shared
@@ -62,11 +64,15 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
-/// Default for [`LogitInput::handshake_timeout`] -- how long a connection has, in total, to
-/// finish its TLS accept (if configured) and send `Hello` before this listener gives up on it --
-/// generous enough for a loaded peer under TLS, tight enough that a connection opened and then
-/// abandoned (a port scan, a misconfigured health check, or a TLS client that never sends its
+/// Default for [`LogitInput::handshake_timeout`] -- how long a connection has, per pre-`Hello`
+/// phase, to finish its TLS accept (if configured) and send `Hello` before this listener gives up
+/// on it -- generous enough for a loaded peer under TLS, tight enough that a connection opened and
+/// then abandoned (a port scan, a misconfigured health check, or a TLS client that never sends its
 /// ClientHello) doesn't pin a connection-limit permit forever.
+///
+/// The *default* only: `logit_in`'s `handshake_timeout:` config field overrides it through
+/// [`LogitInput::with_handshake_timeout`]. `logit_config`'s own `default_handshake_timeout`
+/// mirrors this number by hand (it cannot depend on this crate).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// See this module's own doc comment's "Connection limit" section for why this listener rejects
@@ -141,11 +147,12 @@ impl LogitInput {
         self
     }
 
-    /// Test-only override of [`HANDSHAKE_TIMEOUT`] -- shortens the pre-`Hello` budget so a test
-    /// can observe it actually firing (releasing a permit, timing out a silent TLS accept)
-    /// without a multi-second sleep.
-    #[cfg(test)]
-    fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
+    /// Overrides [`HANDSHAKE_TIMEOUT`] for both pre-`Hello` budgets (the TLS accept and the
+    /// `Hello` read) -- what `logit_in`'s `handshake_timeout:` config field sets. The constant
+    /// stays the default when this is never called; a test uses it to observe the budget actually
+    /// firing (releasing a permit, timing out a silent TLS accept) without a multi-second sleep.
+    /// Graph rule 45 rejects `0s` before it can reach here.
+    pub fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
         self.handshake_timeout = handshake_timeout;
         self
     }

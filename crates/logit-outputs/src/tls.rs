@@ -11,6 +11,32 @@ use anyhow::Context;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::PrivateKeyDer;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+/// A plain `TcpStream` or a TLS-wrapped one, behind one object-safe trait so a sink's connection
+/// field doesn't need to be generic (a sink field can't be, without making the whole sink type
+/// generic in a way `logit-cli::pipeline::build_spec` would have to know about). Lives here
+/// rather than in either sink: `logit_out` (`crates/logit-outputs/src/logit.rs`) and `syslog_out`
+/// (`crates/logit-outputs/src/syslog.rs`) both dial raw TCP that may or may not be TLS-wrapped,
+/// and both want the identical erasure.
+pub(crate) trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
+
+/// The host part of a bare `host:port` endpoint -- the SNI/`ServerName` to hand `rustls` when the
+/// endpoint carries no scheme to parse (`logit_out`'s and `syslog_out`'s shape; `otlp_out`'s
+/// URL-shaped endpoint has `reqwest`/`hyper` do this instead). `rsplit_once` so a bracketed IPv6
+/// literal's own colons don't confuse this (an IPv6 endpoint here would need brackets,
+/// `[::1]:1234`, the same convention every other bare `host:port` field in this codebase leaves
+/// to the operator to write correctly; this only avoids splitting on the wrong colon, not
+/// validating the address itself).
+pub(crate) fn host_only(endpoint: &str) -> &str {
+    endpoint
+        .rsplit_once(':')
+        .map(|(host, _port)| host)
+        .unwrap_or(endpoint)
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+}
 
 /// Client-side TLS tuning for a sink's `tls:` config block. Mirrors `logit_config::
 /// TlsClientConfig` -- this crate doesn't depend on `logit-config` (`docs/design/
