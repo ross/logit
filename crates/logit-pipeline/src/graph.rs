@@ -1687,12 +1687,21 @@ fn is_tail_listener(kind: &ComponentKind) -> bool {
 /// so keeping the rule a one-argument string predicate is what lets the two stay in step by
 /// inspection rather than by a shared type. `N == 0` is rejected here rather than left to panic
 /// on a modulo by zero at render time.
+///
+/// `N` must be ASCII digits and nothing else -- deliberately narrower than `u64::from_str`, which
+/// also accepts a leading `+`, so `{seq%+5}` is a config error rather than a second spelling of
+/// `{seq%5}`. One spelling per meaning is what keeps this predicate mirrorable by eye in
+/// `logit-inputs`.
 fn generate_var_is_valid(name: &str) -> bool {
     if name == "seq" {
         return true;
     }
     match name.strip_prefix("seq%") {
-        Some(modulus) => modulus.parse::<u64>().is_ok_and(|modulus| modulus >= 1),
+        Some(modulus) => {
+            !modulus.is_empty()
+                && modulus.bytes().all(|byte| byte.is_ascii_digit())
+                && modulus.parse::<u64>().is_ok_and(|modulus| modulus >= 1)
+        }
         None => false,
     }
 }
@@ -5122,6 +5131,22 @@ mod tests {
                 "{name}: got: {err}"
             );
         }
+    }
+
+    /// `u64::from_str` would accept `+5`, which would make `{seq%+5}` a silent second spelling of
+    /// `{seq%5}`; rule 42 takes ASCII digits and nothing else, so there is one spelling per
+    /// meaning for `logit-inputs`' own resolver to mirror.
+    #[test]
+    fn a_seq_modulus_with_a_leading_plus_is_rejected() {
+        let err = expect_err(cfg(vec![
+            (
+                "gen",
+                vec![],
+                generate_in_with_event(generate_event(Some("host-{seq%+5}"), vec![], None)),
+            ),
+            ("sink", vec!["gen"], null_out()),
+        ]));
+        assert!(err.contains("'gen'") && err.contains("doesn't substitute"), "got: {err}");
     }
 
     /// The other side of the same rule: the two names `generate_in` does substitute, in every
