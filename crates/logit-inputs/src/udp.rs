@@ -205,6 +205,14 @@ impl<D: Decoder + Send> UdpListener<D> {
 
     /// Test-only: lets `StatsdInput`/`SyslogInput`'s own tests confirm a `with_diagnostics` call
     /// actually reached the wrapped decoder, not just `UdpListener`'s own `diag` field.
+    /// This listener's own diagnostics -- test-only, the driver-half counterpart of
+    /// [`Self::decoder`]: a wrapper's `with_diagnostics` has to set both, and only an accessor on
+    /// each can prove it did (`crate::syslog`'s own regression test).
+    #[cfg(test)]
+    pub(crate) fn diag(&self) -> &Diagnostics {
+        &self.diag
+    }
+
     #[cfg(test)]
     pub(crate) fn decoder(&self) -> &D {
         &self.decoder
@@ -611,7 +619,9 @@ async fn emit(sink: &Fanout, telemetry: &Telemetry, batch: EventBatch, reason: F
     sink.send(batch).await;
 }
 
-fn now_nanos() -> i64 {
+/// `pub(crate)` rather than private: [`crate::tcp`]'s connection loop stamps `received_at` the
+/// same way, and one shared clock reader is better than two copies that could drift apart.
+pub(crate) fn now_nanos() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64
 }
 
