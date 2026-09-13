@@ -16,6 +16,7 @@ use logit_core::{Diagnostics, Registry, Telemetry};
 use logit_inputs::collectd::CollectdInput;
 use logit_inputs::docker::{ContainerFilter, DockerInput};
 use logit_inputs::generate::{GenerateInput, GenerateMetricKind};
+use logit_inputs::graphite::GraphiteInput;
 use logit_inputs::internal::InternalInput;
 use logit_inputs::logit::LogitInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
@@ -343,6 +344,24 @@ fn build_spec(
                     .with_context(|| format!("component '{id}': loading types_db"))?;
                 input = input.with_types_db(Arc::new(loaded));
             }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+        // Both transports go through one component (`logit_inputs::graphite::GraphiteInput`),
+        // which picks its own driver from `transport`: the shared `UdpListener` under `udp`, its
+        // own accept loop under `tcp`. `with_receive` is safe to call either way -- graph rule 17
+        // has already rejected a queue-bounding field on the TCP case, so what reaches the accept
+        // loop is only the batch-assembly half it actually reads.
+        GraphiteIn { bind, transport, protocol, max_line_bytes, max_frame_bytes } => {
+            let input = GraphiteInput::new(
+                bind.clone(),
+                graphite_transport(*transport),
+                graphite_protocol(*protocol),
+            )
+            .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry.clone())
+            .with_receive(receive_config(&component.receive))
+            .with_max_line_bytes(*max_line_bytes as usize)
+            .with_max_frame_bytes(*max_frame_bytes as usize);
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
         SyslogIn { bind } => NodeSpec::Input(
@@ -1018,6 +1037,27 @@ fn statsd_format(cfg: logit_config::StatsdFormat) -> logit_outputs::statsd::Form
     }
 }
 
+/// The sole place `logit_config::GraphiteTransport` crosses into
+/// `logit_inputs::graphite::Transport` -- same reasoning as [`syslog_format`]: `logit-inputs`
+/// never depends on `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), so the two
+/// vocabularies meet here and nowhere else.
+fn graphite_transport(cfg: logit_config::GraphiteTransport) -> logit_inputs::graphite::Transport {
+    match cfg {
+        logit_config::GraphiteTransport::Tcp => logit_inputs::graphite::Transport::Tcp,
+        logit_config::GraphiteTransport::Udp => logit_inputs::graphite::Transport::Udp,
+    }
+}
+
+/// The sole place `logit_config::GraphiteProtocol` crosses into
+/// `logit_proto::graphite::Protocol` -- same reasoning as [`graphite_transport`]. Graph rule 43 is
+/// what guarantees the `pickle`/`udp` pair never reaches here.
+fn graphite_protocol(cfg: logit_config::GraphiteProtocol) -> logit_proto::graphite::Protocol {
+    match cfg {
+        logit_config::GraphiteProtocol::Plaintext => logit_proto::graphite::Protocol::Plaintext,
+        logit_config::GraphiteProtocol::Pickle => logit_proto::graphite::Protocol::Pickle,
+    }
+}
+
 /// Converts config's `Vec<Signal>` (`logit-config`, which `logit-transforms` deliberately doesn't
 /// depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the transform crate's
 /// boolean-flags `SignalSet`.
@@ -1586,6 +1626,80 @@ mod tests {
         assert!(err.contains("loading types_db"), "got: {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn graphite_component(
+        transport: logit_config::GraphiteTransport,
+        protocol: logit_config::GraphiteProtocol,
+    ) -> ResolvedComponent {
+        ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig {
+                batch_max_events: 4242,
+                ..logit_config::ReceiveConfig::default()
+            },
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::GraphiteIn {
+                bind: "127.0.0.1:0".to_string(),
+                transport,
+                protocol,
+                max_line_bytes: 8192,
+                max_frame_bytes: 1 << 20,
+            },
+        }
+    }
+
+    /// Every `transport`/`protocol` pair rule 43 permits builds a real input, and the `receive:`
+    /// block reaches it on both transports -- the TCP one takes only the batch-assembly half, but
+    /// it is the same block and the same converter, so a wiring mistake would show up here.
+    #[test]
+    fn build_spec_builds_a_graphite_input_for_every_permitted_transport_and_protocol() {
+        use logit_config::{GraphiteProtocol, GraphiteTransport};
+        for (transport, protocol) in [
+            (GraphiteTransport::Tcp, GraphiteProtocol::Plaintext),
+            (GraphiteTransport::Tcp, GraphiteProtocol::Pickle),
+            (GraphiteTransport::Udp, GraphiteProtocol::Plaintext),
+        ] {
+            let component = graphite_component(transport, protocol);
+            let (spec, _telemetry) = build_spec("in", &component, Path::new(""), None)
+                .unwrap_or_else(|e| panic!("{transport:?}/{protocol:?} should build: {e}"));
+            match spec {
+                NodeSpec::Input(input, runtime) => {
+                    assert_eq!(
+                        runtime.shutdown_grace,
+                        logit_config::ReceiveConfig::default().shutdown_grace,
+                        "{transport:?}: shutdown_grace comes from the same receive: block"
+                    );
+                    drop(input);
+                }
+                _other => panic!("{transport:?}/{protocol:?} should have built a NodeSpec::Input"),
+            }
+        }
+    }
+
+    /// The two converters are the only place `logit-config`'s vocabulary crosses into
+    /// `logit-inputs`'/`logit-proto`'s, so a mismapped arm (a `pickle` that built a plaintext
+    /// decoder, say) would be silent everywhere else.
+    #[test]
+    fn graphite_converters_map_every_variant() {
+        use logit_config::{GraphiteProtocol, GraphiteTransport};
+        assert_eq!(
+            graphite_transport(GraphiteTransport::Tcp),
+            logit_inputs::graphite::Transport::Tcp
+        );
+        assert_eq!(
+            graphite_transport(GraphiteTransport::Udp),
+            logit_inputs::graphite::Transport::Udp
+        );
+        assert_eq!(
+            graphite_protocol(GraphiteProtocol::Plaintext),
+            logit_proto::graphite::Protocol::Plaintext
+        );
+        assert_eq!(
+            graphite_protocol(GraphiteProtocol::Pickle),
+            logit_proto::graphite::Protocol::Pickle
+        );
     }
 
     #[test]
