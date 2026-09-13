@@ -329,7 +329,7 @@ crates/
   logit-config      YAML config types + generated JSON Schema
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
-  logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
+  logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, logfmt, kv, regex, route (implements logit-pipeline::Router)
@@ -348,4 +348,6 @@ record into a `logit_proto::MessageBuf`, with per-message drop accounting — `s
 payload per signal — `otlp`); plus `logit_pipeline::Input` or `logit_pipeline::Output`, and a
 variant in `logit_config`'s `ComponentKind`. (`prometheus` is the one pair outside all of these,
 by design — its ADR says why.) A new native transform implements `logit_pipeline::Transform`,
-following `logit-transforms::Aggregator`.
+following `logit-transforms::Aggregator`. A new router implements `logit_pipeline::Router`
+(`crates/logit-pipeline/src/router.rs`), following `logit-transforms::Route`
+([ADR `target-components`](docs/adr/target-components.md)).

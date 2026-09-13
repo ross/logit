@@ -746,9 +746,11 @@ is rejected at config-validation time, on either kind of component.
 
 `targets:` is optional too, and lists the `target` components this one may direct events into --
 what `event:to(id)` resolves against ("Routing to a target" above). It sits beside `sources:` on
-the component, not inside the `script:`/`lua_file:` field set, and is the only kind of component
-besides `route` that may carry one. Omitted, the component has no targets and every event it emits
-goes to its own consumers.
+the component, not inside the `script:`/`lua_file:` field set, and a non-empty `targets:` is legal
+only on `lua`/`lua_file` -- `route` is the graph's other router kind, but it declares its targets
+through `routes:`' values instead and must leave `targets:` empty, the same as every non-router
+kind (`docs/design/pipeline-graph.md`'s validation rule 43). Omitted, the component has no targets
+and every event it emits goes to its own consumers.
 
 Built-in native processors (no Lua involved) handle the common structured-parsing cases without
 per-event VM overhead: `json`, `logfmt`, `kv`, `regex`/`grok`, `csv`, `rename`/`remove`/`copy`,

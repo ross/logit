@@ -200,6 +200,46 @@ considered and rejected (ADR `component-graph-configuration`): a typo'd source r
 an orphaned transform, with no error, rather than a clear "did you mean" failure. The kind already
 knows its own arity — config just states the edges.
 
+## Routing: `route` and `target`
+
+A router directs each event at a named `target` component instead of every consumer of a shared
+upstream seeing every batch — the graph's answer to "send these events here and those there"
+without a filter per branch ([ADR `target-components`](../adr/target-components.md)):
+
+```yaml
+components:
+  central_in:
+    type: logit_in
+    bind: 0.0.0.0:5150
+
+  split:
+    type: route
+    sources: [central_in]
+    by: {attribute: stream}
+    routes:                  # value -> target id
+      host: host_stream
+      app: app_stream
+
+  host_stream: {type: target}
+  app_stream:  {type: target}
+
+  untagged_out:
+    type: stdio_out
+    sources: [split]        # the router's own consumers: everything no route claimed
+    target: stderr
+```
+
+`route` reads one key per event — `by:` is exactly one of `{provenance: origin}`,
+`{provenance: previous}`, `{attribute: <key>}`, `{resource: <key>}` — and `routes:` maps the values
+that key can take onto `target` ids; several values may map to one target. A value the key holds
+that no route names, or a missing key, is *unrouted* and falls through to the router's own
+`sources:` edge (`untagged_out` above), not a chain of complementary filters. A `target` has no
+fields and no `sources:` of its own: it's fed by direction, named by whichever router points at it,
+and read by downstream components exactly like any other source (`windowed: {sources: [host_stream]}`,
+say). `lua`/`lua_file` is the other router kind, choosing a target per event with `event:to("id")`
+instead of an equality table — see `docs/design/lua-api.md`'s "Routing to a target." A complete,
+runnable version of the config above is `examples/fan-out-central.yaml`.
+
 ## Validation
 
 Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
@@ -706,6 +746,11 @@ discovering in production:
   no path to improvement under the current design. "Load-bearing" was right, but there is no single
   number for "the fan-out cost" any more — see `docs/design/memory.md` §3 for the complete,
   shape-by-shape account.
+- **A router + targets split (ADR `target-components`) is the cheap form of this diamond** — one
+  partition pass and no clone, against the branches-share-a-clone accounting just above — but it
+  doesn't change the backpressure story: a stalled consumer of one target still backs up through
+  its router into every other target's flow, the same head-of-line blocking the first bullet
+  describes, just paid by a router instead of a filter chain.
 
 Also worth carrying forward as an open question, not a decision: today's `send_batch` silently drops
 a send on a closed downstream (`let _ = tx.blocking_send(...)`). Under a DAG that closure should
@@ -748,7 +793,7 @@ config is a graph rather than a list of linear pipelines.
   undefined component can't be drawn at all" and required rule 2 to pass first — that premise was
   simply wrong once actually tried; corrected here rather than left as a stated constraint the
   implementation quietly didn't follow.)
-- Runs the full validation (all eighteen rules) after rendering and reports any failures to stderr with a
+- Runs the full validation (every rule) after rendering and reports any failures to stderr with a
   non-zero exit — without suppressing the DOT output. This is deliberate: `graph` is most useful on
   exactly the configs that fail validation, since a cycle — or a typo'd source, now visibly
   dangling — is far easier to see rendered than to parse out of an error message naming two
@@ -806,7 +851,7 @@ logit-core   logit-config   logit-script
   "traits and generic machinery here, concrete protocol impls there" split the crate already
   applies everywhere else.
 
-`graph.rs` (resolution + the eighteen validation rules + topo-sort) is a **pure function over
+`graph.rs` (resolution + the validation rules + topo-sort) is a **pure function over
 `Config`** — no channels, no threads, no tokio — mirroring how `apply_transforms` in today's
 `pipeline.rs` was deliberately kept pure specifically so it's unit-testable without spinning up
 real I/O. `logit run`, `logit validate`, and `logit graph` are three different things layered on

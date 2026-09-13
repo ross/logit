@@ -26,7 +26,10 @@ already built that have a known, accepted rough edge.
   ([ADR `attribute-filtering-components`](adr/attribute-filtering-components.md)) answer exactly
   that shape natively. Sampling, throttling, dedup, and anything needing an actual operator
   (`>=`, `contains`, cross-attribute comparison) remain Lua-only; the gap above still applies to
-  them unchanged.
+  them unchanged. **Narrowed again on 2026-09-13:** destination selection — splitting one flow into
+  named streams — is native now: `route` (equality on provenance/attribute/resource) and `target`
+  components (ADR [`target-components`](adr/target-components.md)), and `lua` can route with
+  `event:to`. Sampling, throttling, dedup, and anything needing an operator remain Lua-only.
 - ~~**`HyperLogLog` is real now; statsd still has no producer for it.**~~ — **closed, both halves,
   as of W3.** [`docs/plans/lossless-transit.md`](plans/lossless-transit.md)'s W2 gave `HyperLogLog`
   (`crates/logit-core/src/metric.rs`) a real implementation wrapping the `cardinality-estimator`
@@ -317,6 +320,16 @@ already built that have a known, accepted rough edge.
   at all still costs a full clone (6, one worse than the original code), with no path to
   improvement under the current design. See [memory.md](design/memory.md) §3 for the complete,
   shape-by-shape account — there is no single number for "what fan-out costs now."
+
+  That clone is still what an *ordinary* fan-out with no `Output` branch costs — a router plus
+  `target` components (ADR [`target-components`](adr/target-components.md)) expresses a split
+  without one: `1 + used destinations` allocations per batch, against 324 for the fan-out-plus-
+  filters shape `memory.md` §3 measures for the identical split. So the residual gap above is now
+  specifically "an unconditional fan-out to several mutating branches," not "splitting a flow" —
+  anything that *is* a destination split, named by an attribute/provenance/resource value or a Lua
+  script's own decision, has a cheap, non-cloning answer now. The backpressure caveat two
+  paragraphs up is unchanged either way: a stalled consumer of one target still backs up through
+  its router into every other target's flow, the same as any other shared upstream.
 - **A Lua component's `flush()` has no resource or scope of its own at a timer tick** — unlike an
   `aggregate` component, which tracks its own per-resource windows, a Lua component's flushed
   events default to whichever resource (and, since W7, scope) it most recently saw on a real batch
