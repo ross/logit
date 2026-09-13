@@ -198,8 +198,28 @@ write (cancellation safety against `deliver_with_retry`'s per-attempt timeout, s
 `AsyncWriteExt::write_all` is not cancel-safe), and the very first write of each attempt is a single
 non-`write_all` `write()` call, so a zero-byte failure proves nothing left the host (safe to
 reconnect once and retry the whole frame) while any failure after that proves at least one byte
-landed (`Fault::Ambiguous`, never resent). Only the `None =>` connect arm changes; the invariants
-that make the rest of the function correct are transport-agnostic and untouched.
+landed (`Fault::Ambiguous`, never resent). Only the `None =>` connect arm changes.
+
+**Amendment (2026-09-13, PR review):** those invariants are *not* transport-agnostic, and the
+erased `Box<dyn AsyncStream>` hid the difference. `tokio_rustls`' `poll_write` copies plaintext
+into the rustls session and then writes the socket until one write returns `Pending`, so it
+returns `Ok(n)` with finished records still queued in userspace, and it returns `Err` after
+earlier socket writes in the same call already succeeded. So on TLS an `Ok` proves only that the
+session accepted the bytes, and an `Err` is never proof of a zero-byte attempt. `send_tcp`
+therefore asks `TcpDial` which transport it is on: plaintext keeps the behaviour above verbatim,
+while on TLS there is no internal reconnect-and-retry and no resend once an application write has
+been attempted — every such failure is `Fault::Ambiguous`, and `Fault::Clean` survives only for
+failures inside `TcpDial::connect`, which precede every byte of the frame. The success path now
+also `flush`es on both transports before the batch may be reported delivered (a failed flush is
+`Fault::Ambiguous` and the connection is discarded); without it a TLS batch could be committed
+off the sink queue with its records still in the rustls buffer, to be dropped with the boxed
+stream by the next reconnect or cancelled attempt. `logit_out` never needed this because it waits
+for a per-batch ack; `syslog_out` is write-only and has no such backstop.
+
+`connect_timeout` bounds each connect *phase* separately — the TCP connect, then the TLS
+handshake — so a TLS connect can take up to twice it. That matches `logit_out`, which races every
+step of its own connect against its single timeout; the config field's doc says so rather than
+implying one shared deadline.
 
 `SyslogOutput` gains `with_tls(&TlsClientSettings, base_dir)`. Because `tls` is
 `Option<TlsClientConfig>` here -- presence itself is what turns TLS on, decided at the call site in
