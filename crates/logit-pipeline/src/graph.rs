@@ -33,13 +33,16 @@
 //! 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` -- a config error, not
 //!     something to clamp silently.
 //! 17. A non-default `receive:` block is rejected on any kind that is not a datagram listener
-//!     (today `statsd_in`/`collectd_in`/`syslog_in`) or a tail listener (`tail_in`/`docker_in`) --
+//!     (today `statsd_in`/`collectd_in`/a UDP `syslog_in`), a stream listener (a TCP
+//!     `syslog_in`) or a tail listener (`tail_in`/`docker_in`) --
 //!     `receive:` (`docs/adr/decoupled-listener-io.md`) configures a listener's receive-side
 //!     batch assembly, and a datagram listener's socket-side receive queue on top of that. A
-//!     tail listener has no such queue (the tailed file is its own durable buffer), so it may
-//!     only set `receive`'s batch-assembly/shutdown-grace fields -- a queue-bounding field
+//!     tail listener has no such queue (the tailed file is its own durable buffer), and neither
+//!     does a stream listener (the connection's own flow control is the backpressure,
+//!     `docs/adr/syslog-tcp-ingress-and-tls.md`), so both may only set `receive`'s
+//!     batch-assembly/shutdown-grace fields -- a queue-bounding field
 //!     (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) is rejected by name on
-//!     one. Deliberately **not** `role(&kind) != Role::Listener`: `internal` and `generate_in`
+//!     either. Deliberately **not** `role(&kind) != Role::Listener`: `internal` and `generate_in`
 //!     are listeners by role but have no socket, no queue, and no decoder, so `receive:` on
 //!     either would be a silently-ignored setting -- exactly what this rule exists to catch on
 //!     the sink side (rule 14). A future listener kind rejects `receive:` until it is actually
@@ -158,6 +161,13 @@
 //!     `logit-config` (`docs/design/pipeline-graph.md`'s crate layout). `receive:` on a
 //!     `generate_in` is rejected by rule 17's own allowlist -- it is a listener by role, with no
 //!     socket, queue, or decoder for `receive:` to configure (`docs/plans/load-test-harness.md`).
+//! 43. A `syslog_in` with a `tls:` block must be `transport: tcp`. Syslog over TLS (RFC 5425) is
+//!     RFC 6587 framing carried over TLS over TCP, and DTLS (RFC 6012), its UDP-carried sibling,
+//!     is out of scope (`docs/adr/syslog-tcp-ingress-and-tls.md`) -- so a `tls:` block under
+//!     `transport: udp` could never take effect. Rejected rather than ignored, the same call
+//!     rule 22 makes for a `tls:` block under a plaintext `otlp_out` endpoint: an operator who
+//!     wrote one meant the connection encrypted, and running it in the clear anyway is the worst
+//!     of the available outcomes.
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
@@ -165,6 +175,7 @@
 
 use logit_config::{
     BufferConfig, Component, ComponentKind, Compression, Config, ReceiveConfig, StreamFormat,
+    SyslogTransport,
 };
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -667,14 +678,15 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 17: `receive:` is a datagram- or tail-listener-only concept -- see this module's own
-    // doc comment on why this checks dedicated predicates rather than `role() == Role::Listener`
-    // (which would wrongly also permit `internal`). A tail listener has no receive *queue* (the
-    // tailed file is its own durable buffer), so it may only set the batch-assembly/shutdown-
-    // grace fields `receive:` also carries -- the queue-bounding fields
-    // (`max_datagrams`/`max_bytes`/`overflow`/`receive_buffer_bytes`) stay datagram-only and are
-    // named individually here, not just rejected as "any non-default field", so the error points
-    // at exactly what doesn't apply rather than making an operator guess.
+    // Rule 17: `receive:` is a datagram-, stream- or tail-listener-only concept -- see this
+    // module's own doc comment on why this checks dedicated predicates rather than
+    // `role() == Role::Listener` (which would wrongly also permit `internal`). Neither a tail
+    // listener (the tailed file is its own durable buffer) nor a stream listener (the TCP
+    // connection's own flow control is the backpressure) has a receive *queue*, so both may only
+    // set the batch-assembly/shutdown-grace fields `receive:` also carries -- the queue-bounding
+    // fields (`max_datagrams`/`max_bytes`/`overflow`/`receive_buffer_bytes`) stay datagram-only
+    // and are named individually here, not just rejected as "any non-default field", so the error
+    // points at exactly what doesn't apply rather than making an operator guess.
     for (id, component) in &components {
         if component.receive == ReceiveConfig::default() {
             continue;
@@ -682,7 +694,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         if is_datagram_listener(&component.kind) {
             continue;
         }
-        if is_tail_listener(&component.kind) {
+        if is_tail_listener(&component.kind) || is_stream_listener(&component.kind) {
             let default = ReceiveConfig::default();
             let queue_only_field = if component.receive.max_datagrams != default.max_datagrams {
                 Some("max_datagrams")
@@ -696,9 +708,21 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 None
             };
             if let Some(field) = queue_only_field {
+                // Two messages rather than one, because the *reason* differs and that reason is
+                // the actionable half: a tail listener's buffer is the file, a stream listener's
+                // is the peer's own send window.
+                if is_stream_listener(&component.kind) {
+                    anyhow::bail!(
+                        "component '{id}': 'receive.{field}' is only meaningful on a datagram \
+                         listener (statsd_in, collectd_in, a UDP syslog_in) -- a TCP syslog \
+                         listener has no receive queue; the connection's own flow control is the \
+                         backpressure. Only receive.batch_max_events, batch_max_bytes, \
+                         batch_flush_interval, and shutdown_grace apply (per connection)"
+                    );
+                }
                 anyhow::bail!(
                     "component '{id}': 'receive.{field}' is only meaningful on a datagram \
-                     listener (statsd_in, collectd_in, syslog_in) -- a tail listener has no \
+                     listener (statsd_in, collectd_in, a UDP syslog_in) -- a tail listener has no \
                      receive queue; \
                      only receive.batch_max_events, batch_max_bytes, batch_flush_interval, and \
                      shutdown_grace apply"
@@ -707,8 +731,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             continue;
         }
         anyhow::bail!(
-            "component '{id}': 'receive' is only meaningful on a datagram or tail listener \
-             (statsd_in, collectd_in, syslog_in, tail_in, docker_in), but '{id}' is a {}",
+            "component '{id}': 'receive' is only meaningful on a datagram, stream or tail \
+             listener (statsd_in, collectd_in, syslog_in, tail_in, docker_in), but '{id}' is a {}",
             role(&component.kind).as_str()
         );
     }
@@ -717,7 +741,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // of the four count/byte bounds is an impossible bound, never a small one.
     // `batch_flush_interval: 0s` is deliberately not checked here: zero there means "no timer,"
     // a meaningful setting. `max_datagrams`/`max_bytes` (the receive *queue*'s own bounds) are
-    // datagram-listener-only, since a tail listener has no such queue (rule 17).
+    // datagram-listener-only, since neither a tail nor a stream listener has such a queue
+    // (rule 17).
     for (id, component) in &components {
         if is_datagram_listener(&component.kind) {
             if component.receive.max_datagrams == 0 {
@@ -733,7 +758,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 );
             }
         }
-        if is_datagram_listener(&component.kind) || is_tail_listener(&component.kind) {
+        if is_datagram_listener(&component.kind)
+            || is_tail_listener(&component.kind)
+            || is_stream_listener(&component.kind)
+        {
             if component.receive.batch_max_events == 0 {
                 anyhow::bail!(
                     "component '{id}': 'receive.batch_max_events' must be at least 1 -- 0 means \
@@ -1647,6 +1675,24 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 43: a `syslog_in` `tls:` block needs `transport: tcp`. Syslog over TLS (RFC 5425) is
+    // RFC 6587 framing carried over TLS over TCP; its UDP-carried sibling, DTLS (RFC 6012), is
+    // deliberately out of scope (`docs/adr/syslog-tcp-ingress-and-tls.md`'s Alternatives), so a
+    // `tls:` block under `transport: udp` could never take effect. Rejected rather than ignored,
+    // for the same reason rule 22 rejects a `tls:` block under a plaintext `otlp_out` endpoint:
+    // an operator who wrote one meant the connection to be encrypted, and silently running it in
+    // the clear is the worst of the three possible outcomes.
+    for (id, component) in &components {
+        if let ComponentKind::SyslogIn { transport: SyslogTransport::Udp, tls: Some(_), .. } =
+            &component.kind
+        {
+            anyhow::bail!(
+                "component '{id}': 'tls:' needs 'transport: tcp' -- syslog over TLS (RFC 5425) is \
+                 TCP-carried, and DTLS is out of scope"
+            );
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         let Component { sources, buffer, receive, kind } = component;
@@ -1669,8 +1715,24 @@ fn is_datagram_listener(kind: &ComponentKind) -> bool {
         kind,
         ComponentKind::StatsdIn { .. }
             | ComponentKind::CollectdIn { .. }
-            | ComponentKind::SyslogIn { .. }
+            // Narrowed by `docs/adr/syslog-tcp-ingress-and-tls.md`: a TCP `syslog_in` runs on the
+            // stream driver, which has no `ReceiveQueue` at all -- see [`is_stream_listener`].
+            | ComponentKind::SyslogIn { transport: SyslogTransport::Udp, .. }
     )
+}
+
+/// [`is_datagram_listener`]'s stream-transport counterpart: which `ComponentKind`s the TCP
+/// listener driver (`docs/adr/syslog-tcp-ingress-and-tls.md`,
+/// `logit_inputs::tcp::TcpListener`) backs. Today only a TCP `syslog_in`; `statsd_in` stays
+/// UDP-only until a real need appears, which is exactly why this is an explicit list rather than
+/// "anything with a `transport` field".
+///
+/// Like a tail listener, a stream listener has no receive *queue* -- the connection's own TCP
+/// flow control is the backpressure, so a blocked `Fanout::send` simply stops the socket being
+/// read and the peer's window closes. Only `receive`'s batch-assembly and shutdown-grace fields
+/// apply to one, and those are scoped per connection.
+fn is_stream_listener(kind: &ComponentKind) -> bool {
+    matches!(kind, ComponentKind::SyslogIn { transport: SyslogTransport::Tcp, .. })
 }
 
 /// The predicate rules 17/18/28 need: which `ComponentKind`s the file-tailing driver
@@ -3803,7 +3865,7 @@ mod tests {
         ]));
         assert!(err.contains("'agg'"), "got: {err}");
         assert!(
-            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            err.contains("'receive' is only meaningful on a datagram, stream or tail listener"),
             "got: {err}"
         );
     }
@@ -3816,7 +3878,7 @@ mod tests {
         ]));
         assert!(err.contains("'out'"), "got: {err}");
         assert!(
-            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            err.contains("'receive' is only meaningful on a datagram, stream or tail listener"),
             "got: {err}"
         );
     }
@@ -3833,7 +3895,7 @@ mod tests {
         ]));
         assert!(err.contains("'self'"), "got: {err}");
         assert!(
-            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            err.contains("'receive' is only meaningful on a datagram, stream or tail listener"),
             "got: {err}"
         );
     }
@@ -3931,6 +3993,115 @@ mod tests {
         ]))
         .expect("a zero batch_flush_interval should validate fine -- it means 'no timer'");
         assert_eq!(graph.components["in"].receive.batch_flush_interval, Duration::ZERO);
+    }
+
+    // -- syslog_in: transports, rules 17/18/43 --------------------------------------------------
+
+    /// A `syslog_in` on either transport, with or without a `tls:` block -- the three-way shape
+    /// rules 17/18/43 all key on (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+    fn syslog_in(transport: SyslogTransport, tls: bool) -> ComponentKind {
+        ComponentKind::SyslogIn {
+            bind: "127.0.0.1:0".to_string(),
+            transport,
+            tls: tls.then(|| logit_config::TlsServerConfig {
+                cert_file: "server.pem".to_string(),
+                key_file: "server.key".to_string(),
+                client_ca_file: None,
+            }),
+        }
+    }
+
+    /// Rule 43: DTLS is out of scope, so a `tls:` block under `transport: udp` could never take
+    /// effect -- rejected rather than silently ignored.
+    #[test]
+    fn tls_on_a_udp_syslog_in_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], syslog_in(SyslogTransport::Udp, true)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("'tls:' needs 'transport: tcp'"), "got: {err}");
+        assert!(err.contains("DTLS"), "got: {err}");
+    }
+
+    /// Rule 43's other side: TLS over TCP is exactly what RFC 5425 is.
+    #[test]
+    fn tls_on_a_tcp_syslog_in_validates_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], syslog_in(SyslogTransport::Tcp, true)),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("a TLS-terminating TCP syslog_in is the RFC 5425 shape");
+    }
+
+    /// And rule 43 says nothing about a plaintext TCP listener, which stays perfectly legal.
+    #[test]
+    fn a_plaintext_tcp_syslog_in_validates_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], syslog_in(SyslogTransport::Tcp, false)),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("TCP without TLS is a perfectly ordinary syslog listener");
+    }
+
+    /// Rule 17: a TCP `syslog_in` has no receive queue at all -- the connection's own flow
+    /// control is the backpressure -- so a queue-only field is rejected by name, with the reason
+    /// spelled out rather than left as "not a datagram listener".
+    #[test]
+    fn a_receive_queue_field_on_a_tcp_syslog_in_is_rejected_naming_the_field() {
+        let err = expect_err(cfg_with_receive(vec![
+            ("in", vec![], syslog_in(SyslogTransport::Tcp, false), non_default_receive()),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("'receive.max_datagrams'"), "got: {err}");
+        assert!(err.contains("TCP syslog listener has no receive queue"), "got: {err}");
+        assert!(err.contains("flow control"), "got: {err}");
+    }
+
+    /// The batch-assembly half of rule 17 still applies on TCP -- per connection, which is what
+    /// the config field's own doc comment warns about.
+    #[test]
+    fn a_receive_batch_override_on_a_tcp_syslog_in_validates_fine() {
+        let graph = resolve(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                syslog_in(SyslogTransport::Tcp, false),
+                ReceiveConfig { batch_max_events: 1, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("batch_max_events is one of the fields a stream listener may override");
+        assert_eq!(graph.components["in"].receive.batch_max_events, 1);
+    }
+
+    /// Narrowing `is_datagram_listener` must not have cost the UDP arm its queue fields.
+    #[test]
+    fn a_receive_queue_field_on_a_udp_syslog_in_still_validates_fine() {
+        let graph = resolve(cfg_with_receive(vec![
+            ("in", vec![], syslog_in(SyslogTransport::Udp, false), non_default_receive()),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("a UDP syslog_in is still a datagram listener with a real receive queue");
+        assert_eq!(graph.components["in"].receive.max_datagrams, 4096);
+    }
+
+    /// Rule 18: an impossible batch bound stays impossible on the stream path too -- without
+    /// `is_stream_listener` in rule 18's second loop, a TCP `syslog_in` would have slipped
+    /// through with `batch_max_events: 0` and accumulated forever.
+    #[test]
+    fn a_zero_batch_max_events_on_a_tcp_syslog_in_is_rejected() {
+        let err = expect_err(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                syslog_in(SyslogTransport::Tcp, false),
+                ReceiveConfig { batch_max_events: 0, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'receive.batch_max_events' must be at least 1"), "got: {err}");
     }
 
     // -- tail_in / docker_in ------------------------------------------------------------------
@@ -4856,7 +5027,7 @@ mod tests {
         ]));
         assert!(err.contains("'in'"), "got: {err}");
         assert!(
-            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            err.contains("'receive' is only meaningful on a datagram, stream or tail listener"),
             "got: {err}"
         );
     }
@@ -5284,7 +5455,7 @@ mod tests {
         ]));
         assert!(err.contains("'gen'"), "got: {err}");
         assert!(
-            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            err.contains("'receive' is only meaningful on a datagram, stream or tail listener"),
             "got: {err}"
         );
     }
