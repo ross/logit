@@ -350,7 +350,7 @@ fn build_spec(
         // batching/shutdown fields, not `receive_config`'s eight (graph rule 17,
         // `docs/adr/syslog-tcp-ingress-and-tls.md`). `tls:` is TCP-only -- rule 43 has already
         // rejected it under UDP, and `SyslogInput::with_tls` refuses it again on that arm.
-        SyslogIn { bind, transport, tls } => {
+        SyslogIn { bind, transport, tls, handshake_timeout } => {
             let mut input = match transport {
                 logit_config::SyslogTransport::Udp => {
                     SyslogInput::new(bind.clone()).with_receive(receive_config(&component.receive))
@@ -359,16 +359,20 @@ fn build_spec(
                     .with_tcp_receive(tcp_receive_config(&component.receive)),
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-            .with_telemetry(telemetry.clone());
+            .with_telemetry(telemetry.clone())
+            // A no-op on the UDP arm, which has no connection to bound -- rule 45 has already
+            // rejected a non-default value there, so nothing is silently discarded here.
+            .with_handshake_timeout(*handshake_timeout);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        OtlpIn { bind, protocol, tls } => {
+        OtlpIn { bind, protocol, tls, handshake_timeout } => {
             let mut input = OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone());
+                .with_telemetry(telemetry.clone())
+                .with_handshake_timeout(*handshake_timeout);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -383,10 +387,11 @@ fn build_spec(
                 .with_tls(&to_input_tls_client_settings(tls), base_dir)?;
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        LogitIn { bind, tls, max_frame_bytes } => {
+        LogitIn { bind, tls, max_frame_bytes, handshake_timeout } => {
             let mut input = LogitInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone());
+                .with_telemetry(telemetry.clone())
+                .with_handshake_timeout(*handshake_timeout);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -1506,6 +1511,7 @@ mod tests {
                     bind: "127.0.0.1:0".to_string(),
                     protocol,
                     tls: None,
+                    handshake_timeout: Duration::from_secs(5),
                 },
             };
             assert!(
@@ -1867,6 +1873,7 @@ mod tests {
                     key_file: "server.key".to_string(),
                     client_ca_file: None,
                 }),
+                handshake_timeout: Duration::from_secs(5),
             },
         };
         assert!(matches!(
@@ -1886,7 +1893,12 @@ mod tests {
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
             consumers: vec!["out".to_string()],
-            kind: ComponentKind::SyslogIn { bind: "127.0.0.1:0".to_string(), transport, tls },
+            kind: ComponentKind::SyslogIn {
+                bind: "127.0.0.1:0".to_string(),
+                transport,
+                tls,
+                handshake_timeout: Duration::from_secs(5),
+            },
         }
     }
 
@@ -1983,6 +1995,7 @@ mod tests {
                 bind: "127.0.0.1:0".to_string(),
                 tls: None,
                 max_frame_bytes: None,
+                handshake_timeout: Duration::from_secs(5),
             },
         };
         assert!(matches!(
@@ -2006,12 +2019,117 @@ mod tests {
                     client_ca_file: None,
                 }),
                 max_frame_bytes: Some(32 * 1024 * 1024),
+                handshake_timeout: Duration::from_secs(5),
             },
         };
         assert!(matches!(
             build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0,
             NodeSpec::Input(..)
         ));
+    }
+
+    // ---- `handshake_timeout` reaches each of the three listeners -------------------------------
+    //
+    // `NodeSpec::Input` is a `Box<dyn Input + Send>`, so there is nothing to read the field back
+    // off -- a `#[cfg(test)]` accessor on the concrete listener wouldn't be visible here anyway
+    // (this crate compiles `logit-inputs` without `cfg(test)`). These three tests therefore pin
+    // the wiring the way `build_spec_reports_a_missing_syslog_tls_cert_file_clearly` pins
+    // `with_tls`: by asserting something that can only be true if the call really happened.
+    // A 50ms budget, a connection that says nothing, and the server-side close it must produce --
+    // with `.with_handshake_timeout(..)` deleted from the arm, the listener's own 5s default
+    // applies and every one of these fails on its 1s read.
+
+    /// A free loopback port, released again -- the bind-drop-rebind idiom this crate's own
+    /// integration tests use (`crates/logit-cli/tests/otlp_round_trip.rs`'s `ephemeral_addr`),
+    /// needed here because `Input` has no `local_addr` for a boxed listener to report through.
+    async fn free_port() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().to_string()
+    }
+
+    /// Spawns a built `NodeSpec::Input` and asserts the server closes a connection that sends
+    /// nothing, within a second -- i.e. well inside the 5s default but well outside a 50ms one.
+    async fn assert_closes_a_silent_connection(spec: NodeSpec, addr: &str) {
+        let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
+        tokio::spawn(async move { input.run(logit_pipeline::Fanout::new(vec![])).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut silent, &mut buf),
+        )
+        .await
+        .expect("a configured 50ms handshake_timeout should close a silent connection within 1s");
+        match result {
+            Ok(n) => assert_eq!(n, 0, "expected a close, got a byte"),
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(err) => panic!("read failed outright: {err}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_spec_wires_handshake_timeout_into_a_tcp_syslog_input() {
+        let addr = free_port().await;
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::SyslogIn {
+                bind: addr.clone(),
+                transport: logit_config::SyslogTransport::Tcp,
+                tls: None,
+                handshake_timeout: Duration::from_millis(50),
+            },
+        };
+        let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
+        assert_closes_a_silent_connection(spec, &addr).await;
+    }
+
+    #[tokio::test]
+    async fn build_spec_wires_handshake_timeout_into_a_logit_input() {
+        let addr = free_port().await;
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::LogitIn {
+                bind: addr.clone(),
+                tls: None,
+                max_frame_bytes: None,
+                handshake_timeout: Duration::from_millis(50),
+            },
+        };
+        let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
+        assert_closes_a_silent_connection(spec, &addr).await;
+    }
+
+    /// `otlp_in`'s knob bounds the TLS accept and nothing else (`logit_inputs::otlp`'s "Handshake
+    /// timeout" doc section), so this one needs a real `tls:` block to have any phase to bound.
+    #[tokio::test]
+    async fn build_spec_wires_handshake_timeout_into_an_otlp_input() {
+        let addr = free_port().await;
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::OtlpIn {
+                bind: addr.clone(),
+                protocol: logit_config::OtlpProtocol::Http,
+                tls: Some(logit_config::TlsServerConfig {
+                    cert_file: "server.pem".to_string(),
+                    key_file: "server.key".to_string(),
+                    client_ca_file: None,
+                }),
+                handshake_timeout: Duration::from_millis(50),
+            },
+        };
+        let spec = build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0;
+        assert_closes_a_silent_connection(spec, &addr).await;
     }
 
     #[test]
