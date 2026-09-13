@@ -66,6 +66,10 @@ pub fn flamegraph(root: &Path, args: FlamegraphArgs) -> anyhow::Result<()> {
     let scenarios_dir = root.join("perf/scenarios");
     let scenario = scenario::find(&scenarios_dir, &args.scenario)?;
     require_tools()?;
+    // Fresh spool before this capture's own spawn -- same reasoning as `run`'s per-repeat clear
+    // (`crate::spool`'s module doc). A stale spool would make the flamegraph's own I/O shape
+    // unrepresentative, the same way it corrupts `run`'s throughput numbers.
+    crate::spool::clear(root, &scenario)?;
 
     let out = args
         .out
@@ -130,9 +134,13 @@ fn record_and_render(
         shutdown_timeout: args.shutdown_timeout,
     })
     .context("perf record")?;
+    // `perf record` starts capturing at spawn, not at `ready` -- unlike `run`'s events/s (which
+    // deliberately excludes startup from the graph's own per-event cost), this line describes how
+    // much of `perf.data` was actually written, so it's `startup_s + wall_s` (spawn ->
+    // completion/shutdown) rather than `sample.wall_s` alone.
     println!(
         "   captured {:.1}s of wall time ({:.1} MiB of samples)",
-        sample.wall_s,
+        sample.startup_s.unwrap_or(0.0) + sample.wall_s,
         fs::metadata(perf_data).map(|m| m.len()).unwrap_or(0) as f64 / (1024.0 * 1024.0),
     );
 
