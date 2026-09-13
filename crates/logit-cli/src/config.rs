@@ -231,6 +231,12 @@ mod tests {
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
         );
+        configs.extend(
+            std::fs::read_dir(root.join("perf/scenarios"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
+        );
         configs.sort();
 
         assert!(configs.len() > 1, "expected demo and example configs");
