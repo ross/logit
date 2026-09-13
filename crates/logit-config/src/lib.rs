@@ -1049,6 +1049,51 @@ pub enum ComponentKind {
         #[serde(default)]
         hostname: Option<String>,
     },
+    /// Carbon plaintext or pickle egress -- the mirror of `graphite_in`, and a real relay:
+    /// path, tags, value and timestamp round-trip through the real `GraphiteDecoder` on the
+    /// other end. See `docs/adr/graphite-carbon-relay.md` and
+    /// `docs/plans/graphite-carbon-relay.md`. Unlike `collectd_out`, both transports are
+    /// supported (carbon's own plaintext listener speaks either); pickle is TCP-only (rule 43).
+    GraphiteOut {
+        /// `host:port`. Resolved at send time, never at config-load time -- the same
+        /// `statsd_out`/`collectd_out` precedent.
+        endpoint: String,
+        #[serde(default)]
+        transport: GraphiteTransport,
+        #[serde(default)]
+        protocol: GraphiteProtocol,
+        /// Whether to render event attributes as carbon tags. `carbon` (the default) writes
+        /// `;name=value` in ascending rendered-name order; `drop` is the escape hatch for a
+        /// pre-1.1 Graphite, whose whisper backend would otherwise take the `;` into a directory
+        /// name silently -- see `docs/deploying.md`'s `graphite_out` section.
+        #[serde(default)]
+        tags: GraphiteTags,
+        /// What to do with a metric kind carbon's one-number-per-datapoint wire cannot carry.
+        /// `skip` (the default) drops the record, counted; `expand` renders the dotted sub-paths
+        /// `crates/logit-proto/src/graphite/mod.rs`'s module doc tables, counted degraded.
+        #[serde(default)]
+        multi_value: GraphiteMultiValue,
+        /// Bounds one UDP datagram's worth of packed plaintext lines (several lines
+        /// newline-joined per send) -- not a single line's length, and ignored under
+        /// `transport: tcp`, which has no datagram to overflow. Defaults to `"1432"`, the same
+        /// "commodity Ethernet LAN" figure `statsd_out`'s own `max_packet_bytes` uses. A string
+        /// via [`human_bytes`]. Rule 43 rejects `0`.
+        #[serde(default = "default_graphite_max_packet_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_packet_bytes: u64,
+        /// The longest pickle payload this sink will pack into one length-prefixed frame.
+        /// Defaults to `"1MiB"`, Twisted's own `Int32StringReceiver.MAX_LENGTH` -- the same bound
+        /// carbon's own pickle receiver enforces, so a relay never writes a frame the far end
+        /// would refuse. A string via [`human_bytes`]. Rule 43 bounds it `1024..=16MiB` and
+        /// rejects `0`.
+        #[serde(default = "default_graphite_max_frame_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_frame_bytes: u64,
+        /// TCP only, ignored for UDP. See `SyslogOut::connect_timeout`. Rule 43 rejects `0s`.
+        #[serde(default = "default_graphite_connect_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        connect_timeout: Duration,
+    },
     /// Scrapes Prometheus `/metrics` endpoints on `interval`, the way Prometheus's own server
     /// does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each
     /// target's response declares via its own `Content-Type`. Always synthesizes `up`,
@@ -1450,6 +1495,26 @@ fn default_collectd_max_packet_bytes() -> u64 {
     1452
 }
 
+/// Mirrors `logit_proto::graphite::DEFAULT_MAX_FRAME_BYTES` -- Twisted's own
+/// `Int32StringReceiver.MAX_LENGTH`, which is what carbon's pickle receiver inherits. Can't
+/// reference the codec constant directly, same reason as [`default_syslog_connect_timeout`];
+/// shared by `graphite_in`'s and `graphite_out`'s `max_frame_bytes`, kept in sync by hand.
+fn default_graphite_max_frame_bytes() -> u64 {
+    1 << 20
+}
+
+/// Mirrors `logit_proto::graphite::DEFAULT_MAX_PACKET_BYTES` -- can't reference it directly, same
+/// reason as [`default_syslog_connect_timeout`].
+fn default_graphite_max_packet_bytes() -> u64 {
+    1432
+}
+
+/// `GraphiteOut::connect_timeout`'s default -- matches `StatsdOut`'s/`SyslogOut`'s own 5s default
+/// TCP connect timeout.
+fn default_graphite_connect_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
 /// `PrometheusIn::interval`'s default -- Prometheus's own server ships the same 15s default scrape
 /// interval.
 fn default_prometheus_scrape_interval() -> Duration {
@@ -1597,6 +1662,51 @@ pub enum StatsdFormat {
     #[default]
     Dogstatsd,
     Statsd,
+}
+
+/// Which transport `graphite_in`/`graphite_out` uses. `tcp` (the default) matches carbon's own
+/// default plaintext listener (port 2003); `udp` is plaintext-only -- rule 43 rejects
+/// `protocol: pickle` under `transport: udp`, since Twisted's length-prefixed pickle framing has
+/// no meaning in a datagram. Deliberately its own enum rather than reusing `StatsdTransport` --
+/// same `$defs`-naming reasoning as that type's own doc comment.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphiteTransport {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+/// Which carbon wire protocol `graphite_in`/`graphite_out` speaks. `plaintext` (the default) is
+/// carbon's own default listener protocol; `pickle` is the batch protocol, TCP only (rule 43).
+/// See `crates/logit-proto/src/graphite/mod.rs`'s module doc for the wire shapes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphiteProtocol {
+    #[default]
+    Plaintext,
+    Pickle,
+}
+
+/// Whether `graphite_out` renders attributes as carbon tags at all. See
+/// `crates/logit-proto/src/graphite/mod.rs`'s `Tags` doc comment -- this is that same choice,
+/// exposed as config.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphiteTags {
+    #[default]
+    Carbon,
+    Drop,
+}
+
+/// What `graphite_out` does with a metric kind carbon's one-number-per-datapoint wire cannot
+/// carry. See `crates/logit-proto/src/graphite/mod.rs`'s `MultiValue` doc comment.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphiteMultiValue {
+    #[default]
+    Skip,
+    Expand,
 }
 
 /// The syslog PRI facility, named rather than a bare `0..=23` integer so schemars publishes a
@@ -3207,6 +3317,78 @@ mod tests {
                 assert_eq!(hostname, Some("logit-relay".to_string()));
             }
             other => panic!("expected CollectdOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graphite_out_needs_only_an_endpoint_and_defaults_everything_else() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "graphite_out", "sources": ["in"], "endpoint": "127.0.0.1:2003"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::GraphiteOut {
+                endpoint,
+                transport,
+                protocol,
+                tags,
+                multi_value,
+                max_packet_bytes,
+                max_frame_bytes,
+                connect_timeout,
+            } => {
+                assert_eq!(endpoint, "127.0.0.1:2003");
+                assert_eq!(transport, GraphiteTransport::Tcp, "carbon's own default listener");
+                assert_eq!(protocol, GraphiteProtocol::Plaintext);
+                assert_eq!(tags, GraphiteTags::Carbon);
+                assert_eq!(multi_value, GraphiteMultiValue::Skip);
+                assert_eq!(max_packet_bytes, 1432);
+                assert_eq!(max_frame_bytes, 1 << 20, "Twisted's Int32StringReceiver.MAX_LENGTH");
+                assert_eq!(connect_timeout, Duration::from_secs(5));
+            }
+            other => panic!("expected GraphiteOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graphite_out_enums_deserialize_snake_case() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "graphite_out", "sources": ["in"], "endpoint": "127.0.0.1:2004",
+                "transport": "udp", "protocol": "pickle", "tags": "drop",
+                "multi_value": "expand"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::GraphiteOut { transport, protocol, tags, multi_value, .. } => {
+                assert_eq!(transport, GraphiteTransport::Udp);
+                assert_eq!(protocol, GraphiteProtocol::Pickle);
+                assert_eq!(tags, GraphiteTags::Drop);
+                assert_eq!(multi_value, GraphiteMultiValue::Expand);
+            }
+            other => panic!("expected GraphiteOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graphite_out_byte_and_duration_fields_accept_human_strings() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "graphite_out", "sources": ["in"], "endpoint": "127.0.0.1:2003",
+                "max_packet_bytes": "8KiB", "max_frame_bytes": "2MiB",
+                "connect_timeout": "10s"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::GraphiteOut {
+                max_packet_bytes,
+                max_frame_bytes,
+                connect_timeout,
+                ..
+            } => {
+                assert_eq!(max_packet_bytes, 8 * 1024);
+                assert_eq!(max_frame_bytes, 2 * 1024 * 1024);
+                assert_eq!(connect_timeout, Duration::from_secs(10));
+            }
+            other => panic!("expected GraphiteOut, got {other:?}"),
         }
     }
 
