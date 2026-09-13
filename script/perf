@@ -1,0 +1,19 @@
+#!/bin/bash
+# Usage: script/perf run [--scenario NAME]... [--repeat N] [--label TEXT] [--settle 1s] [--no-build] [--profile release]
+#        script/perf compare <a.json> <b.json> [--threshold 5.0] [--rss-threshold PCT]
+#        script/perf list
+# Out-of-CI load-test harness (crates/logit-perf, docs/adr/load-test-harness.md): spawns the real
+# release `logit` binary against perf/scenarios/*.yaml and measures throughput, CPU per event, and
+# peak RSS.
+#
+# Deliberately NOT part of script/cibuild, for the same reason script/bench is not: this loads the
+# machine heavily (a release build plus several million-event runs) and its numbers describe a
+# shared CI runner's contention, not the code -- see docs/adr/load-test-harness.md's "out of CI"
+# decision. When and how it gets run in the ongoing process (per-PR, nightly, manually triggered)
+# is deliberately still open.
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+run cargo run -q -p logit-perf -- "$@"
