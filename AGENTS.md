@@ -210,7 +210,7 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/schema` | Regenerate `schema/logit.schema.json` — run after any `logit-config` type change, and commit the result |
 | `script/validate` | Manually run `logit validate` over every shipped config (`demo/`, `examples/`); ordinary tests enforce this too |
 | `script/bench [filter]` | `cargo bench -p logit-bench` — throughput + per-benchmark allocation counts. Not part of `cibuild` |
-| `script/perf run\|compare\|list` | Out-of-CI load-test harness (`crates/logit-perf`, `docs/adr/load-test-harness.md`) — spawns the real `logit` binary against `perf/scenarios/*.yaml`. Not part of `cibuild` |
+| `script/perf run\|compare\|attribute\|flamegraph\|list` | Out-of-CI load-test harness (`crates/logit-perf`, `docs/adr/load-test-harness.md`) — spawns the real `logit` binary against `perf/scenarios/*.yaml`. `attribute` decodes a temporary `internal` dump into a per-node time breakdown; `flamegraph` runs `perf record` in its own throwaway image (`crates/logit-perf/Dockerfile`, not `Dockerfile.dev`). Not part of `cibuild` |
 | `script/audit` | `cargo-deny` + `cargo-audit` |
 | `script/cibuild` | The exact sequence CI runs, in order — run this before opening a PR |
 | `script/console` | Interactive shell in the dev container, for anything not covered above |
