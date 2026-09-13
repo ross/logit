@@ -385,14 +385,26 @@ impl Decoder for SyslogDecoder {
         // more -- `parse_line` validates each header field individually and only MSG is allowed
         // to carry non-UTF-8 bytes (see the module doc).
         if !self.line_splitting {
-            // One message, verbatim -- the caller's framer already delimited it
-            // (`Self::with_line_splitting`). One trailing `\r` still comes off, so a `CRLF`
-            // sender and an `LF` one decode identically here the way they do below; the TCP
-            // framer strips the `\r` it can see, but an octet-counted frame's declared length
-            // may simply include one.
+            // One message, already delimited by the caller's framer
+            // (`Self::with_line_splitting`). The only bytes to remove are a terminator the
+            // sender counted *inside* the frame: an octet-counted MSG-LEN may legally cover a
+            // trailing `\r\n`, and taking it off here is what makes such a frame decode
+            // identically to the same line arriving in a UDP datagram. One `\n`, then one `\r`
+            // behind it -- exactly what the splitting arm below does at each line break, and
+            // what `crate::tcp::Framer` does for LF framing.
+            //
+            // The `\r` comes off **only** when an `\n` did. An LF-framed frame reaches here
+            // already terminator-free (the framer consumed the `\n` and one `\r`), so a `\r`
+            // still at its end is payload -- a message genuinely ending in CR, sent as
+            // `...msg\r\r\n` -- and stripping it unconditionally would eat a byte on TCP that
+            // the same bytes keep over UDP. (A counted lone `\r` with no `\n` is therefore kept
+            // too; nothing in RFC 6587 makes a bare CR a terminator.)
             let mut line = bytes;
-            if line.ends_with(b"\r") {
+            if line.ends_with(b"\n") {
                 line = line.slice(..line.len() - 1);
+                if line.ends_with(b"\r") {
+                    line = line.slice(..line.len() - 1);
+                }
             }
             self.absorb_line(line, received_at, out);
             return Ok((self.resource.clone(), None));
@@ -1751,17 +1763,52 @@ mod tests {
         assert_eq!(message_str(&out[0]), "first\nsecond\nthird");
     }
 
-    /// One trailing `\r` still comes off with splitting disabled, so a `CRLF` sender whose octet
-    /// count included the `\r` decodes identically to an `LF` one.
-    #[test]
-    fn with_line_splitting_off_still_strips_one_trailing_cr() {
+    /// `decode_into` with splitting off, for reuse across the terminator cases below.
+    fn decode_framed(frame: &[u8]) -> Vec<Event> {
         let mut decoder =
             SyslogDecoder::new(Arc::new(Resource::default())).with_line_splitting(false);
         let mut out = Vec::new();
         decoder
-            .decode_into(Bytes::from_static(b"<134>1 - - - - - - hello\r"), 7, &mut out)
+            .decode_into(Bytes::copy_from_slice(frame), 7, &mut out)
             .expect("decode should succeed");
-        assert_eq!(message_str(&only_event(out)), "hello");
+        out
+    }
+
+    /// An octet-counted sender may legally count its own `\r\n` terminator inside MSG-LEN, so
+    /// the frame arrives with it attached -- and must then decode exactly like the same line in a
+    /// UDP datagram, which the splitting arm strips at the line break.
+    #[test]
+    fn with_line_splitting_off_strips_a_counted_crlf_terminator() {
+        assert_eq!(
+            message_str(&only_event(decode_framed(b"<134>1 - - - - - - hello\r\n"))),
+            "hello"
+        );
+        assert_eq!(
+            message_str(&only_event(decode("<134>1 - - - - - - hello\r\n"))),
+            "hello",
+            "the identical bytes over UDP must agree"
+        );
+    }
+
+    /// A counted bare `\n` comes off too -- same terminator, one of the two spellings.
+    #[test]
+    fn with_line_splitting_off_strips_a_counted_lf_terminator() {
+        assert_eq!(message_str(&only_event(decode_framed(b"<134>1 - - - - - - hello\n"))), "hello");
+    }
+
+    /// The regression the unconditional `\r` strip caused: an LF-framed frame reaches the decoder
+    /// already terminator-free (`crate::tcp::Framer` consumed the `\n` and one `\r`), so a `\r`
+    /// still at its end is payload -- a message genuinely ending in CR, sent `...hello\r\r\n`.
+    /// It used to lose that byte on TCP while the same bytes kept it over UDP.
+    #[test]
+    fn with_line_splitting_off_keeps_a_payload_cr_the_framer_already_unwrapped() {
+        // What `Framer::next_line` hands the decoder for the wire bytes `...hello\r\r\n`.
+        assert_eq!(
+            message_str(&only_event(decode_framed(b"<134>1 - - - - - - hello\r"))),
+            "hello\r"
+        );
+        // And the same wire bytes through the UDP arm, which is what it has to agree with.
+        assert_eq!(message_str(&only_event(decode("<134>1 - - - - - - hello\r\r\n"))), "hello\r");
     }
 
     #[test]
@@ -1859,6 +1906,45 @@ mod tests {
     async fn tcp_decodes_an_octet_counted_message_end_to_end() {
         let (addr, handle, mut rx) = running_tcp_input(None).await;
         let msg = "<134>Aug 30 10:00:00 myhost nginx: hello over tcp";
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, format!("{} {msg}", msg.len()).as_bytes())
+            .await
+            .unwrap();
+
+        let events = recv_events(&mut rx).await;
+        assert_eq!(events.len(), 1);
+        assert_nginx_line(&events[0]);
+        handle.abort();
+    }
+
+    /// Finding 1's end-to-end case: a message genuinely ending in CR, LF-framed on the wire as
+    /// `...\r\r\n`, keeps that byte -- the framer takes the `\n` and one `\r`, and the decoder
+    /// leaves what is left alone. The same bytes over UDP decode the same way (the decoder-level
+    /// twin of this is `with_line_splitting_off_keeps_a_payload_cr_the_framer_already_unwrapped`).
+    #[tokio::test]
+    async fn tcp_keeps_a_payload_cr_on_an_lf_framed_message_end_to_end() {
+        let (addr, handle, mut rx) = running_tcp_input(None).await;
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(
+            &mut client,
+            b"<134>Aug 30 10:00:00 myhost nginx: hello over tcp\r\r\n",
+        )
+        .await
+        .unwrap();
+
+        let events = recv_events(&mut rx).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(message_str(&events[0]), "hello over tcp\r");
+        handle.abort();
+    }
+
+    /// Finding 1's other end-to-end case: an octet-counted sender whose MSG-LEN covers its own
+    /// `\r\n` terminator gets the terminator stripped, so the message matches what the same line
+    /// would decode to over UDP.
+    #[tokio::test]
+    async fn tcp_strips_a_counted_crlf_terminator_end_to_end() {
+        let (addr, handle, mut rx) = running_tcp_input(None).await;
+        let msg = "<134>Aug 30 10:00:00 myhost nginx: hello over tcp\r\n";
         let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
         tokio::io::AsyncWriteExt::write_all(&mut client, format!("{} {msg}", msg.len()).as_bytes())
             .await
