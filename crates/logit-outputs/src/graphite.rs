@@ -112,11 +112,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{lookup_host, TcpStream, UdpSocket};
 
 /// Which transport a `graphite_out` component was configured with -- the target of
-/// [`crate`]'s CLI-side `graphite_transport` converter
+/// [`crate`]'s CLI-side `graphite_out_transport` converter
 /// (`crates/logit-cli/src/pipeline.rs`), kept as its own small public enum (rather than matching
-/// `logit_config::GraphiteTransport` directly there) purely so that conversion has a named,
-/// stable signature `graphite_in` (W2)'s own converter can mirror -- see the W3 worker report for
-/// the exact shape both sides settled on. Not used internally beyond selecting
+/// `logit_config::GraphiteTransport` directly there) so that conversion has a named, stable
+/// signature. Namespaced `graphite_out_*` on the CLI side specifically because `graphite_in`
+/// converts the same `logit_config::GraphiteTransport` onto its own, different type -- a bare
+/// `graphite_transport` name would collide. Not used internally beyond selecting
 /// [`GraphiteOutput::udp`]/[`GraphiteOutput::tcp`]; [`Conn`] is this module's own internal choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -861,20 +862,40 @@ mod tests {
 
     /// `with_encoder`/`with_max_packet_bytes` must be order-independent --
     /// `CollectdOutput`'s own precedent test. A cap of 4 bytes is smaller than any real line, so
-    /// in either order the event below is dropped whole as oversize -- zero I/O either way.
+    /// in either order the event below must be dropped whole as oversize by the *encoder* (not
+    /// merely fail to error, which a send to an unconnected UDP socket never does regardless of
+    /// whether the cap was actually applied) -- asserted via the codec's own
+    /// `logit.output.metrics.skipped{reason="oversize_line"}` counter, fed through a
+    /// `Registry`-backed `Telemetry` installed on each ordering, so this test is load-bearing:
+    /// dropping `with_encoder`'s own `.with_max_packet_bytes(self.encoder_cap())`
+    /// re-application would leave the cap at `GraphiteEncoder::new()`'s uncapped `usize::MAX` in
+    /// the `with_encoder`-called-last ordering, the line would encode instead of being dropped,
+    /// and this assertion would fail.
     #[tokio::test]
     async fn the_encoder_cap_is_order_independent_with_with_encoder() {
+        let registry_cap_then_encoder = Registry::new();
         let cap_then_encoder = GraphiteOutput::udp("127.0.0.1:1")
             .unwrap()
             .with_max_packet_bytes(4)
-            .with_encoder(GraphiteEncoder::new());
+            .with_encoder(GraphiteEncoder::new())
+            .with_telemetry(registry_cap_then_encoder.telemetry_for("out", "graphite_out", "sink"));
+        let registry_encoder_then_cap = Registry::new();
         let encoder_then_cap = GraphiteOutput::udp("127.0.0.1:1")
             .unwrap()
             .with_encoder(GraphiteEncoder::new())
-            .with_max_packet_bytes(4);
-        for mut output in [cap_then_encoder, encoder_then_cap] {
+            .with_max_packet_bytes(4)
+            .with_telemetry(registry_encoder_then_cap.telemetry_for("out", "graphite_out", "sink"));
+        for (mut output, registry) in [
+            (cap_then_encoder, registry_cap_then_encoder),
+            (encoder_then_cap, registry_encoder_then_cap),
+        ] {
             let batch = batch_with(vec![gauge_event("a.long.enough.metric.name", 1.0)]);
             output.send(&batch).await.expect("an all-dropped batch must not attempt any I/O");
+            assert!(
+                counted(&registry, "logit.output.metrics.skipped", ("reason", "oversize_line")),
+                "expected the encoder's own cap to have dropped the line as oversize in this \
+                 ordering"
+            );
         }
     }
 

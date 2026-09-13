@@ -1121,7 +1121,7 @@ pub enum ComponentKind {
         /// newline-joined per send) -- not a single line's length, and ignored under
         /// `transport: tcp`, which has no datagram to overflow. Defaults to `"1432"`, the same
         /// "commodity Ethernet LAN" figure `statsd_out`'s own `max_packet_bytes` uses. A string
-        /// via [`human_bytes`]. Rule 43 rejects `0`.
+        /// via [`human_bytes`]. Rule 38 rejects `0`.
         #[serde(default = "default_graphite_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,
