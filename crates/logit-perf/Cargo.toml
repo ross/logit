@@ -1,0 +1,22 @@
+[package]
+name = "logit-perf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Out-of-CI load-test harness: spawns the real `logit` binary against perf/scenarios/*.yaml and measures throughput, CPU per event, and peak RSS (docs/adr/load-test-harness.md). Dev-only; ships in nothing."
+
+[[bin]]
+name = "logit-perf"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+anyhow.workspace = true
+# `wait4` (rusage.rs) and SIGTERM (run.rs's settle-then-signal path for a scenario that doesn't
+# self-exit) -- already a workspace dependency (logit-cli's own dev-dependency for the same
+# SIGTERM reason, logit-inputs' inotify wake source).
+libc.workspace = true
