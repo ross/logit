@@ -179,6 +179,16 @@ retargeted to `main` when it merges. `git merge origin/main` to update, never re
 
 Landing order: **W0 → (W1 ∥ W3) → (W2 ∥ W4) → W5.**
 
+### Status (2026-09-13)
+
+PR numbers, per this plan's landing order: W1 (the generic TCP+TLS driver + framer) is #157, W3
+(`syslog_out` TLS) is #159, W4 (the recorded rsyslog-over-TCP fixture) is #161, and W2 (`syslog_in`
+over TCP/TLS, stacked on W1) is #163. This document's own workstream, W5 (round-trip tests, the new
+`examples/syslog-relay.yaml`, and the closeout doc edits below), is built as a branch on top of all
+four but does not yet have a PR open. **Nothing in this stack is merged** — landing order and
+timing are Ross's call, per this plan's "Execution instruction" above, not something this document
+or any workstream branch decides for itself.
+
 ### Per-workstream detail
 
 **W0** — Done when: every relative link resolves, the ADR's headings match `docs/adr/TEMPLATE.md`
