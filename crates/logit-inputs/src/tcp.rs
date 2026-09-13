@@ -1136,6 +1136,81 @@ mod tests {
         assert!(err.to_string().contains("leading zero"), "{err}");
     }
 
+    // ---- framer: recorded interop fixtures ----------------------------------------------------
+    //
+    // A real rsyslog forwarder's TCP byte stream, captured by `script/record-fixtures rsyslog-tcp`
+    // -- see `testdata/interop/syslog/README.md`'s `rsyslog-tcp-000.raw` row and
+    // `docs/plans/recorded-interop-fixtures.md`'s TCP-framed-syslog amendment. This is the framer
+    // half of that fixture's promise: real bytes from a real, un-tuned `omfwd` forwarder (default
+    // `TCP_Framing`, i.e. RFC 6587 §3.4.2 non-transparent) pushed through `Framer` exactly as they
+    // arrived over the wire, then decoded with the real `SyslogDecoder` -- not a hand-typed literal
+    // shaped like what non-transparent framing is assumed to look like.
+
+    /// `testdata/interop/syslog/<name>` as raw bytes -- the TCP fixtures are a whole connection's
+    /// byte stream, not a single UTF-8 datagram, so this is a byte-oriented sibling of
+    /// `crate::syslog`'s own `interop_fixture` test helper rather than a shared one.
+    fn interop_fixture_bytes(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/interop/syslog")
+            .join(name);
+        std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("reading interop fixture {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn interop_fixture_rsyslog_tcp_non_transparent_frame() {
+        let wire = interop_fixture_bytes("rsyslog-tcp-000.raw");
+
+        // One push, then `finish` -- rsyslog's own TCP connection here sends its one message and
+        // is torn down by the recording harness rather than the peer sending an explicit
+        // terminator-then-more-traffic, so the whole fixture arrives as a single read.
+        let mut framer = Framer::new();
+        framer.push(&wire);
+        assert_eq!(
+            framer.framing(),
+            Some(Framing::NonTransparent),
+            "a stock omfwd forwarder with no TCP_Framing parameter must latch non-transparent, not \
+             octet-counting"
+        );
+
+        let mut frames = Vec::new();
+        while let Some(frame) = framer.next_frame().expect("framing should succeed") {
+            frames.push(frame);
+        }
+        if let Some(trailing) = framer.finish().expect("finish should succeed") {
+            frames.push(trailing);
+        }
+        assert_eq!(frames.len(), 1, "exactly one message on this connection: {frames:?}");
+
+        // Line splitting stays on: this frame has no embedded newline (non-transparent framing
+        // never can), so `SyslogDecoder`'s own `\n`-splitting is a no-op here rather than
+        // something this test needs to disable.
+        let mut decoder = crate::syslog::SyslogDecoder::new(Arc::new(Resource::default()));
+        let events = decoder
+            .decode(frames.into_iter().next().unwrap())
+            .expect("decode should succeed")
+            .events;
+        assert_eq!(events.len(), 1, "exactly one decoded event: {events:?}");
+        let event = &events[0];
+
+        assert_eq!(
+            event.attributes.get("syslog.tag").and_then(Value::as_str),
+            Some("logit-fixture"),
+            "syslog.tag should match the `logger -t logit-fixture` invocation the fixture recorded"
+        );
+        // `logger -t logit-fixture "hello from rsyslog, ..."` with no `-p` carries the default
+        // facility/priority `user.notice` (PRI 13 = facility 1 * 8 + severity 5), the same PRI
+        // `rsyslog-000.raw`'s UDP sibling fixture carries -- see
+        // `testdata/interop/syslog/README.md`'s row for both.
+        assert_eq!(
+            event.log.as_ref().and_then(|log| log.severity),
+            Some(logit_core::Severity::Info),
+            "user.notice (PRI 13) maps to Severity::Info (13 % 8 = 5)"
+        );
+        let message = event.log.as_ref().expect("event should carry a log").message.as_str();
+        assert_eq!(message, Some("hello from rsyslog, captured for logit interop fixtures"));
+    }
+
     // ---- driver: fixtures and harness ---------------------------------------------------------
 
     /// A trivial `Decoder`: one frame -> one event, except the literal bytes `b"BAD"`, which are

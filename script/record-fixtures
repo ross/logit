@@ -1,6 +1,6 @@
 #!/bin/bash
 # Usage: script/record-fixtures [producer ...]
-#   Producers: logger, python-syslog-handler, rsyslog, collectd, otlp
+#   Producers: logger, python-syslog-handler, rsyslog, rsyslog-tcp, collectd, otlp
 #   With no arguments, records every producer in `all` below.
 #
 # Captures real wire traffic from real third-party producers (syslog senders, OTel SDKs) into
@@ -139,6 +139,26 @@ record_rsyslog() {
     finish_capture
 }
 
+# rsyslog again, this time forwarding over TCP instead of UDP -- same rsyslogd, same
+# rsyslog-entrypoint.sh (unchanged: it just runs whatever config is mounted at
+# /etc/rsyslog-fixture.conf), the only difference is rsyslog-tcp.conf's `omfwd` action, which
+# targets `protocol="tcp"` port 601 with no `TCP_Framing` parameter -- rsyslog's default TCP
+# framing is RFC 6587 §3.4.2 non-transparent (LF-terminated), not octet-counted, and that stock
+# default is exactly the framing this fixture exists to exercise against `logit`'s auto-detecting
+# TCP listener (`crates/logit-inputs/src/tcp.rs`'s `Framer`). raw_capture.py's TCP mode captures
+# one file per accepted connection's full byte stream, which for one `logger` call over one
+# connection is exactly one file holding exactly one LF-terminated message.
+record_rsyslog_tcp() {
+    echo "== recording: rsyslog (TCP, non-transparent framing) =="
+    local out="${OUT_ROOT}/syslog"
+    start_capture tcp 601 "${out}" rsyslog-tcp 1 90
+    ${DOCKER} run --rm --network "${NET}" \
+        -v "${TOOLS_DIR}/rsyslog-tcp.conf:/etc/rsyslog-fixture.conf:ro,z" \
+        -v "${TOOLS_DIR}/rsyslog-entrypoint.sh:/entrypoint.sh:ro,z" \
+        debian:bookworm-slim bash /entrypoint.sh
+    finish_capture
+}
+
 # collectd, sending its own binary `network`-plugin protocol to raw_capture.py over UDP. Same
 # no-official-image situation as rsyslog above: the collectd project's Docker Hub namespace holds
 # exactly one repository, `collectd/ci` (verified) -- a *build-environment* image, one tag per
@@ -228,7 +248,7 @@ record_otlp() {
 
 # ---- entry point ----------------------------------------------------------------------------------
 
-all=(logger python-syslog-handler rsyslog collectd otlp)
+all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp)
 
 producers=("$@")
 if [ "${#producers[@]}" -eq 0 ]; then
@@ -243,6 +263,7 @@ for p in "${producers[@]}"; do
     logger) record_logger ;;
     python-syslog-handler) record_python_syslog_handler ;;
     rsyslog) record_rsyslog ;;
+    rsyslog-tcp) record_rsyslog_tcp ;;
     collectd) record_collectd ;;
     otlp) record_otlp ;;
     *)
