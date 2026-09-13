@@ -1,0 +1,76 @@
+# A synthetic load: `generate_in` renders a fixed number of events from a template, an ordinary
+# `json` stage parses their bodies, and `null_out` drops the result. This is the shape every perf
+# scenario takes (docs/plans/load-test-harness.md) -- run it directly to see the generator's own
+# completion line:
+#
+#   logit --log-format json run examples/generate-to-null.yaml
+#
+# ...which ends with `{"message":"generation complete","events":1000,...}` on stderr. `count` is
+# reached, `generate_in` returns, its senders drop, and the existing listener-exit cascade flushes
+# the sink and exits 0 -- nothing here needs a signal or a timeout to stop it.
+components:
+  # No socket and no decoder: this listener renders a declarative template as fast as `count` and
+  # `rate` allow, so a measurement is of the pipeline rather than of a load-generator process and
+  # a kernel socket buffer.
+  gen:
+    type: generate_in
+
+    # Total events, exactly: the last batch is short (`count % batch`) rather than rounded up, so
+    # a derived events/s divides by the number actually produced. Omit for an unbounded soak run.
+    count: 1000
+
+    # Events per `EventBatch` down the fanout -- the same unit a real listener's batch assembly
+    # produces. Bigger amortizes the per-batch runtime cost (one channel send, one telemetry
+    # point, one span) over more events; lower it to measure that per-batch cost instead.
+    batch: 100
+
+    # Target events/s, paced against the wall clock. Kept low here so the example is polite to run
+    # on a laptop; a real scenario omits it entirely (generate as fast as backpressure allows) or
+    # sets it high. Above roughly a thousand batches per second the pacing is bursty within any
+    # given millisecond -- the average still holds (docs/known-gaps.md).
+    rate: 5000
+
+    # Batch-level resource attributes. All-literal here, which is the cheapest case: built once at
+    # startup and Arc-shared by every event, a refcount bump rather than a map. A placeholder is
+    # legal too, and renders once per *batch* -- and in resource position `seq` is the batch
+    # ordinal (0, 1, 2, ...), not the event counter, so `host: "h{seq%10}"` really would give this
+    # scenario ten distinct resources cycling one per batch, at no per-event cost. That's how you
+    # measure resource grouping. Per-*event* cardinality goes in `event.attributes` below.
+    resource:
+      service.name: synthetic
+
+    event:
+      # The generated log body. `{{` and `}}` write literal braces, which is what lets a JSON body
+      # be a template at all; `{seq%50}` renders the 0-based event counter modulo 50, giving this
+      # scenario 50 distinct paths. Placeholders are for cardinality, never decoration: each one
+      # costs a rendering and a copy per event, whereas a field with no placeholder in it is
+      # rendered once at startup and shared by every event.
+      log: '{{"method":"GET","path":"/x/{seq%50}","status":200,"bytes":1024}}'
+
+      # Event attributes: literal keys (interned once), templated values. 10 distinct hosts here.
+      attributes:
+        host: "web-{seq%10}"
+
+      # One metric per event. `kind` is sum (a delta counter), gauge, or distribution -- and a
+      # distribution generates *raw* samples, never a pre-built sketch, because summarizing is
+      # `aggregate`'s job, not a listener's (docs/adr/lossless-transit.md).
+      metric:
+        name: requests
+        kind: sum
+        value: 1
+
+  # The stage under test in this example: an ordinary transform, composed downstream exactly as it
+  # would be behind a real listener. Swapping what sits here is how a scenario changes what it
+  # measures, which is why `generate_in` has no "shape" enum of its own.
+  parse:
+    type: json
+    sources: [gen]
+
+  # Drops everything as cheaply as the runtime allows, so the measurement covers everything
+  # *upstream* of a sink without an encoder, a socket, or a filesystem in the number -- the
+  # runtime's own layer-2 telemetry still counts what it received and how long delivery took, so
+  # the graph stays attributable per node. A scenario that wants an encoder measured swaps this
+  # for a `file_out` to /dev/null instead, which is a real sink doing real work.
+  sink:
+    type: null_out
+    sources: [parse]

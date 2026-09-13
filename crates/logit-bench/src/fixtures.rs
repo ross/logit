@@ -21,6 +21,7 @@ use logit_core::{
     AttrMap, BodyFormat, DdSketch, Event, EventBatch, LogRecord, MetricKind, MetricRecord,
     Resource, Samples, Scope, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus, Value,
 };
+use logit_inputs::generate::{GenerateInput, GenerateMetricKind};
 use logit_inputs::statsd::StatsdDecoder;
 use logit_inputs::syslog::SyslogDecoder;
 use logit_pipeline::Transform;
@@ -1213,4 +1214,50 @@ pub fn collectd_batch(count: usize) -> EventBatch {
 
 pub fn collectd_encoder() -> logit_proto::collectd::CollectdEncoder {
     logit_proto::collectd::CollectdEncoder::new()
+}
+
+/// The nginx-shaped event template both `generate_in` fixtures below render, in its all-literal
+/// form: a JSON access-log body, one `host` attribute, one `requests` counter, and a
+/// `service.name` resource.
+///
+/// `{{`/`}}` are `logit_core::template`'s escape for a literal brace, so the rendered body really
+/// is the JSON it looks like.
+const GENERATE_LOG_LITERAL: &str = r#"{{"method":"GET","path":"/x/0","status":200,"bytes":1024}}"#;
+
+/// The same body with `{seq%50}` in its path -- one templated field.
+const GENERATE_LOG_TEMPLATED: &str =
+    r#"{{"method":"GET","path":"/x/{seq%50}","status":200,"bytes":1024}}"#;
+
+/// One builder for both fixtures below, so they differ by *exactly* the two placeholders
+/// [`generate_templated`] adds and nothing else -- which is what makes the difference between
+/// their allocation counts attributable to templating alone (`docs/design/memory.md` §2's
+/// `generate_in` rows).
+fn generate_input(log: &str, host: &str) -> GenerateInput {
+    let template = |raw: &str| logit_core::template::parse(raw).expect("a fixture template parses");
+    GenerateInput::new(None, 100)
+        .with_resource(std::collections::BTreeMap::from([(
+            "service.name".to_string(),
+            "synthetic".to_string(),
+        )]))
+        .expect("a literal resource value always compiles")
+        .with_log(template(log))
+        .expect("a fixture template names only known placeholders")
+        .with_attribute("host", template(host))
+        .expect("a fixture template names only known placeholders")
+        .with_metric(template("requests"), GenerateMetricKind::Sum, 1.0)
+        .expect("a literal metric name always compiles")
+}
+
+/// A `generate_in` on its **prototype** render path: no placeholder anywhere, so one event is
+/// rendered once and `clone`d per generated event with only `timestamp` overwritten
+/// (`crates/logit-inputs/src/generate.rs`'s module doc).
+pub fn generate_literal() -> GenerateInput {
+    generate_input(GENERATE_LOG_LITERAL, "web-1")
+}
+
+/// A `generate_in` on its **per-event** render path, with exactly two templated fields
+/// (`{seq%50}` in the log body, `{seq%10}` in the `host` attribute) -- so the gap from
+/// [`generate_literal`]'s count is precisely what two placeholders cost per event.
+pub fn generate_templated() -> GenerateInput {
+    generate_input(GENERATE_LOG_TEMPLATED, "web-{seq%10}")
 }

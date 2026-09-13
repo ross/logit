@@ -136,9 +136,13 @@ pub enum GenerateMetricKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GenerateMetric {
-    /// The metric's name. A template like every other `generate_in` string field: `{seq}` /
-    /// `{seq%N}` substitute here too, which is how a scenario generates a wide *metric-name*
-    /// cardinality rather than a wide attribute cardinality. Required and non-empty (rule 42).
+    /// The metric's name. A template like every other `generate_in` string field, with one
+    /// narrowing: **only `{seq%N}`, never a bare `{seq}`** (rule 42). A metric name is *interned*
+    /// and an interned name is never freed, so an unbounded one would leave a fresh,
+    /// never-reclaimed name behind for every event a run generates -- a process-lifetime leak
+    /// rather than the cardinality knob it reads as. `{seq%N}` is bounded by `N`, and is how a
+    /// scenario generates a wide *metric-name* cardinality rather than a wide attribute one.
+    /// Required and non-empty (rule 42).
     pub name: String,
     /// Which metric kind to produce. Defaults to `sum`.
     #[serde(default)]
@@ -1116,10 +1120,19 @@ pub enum ComponentKind {
         #[serde(default)]
         event: GenerateEvent,
         /// Resource attributes for every generated event: literal keys, templated values (`{seq}`
-        /// / `{seq%N}`, the same substitution [`GenerateEvent`] documents). An all-literal
-        /// resource -- the usual case -- is built once and `Arc`-shared by every event, so it
-        /// costs one refcount bump per event rather than a map. An empty key is rejected (rule
-        /// 42).
+        /// / `{seq%N}`, the same substitution [`GenerateEvent`] documents). An empty key is
+        /// rejected (rule 42).
+        ///
+        /// A resource is **batch-level**, not per event, so the unit a placeholder here renders
+        /// at is one batch -- and **in resource position `seq` is the batch ordinal** (0, 1,
+        /// 2, ...), not the event counter. That distinction is the feature: the event counter
+        /// advances by `batch` each batch, so `{seq%10}` over it under `batch: 100` would render
+        /// `0` forever. Over the ordinal, `resource: { host: "h{seq%10}" }` means what it reads
+        /// as -- ten distinct resources cycling one per batch, which is what a scenario measuring
+        /// resource grouping wants -- costing one attribute map per batch and nothing per event.
+        /// An all-literal resource, the usual case, keeps the cheaper path still: built once at
+        /// startup and `Arc`-shared by every batch forever, one refcount bump per event rather
+        /// than a map.
         #[serde(default)]
         resource: std::collections::BTreeMap<String, String>,
     },

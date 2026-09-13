@@ -469,6 +469,55 @@ fn prometheus_decode_one_scrape() {
     expect_allocs("prometheus_in: decode 1 scrape (11 series)", stats, 161);
 }
 
+/// `generate_in`'s **prototype** render path: no placeholder anywhere in the template, so one
+/// `Event` is rendered once at construction and `clone`d per generated event with only
+/// `timestamp` overwritten (`crates/logit-inputs/src/generate.rs`'s module doc).
+///
+/// One allocation for a hundred events -- the batch's own `Vec<Event>` -- and nothing per event
+/// at all: this shape's `Event::clone` is *free*, since one attribute fits `AttrMap`'s 8-entry
+/// inline capacity, one metric fits `MetricList`'s inline capacity of 1, and the log body's
+/// `Bytes` is a refcount bump rather than a copy. (Contrast `Event::clone (nginx shape)`'s 4
+/// below, whose attributes have spilled.) That is what makes the generator itself effectively
+/// free next to whatever a scenario puts downstream of it, which is the whole point of having
+/// this path.
+///
+/// Warmed first, twice over: `build_batch`'s first call is what settles the render path and
+/// renders the prototype (including the one `#[cold]` `Bytes` promotion the first clone of a
+/// freshly-built buffer pays -- `docs/design/memory.md`'s "Fixtures" section), and the
+/// `Vec::with_capacity` below is the only thing left to count afterwards.
+#[test]
+fn generate_render_literal_100_events() {
+    let mut input = fixtures::generate_literal();
+    drop(input.build_batch(0, 0, 100, 1));
+
+    let (batch, stats) = measure(|| input.build_batch(1, 100, 100, 2));
+    assert_eq!(batch.events.len(), 100);
+    expect_allocs("generate_in: render 100 events (literal)", stats, 1);
+}
+
+/// `generate_in`'s **per-event** render path, with exactly two templated fields (`{seq%50}` in the
+/// log body, `{seq%10}` in the `host` attribute).
+///
+/// `1 + 2 × 100`: the batch's `Vec<Event>` as above, plus exactly one `Bytes::copy_from_slice`
+/// per templated field per event and nothing else -- the scratch `String` every rendering goes
+/// through has already grown to its widest rendering, so it never reallocates
+/// (`logit_core::template::Compiled::render`'s own guarantee, pinned by
+/// `rendering_into_a_cleared_scratch_string_reallocates_nothing` in that module). The literal
+/// fields alongside them (the metric name's interned `Symbol`, the resource) still cost nothing.
+///
+/// This is the number `docs/plans/load-test-harness.md` calls the risk of `{seq}` on the hot
+/// path: placeholders are a cardinality knob, not decoration, and each one costs an allocation
+/// per event forever.
+#[test]
+fn generate_render_templated_100_events() {
+    let mut input = fixtures::generate_templated();
+    drop(input.build_batch(0, 0, 100, 1));
+
+    let (batch, stats) = measure(|| input.build_batch(1, 100, 100, 2));
+    assert_eq!(batch.events.len(), 100);
+    expect_allocs("generate_in: render 100 events (2 templated fields)", stats, 201);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Listener receive queue and batch accumulator (docs/adr/decoupled-listener-io.md)
 // ---------------------------------------------------------------------------------------------

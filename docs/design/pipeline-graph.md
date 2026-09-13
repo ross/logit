@@ -408,7 +408,13 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     actually substitutes: `seq`, or `seq%N` with `N >= 1`. An unknown placeholder is rejected here
     rather than rendered literally or as nothing: a mistyped `{seg}` would otherwise silently
     collapse a scenario's intended cardinality to a single series, which is the difference between
-    measuring an aggregation window and measuring nothing. The var-name check lives in a small
+    measuring an aggregation window and measuring nothing. **`event.metric.name` is narrower
+    still: only `{seq%N}`, never a bare `{seq}`.** A metric name is *interned*, and
+    `logit_core::interner` is monotonic — a `Symbol` is never removed (`docs/design/memory.md`
+    §4) — so an unbounded metric name would intern a fresh, never-reclaimed name for every event a
+    run generates: a process-lifetime leak wearing a cardinality knob's clothes. A log body or an
+    attribute value is copied onto the event and freed with it, so `{seq}` stays legal there.
+    The var-name check lives in a small
     pure `generate_var_is_valid` helper in `graph.rs` so that `logit-inputs`' own `compile`
     resolver can mirror it exactly without depending on `logit-config` (this document's own
     "Crate layout" section). `receive:` on a `generate_in` is rejected by rule 17's own allowlist
