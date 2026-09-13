@@ -28,7 +28,10 @@ serde_json.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]
-# `test-util` (for `tokio::time::pause`/`#[tokio::test(start_paused = true)]`) only needs to be
-# enabled for this crate's own tests -- a `dev-dependencies` override of the same workspace
-# dependency applies just to test/bench/example builds, not the normal library build.
+# `test-util` (for `tokio::time::pause`/`#[tokio::test(start_paused = true)]`) is enabled per
+# crate that has paused-clock tests, here and in `logit-inputs` -- a `dev-dependencies` override
+# of the same workspace dependency applies just to test/bench/example builds, not the normal
+# library build. It has to be declared in each such crate rather than inherited: a
+# `cargo test -p <crate>` builds that package's feature set alone, so a sibling's override
+# doesn't carry over even though a `--workspace` build's feature unification hides that.
 tokio = { workspace = true, features = ["test-util"] }

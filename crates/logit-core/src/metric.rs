@@ -319,6 +319,28 @@ impl DdSketch {
         self.0.count()
     }
 
+    /// The exact sum of every value ever added to this sketch -- **not** an estimate, unlike
+    /// [`DdSketch::quantile`]. `sketches_ddsketch` accumulates it as a plain `f64` alongside the
+    /// bins (and adds the two sums on `merge`), so it never goes through the bucketing that gives
+    /// a quantile its 1% relative-error bound.
+    ///
+    /// Exact for a decoded sketch too: the "java bytes" format
+    /// ([`DdSketch::to_java_bytes`]) is DataDog's `DDSketchWithExactSummaryStatistics` encoding,
+    /// which carries the sum as its own little-endian `f64` field, so the native wire codec
+    /// (`logit_proto::native`) and the disk spool built on it already round-trip this value
+    /// byte-for-byte with no change to the format. (It's also why [`DdSketch`]'s `PartialEq`,
+    /// which compares those same bytes, already distinguishes two sketches whose bins agree but
+    /// whose sums don't.)
+    ///
+    /// `0.0` for an empty sketch -- the inner crate returns `None` there, but the sum of no
+    /// values is the additive identity, and every caller is accumulating a Σ (the per-node
+    /// `process.duration`/`send.blocked.duration` totals `logit-perf attribute` reports,
+    /// `docs/design/performance.md`), where `None` and `0.0` mean the same thing. Use
+    /// [`DdSketch::count`] when "empty" needs telling apart from "sums to zero".
+    pub fn sum(&self) -> f64 {
+        self.0.sum().unwrap_or(0.0)
+    }
+
     /// Serializes to DataDog's canonical "java bytes" sketch format -- a compact, cross-language
     /// binary encoding, not specific to any JVM. This is how a `Distribution` survives a wire or
     /// disk round trip losslessly: `DDSketch`'s own fields are private with no bin iteration
@@ -1161,6 +1183,47 @@ mod tests {
             relative_error <= 0.01,
             "quantile {q} is more than 1% away from the true value 200.0"
         );
+    }
+
+    /// `sum` is exact where `quantile` is bucketed: the values go in, the arithmetic sum comes
+    /// back, with no relative-error bound in the way. Weighted adds multiply, a merge adds the
+    /// two sums, and an empty sketch is `0.0` rather than the inner crate's `None`.
+    #[test]
+    fn ddsketch_sum_is_exact_and_survives_a_merge() {
+        let mut sketch = DdSketch::new();
+        assert_eq!(sketch.sum(), 0.0, "the sum of no values is the additive identity");
+
+        sketch.add(1.0);
+        sketch.add(2.5);
+        sketch.add(-4.0);
+        assert_eq!(sketch.sum(), -0.5);
+
+        let mut weighted = DdSketch::new();
+        weighted.add_weighted(3.0, 4);
+        assert_eq!(weighted.sum(), 12.0, "a weighted add contributes value * count");
+
+        sketch.merge(&weighted);
+        assert_eq!(sketch.sum(), 11.5, "merge adds the merged sketch's sum");
+        assert_eq!(sketch.count(), 7);
+    }
+
+    /// The property `logit-perf attribute` depends on when it reads a `Distribution` back out of
+    /// a `format: native` dump rather than building it locally: DataDog's "java bytes" encoding
+    /// carries the sum as its own `f64` field, so a round trip through the only lossless view of
+    /// a sketch the wrapped crate exposes -- the one `logit_proto::native` uses -- preserves it
+    /// exactly, with no wire-format change needed.
+    #[test]
+    fn ddsketch_sum_round_trips_through_java_bytes() {
+        let mut sketch = DdSketch::new();
+        for value in [0.25, 1.0, 7.5, 100.0] {
+            sketch.add(value);
+        }
+
+        let decoded = DdSketch::from_java_bytes(&sketch.to_java_bytes())
+            .expect("a sketch's own bytes should decode");
+
+        assert_eq!(decoded.sum(), sketch.sum());
+        assert_eq!(decoded.sum(), 108.75);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use logit_core::{
 use logit_pipeline::Fanout;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 pub struct InternalInput {
     interval: Duration,
@@ -74,6 +75,52 @@ impl InternalInput {
 #[async_trait::async_trait]
 impl Input for InternalInput {
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
+        // Never exercised in production -- `run_input` (`crates/logit-pipeline/src/runtime.rs`)
+        // always calls `run_until_shutdown`. Present because the trait requires it, and shaped
+        // exactly like `crate::udp::UdpListener::run`: a never-firing `watch` channel, so the two
+        // entry points share one loop rather than drifting apart. The `_tx` binding is
+        // load-bearing -- drop the sender and `wait_for` below resolves immediately with
+        // `RecvError`, which would turn every `run` into "drain once, then exit".
+        let (_tx, rx) = watch::channel(false);
+        self.run_until_shutdown(sink, rx).await
+    }
+
+    /// The drain loop, plus **one final drain when `shutdown` fires** -- the whole reason this
+    /// input overrides the trait's default (which just drops `run`'s future, ADR
+    /// `decoupled-listener-io`).
+    ///
+    /// **Why.** Points land in `logit_core::telemetry`'s per-component buffers continuously but
+    /// only leave them on a drain tick, so at the instant a SIGTERM arrives there is always up to
+    /// one whole `interval` of buffered self-telemetry sitting there. Cancel-by-drop threw all of
+    /// it away, silently: a process running the default 10s `interval` for 25s reported two
+    /// intervals and lost the third. That's wrong for any operator watching `logit`'s own
+    /// counters across a restart, and it's load-bearing for `logit-perf`'s attribution mode
+    /// (`docs/design/performance.md`), which reads exactly these points back out of a short-lived
+    /// process it SIGTERMs on purpose -- without this drain the last, and for a short run the
+    /// most interesting, slice of every node's `process.duration` never reaches the dump.
+    ///
+    /// **Why the final drain's batch actually gets delivered.** `sink` is a [`Fanout`] owned by
+    /// this future, and every downstream node's inbox stays open for as long as *some* sender
+    /// exists -- so nothing downstream can begin its own close-time flush until this function
+    /// returns and drops it (`run_with_telemetry`'s shutdown cascade,
+    /// `crates/logit-pipeline/src/runtime.rs`). `run_input` bounds that wait by
+    /// `logit_pipeline::InputRuntimeConfig`'s `shutdown_grace`, which for `internal` is
+    /// `ReceiveConfig::default()`'s 5s (`logit_cli::pipeline::input_runtime_config`) -- one
+    /// `Registry::drain` plus one `Fanout::send` fits inside that with room to spare, and
+    /// `Fanout::send`'s only unbounded wait is downstream backpressure, which the grace backstop
+    /// is there to cut short anyway.
+    ///
+    /// **Residual, by design.** The final drain's own `logit.internal.points.emitted` (and the
+    /// `spans`/`logs` counters, and `logit.internal.drain.duration`) are recorded *after* the
+    /// drain that produced them, so they sit in `internal`'s buffer one tick behind and, with no
+    /// tick left to come, are never emitted. That's the same "a drain can't include a count of
+    /// itself" property every one of these self-counts already has (`InternalInput::tick`'s own
+    /// comment, `docs/design/internal-telemetry.md`) -- not a new gap, just its last instance.
+    async fn run_until_shutdown(
+        &mut self,
+        sink: Fanout,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
         let started = Instant::now();
         let mut ticker = tokio::time::interval(self.interval);
         // `tokio::time::interval` fires its first tick immediately -- consumed here and skipped,
@@ -81,8 +128,16 @@ impl Input for InternalInput {
         // than at t=0 against buffers nothing has had time to populate.
         ticker.tick().await;
         loop {
-            ticker.tick().await;
-            self.tick(started, &sink).await;
+            // Both arms are cancellation-safe: `Interval::tick` guarantees no tick is consumed
+            // when another branch wins, and `wait_for` re-checks the current value on its next
+            // call, so neither a tick nor the shutdown edge can be lost to the loser of a race.
+            tokio::select! {
+                _ = ticker.tick() => self.tick(started, &sink).await,
+                () = shutdown_due(&mut shutdown) => {
+                    self.tick(started, &sink).await;
+                    return Ok(());
+                }
+            }
         }
     }
 }
@@ -146,6 +201,22 @@ impl InternalInput {
         })
         .await;
     }
+}
+
+/// Resolves once `shutdown` holds `true`, yielding nothing.
+///
+/// The wrapper exists to make the `select!` above `Send`, which `Input`'s `#[async_trait]`
+/// requires: `watch::Receiver::wait_for` resolves to a `watch::Ref` holding an
+/// `RwLockReadGuard`, which isn't `Send`, and `select!` keeps each branch's resolved value alive
+/// across the *other* branch's handler -- which here `.await`s a drain. Returning `()` drops the
+/// guard before the macro ever stores it. (`Input::run_until_shutdown`'s default body can inline
+/// the same call because neither of its handlers awaits anything.)
+///
+/// The `Result` is discarded for the same reason that default body discards it: `Err` means the
+/// sender was dropped, which in this process only happens as part of the same teardown, and
+/// "drain once more, then stop" is the right answer either way.
+async fn shutdown_due(shutdown: &mut watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|&due| due).await;
 }
 
 fn now_nanos() -> i64 {
@@ -406,5 +477,129 @@ mod tests {
         }
         assert!(found_points, "a points.emitted counter should still be recorded");
         assert!(found_logs, "a logs.emitted counter should also be recorded, separately");
+    }
+
+    /// Pulls the `EventBatch` out of a `Delivered`, the same two-arm match every assertion in
+    /// this module does inline; the shutdown tests below read several batches each, which is
+    /// where repeating it stops being cheaper than naming it.
+    fn batch_of(delivered: logit_pipeline::Delivered) -> logit_core::EventBatch {
+        match delivered {
+            logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
+            logit_pipeline::Delivered::Shared(shared, _ctx) => (*shared).clone(),
+        }
+    }
+
+    /// Every metric name in a batch, resolved -- what the shutdown tests assert the *contents* of
+    /// a drain with, rather than just its arrival.
+    fn metric_names(batch: &logit_core::EventBatch) -> Vec<&'static str> {
+        batch
+            .events
+            .iter()
+            .flat_map(|e| e.metrics.iter().map(|m| logit_core::interner::resolve(m.name)))
+            .collect()
+    }
+
+    /// The point of the `run_until_shutdown` override: a SIGTERM arriving partway through an
+    /// interval used to drop that interval's buffered points on the floor (cancel-by-drop), so
+    /// with a 60s interval and a shutdown one second in, *nothing* was ever emitted. Now the
+    /// buffered point gets exactly one final drain, and the function returns `Ok(())` rather
+    /// than being cancelled.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_mid_interval_drains_once_more_before_returning() {
+        let registry = Registry::new();
+        let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        component_telemetry.count("logit.input.datagrams", 1.0, &[]);
+
+        let mut input = InternalInput::new(Duration::from_secs(60), registry);
+        let (tx, mut rx) = mpsc::channel(4);
+        let fanout = Fanout::new(vec![tx]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle =
+            tokio::spawn(async move { input.run_until_shutdown(fanout, shutdown_rx).await });
+
+        // One second into a sixty-second interval: the loop is parked on a tick that is 59s away
+        // from firing, which is precisely the window the old cancel-by-drop lost.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(rx.try_recv().is_err(), "no interval tick is due yet");
+        shutdown_tx.send(true).expect("the run task holds a receiver");
+
+        handle.await.expect("the drain task should not panic").expect("should return Ok(())");
+
+        let batch = batch_of(rx.try_recv().expect("the final drain should have sent a batch"));
+        assert_eq!(
+            batch.events[0].attributes.get("component").and_then(|v| v.as_str()),
+            Some("statsd_in")
+        );
+        assert_eq!(metric_names(&batch), vec!["logit.input.datagrams"]);
+        assert!(rx.try_recv().is_err(), "the final drain should send exactly one batch");
+    }
+
+    /// The same property one interval later, which is the case that proves the final drain is a
+    /// drain of the *partial* interval and not just a replay: a full tick emits the first point,
+    /// a second point is then recorded mid-interval, and shutdown emits that one on its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_after_a_tick_still_drains_the_partial_interval() {
+        let registry = Registry::new();
+        let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        component_telemetry.count("logit.input.datagrams", 1.0, &[]);
+
+        let mut input = InternalInput::new(Duration::from_secs(60), registry);
+        let (tx, mut rx) = mpsc::channel(4);
+        let fanout = Fanout::new(vec![tx]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle =
+            tokio::spawn(async move { input.run_until_shutdown(fanout, shutdown_rx).await });
+
+        tokio::task::yield_now().await; // let the loop consume interval's immediate first tick
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await; // ...and let the tick it just made due actually drain
+        let first = batch_of(rx.try_recv().expect("the interval tick should have sent a batch"));
+        assert_eq!(metric_names(&first), vec!["logit.input.datagrams"]);
+
+        component_telemetry.count("logit.input.decode.errors", 1.0, &[]);
+        shutdown_tx.send(true).expect("the run task holds a receiver");
+
+        handle.await.expect("the drain task should not panic").expect("should return Ok(())");
+
+        let second = batch_of(rx.try_recv().expect("the final drain should have sent a batch"));
+        assert_eq!(
+            metric_names(&second),
+            vec!["logit.input.decode.errors"],
+            "the final drain carries only what was buffered since the last tick"
+        );
+        assert!(rx.try_recv().is_err(), "exactly two batches for two drains");
+    }
+
+    /// `run` is what the `Input` trait contract requires to work standalone, and it now reaches
+    /// the same loop through a never-firing `watch` channel -- so the thing worth pinning is that
+    /// it still drains on every interval and never returns on its own.
+    #[tokio::test(start_paused = true)]
+    async fn run_keeps_draining_on_every_interval() {
+        let registry = Registry::new();
+        let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        component_telemetry.count("logit.input.datagrams", 1.0, &[]);
+
+        let mut input = InternalInput::new(Duration::from_secs(60), registry);
+        let (tx, mut rx) = mpsc::channel(4);
+        let fanout = Fanout::new(vec![tx]);
+
+        let handle = tokio::spawn(async move { input.run(fanout).await });
+
+        tokio::task::yield_now().await; // let the loop consume interval's immediate first tick
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        let first = batch_of(rx.try_recv().expect("the first interval tick should have drained"));
+        assert_eq!(metric_names(&first), vec!["logit.input.datagrams"]);
+
+        component_telemetry.count("logit.input.decode.errors", 1.0, &[]);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        let second = batch_of(rx.try_recv().expect("the second interval tick should have drained"));
+        assert_eq!(metric_names(&second), vec!["logit.input.decode.errors"]);
+
+        assert!(!handle.is_finished(), "run should keep ticking, not return on its own");
+        handle.abort();
     }
 }

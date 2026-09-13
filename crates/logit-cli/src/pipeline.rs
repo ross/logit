@@ -901,24 +901,23 @@ fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::U
 /// 17 already guarantees a non-datagram-, non-tail-listener's `receive` is `ReceiveConfig::
 /// default()` by the time a resolved `Graph` reaches `build_spec`, so `internal` always gets
 /// `shutdown_grace: ReceiveConfig::default().shutdown_grace` here (5s today, not
-/// `Duration::ZERO`) regardless of what any `receive:` block would otherwise say. For `internal`
-/// that's harmless, not just unused, only because `InternalInput` never overrides `Input::
-/// run_until_shutdown`: the default impl's own `select!` always resolves at t=shutdown against a
-/// non-overriding input, so `run_input`'s grace backstop -- built from this value -- never gets a
-/// chance to matter. If `internal` ever gains a cooperative drain of its own, this stops being a
-/// harmless default and needs its own `receive.shutdown_grace`-shaped knob rather than inheriting
-/// whatever `ReceiveConfig::default` happens to say.
+/// `Duration::ZERO`) regardless of what any `receive:` block would otherwise say. That fixed 5s
+/// is load-bearing for `internal` rather than merely harmless: `InternalInput` overrides `Input::
+/// run_until_shutdown` to drain its buffered points one final time when shutdown fires
+/// (`crates/logit-inputs/src/internal.rs`), so `run_input`'s grace backstop is what bounds that
+/// drain. One `Registry::drain` plus one `Fanout::send` fits inside 5s with room to spare.
 ///
-/// `tail_in`/`docker_in` and, now, `logit_in` are the listeners where this value is genuinely
-/// load-bearing rather than incidentally harmless: `TailInput` (`crates/logit-inputs/src/tail/
-/// driver.rs`) overrides `run_until_shutdown` to flush every tracked file's accumulator and
-/// write a final checkpoint, and `LogitInput` (`crates/logit-inputs/src/logit.rs`) overrides it
-/// to close every idle connection with `Reject{GOING_AWAY}` -- either drain must fit inside
-/// `shutdown_grace` or `run_input`'s backstop cancels it by drop, losing whatever it hadn't
-/// flushed/closed yet. `logit_in` falls under rule 17's non-datagram, non-tail bucket, so unlike
-/// `tail_in`/`docker_in` it always gets the fixed 5s default here -- there is no
-/// `receive:`-shaped knob to override it with (`docs/known-gaps.md` tracks this as the one
-/// currently un-tunable case).
+/// `tail_in`/`docker_in`, `logit_in` and `internal` are the listeners where this value is
+/// genuinely load-bearing rather than incidentally harmless: `TailInput`
+/// (`crates/logit-inputs/src/tail/driver.rs`) overrides `run_until_shutdown` to flush every
+/// tracked file's accumulator and write a final checkpoint, `LogitInput`
+/// (`crates/logit-inputs/src/logit.rs`) overrides it to close every idle connection with
+/// `Reject{GOING_AWAY}`, and `InternalInput` overrides it for the final drain above -- each of
+/// those has to fit inside `shutdown_grace` or `run_input`'s backstop cancels it by drop, losing
+/// whatever it hadn't flushed/closed/drained yet. `logit_in` and `internal` fall under rule 17's
+/// non-datagram, non-tail bucket, so unlike `tail_in`/`docker_in` they always get the fixed 5s
+/// default here -- there is no `receive:`-shaped knob to override it with
+/// (`docs/known-gaps.md` tracks this as the currently un-tunable case).
 fn input_runtime_config(receive: &logit_config::ReceiveConfig) -> InputRuntimeConfig {
     InputRuntimeConfig { shutdown_grace: receive.shutdown_grace }
 }
