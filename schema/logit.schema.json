@@ -1438,7 +1438,7 @@
           ],
           "properties": {
             "connect_timeout": {
-              "description": "TCP only, ignored for UDP. See `SyslogOut::connect_timeout`.",
+              "description": "TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a dropped connection) is allowed to take before `send` reports it as a failure.",
               "default": "5s",
               "type": "string"
             },

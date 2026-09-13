@@ -1053,7 +1053,8 @@ pub enum ComponentKind {
         #[serde(default = "default_statsd_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,
-        /// TCP only, ignored for UDP. See `SyslogOut::connect_timeout`.
+        /// TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a
+        /// dropped connection) is allowed to take before `send` reports it as a failure.
         #[serde(default = "default_statsd_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
