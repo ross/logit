@@ -37,7 +37,9 @@
 //!   which still clone the bytes rendered once at construction. A templated *metric name* is the
 //!   one exception: it is interned rather than copied, so it pays `interner::intern`'s cost per
 //!   event and permanently grows the interner by one entry per distinct rendering (`{seq%1000}` in
-//!   a metric name means a thousand interned names -- see `docs/design/memory.md` §4).
+//!   a metric name means a thousand interned names -- see `docs/design/memory.md` §4). That is why
+//!   a metric name may use `{seq%N}` but **not** a bare `{seq}`, which would intern a fresh,
+//!   never-freed name per event: rejected at construction here and by graph rule 42 in config.
 //!
 //! `now_nanos()` is read once per batch, not per event, the same way every decoder amortizes it
 //! across a datagram.
@@ -150,6 +152,27 @@ fn resolve_var(name: &str) -> anyhow::Result<GenVar> {
         "generate_in: '{{{name}}}' is not a placeholder generate_in substitutes -- only '{{seq}}' \
          and '{{seq%N}}' (N written as digits, at least 1)"
     )
+}
+
+/// [`resolve_var`], minus the unbounded one, for the one field whose rendering is **interned**
+/// rather than copied: `event.metric.name`.
+///
+/// A bare `{seq}` there would intern a fresh, never-freed `Symbol` for every event a run
+/// generates -- a million-event scenario would leave a million metric names in the process-wide
+/// interner (`docs/design/memory.md` §4: interning is monotonic, nothing is ever removed), which
+/// is a leak in the shape of a feature rather than a cardinality knob. `{seq%N}` is bounded by
+/// `N` and stays allowed; that is what a scenario wanting metric-name cardinality actually means.
+/// Graph rule 42 rejects the same thing at validation time, for a `logit run` that never reaches
+/// this.
+fn resolve_metric_name_var(name: &str) -> anyhow::Result<GenVar> {
+    match resolve_var(name)? {
+        GenVar::SeqMod(modulus) => Ok(GenVar::SeqMod(modulus)),
+        GenVar::Seq => anyhow::bail!(
+            "generate_in: a metric name may not use '{{seq}}' -- a metric name is interned for \
+             the life of the process, so an unbounded one would intern a fresh name per event. \
+             Use '{{seq%N}}' to generate a bounded set of N names"
+        ),
+    }
 }
 
 /// Appends one placeholder's rendering. `write!` into a `String` is infallible, so the `Result`
@@ -341,6 +364,9 @@ impl GenerateInput {
 
     /// The metric stamped on every generated event. Omitted means no metrics -- a logs-only
     /// scenario.
+    ///
+    /// `name` may use `{seq%N}` but **not** a bare `{seq}`: a metric name is interned, and an
+    /// interned `Symbol` lives for the life of the process. See [`resolve_metric_name_var`].
     pub fn with_metric(
         mut self,
         name: Template,
@@ -349,7 +375,7 @@ impl GenerateInput {
     ) -> anyhow::Result<Self> {
         let name = match name.literal() {
             Some(bytes) => MetricName::Fixed(intern(&String::from_utf8_lossy(bytes))),
-            None => MetricName::Templated(name.compile(resolve_var)?),
+            None => MetricName::Templated(name.compile(resolve_metric_name_var)?),
         };
         self.metric = Some(MetricSpec { name, kind, value });
         self.path = RenderPath::Undecided;
@@ -919,6 +945,38 @@ mod tests {
         assert!(GenerateInput::new(Some(1), 1)
             .with_attribute("host", parse("h{seq%+5}").unwrap())
             .is_err());
+    }
+
+    /// A metric name is interned, and an interned `Symbol` is never freed -- so a bare `{seq}`
+    /// there would leave one never-reclaimed name per generated event in the process-wide
+    /// interner. Rejected at construction, and by graph rule 42 before that in a `logit run`.
+    #[test]
+    fn a_bare_seq_in_a_metric_name_is_rejected_at_construction() {
+        let err = GenerateInput::new(Some(1), 1)
+            .with_metric(parse("requests.{seq}").unwrap(), GenerateMetricKind::Sum, 1.0)
+            .expect_err("a bare {seq} in a metric name should be rejected");
+        let err = format!("{err}");
+        assert!(err.contains("interned for the life of the process"), "got: {err}");
+        assert!(err.contains("{seq%N}"), "got: {err}");
+    }
+
+    /// ...while a *bounded* one is exactly what metric-name cardinality means, and stays allowed.
+    #[test]
+    fn a_bounded_seq_modulo_in_a_metric_name_is_accepted() {
+        assert!(GenerateInput::new(Some(1), 1)
+            .with_metric(parse("requests.{seq%100}").unwrap(), GenerateMetricKind::Sum, 1.0)
+            .is_ok());
+    }
+
+    /// The same reasoning does *not* apply to a log body or an attribute value: those are copied
+    /// per event, not interned, so an unbounded `{seq}` costs one allocation and frees with the
+    /// event.
+    #[test]
+    fn a_bare_seq_is_still_allowed_outside_a_metric_name() {
+        assert!(GenerateInput::new(Some(1), 1).with_log(parse("{seq}").unwrap()).is_ok());
+        assert!(GenerateInput::new(Some(1), 1)
+            .with_attribute("n", parse("{seq}").unwrap())
+            .is_ok());
     }
 
     #[test]

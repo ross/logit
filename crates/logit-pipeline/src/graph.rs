@@ -150,7 +150,10 @@
 //!     unknown placeholder is rejected here rather than rendered literally or as nothing: a
 //!     mistyped `{seg}` would otherwise silently collapse a scenario's intended cardinality to a
 //!     single series, which is the difference between measuring an aggregation window and
-//!     measuring nothing. The var-name check lives in `generate_var_is_valid` so that
+//!     measuring nothing. `event.metric.name` is narrower still -- only `{seq%N}`, never a bare
+//!     `{seq}`: a metric name is *interned*, and `logit_core::interner` never removes a `Symbol`,
+//!     so an unbounded name would intern a fresh one per generated event (a process-lifetime
+//!     leak, not a cardinality knob). The var-name check lives in `generate_var_is_valid` so that
 //!     `logit-inputs`' own `compile` resolver can mirror it exactly without depending on
 //!     `logit-config` (`docs/design/pipeline-graph.md`'s crate layout). `receive:` on a
 //!     `generate_in` is rejected by rule 17's own allowlist -- it is a listener by role, with no
@@ -1602,7 +1605,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             );
         }
         if let Some(log) = &event.log {
-            check_generate_template(id, "event.log", log)?;
+            check_generate_template(id, "event.log", log, Rendering::Copied)?;
         }
         for (key, value) in &event.attributes {
             if key.is_empty() {
@@ -1611,7 +1614,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      no name could never be read back"
                 );
             }
-            check_generate_template(id, &format!("event.attributes.{key}"), value)?;
+            check_generate_template(
+                id,
+                &format!("event.attributes.{key}"),
+                value,
+                Rendering::Copied,
+            )?;
         }
         for (key, value) in resource {
             if key.is_empty() {
@@ -1620,7 +1628,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      no name could never be read back"
                 );
             }
-            check_generate_template(id, &format!("resource.{key}"), value)?;
+            check_generate_template(id, &format!("resource.{key}"), value, Rendering::Copied)?;
         }
         if let Some(metric) = &event.metric {
             if metric.name.is_empty() {
@@ -1635,7 +1643,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     metric.value
                 );
             }
-            check_generate_template(id, "event.metric.name", &metric.name)?;
+            check_generate_template(id, "event.metric.name", &metric.name, Rendering::Interned)?;
         }
     }
 
@@ -1706,10 +1714,29 @@ fn generate_var_is_valid(name: &str) -> bool {
     }
 }
 
+/// What becomes of one `generate_in` template's rendering, which is what decides whether an
+/// *unbounded* placeholder is legal in it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rendering {
+    /// Copied onto the event and freed with it: `event.log`, an attribute value, a resource
+    /// value. An unbounded `{seq}` costs one allocation per render and nothing beyond it.
+    Copied,
+    /// Interned: `event.metric.name`. `logit_core::interner` is monotonic -- a `Symbol` is never
+    /// removed (`docs/design/memory.md` §4) -- so an unbounded set of renderings is an unbounded,
+    /// process-lifetime leak rather than a cardinality knob.
+    Interned,
+}
+
 /// Rule 42's per-field template check: it must parse, and every placeholder in it must be one
-/// [`generate_var_is_valid`] recognizes. `field` is the dotted config path (`event.log`,
-/// `resource.service.name`) so the error names what to go and fix.
-fn check_generate_template(id: &str, field: &str, raw: &str) -> anyhow::Result<()> {
+/// [`generate_var_is_valid`] recognizes -- plus, for an [`Rendering::Interned`] field, must be
+/// *bounded*. `field` is the dotted config path (`event.log`, `resource.service.name`) so the
+/// error names what to go and fix.
+fn check_generate_template(
+    id: &str,
+    field: &str,
+    raw: &str,
+    rendering: Rendering,
+) -> anyhow::Result<()> {
     let template = logit_core::template::parse(raw)
         .map_err(|err| anyhow::anyhow!("component '{id}': '{field}' is not a template: {err}"))?;
     for var in template.vars() {
@@ -1717,6 +1744,13 @@ fn check_generate_template(id: &str, field: &str, raw: &str) -> anyhow::Result<(
             anyhow::bail!(
                 "component '{id}': '{field}' names the placeholder '{{{var}}}', which generate_in \
                  doesn't substitute -- only '{{seq}}' and '{{seq%N}}' (N at least 1)"
+            );
+        }
+        if rendering == Rendering::Interned && var == "seq" {
+            anyhow::bail!(
+                "component '{id}': '{field}' may not use '{{seq}}' -- a metric name is interned \
+                 for the life of the process, so an unbounded one would intern a fresh name per \
+                 generated event. Use '{{seq%N}}' for a bounded set of N names"
             );
         }
     }
@@ -5131,6 +5165,72 @@ mod tests {
                 "{name}: got: {err}"
             );
         }
+    }
+
+    /// A metric name is *interned*, and `logit_core::interner` never removes a `Symbol`, so a
+    /// bare `{seq}` there would intern a fresh, never-reclaimed name for every event a run
+    /// generates -- a process-lifetime leak rather than the cardinality knob it reads as. Only
+    /// the bounded `{seq%N}` form is accepted in that one position.
+    #[test]
+    fn a_bare_seq_in_a_generate_in_metric_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            (
+                "gen",
+                vec![],
+                generate_in_with_event(generate_event(
+                    None,
+                    vec![],
+                    Some(generate_metric("requests.{seq}", 1.0)),
+                )),
+            ),
+            ("sink", vec!["gen"], null_out()),
+        ]));
+        assert!(
+            err.contains("'gen'")
+                && err.contains("'event.metric.name' may not use '{seq}'")
+                && err.contains("interned for the life of the process"),
+            "got: {err}"
+        );
+    }
+
+    /// The bounded form stays legal in that same position -- it is what metric-name cardinality
+    /// actually means, and `N` bounds the interner growth.
+    #[test]
+    fn a_bounded_seq_modulus_in_a_generate_in_metric_name_resolves() {
+        resolve(cfg(vec![
+            (
+                "gen",
+                vec![],
+                generate_in_with_event(generate_event(
+                    None,
+                    vec![],
+                    Some(generate_metric("requests.{seq%100}", 1.0)),
+                )),
+            ),
+            ("sink", vec!["gen"], null_out()),
+        ]))
+        .expect("a bounded metric-name modulus is the point of the feature");
+    }
+
+    /// ...and the same bare `{seq}` stays legal everywhere it is *copied* onto the event rather
+    /// than interned, which is every other templated field: the copy frees with its event.
+    #[test]
+    fn a_bare_seq_is_accepted_outside_a_generate_in_metric_name() {
+        resolve(cfg(vec![
+            (
+                "gen",
+                vec![],
+                generate_in_full(
+                    None,
+                    100,
+                    None,
+                    generate_event(Some("n={seq}"), vec![("n", "{seq}")], None),
+                    vec![("shard", "{seq}")],
+                ),
+            ),
+            ("sink", vec!["gen"], null_out()),
+        ]))
+        .expect("a copied rendering is freed with its event, so an unbounded seq is fine");
     }
 
     /// `u64::from_str` would accept `+5`, which would make `{seq%+5}` a silent second spelling of

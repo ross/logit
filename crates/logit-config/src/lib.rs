@@ -136,9 +136,13 @@ pub enum GenerateMetricKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GenerateMetric {
-    /// The metric's name. A template like every other `generate_in` string field: `{seq}` /
-    /// `{seq%N}` substitute here too, which is how a scenario generates a wide *metric-name*
-    /// cardinality rather than a wide attribute cardinality. Required and non-empty (rule 42).
+    /// The metric's name. A template like every other `generate_in` string field, with one
+    /// narrowing: **only `{seq%N}`, never a bare `{seq}`** (rule 42). A metric name is *interned*
+    /// and an interned name is never freed, so an unbounded one would leave a fresh,
+    /// never-reclaimed name behind for every event a run generates -- a process-lifetime leak
+    /// rather than the cardinality knob it reads as. `{seq%N}` is bounded by `N`, and is how a
+    /// scenario generates a wide *metric-name* cardinality rather than a wide attribute one.
+    /// Required and non-empty (rule 42).
     pub name: String,
     /// Which metric kind to produce. Defaults to `sum`.
     #[serde(default)]
