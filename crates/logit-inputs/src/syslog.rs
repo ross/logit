@@ -189,12 +189,14 @@ impl SyslogInput {
 
     /// Attaches a component id to this listener's diagnostics -- and to the [`SyslogDecoder`] it
     /// wraps, so both report under the same id. Both halves matter on either transport: the
-    /// driver's own `diag` is what a whole-datagram or whole-frame failure reports through
-    /// (`decode_loop`'s `bad_datagram`, the TCP driver's `bad_frame`/`framing_error`/
-    /// `connection_error`); the decoder's own `diag` field is what a malformed *line* inside an
-    /// otherwise-valid datagram or frame reports through (`bad_line`) -- two distinct
-    /// `Diagnostics` values that must both carry the same id and telemetry handle, or one class
-    /// of decode failure silently reports under no component id and with telemetry disabled.
+    /// driver's own `diag` is what a transport-level failure reports through (`decode_loop`'s
+    /// `bad_datagram`, the TCP driver's `framing_error`/`connection_error`); the decoder's own
+    /// `diag` field is what a rejected syslog message reports through (`bad_line`) -- for a whole
+    /// frame on TCP just as much as for one line inside a multi-line datagram, since
+    /// [`Decoder::decode_into`] is infallible here and never hands the driver a frame to report
+    /// as its own `bad_frame` (that key is for a fallible decoder). Two distinct `Diagnostics`
+    /// values that must both carry the same id and telemetry handle, or one class of decode
+    /// failure silently reports under no component id and with telemetry disabled.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.inner = match self.inner {
             Inner::Udp(listener) => Inner::Udp(
