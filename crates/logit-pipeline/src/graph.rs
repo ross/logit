@@ -33,21 +33,24 @@
 //! 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` -- a config error, not
 //!     something to clamp silently.
 //! 17. A non-default `receive:` block is rejected on any kind that is not a datagram listener
-//!     (today `statsd_in`/`collectd_in`/`syslog_in`) or a tail listener (`tail_in`/`docker_in`) --
-//!     `receive:` (`docs/adr/decoupled-listener-io.md`) configures a listener's receive-side
-//!     batch assembly, and a datagram listener's socket-side receive queue on top of that. A
-//!     tail listener has no such queue (the tailed file is its own durable buffer), so it may
-//!     only set `receive`'s batch-assembly/shutdown-grace fields -- a queue-bounding field
-//!     (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) is rejected by name on
-//!     one. Deliberately **not** `role(&kind) != Role::Listener`: `internal` and `generate_in`
-//!     are listeners by role but have no socket, no queue, and no decoder, so `receive:` on
-//!     either would be a silently-ignored setting -- exactly what this rule exists to catch on
-//!     the sink side (rule 14). A future listener kind rejects `receive:` until it is actually
-//!     wired to one of these two drivers.
+//!     (today `statsd_in`/`collectd_in`/`syslog_in`/`graphite_in` under `transport: udp`), a
+//!     **stream listener** (`graphite_in` under `transport: tcp`), or a tail listener
+//!     (`tail_in`/`docker_in`) -- `receive:` (`docs/adr/decoupled-listener-io.md`) configures a
+//!     listener's receive-side batch assembly, and a datagram listener's socket-side receive
+//!     queue on top of that. Neither a tail listener (the tailed file is its own durable buffer)
+//!     nor a stream listener (TCP's own flow control is the backpressure, ADR
+//!     `graphite-carbon-relay`) has such a queue, so either may only set `receive`'s
+//!     batch-assembly/shutdown-grace fields -- a queue-bounding field (`max_datagrams`,
+//!     `max_bytes`, `overflow`, `receive_buffer_bytes`) is rejected by name on one. Deliberately
+//!     **not** `role(&kind) != Role::Listener`: `internal` and `generate_in` are listeners by
+//!     role but have no socket, no queue, and no decoder, so `receive:` on either would be a
+//!     silently-ignored setting -- exactly what this rule exists to catch on the sink side (rule
+//!     14). A future listener kind rejects `receive:` until it is actually wired to one of these
+//!     three drivers.
 //! 18. A datagram listener's `receive.max_datagrams` or `receive.max_bytes` of `0` is rejected;
-//!     a datagram or tail listener's `receive.batch_max_events` or `receive.batch_max_bytes` of
-//!     `0` is rejected -- each an impossible bound, the twin of rule 15.
-//!     `receive.batch_flush_interval: 0s` is **not** rejected: it means "no flush timer," a
+//!     a datagram, stream or tail listener's `receive.batch_max_events` or
+//!     `receive.batch_max_bytes` of `0` is rejected -- each an impossible bound, the twin of rule
+//!     15. `receive.batch_flush_interval: 0s` is **not** rejected: it means "no flush timer," a
 //!     meaningful setting, unlike the count bounds.
 //! 19. A `trace_context` with an empty `trace_id`, `span_id`, or `flags` field name is rejected
 //!     -- it could never name a real attribute, so that lookup can only ever be a no-op, the same
@@ -158,17 +161,40 @@
 //!     `logit-config` (`docs/design/pipeline-graph.md`'s crate layout). `receive:` on a
 //!     `generate_in` is rejected by rule 17's own allowlist -- it is a listener by role, with no
 //!     socket, queue, or decoder for `receive:` to configure (`docs/plans/load-test-harness.md`).
+//! 43. A `graphite_in`'s (and, once `graphite_out` lands, a `graphite_out`'s) protocol/transport
+//!     combination and size bounds (`docs/adr/graphite-carbon-relay.md`). `protocol: pickle`
+//!     requires `transport: tcp`: carbon's pickle wire is a 4-byte big-endian length prefix
+//!     around each batch (Twisted's `Int32StringReceiver`), which has no meaning in a datagram
+//!     that already delimits itself, so the combination could only ever mis-frame rather than
+//!     work slightly worse. `max_line_bytes` and `max_frame_bytes` of `0` are rejected -- the
+//!     impossible bound of rules 9/15/18/38 again: every line, or every frame, would exceed it.
+//!     `max_frame_bytes` is additionally bounded to `1024..=16 MiB`: below 1024 no real carbon
+//!     batch fits, and above 16 MiB one frame's declared length is a bigger allocation than any
+//!     sender has a reason to ask for -- the same "a bound above what the transport can honestly
+//!     carry is a silent failure, not a generous setting" reasoning rule 38 applies to
+//!     `collectd_out`'s `MaxPacketSize` range. (`graphite_out`'s half of this rule -- its own
+//!     `protocol`/`transport` pair, its `max_frame_bytes`, and a `connect_timeout` of `0` --
+//!     lands with that component and is checked in the same block.)
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
 //! it is required (by 7) to have a consumer, so the chain can only terminate at a sink.
 
 use logit_config::{
-    BufferConfig, Component, ComponentKind, Compression, Config, ReceiveConfig, StreamFormat,
+    BufferConfig, Component, ComponentKind, Compression, Config, GraphiteProtocol,
+    GraphiteTransport, ReceiveConfig, StreamFormat,
 };
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
+
+/// Rule 43's bound on a `graphite_in`/`graphite_out` `max_frame_bytes`. The lower end is the
+/// smallest frame a real carbon pickle batch fits in; the upper is 16 MiB, past which a frame's
+/// *declared* length is a larger allocation than any sender has a reason to ask for -- the same
+/// shape rule 38 gives `collectd_out`'s `MaxPacketSize` range. The default
+/// (`logit_proto::graphite::DEFAULT_MAX_FRAME_BYTES`, Twisted's own `MAX_LENGTH`) sits at 1 MiB,
+/// comfortably inside it.
+const GRAPHITE_FRAME_BYTES_RANGE: std::ops::RangeInclusive<u64> = 1024..=16 * 1024 * 1024;
 
 /// A component's arity class, fixed by its `kind` (`docs/design/pipeline-graph.md`'s arity
 /// table) -- never derived from topology, so a typo'd source reference can't silently reclassify
@@ -201,6 +227,7 @@ pub fn role(kind: &ComponentKind) -> Role {
     match kind {
         StatsdIn { .. }
         | CollectdIn { .. }
+        | GraphiteIn { .. }
         | SyslogIn { .. }
         | OtlpIn { .. }
         | TailIn { .. }
@@ -255,6 +282,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
     match kind {
         StatsdIn { .. } => "statsd_in",
         CollectdIn { .. } => "collectd_in",
+        GraphiteIn { .. } => "graphite_in",
         SyslogIn { .. } => "syslog_in",
         OtlpIn { .. } => "otlp_in",
         TailIn { .. } => "tail_in",
@@ -305,6 +333,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
         kind,
         ComponentKind::StatsdIn { .. }
             | ComponentKind::CollectdIn { .. }
+            | ComponentKind::GraphiteIn { .. }
             | ComponentKind::SyslogIn { .. }
             | ComponentKind::OtlpIn { .. }
             | ComponentKind::TailIn { .. }
@@ -667,10 +696,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 17: `receive:` is a datagram- or tail-listener-only concept -- see this module's own
-    // doc comment on why this checks dedicated predicates rather than `role() == Role::Listener`
-    // (which would wrongly also permit `internal`). A tail listener has no receive *queue* (the
-    // tailed file is its own durable buffer), so it may only set the batch-assembly/shutdown-
+    // Rule 17: `receive:` is a datagram-, stream- or tail-listener-only concept -- see this
+    // module's own doc comment on why this checks dedicated predicates rather than `role() ==
+    // Role::Listener` (which would wrongly also permit `internal`). Neither a tail listener (the
+    // tailed file is its own durable buffer) nor a stream listener (TCP's own flow control is the
+    // backpressure) has a receive *queue*, so either may only set the batch-assembly/shutdown-
     // grace fields `receive:` also carries -- the queue-bounding fields
     // (`max_datagrams`/`max_bytes`/`overflow`/`receive_buffer_bytes`) stay datagram-only and are
     // named individually here, not just rejected as "any non-default field", so the error points
@@ -682,7 +712,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         if is_datagram_listener(&component.kind) {
             continue;
         }
-        if is_tail_listener(&component.kind) {
+        if is_tail_listener(&component.kind) || is_stream_listener(&component.kind) {
             let default = ReceiveConfig::default();
             let queue_only_field = if component.receive.max_datagrams != default.max_datagrams {
                 Some("max_datagrams")
@@ -696,10 +726,16 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 None
             };
             if let Some(field) = queue_only_field {
+                let no_queue_because = if is_stream_listener(&component.kind) {
+                    "a stream listener has no receive queue (TCP's own flow control is the \
+                     backpressure)"
+                } else {
+                    "a tail listener has no receive queue"
+                };
                 anyhow::bail!(
                     "component '{id}': 'receive.{field}' is only meaningful on a datagram \
-                     listener (statsd_in, collectd_in, syslog_in) -- a tail listener has no \
-                     receive queue; \
+                     listener (statsd_in, collectd_in, syslog_in, graphite_in with transport: \
+                     udp) -- {no_queue_because}; \
                      only receive.batch_max_events, batch_max_bytes, batch_flush_interval, and \
                      shutdown_grace apply"
                 );
@@ -707,8 +743,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             continue;
         }
         anyhow::bail!(
-            "component '{id}': 'receive' is only meaningful on a datagram or tail listener \
-             (statsd_in, collectd_in, syslog_in, tail_in, docker_in), but '{id}' is a {}",
+            "component '{id}': 'receive' is only meaningful on a datagram, stream or tail \
+             listener (statsd_in, collectd_in, syslog_in, graphite_in, tail_in, docker_in), but \
+             '{id}' is a {}",
             role(&component.kind).as_str()
         );
     }
@@ -717,7 +754,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // of the four count/byte bounds is an impossible bound, never a small one.
     // `batch_flush_interval: 0s` is deliberately not checked here: zero there means "no timer,"
     // a meaningful setting. `max_datagrams`/`max_bytes` (the receive *queue*'s own bounds) are
-    // datagram-listener-only, since a tail listener has no such queue (rule 17).
+    // datagram-listener-only, since neither a tail nor a stream listener has such a queue
+    // (rule 17).
     for (id, component) in &components {
         if is_datagram_listener(&component.kind) {
             if component.receive.max_datagrams == 0 {
@@ -733,7 +771,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 );
             }
         }
-        if is_datagram_listener(&component.kind) || is_tail_listener(&component.kind) {
+        if is_datagram_listener(&component.kind)
+            || is_tail_listener(&component.kind)
+            || is_stream_listener(&component.kind)
+        {
             if component.receive.batch_max_events == 0 {
                 anyhow::bail!(
                     "component '{id}': 'receive.batch_max_events' must be at least 1 -- 0 means \
@@ -1647,6 +1688,60 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 43: `graphite_in`'s protocol/transport pair and size bounds
+    // (`docs/adr/graphite-carbon-relay.md`). Carbon's pickle wire is a 4-byte big-endian length
+    // prefix around each batch (Twisted's `Int32StringReceiver`), which has no meaning in a
+    // datagram that already delimits itself -- so `protocol: pickle` over UDP could only ever
+    // mis-frame, and is a config error rather than a degraded mode. The zero checks are rules
+    // 9/15/18/38's impossible-bound shape; the `max_frame_bytes` range is rule 38's
+    // "a bound the transport cannot honestly carry is a silent failure, not a generous setting"
+    // applied to a length-prefixed frame: below 1024 no real carbon batch fits, and above 16 MiB
+    // one declared length is a larger allocation than any sender has a reason to ask for.
+    //
+    // `graphite_out`'s half of this rule -- its own `protocol`/`transport` pair, its
+    // `max_frame_bytes`, and a `connect_timeout` of `0` -- belongs in this same block when that
+    // component lands; the shared constants and the error wording below are written to be reused
+    // rather than duplicated.
+    for (id, component) in &components {
+        if let ComponentKind::GraphiteIn {
+            transport,
+            protocol,
+            max_line_bytes,
+            max_frame_bytes,
+            ..
+        } = &component.kind
+        {
+            if *protocol == GraphiteProtocol::Pickle && *transport != GraphiteTransport::Tcp {
+                anyhow::bail!(
+                    "component '{id}': protocol: pickle requires transport: tcp -- carbon frames \
+                     a pickle batch with a 4-byte big-endian length prefix (Twisted's \
+                     Int32StringReceiver), which has no meaning in a datagram that already \
+                     delimits itself"
+                );
+            }
+            if *max_line_bytes == 0 {
+                anyhow::bail!(
+                    "component '{id}': max_line_bytes: 0 would skip every plaintext line -- use \
+                     a positive byte size"
+                );
+            }
+            if *max_frame_bytes == 0 {
+                anyhow::bail!(
+                    "component '{id}': max_frame_bytes: 0 would refuse every pickle frame -- use \
+                     a positive byte size"
+                );
+            }
+            if !GRAPHITE_FRAME_BYTES_RANGE.contains(max_frame_bytes) {
+                anyhow::bail!(
+                    "component '{id}': max_frame_bytes: {max_frame_bytes} is outside \
+                     1024..=16777216 -- below 1024 no real carbon pickle batch fits, and above \
+                     16MiB a frame's declared length is a larger allocation than any sender has \
+                     a reason to ask for"
+                );
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         let Component { sources, buffer, receive, kind } = component;
@@ -1670,7 +1765,24 @@ fn is_datagram_listener(kind: &ComponentKind) -> bool {
         ComponentKind::StatsdIn { .. }
             | ComponentKind::CollectdIn { .. }
             | ComponentKind::SyslogIn { .. }
+            | ComponentKind::GraphiteIn { transport: GraphiteTransport::Udp, .. }
     )
+}
+
+/// The predicate rules 17/18 need for a **stream** listener: one that assembles batches on the
+/// receive side but has no receive *queue*, because its transport cannot drop silently.
+/// `graphite_in` under `transport: tcp` is the only one today
+/// (`crates/logit-inputs/src/graphite/tcp.rs`): ADR `decoupled-listener-io`'s queue exists for a
+/// UDP socket's invisible drops, and TCP's own flow control is the backpressure instead, so the
+/// queue-bounding fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) are as
+/// meaningless on one as they are on a tail listener -- and are rejected by name for the same
+/// reason, rather than silently ignored.
+///
+/// Kept explicit alongside [`is_datagram_listener`] and [`is_tail_listener`], never derived from
+/// [`Role`]: a future listener kind rejects `receive:` until it is actually wired to one of the
+/// three drivers.
+fn is_stream_listener(kind: &ComponentKind) -> bool {
+    matches!(kind, ComponentKind::GraphiteIn { transport: GraphiteTransport::Tcp, .. })
 }
 
 /// The predicate rules 17/18/28 need: which `ComponentKind`s the file-tailing driver
@@ -3803,7 +3915,7 @@ mod tests {
         ]));
         assert!(err.contains("'agg'"), "got: {err}");
         assert!(
-            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            err.contains("'receive' is only meaningful on a datagram, stream or tail listener"),
             "got: {err}"
         );
     }
@@ -3816,7 +3928,7 @@ mod tests {
         ]));
         assert!(err.contains("'out'"), "got: {err}");
         assert!(
-            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            err.contains("'receive' is only meaningful on a datagram, stream or tail listener"),
             "got: {err}"
         );
     }
@@ -3833,7 +3945,7 @@ mod tests {
         ]));
         assert!(err.contains("'self'"), "got: {err}");
         assert!(
-            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            err.contains("'receive' is only meaningful on a datagram, stream or tail listener"),
             "got: {err}"
         );
     }
@@ -4840,8 +4952,9 @@ mod tests {
     }
 
     /// `receive:` stays rejected on `prometheus_in` via rule 17's explicit allowlist -- it's a
-    /// listener by role, but not one of the two drivers (`is_datagram_listener`/
-    /// `is_tail_listener`) rule 17 actually wires `receive:` to, so a non-default block on it is
+    /// listener by role, but not one of the three drivers (`is_datagram_listener`/
+    /// `is_stream_listener`/`is_tail_listener`) rule 17 actually wires `receive:` to, so a
+    /// non-default block on it is
     /// caught the same way `internal`'s own is.
     #[test]
     fn a_non_default_receive_on_prometheus_in_is_rejected() {
@@ -4856,7 +4969,7 @@ mod tests {
         ]));
         assert!(err.contains("'in'"), "got: {err}");
         assert!(
-            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            err.contains("'receive' is only meaningful on a datagram, stream or tail listener"),
             "got: {err}"
         );
     }
@@ -4913,6 +5026,227 @@ mod tests {
             ("out", vec!["in"], sink(), ReceiveConfig::default()),
         ]));
         assert!(err.contains("'receive.max_datagrams' must be at least 1"), "got: {err}");
+    }
+
+    // ---- graphite_in + rule 43 (docs/adr/graphite-carbon-relay.md) ----------------------------
+
+    fn graphite_in(transport: GraphiteTransport, protocol: GraphiteProtocol) -> ComponentKind {
+        graphite_in_sized(transport, protocol, 8192, 1 << 20)
+    }
+
+    /// The same with both size bounds spelled out -- an enum variant has no functional-record-
+    /// update syntax, so rule 43's bound tests take this rather than `..graphite_in(..)`.
+    fn graphite_in_sized(
+        transport: GraphiteTransport,
+        protocol: GraphiteProtocol,
+        max_line_bytes: u64,
+        max_frame_bytes: u64,
+    ) -> ComponentKind {
+        ComponentKind::GraphiteIn {
+            bind: "0.0.0.0:2003".to_string(),
+            transport,
+            protocol,
+            max_line_bytes,
+            max_frame_bytes,
+        }
+    }
+
+    #[test]
+    fn a_graphite_in_resolves_as_an_implemented_listener() {
+        let kind = graphite_in(GraphiteTransport::Tcp, GraphiteProtocol::Plaintext);
+        assert_eq!(kind_name(&kind), "graphite_in");
+        assert_eq!(role(&kind), Role::Listener);
+        let graph = resolve(cfg(vec![
+            ("in", vec![], graphite_in(GraphiteTransport::Tcp, GraphiteProtocol::Plaintext)),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("a graphite_in should resolve");
+        assert_eq!(graph.components["in"].role(), Role::Listener);
+        assert_eq!(graph.components["in"].kind_name(), "graphite_in");
+    }
+
+    /// Rule 6's arity table: a listener has no `sources` of its own, whichever transport it runs.
+    #[test]
+    fn a_graphite_in_with_sources_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("first", vec![], graphite_in(GraphiteTransport::Udp, GraphiteProtocol::Plaintext)),
+            ("in", vec!["first"], graphite_in(GraphiteTransport::Tcp, GraphiteProtocol::Plaintext)),
+            ("out", vec!["in", "first"], sink()),
+        ]));
+        assert!(err.contains("'in'") && err.contains("listener"), "got: {err}");
+    }
+
+    /// Rule 43's headline check: carbon's pickle wire is a length-prefixed stream framing, which a
+    /// self-delimiting datagram has no use for.
+    #[test]
+    fn a_graphite_in_with_pickle_over_udp_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], graphite_in(GraphiteTransport::Udp, GraphiteProtocol::Pickle)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("protocol: pickle requires transport: tcp"), "got: {err}");
+    }
+
+    #[test]
+    fn a_graphite_in_with_pickle_over_tcp_resolves() {
+        resolve(cfg(vec![
+            ("in", vec![], graphite_in(GraphiteTransport::Tcp, GraphiteProtocol::Pickle)),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("pickle over TCP is carbon's own port-2004 listener");
+    }
+
+    /// Rule 43's impossible bounds, the shape rules 9/15/18/38 share: `0` means *nothing can ever
+    /// get through*, which is a config error rather than a small setting.
+    #[test]
+    fn a_graphite_in_with_a_zero_size_bound_is_rejected() {
+        for (field, kind) in [
+            (
+                "max_line_bytes",
+                graphite_in_sized(GraphiteTransport::Tcp, GraphiteProtocol::Plaintext, 0, 1 << 20),
+            ),
+            (
+                "max_frame_bytes",
+                graphite_in_sized(GraphiteTransport::Tcp, GraphiteProtocol::Pickle, 8192, 0),
+            ),
+        ] {
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains(&format!("{field}: 0")), "got: {err}");
+        }
+    }
+
+    /// Rule 43's range: below 1024 no real carbon batch fits; above 16 MiB a frame's *declared*
+    /// length is a bigger allocation than any sender has a reason to ask for. The default sits
+    /// comfortably inside, which the resolving half of this test pins.
+    #[test]
+    fn a_graphite_in_max_frame_bytes_is_bounded() {
+        for out_of_range in [1023u64, 16 * 1024 * 1024 + 1] {
+            let err = expect_err(cfg(vec![
+                (
+                    "in",
+                    vec![],
+                    graphite_in_sized(
+                        GraphiteTransport::Tcp,
+                        GraphiteProtocol::Pickle,
+                        8192,
+                        out_of_range,
+                    ),
+                ),
+                ("out", vec!["in"], sink()),
+            ]));
+            assert!(err.contains("outside 1024..=16777216"), "got: {err}");
+        }
+        for in_range in [1024u64, 1 << 20, 16 * 1024 * 1024] {
+            resolve(cfg(vec![
+                (
+                    "in",
+                    vec![],
+                    graphite_in_sized(
+                        GraphiteTransport::Tcp,
+                        GraphiteProtocol::Pickle,
+                        8192,
+                        in_range,
+                    ),
+                ),
+                ("out", vec!["in"], sink()),
+            ]))
+            .unwrap_or_else(|e| panic!("{in_range} is inside the range: {e}"));
+        }
+    }
+
+    /// A UDP `graphite_in` is a datagram listener, so the *whole* `receive:` block applies to it
+    /// -- the property `is_datagram_listener`'s new arm exists to carry.
+    #[test]
+    fn a_non_default_receive_on_a_udp_graphite_in_is_allowed() {
+        let graph = resolve(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                graphite_in(GraphiteTransport::Udp, GraphiteProtocol::Plaintext),
+                non_default_receive(),
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("a udp graphite_in is a datagram listener, so receive: applies to it");
+        assert_eq!(graph.components["in"].receive.max_datagrams, 4096);
+    }
+
+    /// A TCP `graphite_in` has no receive queue at all (TCP's own flow control is the
+    /// backpressure), so a queue-bounding field is rejected **by name** rather than silently
+    /// ignored -- the treatment rule 17 already gives a tail listener.
+    #[test]
+    fn a_queue_bounding_receive_field_on_a_tcp_graphite_in_is_rejected_by_name() {
+        for (field, receive) in [
+            ("max_datagrams", ReceiveConfig { max_datagrams: 4096, ..ReceiveConfig::default() }),
+            ("max_bytes", ReceiveConfig { max_bytes: 1024, ..ReceiveConfig::default() }),
+            (
+                "overflow",
+                ReceiveConfig {
+                    overflow: logit_config::OverflowPolicy::Block,
+                    ..ReceiveConfig::default()
+                },
+            ),
+            (
+                "receive_buffer_bytes",
+                ReceiveConfig { receive_buffer_bytes: Some(1 << 20), ..ReceiveConfig::default() },
+            ),
+        ] {
+            let err = expect_err(cfg_with_receive(vec![
+                (
+                    "in",
+                    vec![],
+                    graphite_in(GraphiteTransport::Tcp, GraphiteProtocol::Plaintext),
+                    receive,
+                ),
+                ("out", vec!["in"], sink(), ReceiveConfig::default()),
+            ]));
+            assert!(err.contains(&format!("'receive.{field}'")), "got: {err}");
+            assert!(err.contains("a stream listener has no receive queue"), "got: {err}");
+        }
+    }
+
+    /// The other half of rule 17's split: batch assembly and `shutdown_grace` *are* meaningful on
+    /// a TCP listener -- it runs its own `BatchAccumulator` per connection -- so those fields must
+    /// pass.
+    #[test]
+    fn a_batch_assembly_receive_field_on_a_tcp_graphite_in_is_allowed() {
+        let graph = resolve(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                graphite_in(GraphiteTransport::Tcp, GraphiteProtocol::Plaintext),
+                ReceiveConfig {
+                    batch_max_events: 42,
+                    shutdown_grace: Duration::from_secs(9),
+                    ..ReceiveConfig::default()
+                },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("a tcp graphite_in assembles batches, so those receive: fields apply");
+        assert_eq!(graph.components["in"].receive.batch_max_events, 42);
+        assert_eq!(graph.components["in"].receive.shutdown_grace, Duration::from_secs(9));
+    }
+
+    /// Rule 18's zero-bound check reaches a TCP `graphite_in` through `is_stream_listener`, and a
+    /// UDP one through `is_datagram_listener`.
+    #[test]
+    fn a_zero_batch_bound_on_a_graphite_in_is_rejected_on_both_transports() {
+        for transport in [GraphiteTransport::Tcp, GraphiteTransport::Udp] {
+            let err = expect_err(cfg_with_receive(vec![
+                (
+                    "in",
+                    vec![],
+                    graphite_in(transport, GraphiteProtocol::Plaintext),
+                    ReceiveConfig { batch_max_events: 0, ..ReceiveConfig::default() },
+                ),
+                ("out", vec!["in"], sink(), ReceiveConfig::default()),
+            ]));
+            assert!(
+                err.contains("'receive.batch_max_events' must be at least 1"),
+                "{transport:?}: got: {err}"
+            );
+        }
     }
 
     // ---- rule 41: prometheus_out --------------------------------------------------------------
@@ -5284,7 +5618,7 @@ mod tests {
         ]));
         assert!(err.contains("'gen'"), "got: {err}");
         assert!(
-            err.contains("'receive' is only meaningful on a datagram or tail listener"),
+            err.contains("'receive' is only meaningful on a datagram, stream or tail listener"),
             "got: {err}"
         );
     }
