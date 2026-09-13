@@ -37,11 +37,20 @@
 //! any TLS accept, and counted as `logit.input.connections.rejected{reason="limit"}`. The
 //! `logit.input.connections` gauge correspondingly counts permit holders only.
 //!
-//! **Pre-handshake timeout.** [`HANDSHAKE_TIMEOUT`] bounds the TLS accept inside each connection
-//! task, for the same reason `logit_in` bounds its own: without it, a client that opens a
-//! connection and never sends a ClientHello pins a connection-limit permit forever. There is
-//! deliberately *no* idle timeout after a successful handshake -- a handshaken-then-silent
-//! connection still holds its permit indefinitely, the same known gap `otlp_in` has
+//! **Pre-handshake timeout.** [`HANDSHAKE_TIMEOUT`] bounds each of a connection's two pre-message
+//! phases *independently*, exactly as `logit_in` bounds its own two: the TLS accept (in the accept
+//! loop's `Some` arm, when TLS is configured) and then the wait for the connection's very first
+//! byte, inside [`serve_connection`], which starts a fresh budget of the same length rather than
+//! inheriting a shared deadline. So on the TLS path the worst case is two of these back to back --
+//! 10s at the default -- before a connection that has said nothing gives up its permit.
+//!
+//! **The first-byte bound applies on both arms, plaintext included.** It has to: `syslog_in` with
+//! no `tls:` block is the default shape, and without it 1024 connections that complete the TCP
+//! handshake and then send nothing would hold every permit forever, at a cost to the peer of 1024
+//! SYNs and no bytes. The bound is on the *first* byte specifically -- i.e. until [`Framer`] has
+//! latched a [`Framing`] -- because that is the phase with no legitimate reason to be slow; after
+//! it there is deliberately *no* idle timeout, so a connection that sent one frame and then went
+//! quiet holds its permit indefinitely, the same known gap `otlp_in` has
 //! (`docs/known-gaps.md`).
 
 use crate::Input;
@@ -51,7 +60,7 @@ use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
 use logit_proto::Decoder;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -194,7 +203,9 @@ impl Framer {
         self.framing
     }
 
-    /// Bytes held but not yet formed into a frame -- for tests and for the EOF accounting.
+    /// Bytes held but not yet formed into a frame. Read by `report_buffered_tail` on the paths
+    /// that end a connection without ever reaching [`Framer::finish`] -- a peer RST mid-message,
+    /// or shutdown -- so a discarded partial frame is still counted rather than vanishing.
     pub fn buffered(&self) -> usize {
         self.buf.len()
     }
@@ -558,6 +569,21 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
         let live_connections = Arc::new(AtomicI64::new(0));
         let handshake_timeout = self.handshake_timeout;
         let config = self.config;
+        // One shared `Diagnostics` for the two per-frame keys, so their throttle is listener-wide
+        // rather than per connection. `logit_core::Diagnostics` derives a plain `Clone` over its
+        // own per-key counts, so the per-connection clone below starts every connection back at
+        // zero -- and since a framing error is fatal to its connection, `framing_error` would then
+        // sit at count 1 forever and warn on every single occurrence, one log line per TCP
+        // handshake from a peer looping connect / send-a-bad-frame / close. `udp.rs` gets
+        // listener-wide `bad_datagram` throttling for free by handing one clone to its single
+        // `decode_loop`; a stream listener has one task per connection, so it takes a real shared
+        // handle. `with_diagnostics`'s own doc already describes these keys as listener-scoped.
+        //
+        // A `std::sync::Mutex`, not tokio's: it is locked only on an error branch, never on the
+        // happy path, and never held across an `.await`. `connection_error` deliberately keeps the
+        // per-connection clone below -- it is inherited verbatim from `logit_in`/`otlp_in`, and
+        // forking that convention here is not this driver's call to make.
+        let frame_diag = Arc::new(std::sync::Mutex::new(self.diag.clone()));
 
         loop {
             let (stream, _peer) = tokio::select! {
@@ -589,6 +615,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
             let conn_shutdown = shutdown.clone();
             let live_connections = Arc::clone(&live_connections);
             let decoder = self.decoder.clone();
+            let frame_diag = Arc::clone(&frame_diag);
 
             tokio::spawn(async move {
                 // Held for exactly as long as this task runs -- a TLS accept that fails or times
@@ -610,9 +637,10 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                                     tls_stream,
                                     decoder,
                                     config,
+                                    handshake_timeout,
                                     sink,
                                     telemetry.clone(),
-                                    diag.clone(),
+                                    frame_diag,
                                     conn_shutdown,
                                 )
                                 .await
@@ -623,14 +651,18 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                             )),
                         }
                     }
+                    // No TLS to bound, but `serve_connection`'s own first-byte deadline still
+                    // applies -- see this module's "Pre-handshake timeout" doc section for why
+                    // this arm needs it just as much as the TLS one.
                     None => {
                         serve_connection(
                             stream,
                             decoder,
                             config,
+                            handshake_timeout,
                             sink,
                             telemetry.clone(),
-                            diag.clone(),
+                            frame_diag,
                             conn_shutdown,
                         )
                         .await
@@ -700,19 +732,29 @@ async fn read_step<S: AsyncRead + Unpin + Send>(
 /// Owns its own [`Framer`], [`BatchAccumulator`] and decoder clone, so nothing here is shared with
 /// any sibling connection. Flushes on the accumulator's own bounds, on `batch_flush_interval`, on
 /// shutdown, and on close (clean or otherwise).
+///
+/// `handshake_timeout` bounds the wait for this connection's *first* byte -- see this module's
+/// "Pre-handshake timeout" doc section. Passed on both arms of the accept loop, TLS or not.
+#[allow(clippy::too_many_arguments)] // one connection's whole context; a params struct would only move it
 async fn serve_connection<S, D>(
     mut stream: S,
     mut decoder: D,
     config: TcpListenerConfig,
+    handshake_timeout: Duration,
     sink: Fanout,
     telemetry: Telemetry,
-    mut diag: Diagnostics,
+    frame_diag: Arc<Mutex<Diagnostics>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
     D: Decoder + Send,
 {
+    // Absolute, computed once, rather than a budget re-armed per read: the read below is re-entered
+    // on every `batch_flush_interval` tick (the `Err(_elapsed) => continue` arm), so a per-read
+    // budget would be reset by each 100ms tick and never actually fire. Only ever consulted while
+    // `framer` has not yet latched a `Framing`, i.e. before this connection's first byte.
+    let first_byte_deadline = tokio::time::Instant::now() + handshake_timeout;
     let mut framer = Framer::new();
     // Reused across every read, cleared (not replaced) between them, so its allocated capacity
     // survives from one read to the next.
@@ -748,6 +790,7 @@ where
         // already true when this iteration started". The `Ref` temporary is dropped at the end of
         // this statement, well before any `.await`.
         if *shutdown.borrow() {
+            report_buffered_tail(&framer, &telemetry, &frame_diag);
             if let Some(batch) = accumulator.take() {
                 emit(&sink, &telemetry, batch, FlushReason::Shutdown).await;
             }
@@ -755,19 +798,41 @@ where
         }
 
         read_buf.clear();
-        let step = match next_flush {
+        // Two independent deadlines can bound this read: the flush tick (recurring, benign) and
+        // the first-byte deadline (once, fatal). Race whichever comes first, then decide which it
+        // was -- `timeout_at`, not `timeout`, so the first-byte deadline stays absolute across
+        // however many flush ticks elapse before it.
+        let awaiting_first_byte = framer.framing().is_none();
+        let read_deadline = match (next_flush, awaiting_first_byte) {
+            (Some(flush), true) => Some(flush.min(first_byte_deadline)),
+            (Some(flush), false) => Some(flush),
+            (None, true) => Some(first_byte_deadline),
+            (None, false) => None,
+        };
+        let step = match read_deadline {
             None => read_step(&mut stream, &mut read_buf, &mut shutdown).await,
             Some(deadline) => {
-                let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
-                match tokio::time::timeout(
-                    wait,
+                match tokio::time::timeout_at(
+                    deadline,
                     read_step(&mut stream, &mut read_buf, &mut shutdown),
                 )
                 .await
                 {
                     Ok(step) => step,
-                    // The flush deadline won -- loop back round to the interval trigger above.
-                    Err(_elapsed) => continue,
+                    Err(_elapsed) => {
+                        // Checked against the clock rather than inferred from which deadline was
+                        // smaller, so a flush tick landing on the same instant can't mask it.
+                        // Returning `Err` is what routes this through the accept loop's
+                        // `connection_error` diagnostic and drops the permit.
+                        if awaiting_first_byte && tokio::time::Instant::now() >= first_byte_deadline
+                        {
+                            return Err(anyhow::anyhow!(
+                                "the peer sent no bytes within {handshake_timeout:?}"
+                            ));
+                        }
+                        // The flush deadline won -- loop back round to the interval trigger above.
+                        continue;
+                    }
                 }
             }
         };
@@ -775,6 +840,7 @@ where
         match step {
             ReadStep::Bytes => {}
             ReadStep::Shutdown => {
+                report_buffered_tail(&framer, &telemetry, &frame_diag);
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Shutdown).await;
                 }
@@ -793,12 +859,14 @@ where
                             &mut accumulator,
                             &sink,
                             &telemetry,
-                            &mut diag,
+                            &frame_diag,
                         )
                         .await;
                     }
                     Ok(None) => {}
-                    Err(err) => report_frame_error(&err, &telemetry, &mut diag),
+                    Err(err) => {
+                        report_frame_error(&err, &telemetry, &frame_diag);
+                    }
                 }
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Closed).await;
@@ -808,6 +876,7 @@ where
             ReadStep::Failed(err) => {
                 // The connection broke, but whatever was already decoded is still good -- deliver
                 // it before surfacing the error as this connection's `connection_error`.
+                report_buffered_tail(&framer, &telemetry, &frame_diag);
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Closed).await;
                 }
@@ -830,7 +899,7 @@ where
                         &mut accumulator,
                         &sink,
                         &telemetry,
-                        &mut diag,
+                        &frame_diag,
                     )
                     .await;
                 }
@@ -839,7 +908,7 @@ where
                     // Neither framing can resynchronize past one of these (see [`FrameError`]), so
                     // this connection ends here -- diagnosed on its own key rather than bubbling
                     // up as a `connection_error`, since the cause is the peer's framing, not I/O.
-                    report_frame_error(&err, &telemetry, &mut diag);
+                    report_frame_error(&err, &telemetry, &frame_diag);
                     if let Some(batch) = accumulator.take() {
                         emit(&sink, &telemetry, batch, FlushReason::Closed).await;
                     }
@@ -862,7 +931,7 @@ async fn absorb_frame<D: Decoder + Send>(
     accumulator: &mut BatchAccumulator,
     sink: &Fanout,
     telemetry: &Telemetry,
-    diag: &mut Diagnostics,
+    frame_diag: &Mutex<Diagnostics>,
 ) {
     telemetry.count("logit.input.frames", 1.0, &[]);
     telemetry.count("logit.input.frame.bytes", frame.len() as f64, &[]);
@@ -876,17 +945,60 @@ async fn absorb_frame<D: Decoder + Send>(
             }
         }
         Err(err) => {
-            diag.warn_throttled("bad_frame", err);
+            warn_frame_throttled(frame_diag, "bad_frame", err);
         }
     }
 }
 
 /// Counts and diagnoses a framing failure. Its own diagnostic key, not `connection_error`: an
 /// operator triaging "my sender's frames are being rejected" is looking at something quite
-/// different from "a peer's socket broke".
-fn report_frame_error(err: &FrameError, telemetry: &Telemetry, diag: &mut Diagnostics) {
+/// different from "a peer's socket broke". Returns whether the diagnostic actually reported (i.e.
+/// was not throttled), so a test can assert the listener-wide cadence directly.
+fn report_frame_error(
+    err: &FrameError,
+    telemetry: &Telemetry,
+    frame_diag: &Mutex<Diagnostics>,
+) -> bool {
     telemetry.count("logit.input.frames.dropped", 1.0, &[("reason", err.reason())]);
-    diag.warn_throttled("framing_error", err);
+    warn_frame_throttled(frame_diag, "framing_error", err)
+}
+
+/// A partial frame still held by the [`Framer`] when a connection ends *without* a clean EOF --
+/// a peer RST mid-message, or this listener shutting down before the sender finished one.
+///
+/// Dropping those bytes is correct (nobody ever sent a complete message, and on shutdown the
+/// sender has not finished), but dropping them *silently* is the gap: the identical bytes followed
+/// by a FIN would be emitted by [`Framer::finish`] under non-transparent framing or counted
+/// `truncated` under octet counting, and `logit.input.frames.dropped{reason="truncated"}` exists
+/// precisely to make this class visible. A no-op when nothing is buffered, which is the ordinary
+/// case on both paths.
+fn report_buffered_tail(framer: &Framer, telemetry: &Telemetry, frame_diag: &Mutex<Diagnostics>) {
+    let held = framer.buffered();
+    if held == 0 {
+        return;
+    }
+    report_frame_error(
+        &FrameError::Truncated(format!(
+            "the connection ended abruptly with {held} byte(s) of an incomplete frame buffered"
+        )),
+        telemetry,
+        frame_diag,
+    );
+}
+
+/// Reports one per-frame diagnostic through the listener-wide throttle -- see the `frame_diag`
+/// handle's own comment in `run_until_shutdown` for why these two keys need a shared
+/// [`Diagnostics`] rather than the per-connection clone `connection_error` uses. The guard never
+/// outlives this call, so it is never held across an `.await`.
+fn warn_frame_throttled(
+    frame_diag: &Mutex<Diagnostics>,
+    key: &'static str,
+    msg: impl std::fmt::Display,
+) -> bool {
+    // A poisoned lock means some other connection panicked mid-report; the counts themselves are
+    // still perfectly usable, and losing the throttle entirely would be the worse outcome.
+    let mut diag = frame_diag.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    diag.warn_throttled(key, msg)
 }
 
 /// `sink.send` mints a fresh [`logit_pipeline::TraceContext::new_root`] here -- once per
@@ -1285,11 +1397,18 @@ mod tests {
     /// Reads one byte, expecting the peer to have closed instead.
     async fn expect_closed<S: AsyncRead + Unpin>(stream: &mut S, what: &str) {
         let mut buf = [0u8; 1];
-        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+        let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
             .await
-            .unwrap_or_else(|_| panic!("{what}: expected a close within 2s"))
-            .expect("read should not fail outright");
-        assert_eq!(n, 0, "{what}: expected a close, got a byte");
+            .unwrap_or_else(|_| panic!("{what}: expected a close within 2s"));
+        match result {
+            Ok(n) => assert_eq!(n, 0, "{what}: expected a close, got a byte"),
+            // A close with bytes still unread in the peer's receive queue is an RST, not a FIN
+            // (Linux `tcp_close`), and a read after RST is `ECONNRESET` -- still a close. The
+            // oversize-frame test writes more than the server ever reads, so which of the two it
+            // gets depends on socket-buffer sizes rather than on anything under test.
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(err) => panic!("{what}: read failed outright: {err}"),
+        }
     }
 
     /// The value of `metric`'s `Sum` in a drained `Registry` snapshot, optionally restricted to
@@ -1572,6 +1691,154 @@ mod tests {
         handle.abort();
     }
 
+    /// The throttle `report_frame_error` reports through has to be shared across connections to
+    /// work at all: a framing error is fatal to its connection, so against a per-connection
+    /// `Diagnostics` clone the count would sit at 1 forever and every single occurrence would
+    /// warn. Asserted on `warn_throttled`'s own return value, since the `tracing` output itself is
+    /// only capturable on the emitting thread and these reports come from spawned tasks.
+    #[test]
+    fn the_per_frame_diagnostic_throttle_is_shared_not_per_connection() {
+        let frame_diag = Mutex::new(Diagnostics::new("syslog_in"));
+        let telemetry = Telemetry::default();
+        let err = FrameError::Malformed("an octet count of zero".to_string());
+
+        assert!(
+            report_frame_error(&err, &telemetry, &frame_diag),
+            "the 1st occurrence across the listener reports"
+        );
+        assert!(
+            report_frame_error(&err, &telemetry, &frame_diag),
+            "the 2nd reports too -- 2 is a power of two"
+        );
+        assert!(
+            !report_frame_error(&err, &telemetry, &frame_diag),
+            "the 3rd is suppressed, which a per-connection clone could never manage"
+        );
+    }
+
+    /// The wiring half of the test above: two separate connections' framing errors both land on
+    /// the one listener-wide handle, so both are counted on
+    /// `logit.component.diagnostics{key="framing_error"}` rather than each starting a fresh count.
+    #[tokio::test]
+    async fn two_connections_report_their_framing_errors_through_one_throttle() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener
+            .with_telemetry(telemetry.clone())
+            // Attached so `warn_throttled`'s own occurrence counter is observable -- see
+            // `Diagnostics`' `telemetry` field.
+            .with_diagnostics(Diagnostics::new("syslog_in").with_telemetry(telemetry));
+        let (sink, _rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        for attempt in 0..2 {
+            // A zero octet count: malformed, and fatal to its connection.
+            let mut client = connect(&addr).await;
+            client.write_all(b"0 nope").await.unwrap();
+            expect_closed(&mut client, &format!("connection {attempt} after a malformed count"))
+                .await;
+        }
+
+        let events = registry.drain(0);
+        assert_eq!(
+            sum_of(&events, "logit.input.frames.dropped", Some(("reason", "malformed"))),
+            Some(2.0)
+        );
+        assert_eq!(
+            sum_of(&events, "logit.component.diagnostics", Some(("key", "framing_error"))),
+            Some(2.0),
+            "both connections must report through the one listener-wide Diagnostics"
+        );
+
+        handle.abort();
+    }
+
+    /// The `ReadStep::Failed` path -- the one way a connection ends without `Framer::finish` ever
+    /// running, so a buffered partial frame would otherwise be discarded with no
+    /// `logit.input.frames.dropped` count and no diagnostic, while the identical bytes followed by
+    /// a FIN would be emitted as a final message.
+    ///
+    /// `SO_LINGER 0` is what makes it deterministic: it turns the client's `close` into an RST
+    /// rather than a FIN, so the server's blocked read fails with `ECONNRESET` instead of
+    /// reporting a clean EOF. The two writes are separate, with the first one's delivery awaited
+    /// in between, so the server has demonstrably consumed the tail into its framer before the RST
+    /// arrives -- an RST landing while bytes are still queued would discard them unread, which is
+    /// a different (and uncountable) case.
+    #[tokio::test]
+    async fn an_abrupt_close_with_a_buffered_partial_frame_counts_it_truncated() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener.with_telemetry(telemetry);
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>complete\n").await.unwrap();
+        // Awaiting the delivery proves the server finished that read and is back blocked in the
+        // next one, so the write below is what it picks up.
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>complete"]);
+
+        client.write_all(b"<13>unterminated").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        socket2::SockRef::from(&client)
+            .set_linger(Some(Duration::ZERO))
+            .expect("SO_LINGER should be settable on a loopback socket");
+        drop(client);
+
+        // The count lands on the connection's own task, after its read fails.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            sum_of(&registry.drain(0), "logit.input.frames.dropped", Some(("reason", "truncated"))),
+            Some(1.0),
+            "the partial frame the RST discarded must still be counted"
+        );
+
+        handle.abort();
+    }
+
+    /// The shutdown twin of the test above: a connection mid-message when the listener stops has
+    /// its partial frame counted too, rather than dropped in silence.
+    #[tokio::test]
+    async fn shutdown_mid_message_counts_the_buffered_partial_frame() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener.with_telemetry(telemetry);
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>complete\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>complete"]);
+
+        // Half a message, then shut the listener down: the sender never finished it, so dropping
+        // it is right -- being quiet about it is not.
+        client.write_all(b"<13>half a mes").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown_tx.send(true).expect("the receiver should still be alive");
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            closed.expect("the fanout should close within 2s").is_none(),
+            "nothing complete was pending, so no batch should follow"
+        );
+        assert_eq!(
+            sum_of(&registry.drain(0), "logit.input.frames.dropped", Some(("reason", "truncated"))),
+            Some(1.0)
+        );
+
+        handle.await.expect("the task should not panic").expect("shutdown should be clean");
+    }
+
     /// A framing error is fatal to *its* connection and to nothing else -- neither framing can
     /// resynchronize past one, but a sibling connection never saw it.
     #[tokio::test]
@@ -1718,6 +1985,67 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(500), rx.recv()).await.is_err(),
             "a client presenting no certificate must not deliver events"
         );
+
+        handle.abort();
+    }
+
+    /// The plaintext twin of the TLS test below, and the case that actually matters in production:
+    /// `syslog_in` with no `tls:` block is the default shape, so without a first-byte deadline on
+    /// this arm 1024 connections that complete the TCP handshake and send nothing would hold every
+    /// permit forever -- 1024 SYNs, no crypto, no bytes. Under `with_max_connections(1)` the second
+    /// client can only be served if the first one's permit genuinely came back.
+    #[tokio::test]
+    async fn a_silent_plaintext_connection_releases_its_permit_after_the_handshake_timeout() {
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener =
+            listener.with_max_connections(1).with_handshake_timeout(Duration::from_millis(50));
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        // Connected, not a byte sent, and held (not dropped) past the deadline -- so nothing but
+        // the deadline itself could free the permit.
+        let mut silent = connect(&addr).await;
+        expect_closed(&mut silent, "a plaintext connection that sent no bytes").await;
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>permit came back\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>permit came back"]);
+
+        drop(silent);
+        handle.abort();
+    }
+
+    /// A first-byte deadline must not become an idle deadline: once a connection has latched its
+    /// framing, a long gap before the next frame is ordinary (this module's "Pre-handshake
+    /// timeout" doc section says there is deliberately no idle timeout). With a 50ms budget and a
+    /// 100ms flush interval, this also exercises the interaction the naive wrapper would get
+    /// wrong -- several flush ticks elapse between the two frames.
+    #[tokio::test]
+    async fn the_first_byte_deadline_does_not_apply_once_the_framing_has_latched() {
+        // The flush timer left on (unlike `one_per_frame`), since a flush tick re-entering the
+        // read is exactly what a per-read budget would keep resetting.
+        let config = TcpListenerConfig {
+            batch_max_events: 1,
+            batch_flush_interval: Duration::from_millis(100),
+            ..TcpListenerConfig::default()
+        };
+        let (addr, listener) = bound_listener(config).await;
+        let mut listener = listener.with_handshake_timeout(Duration::from_millis(50));
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>first\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>first"]);
+
+        // Comfortably past the first-byte budget, and past several `batch_flush_interval` ticks.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        client.write_all(b"<13>much later\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>much later"]);
 
         handle.abort();
     }
