@@ -76,8 +76,11 @@ pub use crate::tls::TlsServerSettings;
 /// thing for an operator to learn.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
-/// How long a connection has to finish its TLS accept before this listener gives up on it and
-/// releases its connection-limit permit -- see this module's "Pre-handshake timeout" doc section.
+/// How long a connection has, per pre-message phase, before this listener gives up on it and
+/// releases its connection-limit permit: the TLS accept when TLS is configured, and -- on both
+/// arms, plaintext included -- the wait for the connection's first byte. Each phase gets its own
+/// budget of this length, so a TLS connection that says nothing at all costs two of them. See this
+/// module's "Pre-handshake timeout" doc section.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The largest single frame this driver will assemble, in bytes, for either framing.
@@ -438,6 +441,13 @@ pub struct TcpListener<D: Decoder + Clone + Send + 'static> {
     decoder: D,
     config: TcpListenerConfig,
     diag: Diagnostics,
+    /// The listener-wide throttle for the two per-frame diagnostic keys (`bad_frame`,
+    /// `framing_error`), shared by every connection task -- see the comment where it is cloned in
+    /// [`Input::run_until_shutdown`] for why those two keys cannot use the per-connection
+    /// `diag` clone that `connection_error` does. Held here rather than built inside
+    /// `run_until_shutdown` so it is one piece of listener state with one owner, settable by
+    /// [`Self::with_diagnostics`] and readable by a test.
+    frame_diag: Arc<Mutex<Diagnostics>>,
     telemetry: Telemetry,
     tls: Option<Arc<rustls::ServerConfig>>,
     /// Set by [`Input::bind`], taken back out by [`Input::run_until_shutdown`] -- the same
@@ -456,6 +466,7 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
             decoder,
             config,
             diag: Diagnostics::default(),
+            frame_diag: Arc::new(Mutex::new(Diagnostics::default())),
             telemetry: Telemetry::default(),
             tls: None,
             listener: None,
@@ -476,8 +487,17 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
     /// the full reasoning, and use [`Self::map_decoder`] to propagate the same value into a
     /// concrete decoder that needs it.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.frame_diag = Arc::new(Mutex::new(diag.clone()));
         self.diag = diag;
         self
+    }
+
+    /// Test-only handle on the shared per-frame throttle (the `frame_diag` field), so a test can
+    /// read `Diagnostics::occurrences` after driving several connections and confirm the count is
+    /// genuinely listener-wide. Taken before the listener is moved into its task.
+    #[cfg(test)]
+    fn frame_diag(&self) -> Arc<Mutex<Diagnostics>> {
+        Arc::clone(&self.frame_diag)
     }
 
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
@@ -527,8 +547,9 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
         self
     }
 
-    /// Test-only override of [`HANDSHAKE_TIMEOUT`] -- shortens the TLS-accept budget so a test can
-    /// observe a permit actually coming back without a multi-second sleep.
+    /// Test-only override of [`HANDSHAKE_TIMEOUT`] -- shortens both pre-message budgets (the TLS
+    /// accept and the first-byte wait, on either arm) so a test can observe a permit actually
+    /// coming back without a multi-second sleep.
     #[cfg(test)]
     fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
         self.handshake_timeout = handshake_timeout;
@@ -583,7 +604,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
         // happy path, and never held across an `.await`. `connection_error` deliberately keeps the
         // per-connection clone below -- it is inherited verbatim from `logit_in`/`otlp_in`, and
         // forking that convention here is not this driver's call to make.
-        let frame_diag = Arc::new(std::sync::Mutex::new(self.diag.clone()));
+        let frame_diag = Arc::clone(&self.frame_diag);
 
         loop {
             let (stream, _peer) = tokio::select! {
@@ -1716,25 +1737,35 @@ mod tests {
         );
     }
 
-    /// The wiring half of the test above: two separate connections' framing errors both land on
-    /// the one listener-wide handle, so both are counted on
-    /// `logit.component.diagnostics{key="framing_error"}` rather than each starting a fresh count.
+    /// The wiring half of the test above, and the half that discriminates against the bug: three
+    /// separate connections' framing errors must all land on the *same* [`Diagnostics`], so its
+    /// `framing_error` occurrence count reaches 3.
+    ///
+    /// Note what deliberately isn't asserted. `logit.component.diagnostics{key="framing_error"}`
+    /// and `logit.input.frames.dropped{reason="malformed"}` both reach 3 either way --
+    /// `Telemetry` mirrors into one shared component buffer no matter which `Diagnostics` value
+    /// did the counting -- so a metric assertion would pass against the per-connection clone this
+    /// test exists to rule out. `warn_throttled`'s return value is no help from out here either,
+    /// since the reports happen on spawned tasks. The occurrence count on the shared handle is the
+    /// one observable that differs: 3 when the handle is shared, and 0 when each connection counts
+    /// 1 in its own throwaway clone.
     #[tokio::test]
-    async fn two_connections_report_their_framing_errors_through_one_throttle() {
+    async fn three_connections_report_their_framing_errors_through_one_throttle() {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
         let (addr, listener) = bound_listener(one_per_frame()).await;
-        let mut listener = listener
-            .with_telemetry(telemetry.clone())
-            // Attached so `warn_throttled`'s own occurrence counter is observable -- see
-            // `Diagnostics`' `telemetry` field.
-            .with_diagnostics(Diagnostics::new("syslog_in").with_telemetry(telemetry));
+        let listener =
+            listener.with_telemetry(telemetry).with_diagnostics(Diagnostics::new("syslog_in"));
+        // Taken before the listener moves into its task -- this is the very handle every
+        // connection task reports through.
+        let frame_diag = listener.frame_diag();
         let (sink, _rx) = fanout_into_channel(16);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut listener = listener;
         let handle =
             tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
 
-        for attempt in 0..2 {
+        for attempt in 0..3 {
             // A zero octet count: malformed, and fatal to its connection.
             let mut client = connect(&addr).await;
             client.write_all(b"0 nope").await.unwrap();
@@ -1742,15 +1773,17 @@ mod tests {
                 .await;
         }
 
-        let events = registry.drain(0);
         assert_eq!(
-            sum_of(&events, "logit.input.frames.dropped", Some(("reason", "malformed"))),
-            Some(2.0)
+            frame_diag.lock().unwrap().occurrences("framing_error"),
+            3,
+            "all three connections must count on the one listener-wide Diagnostics -- a \
+             per-connection clone would leave this at 0, having counted 1 in each throwaway copy"
         );
+        // Weaker (it would hold either way, per this test's doc comment), but it does confirm the
+        // three errors were classified as malformed rather than as something else on the way.
         assert_eq!(
-            sum_of(&events, "logit.component.diagnostics", Some(("key", "framing_error"))),
-            Some(2.0),
-            "both connections must report through the one listener-wide Diagnostics"
+            sum_of(&registry.drain(0), "logit.input.frames.dropped", Some(("reason", "malformed"))),
+            Some(3.0)
         );
 
         handle.abort();
