@@ -42,14 +42,22 @@
 //! `now_nanos()` is read once per batch, not per event, the same way every decoder amortizes it
 //! across a datagram.
 //!
+//! The **resource** is a third case, because it is batch-level rather than per event: an
+//! all-literal resource is built once at construction and `Arc`-shared by every batch forever,
+//! and a templated one is rebuilt once per batch from that batch's *first* sequence number. So
+//! `resource: { host: "h{seq%10}" }` is a real multi-resource cardinality knob costing one
+//! `AttrMap` and one `Arc<Resource>` per batch and nothing per event -- with `batch` as its
+//! granularity. See [`GenerateInput::with_resource`].
+//!
 //! # Rate pacing
 //!
-//! `rate` is held against the *wall clock*, never a fixed `interval(batch / rate)` timer: the
-//! deadline for the batch about to be sent is `start + (sent + n) / rate`, recomputed from the
-//! run's own start every time, so a batch that ran late doesn't shift every later deadline. The
-//! average rate over a run holds instead of drifting. Above roughly a thousand batches per second
-//! the sleep granularity makes it bursty within any given millisecond -- accurate on average,
-//! ~1 ms granular in the small (`docs/known-gaps.md`).
+//! `rate` is held against the *wall clock*, never a fixed `interval(batch / rate)` timer: before
+//! sending a batch this input sleeps until `start + sent / rate`, recomputed from the run's own
+//! start every time, so a batch that ran late doesn't shift every later deadline. The average
+//! rate over a run holds instead of drifting, and the first batch goes out immediately rather
+//! than waiting out a batch-interval nothing has been generated in yet. Above roughly a thousand
+//! batches per second the sleep granularity makes it bursty within any given millisecond --
+//! accurate on average, ~1 ms granular in the small (`docs/known-gaps.md`).
 //!
 //! # Telemetry
 //!
@@ -233,6 +241,22 @@ impl MetricSpec {
     }
 }
 
+/// How a batch gets its [`Resource`] -- the batch-level mirror of [`RenderPath`], and independent
+/// of it: a templated resource on an all-literal event template still takes the prototype path
+/// for its events.
+#[derive(Debug, Clone)]
+enum ResourceSpec {
+    /// Every value is literal, which is the usual case: the resource was built once, at
+    /// construction, and every batch this input ever sends shares *this* `Arc`. Rebuilding it per
+    /// batch would re-intern every key and reallocate an `AttrMap` for a value that cannot
+    /// change; `InternalInput::resource` carries the same reasoning.
+    Fixed(Arc<Resource>),
+    /// At least one value has a placeholder: rebuilt once per batch from that batch's *first*
+    /// sequence number, so one `AttrMap` and one `Arc<Resource>` per batch and nothing per event.
+    /// See [`GenerateInput::with_resource`] for what that buys and what it means for `batch`.
+    Templated(Vec<(Symbol, Field)>),
+}
+
 /// Which of this module's two render paths applies -- settled on first use rather than in
 /// [`GenerateInput::new`], since a `with_*` builder may still add a templated field afterwards.
 #[derive(Debug, Clone)]
@@ -265,11 +289,7 @@ pub struct GenerateInput {
     /// only ever iterated, never looked up.
     attributes: Vec<(Symbol, Field)>,
     metric: Option<MetricSpec>,
-    /// Built once and `Arc`-shared by every batch this input ever sends -- the resource is
-    /// batch-level and identical on every batch, so rebuilding it per batch would re-intern every
-    /// key and reallocate an `AttrMap` for a value that cannot change. `InternalInput::resource`
-    /// carries the same reasoning.
-    resource: Arc<Resource>,
+    resource: ResourceSpec,
     path: RenderPath,
     /// One reused render buffer, `clear`ed per templated field -- it stops allocating entirely
     /// once it has grown to the widest rendering it has seen
@@ -289,7 +309,7 @@ impl GenerateInput {
             log: None,
             attributes: Vec::new(),
             metric: None,
-            resource: Arc::new(Resource::default()),
+            resource: ResourceSpec::Fixed(Arc::new(Resource::default())),
             path: RenderPath::Undecided,
             scratch: String::new(),
             diag: Diagnostics::default(),
@@ -334,27 +354,42 @@ impl GenerateInput {
         Ok(self)
     }
 
-    /// The resource every batch carries. Values may name placeholders, but **a resource template
-    /// is rendered exactly once per process, at `seq = 0`** -- not per event: the resource is
-    /// batch-level and `Arc`-shared by every event in every batch
-    /// (`logit_core::EventBatch::resource`), so a per-event rendering would have nowhere to go.
-    /// A placeholder here is therefore a way to write one fixed value, not a cardinality knob;
-    /// put cardinality in `event.attributes`, which really is per event.
+    /// The resource every batch carries. Values may name placeholders, and the unit a resource
+    /// template renders at is **one batch**, not one event: the resource is batch-level and
+    /// `Arc`-shared by every event in the batch (`logit_core::EventBatch::resource`), so a
+    /// per-event rendering would have nowhere to go. Each batch's resource is rendered from that
+    /// batch's *first* sequence number.
     ///
-    /// Takes raw strings rather than parsed [`Template`]s, unlike every other builder here, for
-    /// the same reason: this is the one field that never reaches the hot path, so there is nothing
-    /// for a caller to pre-parse on its behalf.
+    /// That makes `resource: { host: "h{seq%10}" }` a real multi-resource cardinality knob at
+    /// zero per-event cost -- one `AttrMap` and one `Arc<Resource>` per batch, nothing per event
+    /// -- which is what a scenario measuring resource grouping (`aggregate`'s
+    /// `logit.transform.resource.groups`, a sink that keys on the resource) actually needs. Two
+    /// consequences worth knowing: `batch` is the granularity, so a modulus finer than the number
+    /// of batches a run produces is silently coarser than it looks; and an all-literal resource
+    /// keeps the strictly cheaper path, built once at construction and `Arc`-shared by every
+    /// batch forever ([`ResourceSpec`]).
+    ///
+    /// Takes raw strings rather than parsed [`Template`]s, unlike every other builder here: a
+    /// resource value's parse is startup-only either way, so there is nothing for a caller to
+    /// pre-parse on its behalf.
     pub fn with_resource(mut self, resource: BTreeMap<String, String>) -> anyhow::Result<Self> {
-        let mut attributes = AttrMap::new();
-        let mut scratch = String::new();
+        let mut fields = Vec::with_capacity(resource.len());
         for (key, value) in &resource {
             let template = logit_core::template::parse(value).map_err(|err| {
                 anyhow::anyhow!("generate_in: resource {key:?} is not a template: {err}")
             })?;
-            let field = Field::new(&template)?;
-            attributes.insert_sym(intern(key), Value::Str(field.render(0, &mut scratch)));
+            fields.push((intern(key), Field::new(&template)?));
         }
-        self.resource = Arc::new(Resource { attributes, ..Default::default() });
+        self.resource = if fields.iter().all(|(_, field)| field.is_literal()) {
+            let mut attributes = AttrMap::new();
+            let mut scratch = String::new();
+            for (key, field) in &fields {
+                attributes.insert_sym(*key, Value::Str(field.render(0, &mut scratch)));
+            }
+            ResourceSpec::Fixed(Arc::new(Resource { attributes, ..Default::default() }))
+        } else {
+            ResourceSpec::Templated(fields)
+        };
         Ok(self)
     }
 
@@ -387,6 +422,11 @@ impl GenerateInput {
     /// measuring allocations must warm it, exactly like every other measurement in that crate.
     pub fn build_batch(&mut self, first_seq: u64, n: usize, now: i64) -> EventBatch {
         self.settle_render_path();
+        // Taken out and put back so the renders below can borrow it mutably while everything they
+        // render *from* is borrowed immutably -- and so its grown capacity survives across
+        // batches, which is what makes a warm scratch allocate nothing.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let resource = self.render_resource(first_seq, &mut scratch);
         let mut events = Vec::with_capacity(n);
         if let RenderPath::Prototype(prototype) = &self.path {
             for _ in 0..n {
@@ -398,16 +438,28 @@ impl GenerateInput {
                 events.push(event);
             }
         } else {
-            // Taken out and put back so the per-event render can borrow it mutably while
-            // everything it renders from is borrowed immutably -- and so its grown capacity
-            // survives across batches, which is what makes a warm scratch allocate nothing.
-            let mut scratch = std::mem::take(&mut self.scratch);
             for seq in first_seq..first_seq + n as u64 {
                 events.push(self.render_one(seq, now, &mut scratch));
             }
-            self.scratch = scratch;
         }
-        EventBatch { resource: self.resource.clone(), scope: None, events }
+        self.scratch = scratch;
+        EventBatch { resource, scope: None, events }
+    }
+
+    /// This batch's resource: the one shared `Arc` when every value is literal, or a fresh one
+    /// rendered from `first_seq` when any value is templated. See
+    /// [`GenerateInput::with_resource`].
+    fn render_resource(&self, first_seq: u64, scratch: &mut String) -> Arc<Resource> {
+        match &self.resource {
+            ResourceSpec::Fixed(resource) => resource.clone(),
+            ResourceSpec::Templated(fields) => {
+                let mut attributes = AttrMap::new();
+                for (key, field) in fields {
+                    attributes.insert_sym(*key, Value::Str(field.render(first_seq, scratch)));
+                }
+                Arc::new(Resource { attributes, ..Default::default() })
+            }
+        }
     }
 
     fn settle_render_path(&mut self) {
@@ -459,8 +511,8 @@ impl GenerateInput {
 
     /// Holds `rate` against the wall clock -- see this module's "Rate pacing" section for why the
     /// deadline is recomputed from `started` rather than slept for in fixed increments.
-    async fn pace(&mut self, started: Instant, target: u64, rate: u64) {
-        let due_at = started + Duration::from_secs_f64(target as f64 / rate as f64);
+    async fn pace(&mut self, started: Instant, sent: u64, rate: u64) {
+        let due_at = started + Duration::from_secs_f64(sent as f64 / rate as f64);
         let now = Instant::now();
         if now < due_at {
             tokio::time::sleep_until(due_at).await;
@@ -476,7 +528,7 @@ impl GenerateInput {
                 "rate_behind",
                 format!(
                     "generating slower than the configured rate of {rate}/s -- {behind:?} behind \
-                     after {target} events"
+                     after {sent} events"
                 ),
             );
         }
@@ -497,7 +549,7 @@ impl Input for GenerateInput {
                 None => self.batch,
             };
             if let Some(rate) = self.rate {
-                self.pace(started, sent + n as u64, rate).await;
+                self.pace(started, sent, rate).await;
             }
             let batch = self.build_batch(sent, n, now_nanos());
             sink.send(batch).await;
@@ -725,8 +777,8 @@ mod tests {
         assert_eq!(names, vec!["series.0", "series.1"]);
     }
 
-    /// The resource is built once and `Arc`-shared by every batch -- not rebuilt per batch, which
-    /// would re-intern every key for a value that cannot change.
+    /// An **all-literal** resource is built once and `Arc`-shared by every batch -- not rebuilt
+    /// per batch, which would re-intern every key for a value that cannot change.
     #[tokio::test]
     async fn every_batch_shares_one_resource_arc() {
         let input = GenerateInput::new(Some(4), 2)
@@ -744,23 +796,51 @@ mod tests {
         );
     }
 
-    /// A resource template is rendered **once**, at `seq = 0` -- documented behaviour, not an
-    /// oversight: the resource is batch-level and `Arc`-shared, so there is nowhere for a
-    /// per-event rendering to go.
+    /// A **templated** resource renders once per batch, from that batch's first sequence number
+    /// -- the multi-resource cardinality knob `with_resource` documents. Two consecutive batches
+    /// must therefore get genuinely different resources, and must *not* share an `Arc` the way
+    /// the literal case above does.
     #[tokio::test]
-    async fn a_templated_resource_value_is_rendered_once_at_seq_zero() {
+    async fn a_templated_resource_is_rendered_once_per_batch_from_its_first_seq() {
         let input = GenerateInput::new(Some(4), 2)
             .with_resource(BTreeMap::from([("shard".to_string(), "s{seq%4}".to_string())]))
             .unwrap();
         let batches = run_to_completion(input).await;
-        for batch in &batches {
-            assert_eq!(batch.resource.attributes.get("shard").and_then(|v| v.as_str()), Some("s0"));
-        }
+        assert_eq!(batches.len(), 2);
+
+        let shard = |batch: &EventBatch| {
+            batch.resource.attributes.get("shard").and_then(|v| v.as_str()).unwrap().to_string()
+        };
+        // Batch 0 covers seq 0..2 and batch 1 covers seq 2..4, so each renders its own first seq.
+        assert_eq!(shard(&batches[0]), "s0");
+        assert_eq!(shard(&batches[1]), "s2");
+        assert!(
+            !Arc::ptr_eq(&batches[0].resource, &batches[1].resource),
+            "a templated resource is a fresh Arc per batch, not the shared one"
+        );
     }
 
-    /// `rate` paces against the wall clock: with `rate: 1000` and `batch: 100`, no batch may be
-    /// sent before the 100 events it carries are actually due. Paused clock, so this asserts the
-    /// real arithmetic rather than a sleep's accuracy.
+    /// The cost side of the same rule: a templated resource is rendered once per *batch*, never
+    /// once per event -- every event in a batch reads the very same `Arc`, which is what keeps
+    /// this knob free on the per-event path.
+    #[test]
+    fn a_templated_resource_costs_nothing_per_event() {
+        let mut input = GenerateInput::new(None, 100)
+            .with_resource(BTreeMap::from([("host".to_string(), "h{seq%10}".to_string())]))
+            .unwrap();
+        let batch = input.build_batch(30, 4, 1);
+        assert_eq!(
+            batch.resource.attributes.get("host").and_then(|v| v.as_str()),
+            Some("h0"),
+            "seq 30 modulo 10"
+        );
+        assert_eq!(batch.events.len(), 4);
+    }
+
+    /// `rate` paces against the wall clock: a batch waits until the events already *sent* are due
+    /// at the configured rate, so the first goes out immediately and the second waits out the
+    /// 100 events the first carried. Paused clock, so this asserts the real arithmetic rather
+    /// than a sleep's accuracy.
     #[tokio::test(start_paused = true)]
     async fn rate_paces_batches_against_the_wall_clock() {
         let mut input = GenerateInput::new(Some(200), 100).with_rate(Some(1000));
@@ -774,11 +854,15 @@ mod tests {
         let second_at = started.elapsed();
 
         generating.await.expect("the task should not panic").expect("run returns Ok");
-        assert_eq!(first_at, Duration::from_millis(100), "100 events at 1000/s are due at +100ms");
+        assert_eq!(
+            first_at,
+            Duration::ZERO,
+            "nothing is owed yet, so the first batch is immediate"
+        );
         assert_eq!(
             second_at,
-            Duration::from_millis(200),
-            "the second batch's 100 events are due at +200ms, paced from the run's start"
+            Duration::from_millis(100),
+            "the 100 events already sent are due at +100ms at 1000/s, paced from the run's start"
         );
     }
 
