@@ -34,8 +34,16 @@ Everything here is reproducible:
 
 ## 0. What this measures, and what it doesn't
 
-**Measures**, per scenario, per repeat, from `wait4`'s rusage and the wall-clock gap between
-spawning the process and its generator's own `generation complete` line:
+**Measures**, per scenario, per repeat, from `wait4`'s rusage and two log lines the process itself
+emits under `--log-format json`: its own readiness line (`tracing::info!(target: "logit", "ready")`,
+logged once the bind pass has opened every listener's socket and every node has been spawned —
+`crates/logit-pipeline/src/runtime.rs`) and its generator's `generation complete` line. `wall_s` is
+the gap **from `ready` to completion**, not from spawn — process bring-up (loading the binary,
+binding sockets, spawning every node) happens before `generate_in` sends a single event, so folding
+it into `wall_s` would count startup as part of the graph's own per-event cost. A repeat whose
+`ready` line never arrives (a binary built without the log line, or an unexpected race) falls back
+to the old spawn → completion measurement for `wall_s`, loudly — `crate::run` prints a warning to
+that repeat's own stderr rather than silently reporting a startup-inflated number:
 
 - **events/s** — `count / wall_seconds`. Real, useful, but the noisiest of the three on a shared
   box (see the preamble above) — read it as a rough throughput sense, not the regression gate.
@@ -45,6 +53,11 @@ spawning the process and its generator's own `generation complete` line:
 - **peak RSS** — `ru_maxrss` (kibibytes on Linux, converted to bytes). Reported for every scenario,
   especially informative for `buffered` (real segment-file I/O and buffering), but never gates
   `compare`'s exit code unless `--rss-threshold` is passed explicitly.
+- **startup_s** — spawn → `ready`, alongside the other three (a column in `run`'s table, a field
+  next to `wall_s` in the results JSON). `compare` *warns* — never gates the exit code — on a
+  startup regression past `--threshold`: process bring-up is a different question from the graph's
+  own per-event cost, worth a human's attention without failing a throughput/CPU/RSS-focused gate.
+  `null` in the JSON (`n/a` in the table) for a repeat whose `ready` line never arrived.
 
 **Doesn't measure:**
 
@@ -214,12 +227,44 @@ W7a's 16k-790k range) is not yet established.
 repeats run back-to-back against a spool the harness never clears, a condition now known to add
 real, if only partly quantified, startup cost on top of whatever else is going on — it is not a
 steady-state number, and re-running `buffered` alone may well reproduce a different value depending
-on that spool's prior state. Deleting `perf/results/spool/` before a solo `buffered` comparison is
-the practical workaround today. **W8 (in flight)** is the harness-side follow-up that clears a
-disk-backed scenario's spool before each `run`/`attribute` invocation (filed in
-`docs/known-gaps.md`, not built in this docs-only workstream) — it's also what will show whether
-clearing the spool actually closes most of this gap or only a part of it. `buffered`'s own comment
-in `perf/scenarios/buffered.yaml` now carries this same, softened account.
+on that spool's prior state. That table predates the fix below; it is left as it was measured
+rather than silently edited, since §1's own preamble already frames every number there as
+this-machine-this-day.
+
+**W8 (landed here): the harness now clears the spool itself.** `script/perf run`/`attribute`/
+`flamegraph` remove every `buffer.disk.path` directory a scenario declares before each spawn — every
+repeat, not just once per invocation — refusing to touch anything outside `perf/results/`
+(`crates/logit-perf/src/spool.rs`). Manually deleting `perf/results/spool/` before a solo comparison
+is no longer necessary; the harness does it for you now, every time. Re-running `buffered` solo on
+this fix, `script/perf run --repeat 5 --profile release --scenario buffered`:
+
+```
+repeat 1/5: 884,613 events/s   1.810 µs/event   28.8 MiB peak RSS   0.003s startup
+repeat 2/5: 510,016 events/s   2.645 µs/event   30.6 MiB peak RSS   0.003s startup
+repeat 3/5: 837,626 events/s   1.929 µs/event   27.0 MiB peak RSS   0.004s startup
+repeat 4/5: 862,801 events/s   1.902 µs/event   24.8 MiB peak RSS   0.003s startup
+repeat 5/5: 792,157 events/s   2.088 µs/event   26.4 MiB peak RSS   0.004s startup
+```
+
+> Taken on a busy machine — other work was running on the host concurrently — so read this as
+> **indicative only, not `buffered`'s steady-state number**. A definitive, solo re-measurement on a
+> quiet machine is still pending: `script/perf run --repeat 5 --scenario buffered --label quiet`.
+
+Even under that contention, the qualitative signature the fix targets is gone. Neither run above is
+monotonic any more (repeat 2 dips to 510k, repeat 3 recovers to 838k) — contrast the strictly-falling
+134k→75k→53k→38k→27k and 615k→939k→289k→126k→80k sequences earlier in this section, each one falling
+every single repeat with no exception. Peak RSS stays flat in a 24.8–30.6 MiB band rather than
+climbing 56→110 MiB or 26→70 MiB across the run — the clearest single signal that the spool is no
+longer accumulating repeat over repeat. `startup_s` (spawn → `ready`, §0) is small here, 2.6–4.4 ms —
+not a meaningful share of `buffered`'s own per-event cost, so process bring-up was never the
+explanation; the spool accumulation this fix removes was. The remaining spread in this run (roughly
+510k–885k, a repeat-2 dip of about 40% below the top) reads as ordinary scheduling noise on a shared,
+busy box rather than the harness's own artifact — but that reading, like the whole run, wants
+confirming quiet-machine data before it's treated as settled; `535,735` and the two `--repeat 5`
+sequences above remain the honest record of what the *unfixed* harness reported, and this run's
+median (837,626 events/s, 1.929 µs/event) is the fix's first post-fix data point, not yet a number
+this section can retire the caveat on. `buffered`'s own comment in `perf/scenarios/buffered.yaml`
+now carries this same account.
 
 ## 4. Before/after: the regression workflow
 
@@ -235,9 +280,11 @@ medians, and exits non-zero if events/s dropped or CPU µs/event rose by more th
 percent (peak RSS is reported but never gates the exit code unless `--rss-threshold` is also given).
 It also warns — not fails — on a hostname or CPU-model mismatch between the two files, since neither
 number is trustworthy across machines per the preamble's ~20% caveat. A scenario present in only one
-file is listed, not compared. Given §3, treat a `buffered` regression from `compare` with real
-suspicion until `perf/results/spool/` is confirmed clean on both sides — today, nothing enforces
-that for you.
+file is listed, not compared. `run` now clears `buffered`'s spool before every repeat (§3, W8), so
+the specific accumulation artifact that made a `buffered` regression untrustworthy is gone; treat any
+`buffered` comparison with the same ordinary caution as its still-wider-than-most repeat spread
+warrants (`docs/known-gaps.md`'s "no cross-run noise model" entry) rather than the spool-specific
+suspicion this note used to carry.
 
 ## 5. Flamegraph
 
@@ -292,9 +339,11 @@ like in practice.
   manually triggered, gating a PR on `compare --threshold`, or some other cadence is real future
   work; nothing here assumes an answer, and nothing wires the harness into CI, a pre-merge gate, or
   a schedule yet.
-- **`buffered`'s variance** is now mechanistically understood (§3) but not fixed — clearing a
-  disk-backed scenario's spool before each harness invocation is filed in `docs/known-gaps.md` as
-  follow-up work, not done in this workstream.
+- **`buffered`'s variance**: the spool-accumulation mechanism §3 identified is now fixed on the
+  harness side (W8 — every spawn clears a scenario's declared `buffer.disk.path` first). What isn't
+  settled yet is how much of the *remaining* spread is ordinary machine noise versus something still
+  unaccounted for — §3's post-fix numbers were taken on a busy machine, and a quiet-machine
+  `--repeat 5` re-measurement (`docs/known-gaps.md`'s `buffered` entry) is the open follow-up.
 - **Templated metric names permanently grow the process-wide interner**, one entry per distinct
   rendering, for the life of the process (`generate_in`'s own module doc; `docs/design/memory.md`
   §4). `generate_in` already refuses a bare `{seq}` there for exactly this reason, and every shipped
