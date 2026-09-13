@@ -57,9 +57,9 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (both sinks share the one definition in `crate::tls`).
 pub use crate::tls::TlsClientSettings;
 
-/// The TLS-adjacent pieces every raw-TCP sink shares, defined once in `crate::tls`:
-/// `AsyncStream` erases "plain or TLS-wrapped stream" behind one object-safe trait, and
-/// `host_only` derives the SNI name from a bare `host:port` endpoint.
+// The TLS-adjacent pieces every raw-TCP sink shares, defined once in `crate::tls`: `AsyncStream`
+// erases "plain or TLS-wrapped stream" behind one object-safe trait, and `host_only` derives the
+// SNI name from a bare `host:port` endpoint.
 use crate::tls::{host_only, AsyncStream};
 
 /// A live, handshaken connection -- everything about it that only exists once the handshake has
