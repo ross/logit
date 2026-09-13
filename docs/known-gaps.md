@@ -77,12 +77,13 @@ already built that have a known, accepted rough edge.
     ground a corpus-driven fuzzer would, but needs nightly Rust to build at all
     (`docs/adr/containerized-development.md`'s stable-only toolchain), so real fuzz targets are
     deferred, not built.
-  - **`logit_in`'s shutdown grace is fixed at 5s, not operator-tunable** — graph validation's rule
-    17 rejects a `receive:` block on `logit_in` (it isn't a datagram or tail listener), so it
-    always gets `ReceiveConfig::default().shutdown_grace` with no config-level way to change it,
-    even though `LogitInput` (unlike `internal`) genuinely uses that grace to close idle
-    connections cleanly on shutdown. A real gap if a deployment ever needs a different number, not
-    yet a `receive:`-shaped knob.
+  - **`logit_in`'s and `internal`'s shutdown grace is fixed at 5s, not operator-tunable** — graph
+    validation's rule 17 rejects a `receive:` block on either (neither is a datagram or tail
+    listener), so both always get `ReceiveConfig::default().shutdown_grace` with no config-level
+    way to change it, even though both genuinely use that grace: `LogitInput` to close idle
+    connections cleanly on shutdown, `InternalInput` for its final drain of buffered self-telemetry
+    (`crates/logit-inputs/src/internal.rs`). A real gap if a deployment ever needs a different
+    number, not yet a `receive:`-shaped knob.
   - **`otlp_in` can hold the graph open past shutdown.** Every connection `OtlpInput::run` spawns
     holds its own `Fanout` clone but the input never overrides `Input::run_until_shutdown` the way
     `logit_in` now does (`crates/logit-inputs/src/logit.rs`'s own module doc comment) — an idle

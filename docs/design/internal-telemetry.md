@@ -319,6 +319,15 @@ divide evenly, a real window ends up straddling two drains in a way that isn't r
 run. The same rule DogStatsD documents for its own aggregation-interval-vs.-Agent-flush-interval
 relationship, for the same reason.
 
+**Shutdown drains once more.** `InternalInput` overrides `Input::run_until_shutdown`
+([ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)) to run one final drain when the
+shutdown signal fires, instead of being cancelled by drop — otherwise everything buffered since
+the last tick, up to a whole `interval`, was silently lost on every SIGTERM. The `Fanout` is owned
+by that future, so no downstream node starts its own close-time flush until the final batch has
+been sent, and `run_input`'s `shutdown_grace` (5s for `internal`) bounds the wait. The one thing
+that final drain can't emit is its own `points.emitted`/`drain.duration`, which as always are
+recorded a tick behind — with no tick left to come.
+
 `internal`'s own points (`logit.internal.points.emitted`, `logit.internal.spans.emitted`,
 `logit.internal.logs.emitted`, `logit.internal.drain.duration`) are recorded via its own
 `Telemetry` handle, registered in the same `Registry` it drains — they ride along in the *next*
