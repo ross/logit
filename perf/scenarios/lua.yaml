@@ -1,0 +1,38 @@
+# The Lua hop and its event proxy (docs/plans/load-test-harness.md's scenario table): generate_in
+# feeds a `lua` component running the same enrichment script logit-bench measures at the
+# component level, then null_out discards. Measures the cost of crossing into the LuaJIT OS
+# thread and back -- the event proxy's field access/write, the round trip through `ScriptWorker`
+# -- for a whole real graph rather than one already-constructed event
+# (crates/logit-bench/benches/pipeline.rs).
+#
+#   script/perf run --scenario lua
+#
+# `host` is set on every generated event (`web-{seq%10}`, the same cardinality passthrough uses)
+# so the script's `if event.attributes.host ~= nil then` branch is actually taken on every event,
+# not skipped -- a script whose one conditional never fires isn't measuring what it looks like it
+# measures.
+components:
+  gen:
+    type: generate_in
+    count: 4000000
+    event:
+      attributes:
+        host: "web-{seq%10}"
+
+  # Copied verbatim from crates/logit-bench/src/fixtures.rs's `LUA_ENRICH_SCRIPT` -- the same
+  # enrichment script logit-bench's own divan benches and allocation tests measure at the
+  # component level, so this scenario's Lua-hop cost is directly comparable to those numbers.
+  enrich:
+    type: lua
+    sources: [gen]
+    script: |
+      function process(event)
+        if event.attributes.host ~= nil then
+          event.attributes.env = "prod"
+        end
+        return event
+      end
+
+  out:
+    type: null_out
+    sources: [enrich]

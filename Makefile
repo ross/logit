@@ -3,7 +3,7 @@
 # https://github.blog/engineering/scripts-to-rule-them-all/) -- see AGENTS.md and README.md, and
 # add new commands there, not here.
 
-.PHONY: bootstrap setup update server demo test bench lint fmt fmt-check check schema validate audit cibuild console image up down clean
+.PHONY: bootstrap setup update server demo test bench perf lint fmt fmt-check check schema validate audit cibuild console image up down clean
 
 bootstrap:  ## Build the dev container image.
 	./script/bootstrap
@@ -25,6 +25,9 @@ test:       ## cargo nextest run --workspace
 
 bench:      ## Throughput + allocation benchmarks (docs/design/memory.md)
 	./script/bench
+
+perf:       ## Load-test harness (default: run every scenario) -- override: make perf PERF_ARGS="compare a.json b.json"
+	./script/perf $(if $(PERF_ARGS),$(PERF_ARGS),run)
 
 lint:       ## cargo clippy, warnings denied
 	./script/lint

@@ -1,0 +1,42 @@
+# Native encode + decode + per-batch ack round trip (docs/plans/load-test-harness.md's scenario
+# table): one process, two disconnected chains sharing one loopback connection --
+# `gen -> relay_out` (logit_out, dialing out) and `relay_in -> drop` (logit_in, listening) --
+# rather than one straight-line graph. `relay_out` encodes each batch to logit_proto::native and
+# waits for `relay_in`'s Ack before sending the next, so this measures the whole native-transport
+# round trip (encode, one loopback TCP hop, decode, ack) in the loop, not just the encoder or
+# decoder alone (unlike encode-native-devnull, which is encode-only, one-way, no ack).
+#
+# Two disconnected chains in one graph is a legal shape (graph rule 5's cycle check operates per
+# weakly-connected component, not across the whole graph) -- the runtime's pre-spawn bind pass
+# binds every listener, sorted by id, before any task runs (crates/logit-pipeline/src/runtime.rs),
+# so `relay_in`'s socket is already listening before `relay_out` ever dials it; `logit_out` itself
+# dials lazily and retries under `Fault::Clean` regardless, so the ordering is safe either way.
+#
+#   script/perf run --scenario native-relay
+#
+# Unlike every other scenario, this one never self-exits: `relay_in` is a socket listener with no
+# `count` of its own, so once `gen` finishes and `relay_out`'s sender drops, `relay_in` just keeps
+# listening. The harness detects the listener (any `type` ending `_in`) and waits `--settle` past
+# the `generation complete` line, then sends SIGTERM rather than waiting for a natural exit
+# (crates/logit-perf/src/scenario.rs's `needs_sigterm`) -- this is the one scenario that exercises
+# that path for real.
+components:
+  gen:
+    type: generate_in
+    count: 7000000
+    event:
+      attributes:
+        host: "web-{seq%10}"
+
+  relay_out:
+    type: logit_out
+    sources: [gen]
+    endpoint: 127.0.0.1:19001
+
+  relay_in:
+    type: logit_in
+    bind: 127.0.0.1:19001
+
+  drop:
+    type: null_out
+    sources: [relay_in]
