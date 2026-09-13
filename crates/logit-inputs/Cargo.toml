@@ -39,6 +39,13 @@ tokio-rustls.workspace = true
 # dependency of `logit-outputs` at this exact version (its `otlp_out`/`influxdb_out` HTTP clients),
 # so promoting it here too adds no new crate version to `Cargo.lock`.
 reqwest.workspace = true
+# `generate_in`'s `generation complete` line (docs/plans/load-test-harness.md). Every other
+# self-diagnostic in this crate goes through `logit_core::Diagnostics`, which is where `tracing`
+# normally lives -- this one can't: the perf harness reads `events`/`batches`/`elapsed` as
+# *fields* off the JSON log line, and `Diagnostics` renders a component/key pair plus one
+# already-formatted message. Emitting an event is not picking a subscriber; `logit-inputs` still
+# never installs one.
+tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # tail_in/docker_in's inotify wake source (docs/adr/file-tailing-and-docker-json-logs.md) --
@@ -53,7 +60,7 @@ libc.workspace = true
 # (AGENTS.md's crate layout).
 logit-transforms.workspace = true
 # `internal.rs`'s own tests drive `logit_core::TelemetryLayer` through a real `tracing` event
-# (docs/plans/operator-surface.md, workstream D) -- test-only, `logit-inputs` itself never picks
-# a subscriber.
-tracing.workspace = true
+# (docs/plans/operator-surface.md, workstream D) -- `logit-inputs` still never picks a subscriber
+# itself, which is what `tracing-subscriber` is needed for here. (`tracing` itself is a real
+# dependency now, for `generate_in`'s completion line -- see above.)
 tracing-subscriber.workspace = true
