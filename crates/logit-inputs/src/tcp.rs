@@ -1,0 +1,1680 @@
+//! The shared TCP (optionally TLS) listener driver: an accept loop, one connection task per
+//! peer, RFC 6587 framing, and frame->batch assembly -- the stream-transport twin of
+//! [`crate::udp::UdpListener`] (`docs/adr/decoupled-listener-io.md`).
+//!
+//! **Why a generic driver rather than a `syslog_in`-shaped accept loop.** `syslog_in` over TCP is
+//! the first caller (`docs/plans/syslog-tls.md`), but nothing below mentions syslog: the same
+//! accept loop, connection cap, TLS termination and batching apply unchanged to any
+//! newline-or-length-framed stream protocol, `statsd_in` included. Generic over the decoder for
+//! exactly the reason [`crate::udp::UdpListener`] is -- that is the only thing two such listeners
+//! ever differ in.
+//!
+//! **`D: Clone` is load-bearing.** Every connection gets its own decoder clone, because a decoder
+//! may hold real per-connection state (`SyslogDecoder`'s own `Diagnostics` throttle today; a
+//! future decoder's scratch buffers or sticky identity, the way `collectd`'s already works per
+//! datagram). Sharing one decoder across connections behind a lock would serialize every
+//! connection's decode against every other's; cloning keeps each connection independent.
+//!
+//! **No receive queue.** Unlike the UDP driver, there is no [`crate::udp::ReceiveQueue`] here and
+//! no `receive.max_datagrams`/`max_bytes`/`overflow` to configure. TCP's own flow control *is* the
+//! queue: a connection whose downstream has stalled simply stops being read, the kernel window
+//! closes, and the sender blocks -- which is the correct behaviour for a reliable transport, where
+//! dropping bytes to keep reading (the UDP driver's `drop_oldest` default) would corrupt the frame
+//! stream rather than lose one self-contained datagram.
+//!
+//! **Batching is per connection.** Each connection task owns its own
+//! [`logit_pipeline::BatchAccumulator`], so `batch_max_events` bounds one connection's in-flight
+//! events, not the listener's -- N concurrent connections can hold N times that. See
+//! [`TcpListenerConfig::batch_max_events`].
+//!
+//! **Connection limit.** A [`tokio::sync::Semaphore`] with `try_acquire_owned`, capped at
+//! [`MAX_CONCURRENT_CONNECTIONS`], exactly as `logit_in`
+//! (`crates/logit-inputs/src/logit.rs`'s "Connection limit" section) -- reject, don't queue.
+//! **The one deliberate difference from `logit_in`:** there, a past-the-cap connection is wrapped
+//! in TLS first so it can be told *why* it is being closed (a `Reject` control frame). Syslog over
+//! TCP has no in-band reject message of any kind, so there is nothing to say and no reason to
+//! spend a handshake saying it -- a past-the-cap connection here is dropped immediately, before
+//! any TLS accept, and counted as `logit.input.connections.rejected{reason="limit"}`. The
+//! `logit.input.connections` gauge correspondingly counts permit holders only.
+//!
+//! **Pre-handshake timeout.** [`HANDSHAKE_TIMEOUT`] bounds the TLS accept inside each connection
+//! task, for the same reason `logit_in` bounds its own: without it, a client that opens a
+//! connection and never sends a ClientHello pins a connection-limit permit forever. There is
+//! deliberately *no* idle timeout after a successful handshake -- a handshaken-then-silent
+//! connection still holds its permit indefinitely, the same known gap `otlp_in` has
+//! (`docs/known-gaps.md`).
+
+use crate::Input;
+use bytes::{Bytes, BytesMut};
+use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
+use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
+use logit_proto::Decoder;
+use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::net::TcpListener as TokioTcpListener;
+use tokio::sync::watch;
+use tokio_rustls::TlsAcceptor;
+
+/// `crate::tls::TlsServerSettings`, re-exported here for symmetry with `crate::logit`/`crate::otlp`
+/// (all three listeners share the one definition in `crate::tls`).
+pub use crate::tls::TlsServerSettings;
+
+/// See this module's "Connection limit" doc section. The same number `logit_in` and `otlp_in` use
+/// -- there is no protocol reason for a syslog listener to differ, and one shared figure is one
+/// thing for an operator to learn.
+const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
+
+/// How long a connection has to finish its TLS accept before this listener gives up on it and
+/// releases its connection-limit permit -- see this module's "Pre-handshake timeout" doc section.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The largest single frame this driver will assemble, in bytes, for either framing.
+///
+/// Not configurable, deliberately. It is *not* `syslog_out`'s `max_message_bytes` (8192): that is a
+/// sender-side knob an operator may legitimately raise, and a receiver whose ceiling tracked it
+/// would have to be re-tuned in lockstep with every sender on the network. 64 KiB instead, which
+/// is where the UDP driver's own 65507-byte read buffer already puts the practical per-message
+/// ceiling for the same protocols -- generous against RFC 5424's own "no upper limit, but a
+/// receiver MUST be able to accept 2048 octets" and against every real sender's default.
+pub const MAX_FRAME_BYTES: usize = 65_536;
+
+/// Bytes pulled off the socket per read. Deliberately well under [`MAX_FRAME_BYTES`]: a listener
+/// with many idle connections pays this per connection, and a frame larger than one read is
+/// assembled across reads by [`Framer`] regardless.
+const READ_BUFFER_BYTES: usize = 8 * 1024;
+
+// ---- framing ---------------------------------------------------------------------------------
+
+/// Which of RFC 6587's two framings a connection is speaking.
+///
+/// Latched from the very first byte a connection sends and never re-evaluated
+/// (`docs/adr/syslog-tcp-ingress-and-tls.md`): an ASCII digit can only begin an octet count, since
+/// a non-transparent syslog frame always begins `<` (the PRI's opening angle bracket). Anything
+/// else is non-transparent.
+///
+/// Note the latch keys on "ASCII digit", not on `1`-`9`, even though RFC 6587 §3.4.1's `MSG-LEN =
+/// NONZERO-DIGIT *DIGIT` forbids a leading zero. A leading `0` is a malformed octet count, not a
+/// non-transparent frame, so latching it here and failing loudly in
+/// [`Framer::next_frame`] is the honest reading -- treating it as non-transparent would silently
+/// mis-frame a broken sender's whole stream instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Framing {
+    /// RFC 6587 §3.4.1: `MSG-LEN SP MSG`, where `MSG-LEN` is the octet count of `MSG`. The only
+    /// framing that can carry a message containing a newline.
+    OctetCounting,
+    /// RFC 6587 §3.4.2: messages separated by a trailing `LF` (a `CR` before it is stripped).
+    NonTransparent,
+}
+
+impl Framing {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Framing::OctetCounting => "octet_counting",
+            Framing::NonTransparent => "non_transparent",
+        }
+    }
+}
+
+/// Why [`Framer`] could not produce the next frame. Every variant is fatal *to the connection*:
+/// neither framing can resynchronize after one (an octet count that cannot be trusted leaves no
+/// way to know where the next frame starts, and a line past the size ceiling would only get
+/// longer), so the driver counts it, diagnoses it, and closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameError {
+    /// A frame larger than [`MAX_FRAME_BYTES`] -- a declared octet count above it, or a
+    /// non-transparent line that passed it without a terminator.
+    Oversize(String),
+    /// An octet count that is not one RFC 6587 §3.4.1's `MSG-LEN = NONZERO-DIGIT *DIGIT`
+    /// production permits: a non-digit before the SP, a leading zero (a zero count included), or
+    /// more than nine digits.
+    Malformed(String),
+    /// The peer closed mid-frame under octet counting, so a declared MSG never fully arrived.
+    /// Distinct from the two above in that nothing was wrong with what the peer *sent* -- it just
+    /// stopped -- and distinct from the non-transparent EOF case, where a terminator-less remainder
+    /// is a perfectly ordinary final message and is emitted rather than dropped.
+    Truncated(String),
+}
+
+impl FrameError {
+    /// The `reason` tag on `logit.input.frames.dropped`
+    /// (`docs/design/internal-telemetry.md`'s "Naming" section).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            FrameError::Oversize(_) => "oversize",
+            FrameError::Malformed(_) => "malformed",
+            FrameError::Truncated(_) => "truncated",
+        }
+    }
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameError::Oversize(detail)
+            | FrameError::Malformed(detail)
+            | FrameError::Truncated(detail) => f.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+/// RFC 6587 frame extraction over a byte stream -- pure, socket-free and synchronous, so it is
+/// directly unit-testable and a recorded interop fixture can be replayed through it byte for byte
+/// (`docs/plans/recorded-interop-fixtures.md`) without standing anything up.
+///
+/// Usage is `push` whatever came off the socket, then `next_frame` in a loop until it returns
+/// `Ok(None)`; at EOF, [`Framer::finish`] once for whatever partial frame is left.
+pub struct Framer {
+    /// `None` until the first byte arrives -- see [`Framing`]'s doc comment for the latch rule.
+    framing: Option<Framing>,
+    buf: BytesMut,
+    /// How far into `buf` the non-transparent path has already looked for a `LF` without finding
+    /// one. Reset whenever a frame is taken. Without it, a long line arriving over many reads
+    /// would be rescanned from the start on every read -- O(n^2) in the line's own length.
+    scanned: usize,
+}
+
+impl Default for Framer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Framer {
+    pub fn new() -> Self {
+        Self { framing: None, buf: BytesMut::with_capacity(READ_BUFFER_BYTES), scanned: 0 }
+    }
+
+    /// The framing this connection latched, or `None` if it has not sent a byte yet.
+    pub fn framing(&self) -> Option<Framing> {
+        self.framing
+    }
+
+    /// Bytes held but not yet formed into a frame -- for tests and for the EOF accounting.
+    pub fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Appends whatever came off the socket. Latches [`Framing`] on the first byte ever pushed.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        if self.framing.is_none() {
+            if let Some(&first) = self.buf.first() {
+                self.framing = Some(if first.is_ascii_digit() {
+                    Framing::OctetCounting
+                } else {
+                    Framing::NonTransparent
+                });
+            }
+        }
+    }
+
+    /// The next complete frame, if one is fully buffered. `Ok(None)` means "need more bytes", not
+    /// "end of stream" -- only the caller knows the socket closed, and says so via
+    /// [`Framer::finish`].
+    ///
+    /// The returned [`Bytes`] is the message *verbatim*: under octet counting exactly the declared
+    /// MSG-LEN bytes (an embedded `LF` is payload, not a terminator), under non-transparent the
+    /// line with its `LF` and at most one preceding `CR` removed.
+    pub fn next_frame(&mut self) -> Result<Option<Bytes>, FrameError> {
+        loop {
+            match self.framing {
+                None => return Ok(None),
+                Some(Framing::OctetCounting) => return self.next_octet_counted(),
+                Some(Framing::NonTransparent) => match self.next_line()? {
+                    // An empty line carries no message. Senders emit them (a stray `LF` after a
+                    // `CRLF`-terminated message, a keepalive newline), and RFC 6587 §3.4.2 has
+                    // nothing for a receiver to do with one -- skip it and look for the next,
+                    // rather than handing the decoder an empty frame to reject.
+                    Some(line) if line.is_empty() => continue,
+                    other => return Ok(other),
+                },
+            }
+        }
+    }
+
+    /// Whatever is left when the peer closes. Under non-transparent framing a terminator-less
+    /// remainder is an ordinary final message and is returned; under octet counting a partial MSG
+    /// is [`FrameError::Truncated`], since its declared length says bytes are missing.
+    pub fn finish(&mut self) -> Result<Option<Bytes>, FrameError> {
+        if self.buf.is_empty() {
+            return Ok(None);
+        }
+        match self.framing {
+            None => Ok(None),
+            Some(Framing::OctetCounting) => {
+                let held = self.buf.len();
+                self.buf.clear();
+                self.scanned = 0;
+                Err(FrameError::Truncated(format!(
+                    "the peer closed with {held} octet-counted byte(s) of an incomplete frame \
+                     buffered"
+                )))
+            }
+            Some(Framing::NonTransparent) => {
+                if self.buf.len() > MAX_FRAME_BYTES {
+                    let held = self.buf.len();
+                    self.buf.clear();
+                    self.scanned = 0;
+                    return Err(FrameError::Oversize(format!(
+                        "the peer closed with a {held}-byte unterminated line buffered, over the \
+                         {MAX_FRAME_BYTES}-byte frame ceiling"
+                    )));
+                }
+                let line = self.buf.split_to(self.buf.len()).freeze();
+                self.scanned = 0;
+                let line = strip_cr(line);
+                Ok(if line.is_empty() { None } else { Some(line) })
+            }
+        }
+    }
+
+    /// RFC 6587 §3.4.2: everything up to the next `LF`, with at most one preceding `CR` removed.
+    fn next_line(&mut self) -> Result<Option<Bytes>, FrameError> {
+        let found = self.buf[self.scanned..].iter().position(|&b| b == b'\n');
+        let Some(offset) = found else {
+            self.scanned = self.buf.len();
+            if self.buf.len() > MAX_FRAME_BYTES {
+                return Err(FrameError::Oversize(format!(
+                    "a non-transparent line reached {} bytes with no LF, over the \
+                     {MAX_FRAME_BYTES}-byte frame ceiling",
+                    self.buf.len()
+                )));
+            }
+            return Ok(None);
+        };
+        let idx = self.scanned + offset;
+        if idx > MAX_FRAME_BYTES {
+            return Err(FrameError::Oversize(format!(
+                "a non-transparent line of {idx} bytes is over the {MAX_FRAME_BYTES}-byte frame \
+                 ceiling"
+            )));
+        }
+        let line = self.buf.split_to(idx).freeze();
+        let _lf = self.buf.split_to(1);
+        self.scanned = 0;
+        Ok(Some(strip_cr(line)))
+    }
+
+    /// RFC 6587 §3.4.1: `MSG-LEN SP MSG`, where `MSG-LEN = NONZERO-DIGIT *DIGIT` -- so a leading
+    /// zero (and therefore a count of zero) is malformed, not a zero-length message.
+    ///
+    /// At most nine digits, rather than "as many as fit": [`MAX_FRAME_BYTES`] needs five, so nine
+    /// is already far past any legitimate count, and an explicit ceiling is what turns "a peer
+    /// that sent digits forever" from an unbounded buffer into a bounded, diagnosable
+    /// [`FrameError::Malformed`].
+    fn next_octet_counted(&mut self) -> Result<Option<Bytes>, FrameError> {
+        const MAX_COUNT_DIGITS: usize = 9;
+
+        let mut digits = 0usize;
+        loop {
+            match self.buf.get(digits) {
+                // Not enough bytes to know yet -- `digits <= MAX_COUNT_DIGITS` here, so this waits
+                // for at most one more byte before the checks below fire.
+                None => return Ok(None),
+                Some(&b) if b.is_ascii_digit() => {
+                    if digits == MAX_COUNT_DIGITS {
+                        return Err(FrameError::Malformed(format!(
+                            "an octet count of more than {MAX_COUNT_DIGITS} digits"
+                        )));
+                    }
+                    digits += 1;
+                }
+                Some(&b' ') => break,
+                Some(&b) => {
+                    return Err(FrameError::Malformed(format!(
+                        "expected a digit or SP in an octet count, got byte 0x{b:02x} at offset \
+                         {digits}"
+                    )))
+                }
+            }
+        }
+
+        // Unreachable through `next_frame` (the framing only latches to `OctetCounting` on a
+        // leading digit), but this function is reachable directly from a test and a zero-digit
+        // count is malformed either way.
+        if digits == 0 {
+            return Err(FrameError::Malformed("an octet count with no digits".to_string()));
+        }
+        // RFC 6587 §3.4.1's `NONZERO-DIGIT` first character. `0` alone and `012` are both rejected
+        // here, the second before it can be read as 12 -- a sender that pads its counts is not
+        // speaking this framing, and guessing at its intent would silently mis-frame the rest of
+        // the stream.
+        if self.buf[0] == b'0' {
+            return Err(FrameError::Malformed(if digits == 1 {
+                "an octet count of zero".to_string()
+            } else {
+                "an octet count with a leading zero (RFC 6587 §3.4.1: MSG-LEN = NONZERO-DIGIT \
+                 *DIGIT)"
+                    .to_string()
+            }));
+        }
+
+        let len: usize = std::str::from_utf8(&self.buf[..digits])
+            .expect("every byte was checked to be an ASCII digit")
+            .parse()
+            .expect("at most nine ASCII digits always fit a usize");
+        if len > MAX_FRAME_BYTES {
+            return Err(FrameError::Oversize(format!(
+                "an octet count of {len} is over the {MAX_FRAME_BYTES}-byte frame ceiling"
+            )));
+        }
+
+        let header = digits + 1; // the digits plus the single SP
+        if self.buf.len() < header + len {
+            return Ok(None);
+        }
+        let _header = self.buf.split_to(header);
+        let msg = self.buf.split_to(len).freeze();
+        self.scanned = 0;
+        Ok(Some(msg))
+    }
+}
+
+/// Removes one trailing `CR`, so a `CRLF`-terminated sender and an `LF`-terminated one hand the
+/// decoder the identical message. Only one: a message genuinely ending in `CR CR` keeps the first.
+fn strip_cr(line: Bytes) -> Bytes {
+    match line.last() {
+        Some(b'\r') => line.slice(..line.len() - 1),
+        _ => line,
+    }
+}
+
+// ---- the listener ----------------------------------------------------------------------------
+
+/// [`TcpListener`]'s runtime knobs -- [`crate::udp::UdpListenerConfig`] minus every queue field
+/// (see this module's "No receive queue" doc section), with the four batching/shutdown fields at
+/// byte-for-byte the same defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TcpListenerConfig {
+    /// Events to accumulate **per connection** before one `Fanout::send`. `1` means one send per
+    /// frame. Because each connection accumulates independently (this module's "Batching is per
+    /// connection" doc section), the listener's worst-case in-flight event count is this times the
+    /// number of live connections, not this.
+    pub batch_max_events: usize,
+    /// The same bound by estimated heap bytes, also **per connection**.
+    pub batch_max_bytes: u64,
+    /// `Duration::ZERO` disables the flush timer entirely; bounds are then the only trigger.
+    pub batch_flush_interval: Duration,
+    /// How long [`TcpListener::run_until_shutdown`] keeps draining after shutdown fires before
+    /// [`logit_pipeline::runtime::run_input`]'s grace backstop cancels it by drop.
+    pub shutdown_grace: Duration,
+}
+
+/// The same numbers as [`crate::udp::UdpListenerConfig::default`]'s corresponding fields --
+/// `docs/adr/decoupled-listener-io.md` justifies them, and a TCP listener has no reason to batch
+/// differently from a UDP one.
+impl Default for TcpListenerConfig {
+    fn default() -> Self {
+        Self {
+            batch_max_events: 1_000,
+            batch_max_bytes: 1024 * 1024,
+            batch_flush_interval: Duration::from_millis(100),
+            shutdown_grace: Duration::from_secs(5),
+        }
+    }
+}
+
+/// A TCP (optionally TLS) listener that turns each connection's RFC 6587 frame stream into
+/// batches of decoded events -- the stream twin of [`crate::udp::UdpListener`]. See this module's
+/// own doc comment for the accept/cap/handshake/batching contracts.
+pub struct TcpListener<D: Decoder + Clone + Send + 'static> {
+    bind: String,
+    decoder: D,
+    config: TcpListenerConfig,
+    diag: Diagnostics,
+    telemetry: Telemetry,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    /// Set by [`Input::bind`], taken back out by [`Input::run_until_shutdown`] -- the same
+    /// bind-pre-pass shape `otlp_in` uses (`docs/plans/operator-surface.md`, workstream B), rather
+    /// than `logit_in`'s bind-inside-`run_until_shutdown`, so a test (and `logit run`'s startup
+    /// ordering) can learn the real address before anything is spawned.
+    listener: Option<TokioTcpListener>,
+    max_connections: usize,
+    handshake_timeout: Duration,
+}
+
+impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
+    pub fn new(bind: impl Into<String>, decoder: D, config: TcpListenerConfig) -> Self {
+        Self {
+            bind: bind.into(),
+            decoder,
+            config,
+            diag: Diagnostics::default(),
+            telemetry: Telemetry::default(),
+            tls: None,
+            listener: None,
+            max_connections: MAX_CONCURRENT_CONNECTIONS,
+            handshake_timeout: HANDSHAKE_TIMEOUT,
+        }
+    }
+
+    /// The address actually bound, once [`Input::bind`] has run -- lets a test learn the
+    /// OS-assigned port without a bind-drop-rebind race.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.listener.as_ref().and_then(|l| l.local_addr().ok())
+    }
+
+    /// Sets *this listener's own* diagnostics -- the `connection_error`, `bad_frame` and
+    /// `framing_error` keys reported below. Does **not** reach `self.decoder`'s own diagnostics
+    /// field, if it has one; see [`crate::udp::UdpListener::with_diagnostics`]'s doc comment for
+    /// the full reasoning, and use [`Self::map_decoder`] to propagate the same value into a
+    /// concrete decoder that needs it.
+    pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.diag = diag;
+        self
+    }
+
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
+    /// Applies `f` to the wrapped decoder -- lets a caller that knows the concrete decoder type
+    /// chain that decoder's own consuming builder methods through this builder-style API, exactly
+    /// as [`crate::udp::UdpListener::map_decoder`] does.
+    pub fn map_decoder(mut self, f: impl FnOnce(D) -> D) -> Self {
+        self.decoder = f(self.decoder);
+        self
+    }
+
+    /// Overrides the batching/shutdown-grace knobs -- what a `receive:` config block sets.
+    /// Defaults to [`TcpListenerConfig::default`] when never called.
+    pub fn with_config(mut self, config: TcpListenerConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// The currently-configured batching/shutdown-grace knobs -- for test introspection, mirroring
+    /// [`crate::udp::UdpListener::config`].
+    pub fn config(&self) -> TcpListenerConfig {
+        self.config
+    }
+
+    /// Turns on TLS termination for this listener (`tls:` in config) -- no ALPN, for the same
+    /// reason `logit_in` passes none (`crates/logit-inputs/src/logit.rs::with_tls`): this isn't an
+    /// HTTP-shaped protocol, so there's nothing for a client to negotiate down to. Every path in
+    /// `settings` is resolved against `base_dir` (the config file's own directory).
+    pub fn with_tls(
+        mut self,
+        settings: &TlsServerSettings,
+        base_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        self.tls = Some(Arc::new(crate::tls::build_server_config(settings, base_dir, &[])?));
+        Ok(self)
+    }
+
+    /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`] -- opening 1025 real connections to
+    /// exercise the cap would be slow and flaky; this makes the cap reachable with two.
+    #[cfg(test)]
+    fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections;
+        self
+    }
+
+    /// Test-only override of [`HANDSHAKE_TIMEOUT`] -- shortens the TLS-accept budget so a test can
+    /// observe a permit actually coming back without a multi-second sleep.
+    #[cfg(test)]
+    fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
+        self.handshake_timeout = handshake_timeout;
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
+    async fn bind(&mut self) -> anyhow::Result<()> {
+        if self.listener.is_some() {
+            return Ok(()); // idempotent, per `Input::bind`'s contract
+        }
+        let listener = TokioTcpListener::bind(&self.bind).await?;
+        self.diag.info("bound", format_args!("listening on {}", self.bind));
+        self.listener = Some(listener);
+        Ok(())
+    }
+
+    async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
+        // Never exercised in production -- `run_input` always calls `run_until_shutdown`. Present
+        // because the trait requires it, mirroring `crate::udp::UdpListener::run`.
+        let (_tx, rx) = watch::channel(false);
+        self.run_until_shutdown(sink, rx).await
+    }
+
+    async fn run_until_shutdown(
+        &mut self,
+        sink: Fanout,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        self.bind().await?;
+        let listener = self.listener.take().expect("bind() leaves a listener behind");
+        let connection_limit = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
+        // Built once outside the loop -- `TlsAcceptor::from` just wraps the `Arc<ServerConfig>`,
+        // so cloning it per connection below is an `Arc` clone, not a config rebuild.
+        let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
+        let live_connections = Arc::new(AtomicI64::new(0));
+        let handshake_timeout = self.handshake_timeout;
+        let config = self.config;
+
+        loop {
+            let (stream, _peer) = tokio::select! {
+                accepted = listener.accept() => accepted?,
+                _ = shutdown.wait_for(|&due| due) => return Ok(()),
+            };
+
+            // Non-blocking (`try_acquire_owned`, not `acquire_owned`): at capacity the connection
+            // is closed immediately rather than queued behind a permit that may never come. And
+            // it is closed *here*, before any TLS accept -- see this module's "Connection limit"
+            // doc section for why this deliberately diverges from `logit_in`.
+            let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
+                self.telemetry.count(
+                    "logit.input.connections.rejected",
+                    1.0,
+                    &[("reason", "limit")],
+                );
+                drop(stream);
+                continue;
+            };
+
+            // Every connection task holds its own `Fanout` clone, so the shutdown cascade
+            // (`docs/adr/service-lifecycle-and-output-retry.md`) only completes once every one of
+            // them has dropped -- which is what `serve_connection`'s own shutdown race guarantees.
+            let sink = sink.clone();
+            let mut diag = self.diag.clone();
+            let telemetry = self.telemetry.clone();
+            let tls_acceptor = tls_acceptor.clone();
+            let conn_shutdown = shutdown.clone();
+            let live_connections = Arc::clone(&live_connections);
+            let decoder = self.decoder.clone();
+
+            tokio::spawn(async move {
+                // Held for exactly as long as this task runs -- a TLS accept that fails or times
+                // out gives the permit back here, which is the whole point of bounding it.
+                let _permit = permit;
+                live_connections.fetch_add(1, Ordering::Relaxed);
+                telemetry.gauge(
+                    "logit.input.connections",
+                    live_connections.load(Ordering::Relaxed) as f64,
+                    &[],
+                );
+
+                let result = match tls_acceptor {
+                    Some(acceptor) => {
+                        match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await
+                        {
+                            Ok(Ok(tls_stream)) => {
+                                serve_connection(
+                                    tls_stream,
+                                    decoder,
+                                    config,
+                                    sink,
+                                    telemetry.clone(),
+                                    diag.clone(),
+                                    conn_shutdown,
+                                )
+                                .await
+                            }
+                            Ok(Err(err)) => Err(anyhow::anyhow!("TLS handshake failed: {err}")),
+                            Err(_elapsed) => Err(anyhow::anyhow!(
+                                "TLS handshake did not complete within {handshake_timeout:?}"
+                            )),
+                        }
+                    }
+                    None => {
+                        serve_connection(
+                            stream,
+                            decoder,
+                            config,
+                            sink,
+                            telemetry.clone(),
+                            diag.clone(),
+                            conn_shutdown,
+                        )
+                        .await
+                    }
+                };
+
+                live_connections.fetch_sub(1, Ordering::Relaxed);
+                telemetry.gauge(
+                    "logit.input.connections",
+                    live_connections.load(Ordering::Relaxed) as f64,
+                    &[],
+                );
+
+                // One connection's I/O error (a peer vanishing mid-frame, a TLS accept that failed
+                // or timed out) must not be fatal to the listener or its sibling connections --
+                // only `TcpListener::accept` failing in the loop above is.
+                if let Err(err) = result {
+                    diag.warn_throttled("connection_error", err);
+                }
+            });
+        }
+    }
+}
+
+/// What one `read`-versus-`shutdown` race produced.
+enum ReadStep {
+    /// Bytes landed in the read buffer.
+    Bytes,
+    /// The peer closed cleanly.
+    Eof,
+    /// Shutdown fired before anything else did.
+    Shutdown,
+    Failed(std::io::Error),
+}
+
+/// One read step, raced against `shutdown`.
+///
+/// `AsyncReadExt::read_buf` is cancellation-safe (no bytes are consumed if another `select!` arm
+/// wins), which is what lets both this race and the flush-deadline timeout in
+/// [`serve_connection`] drop it mid-await without losing stream bytes.
+///
+/// `shutdown.changed()`, not `wait_for` -- `wait_for`'s `Ref` guard makes the combined future
+/// `!Send`, which `tokio::spawn`ing this connection's task requires. The caller's explicit
+/// `*shutdown.borrow()` check before calling this is what covers the case `changed()` alone
+/// cannot: shutdown having *already* fired before this loop iteration began. Exactly the
+/// discipline `crates/logit-inputs/src/logit.rs`'s own `serve_connection` documents.
+async fn read_step<S: AsyncRead + Unpin + Send>(
+    stream: &mut S,
+    buf: &mut BytesMut,
+    shutdown: &mut watch::Receiver<bool>,
+) -> ReadStep {
+    tokio::select! {
+        result = stream.read_buf(buf) => match result {
+            Ok(0) => ReadStep::Eof,
+            Ok(_) => ReadStep::Bytes,
+            Err(err) => ReadStep::Failed(err),
+        },
+        _ = shutdown.changed() => ReadStep::Shutdown,
+    }
+}
+
+/// Serves one already-accepted (and, under TLS, already-handshaken) connection to completion --
+/// generic over the IO type so the plaintext (`TcpStream`) and TLS
+/// (`tokio_rustls::server::TlsStream<TcpStream>`) cases share every line, exactly as
+/// `crate::logit::serve_connection` and `crate::otlp::serve_connection` do.
+///
+/// Owns its own [`Framer`], [`BatchAccumulator`] and decoder clone, so nothing here is shared with
+/// any sibling connection. Flushes on the accumulator's own bounds, on `batch_flush_interval`, on
+/// shutdown, and on close (clean or otherwise).
+async fn serve_connection<S, D>(
+    mut stream: S,
+    mut decoder: D,
+    config: TcpListenerConfig,
+    sink: Fanout,
+    telemetry: Telemetry,
+    mut diag: Diagnostics,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    D: Decoder + Send,
+{
+    let mut framer = Framer::new();
+    // Reused across every read, cleared (not replaced) between them, so its allocated capacity
+    // survives from one read to the next.
+    let mut read_buf = BytesMut::with_capacity(READ_BUFFER_BYTES);
+    let mut accumulator = BatchAccumulator::new(config.batch_max_events, config.batch_max_bytes);
+    // Reused across every `decode_into` call, cleared (not taken) between them -- see
+    // `BatchAccumulator::absorb`'s own doc comment on why `std::mem::take` here would silently
+    // undo the allocation win.
+    let mut scratch: Vec<Event> = Vec::new();
+    let has_interval = !config.batch_flush_interval.is_zero();
+    let mut next_flush =
+        has_interval.then(|| tokio::time::Instant::now() + config.batch_flush_interval);
+
+    loop {
+        // The interval trigger, reusing `BatchAccumulator::next_deadline`'s cadence math rather
+        // than a second copy of it -- the identical shape `crate::udp::decode_loop` uses.
+        if let Some(deadline) = next_flush {
+            let now_instant = tokio::time::Instant::now();
+            if deadline <= now_instant {
+                if let Some(batch) = accumulator.take() {
+                    emit(&sink, &telemetry, batch, FlushReason::Interval).await;
+                }
+                next_flush = Some(BatchAccumulator::next_deadline(
+                    deadline,
+                    now_instant,
+                    config.batch_flush_interval,
+                ));
+            }
+        }
+
+        // Checked explicitly rather than left to `read_step`'s `changed()` arm: `changed()` only
+        // fires on a transition this receiver has not yet observed, which would miss "shutdown was
+        // already true when this iteration started". The `Ref` temporary is dropped at the end of
+        // this statement, well before any `.await`.
+        if *shutdown.borrow() {
+            if let Some(batch) = accumulator.take() {
+                emit(&sink, &telemetry, batch, FlushReason::Shutdown).await;
+            }
+            return Ok(());
+        }
+
+        read_buf.clear();
+        let step = match next_flush {
+            None => read_step(&mut stream, &mut read_buf, &mut shutdown).await,
+            Some(deadline) => {
+                let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout(
+                    wait,
+                    read_step(&mut stream, &mut read_buf, &mut shutdown),
+                )
+                .await
+                {
+                    Ok(step) => step,
+                    // The flush deadline won -- loop back round to the interval trigger above.
+                    Err(_elapsed) => continue,
+                }
+            }
+        };
+
+        match step {
+            ReadStep::Bytes => {}
+            ReadStep::Shutdown => {
+                if let Some(batch) = accumulator.take() {
+                    emit(&sink, &telemetry, batch, FlushReason::Shutdown).await;
+                }
+                return Ok(());
+            }
+            ReadStep::Eof => {
+                // A terminator-less remainder is an ordinary final message under non-transparent
+                // framing and a truncated frame under octet counting -- `Framer::finish` decides.
+                match framer.finish() {
+                    Ok(Some(frame)) => {
+                        absorb_frame(
+                            frame,
+                            now_nanos(),
+                            &mut decoder,
+                            &mut scratch,
+                            &mut accumulator,
+                            &sink,
+                            &telemetry,
+                            &mut diag,
+                        )
+                        .await;
+                    }
+                    Ok(None) => {}
+                    Err(err) => report_frame_error(&err, &telemetry, &mut diag),
+                }
+                if let Some(batch) = accumulator.take() {
+                    emit(&sink, &telemetry, batch, FlushReason::Closed).await;
+                }
+                return Ok(());
+            }
+            ReadStep::Failed(err) => {
+                // The connection broke, but whatever was already decoded is still good -- deliver
+                // it before surfacing the error as this connection's `connection_error`.
+                if let Some(batch) = accumulator.take() {
+                    emit(&sink, &telemetry, batch, FlushReason::Closed).await;
+                }
+                return Err(err.into());
+            }
+        }
+
+        // `received_at` is when the bytes came off the socket, not when the frame they complete is
+        // decoded -- `logit_proto::Decoder::decode_into`'s own contract.
+        let received_at = now_nanos();
+        framer.push(&read_buf);
+        loop {
+            match framer.next_frame() {
+                Ok(Some(frame)) => {
+                    absorb_frame(
+                        frame,
+                        received_at,
+                        &mut decoder,
+                        &mut scratch,
+                        &mut accumulator,
+                        &sink,
+                        &telemetry,
+                        &mut diag,
+                    )
+                    .await;
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    // Neither framing can resynchronize past one of these (see [`FrameError`]), so
+                    // this connection ends here -- diagnosed on its own key rather than bubbling
+                    // up as a `connection_error`, since the cause is the peer's framing, not I/O.
+                    report_frame_error(&err, &telemetry, &mut diag);
+                    if let Some(batch) = accumulator.take() {
+                        emit(&sink, &telemetry, batch, FlushReason::Closed).await;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// One complete frame: counted, decoded, and accumulated. A decode error is diagnosed and the
+/// frame dropped -- the connection stays open, mirroring `crate::udp::decode_loop`'s
+/// `bad_datagram` handling of one malformed datagram among good ones.
+#[allow(clippy::too_many_arguments)] // eight threaded-through borrows; a params struct would only move them
+async fn absorb_frame<D: Decoder + Send>(
+    frame: Bytes,
+    received_at: i64,
+    decoder: &mut D,
+    scratch: &mut Vec<Event>,
+    accumulator: &mut BatchAccumulator,
+    sink: &Fanout,
+    telemetry: &Telemetry,
+    diag: &mut Diagnostics,
+) {
+    telemetry.count("logit.input.frames", 1.0, &[]);
+    telemetry.count("logit.input.frame.bytes", frame.len() as f64, &[]);
+    scratch.clear();
+    match decoder.decode_into(frame, received_at, scratch) {
+        Ok((resource, scope)) => {
+            // `scope` is whatever the decoder returned -- `None` for every decoder driven here
+            // today, but threaded through rather than hardcoded, exactly as `crate::udp` does.
+            if let Some((batch, reason)) = accumulator.absorb(resource, scope, scratch) {
+                emit(sink, telemetry, batch, reason).await;
+            }
+        }
+        Err(err) => {
+            diag.warn_throttled("bad_frame", err);
+        }
+    }
+}
+
+/// Counts and diagnoses a framing failure. Its own diagnostic key, not `connection_error`: an
+/// operator triaging "my sender's frames are being rejected" is looking at something quite
+/// different from "a peer's socket broke".
+fn report_frame_error(err: &FrameError, telemetry: &Telemetry, diag: &mut Diagnostics) {
+    telemetry.count("logit.input.frames.dropped", 1.0, &[("reason", err.reason())]);
+    diag.warn_throttled("framing_error", err);
+}
+
+/// `sink.send` mints a fresh [`logit_pipeline::TraceContext::new_root`] here -- once per
+/// *accumulated* batch, not once per frame that fed it. See `crate::udp::emit`'s own doc comment
+/// for the many-to-one attribution gap this shares with every other accumulating listener;
+/// `docs/known-gaps.md`'s internal-spans entry is the one place it is tracked.
+async fn emit(sink: &Fanout, telemetry: &Telemetry, batch: EventBatch, reason: FlushReason) {
+    telemetry.count("logit.component.receive.flushed", 1.0, &[("reason", reason.as_str())]);
+    sink.send(batch).await;
+}
+
+/// The one clock this driver reads, shared with [`crate::udp`] rather than duplicated so both
+/// listeners stamp `received_at` identically.
+fn now_nanos() -> i64 {
+    crate::udp::now_nanos()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use logit_core::{AttrMap, MetricKind, Registry, Resource, Value};
+    use logit_pipeline::unwrap_batch;
+    use logit_proto::CodecError;
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+    use tokio::sync::mpsc;
+
+    // ---- framer ------------------------------------------------------------------------------
+
+    /// Pushes `bytes` and drains every frame that completes, as UTF-8 strings. Panics on a
+    /// framing error -- [`push_and_expect_error`] is the test-side counterpart for those.
+    fn push_and_drain(framer: &mut Framer, bytes: &[u8]) -> Vec<String> {
+        framer.push(bytes);
+        let mut out = Vec::new();
+        loop {
+            match framer.next_frame().expect("framing should succeed") {
+                Some(frame) => out.push(String::from_utf8_lossy(&frame).into_owned()),
+                None => return out,
+            }
+        }
+    }
+
+    /// Pushes `bytes` and drains until the framer reports an error, which it must.
+    fn push_and_expect_error(framer: &mut Framer, bytes: &[u8]) -> FrameError {
+        framer.push(bytes);
+        loop {
+            match framer.next_frame() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("expected a framing error, got 'need more bytes'"),
+                Err(err) => return err,
+            }
+        }
+    }
+
+    #[test]
+    fn the_first_byte_latches_the_framing_for_the_connection() {
+        assert_eq!(Framer::new().framing(), None, "nothing is latched before the first byte");
+
+        let mut counted = Framer::new();
+        counted.push(b"1");
+        assert_eq!(counted.framing(), Some(Framing::OctetCounting));
+        assert_eq!(counted.framing().unwrap().as_str(), "octet_counting");
+
+        // A non-transparent syslog frame always starts `<` -- but anything that isn't an ASCII
+        // digit latches this way, not just `<`.
+        for first in [&b"<"[..], b" ", b"x", b"\n"] {
+            let mut lines = Framer::new();
+            lines.push(first);
+            assert_eq!(
+                lines.framing(),
+                Some(Framing::NonTransparent),
+                "leading byte {first:?} should latch non-transparent"
+            );
+        }
+        assert_eq!(Framing::NonTransparent.as_str(), "non_transparent");
+    }
+
+    /// The latch is for the connection's life: a later message that looks like the *other* framing
+    /// changes nothing.
+    #[test]
+    fn the_latched_framing_is_never_re_evaluated() {
+        let mut lines = Framer::new();
+        assert_eq!(
+            push_and_drain(&mut lines, b"<13>one\n12 not a count\n"),
+            vec!["<13>one", "12 not a count"]
+        );
+        assert_eq!(lines.framing(), Some(Framing::NonTransparent));
+    }
+
+    #[test]
+    fn a_frame_delivered_one_byte_per_push_is_assembled() {
+        for wire in [&b"<13>hello\n"[..], &b"9 <13>hello"[..]] {
+            let mut framer = Framer::new();
+            let mut got = Vec::new();
+            for byte in wire {
+                got.extend(push_and_drain(&mut framer, &[*byte]));
+            }
+            // The octet-counted case has no terminator, so its last byte completes the frame only
+            // because the declared length says so -- exactly the property under test.
+            assert_eq!(
+                got,
+                vec!["<13>hello".to_string()],
+                "wire {:?}",
+                String::from_utf8_lossy(wire)
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_spanning_two_pushes_is_assembled() {
+        let mut lines = Framer::new();
+        assert!(push_and_drain(&mut lines, b"<13>hel").is_empty(), "no LF yet");
+        assert_eq!(push_and_drain(&mut lines, b"lo\n"), vec!["<13>hello"]);
+
+        let mut counted = Framer::new();
+        assert!(push_and_drain(&mut counted, b"9 <13>he").is_empty(), "short of the declared 9");
+        assert_eq!(push_and_drain(&mut counted, b"llo"), vec!["<13>hello"]);
+    }
+
+    #[test]
+    fn several_frames_in_one_push_come_out_in_order() {
+        let mut lines = Framer::new();
+        assert_eq!(
+            push_and_drain(&mut lines, b"<13>one\n<13>two\n<13>three\n"),
+            vec!["<13>one", "<13>two", "<13>three"]
+        );
+
+        let mut counted = Framer::new();
+        assert_eq!(
+            push_and_drain(&mut counted, b"7 <13>one7 <13>two9 <13>three"),
+            vec!["<13>one", "<13>two", "<13>three"]
+        );
+    }
+
+    /// The reason octet counting exists at all: a MSG containing a newline is one frame, not two.
+    #[test]
+    fn an_octet_counted_message_containing_a_newline_stays_one_frame() {
+        let msg = "<13>first line\nsecond line\nthird";
+        let wire = format!("{} {msg}", msg.len());
+        let mut framer = Framer::new();
+        assert_eq!(push_and_drain(&mut framer, wire.as_bytes()), vec![msg]);
+    }
+
+    #[test]
+    fn one_trailing_cr_is_stripped_from_a_non_transparent_line() {
+        let mut framer = Framer::new();
+        assert_eq!(push_and_drain(&mut framer, b"<13>hello\r\n"), vec!["<13>hello"]);
+        // Only one: a message genuinely ending in CR keeps it.
+        assert_eq!(push_and_drain(&mut framer, b"<13>hello\r\r\n"), vec!["<13>hello\r"]);
+    }
+
+    #[test]
+    fn an_empty_non_transparent_line_is_skipped() {
+        let mut framer = Framer::new();
+        assert_eq!(push_and_drain(&mut framer, b"<13>a\n\n\r\n<13>b\n"), vec!["<13>a", "<13>b"]);
+    }
+
+    #[test]
+    fn an_oversize_non_transparent_line_is_an_oversize_error() {
+        // Past the ceiling with no terminator in sight: the framer must not keep buffering in the
+        // hope that one arrives.
+        let unterminated = vec![b'<'; MAX_FRAME_BYTES + 1];
+        let err = push_and_expect_error(&mut Framer::new(), &unterminated);
+        assert_eq!(err.reason(), "oversize", "{err}");
+
+        // And the same line *with* its terminator, which takes the other branch.
+        let mut terminated = unterminated.clone();
+        terminated.push(b'\n');
+        let err = push_and_expect_error(&mut Framer::new(), &terminated);
+        assert_eq!(err.reason(), "oversize", "{err}");
+
+        // Exactly at the ceiling is fine -- the bound is inclusive.
+        let at_ceiling = {
+            let mut line = vec![b'<'; MAX_FRAME_BYTES];
+            line.push(b'\n');
+            line
+        };
+        assert_eq!(push_and_drain(&mut Framer::new(), &at_ceiling).len(), 1);
+    }
+
+    #[test]
+    fn an_octet_count_over_the_ceiling_is_an_oversize_error() {
+        let wire = format!("{} x", MAX_FRAME_BYTES + 1);
+        let err = push_and_expect_error(&mut Framer::new(), wire.as_bytes());
+        assert_eq!(err.reason(), "oversize", "{err}");
+    }
+
+    #[test]
+    fn a_trailing_partial_line_at_eof_is_emitted_as_a_final_message() {
+        let mut framer = Framer::new();
+        assert_eq!(push_and_drain(&mut framer, b"<13>a\n<13>no terminator"), vec!["<13>a"]);
+        let last = framer.finish().expect("a terminator-less remainder is a message, not an error");
+        assert_eq!(last.as_deref().map(String::from_utf8_lossy), Some("<13>no terminator".into()));
+        assert_eq!(framer.finish(), Ok(None), "nothing is left after finish()");
+    }
+
+    #[test]
+    fn a_trailing_partial_octet_counted_frame_at_eof_is_truncated() {
+        let mut framer = Framer::new();
+        assert!(push_and_drain(&mut framer, b"9 <13>hel").is_empty());
+        assert_eq!(framer.buffered(), 9);
+        let err = framer.finish().expect_err("a short MSG under a declared count is truncated");
+        assert_eq!(err.reason(), "truncated", "{err}");
+        assert_eq!(framer.buffered(), 0, "the unusable remainder is discarded");
+    }
+
+    #[test]
+    fn a_non_digit_before_the_sp_is_malformed() {
+        let err = push_and_expect_error(&mut Framer::new(), b"12x <13>hello");
+        assert_eq!(err.reason(), "malformed", "{err}");
+    }
+
+    #[test]
+    fn a_ten_digit_octet_count_is_malformed() {
+        let err = push_and_expect_error(&mut Framer::new(), b"1234567890 <13>hello");
+        assert_eq!(err.reason(), "malformed", "{err}");
+    }
+
+    #[test]
+    fn a_zero_octet_count_is_malformed() {
+        let err = push_and_expect_error(&mut Framer::new(), b"0 <13>hello");
+        assert_eq!(err.reason(), "malformed", "{err}");
+        assert!(err.to_string().contains("zero"), "{err}");
+    }
+
+    /// RFC 6587 §3.4.1's `MSG-LEN = NONZERO-DIGIT *DIGIT`: a padded count is not this framing.
+    /// The leading `0` still latches octet counting (see [`Framing`]'s doc comment), so the
+    /// connection fails loudly here rather than being silently read as non-transparent.
+    #[test]
+    fn an_octet_count_with_a_leading_zero_is_malformed() {
+        let mut framer = Framer::new();
+        framer.push(b"012 <13>hello");
+        assert_eq!(framer.framing(), Some(Framing::OctetCounting));
+        let err = framer.next_frame().expect_err("a padded count is malformed, not 12");
+        assert_eq!(err.reason(), "malformed", "{err}");
+        assert!(err.to_string().contains("leading zero"), "{err}");
+    }
+
+    // ---- driver: fixtures and harness ---------------------------------------------------------
+
+    /// A trivial `Decoder`: one frame -> one event, except the literal bytes `b"BAD"`, which are
+    /// rejected -- enough to exercise decode-error handling without pulling in syslog grammar
+    /// specifics. Every decoded event carries the raw frame under `"payload"`.
+    #[derive(Clone)]
+    struct TestDecoder {
+        resource: Arc<Resource>,
+    }
+
+    impl TestDecoder {
+        fn new() -> Self {
+            Self { resource: Arc::new(Resource::default()) }
+        }
+    }
+
+    impl Decoder for TestDecoder {
+        fn decode_into(
+            &mut self,
+            bytes: Bytes,
+            received_at: i64,
+            out: &mut Vec<Event>,
+        ) -> Result<(Arc<Resource>, Option<Arc<logit_core::Scope>>), CodecError> {
+            if &bytes[..] == b"BAD" {
+                return Err(CodecError::Malformed("bad frame".to_string()));
+            }
+            let mut attrs = AttrMap::new();
+            attrs.insert("payload", Value::str(String::from_utf8_lossy(&bytes)));
+            out.push(Event::empty(received_at, attrs));
+            Ok((Arc::clone(&self.resource), None))
+        }
+    }
+
+    fn payload(event: &Event) -> String {
+        match event.attributes.get("payload") {
+            Some(Value::Str(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+            other => panic!("expected a payload attribute, got {other:?}"),
+        }
+    }
+
+    /// One event per frame, no interval timer -- the configuration most driver tests want, since
+    /// it makes every delivery attributable to exactly one frame.
+    fn one_per_frame() -> TcpListenerConfig {
+        TcpListenerConfig {
+            batch_max_events: 1,
+            batch_flush_interval: Duration::ZERO,
+            ..TcpListenerConfig::default()
+        }
+    }
+
+    /// Binds an ephemeral port through `Input::bind` (not by binding and dropping a probe socket
+    /// the way `logit_in`'s tests must) -- the whole point of this driver's bind pre-pass.
+    async fn bound_listener(config: TcpListenerConfig) -> (String, TcpListener<TestDecoder>) {
+        let mut listener = TcpListener::new("127.0.0.1:0", TestDecoder::new(), config);
+        listener.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = listener.local_addr().expect("bind() leaves a real address behind").to_string();
+        (addr, listener)
+    }
+
+    fn fanout_into_channel(capacity: usize) -> (Fanout, mpsc::Receiver<logit_pipeline::Delivered>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Fanout::new(vec![tx]), rx)
+    }
+
+    async fn recv_batch(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> EventBatch {
+        let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a batch should be delivered within 5s")
+            .expect("the fanout should not have closed");
+        unwrap_batch(delivered)
+    }
+
+    fn payloads(batch: &EventBatch) -> Vec<String> {
+        batch.events.iter().map(payload).collect()
+    }
+
+    async fn connect(addr: &str) -> TcpStream {
+        TcpStream::connect(addr).await.expect("connecting to the bound listener should succeed")
+    }
+
+    /// Reads one byte, expecting the peer to have closed instead.
+    async fn expect_closed<S: AsyncRead + Unpin>(stream: &mut S, what: &str) {
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("{what}: expected a close within 2s"))
+            .expect("read should not fail outright");
+        assert_eq!(n, 0, "{what}: expected a close, got a byte");
+    }
+
+    /// The value of `metric`'s `Sum` in a drained `Registry` snapshot, optionally restricted to
+    /// the point carrying `tag` -- mirrors `crate::logit`'s own test-module `drained_counter`,
+    /// split into drain-then-query so one test can check several metrics from one snapshot.
+    fn sum_of(events: &[Event], metric: &str, tag: Option<(&str, &str)>) -> Option<f64> {
+        events.iter().find_map(|e| {
+            if let Some((key, value)) = tag {
+                if e.attributes.get(key).and_then(|v| v.as_str()) != Some(value) {
+                    return None;
+                }
+            }
+            e.metrics.iter().find_map(|m| {
+                if logit_core::interner::resolve(m.name) != metric {
+                    return None;
+                }
+                match m.kind {
+                    MetricKind::Sum(sum) => Some(sum.value),
+                    _ => None,
+                }
+            })
+        })
+    }
+
+    fn testdata_dir() -> std::path::PathBuf {
+        // `logit-inputs` lives at `crates/logit-inputs`; the fixtures live at the repo root's
+        // `testdata/tls` (`testdata/tls/README.md`) -- two levels up from `CARGO_MANIFEST_DIR`,
+        // the same path `crate::logit`/`crate::otlp`'s own TLS tests use.
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
+    }
+
+    fn test_tls_settings(client_ca_file: Option<&str>) -> TlsServerSettings {
+        TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: client_ca_file.map(str::to_string),
+        }
+    }
+
+    /// A `tokio-rustls` client trusting exactly `ca_file` under `testdata/tls` -- `other-ca.pem`
+    /// is what makes a "wrong CA" test real rather than a certificate-name mismatch.
+    /// `client_cert` is `(cert, key)` file names for the mTLS cases, `None` for a client
+    /// presenting nothing.
+    async fn tls_connector(
+        ca_file: &str,
+        client_cert: Option<(&str, &str)>,
+    ) -> tokio_rustls::TlsConnector {
+        let dir = testdata_dir();
+        let mut roots = rustls::RootCertStore::empty();
+        let ca: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(dir.join(ca_file))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        roots.add_parsable_certificates(ca);
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots);
+        let cfg = match client_cert {
+            Some((cert_file, key_file)) => {
+                let chain: Vec<CertificateDer<'static>> =
+                    CertificateDer::pem_file_iter(dir.join(cert_file))
+                        .unwrap()
+                        .collect::<Result<_, _>>()
+                        .unwrap();
+                let key = PrivateKeyDer::from_pem_file(dir.join(key_file)).unwrap();
+                builder.with_client_auth_cert(chain, key).unwrap()
+            }
+            None => builder.with_no_client_auth(),
+        };
+        tokio_rustls::TlsConnector::from(Arc::new(cfg))
+    }
+
+    /// `testdata/tls/server.pem` carries a `localhost` SAN (`testdata/tls/README.md`), so that is
+    /// the name every TLS client here presents.
+    fn server_name() -> rustls_pki_types::ServerName<'static> {
+        rustls_pki_types::ServerName::try_from("localhost").unwrap()
+    }
+
+    type ClientTls = tokio_rustls::client::TlsStream<TcpStream>;
+
+    async fn tls_connect(connector: &tokio_rustls::TlsConnector, addr: &str) -> ClientTls {
+        let stream = connect(addr).await;
+        tokio::time::timeout(Duration::from_secs(5), connector.connect(server_name(), stream))
+            .await
+            .expect("the TLS handshake should complete within 5s")
+            .expect("the TLS handshake should succeed")
+    }
+
+    // ---- driver: plaintext --------------------------------------------------------------------
+
+    /// The bind pre-pass (`docs/plans/operator-surface.md`, workstream B): the port is live and
+    /// its OS-assigned address is readable before anything is spawned, and a second `bind()` is a
+    /// no-op per `Input::bind`'s contract.
+    #[tokio::test]
+    async fn bind_makes_the_port_live_and_local_addr_reports_it_before_run() {
+        let mut listener =
+            TcpListener::new("127.0.0.1:0", TestDecoder::new(), TcpListenerConfig::default());
+        assert_eq!(listener.local_addr(), None, "no address before bind()");
+
+        listener.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = listener.local_addr().expect("bind() should leave a real address behind");
+
+        // Nothing is running yet -- this connection sits in the accept backlog, which is exactly
+        // what makes a bind pre-pass worth having: no startup window where the port refuses.
+        let _early = TcpStream::connect(addr).await.expect("the bound port should accept");
+
+        listener.bind().await.expect("a second bind should be a harmless no-op");
+        assert_eq!(listener.local_addr(), Some(addr), "the address must not change");
+    }
+
+    #[tokio::test]
+    async fn a_plaintext_connection_round_trips_a_decoded_frame() {
+        let (addr, mut listener) = bound_listener(one_per_frame()).await;
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>hello\n").await.unwrap();
+
+        let batch = recv_batch(&mut rx).await;
+        assert_eq!(payloads(&batch), vec!["<13>hello"]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn the_accumulator_flushes_on_batch_max_events() {
+        let config = TcpListenerConfig {
+            batch_max_events: 2,
+            batch_flush_interval: Duration::ZERO,
+            ..TcpListenerConfig::default()
+        };
+        let (addr, mut listener) = bound_listener(config).await;
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        // Three frames in one write: the bound fires on the second, and the third stays held --
+        // with the interval timer off, nothing else can flush it while the connection is open.
+        client.write_all(b"<13>one\n<13>two\n<13>three\n").await.unwrap();
+
+        let batch = recv_batch(&mut rx).await;
+        assert_eq!(payloads(&batch), vec!["<13>one", "<13>two"]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv()).await.is_err(),
+            "the third frame must still be accumulating, not delivered"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn the_accumulator_flushes_on_the_batch_flush_interval() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let config = TcpListenerConfig {
+            batch_max_events: 1_000,
+            batch_flush_interval: Duration::from_millis(50),
+            ..TcpListenerConfig::default()
+        };
+        let (addr, listener) = bound_listener(config).await;
+        let mut listener = listener.with_telemetry(telemetry);
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        // Far short of `batch_max_events`, and the connection stays open -- only the interval
+        // timer can deliver this.
+        client.write_all(b"<13>alone\n").await.unwrap();
+
+        let batch = recv_batch(&mut rx).await;
+        assert_eq!(payloads(&batch), vec!["<13>alone"]);
+
+        let events = registry.drain(0);
+        assert_eq!(
+            sum_of(&events, "logit.component.receive.flushed", Some(("reason", "interval"))),
+            Some(1.0)
+        );
+        assert_eq!(sum_of(&events, "logit.input.frames", None), Some(1.0));
+        assert_eq!(sum_of(&events, "logit.input.frame.bytes", None), Some(9.0));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_clean_close_flushes_whatever_is_accumulated() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let config = TcpListenerConfig {
+            batch_max_events: 1_000,
+            batch_flush_interval: Duration::ZERO,
+            ..TcpListenerConfig::default()
+        };
+        let (addr, listener) = bound_listener(config).await;
+        let mut listener = listener.with_telemetry(telemetry);
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        // The last message has no terminator: a non-transparent close emits it as a final frame
+        // (`Framer::finish`), and only then does the accumulator flush.
+        client.write_all(b"<13>one\n<13>two").await.unwrap();
+        client.flush().await.unwrap();
+        drop(client);
+
+        let batch = recv_batch(&mut rx).await;
+        assert_eq!(payloads(&batch), vec!["<13>one", "<13>two"]);
+        assert_eq!(
+            sum_of(
+                &registry.drain(0),
+                "logit.component.receive.flushed",
+                Some(("reason", "closed"))
+            ),
+            Some(1.0)
+        );
+
+        handle.abort();
+    }
+
+    /// A frame the decoder rejects is diagnosed and dropped; the connection keeps serving the
+    /// frames either side of it -- `crate::udp::decode_loop`'s `bad_datagram` contract, per frame.
+    #[tokio::test]
+    async fn a_frame_the_decoder_rejects_does_not_close_the_connection() {
+        let (addr, mut listener) = bound_listener(one_per_frame()).await;
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>good-1\nBAD\n<13>good-2\n").await.unwrap();
+
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>good-1"]);
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>good-2"]);
+
+        handle.abort();
+    }
+
+    /// The cap rejects rather than queues, and -- unlike `logit_in` -- closes before any TLS
+    /// handshake, since syslog has no in-band reject to deliver (this module's "Connection limit"
+    /// doc section).
+    #[tokio::test]
+    async fn the_connection_cap_drops_a_connection_past_the_limit_and_counts_it() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener.with_telemetry(telemetry).with_max_connections(1);
+        let (sink, _rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        // The first connection takes the one permit and holds it, idle.
+        let _first = connect(&addr).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut second = connect(&addr).await;
+        expect_closed(&mut second, "a past-the-cap connection").await;
+
+        assert_eq!(
+            sum_of(
+                &registry.drain(0),
+                "logit.input.connections.rejected",
+                Some(("reason", "limit"))
+            ),
+            Some(1.0)
+        );
+
+        handle.abort();
+    }
+
+    /// A framing error is fatal to *its* connection and to nothing else -- neither framing can
+    /// resynchronize past one, but a sibling connection never saw it.
+    #[tokio::test]
+    async fn an_oversize_frame_closes_only_that_connection() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener.with_telemetry(telemetry);
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut good = connect(&addr).await;
+        let mut bad = connect(&addr).await;
+        good.write_all(b"<13>fine\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>fine"]);
+
+        // Past the ceiling with no terminator. The write may itself fail once the server has
+        // closed on us, which is the behaviour under test, not a failure.
+        let oversize = vec![b'<'; MAX_FRAME_BYTES + 4_096];
+        let _ = tokio::time::timeout(Duration::from_secs(5), bad.write_all(&oversize)).await;
+        expect_closed(&mut bad, "the connection that sent an oversize frame").await;
+
+        good.write_all(b"<13>still here\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>still here"]);
+
+        assert_eq!(
+            sum_of(&registry.drain(0), "logit.input.frames.dropped", Some(("reason", "oversize"))),
+            Some(1.0)
+        );
+
+        handle.abort();
+    }
+
+    /// The shutdown cascade (`docs/adr/service-lifecycle-and-output-retry.md`): every connection
+    /// task's `Fanout` clone must drop, or the downstream inbox never observes a close. An idle
+    /// connection is the case that only works because each one races its read against `shutdown`.
+    #[tokio::test]
+    async fn shutdown_returns_promptly_with_an_idle_connection_still_open() {
+        let (addr, mut listener) = bound_listener(one_per_frame()).await;
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let _idle = connect(&addr).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(true).expect("the receiver should still be alive");
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            closed.expect("the fanout should close within 2s").is_none(),
+            "expected every Fanout clone to have dropped"
+        );
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("run_until_shutdown should return within 2s")
+            .expect("the task should not panic")
+            .expect("shutdown should be clean");
+    }
+
+    // ---- driver: TLS --------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_tls_connection_round_trips_a_decoded_frame() {
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener.with_tls(&test_tls_settings(None), &testdata_dir()).unwrap();
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let connector = tls_connector("ca.pem", None).await;
+        let mut client = tls_connect(&connector, &addr).await;
+        // Octet counting over TLS, so this also proves the framing latch is per connection and
+        // entirely independent of the transport wrapping it.
+        client.write_all(b"12 <13>over tls").await.unwrap();
+        client.flush().await.unwrap();
+
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>over tls"]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_client_trusting_the_wrong_ca_is_refused_and_the_listener_keeps_serving() {
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener.with_tls(&test_tls_settings(None), &testdata_dir()).unwrap();
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let wrong = tls_connector("other-ca.pem", None).await;
+        let stream = connect(&addr).await;
+        let refused =
+            tokio::time::timeout(Duration::from_secs(5), wrong.connect(server_name(), stream))
+                .await
+                .expect("the handshake should resolve within 5s");
+        assert!(refused.is_err(), "a client trusting only other-ca.pem must not complete");
+
+        // A failed handshake must not be fatal to the listener or its siblings.
+        let connector = tls_connector("ca.pem", None).await;
+        let mut client = tls_connect(&connector, &addr).await;
+        client.write_all(b"<13>still serving\n").await.unwrap();
+        client.flush().await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>still serving"]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mutual_tls_accepts_a_client_certificate_and_refuses_a_client_without_one() {
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener =
+            listener.with_tls(&test_tls_settings(Some("ca.pem")), &testdata_dir()).unwrap();
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let with_cert = tls_connector("ca.pem", Some(("client.pem", "client.key"))).await;
+        let mut client = tls_connect(&with_cert, &addr).await;
+        client.write_all(b"<13>authenticated\n").await.unwrap();
+        client.flush().await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>authenticated"]);
+
+        // No client certificate. Under TLS 1.3 the server's "certificate required" alert lands
+        // after the client believes the handshake finished, so the failure may surface at connect
+        // time or on the first write -- what must hold either way is that nothing is delivered.
+        let without_cert = tls_connector("ca.pem", None).await;
+        let stream = connect(&addr).await;
+        if let Ok(Ok(mut anonymous)) = tokio::time::timeout(
+            Duration::from_secs(5),
+            without_cert.connect(server_name(), stream),
+        )
+        .await
+        {
+            let _ = anonymous.write_all(b"<13>no certificate\n").await;
+            let _ = anonymous.flush().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), rx.recv()).await.is_err(),
+            "a client presenting no certificate must not deliver events"
+        );
+
+        handle.abort();
+    }
+
+    /// The pre-handshake timeout's whole purpose (this module's "Pre-handshake timeout" doc
+    /// section): a client that opens a connection and never sends a ClientHello must not pin a
+    /// connection-limit permit. Proven under `with_max_connections(1)`, so the second connection
+    /// can only succeed if the first one's permit genuinely came back.
+    #[tokio::test]
+    async fn a_silent_connection_releases_its_permit_after_the_handshake_timeout() {
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener
+            .with_tls(&test_tls_settings(None), &testdata_dir())
+            .unwrap()
+            .with_max_connections(1)
+            .with_handshake_timeout(Duration::from_millis(50));
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        // Raw TCP, not a byte sent -- held (not dropped) past the timeout, so nothing but the
+        // timeout itself could free the permit.
+        let _silent = connect(&addr).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let connector = tls_connector("ca.pem", None).await;
+        let mut client = tls_connect(&connector, &addr).await;
+        client.write_all(b"<13>permit came back\n").await.unwrap();
+        client.flush().await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>permit came back"]);
+
+        handle.abort();
+    }
+}
