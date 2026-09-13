@@ -31,6 +31,11 @@ components:
     #   key_file: server.key    # required -- server.pem's private key
     #   client_ca_file: null    # set for mutual TLS -- every connecting client must then present
     #                             a certificate chaining to this CA; omit for server-auth-only TLS
+    # handshake_timeout: 5s     # bounds each pre-message phase *separately* -- the TLS accept,
+    #                             then the wait for the connection's first byte -- so a TLS peer
+    #                             that connects and says nothing costs up to twice this before
+    #                             its connection-cap slot is released. Not an idle timeout: the
+    #                             gap before a *later* frame is unbounded. transport: tcp only.
 
     # A TCP syslog_in has no receive *queue* -- the connection's own flow control is the
     # backpressure -- so only the batch-assembly/shutdown fields below apply, scoped **per
