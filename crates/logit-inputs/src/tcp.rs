@@ -539,6 +539,14 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
         Ok(self)
     }
 
+    /// This listener's own diagnostics -- test-only, the driver-half counterpart of
+    /// [`Self::decoder`] below: a wrapper's `with_diagnostics` has to set both, and only an
+    /// accessor on each can prove it did (`crate::syslog`'s own regression test).
+    #[cfg(test)]
+    pub(crate) fn diag(&self) -> &Diagnostics {
+        &self.diag
+    }
+
     /// The wrapped decoder -- test-only, and for exactly the reason
     /// [`crate::udp::UdpListener::decoder`] exists: a wrapper's `with_diagnostics` has to reach
     /// the decoder's own `Diagnostics` as well as this listener's, and only an accessor can prove

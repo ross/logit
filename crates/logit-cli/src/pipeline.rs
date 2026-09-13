@@ -1910,6 +1910,31 @@ mod tests {
         ));
     }
 
+    /// The negative twin of the test above, and the one that actually pins the `with_tls` call:
+    /// the positive test passes even with that call deleted, since `build_spec` would still hand
+    /// back a `NodeSpec::Input`. A cert path that doesn't exist can only fail if the certificate
+    /// is really being loaded -- the same division of labour
+    /// `build_spec_reports_a_missing_tls_ca_file_clearly` documents for `otlp_out`, since graph
+    /// rule 43 never touches the filesystem.
+    #[test]
+    fn build_spec_reports_a_missing_syslog_tls_cert_file_clearly() {
+        let component = syslog_in_component(
+            logit_config::SyslogTransport::Tcp,
+            Some(logit_config::TlsServerConfig {
+                cert_file: "does-not-exist.pem".to_string(),
+                key_file: "server.key".to_string(),
+                client_ca_file: None,
+            }),
+        );
+        let err = match build_spec("in", &component, &testdata_tls_dir(), None) {
+            Ok(_) => panic!("expected a missing tls.cert_file to fail build_spec"),
+            Err(err) => err,
+        };
+        let err = format!("{err:?}");
+        assert!(err.contains("tls.cert_file"), "got: {err}");
+        assert!(err.contains("does-not-exist.pem"), "got: {err}");
+    }
+
     /// The default transport still builds the UDP listener, `receive:` and all.
     #[test]
     fn build_spec_builds_a_udp_syslog_input() {

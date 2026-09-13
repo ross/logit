@@ -1093,7 +1093,8 @@ mod tests {
         let input = SyslogInput::new("127.0.0.1:0").with_diagnostics(Diagnostics::new("my-id"));
         match &input.inner {
             Inner::Udp(listener) => {
-                assert_eq!(listener.decoder().diag().component_id(), "my-id")
+                assert_eq!(listener.decoder().diag().component_id(), "my-id");
+                assert_eq!(listener.diag().component_id(), "my-id");
             }
             Inner::Tcp(_) => panic!("SyslogInput::new must build a UDP listener"),
         }
@@ -1107,6 +1108,10 @@ mod tests {
         match &input.inner {
             Inner::Tcp(listener) => {
                 assert_eq!(listener.decoder().diag().component_id(), "tcp-id");
+                // The driver half too: `with_diagnostics` has to reach both, and the decoder
+                // being right says nothing about the listener's own `framing_error`/
+                // `connection_error` handle having been set.
+                assert_eq!(listener.diag().component_id(), "tcp-id");
                 assert!(
                     !listener.decoder().line_splitting,
                     "with_diagnostics must not undo SyslogInput::tcp's line-splitting choice"
