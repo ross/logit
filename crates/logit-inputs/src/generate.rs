@@ -342,8 +342,13 @@ impl GenerateInput {
     }
 
     /// Target events per second. `None` (the default) is unthrottled.
+    ///
+    /// `Some(0)` is folded to `None` rather than stored: graph rule 42 rejects `rate: 0` in
+    /// config, but a direct caller has no rule 42 in front of it, and a zero rate would make
+    /// [`GenerateInput::pace`]'s `sent / rate` infinite -- which `Duration::from_secs_f64`
+    /// panics on. Same shape as `new`'s `batch.max(1)`.
     pub fn with_rate(mut self, rate: Option<u64>) -> Self {
-        self.rate = rate;
+        self.rate = rate.filter(|rate| *rate > 0);
         self
     }
 
@@ -977,6 +982,18 @@ mod tests {
         assert!(GenerateInput::new(Some(1), 1)
             .with_attribute("n", parse("{seq}").unwrap())
             .is_ok());
+    }
+
+    /// Rule 42 rejects `rate: 0` in config, but a direct caller has no rule 42 in front of it --
+    /// and `0` would make `pace`'s `sent / rate` infinite, which `Duration::from_secs_f64`
+    /// panics on. Folded to "unthrottled" instead, the same shape as `batch`'s clamp.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_rate_means_unthrottled_rather_than_a_panic() {
+        let started = Instant::now();
+        let batches =
+            run_to_completion(GenerateInput::new(Some(200), 100).with_rate(Some(0))).await;
+        assert_eq!(batches.iter().map(|b| b.events.len()).sum::<usize>(), 200);
+        assert_eq!(started.elapsed(), Duration::ZERO, "a zero rate must not pace at all");
     }
 
     #[test]
