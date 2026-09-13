@@ -176,7 +176,7 @@ the tag's literal argument string instead of failing.
 |---|---|---|
 | Listener (`statsd_in`, `collectd_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
-| Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
+| Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
 considered and rejected (ADR `component-graph-configuration`): a typo'd source reference would silently turn a real sink into
@@ -361,15 +361,17 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     configured id names a component present in this graph — `origin`/`previous` are exactly as
     likely to name a component in a different process's graph, relayed unchanged across
     `logit_out`/`logit_in`.
-38. A `statsd_out` or `collectd_out` `max_packet_bytes: 0` is rejected, the same shape as rule 15's
-    `buffer.max_batches`/`max_bytes: 0` — an impossible bound (every metric line/value list would
-    overflow it and be dropped whole), not a small one (`docs/adr/statsd-output.md`,
-    `docs/adr/collectd-binary-relay.md`). `collectd_out` additionally rejects any value outside
+38. A `statsd_out`, `collectd_out`, or `graphite_out` `max_packet_bytes: 0` is rejected, the same
+    shape as rule 15's `buffer.max_batches`/`max_bytes: 0` — an impossible bound (every metric
+    line/value list would overflow it and be dropped whole), not a small one
+    (`docs/adr/statsd-output.md`, `docs/adr/collectd-binary-relay.md`,
+    `docs/adr/graphite-carbon-relay.md`). `collectd_out` additionally rejects any value outside
     `1024..=65535` — collectd's own `MaxPacketSize` range (`docs/adr/collectd-binary-relay.md`):
     above it, every datagram fails `EMSGSIZE` at the socket (no UDP payload is that large), which
     `collectd_out` counts as a per-datagram drop rather than surfacing as a `Fault` — so an
     unbounded value would silently report `requests{class="ok"}` while delivering nothing.
-    `statsd_out` makes no such range claim in its own ADR, so it keeps only the zero check.
+    `statsd_out` and `graphite_out` make no such range claim in their own ADRs, so they keep only
+    the zero check.
 39. An `aggregate` with `temporality: cumulative` requires `series_retention >= 1` (a count of
     windows, not a duration) and `max_retained_series >= 1` — those two bounds are what keeps a running total alive
     across the window boundary, so with either at `0` no accumulator survives a flush and every
@@ -419,6 +421,18 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     resolver can mirror it exactly without depending on `logit-config` (this document's own
     "Crate layout" section). `receive:` on a `generate_in` is rejected by rule 17's own allowlist
     — it is a listener by role, with no socket, queue, or decoder for `receive:` to configure.
+43. `protocol: pickle` requires `transport: tcp` on `graphite_in`/`graphite_out`
+    (`docs/adr/graphite-carbon-relay.md`) — Twisted's length-prefixed pickle framing has no meaning
+    in a datagram, so the combination is a config error rather than a silent reinterpretation. A
+    zero `max_line_bytes`/`max_frame_bytes`/`connect_timeout` is rejected, the same impossible-
+    bound shape as rules 9/15/18/38 (`max_line_bytes: 0` would drain every byte as one endless
+    oversize line; `max_frame_bytes: 0` could never fit even carbon's own two-opcode empty-list
+    pickle frame; `connect_timeout: 0s` could never establish a TCP connection at all). And
+    `max_frame_bytes` is bounded `1024..=16 MiB` — below 1024 not even one realistic datapoint fits
+    a frame, and above 16 MiB is far past what any real sender or receiver needs, so a larger value
+    is almost certainly a mistake. `graphite_out`'s `max_packet_bytes: 0` is rule 38's own zero
+    check, extended (no collectd-style range clamp: an oversize packed datagram is already counted
+    `oversize_datagram` and skipped, `statsd_out`'s own `EMSGSIZE` handling).
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that

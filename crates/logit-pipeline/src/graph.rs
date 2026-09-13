@@ -158,17 +158,37 @@
 //!     `logit-config` (`docs/design/pipeline-graph.md`'s crate layout). `receive:` on a
 //!     `generate_in` is rejected by rule 17's own allowlist -- it is a listener by role, with no
 //!     socket, queue, or decoder for `receive:` to configure (`docs/plans/load-test-harness.md`).
+//! 43. `protocol: pickle` requires `transport: tcp` on `graphite_in`/`graphite_out` -- Twisted's
+//!     length-prefixed pickle framing has no meaning in a datagram, so the combination is a
+//!     config error rather than a silent reinterpretation. A zero `max_line_bytes`/
+//!     `max_frame_bytes`/`connect_timeout` is rejected -- each an impossible bound, the shape
+//!     rules 9/15/18/38 already use (`max_line_bytes: 0` would drain every byte as one endless
+//!     oversize line; `max_frame_bytes: 0` could never fit even carbon's own two-opcode empty-list
+//!     pickle frame; `connect_timeout: 0s` could never establish a TCP connection at all). And
+//!     `max_frame_bytes` is bounded `1024..=16 MiB` -- below 1024 not even one realistic datapoint
+//!     fits a frame, and above 16 MiB is far past any sender or receiver in
+//!     `docs/adr/graphite-carbon-relay.md`'s decisions actually needs, so a larger value is almost
+//!     certainly a config mistake rather than a deliberate choice. (`graphite_out`'s half of this
+//!     rule.)
 //!
 //! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
 //! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
 //! it is required (by 7) to have a consumer, so the chain can only terminate at a sink.
 
 use logit_config::{
-    BufferConfig, Component, ComponentKind, Compression, Config, ReceiveConfig, StreamFormat,
+    BufferConfig, Component, ComponentKind, Compression, Config, GraphiteProtocol,
+    GraphiteTransport, ReceiveConfig, StreamFormat,
 };
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
+
+/// Rule 43's bound on `graphite_in`'s `max_frame_bytes` and `graphite_out`'s `max_frame_bytes` --
+/// below 1024 not even one realistic datapoint fits a pickle frame, and above 16 MiB is far past
+/// what any real sender or receiver needs, so a larger value is almost certainly a config mistake.
+/// A module-level const (rather than a literal at each of the two call sites) so both kinds'
+/// checks are provably the same range.
+const GRAPHITE_FRAME_BYTES_RANGE: std::ops::RangeInclusive<u64> = 1024..=16 * 1024 * 1024;
 
 /// A component's arity class, fixed by its `kind` (`docs/design/pipeline-graph.md`'s arity
 /// table) -- never derived from topology, so a typo'd source reference can't silently reclassify
@@ -238,6 +258,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | SyslogOut { .. }
         | StatsdOut { .. }
         | CollectdOut { .. }
+        | GraphiteOut { .. }
         | PrometheusOut { .. }
         | NullOut { .. } => Role::Sink,
     }
@@ -292,6 +313,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         SyslogOut { .. } => "syslog_out",
         StatsdOut { .. } => "statsd_out",
         CollectdOut { .. } => "collectd_out",
+        GraphiteOut { .. } => "graphite_out",
         PrometheusOut { .. } => "prometheus_out",
         NullOut { .. } => "null_out",
     }
@@ -341,6 +363,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::LogitOut { .. }
             | ComponentKind::StatsdOut { .. }
             | ComponentKind::CollectdOut { .. }
+            | ComponentKind::GraphiteOut { .. }
             | ComponentKind::PrometheusOut { .. }
             | ComponentKind::GenerateIn { .. }
             | ComponentKind::NullOut { .. }
@@ -1419,21 +1442,26 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 38: `statsd_out`'s/`collectd_out`'s `max_packet_bytes: 0` is rejected the same way rule
-    // 15's `max_batches`/`max_bytes: 0` is -- an impossible bound (every line/value list would
-    // overflow it and be dropped whole), not a small one. `collectd_out` additionally rejects
-    // anything outside `1024..=65535` -- collectd's own `MaxPacketSize` range
+    // Rule 38: `statsd_out`'s/`collectd_out`'s/`graphite_out`'s `max_packet_bytes: 0` is rejected
+    // the same way rule 15's `max_batches`/`max_bytes: 0` is -- an impossible bound (every
+    // line/value list would overflow it and be dropped whole), not a small one. `collectd_out`
+    // additionally rejects anything outside `1024..=65535` -- collectd's own `MaxPacketSize` range
     // (`docs/adr/collectd-binary-relay.md`) -- because unlike `statsd_out` (which just starts a
     // new datagram at the cap) a `collectd_out` value above the real UDP payload ceiling (65507)
     // packs datagrams the socket can never actually send: every one fails `EMSGSIZE` at `send_to`,
     // which `collectd_out` counts as a per-datagram drop rather than a `Fault` -- so the component
     // would silently report `requests{class="ok"}` while delivering nothing at all. `statsd_out`
     // makes no such range claim in its own ADR, so it keeps only the zero check above.
+    // `graphite_out` makes no such claim either (`docs/adr/graphite-carbon-relay.md`) -- an
+    // oversize packed datagram is already counted `oversize_datagram` and skipped rather than
+    // sunk, the same as `statsd_out`'s own `EMSGSIZE` handling -- so it too keeps only the zero
+    // check here.
     for (id, component) in &components {
         if matches!(
             &component.kind,
             ComponentKind::StatsdOut { max_packet_bytes: 0, .. }
                 | ComponentKind::CollectdOut { max_packet_bytes: 0, .. }
+                | ComponentKind::GraphiteOut { max_packet_bytes: 0, .. }
         ) {
             anyhow::bail!(
                 "component '{id}': max_packet_bytes: 0 would drop every metric line -- use a \
@@ -1644,6 +1672,47 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 );
             }
             check_generate_template(id, "event.metric.name", &metric.name, Rendering::Interned)?;
+        }
+    }
+
+    // Rule 43 (`graphite_out`'s half -- `graphite_in`'s own half covers `max_line_bytes` and
+    // lives beside its own kind's checks): `protocol: pickle` needs `transport: tcp`, since a
+    // length-prefixed pickle frame has no meaning in a datagram; a zero
+    // `max_frame_bytes`/`connect_timeout` is the same impossible-bound shape rules 9/15/18/38
+    // already reject; and `max_frame_bytes` is bounded by `GRAPHITE_FRAME_BYTES_RANGE`.
+    for (id, component) in &components {
+        if let ComponentKind::GraphiteOut {
+            transport,
+            protocol,
+            max_frame_bytes,
+            connect_timeout,
+            ..
+        } = &component.kind
+        {
+            if *protocol == GraphiteProtocol::Pickle && *transport != GraphiteTransport::Tcp {
+                anyhow::bail!(
+                    "component '{id}': protocol: pickle requires transport: tcp -- carbon's \
+                     length-prefixed pickle framing has no meaning in a datagram"
+                );
+            }
+            if *max_frame_bytes == 0 {
+                anyhow::bail!(
+                    "component '{id}': max_frame_bytes: 0 could never fit even an empty pickle \
+                     frame -- use a positive byte size"
+                );
+            }
+            if !GRAPHITE_FRAME_BYTES_RANGE.contains(max_frame_bytes) {
+                anyhow::bail!(
+                    "component '{id}': max_frame_bytes: {max_frame_bytes} is outside \
+                     1024..=16777216 (16 MiB)"
+                );
+            }
+            if connect_timeout.is_zero() {
+                anyhow::bail!(
+                    "component '{id}': connect_timeout: 0s could never establish a TCP \
+                     connection -- use a positive duration"
+                );
+            }
         }
     }
 
@@ -1991,6 +2060,25 @@ mod tests {
             endpoint: "127.0.0.1:25826".to_string(),
             max_packet_bytes,
             hostname: None,
+        }
+    }
+
+    fn graphite_out(
+        transport: GraphiteTransport,
+        protocol: GraphiteProtocol,
+        max_packet_bytes: u64,
+        max_frame_bytes: u64,
+        connect_timeout: Duration,
+    ) -> ComponentKind {
+        ComponentKind::GraphiteOut {
+            endpoint: "127.0.0.1:2003".to_string(),
+            transport,
+            protocol,
+            tags: logit_config::GraphiteTags::default(),
+            multi_value: logit_config::GraphiteMultiValue::default(),
+            max_packet_bytes,
+            max_frame_bytes,
+            connect_timeout,
         }
     }
 
@@ -4563,6 +4651,166 @@ mod tests {
             ]))
             .unwrap_or_else(|err| panic!("bound {bound} should resolve fine, got: {err}"));
         }
+    }
+
+    #[test]
+    fn graphite_out_is_a_sink_and_is_implemented() {
+        let kind = graphite_out(
+            GraphiteTransport::Tcp,
+            GraphiteProtocol::Plaintext,
+            1432,
+            1 << 20,
+            Duration::from_secs(5),
+        );
+        assert_eq!(kind_name(&kind), "graphite_out");
+        assert_eq!(role(&kind), Role::Sink);
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+            .expect("a well-formed graphite_out should resolve fine");
+    }
+
+    #[test]
+    fn a_graphite_out_with_no_sources_is_rejected() {
+        let err = expect_err(cfg(vec![(
+            "out",
+            vec![],
+            graphite_out(
+                GraphiteTransport::Tcp,
+                GraphiteProtocol::Plaintext,
+                1432,
+                1 << 20,
+                Duration::from_secs(5),
+            ),
+        )]));
+        assert!(err.contains("'out'") && err.contains("sink"), "got: {err}");
+    }
+
+    /// Rule 43: pickle over UDP is rejected -- Twisted's length-prefixed framing has no meaning
+    /// in a datagram.
+    #[test]
+    fn a_pickle_graphite_out_on_udp_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                graphite_out(
+                    GraphiteTransport::Udp,
+                    GraphiteProtocol::Pickle,
+                    1432,
+                    1 << 20,
+                    Duration::from_secs(5),
+                ),
+            ),
+        ]));
+        assert!(
+            err.contains("'out'") && err.contains("protocol: pickle requires transport: tcp"),
+            "got: {err}"
+        );
+    }
+
+    /// Pickle over TCP is fine -- only the UDP combination is rejected.
+    #[test]
+    fn a_pickle_graphite_out_on_tcp_resolves_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                graphite_out(
+                    GraphiteTransport::Tcp,
+                    GraphiteProtocol::Pickle,
+                    1432,
+                    1 << 20,
+                    Duration::from_secs(5),
+                ),
+            ),
+        ]))
+        .expect("pickle over tcp should resolve fine");
+    }
+
+    /// Rule 38 (`graphite_out`'s zero check): `max_packet_bytes: 0` would drop every plaintext
+    /// line -- the same impossible bound as `statsd_out`'s/`collectd_out`'s own.
+    #[test]
+    fn a_zero_max_packet_bytes_graphite_out_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                graphite_out(
+                    GraphiteTransport::Tcp,
+                    GraphiteProtocol::Plaintext,
+                    0,
+                    1 << 20,
+                    Duration::from_secs(5),
+                ),
+            ),
+        ]));
+        assert!(err.contains("'out'") && err.contains("max_packet_bytes: 0"), "got: {err}");
+    }
+
+    /// Rule 43: `max_frame_bytes` outside `1024..=16 MiB` is rejected, both below and above.
+    #[test]
+    fn a_max_frame_bytes_outside_its_range_is_rejected() {
+        for bad in [0u64, 1023, 16 * 1024 * 1024 + 1] {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                (
+                    "out",
+                    vec!["in"],
+                    graphite_out(
+                        GraphiteTransport::Tcp,
+                        GraphiteProtocol::Plaintext,
+                        1432,
+                        bad,
+                        Duration::from_secs(5),
+                    ),
+                ),
+            ]));
+            assert!(err.contains("'out'") && err.contains("max_frame_bytes"), "got: {err}");
+        }
+    }
+
+    /// Both ends of `1024..=16 MiB` are legal.
+    #[test]
+    fn max_frame_bytes_at_either_bound_is_accepted_for_graphite_out() {
+        for bound in [1024u64, 16 * 1024 * 1024] {
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                (
+                    "out",
+                    vec!["in"],
+                    graphite_out(
+                        GraphiteTransport::Tcp,
+                        GraphiteProtocol::Plaintext,
+                        1432,
+                        bound,
+                        Duration::from_secs(5),
+                    ),
+                ),
+            ]))
+            .unwrap_or_else(|err| panic!("bound {bound} should resolve fine, got: {err}"));
+        }
+    }
+
+    /// Rule 43: a zero `connect_timeout` could never establish a TCP connection.
+    #[test]
+    fn a_zero_connect_timeout_graphite_out_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                graphite_out(
+                    GraphiteTransport::Tcp,
+                    GraphiteProtocol::Plaintext,
+                    1432,
+                    1 << 20,
+                    Duration::ZERO,
+                ),
+            ),
+        ]));
+        assert!(err.contains("'out'") && err.contains("connect_timeout: 0s"), "got: {err}");
     }
 
     /// An `aggregate` with the given temporality and retention bounds -- rule 39's fixture.
