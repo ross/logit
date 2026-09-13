@@ -114,6 +114,69 @@ pub enum SetValue {
     Str(String),
 }
 
+/// Which metric kind a [`GenerateMetric`] produces. Named after the three
+/// `logit_core::MetricKind`s a load-test scenario actually wants to exercise, not the full set:
+/// `Sum` for a counter, `Gauge` for a level, and `Distribution` for the sketch-merging path (as
+/// raw `Samples`, the shape a real listener produces -- never pre-sketched, per
+/// `docs/adr/lossless-transit.md`'s "a decoder never pre-summarizes" rule, which
+/// `generate_in` stands in for here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerateMetricKind {
+    /// A delta counter -- the default, and the cheapest shape to generate.
+    #[default]
+    Sum,
+    Gauge,
+    Distribution,
+}
+
+/// The metric [`ComponentKind::GenerateIn`] stamps onto every event it generates, when
+/// `event.metric` is set at all. One metric per event: a scenario that needs more than one
+/// exercises a `set`/`kv_metrics` stage downstream rather than growing this block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GenerateMetric {
+    /// The metric's name. A template like every other `generate_in` string field: `{seq}` /
+    /// `{seq%N}` substitute here too, which is how a scenario generates a wide *metric-name*
+    /// cardinality rather than a wide attribute cardinality. Required and non-empty (rule 42).
+    pub name: String,
+    /// Which metric kind to produce. Defaults to `sum`.
+    #[serde(default)]
+    pub kind: GenerateMetricKind,
+    /// The value carried on every generated point -- constant, deliberately: a varying value
+    /// would measure the generator's own arithmetic rather than the pipeline's. Defaults to `1`,
+    /// the natural increment for the default `sum`. Must be finite (rule 42).
+    #[serde(default = "default_generate_metric_value")]
+    pub value: f64,
+}
+
+/// The event template [`ComponentKind::GenerateIn`] renders per generated event. Every field
+/// defaults, so an omitted `event:` block generates the cheapest event there is: a timestamp, the
+/// configured resource, and nothing else -- which is exactly what a "runtime floor" scenario
+/// wants to measure.
+///
+/// `log` and every value in `attributes` (and [`GenerateMetric::name`]) are **templates**:
+/// `{seq}` renders the generator's 0-based event counter and `{seq%N}` renders it modulo `N`, the
+/// knob that gives a scenario a chosen attribute or series cardinality. `{{`/`}}` write a literal
+/// brace, which a JSON log body needs (`docs/plans/load-test-harness.md`,
+/// `logit_core::template`). A field with no placeholder in it is rendered **once**, at
+/// construction, and the resulting bytes are cloned onto every event -- a refcount bump, not a
+/// copy -- so placeholders are for cardinality, never decoration: each one costs a rendering and
+/// a copy per event.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct GenerateEvent {
+    /// The generated log body, as a template. Omitted means the event carries no log record at
+    /// all (a metrics-only scenario).
+    pub log: Option<String>,
+    /// Event attributes: literal keys (interned once, at construction), templated values. An
+    /// empty key is rejected (rule 42).
+    pub attributes: std::collections::BTreeMap<String, String>,
+    /// The metric to stamp on every event. Omitted means the event carries no metrics (a
+    /// logs-only scenario).
+    pub metric: Option<GenerateMetric>,
+}
+
 /// Which OTLP transport a component speaks -- both `otlp_in` and `otlp_out` carry identical
 /// protobuf payloads (`crates/logit-proto/src/otlp`), differing only in framing and endpoint
 /// shape (`docs/adr/hand-rolled-grpc-over-hyper.md`).
@@ -1011,6 +1074,55 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: TlsClientConfig,
     },
+    /// A synthetic event source for load testing -- the listener end of the perf harness
+    /// (`docs/plans/load-test-harness.md`). No socket, no decoder: it renders a declarative
+    /// [`GenerateEvent`] template as fast as `count`/`rate` allow, so a scenario measures the
+    /// runtime and the components under test rather than a generator process and a kernel socket
+    /// buffer. Costs nothing unless configured, exactly like every other kind.
+    ///
+    /// Deliberately no "shape" enum (`nginx`, `statsd`, ...): the template plus an ordinary
+    /// `json`/`regex`/`kv_metrics` stage downstream already composes any shape a scenario needs,
+    /// and each shape baked in here would be a second, drifting copy of a fixture.
+    GenerateIn {
+        /// Total events to generate, after which the input returns and the existing
+        /// listener-exit cascade shuts the process down cleanly (`crates/logit-pipeline/src/
+        /// runtime.rs`). **Exact**: the last batch is short (`count % batch`) rather than
+        /// rounded up to a whole batch, so a scenario's derived events/s and CPU-per-event are
+        /// computed against the number actually produced. Omitted means unbounded -- a soak run,
+        /// or one a profiler attaches to. Rejected at `0` (rule 42): a generator that generates
+        /// nothing is the black-hole shape graph rule 7 exists to catch, not a small run.
+        #[serde(default)]
+        count: Option<u64>,
+        /// Events per generated batch -- one `EventBatch` down the fanout, the same unit a real
+        /// listener's batch assembly produces. Defaults to 100. Bigger amortizes the per-batch
+        /// runtime cost (channel send, telemetry point, span) over more events, which is why a
+        /// scenario measuring a *per-batch* cost lowers it rather than raising `count`. Rejected
+        /// at `0` (rule 42).
+        #[serde(default = "default_generate_batch")]
+        batch: usize,
+        /// Target events per second, paced against wall clock: `generate_in` sends while it is
+        /// behind the pace `rate` implies and sleeps until the next batch is due otherwise, so
+        /// the *average* rate holds over a run rather than drifting the way a fixed
+        /// `interval(batch/rate)` timer would. Above roughly a thousand batches per second the
+        /// sleep granularity makes it bursty within any given millisecond -- the average is still
+        /// right (`docs/known-gaps.md`). Omitted means unthrottled: generate as fast as
+        /// downstream backpressure allows, which is what a throughput scenario wants. Rejected at
+        /// `0` (rule 42) -- a rate of zero would generate nothing at all, never "as slow as
+        /// possible".
+        #[serde(default)]
+        rate: Option<u64>,
+        /// What each generated event carries. See [`GenerateEvent`] -- every field defaults, so
+        /// an omitted block generates a bare timestamped event.
+        #[serde(default)]
+        event: GenerateEvent,
+        /// Resource attributes for every generated event: literal keys, templated values (`{seq}`
+        /// / `{seq%N}`, the same substitution [`GenerateEvent`] documents). An all-literal
+        /// resource -- the usual case -- is built once and `Arc`-shared by every event, so it
+        /// costs one refcount bump per event rather than a map. An empty key is rejected (rule
+        /// 42).
+        #[serde(default)]
+        resource: std::collections::BTreeMap<String, String>,
+    },
     /// A Prometheus/OpenMetrics **exposition** endpoint: a stateful sink holding a registry of
     /// current series that an HTTP handler renders on demand, rather than one that writes anywhere.
     /// The mirror of `PrometheusIn` (scrape). Both text dialects are served, negotiated on the
@@ -1049,10 +1161,28 @@ pub enum ComponentKind {
         #[serde(default = "default_prometheus_max_series")]
         max_series: usize,
     },
+    /// A sink that drops everything, as cheaply as the runtime allows -- the sink end of the perf
+    /// harness (`docs/plans/load-test-harness.md`). Its point is measuring everything *upstream*
+    /// of a sink without a real one's encoder, socket, or filesystem in the number; the runtime's
+    /// own layer-2 telemetry still counts what it received and how long delivery took, so a
+    /// scenario ending here is still attributable per node.
+    ///
+    /// No fields -- and no `format:`/`path:` to grow later: a scenario that wants an encoder in
+    /// the measurement uses `file_out` to `/dev/null` instead, which is a real sink doing real
+    /// work rather than a special case here.
+    NullOut {},
 }
 
 fn default_prometheus_path() -> String {
     "/metrics".to_string()
+}
+
+fn default_generate_batch() -> usize {
+    100
+}
+
+fn default_generate_metric_value() -> f64 {
+    1.0
 }
 
 fn default_prometheus_expire_after() -> Duration {
@@ -3624,6 +3754,99 @@ mod tests {
         match component.kind {
             ComponentKind::PrometheusIn { targets, .. } => assert!(targets.is_empty()),
             other => panic!("expected PrometheusIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generate_in_defaults_everything_but_the_batch_size() {
+        let component: Component = serde_json::from_str(r#"{"type": "generate_in"}"#).unwrap();
+        match component.kind {
+            ComponentKind::GenerateIn { count, batch, rate, event, resource } => {
+                assert_eq!(count, None, "omitted count means unbounded");
+                assert_eq!(batch, 100);
+                assert_eq!(rate, None, "omitted rate means unthrottled");
+                assert_eq!(event, GenerateEvent::default());
+                assert!(resource.is_empty());
+            }
+            other => panic!("expected GenerateIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generate_in_reads_every_field_including_the_event_template() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "generate_in", "count": 2000000, "batch": 500, "rate": 50000,
+                "resource": {"service.name": "web"},
+                "event": {
+                  "log": "{{\"path\":\"/x/{seq%50}\"}}",
+                  "attributes": {"host": "web-{seq%10}"},
+                  "metric": {"name": "requests", "kind": "distribution", "value": 2.5}
+                }}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::GenerateIn { count, batch, rate, event, resource } => {
+                assert_eq!(count, Some(2_000_000));
+                assert_eq!(batch, 500);
+                assert_eq!(rate, Some(50_000));
+                assert_eq!(resource.get("service.name"), Some(&"web".to_string()));
+                // Still the raw template text, doubled braces and all -- unescaping `{{`/`}}` is
+                // `logit_core::template::parse`'s job, not deserialization's.
+                assert_eq!(event.log.as_deref(), Some(r#"{{"path":"/x/{seq%50}"}}"#));
+                assert_eq!(event.attributes.get("host"), Some(&"web-{seq%10}".to_string()));
+                assert_eq!(
+                    event.metric,
+                    Some(GenerateMetric {
+                        name: "requests".to_string(),
+                        kind: GenerateMetricKind::Distribution,
+                        value: 2.5,
+                    })
+                );
+            }
+            other => panic!("expected GenerateIn, got {other:?}"),
+        }
+    }
+
+    /// A `metric:` block names only what it has to; `sum` at `1` is the counter shape every other
+    /// field's default is chosen around.
+    #[test]
+    fn a_generate_metric_defaults_to_a_sum_of_one() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "generate_in", "event": {"metric": {"name": "requests"}}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::GenerateIn { event, .. } => {
+                assert_eq!(
+                    event.metric,
+                    Some(GenerateMetric {
+                        name: "requests".to_string(),
+                        kind: GenerateMetricKind::Sum,
+                        value: 1.0,
+                    })
+                );
+            }
+            other => panic!("expected GenerateIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generate_in_rejects_an_unknown_field_inside_its_event_block() {
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "generate_in", "event": {"logs": "oops"}}"#,
+        )
+        .expect_err("`deny_unknown_fields` should catch a misspelled template field");
+        assert!(err.to_string().contains("unknown field `logs`"), "got: {err}");
+    }
+
+    #[test]
+    fn null_out_deserializes_with_nothing_but_its_sources() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "null_out", "sources": ["gen"]}"#).unwrap();
+        assert_eq!(component.sources, vec!["gen".to_string()]);
+        match component.kind {
+            ComponentKind::NullOut {} => {}
+            other => panic!("expected NullOut, got {other:?}"),
         }
     }
 }
