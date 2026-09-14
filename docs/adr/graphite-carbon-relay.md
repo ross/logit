@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-09-13
+updated: 2026-09-14
 ---
 
 # Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch
@@ -374,3 +374,61 @@ hand after the fact; this pair starts with one list, not two):
 - No new crate dependency: `deny.toml` and `script/audit` output are expected unchanged.
 - `crates/logit-core/tests/type_sizes.rs` is untouched by this pair: nothing in the core model
   changes shape to support it.
+
+## Amendment: the shared-driver trigger fired; `graphite_in` TCP is now `logit_inputs::tcp` (2026-09-14)
+
+"No shared `logit_inputs::tcp` driver is extracted for this pair" above named its own trigger: a
+second line-oriented TCP listener. `syslog_in` over TCP became one
+([ADR `syslog-tcp-ingress-and-tls`](syslog-tcp-ingress-and-tls.md)) and, in building it, extracted
+exactly the driver that section anticipated — accept loop, connection cap, gauge and rejection
+counter, TLS termination, per-connection decoder clone and batch assembly, a first-byte deadline.
+So `crates/logit-inputs/src/graphite/tcp.rs` is deleted and `graphite_in` runs on
+`crates/logit-inputs/src/tcp.rs`, as `enum Inner { Udp, Tcp }` over the two shared drivers, exactly
+the shape `SyslogInput` already had.
+
+**Framing became an explicit per-listener choice** rather than the driver's one built-in guess. The
+driver used to sniff each connection's first byte for an RFC 6587 octet count, which is right for
+syslog (a non-transparent message always starts `<`) and wrong here: a carbon path may legitimately
+begin with a digit, and the sniff would reframe the whole connection on it. `FramingMode` is now
+set through `TcpListener::with_framing`, and `graphite_in` picks from `protocol:`:
+
+| `protocol:` | mode | bound | over the bound |
+|---|---|---|---|
+| `plaintext` | `Lines { oversize: DrainToNextLine }` | `max_line_bytes` | that line is dropped and counted; the framer resynchronizes at the next `\n` and the connection stays up |
+| `pickle` | `LengthPrefixed` (Twisted's `Int32StringReceiver`) | `max_frame_bytes` | the connection is closed — a length-framed stream has no resync point |
+
+Both bounds keep their operator-facing meanings and defaults; the driver's own `MAX_FRAME_BYTES`
+remains what a listener that never calls `with_framing` gets. `Oversize::DrainToNextLine` is this
+ADR's original recoverable-oversize behaviour, moved into the driver as a mode rather than
+reimplemented — it is a non-fatal `FrameError` the frame loop continues past.
+
+**What `graphite_in` gains.** `tls:` and `handshake_timeout:`, both the driver's and both TCP-only
+(graph rules 43 and 45 now cover this listener). The second closes the known gap this listener
+carried: a peer that connected and sent nothing held one of its 1024 permits indefinitely. Neither
+is an idle timeout; the post-first-byte silence gap is still the accepted one every TCP listener
+has. There is no `graphite_out` TLS half — carbon's own senders speak none, so the listener side is
+for a `logit`-to-`logit` or stunnel-shaped relay hop.
+
+**What it costs.** The bespoke loop handed the decoder everything through the read buffer's last
+`\n` in one `decode_into` call; the driver frames first, so plaintext is now **one call per line**,
+with its `Arc<Resource>` clone, two telemetry counts and `BatchAccumulator::absorb` per line rather
+than per read. The decoded events are identical (`decode_plaintext` splits on `\n` internally
+either way). This is carbon's hottest path, so the cost is recorded rather than assumed: a
+`FramingMode::LineChunk` — emit through the last `LF` as one frame, which both line decoders
+already split internally — is the reserve fix if it ever stops being acceptable, and is
+deliberately not built speculatively.
+
+**Telemetry follows the driver's vocabulary**, one per driver rather than one per listener:
+`logit.input.lines`/`.line.bytes` become `logit.input.frames`/`.frame.bytes`, and
+`logit.input.metrics.skipped{reason="oversize_line"}` becomes
+`logit.input.frames.dropped{reason="oversize"}` — which now covers the pickle case too, where the
+old listener had a diagnostic (`oversize_frame`) and no counter at all. The `oversize_line`/
+`oversize_frame` diagnostic keys are gone; both are `framing_error`. `frame.bytes` counts the
+payload the decoder was handed, so a pickle frame no longer includes its own 4-byte length prefix.
+Pre-release, so no compatibility shim: `docs/design/internal-telemetry.md` is the record.
+
+**What did not survive the port.** The old loop needed its own teardown signal, because it drained
+a `JoinSet` of connection tasks *after* `accept` failed and an idle client would otherwise park
+that drain forever; its regression test drove a real `accept` failure through
+`libc::shutdown(SHUT_RD)`. The shared driver returns an accept error straight out of its loop with
+nothing to park on, so both the signal and the test are gone rather than ported.

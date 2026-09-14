@@ -64,15 +64,29 @@ components:
     # plaintext (default) | pickle -- pickle requires transport: tcp (a length-prefixed frame has
     # no meaning in a datagram) and is carbon's other listener, conventionally on port 2004.
     # protocol: plaintext
-    # The longest TCP plaintext line assembled before draining to the next newline; past it the
-    # line is abandoned and counted once (oversize_line), and the line after it still decodes.
-    # Ignored under transport: udp, where a datagram is already its own frame.
+    # The longest TCP plaintext line assembled before it is dropped; past the bound the line is
+    # abandoned and counted once (logit.input.frames.dropped{reason="oversize"}, diagnostic
+    # framing_error), the reader resynchronizes at the next newline, and the connection stays up --
+    # so the line after an oversize one still decodes. Ignored under transport: udp, where a
+    # datagram is already its own frame.
     # max_line_bytes: "8192"
     # The longest pickle payload accepted in one length-prefixed frame -- Twisted's own
     # Int32StringReceiver.MAX_LENGTH, which carbon's own pickle receiver enforces too. A frame
-    # declaring more closes the connection (oversize_frame): a length-framed stream has no resync
-    # point to skip forward to. Ignored under protocol: plaintext.
+    # declaring more is counted the same way but closes the connection: a length-framed stream has
+    # no resync point to skip forward to. Ignored under protocol: plaintext.
     # max_frame_bytes: "1MiB"
+    # transport: tcp only. How long one connection has, per pre-message phase, before it is closed
+    # and its connection-cap permit handed back: the TLS accept when tls: is set, then the wait for
+    # its very first byte. Not an idle timeout -- once a connection has sent a byte, a long gap
+    # before the next datapoint is ordinary carbon traffic and is not bounded (docs/known-gaps.md).
+    # handshake_timeout: 5s
+    # transport: tcp only, and off unless present: a tls: block turns TLS on and makes it required
+    # (there is no plaintext fallback on a TLS listener). Plain carbon senders speak no TLS, so
+    # this is for a logit-to-logit or stunnel-shaped relay hop; there is no graphite_out half.
+    # tls:
+    #   cert_file: /etc/logit/tls/server.pem
+    #   key_file: /etc/logit/tls/server.key
+    #   client_ca_file: /etc/logit/tls/ca.pem   # omit for server-auth-only TLS
     #
     # Every field below defaults (docs/adr/decoupled-listener-io.md) -- an omitted `receive:` block
     # is exactly the values shown here, commented out purely as a reference for tuning a real

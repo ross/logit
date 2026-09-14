@@ -474,7 +474,7 @@ fn graphite_decode_one_tagged_line() {
 }
 
 /// The listener's actual hot path: `decode_into` against a buffer the read loop reuses across
-/// datagrams (`crate::udp`'s `decode_loop`, and `graphite/tcp.rs`'s per-connection `scratch`).
+/// datagrams (`crate::udp`'s `decode_loop`, and `crate::tcp`'s per-connection `scratch`).
 /// Zero -- there is nothing left to allocate once the caller's `Vec<Event>` keeps its capacity,
 /// which is the strongest statement this codec can make.
 #[test]

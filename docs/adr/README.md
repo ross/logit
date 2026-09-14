@@ -12,8 +12,8 @@ New ADR checklist: copy `TEMPLATE.md` to `docs/adr/<slug>.md`, fill in `created`
 | ADR | Created | Updated |
 |---|---|---|
 | [`target` components: named destinations a router directs events into, beside `sources:`](target-components.md) | 2026-09-13 | 2026-09-13 |
-| [`syslog_in` gains TCP and TLS ingress; `syslog_out` gains TLS](syslog-tcp-ingress-and-tls.md) | 2026-09-13 | 2026-09-13 |
-| [Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch](graphite-carbon-relay.md) | 2026-09-13 | 2026-09-13 |
+| [`syslog_in` gains TCP and TLS ingress; `syslog_out` gains TLS](syslog-tcp-ingress-and-tls.md) | 2026-09-13 | 2026-09-14 |
+| [Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch](graphite-carbon-relay.md) | 2026-09-13 | 2026-09-14 |
 | [A load-test harness: the real binary, a declarative event template, and CPU per event as the signal](load-test-harness.md) | 2026-09-12 | 2026-09-13 |
 | [`FramedEncoder`: a third codec trait for sinks that need per-message framing, over a shared `MessageBuf`](framed-encoder.md) | 2026-09-12 | 2026-09-13 |
 | [collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder](collectd-binary-relay.md) | 2026-09-12 | 2026-09-12 |

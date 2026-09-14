@@ -312,8 +312,8 @@ so an omitted `receive:` is the values below.
 A stream listener has no receive queue (its connection's own flow control is the backpressure), but
 it does have something a datagram listener doesn't: a connection that can be opened and then left
 saying nothing, holding one of the listener's 1024 concurrency-cap permits. `syslog_in`
-(`transport: tcp`), `logit_in`, and `otlp_in` each bound that with a `handshake_timeout:` field —
-**5s by default**, a humantime string like `connect_timeout`:
+(`transport: tcp`), `graphite_in` (`transport: tcp`), `logit_in`, and `otlp_in` each bound that
+with a `handshake_timeout:` field — **5s by default**, a humantime string like `connect_timeout`:
 
 ```yaml
 components:
@@ -331,6 +331,7 @@ two of them — 10s at the default — before it is closed and its permit releas
 | Kind | Phases bounded |
 |---|---|
 | `syslog_in` (`transport: tcp`) | the TLS accept (under `tls:`), then the wait for the connection's first byte — on the plaintext arm too |
+| `graphite_in` (`transport: tcp`) | the same two phases, on the same shared driver |
 | `logit_in` | the TLS accept (under `tls:`), then the `Hello` read |
 | `otlp_in` | the TLS accept (under `tls:`), or — on the plaintext arm, which has no TLS accept — the wait for the connection's first byte |
 
@@ -347,7 +348,7 @@ its *first* byte and then goes silent" row. `hyper`'s own HTTP/1 header-read tim
 deliberately not used to close it — it re-arms on every idle keep-alive gap, so it would behave as
 an idle timeout and kill a long-interval exporter's pooled connection.
 
-**It is not an idle timeout, on any of the three.** Once a connection has got past its pre-message
+**It is not an idle timeout, on any of them.** Once a connection has got past its pre-message
 phases, the gap before its next frame/request is deliberately unbounded — a long-lived,
 mostly-quiet sender is ordinary traffic, not a fault. A connection that goes silent *after* that
 point holds its permit indefinitely, which is a known, separately-tracked gap (see
@@ -356,9 +357,9 @@ own piece of work). Lowering `handshake_timeout` does not help with that case; i
 fast a connection that never said anything at all is given up on.
 
 `handshake_timeout` must be greater than `0s` (rule 45 — `0` would close every connection before
-its handshake could start), and on a `syslog_in` with `transport: udp` it must be left at its
-default: a datagram listener has no connection to hand shake, so a value set there is rejected at
-validation time rather than silently ignored.
+its handshake could start), and on a `syslog_in` or `graphite_in` with `transport: udp` it must be
+left at its default: a datagram listener has no connection to hand shake, so a value set there is
+rejected at validation time rather than silently ignored.
 
 ### Failure semantics: `drop_oldest`, not `block` — the opposite default from `buffer:`
 
@@ -472,10 +473,19 @@ cross-protocol one, `statsd_in` through an `aggregate` window into `graphite_out
   (`logit.input.connections.rejected{reason="limit"}`), because carbon's wire has no way to say
   "try later" and a sender holding an accepted-but-unread connection would look healthy while
   delivering nothing. `udp` runs the same shared datagram listener `statsd_in`/`collectd_in`/
-  `syslog_in` do, so everything in the receive-queue section above applies to it unchanged.
-  **Known gap:** unlike `syslog_in`/`otlp_in`/`logit_in`, `graphite_in` has no `handshake_timeout`
-  field at all, so a TCP peer that connects and sends nothing holds one of those 1024 permits
-  indefinitely — see `docs/known-gaps.md`'s "`graphite_in` over TCP has no `handshake_timeout`" row.
+  `syslog_in` do, so everything in the receive-queue section above applies to it unchanged. The TCP
+  driver is the same one a TCP `syslog_in` runs on, so `tls:` and `handshake_timeout:` mean exactly
+  what they mean there (next bullet).
+- **`tls:` and `handshake_timeout:` are TCP-only, and behave as `syslog_in`'s do.** A `tls:` block's
+  mere presence turns TLS on and makes it required — there is no plaintext fallback on a TLS
+  listener — and `logit validate` rejects one under `transport: udp` (carbon has no DTLS receiver).
+  Plain carbon senders have no TLS of their own, so this is for a `logit`-to-`logit` or
+  stunnel-shaped relay hop. `handshake_timeout:` (default `5s`) bounds each pre-message phase
+  independently: the TLS accept when `tls:` is set, then the wait for the connection's very first
+  byte, so a TLS connection that says nothing at all costs up to two of them before its permit
+  comes back. It is **not** an idle timeout — once a connection has sent a byte, a long gap before
+  the next datapoint is ordinary carbon traffic and is not bounded at all
+  (`docs/known-gaps.md`'s "No idle-connection timeout on a TCP listener" row).
 - **`receive:` means different halves on the two transports.** A UDP `graphite_in` takes the whole
   block. A TCP one has **no receive queue at all** — TCP's own flow control is the backpressure,
   and the queue exists (ADR `decoupled-listener-io`) for a UDP socket's *silent* drops, which a
@@ -493,12 +503,13 @@ cross-protocol one, `statsd_in` through an `aggregate` window into `graphite_out
   and every declared length validated before anything is allocated. It is deliberately not a
   general unpickler.
 - **The two size bounds are the ones you may need to raise.** `max_line_bytes` (default `"8192"`)
-  bounds one TCP plaintext line: past it, with no newline in sight, the line is abandoned and
-  counted once (`logit.input.metrics.skipped{reason="oversize_line"}`, diagnostic `oversize_line`)
-  and the reader drains to the next newline — so the line *after* an oversize one still decodes.
-  `max_frame_bytes` (default `"1MiB"`, Twisted's own `MAX_LENGTH`) bounds one pickle frame, and a
-  frame declaring more closes the connection (`oversize_frame`), because a length-framed stream has
-  no resync point to skip forward to. `logit validate` holds it to `1024..=16MiB`.
+  bounds one TCP plaintext line: past it the line is abandoned and counted once
+  (`logit.input.frames.dropped{reason="oversize"}`, diagnostic `framing_error`) and the reader
+  drains to the next newline — so the line *after* an oversize one still decodes, and the
+  connection stays up. `max_frame_bytes` (default `"1MiB"`, Twisted's own `MAX_LENGTH`) bounds one
+  pickle frame; a frame declaring more is counted the same way but **closes the connection**,
+  because a length-framed stream has no resync point to skip forward to. `logit validate` holds it
+  to `1024..=16MiB`.
 
 **The path is the metric name, and there is no `graphite.*` namespace.** Unlike `collectd_in` and
 `syslog_in`, which park their wire identity in attributes a matching sink reads back,
@@ -963,6 +974,13 @@ TLS-specific counter, the same call this section's `otlp_in`/`otlp_out` paragrap
 `docs/known-gaps.md` tracks what's still open: DTLS, certificates read once at startup, no
 `server_name` override, and no idle-connection timeout once a connection has handshaken (or, on
 plaintext, sent its first byte).
+
+A **TCP `graphite_in`** takes the identical `tls:` block, because it runs on the same listener
+driver ([ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md)'s 2026-09-14 amendment):
+`cert_file`/`key_file`, optional `client_ca_file` for mutual TLS, presence turns TLS on and makes
+it required, `transport: tcp` only. There is no matching `graphite_out` half — carbon's own senders
+speak no TLS, so the listener side is for a `logit`-to-`logit` or stunnel-shaped relay hop. What to
+watch is the same set as `syslog_in`'s above, `logit.input.frames.dropped{reason}` included.
 
 ## Forwarding between `logit` nodes
 

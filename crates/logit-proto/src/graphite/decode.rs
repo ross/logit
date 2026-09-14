@@ -6,11 +6,17 @@
 //! in how they get there -- splitting a line on whitespace, or walking a restricted pickle stack
 //! ([`super::pickle`]).
 //!
-//! **Framing is not this decoder's job.** `graphite_in` owns the read buffer, the `max_line_bytes`
-//! drain-to-newline state and the 4-byte pickle length prefix; [`GraphiteDecoder::decode_into`] is
-//! handed either a datagram/complete-lines slice or one already-unframed pickle payload. That is
-//! why the `oversize_line`/`oversize_frame` rows of [`super`]'s decode table are counted there
-//! rather than here.
+//! **Framing is not this decoder's job.** `graphite_in`'s listener owns the read buffer, the
+//! `max_line_bytes` drain-to-newline state and the 4-byte pickle length prefix -- since W5 of the
+//! connection-follow-ups effort, through the shared TCP driver's `Framer`
+//! (`crates/logit-inputs/src/tcp.rs`). [`GraphiteDecoder::decode_into`] is handed either a whole
+//! datagram (UDP, which may hold several lines) or exactly one delimited message: one plaintext
+//! line, or one already-unframed pickle payload. That is why the two oversize rows of [`super`]'s
+//! decode table are counted there rather than here.
+//!
+//! Line splitting stays on regardless, and is not redundant: a UDP datagram genuinely may carry
+//! several LF-separated lines, and on the framed TCP path the split is a single iteration over a
+//! buffer with no `\n` in it.
 //!
 //! Every tag value is a zero-copy [`Bytes::slice`] of the input, so an event's attributes share the
 //! receive buffer's allocation instead of copying out of it (`docs/design/memory.md` §2) -- the
