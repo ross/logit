@@ -34,8 +34,14 @@ components:
     # handshake_timeout: 5s     # bounds each pre-message phase *separately* -- the TLS accept,
     #                             then the wait for the connection's first byte -- so a TLS peer
     #                             that connects and says nothing costs up to twice this before
-    #                             its connection-cap slot is released. Not an idle timeout: the
-    #                             gap before a *later* frame is unbounded. transport: tcp only.
+    #                             its connection-cap slot is released. Not an idle timeout: see
+    #                             idle_timeout below. transport: tcp only.
+    # idle_timeout: 5m          # off by default. Bounds the gap *after* the first byte -- closes
+    #                             a connection quiet for longer than this and releases its permit.
+    #                             Recommended wherever consistent traffic is expected, sized above
+    #                             the sender's longest normal gap; leave unset for sparse/bursty
+    #                             senders, and think twice here since plaintext syslog senders
+    #                             cannot detect the close (docs/adr/idle-connection-timeout.md).
 
     # A TCP syslog_in has no receive *queue* -- the connection's own flow control is the
     # backpressure -- so only the batch-assembly/shutdown fields below apply, scoped **per

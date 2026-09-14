@@ -27,7 +27,13 @@ components:
     #   client_ca_file: ca.pem    # omit for server-auth-only TLS; set it to require a client cert
     # handshake_timeout: 5s       # tcp only; bounds each pre-message phase *separately* -- the TLS
     #                             # accept, then the wait for the connection's first byte. NOT an idle
-    #                             # timeout: the gap before a *later* line is unbounded.
+    #                             # timeout: see idle_timeout below.
+    # idle_timeout: 5m            # tcp only, off by default. Bounds the gap before a *later* line --
+    #                             # closes a connection quiet for longer than this and releases its
+    #                             # permit. Recommended wherever consistent traffic is expected, sized
+    #                             # above the sender's longest normal gap; think twice here since a
+    #                             # plaintext statsd client cannot detect the close
+    #                             # (docs/adr/idle-connection-timeout.md).
     # Every field below defaults (docs/adr/decoupled-listener-io.md) -- an omitted `receive:`
     # block is exactly the values shown here, commented out purely as a reference for tuning a
     # real deployment. `receive:` is meaningful only on a datagram, stream or tail listener;
