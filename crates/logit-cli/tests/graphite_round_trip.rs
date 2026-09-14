@@ -13,12 +13,15 @@
 //! canonicalization happens to reproduce the input verbatim) -- the same convention
 //! `collectd_round_trip.rs`'s/`statsd_round_trip.rs`'s corpora use. Plaintext fixtures are
 //! human-readable text; the four pickle fixtures (`pickle-protocol-2`, `pickle-protocol-5`,
-//! `sanitizer-path`, `sanitizer-tag`) are binary and are pinned against a test-side
-//! [`PickleBuilder`] -- deliberately independent of `logit_proto::graphite::pickle`'s own writer,
-//! by [`every_committed_in_file_matches_its_builder`] -- for the same reason
+//! `sanitizer-path`, `sanitizer-tag`) are binary. Of those, `sanitizer-path`/`sanitizer-tag` are
+//! pinned against a test-side [`PickleBuilder`] -- deliberately independent of
+//! `logit_proto::graphite::pickle`'s own writer, by
+//! [`every_committed_in_file_matches_its_builder`] -- for the same reason
 //! `collectd_round_trip.rs`'s `PacketBuilder` is independent of that codec's own writers: a
 //! fixture built by the same code the encoder uses could not prove the encoder writes what a real
-//! sender's bytes decode to.
+//! sender's bytes decode to. `pickle-protocol-2`/`pickle-protocol-5` are deliberately **not**
+//! rebuilt by `PickleBuilder` -- they are committed CPython dumps, excluded by design (see the
+//! next paragraph), so there is no independent writer for them to be pinned against.
 //!
 //! `pickle-protocol-2`/`pickle-protocol-5`'s `.in` files are real CPython `pickle.dumps(...,
 //! protocol=2)`/`protocol=-1` dumps of `[('sys.cpu', (1700000000, 0.5))]` -- the identical byte

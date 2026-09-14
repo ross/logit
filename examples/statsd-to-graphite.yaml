@@ -47,13 +47,15 @@ components:
     type: graphite_out
     sources: [windowed]
     endpoint: central-carbon:2003
-    # Both defaults, spelled out here because they are the two settings this cross-protocol hop
-    # actually depends on (see this file's header comment):
+    # `tags:` is the default; `multi_value:` is not -- these are the two settings this
+    # cross-protocol hop actually depends on (see this file's header comment):
     tags: carbon
     # skip (this sink's own default) would drop every flushed Distribution/Set record whole,
-    # counted metrics.skipped{metric_kind=...} -- expand is what turns each into the dotted
-    # sub-paths crates/logit-proto/src/graphite/mod.rs's module doc documents
-    # (page.latency.count/.sum/.q0_5.../.q0_99 for a timer, page.uniques.count for a set).
+    # counted metrics.skipped{metric_kind=...} -- expand is the deliberate override, and is what
+    # turns each into the dotted sub-paths crates/logit-proto/src/graphite/mod.rs's module doc
+    # documents (page.latency.count/.sum/.q0_5.../.q0_99 for a timer, page.uniques.count for a
+    # set). Without it this example would relay nothing at all: skip drops every summarized record
+    # a 10s aggregate window produces.
     multi_value: expand
     # Every other field below defaults -- an omitted field is exactly the value shown here,
     # commented out purely as a reference for tuning a real deployment.
