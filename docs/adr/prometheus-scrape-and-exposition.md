@@ -382,7 +382,7 @@ already shipped:
   none of the "Model mapping" tables above change when remote-write lands — only a second syntax
   module is added beside `text.rs`.
 - `prometheus_in` gains an optional `bind:` field (a remote-write receiver) on the same
-  `ComponentKind::PrometheusIn` variant, with a graph rule requiring exactly one of `targets`/
+  `ComponentKind::PrometheusIn` variant, with a graph rule requiring exactly one of `scrape_targets`/
   `bind` to be set. `prometheus_out` gains an optional `endpoint:` field (a remote-write sender)
   under the identical "exactly one of `bind`/`endpoint`" shape. Both are purely additive fields on
   existing config shapes, not new kinds — an existing `prometheus_in`/`prometheus_out` config

@@ -423,7 +423,7 @@ pub fn target_edges(component: &Component) -> Vec<(Option<&str>, &str)> {
 /// re-derived per caller.
 ///
 /// A `route` ignores `Component.targets` entirely: its edges *are* its `routes:` values, and rule
-/// 43 rejects a `targets:` written on one anyway.
+/// 47 rejects a `targets:` written on one anyway.
 ///
 /// Public for the same reason [`target_edges`] and [`role`] are.
 pub fn targets_of(component: &Component) -> Vec<&str> {
@@ -658,7 +658,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             Role::Transform if component.sources.is_empty() => {
                 anyhow::bail!("component '{id}' is a transform and requires at least one source");
             }
-            // Rule 45's first clause lives here, with the rest of the arity table: a `target` is
+            // Rule 49's first clause lives here, with the rest of the arity table: a `target` is
             // fed by *direction* (`docs/adr/target-components.md`), from a router that names it,
             // so it never names anything itself -- the one role whose inbound edges aren't in its
             // own config.
@@ -687,7 +687,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // consumers are the ordinary `sources:` entries naming it, so the message reads the same way
     // for one.
     //
-    // Rule 46 is the one exemption: a router (anything with a non-empty `targets_of`) may have no
+    // Rule 50 is the one exemption: a router (anything with a non-empty `targets_of`) may have no
     // ordinary consumers at all. Its consumers are where its *unrouted* events go, and a config
     // that routes everything it produces is a real shape, not a black hole -- an event no route
     // claimed is dropped and counted, `logit.component.events.dropped{reason="unrouted"}`
@@ -701,7 +701,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 43: `targets:` is a `lua`/`lua_file`-only concept -- rule 14's shape, for rule 14's
+    // Rule 47: `targets:` is a `lua`/`lua_file`-only concept -- rule 14's shape, for rule 14's
     // reason. A `route` declares its targets through `routes:`' values (so repeating them here
     // would be a second place to keep in sync), and no other kind has any way to direct an event
     // anywhere at all, so a `targets:` on one is a misplaced block silently doing nothing rather
@@ -759,7 +759,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 44: every router -> target reference resolves, isn't the router itself, and names a
+    // Rule 48: every router -> target reference resolves, isn't the router itself, and names a
     // `target` kind; a `lua`/`lua_file` may not repeat one. The unresolved case is checked first
     // so a typo'd id is reported as a typo rather than as whatever kind it happened to collide
     // with. Directing at an ordinary component is the inversion
@@ -795,7 +795,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 45's last clause: a `target` no router directs to is rule 7's black hole seen from the
+    // Rule 49's last clause: a `target` no router directs to is rule 7's black hole seen from the
     // other end. The directed-to set is computed once over every component's `targets_of` rather
     // than per target.
     let directed_to: BTreeSet<&str> = components.values().flat_map(targets_of).collect();
@@ -4416,7 +4416,7 @@ mod tests {
         assert!(err.contains("'t': is a target that no router directs to"), "got: {err}");
     }
 
-    /// Rule 46: a router whose every event is routed has no ordinary consumers, and that is a
+    /// Rule 50: a router whose every event is routed has no ordinary consumers, and that is a
     /// real config -- its unrouted events are dropped and counted at runtime, not silently lost.
     /// It must therefore resolve rather than being rejected by rule 7.
     #[test]
