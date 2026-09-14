@@ -91,6 +91,17 @@ pub trait Transform: Send {
         None
     }
 
+    /// Called once per incoming batch, after the last of that batch's events has been through
+    /// `process` -- the closing bracket to `observe_batch_context`/`observe_scope`/`map_resource`
+    /// above. Gives a transform a place to do per-batch bookkeeping it deliberately kept out of
+    /// `process`: `KvMetrics` (`crates/logit-transforms/src/kv_metrics.rs`) is the first
+    /// implementer, tallying its `derived`/`skipped` counts in plain integers per event and
+    /// emitting them as telemetry here, once per batch, instead of paying `Telemetry::count`'s
+    /// mutex + hash-map upsert once per configured metric per event. Default no-op, same
+    /// reasoning as the other hooks: the cost is one virtual call per *batch*, not per event, and
+    /// only the implementer that needs it pays anything more.
+    fn end_batch(&mut self) {}
+
     /// `Some(interval)` if this transform has a flush contract -- a timer-driven emission
     /// independent of inbound traffic, like `aggregate`'s tumbling windows
     /// (`docs/adr/aggregation-window-semantics.md`). `None` (the default) means this
