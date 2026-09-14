@@ -74,7 +74,6 @@ use crate::Input;
 use bytes::{Bytes, BytesMut};
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
 use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
-use logit_proto::graphite::pickle::LENGTH_PREFIX_BYTES;
 use logit_proto::Decoder;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -123,6 +122,15 @@ pub const MAX_FRAME_BYTES: usize = 65_536;
 /// with many idle connections pays this per connection, and a frame larger than one read is
 /// assembled across reads by [`Framer`] regardless.
 const READ_BUFFER_BYTES: usize = 8 * 1024;
+
+/// Bytes in [`FramingMode::LengthPrefixed`]'s frame prefix: one big-endian `u32` payload length,
+/// Twisted's `Int32StringReceiver` framing -- the same shape carbon's pickle listener speaks
+/// (`logit_proto::graphite::pickle::LENGTH_PREFIX_BYTES`, its own writer's counterpart). A local
+/// copy rather than importing that one so this protocol-agnostic driver names nothing
+/// graphite-specific; the guard below keeps the two from silently drifting apart.
+const LENGTH_PREFIX_BYTES: usize = 4;
+
+const _: () = assert!(LENGTH_PREFIX_BYTES == logit_proto::graphite::pickle::LENGTH_PREFIX_BYTES);
 
 // ---- framing ---------------------------------------------------------------------------------
 
