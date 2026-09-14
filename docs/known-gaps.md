@@ -1533,14 +1533,25 @@ already built that have a known, accepted rough edge.
 - **`script/perf compare` has no cross-run noise model.** It diffs two results files' medians
   directly against `--threshold`, with no notion of how much run-to-run variance either file's own
   `repeats:` already show. A scenario whose own repeats already spread more than `--threshold`
-  (`buffered` far more than any other, see below) can trip a "regression" on nothing but scheduling
-  luck, and a real regression smaller than that scenario's noise floor can pass silently. `compare`
-  already warns on a host/CPU-model mismatch between the two files; it has no equivalent warning
-  for "this scenario's own repeats disagree by more than the threshold you're gating on" — worth
-  closing before this harness ever gates anything automatically, not before ([ADR
-  `load-test-harness`](adr/load-test-harness.md)'s "when the harness runs" open question).
+  (`aggregate` far more than most, `buffered` in the same ballpark, see below) can trip a
+  "regression" on nothing but scheduling luck, and a real regression smaller than that scenario's
+  noise floor can pass silently. `compare` already warns on a host/CPU-model mismatch between the
+  two files; it has no equivalent warning for "this scenario's own repeats disagree by more than the
+  threshold you're gating on" — worth closing before this harness ever gates anything automatically,
+  not before ([ADR `load-test-harness`](adr/load-test-harness.md)'s "when the harness runs" open
+  question). Confirmed, quiet-machine evidence of exactly this failure mode:
+  [`docs/design/performance.md`](design/performance.md) §1's noise sub-section found `aggregate`
+  spreads roughly ±25% between repeats even solo on an idle machine (a dedicated `aggregate`-only
+  rerun reproduced it), while `passthrough`, `json-parse`, and `lua` stay far tighter on the same
+  run — so a single 5% threshold flags `aggregate` on nothing but its own ordinary variance.
+  Candidate fixes, none built: gate `compare` on each file's `min` (or another variance-aware
+  statistic) instead of a bare median-to-median diff, give it a per-scenario threshold so a
+  flush-tick scenario can carry a wider band than a steadier one, or raise `--repeat` specifically
+  for flush-tick scenarios so the reported median is less exposed to any one repeat's tick
+  alignment.
 - **`buffered`'s events/s was the least reproducible number this harness reported; the harness-side
-  fix has landed (W8), and one remaining product-side item is tracked below.**
+  fix has landed (W8, #165) and is now confirmed on a quiet machine — resolved, with one
+  product-side question left open, tracked below.**
   `crates/logit-pipeline/src/disk_queue.rs`'s `DiskQueue::open` pays an un-cleared spool's cost twice
   at every startup: it reads and CRC-walks the *active* segment in full to validate it for a torn
   tail (a cost bounded by the default `segment_bytes` rotation threshold, 64MiB — on its own, not
@@ -1556,21 +1567,25 @@ already built that have a known, accepted rough edge.
   directory and never reset it either. See [`docs/design/performance.md`](design/performance.md) §3
   for the full account, including this run's own numbers.
 
-  **Harness-side fix, landed:** `script/perf run`/`attribute`/`flamegraph` now clear every
+  **Harness-side fix, landed (#165):** `script/perf run`/`attribute`/`flamegraph` now clear every
   `buffer.disk.path` directory a scenario declares before each spawn — every repeat, not just once
   per invocation (`crates/logit-perf/src/spool.rs`), refusing to remove anything outside
-  `perf/results/`. A post-fix solo `--repeat 5` (taken on a busy machine — other work was running on
-  the host concurrently, so read this as indicative, not `buffered`'s steady-state number):
-  885k → 510k → 838k → 863k → 792k events/s, peak RSS flat at 24.8–30.6 MiB and `startup_s`
-  (spawn → `ready`) a small 2.6–4.4 ms throughout — no monotonic decay, no RSS climb, in contrast to
-  every pre-fix sequence above. **What remains open:** whether the leftover ~510k–885k spread in that
-  run is ordinary scheduling noise from the busy machine it was measured on, or something the fix
-  doesn't fully address, isn't settled yet — a quiet-machine re-measurement
-  (`script/perf run --repeat 5 --scenario buffered --label quiet`) is the pending follow-up. Separately,
-  `DiskQueue::open`'s double-read startup scan itself (the active-segment validation pass, and the
-  second pass counting what's left to replay) is unchanged — the harness fix removes the *accumulated*
-  cost a stale spool added on top of it, not that per-startup scan's own cost, which stays a
-  product-side item (`crates/logit-pipeline/src/disk_queue.rs`) nobody has picked up.
+  `perf/results/`. A post-fix solo `--repeat 5` on a busy machine: 885k → 510k → 838k → 863k → 792k
+  events/s, peak RSS flat at 24.8–30.6 MiB and `startup_s` (spawn → `ready`) a small 2.6–4.4 ms
+  throughout — no monotonic decay, no RSS climb, in contrast to every pre-fix sequence above. A
+  follow-up solo `--repeat 5` on a quiet, idle machine confirmed the same signature with nothing else
+  on the box to blame for any remaining spread either: 632,897 → 659,892 → 641,560 → 780,888 →
+  873,406 events/s (2.63 → 2.53 → 2.57 → 2.04 → 1.84 µs/event), peak RSS 25–28 MiB, startup ~4 ms —
+  still no decay, no climb. `script/perf attribute --scenario buffered` on the same build put the
+  constraint downstream of `gen` (the disk queue's own write/read path), not the harness: `gen` sent
+  and `out` received all 1,200,000 events, `gen` spent 1.3959s blocked in `send`, and neither the
+  sink nor the listener show any process time of their own. **What remains open, narrower than
+  before:** a roughly 1.4× spread within five repeats even solo and idle (632,897 to 873,406
+  events/s), and whether `DiskQueue::open`'s still-unchanged double-read startup scan (the
+  active-segment validation pass, and the second pass counting what's left to replay against a
+  *cleared* spool's own first-open cost) accounts for any of it — a product-side item
+  (`crates/logit-pipeline/src/disk_queue.rs`) nobody has picked up, and no longer suspected as the
+  main cause of `buffered`'s variance the way it was before the quiet-machine confirmation.
 - **When and how the load-test harness runs in the ongoing development process is deliberately
   undecided.** [ADR `load-test-harness`](adr/load-test-harness.md)'s own "Open question" section:
   nightly, manually-triggered, gating a PR on a `compare --threshold` regression, or some other
