@@ -105,9 +105,12 @@ starting` before that, `503 draining` after a shutdown signal, and `503 degraded
 exited with an error while the process is still draining. `GET /healthz` returns `200 ok`
 whenever the admin task itself can still answer, regardless of the pipeline's own state. Add
 `?format=json` to `/readyz` for `{status, since, components: {id: "pending"|"bound"|
-"running"|"finished"|"failed"}}` instead of the bare status word; `/healthz?format=json` returns
-just `{status}`, since it has nothing else to report. No TLS, no auth — this is a
-loopback/pod-local endpoint by design, not one meant to cross a real network boundary.
+"running"|"finished"|"failed"|"alias"}}` instead of the bare status word; `/healthz?format=json`
+returns just `{status}`, since it has nothing else to report. A `target` component
+([ADR `target-components`](adr/target-components.md)) is always and only `alias`: it has no task
+and no inbox — it is a name for its routers' outbound edges, so its liveness is theirs, and none
+of the other states can apply to it. No TLS, no auth — this is a loopback/pod-local endpoint by
+design, not one meant to cross a real network boundary.
 
 A Kubernetes deployment maps naturally onto the two routes:
 

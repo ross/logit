@@ -224,7 +224,11 @@ throwaway image. [ADR `load-test-harness`](docs/adr/load-test-harness.md),
 [docs/plans/load-test-harness.md](docs/plans/load-test-harness.md), and
 [docs/design/performance.md](docs/design/performance.md) (the first recorded run) have the full
 account; the harness is built and runnable by hand, deliberately not wired into `script/cibuild`
-or any schedule yet.
+or any schedule yet. `target`/`route` are real, implemented `ComponentKind`s too: a `target` is a
+named, zero-cost destination a router directs events into, and `route` is the native equality-only
+router that fills it, closing the two structural costs (a filter chain paid by every branch, and
+the deep clone an all-mutating fan-out can't avoid) the central-collector split-apart topology had
+no better answer for ([ADR `target-components`](docs/adr/target-components.md)).
 
 ## Environment
 
@@ -355,10 +359,10 @@ crates/
   logit-config      YAML config types + generated JSON Schema
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
-  logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution+validation, node runtime
+  logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry), generate_in (load-test event generator)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, null_out (load-test discard sink)
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, logfmt, kv, regex
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, logfmt, kv, regex, route (implements logit-pipeline::Router)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
   logit-perf        dev-only, publish = false: the load-test harness binary (`logit-perf`, `script/perf`) -- spawns the real logit-cli binary against perf/scenarios/*.yaml (docs/adr/load-test-harness.md, docs/design/performance.md)
@@ -380,4 +384,6 @@ record into a `logit_proto::MessageBuf`, with per-message drop accounting — `s
 payload per signal — `otlp`); plus `logit_pipeline::Input` or `logit_pipeline::Output`, and a
 variant in `logit_config`'s `ComponentKind`. (`prometheus` is the one pair outside all of these,
 by design — its ADR says why.) A new native transform implements `logit_pipeline::Transform`,
-following `logit-transforms::Aggregator`.
+following `logit-transforms::Aggregator`. A new router implements `logit_pipeline::Router`
+(`crates/logit-pipeline/src/router.rs`), following `logit-transforms::Route`
+([ADR `target-components`](docs/adr/target-components.md)).

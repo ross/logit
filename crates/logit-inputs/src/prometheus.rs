@@ -5,17 +5,20 @@
 //! ## Config
 //!
 //! ```yaml
-//! targets: ["http://node-exporter:9100/metrics"]   # required, non-empty, absolute http(s) URLs
+//! scrape_targets: ["http://node-exporter:9100/metrics"]   # required, non-empty, absolute http(s) URLs
 //! interval: 15s        # scrape cadence; default 15s
 //! timeout: 10s          # per-request timeout; default 10s
 //! headers: {}           # optional extra request headers
 //! tls: {}                # TlsClientConfig -- only meaningful when a target is https://
 //! ```
 //!
+//! Named `scrape_targets`, not `targets` -- `Component.targets` (`docs/adr/
+//! target-components.md`) claims the bare name at the flattened top level.
+//!
 //! A future `bind:` field on the same `ComponentKind::PrometheusIn` variant (a remote-write
-//! receiver) is planned as an additive, non-breaking change -- "exactly one of `targets`/`bind`"
-//! would become a graph rule once it lands, not a new kind (see the ADR's "Remote-write forward
-//! compatibility" section).
+//! receiver) is planned as an additive, non-breaking change -- "exactly one of
+//! `scrape_targets`/`bind`" would become a graph rule once it lands, not a new kind (see the
+//! ADR's "Remote-write forward compatibility" section).
 //!
 //! ## Modeled on `internal.rs`
 //!

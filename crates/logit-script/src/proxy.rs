@@ -23,8 +23,77 @@ use logit_core::{
 use mlua::{
     AnyUserData, Lua, MetaMethod, RegistryKey, Table, UserData, UserDataMethods, Value as LuaValue,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
+
+/// The `target` ids one `lua`/`lua_file` component may direct events into, as a name -> slot
+/// lookup -- built **once per worker** ([`crate::ScriptWorker::with_targets`]) and shared by every
+/// [`EventProxy`] that worker mints, rather than rebuilt per event.
+///
+/// A `Vec<Box<str>>` scanned linearly, not a `HashMap`: a `targets:` list is a handful of ids
+/// written out by an operator in one YAML block, so a scan over `Box<str>` beats hashing on every
+/// `event:to(..)` call -- and, more to the point here, neither shape allocates on lookup, which is
+/// what the allocation suite in `crates/logit-bench/tests/allocations.rs` actually pins. The slot
+/// is the index, which *is* `logit_pipeline::graph::targets_of`'s order -- the one place that
+/// order is derived (`docs/adr/target-components.md`) -- so `Some(n)` here and
+/// `logit_pipeline::Destination::To(n)` mean the same target.
+#[derive(Default)]
+pub(crate) struct TargetTable {
+    names: Vec<Box<str>>,
+}
+
+impl TargetTable {
+    pub(crate) fn new(names: &[String]) -> Self {
+        Self { names: names.iter().map(|name| name.as_str().into()).collect() }
+    }
+
+    /// The shared empty table, for a component with no `targets:` -- a refcount bump, never an
+    /// allocation. See [`NO_TARGETS`].
+    pub(crate) fn empty() -> Rc<Self> {
+        no_targets()
+    }
+
+    /// The slot `name` occupies, or `None` if this component declares no such target -- which
+    /// `event:to(..)` turns into a script error naming the configured list, never a silent
+    /// forward (`docs/adr/target-components.md`).
+    pub(crate) fn slot(&self, name: &str) -> Option<u16> {
+        self.names.iter().position(|candidate| &**candidate == name).map(|slot| slot as u16)
+    }
+
+    /// The configured ids, in slot order -- for `event:to(..)`'s error message only.
+    pub(crate) fn names(&self) -> &[Box<str>] {
+        &self.names
+    }
+
+    /// `event:to("x")`'s error text for an id this component doesn't declare. Built only on the
+    /// error path, so the allocations here cost nothing in the ordinary case.
+    fn unknown_target_message(&self, name: &str) -> String {
+        match self.names().is_empty() {
+            true => format!(
+                "event:to({name:?}): no target named {name:?} -- this component declares no targets"
+            ),
+            false => format!(
+                "event:to({name:?}): no target named {name:?} -- this component's targets are [{}]",
+                self.names().join(", ")
+            ),
+        }
+    }
+}
+
+thread_local! {
+    /// The one empty [`TargetTable`] every [`EventProxy::new`] proxy shares -- a `lua` component
+    /// with no `targets:` is the overwhelmingly common case, and minting a fresh `Rc` per event
+    /// for it would add a real allocation to every `process()` call
+    /// (`crates/logit-bench/tests/allocations.rs`'s exact-equality counts). A `thread_local`
+    /// rather than a `static`: `Rc` is `!Send`, and so, by design, is every `ScriptWorker` that
+    /// could reach this (`docs/design/lua-api.md`'s concurrency section).
+    static NO_TARGETS: Rc<TargetTable> = Rc::new(TargetTable::default());
+}
+
+/// A shared handle to the empty [`TargetTable`] -- a refcount bump, never an allocation.
+fn no_targets() -> Rc<TargetTable> {
+    NO_TARGETS.with(Rc::clone)
+}
 
 /// Wraps one [`Event`] for the duration of a `process()`/`flush()` call -- and possibly longer, if
 /// a script stashes it in a global or upvalue.
@@ -84,17 +153,55 @@ pub struct EventProxy {
     /// `event.span`'s sub-proxy ([`SpanProxy`]), cached and gated on `event.span.is_some()` the
     /// same way `log` is above.
     span: RefCell<Option<RegistryKey>>,
+    /// Where `event:to(id)` said this event goes -- a slot in [`TargetTable`] order, `None` for an
+    /// unrouted event (the default, and every event of a component with no `targets:`).
+    ///
+    /// **The mark rides on the *handle*, not on the `Event`.** `crates/logit-core/tests/
+    /// type_sizes.rs` pins `size_of::<Event>()` exactly, and a routing decision is a property of
+    /// this one `process()`/`flush()` call's answer, not of the event as a value -- the same
+    /// reasoning that keeps provenance off `Event` (`docs/adr/target-components.md`'s "Lua"
+    /// consequence). It leaves with the event, once, through [`take_event`].
+    ///
+    /// A `Cell`, not a plain field: `event:to(..)` is reached through `&self` like every other
+    /// method on this type.
+    target: Cell<Option<u16>>,
+    /// This component's `targets:` list, shared with every other proxy this worker mints -- see
+    /// [`TargetTable`]. Empty (and shared process-wide per thread, see [`no_targets`]) for a
+    /// component that declares none.
+    targets: Rc<TargetTable>,
 }
 
 impl EventProxy {
+    /// A proxy for a component that declares no `targets:` -- every caller outside
+    /// `ScriptWorker::process` (`event:clone()` excepted, which shares its source's table).
+    /// `event:to(..)` on one of these is a script error naming the empty list, never a silent
+    /// forward.
     pub fn new(event: Event) -> Self {
+        Self::with_targets(event, no_targets())
+    }
+
+    /// A proxy that can be routed: `event:to(id)` resolves `id` against `targets`.
+    /// `ScriptWorker::process`'s own constructor.
+    pub(crate) fn with_targets(event: Event, targets: Rc<TargetTable>) -> Self {
         Self {
             event: Rc::new(RefCell::new(event)),
             attrs: RefCell::new(None),
             log: RefCell::new(None),
             metrics: RefCell::new(None),
             span: RefCell::new(None),
+            target: Cell::new(None),
+            targets,
         }
+    }
+
+    /// `event:clone()`'s independent copy: a fresh `Event`, but the *same* routing table (an `Rc`
+    /// bump) and a *copy* of the mark -- "a script fanning out a routed event gets two events
+    /// headed the same way, and `b:to(nil)` is how they diverge"
+    /// (`docs/adr/target-components.md`).
+    fn cloned_from(source: &Self) -> Self {
+        let clone = Self::with_targets(source.event.borrow().clone(), source.targets.clone());
+        clone.target.set(source.target.get());
+        clone
     }
 
     /// Returns this event's `AttrsProxy` userdata, creating and caching it on the first call and
@@ -156,7 +263,11 @@ impl EventProxy {
     /// synchronously emptying the cached userdata's box via `take`, the same tool [`take_event`]
     /// uses on the `EventProxy` itself -- Lua's GC would get there eventually, but "eventually"
     /// isn't deterministic enough to depend on here.
-    pub fn into_inner(self, lua: &Lua) -> Event {
+    ///
+    /// Returns the routing mark alongside the event (`None` for an unrouted one): the mark rides
+    /// on this handle, not on the `Event` (see the `target` field), so this -- the one point the
+    /// event leaves the Lua side -- is where it has to come with it.
+    pub fn into_inner(self, lua: &Lua) -> (Event, Option<u16>) {
         if let Some(key) = self.attrs.into_inner() {
             if let Ok(ud) = lua.registry_value::<AnyUserData>(&key) {
                 let _ = ud.take::<AttrsProxy>();
@@ -181,10 +292,11 @@ impl EventProxy {
             }
             let _ = lua.remove_registry_value(key);
         }
-        match Rc::try_unwrap(self.event) {
+        let event = match Rc::try_unwrap(self.event) {
             Ok(cell) => cell.into_inner(),
             Err(rc) => rc.borrow().clone(),
-        }
+        };
+        (event, self.target.get())
     }
 
     /// Test-only window onto the strong-count `into_inner`'s `Rc::try_unwrap` above lives and
@@ -280,7 +392,52 @@ impl UserData for EventProxy {
         // An independent deep copy, for fan-out: `return {a, b}` needs a second event distinct
         // from the first, and there's no `Event.new(...)` constructor yet (docs/adr and the
         // v0.1-lua-engine PR both call this out as a deliberate follow-up, not an oversight).
-        methods.add_method("clone", |_, this, ()| Ok(EventProxy::new(this.event.borrow().clone())));
+        // Carries the routing mark over and shares the target table -- see `cloned_from`.
+        methods.add_method("clone", |_, this, ()| Ok(EventProxy::cloned_from(this)));
+
+        // `event:to(id)` -- *mark* this event for one of this component's `targets:`, and return
+        // the same handle so `return event:to("host_stream")` chains
+        // (`docs/adr/target-components.md`, `docs/design/lua-api.md`'s "Routing to a target").
+        // It marks; it does not emit: the event still has to be returned from `process()`/
+        // `flush()`, exactly as an unrouted one does.
+        //
+        // `add_function`, not `add_method`, purely so the *same* userdata can be handed back --
+        // `add_method` only ever sees a `&EventProxy`, from which the `AnyUserData` that wraps it
+        // is unreachable. Method-call syntax (`event:to(..)`) passes the handle as the first
+        // argument either way, so the script-visible shape is identical. A destructed handle
+        // (`take_event` already ran on it) never reaches this closure at all: Lua swaps a
+        // destructed userdata's metatable out, so the `__index` lookup of `to` itself raises, and
+        // `clarify_destructed_handle_use` gives the same "already returned/emitted" wording every
+        // other method on this type gives.
+        methods.add_function("to", |_, (this, id): (AnyUserData, LuaValue)| {
+            {
+                let proxy = this.borrow::<EventProxy>()?;
+                match id {
+                    // `event:to(nil)` clears the mark -- an event a script routed and then thought
+                    // better of goes back to this component's ordinary consumers.
+                    LuaValue::Nil => proxy.target.set(None),
+                    LuaValue::String(name) => match proxy.targets.slot(name.to_str()?) {
+                        Some(slot) => proxy.target.set(Some(slot)),
+                        // "An id not in `targets:` is a script error, counted like every other
+                        // script error, never a silent forward" -- the ADR's rule, and the reason
+                        // this names the configured list rather than just the bad id.
+                        None => {
+                            return Err(mlua::Error::RuntimeError(
+                                proxy.targets.unknown_target_message(name.to_str()?),
+                            ))
+                        }
+                    },
+                    other => {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "event:to(id) takes a target id string, or nil to clear the mark, got \
+                             {}",
+                            other.type_name()
+                        )))
+                    }
+                }
+            }
+            Ok(this)
+        });
 
         // The escape hatch: a real Lua table, disconnected from the live event, for anything the
         // proxy doesn't expose directly -- including iterating all attributes, since `__pairs`
@@ -1533,7 +1690,11 @@ fn span_to_table<'lua>(lua: &'lua Lua, span: &SpanRecord) -> mlua::Result<Table<
 ///
 /// Takes `&Lua` to hand to [`EventProxy::into_inner`], which needs it to release the cached
 /// `AttrsProxy` registry entry before its own `Rc::try_unwrap` fast path.
-pub(crate) fn take_event(lua: &Lua, ud: AnyUserData) -> mlua::Result<Event> {
+///
+/// Returns the event's routing mark (`event:to(..)`, `None` if unmarked) alongside it: the mark
+/// lives on the handle this consumes, so this is the one place it can leave with the event. See
+/// [`EventProxy`]'s `target` field.
+pub(crate) fn take_event(lua: &Lua, ud: AnyUserData) -> mlua::Result<(Event, Option<u16>)> {
     match ud.take::<EventProxy>() {
         Ok(proxy) => Ok(proxy.into_inner(lua)),
         Err(mlua::Error::UserDataDestructed) => Err(mlua::Error::RuntimeError(
@@ -1619,7 +1780,7 @@ mod tests {
 
     fn emitted(outcome: ProcessOutcome) -> Event {
         match outcome {
-            ProcessOutcome::Emit(e) => *e,
+            ProcessOutcome::Emit(e, _) => *e,
             _ => panic!("expected Emit"),
         }
     }

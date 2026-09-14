@@ -61,6 +61,13 @@ fn non_empty_components_schema(generator: &mut SchemaGenerator) -> Schema {
 pub struct Component {
     #[serde(default)]
     pub sources: Vec<String>,
+    /// The `target` components this router directs events into, in slot order
+    /// (`docs/adr/target-components.md`). Legal only on `lua`/`lua_file`; a `route` derives its
+    /// targets from `routes:`' values instead, and every other kind must leave this empty --
+    /// enforced at validation time (`logit-pipeline`'s graph rules), not here, for the same reason
+    /// `buffer:` and `receive:` are validated there.
+    #[serde(default)]
+    pub targets: Vec<String>,
     /// Per-sink delivery buffer (`docs/adr/buffered-sink-delivery.md`). Meaningful only on a
     /// sink -- graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value
     /// on any other kind. A sibling field of `kind`, not nested inside every sink
@@ -292,6 +299,25 @@ pub enum MatchMode {
     #[default]
     AnyOf,
     Only,
+}
+
+/// What one `route` reads from each event. Externally tagged, so config reads
+/// `by: {provenance: origin}`, `by: {attribute: stream}`, or `by: {resource: service.name}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteBy {
+    Provenance(ProvenanceField),
+    Attribute(String),
+    Resource(String),
+}
+
+/// Which half of a batch's provenance a `route` switches on
+/// (`docs/adr/batch-provenance-on-delivered.md`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceField {
+    Origin,
+    Previous,
 }
 
 /// Per-signal HTTP path overrides for `otlp_out` (`paths:` in config). Not a `HashMap<String,
@@ -896,6 +922,18 @@ pub enum ComponentKind {
         #[serde(default)]
         previous: Vec<String>,
     },
+    /// Equality-only routing: one key read per event, one target per matching value
+    /// (`docs/adr/target-components.md`). Deliberately no predicate language -- the same posture
+    /// `has_attributes`/`has_provenance` take (`docs/adr/routing-by-condition-is-lua.md`). An
+    /// event whose key is absent, or whose value no route names, is *unrouted*: it goes to this
+    /// component's ordinary consumers, or is dropped and counted if it has none.
+    Route {
+        by: RouteBy,
+        /// Value -> target id. Several values may name one target. The graph's router->target
+        /// edges derive from these values, so there is no separate `targets:` list to keep in
+        /// sync.
+        routes: std::collections::BTreeMap<String, String>,
+    },
     /// Parses a log record's message as logfmt (`level=info msg="hello world" dur=3ms`), merging
     /// the resulting key/values into the event's attributes. Additive and pass-through-on-failure,
     /// exactly like `json`. See `docs/adr/logfmt-and-kv-parsing.md`.
@@ -1236,10 +1274,14 @@ pub enum ComponentKind {
     /// `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. See
     /// `docs/adr/prometheus-scrape-and-exposition.md`. A future `bind:` field on this same variant
     /// (a remote-write receiver) is planned as an additive, non-breaking change -- "exactly one of
-    /// `targets`/`bind`" would become a graph rule once it lands, not a new kind.
+    /// `scrape_targets`/`bind`" would become a graph rule once it lands, not a new kind.
+    ///
+    /// Named `scrape_targets`, not `targets` -- `Component.targets` (`docs/adr/
+    /// target-components.md`) claims the bare name at the flattened top level, and `#[serde(flatten)]`
+    /// can't have two fields answer to the same key.
     PrometheusIn {
         /// Absolute `http://`/`https://` scrape URLs. Required, non-empty (rule 40).
-        targets: Vec<String>,
+        scrape_targets: Vec<String>,
         /// Scrape cadence. Rule 9 rejects `0s`.
         #[serde(default = "default_prometheus_scrape_interval", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
@@ -1365,6 +1407,11 @@ pub enum ComponentKind {
     /// the measurement uses `file_out` to `/dev/null` instead, which is a real sink doing real
     /// work rather than a special case here.
     NullOut {},
+    /// A named destination a router directs events into (`docs/adr/target-components.md`). No
+    /// fields, and no `sources:` -- a target is fed by *direction*, from a router that names it,
+    /// never by naming anything itself. Downstream components read it exactly like any other
+    /// component, by listing it in their own `sources:`.
+    Target {},
 }
 
 fn default_prometheus_path() -> String {
@@ -3889,6 +3936,7 @@ mod tests {
     fn interval_round_trips_through_serialize_then_deserialize() {
         let original = Component {
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             buffer: BufferConfig::default(),
             receive: ReceiveConfig::default(),
             kind: ComponentKind::Lua {
@@ -4296,14 +4344,14 @@ mod tests {
     }
 
     #[test]
-    fn prometheus_in_requires_only_targets_and_defaults_the_rest() {
+    fn prometheus_in_requires_only_scrape_targets_and_defaults_the_rest() {
         let component: Component = serde_json::from_str(
-            r#"{"type": "prometheus_in", "targets": ["http://node-exporter:9100/metrics"]}"#,
+            r#"{"type": "prometheus_in", "scrape_targets": ["http://node-exporter:9100/metrics"]}"#,
         )
         .unwrap();
         match component.kind {
-            ComponentKind::PrometheusIn { targets, interval, timeout, headers, tls } => {
-                assert_eq!(targets, vec!["http://node-exporter:9100/metrics".to_string()]);
+            ComponentKind::PrometheusIn { scrape_targets, interval, timeout, headers, tls } => {
+                assert_eq!(scrape_targets, vec!["http://node-exporter:9100/metrics".to_string()]);
                 assert_eq!(interval, Duration::from_secs(15));
                 assert_eq!(timeout, Duration::from_secs(10));
                 assert!(headers.is_empty());
@@ -4316,7 +4364,7 @@ mod tests {
     #[test]
     fn prometheus_in_interval_timeout_headers_and_tls_can_all_be_set() {
         let component: Component = serde_json::from_str(
-            r#"{"type": "prometheus_in", "targets": ["https://node-exporter:9100/metrics"],
+            r#"{"type": "prometheus_in", "scrape_targets": ["https://node-exporter:9100/metrics"],
                 "interval": "30s", "timeout": "5s",
                 "headers": {"X-Scope-OrgID": "tenant-a"},
                 "tls": {"ca_file": "ca.pem"}}"#,
@@ -4334,15 +4382,17 @@ mod tests {
     }
 
     #[test]
-    fn prometheus_in_rejects_an_empty_targets_list_at_deserialize_time_only_if_required() {
-        // `targets` has no `#[serde(default)]`, so an omitted or empty-but-present list both
-        // deserialize fine here -- rule 40 (`logit-pipeline::graph`) is what rejects an empty
-        // list, not this crate's schema (mirrors `TailIn::paths`'s own split of "shape" vs.
+    fn prometheus_in_rejects_an_empty_scrape_targets_list_at_deserialize_time_only_if_required() {
+        // `scrape_targets` has no `#[serde(default)]`, so an omitted or empty-but-present list
+        // both deserialize fine here -- rule 40 (`logit-pipeline::graph`) is what rejects an
+        // empty list, not this crate's schema (mirrors `TailIn::paths`'s own split of "shape" vs.
         // "meaning").
         let component: Component =
-            serde_json::from_str(r#"{"type": "prometheus_in", "targets": []}"#).unwrap();
+            serde_json::from_str(r#"{"type": "prometheus_in", "scrape_targets": []}"#).unwrap();
         match component.kind {
-            ComponentKind::PrometheusIn { targets, .. } => assert!(targets.is_empty()),
+            ComponentKind::PrometheusIn { scrape_targets, .. } => {
+                assert!(scrape_targets.is_empty())
+            }
             other => panic!("expected PrometheusIn, got {other:?}"),
         }
     }
@@ -4438,5 +4488,93 @@ mod tests {
             ComponentKind::NullOut {} => {}
             other => panic!("expected NullOut, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn target_deserializes_with_no_fields() {
+        let component: Component = serde_json::from_str(r#"{"type": "target"}"#).unwrap();
+        assert!(component.sources.is_empty());
+        match component.kind {
+            ComponentKind::Target {} => {}
+            other => panic!("expected Target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_deserializes_with_by_provenance_origin() {
+        let component: Component = serde_json::from_str(
+            r#"{
+                "type": "route",
+                "sources": ["central_in"],
+                "by": {"provenance": "origin"},
+                "routes": {"host": "host_stream", "app": "app_stream"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(component.sources, vec!["central_in".to_string()]);
+        match component.kind {
+            ComponentKind::Route { by, routes } => {
+                assert_eq!(by, RouteBy::Provenance(ProvenanceField::Origin));
+                assert_eq!(
+                    routes,
+                    std::collections::BTreeMap::from([
+                        ("host".to_string(), "host_stream".to_string()),
+                        ("app".to_string(), "app_stream".to_string()),
+                    ])
+                );
+            }
+            other => panic!("expected Route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_by_attribute_and_resource_deserialize() {
+        let component: Component = serde_json::from_str(
+            r#"{
+                "type": "route",
+                "sources": ["in"],
+                "by": {"attribute": "stream"},
+                "routes": {"host": "host_stream"}
+            }"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Route { by, .. } => {
+                assert_eq!(by, RouteBy::Attribute("stream".to_string()));
+            }
+            other => panic!("expected Route, got {other:?}"),
+        }
+
+        let component: Component = serde_json::from_str(
+            r#"{
+                "type": "route",
+                "sources": ["in"],
+                "by": {"resource": "service.name"},
+                "routes": {"web": "web_stream"}
+            }"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Route { by, .. } => {
+                assert_eq!(by, RouteBy::Resource("service.name".to_string()));
+            }
+            other => panic!("expected Route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn component_targets_default_to_empty() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "null_out", "sources": ["gen"]}"#).unwrap();
+        assert!(component.targets.is_empty());
+    }
+
+    #[test]
+    fn a_lua_component_parses_its_targets_list() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "lua", "script": "return event", "targets": ["a", "b"]}"#,
+        )
+        .unwrap();
+        assert_eq!(component.targets, vec!["a".to_string(), "b".to_string()]);
     }
 }

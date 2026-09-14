@@ -575,6 +575,15 @@ pub fn has_attributes_resource() -> logit_transforms::HasAttributes {
     )
 }
 
+/// A `has_attributes` matching [`nginx_event_with_stream`]'s `stream` attribute against one value
+/// -- the "today's shape" half of the route-vs-fan-out comparison
+/// (`crates/logit-bench/tests/allocations.rs`'s `// Routing` section,
+/// `docs/adr/target-components.md`): one of these per branch is what a `stream: host`/`stream:
+/// app` fan-out pair looks like without a `route`/target.
+pub fn has_attributes_stream(value: &str) -> logit_transforms::HasAttributes {
+    logit_transforms::HasAttributes::new(vec![], vec![("stream".to_string(), Value::str(value))])
+}
+
 /// A `trace_context` configured to lift `trace_id` only (no `span_id`/`flags`, `keep_source:
 /// false`) -- the common case, for `crates/logit-bench/tests/allocations.rs`'s
 /// `trace_context_lifts_a_valid_trace_id`.
@@ -692,6 +701,29 @@ pub fn nginx_batch(count: usize) -> EventBatch {
         resource: resource(),
         scope: None,
         events: (0..count).map(|_| event.clone()).collect(),
+    }
+}
+
+/// [`nginx_event`] with a `stream` attribute added -- the `route`/`has_attributes` split fixture
+/// for `crates/logit-bench/tests/allocations.rs`'s `// Routing` section
+/// (`docs/adr/target-components.md`): the headline central-collector topology switches on exactly
+/// this kind of tag.
+pub fn nginx_event_with_stream(stream: &str) -> Event {
+    let mut event = nginx_event();
+    event.attributes.insert("stream", Value::str(stream));
+    event
+}
+
+/// `count` [`nginx_event_with_stream`] events in one batch, alternating `"host"`/`"app"` -- the
+/// same 64-event split the ADR's route-vs-fan-out comparison measures both ways
+/// (`crates/logit-bench/tests/allocations.rs`'s `// Routing` section).
+pub fn nginx_batch_alternating_stream(count: usize) -> EventBatch {
+    EventBatch {
+        resource: resource(),
+        scope: None,
+        events: (0..count)
+            .map(|i| nginx_event_with_stream(if i % 2 == 0 { "host" } else { "app" }))
+            .collect(),
     }
 }
 

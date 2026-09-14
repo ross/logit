@@ -1,12 +1,12 @@
 //! Built-in native transform components -- no Lua VM involved, per `docs/design/lua-api.md`'s
 //! "built-in native processors ... meant to sit in front of user Lua" split. Each implements
-//! `logit_pipeline::Transform`, letting the node runtime run it as an ordinary tokio task (no
-//! dedicated OS thread, unlike a Lua component -- `docs/design/pipeline-graph.md`'s "Node kinds"
-//! section). `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`,
-//! `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`,
-//! `has_provenance`, `drop_provenance`, `logfmt`, `kv`, and `regex` are implemented
-//! (`rename`/`filter`/`sample`/`throttle`/`dedup` were retired rather than landing --
-//! `docs/adr/routing-by-condition-is-lua.md`).
+//! `logit_pipeline::Transform` (or, for `route`, `logit_pipeline::Router`), letting the node
+//! runtime run it as an ordinary tokio task (no dedicated OS thread, unlike a Lua component --
+//! `docs/design/pipeline-graph.md`'s "Node kinds" section). `aggregate`, `json`, `csv`,
+//! `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`,
+//! `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`,
+//! `logfmt`, `kv`, `regex`, and `route` are implemented (`rename`/`filter`/`sample`/`throttle`/
+//! `dedup` were retired rather than landing -- `docs/adr/routing-by-condition-is-lua.md`).
 
 mod aggregate;
 mod attributes;
@@ -17,6 +17,7 @@ mod kv_metrics;
 mod logfmt;
 mod provenance;
 mod regex;
+mod route;
 mod scale;
 mod set;
 mod signals;
@@ -33,6 +34,7 @@ pub use kv_metrics::{KvMetrics, MetricSpec};
 pub use logfmt::{Kv, Logfmt};
 pub use provenance::{DropProvenance, HasProvenance};
 pub use regex::RegexParser;
+pub use route::Route;
 pub use scale::Scale;
 pub use set::Set;
 pub use signals::{DropSignals, HasSignal, KeepSignals, MatchMode, SignalSet};

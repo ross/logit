@@ -65,6 +65,14 @@ pub enum NodeState {
     Finished,
     /// It returned `Err`, or its task panicked.
     Failed,
+    /// A `target` ([`crate::graph::Role::Target`], `docs/adr/target-components.md`): there is no
+    /// task and no inbox to report on, because a target is a *name* for its routers' outbound
+    /// edges, not a node that runs. Its liveness is its routers' -- a target whose routers are all
+    /// `Running` is carrying traffic, and one whose routers have all exited is not, with nothing
+    /// of its own in between. Set once, in the pre-spawn pass that builds each target's `Fanout`
+    /// (`crate::runtime::run_with_telemetry`), and never moved again: the `Running`/`Finished`/
+    /// `Failed` transitions all come from a `JoinSet` entry a target doesn't have.
+    Alias,
 }
 
 impl NodeState {
@@ -75,6 +83,7 @@ impl NodeState {
             NodeState::Running => "running",
             NodeState::Finished => "finished",
             NodeState::Failed => "failed",
+            NodeState::Alias => "alias",
         }
     }
 }

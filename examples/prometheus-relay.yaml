@@ -15,7 +15,7 @@
 components:
   node_exporter:
     type: prometheus_in
-    targets: ["http://127.0.0.1:9100/metrics"] # an absolute http(s) URL; node-exporter's default
+    scrape_targets: ["http://127.0.0.1:9100/metrics"] # an absolute http(s) URL; node-exporter's default
     interval: 15s # the standard Prometheus scrape cadence
 
   metrics:

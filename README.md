@@ -46,7 +46,9 @@ as implemented native transforms —
 run` rejects a config referencing any other unimplemented kind with a clear error. Config is a flat
 graph of named components, each declaring its own `sources` ([ADR `component-graph-configuration`](docs/adr/component-graph-configuration.md),
 [docs/design/pipeline-graph.md](docs/design/pipeline-graph.md)) — `logit graph <config>` prints the
-resolved graph as graphviz DOT. To see it running, use [demo/](demo/README.md) (above) rather than
+resolved graph as graphviz DOT. A `route` component (or a Lua script calling `event:to(..)`) directs
+events into named `target` components instead, which downstream flows read like any other source —
+one partition pass in place of a filter per branch ([ADR `target-components`](docs/adr/target-components.md)). To see it running, use [demo/](demo/README.md) (above) rather than
 building from source — [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml) and
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) are contributor-facing fixtures
 `script/server [config]` runs against the local dev stack below (the latter against a real nginx,
@@ -122,7 +124,7 @@ crates/
   logit-config      YAML config types + generated JSON Schema
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
-  logit-pipeline    Input/Output/Transform traits, Fanout, graph resolution, the node runtime
+  logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution, the node runtime
   logit-inputs      per-protocol listeners; statsd, syslog, otlp, tail (tail_in/docker_in)
   logit-outputs     per-protocol sinks; InfluxDB, stdio, syslog
   logit-transforms  built-in native transform components; aggregate, json, csv, kv_metrics, keep, remove, set, trace_context, scale, logfmt, kv

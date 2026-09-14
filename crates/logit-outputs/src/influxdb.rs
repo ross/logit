@@ -1070,7 +1070,7 @@ mod tests {
         let mut event = metric_event("page.views", MetricKind::counter(1.0), &[]);
         event.attributes.insert("host", Value::Bytes(Bytes::from_static(b"web-01")));
         let event = match worker.process(event).expect("process should succeed") {
-            logit_script::ProcessOutcome::Emit(event) => *event,
+            logit_script::ProcessOutcome::Emit(event, _) => *event,
             _ => panic!("expected the script to emit the event unchanged"),
         };
 

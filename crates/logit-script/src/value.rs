@@ -292,7 +292,7 @@ mod array_attribute_tests {
 
     fn emitted(outcome: ProcessOutcome) -> Event {
         match outcome {
-            ProcessOutcome::Emit(e) => *e,
+            ProcessOutcome::Emit(e, _) => *e,
             _ => panic!("expected Emit"),
         }
     }

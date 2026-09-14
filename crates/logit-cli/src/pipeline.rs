@@ -57,8 +57,9 @@ use logit_transforms::{
     HasSignal as HasSignalTransform, JsonParser, Keep as KeepTransform,
     KeepSignals as KeepSignalsTransform, Kv as KvTransform, KvMetrics as KvMetricsTransform,
     Logfmt as LogfmtTransform, MatchMode as TransformMatchMode, RegexParser,
-    Remove as RemoveTransform, Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets,
-    SignalSet, SpanLift, TraceContext as TraceContextTransform,
+    Remove as RemoveTransform, Route as RouteTransform, Scale as ScaleTransform,
+    Set as SetTransform, Sets as TransformSets, SignalSet, SpanLift,
+    TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -402,8 +403,8 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        PrometheusIn { targets, interval, timeout, headers, tls } => {
-            let input = PrometheusInput::new(targets.clone(), *interval)
+        PrometheusIn { scrape_targets, interval, timeout, headers, tls } => {
+            let input = PrometheusInput::new(scrape_targets.clone(), *interval)
                 .with_timeout(*timeout)
                 .with_headers(headers)?
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -498,12 +499,21 @@ fn build_spec(
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
 
-        Lua { script, interval } => NodeSpec::Lua { script: script.clone(), interval: *interval },
+        // `component.targets` (`docs/adr/target-components.md`) is what `run_lua` turns into
+        // `event:to("..")`'s name -> slot table inside the VM, and what it resolves its
+        // slot-ordered target `Fanout`s from. Not `graph::targets_of(component)`: this function
+        // takes a `ResolvedComponent`, whose `targets` field *is* that call's output, already
+        // slot-ordered and de-duplicated by `graph::resolve`.
+        Lua { script, interval } => NodeSpec::Lua {
+            script: script.clone(),
+            interval: *interval,
+            targets: component.targets.clone(),
+        },
         LuaFile { lua_file, interval } => {
             let script_path = base_dir.join(lua_file);
             let script = std::fs::read_to_string(&script_path)
                 .with_context(|| format!("reading lua_file {}", script_path.display()))?;
-            NodeSpec::Lua { script, interval: *interval }
+            NodeSpec::Lua { script, interval: *interval, targets: component.targets.clone() }
         }
         Aggregate {
             interval,
@@ -854,6 +864,20 @@ fn build_spec(
             queue_config(&component.buffer, base_dir),
             write_config(&component.buffer),
         ),
+
+        // A target is a zero-cost alias -- nothing to build (`docs/adr/target-components.md`'s
+        // "Runtime: a target is a zero-cost alias"). `logit_pipeline::run_with_telemetry`'s
+        // pre-spawn pass is what gives it a real `Fanout`; `NodeSpec::Target` exists purely so
+        // the registry stays one spec per component.
+        Target {} => NodeSpec::Target,
+
+        // `Route::new` resolves every `routes:` value to its target's slot once, here, against
+        // this router's own slot-ordered `component.targets` (`graph::targets_of`'s output,
+        // rules 48/51 guaranteeing every value resolves). No `with_telemetry`: `route` records no
+        // layer-3 points of its own (see `logit_transforms::route`'s module doc).
+        Route { by, routes } => {
+            NodeSpec::Router(Box::new(RouteTransform::new(by.clone(), routes, &component.targets)))
+        }
     };
     Ok((spec, telemetry))
 }
@@ -1363,6 +1387,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
+            targets: Vec::new(),
             kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
         }
     }
@@ -1372,6 +1397,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: sources.into_iter().map(String::from).collect(),
+            targets: Vec::new(),
             kind: ComponentKind::InfluxDbOut {
                 url: "http://localhost:8086".to_string(),
                 org: "org".to_string(),
@@ -1421,6 +1447,7 @@ mod tests {
                     buffer: logit_config::BufferConfig::default(),
                     receive: logit_config::ReceiveConfig::default(),
                     sources: vec!["in".to_string()],
+                    targets: Vec::new(),
                     kind: ComponentKind::Lua { script: "".to_string(), interval: None },
                 },
             ),
@@ -1430,6 +1457,7 @@ mod tests {
                     buffer: logit_config::BufferConfig::default(),
                     receive: logit_config::ReceiveConfig::default(),
                     sources: vec!["in".to_string()],
+                    targets: Vec::new(),
                     kind: ComponentKind::Lua { script: "".to_string(), interval: None },
                 },
             ),
@@ -1448,6 +1476,7 @@ mod tests {
                     buffer: logit_config::BufferConfig::default(),
                     receive: logit_config::ReceiveConfig::default(),
                     sources: vec!["in".to_string()],
+                    targets: Vec::new(),
                     kind: ComponentKind::LuaFile {
                         lua_file: "does-not-exist.lua".to_string(),
                         interval: None,
@@ -1480,6 +1509,7 @@ mod tests {
                     buffer: logit_config::BufferConfig::default(),
                     receive: logit_config::ReceiveConfig::default(),
                     sources: vec![],
+                    targets: Vec::new(),
                     kind: ComponentKind::Internal {
                         interval: Duration::from_secs(10),
                         span_sample_rate: logit_core::DEFAULT_SPAN_SAMPLE_RATE,
@@ -1503,6 +1533,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Internal {
                 interval: Duration::from_secs(10),
@@ -1522,6 +1553,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Aggregate {
                 interval: Duration::from_secs(10),
@@ -1548,6 +1580,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::InfluxDbOut {
                 url: "http://localhost:8086".to_string(),
@@ -1571,6 +1604,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::CollectdOut {
                 endpoint: "127.0.0.1:25826".to_string(),
@@ -1608,6 +1642,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: graphite_out_kind(
                 logit_config::GraphiteTransport::Udp,
@@ -1629,6 +1664,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: graphite_out_kind(
                 logit_config::GraphiteTransport::Tcp,
@@ -1649,6 +1685,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::PrometheusOut {
                 bind: "127.0.0.1:0".to_string(),
@@ -1669,6 +1706,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::NullOut {},
         };
@@ -1679,12 +1717,53 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_builds_a_target() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Target {},
+        };
+        assert!(matches!(
+            build_spec("t", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Target
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_route_router() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: vec!["host_stream".to_string(), "app_stream".to_string()],
+            consumers: vec![],
+            kind: ComponentKind::Route {
+                by: logit_config::RouteBy::Attribute("stream".to_string()),
+                routes: [
+                    ("host".to_string(), "host_stream".to_string()),
+                    ("app".to_string(), "app_stream".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        };
+        assert!(matches!(
+            build_spec("r", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Router(_)
+        ));
+    }
+
+    #[test]
     fn build_spec_builds_an_otlp_input() {
         for protocol in [logit_config::OtlpProtocol::Http, logit_config::OtlpProtocol::Grpc] {
             let component = ResolvedComponent {
                 buffer: logit_config::BufferConfig::default(),
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
+                targets: Vec::new(),
                 consumers: vec!["out".to_string()],
                 kind: ComponentKind::OtlpIn {
                     bind: "127.0.0.1:0".to_string(),
@@ -1715,6 +1794,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::GenerateIn {
                 count: Some(1000),
@@ -1750,9 +1830,10 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::PrometheusIn {
-                targets: vec!["http://127.0.0.1:0/metrics".to_string()],
+                scrape_targets: vec!["http://127.0.0.1:0/metrics".to_string()],
                 interval: Duration::from_secs(15),
                 timeout: Duration::from_secs(10),
                 headers: HashMap::new(),
@@ -1773,6 +1854,7 @@ mod tests {
                 ..logit_config::ReceiveConfig::default()
             },
             sources: vec![],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::CollectdIn { bind: "127.0.0.1:0".to_string(), types_db },
         }
@@ -1820,6 +1902,7 @@ mod tests {
                 ..logit_config::ReceiveConfig::default()
             },
             sources: vec![],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::GraphiteIn {
                 bind: "127.0.0.1:0".to_string(),
@@ -1892,6 +1975,7 @@ mod tests {
                 ..logit_config::ReceiveConfig::default()
             },
             sources: vec![],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::TailIn {
                 paths: vec!["/var/log/app.log".to_string()],
@@ -1910,6 +1994,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::DockerIn {
                 root: "/var/lib/docker/containers".to_string(),
@@ -2004,6 +2089,7 @@ mod tests {
                 buffer: logit_config::BufferConfig::default(),
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
+                targets: Vec::new(),
                 consumers: vec![],
                 kind: ComponentKind::OtlpOut {
                     endpoint: "http://localhost:4318".to_string(),
@@ -2034,6 +2120,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::OtlpOut {
                 endpoint: "https://tempo:4317".to_string(),
@@ -2062,6 +2149,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::OtlpOut {
                 endpoint: "https://localhost:4318".to_string(),
@@ -2091,6 +2179,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::OtlpOut {
                 endpoint: "https://localhost:4318".to_string(),
@@ -2117,6 +2206,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::OtlpIn {
                 bind: "127.0.0.1:0".to_string(),
@@ -2145,6 +2235,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::SyslogIn {
                 bind: "127.0.0.1:0".to_string(),
@@ -2243,6 +2334,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::LogitIn {
                 bind: "127.0.0.1:0".to_string(),
@@ -2263,6 +2355,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::LogitIn {
                 bind: "127.0.0.1:0".to_string(),
@@ -2329,6 +2422,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::SyslogIn {
                 bind: addr.clone(),
@@ -2348,6 +2442,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::LogitIn {
                 bind: addr.clone(),
@@ -2369,6 +2464,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::OtlpIn {
                 bind: addr.clone(),
@@ -2391,6 +2487,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::LogitOut {
                 endpoint: "central:5140".to_string(),
@@ -2411,6 +2508,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::LogitOut {
                 endpoint: "central:5140".to_string(),
@@ -2446,6 +2544,7 @@ mod tests {
             },
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::InfluxDbOut {
                 url: "http://localhost:8086".to_string(),
@@ -2495,6 +2594,7 @@ mod tests {
             },
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::InfluxDbOut {
                 url: "http://localhost:8086".to_string(),
@@ -2538,6 +2638,7 @@ mod tests {
             },
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::NullOut {},
         };
@@ -2559,6 +2660,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Logfmt { bare_keys: false },
         };
@@ -2574,6 +2676,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Kv {
                 pair_sep: "&".to_string(),
@@ -2593,6 +2696,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Json { skip_to_brace: true },
         };
@@ -2619,6 +2723,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::StdioOut { target, format, compression },
         }
@@ -2719,6 +2824,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::FileOut { path: path.to_string(), rotate, format, compression },
         }
@@ -2821,6 +2927,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::KvMetrics {
                 counters: vec![logit_config::MetricSpec {
@@ -2844,6 +2951,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Keep { fields: vec!["status".to_string()] },
         };
@@ -2859,6 +2967,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Remove { fields: vec!["client_ip".to_string()] },
         };
@@ -2874,6 +2983,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Set {
                 resource: std::collections::BTreeMap::from([(
@@ -2899,6 +3009,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::TraceContext {
                 trace_id: "tid".to_string(),
@@ -2950,6 +3061,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::TraceContext {
                 trace_id: "trace.id".to_string(),
@@ -3004,6 +3116,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Scale {
                 fields: std::collections::BTreeMap::from([("request_time".to_string(), 1000.0)]),
@@ -3044,6 +3157,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::Regex {
                 pattern: r"status=(?P<status>\d+)".to_string(),
@@ -3062,6 +3176,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::HasSignal {
                 signals: vec![logit_config::Signal::Traces],
@@ -3080,6 +3195,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::KeepSignals { signals: vec![logit_config::Signal::Logs] },
         };
@@ -3095,6 +3211,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::DropSignals { signals: vec![logit_config::Signal::Metrics] },
         };
@@ -3110,6 +3227,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::HasAttributes {
                 resource: std::collections::BTreeMap::new(),
@@ -3131,6 +3249,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::DropAttributes {
                 resource: std::collections::BTreeMap::from([(
@@ -3152,6 +3271,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::HasProvenance {
                 origin: vec!["nginx_in".to_string()],
@@ -3170,6 +3290,7 @@ mod tests {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
             sources: vec!["in".to_string()],
+            targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::DropProvenance {
                 origin: vec![],

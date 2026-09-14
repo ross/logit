@@ -7,6 +7,7 @@ publish.workspace = true
 description = "Built-in native transform stages (no Lua VM involved) -- aggregate first."
 
 [dependencies]
+logit-config.workspace = true
 logit-core.workspace = true
 logit-pipeline.workspace = true
 thiserror.workspace = true
@@ -22,5 +23,4 @@ regex.workspace = true
 # `Transform::process` directly the way every other test in this crate does.
 anyhow.workspace = true
 async-trait.workspace = true
-logit-config.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }

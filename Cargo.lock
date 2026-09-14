@@ -906,6 +906,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "divan",
+ "logit-config",
  "logit-core",
  "logit-inputs",
  "logit-outputs",

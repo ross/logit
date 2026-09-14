@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-08-29
+updated: 2026-09-13
 ---
 
 # Configuration: a component graph, not inputs/outputs/pipelines
@@ -95,3 +95,12 @@ runtime model, and the `logit graph` subcommand: [docs/design/pipeline-graph.md]
 - This is a breaking config-format change with no migration path — acceptable pre-release, per the
   project's current stage; there is exactly one shipped example config and no external users of the
   format yet.
+- **Amended 2026-09-13: the "named outlets or edge predicates" rejection above is narrowed, not
+  reversed, by [ADR `target-components`](target-components.md).** Edge predicates stay rejected
+  outright. What that ADR adds is a `target` component kind — a named destination in the same flat
+  map, fed by a router that names it per event — and the specific thing it was careful *not* to
+  add is a second way to spell an edge: router → target is the only producer-declared edge in the
+  graph, a router may name nothing but a `target`, and target → consumer stays `sources:`. Filter
+  chains remain the branching mechanism for any condition a router can't express; a target is the
+  same branch made cheap (one partition pass, no clone) where the condition is equality or a Lua
+  script's own decision. That ADR carries the full argument against this section's objection.

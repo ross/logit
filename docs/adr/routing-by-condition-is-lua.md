@@ -1,6 +1,6 @@
 ---
 created: 2026-09-07
-updated: 2026-09-10
+updated: 2026-09-13
 ---
 
 # Routing by condition, sampling, throttling, dedup, and renaming are `lua` components
@@ -178,3 +178,13 @@ assumed), this decision is the one to revisit, and the alternative below is wher
   against. Same posture as above: no operators, no boolean algebra beyond the AND-across-fields/
   OR-within-a-field this pair adds (itself `has_attributes`' and `has_signal`'s shapes composed,
   not a new primitive), and this ADR's core holding is still unchanged.
+- **The trigger fired a third time on 2026-09-13, for *destination* selection rather than
+  predicate evaluation.** The same central-collector fan-out those two entries answered still
+  paid N filter passes over every event and, with no `Output` branch, a full `EventBatch` clone
+  per extra branch (`docs/design/memory.md` §3) -- costs of the *shape*, not of any one filter.
+  [ADR `target-components`](target-components.md) answers that with a `target` component kind and
+  two routers: a native `route` (equality only, `by:` one of provenance/attribute/resource plus a
+  value → target map -- `has_attributes`' bounded matcher pointed at a destination, no wider) and
+  `event:to("id")` for `lua`. Same posture as the two entries above: no operators, no boolean
+  algebra, no predicate language, and this ADR's core holding is unchanged -- anything needing an
+  operator still means writing `lua`, which can now route as well as filter.

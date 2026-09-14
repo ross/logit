@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-09-12
+updated: 2026-09-13
 ---
 
 # Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping
@@ -478,3 +478,11 @@ scrape time; it remains the one sink outside all three codec traits, by design.)
   that ADR's amendment. Internal telemetry still flows through the graph as ordinary events;
   `prometheus_out` is an ordinary sink fed by whatever the graph routes to it, including
   `internal`, not a second telemetry representation bypassing the pipeline.
+
+**2026-09-13 amendment:** `ComponentKind::PrometheusIn`'s `targets` field is renamed
+`scrape_targets` (config key and all). [ADR `target-components`](target-components.md) puts a
+`targets: Vec<String>` field on `Component` itself, at the same flattened top level `serde(flatten)`
+merges every `ComponentKind` variant's fields into — two fields answering to the same key there is
+a collision, not a coexistence, so this ADR's field yields the bare name. `bind`'s future "exactly
+one of `scrape_targets`/`bind`" rule (see "Remote-write forward compatibility" above) renames along
+with it.

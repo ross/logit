@@ -55,6 +55,10 @@ pub struct Config {
 pub struct Component {
     #[serde(default)]
     pub sources: Vec<String>,
+    // The `target` components a router directs events into, in slot order
+    // (docs/adr/target-components.md). Legal only on `lua`/`lua_file`.
+    #[serde(default)]
+    pub targets: Vec<String>,
     #[serde(flatten)]
     pub kind: ComponentKind,
 }
@@ -107,6 +111,10 @@ pub enum ComponentKind {
     // Splits each row of a delimited line into positional attributes named by a configured
     // `columns` list (docs/adr/csv-positional-columns.md).
     Csv { columns: Vec<String>, delimiter: char },
+    // Equality-only routing: one key read per event, one target per matching value
+    // (docs/adr/target-components.md). An unrouted event goes to this component's ordinary
+    // consumers.
+    Route { by: RouteBy, routes: BTreeMap<String, String> },
     // as each lands in logit-transforms, same shape: a `ComponentKind` variant, no `sources`
     // opinion of its own (that lives on `Component`, uniformly). `rename`/`filter`/`sample`/
     // `throttle`/`dedup` used to be sketched here too -- retired before landing, not merely
@@ -117,6 +125,9 @@ pub enum ComponentKind {
     InfluxDbOut { url: String, org: String, bucket: String, token: String },
     OtlpOut { endpoint: String },
     LogitOut { endpoint: String },
+    // A named destination a router directs events into (docs/adr/target-components.md). No
+    // fields, and no `sources` -- fed by direction, never by naming anything itself.
+    Target {},
 }
 ```
 
@@ -175,13 +186,59 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
+| Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
+
+Rule 7's "≥1 consumer" column is relaxed for *routers* only (rule 50): a component that directs at
+a target may have no ordinary consumers at all, since its consumers are only where its *unrouted*
+events go — those are dropped and counted rather than silently lost
+([ADR `target-components`](../adr/target-components.md)).
 
 Deriving role from topology instead ("no sources → listener", "nothing reads it → sink") was
 considered and rejected (ADR `component-graph-configuration`): a typo'd source reference would silently turn a real sink into
 an orphaned transform, with no error, rather than a clear "did you mean" failure. The kind already
 knows its own arity — config just states the edges.
+
+## Routing: `route` and `target`
+
+A router directs each event at a named `target` component instead of every consumer of a shared
+upstream seeing every batch — the graph's answer to "send these events here and those there"
+without a filter per branch ([ADR `target-components`](../adr/target-components.md)):
+
+```yaml
+components:
+  central_in:
+    type: logit_in
+    bind: 0.0.0.0:5150
+
+  split:
+    type: route
+    sources: [central_in]
+    by: {attribute: stream}
+    routes:                  # value -> target id
+      host: host_stream
+      app: app_stream
+
+  host_stream: {type: target}
+  app_stream:  {type: target}
+
+  untagged_out:
+    type: stdio_out
+    sources: [split]        # the router's own consumers: everything no route claimed
+    target: stderr
+```
+
+`route` reads one key per event — `by:` is exactly one of `{provenance: origin}`,
+`{provenance: previous}`, `{attribute: <key>}`, `{resource: <key>}` — and `routes:` maps the values
+that key can take onto `target` ids; several values may map to one target. A value the key holds
+that no route names, or a missing key, is *unrouted* and falls through to the router's own
+`sources:` edge (`untagged_out` above), not a chain of complementary filters. A `target` has no
+fields and no `sources:` of its own: it's fed by direction, named by whichever router points at it,
+and read by downstream components exactly like any other source (`windowed: {sources: [host_stream]}`,
+say). `lua`/`lua_file` is the other router kind, choosing a target per event with `event:to("id")`
+instead of an equality table — see `docs/design/lua-api.md`'s "Routing to a target." A complete,
+runnable version of the config above is `examples/fan-out-central.yaml`.
 
 ## Validation
 
@@ -489,6 +546,39 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     `max_packet_bytes: 0` is rule 38's own zero check, extended (no collectd-style range clamp: an
     oversize packed datagram is already counted `oversize_datagram` and skipped, `statsd_out`'s
     own `EMSGSIZE` handling).
+47. A non-empty `targets:` is legal only on a `lua`/`lua_file` component
+    ([ADR `target-components`](../adr/target-components.md)). On any other kind it is rejected by
+    name — rule 14's shape: a `route` declares its targets through `routes:`' values, and no other
+    kind has any way to direct an event anywhere, so a set-but-ignored list is a config error
+    rather than a setting silently doing nothing.
+48. Every id in `graph::targets_of` — a `lua`/`lua_file`'s `targets:` entries, a `route`'s
+    `routes:` values — must resolve to a defined component, must not be the router itself, and must
+    name a `target` kind: a router may never direct at an ordinary component, which would be a
+    `sources:` entry written on the wrong side of the edge (the inversion ADR
+    `component-graph-configuration`'s "named outlets" rejection was about), so the message says so.
+    A `lua`/`lua_file` `targets:` list may not repeat an id — rule 4's reasoning, one hop over: two
+    `Fanout`s into the same target would deliver every routed batch to it twice. A `route` mapping
+    several `routes:` values onto one target is legal by contrast and collapses to one slot — that
+    is the many-to-one the kind is for. Rule 51's `routes:` shape checks deliberately run *before*
+    this rule, so an empty `routes:` value is reported as the empty value it is rather than as an
+    unresolved target id.
+49. A `target` declares no `sources` — it is fed by direction, from a router that names it, never
+    by naming anything itself (checked in rule 6's own arity match, where the rest of the table
+    lives). Rule 7 still requires it to have at least one consumer, and it must also be directed to
+    by at least one router: rule 7's mirror, since a target nothing routes to is the same black
+    hole seen from the other end — its consumers would wait on it forever.
+50. Rule 7 is relaxed for routers only: a component with a non-empty `graph::targets_of` is exempt
+    from the "no consumers" rejection. A router's ordinary consumers are where its *unrouted*
+    events go, so a router without any is a legal config — those events are dropped and counted
+    (`logit.component.events.dropped{reason="unrouted"}`), never silently.
+51. A `route` needs a non-empty `routes:` map — an empty one can only ever be a no-op, rules
+    10/20's reasoning — with no empty key (it could never match a real value) and no empty value
+    (it could never name a real target), and, under `by: {attribute: k}`/`{resource: k}`, a
+    non-empty `k`: rule 19/20's empty-field-name rejection, applied to the one key a `route` reads
+    per event.
+
+**Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
+graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
 
 **Sink reachability from a listener needs no separate rule.** It's implied by 2 + 5 + 7: every
 acyclic chain of ≥1-source components terminates somewhere, and every non-terminal component in that
@@ -504,7 +594,9 @@ no special-casing needed, and no restriction to state.
 - Each component is a node: one inbox (`mpsc::Receiver<EventBatch>`, capacity `CHANNEL_CAPACITY`,
   unchanged from today) and a `Fanout` — one `mpsc::Sender` per consumer, resolved from the inverted
   `sources` relation.
-- **Fan-in is free**: N sources into one component is N cloned `Sender`s feeding the same inbox.
+- **Fan-in is free**: N sources into one component is N cloned `Sender`s feeding the same inbox. A
+  `target` several routers direct at is fan-in at the target by exactly the same mechanism — each
+  router holds a clone of that target's senders ([ADR `target-components`](../adr/target-components.md)).
 - **Fan-out costs a clone per extra consumer**: exactly the `output_txs.split_last()` pattern
   `send_batch` already uses (`crates/logit-cli/src/pipeline.rs`), generalized from "per output" to
   "per downstream consumer of any node."
@@ -519,6 +611,27 @@ no special-casing needed, and no restriction to state.
   delivery one for `write_loop`'s retry to absorb
   (`docs/adr/prometheus-scrape-and-exposition.md`'s "`Output::bind`"). Sorted, sequential order is
   what makes "which one failed" reproducible instead of a race between binds.
+- **A `target` is not a node.** It gets no task, no inbox, and no channel at all — a listener's
+  inbox exists but is dropped unread (nothing can name a listener as a source), while a target's is
+  never created, one step stronger: a target declares no `sources:` and nothing may name *it* as a
+  source either, so there is nothing to create. What a target actually is at runtime is **one
+  `Fanout`**, built in a pass *before* the spawn loop (ids are sorted, so a router can precede its
+  own targets), wired to that target's consumers' inboxes and carrying the target's own id
+  (`with_component`) and telemetry handle (`with_telemetry`). Each of its routers gets a clone, and
+  its readiness state is `NodeState::Alias` for the life of the run. That map of target `Fanout`s is
+  **dropped alongside the construction-only `senders` map**: a live clone left behind would be an
+  extra outstanding `Sender` on every one of that target's consumers' channels, so the shutdown
+  cascade below could never reach past the target — a hang, not a failed assertion, which is why
+  `a_router_exiting_closes_its_targets_consumers_inboxes` pins it under a timeout.
+  ([ADR `target-components`](../adr/target-components.md)).
+- **A router is an ordinary node with one extra edge set.** It owns its own `Fanout` (slot 0, the
+  unrouted/forward edge) plus a slot-ordered `Vec<Fanout>`, one per `graph::targets_of` entry. Per
+  incoming batch it routes every event *borrowing* it, counts per destination, `reserve_exact`s,
+  moves each event into its destination's buffer (`route_batch`), and sends **one batch per
+  non-empty destination under one child `BatchContext` and one span** — one incoming batch is one
+  hop however many ways it forks, exactly the rule an ordinary fan-out already follows. A router
+  with targets and no ordinary consumers is legal; its forward partition is dropped and counted
+  `logit.component.events.dropped{reason="unrouted"}`, never silently.
 - **Build in reverse topological order** — from sinks back toward listeners — so every node's
   outbound `Fanout` is fully wired (every consumer's inbox already exists) before that node can
   start producing. This generalizes what `run_config` already does today (build outputs, then the
@@ -537,9 +650,15 @@ entire pipeline's transform chain serially, because chain adjacency was guarante
 sources and consumers can be arbitrary other components — so **each Lua component gets its own
 thread**, communicating with its neighbors over the same `mpsc` channels every other node uses.
 
-Everything else — listeners, sinks, and native `Send` transforms (`aggregate` today via
-`logit-transforms::Aggregator`; `json`/`filter`/etc. as they land in the same crate) — runs as an
-ordinary tokio task, no dedicated thread required. This is a strict generalization of today's split
+Everything else — listeners, sinks, native `Send` transforms (`aggregate` today via
+`logit-transforms::Aggregator`; `json`/`filter`/etc. as they land in the same crate), and **native
+`Router`s** (`route`, [ADR `target-components`](../adr/target-components.md); a `Router` is `Send`
+for the same reason a `Transform` is, and `run_router` is `run_transform` minus the flush-deadline
+race) — runs as an ordinary tokio task, no dedicated thread required. A `target` runs as nothing at
+all — see the runtime model above. A **Lua router** (a `lua`/`lua_file` component with `targets:`)
+is not a further exception: it is the same one OS thread it would be without them, partitioning
+each batch by the `event:to(..)` mark its script set and sending one batch per destination from
+that thread. This is a strict generalization of today's split
 (input/output tasks vs. one worker thread per pipeline), not a new idea — it just now applies per
 node instead of per pipeline.
 
@@ -649,6 +768,13 @@ previous = Some(self.component)              // rewritten on every send
   becomes *both* `origin` and `previous`, the honest statement for a batch built from accumulated
   state rather than a re-emission of anything that passed through unchanged.
 - A real fan-out gives every branch the identical provenance, same as it does for trace context.
+- **`previous` downstream of a `target` is the target's id, never the router's** — and `origin` is
+  untouched. No special case makes this true: a target's one `Fanout` is built
+  `with_component(<target id>)` like every other node's, so the rule above applies unchanged and a
+  `has_provenance{previous: [host_stream]}` reads naturally
+  ([ADR `target-components`](../adr/target-components.md)). A router's own forward edge stamps the
+  *router's* id, as any other node would. Which router fed a target is deliberately not recoverable
+  from provenance; if that ever matters it is a router-side metric, not a provenance change.
 
 `logit_in`'s relay (`Fanout::send_relayed`) uses a different rule, `stamp_relayed`: it back-fills
 (`or`, not overwrite) only whatever the wire didn't carry, so a v2 `logit_out` peer's own
@@ -690,6 +816,11 @@ discovering in production:
   no path to improvement under the current design. "Load-bearing" was right, but there is no single
   number for "the fan-out cost" any more — see `docs/design/memory.md` §3 for the complete,
   shape-by-shape account.
+- **A router + targets split (ADR `target-components`) is the cheap form of this diamond** — one
+  partition pass and no clone, against the branches-share-a-clone accounting just above — but it
+  doesn't change the backpressure story: a stalled consumer of one target still backs up through
+  its router into every other target's flow, the same head-of-line blocking the first bullet
+  describes, just paid by a router instead of a filter chain.
 
 Also worth carrying forward as an open question, not a decision: today's `send_batch` silently drops
 a send on a closed downstream (`let _ = tx.blocking_send(...)`). Under a DAG that closure should
@@ -732,7 +863,7 @@ config is a graph rather than a list of linear pipelines.
   undefined component can't be drawn at all" and required rule 2 to pass first — that premise was
   simply wrong once actually tried; corrected here rather than left as a stated constraint the
   implementation quietly didn't follow.)
-- Runs the full validation (all eighteen rules) after rendering and reports any failures to stderr with a
+- Runs the full validation (every rule) after rendering and reports any failures to stderr with a
   non-zero exit — without suppressing the DOT output. This is deliberate: `graph` is most useful on
   exactly the configs that fail validation, since a cycle — or a typo'd source, now visibly
   dangling — is far easier to see rendered than to parse out of an error message naming two
@@ -740,6 +871,12 @@ config is a graph rather than a list of linear pipelines.
 - Styles nodes by role (listener / transform / sink) so the shape of the data flow — where it
   enters, where it forks, where it lands — reads at a glance without cross-referencing the arity
   table.
+- Renders a `target` as a dashed box, and every router → target edge dashed too, labelled with the
+  `routes:` key that directs an event down it (a `lua`/`lua_file` `targets:` entry carries no
+  label — its destination is chosen in the script, by `event:to("..")`). These edges come from
+  `graph::target_edges`, which reads the raw `Config` like everything else here, so a router whose
+  target id resolves to nothing still renders as a visibly dangling dashed edge rather than
+  blocking output ([ADR `target-components`](../adr/target-components.md)).
 - Still needs every `!env` reference in the config to resolve, though ("Environment substitution"
   above) — a missing variable fails to load before `render` is ever called, same as `run`/
   `validate`, even for a field this command never reads.
@@ -784,7 +921,7 @@ logit-core   logit-config   logit-script
   "traits and generic machinery here, concrete protocol impls there" split the crate already
   applies everywhere else.
 
-`graph.rs` (resolution + the eighteen validation rules + topo-sort) is a **pure function over
+`graph.rs` (resolution + the validation rules + topo-sort) is a **pure function over
 `Config`** — no channels, no threads, no tokio — mirroring how `apply_transforms` in today's
 `pipeline.rs` was deliberately kept pure specifically so it's unit-testable without spinning up
 real I/O. `logit run`, `logit validate`, and `logit graph` are three different things layered on
