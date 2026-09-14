@@ -1435,7 +1435,11 @@ fn now_nanos() -> i64 {
 /// horizon is tokio's own (30 years, chosen there because 100 years overflows on some platforms).
 /// Only ever reached by a listener with no flush interval *and* no idle timeout, since otherwise
 /// the flush tick is the smaller deadline.
-fn far_future() -> tokio::time::Instant {
+///
+/// `pub(crate)` because `crate::logit`'s own idle deadline wants the identical fallback and
+/// tokio's copy is out of reach there too -- one definition rather than two 30-year constants
+/// drifting apart.
+pub(crate) fn far_future() -> tokio::time::Instant {
     tokio::time::Instant::now() + Duration::from_secs(86_400 * 365 * 30)
 }
 
