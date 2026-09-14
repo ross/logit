@@ -19,11 +19,28 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Same bind-drop-rebind idiom `otlp_round_trip.rs` and `crates/logit-inputs/src/otlp.rs`'s own
-/// tests use to learn a free port before constructing the component that will actually bind it.
+/// An address with *nothing* listening on it: bind an ephemeral port, read it back, drop the
+/// socket. The only remaining use is
+/// [`connect_refused_is_classified_clean_against_a_real_logit_in_torn_down`], which needs an
+/// address no `logit_in` will answer on -- every test that wants a live listener goes through
+/// [`bound_input`] instead.
 async fn ephemeral_addr() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     listener.local_addr().unwrap().to_string()
+}
+
+/// Stands a `logit_in` up on an ephemeral port: builds it, lets `configure` apply whatever
+/// builders the test needs (TLS, mostly), binds it, and hands back the OS-assigned address
+/// alongside the already-bound input.
+///
+/// `Input::bind` (`docs/plans/operator-surface.md`, workstream B) opens the listening socket here,
+/// before `run` is ever spawned, so a `LogitOutput::send` below cannot race the bind -- which is
+/// what this file used to paper over with a 50 ms sleep after every spawn.
+async fn bound_input(configure: impl FnOnce(LogitInput) -> LogitInput) -> (String, LogitInput) {
+    let mut input = configure(LogitInput::new("127.0.0.1:0"));
+    input.bind().await.expect("binding an ephemeral port should succeed");
+    let addr = input.local_addr().expect("bind() leaves a real address behind").to_string();
+    (addr, input)
 }
 
 fn sample_batch() -> EventBatch {
@@ -47,8 +64,8 @@ fn sample_batch() -> EventBatch {
     EventBatch { resource: Arc::new(resource), scope: None, events: vec![event] }
 }
 
-/// Runs `input` in the background, sends `batch` through `output`, and returns every
-/// [`EventBatch`] the input's own `Fanout` received.
+/// Runs `input` -- already bound by [`bound_input`] -- in the background, sends `batch` through
+/// `output`, and returns every [`EventBatch`] the input's own `Fanout` received.
 async fn round_trip(
     mut input: LogitInput,
     mut output: LogitOutput,
@@ -59,7 +76,6 @@ async fn round_trip(
     tokio::spawn(async move {
         let _ = input.run(sink).await;
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     output.send(batch).await.expect("send should succeed against a live logit_in");
 
@@ -96,7 +112,6 @@ async fn round_trip_with_provenance(
     tokio::spawn(async move {
         let _ = input.run(sink).await;
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     output.observe_batch(logit_pipeline::BatchContext {
         trace: logit_pipeline::TraceContext::new_root(),
@@ -121,8 +136,7 @@ async fn round_trip_with_provenance(
 /// (`docs/adr/batch-provenance-on-delivered.md`).
 #[tokio::test]
 async fn origin_and_previous_cross_the_wire_untouched_from_a_remote_peer() {
-    let addr = ephemeral_addr().await;
-    let input = LogitInput::new(addr.clone());
+    let (addr, input) = bound_input(|input| input).await;
     let output = LogitOutput::new(addr);
 
     let sent_provenance = logit_core::Provenance {
@@ -149,8 +163,7 @@ async fn origin_and_previous_cross_the_wire_untouched_from_a_remote_peer() {
 /// empty -- `logit_in` backfills its own id into both.
 #[tokio::test]
 async fn a_batch_with_no_provenance_gets_logit_ins_own_id_backfilled() {
-    let addr = ephemeral_addr().await;
-    let input = LogitInput::new(addr.clone());
+    let (addr, input) = bound_input(|input| input).await;
     let output = LogitOutput::new(addr);
 
     let batch = sample_batch();
@@ -171,8 +184,7 @@ async fn a_batch_with_no_provenance_gets_logit_ins_own_id_backfilled() {
 
 #[tokio::test]
 async fn logit_output_to_logit_input_round_trips_a_batch_plaintext() {
-    let addr = ephemeral_addr().await;
-    let input = LogitInput::new(addr.clone());
+    let (addr, input) = bound_input(|input| input).await;
     let output = LogitOutput::new(addr);
 
     let batch = sample_batch();
@@ -182,8 +194,7 @@ async fn logit_output_to_logit_input_round_trips_a_batch_plaintext() {
 
 #[tokio::test]
 async fn logit_output_to_logit_input_round_trips_a_lz4_compressed_batch() {
-    let addr = ephemeral_addr().await;
-    let input = LogitInput::new(addr.clone());
+    let (addr, input) = bound_input(|input| input).await;
     let output = LogitOutput::new(addr).with_compression(Compression::Lz4);
 
     let batch = sample_batch();
@@ -212,8 +223,7 @@ async fn a_statsd_decoded_batch_forwards_through_logit_out_and_logit_in_with_its
     let batch = EventBatch { resource, scope: None, events };
     assert_eq!(batch.events.len(), 1, "one statsd line should decode to one event");
 
-    let addr = ephemeral_addr().await;
-    let input = LogitInput::new(addr.clone());
+    let (addr, input) = bound_input(|input| input).await;
     let output = LogitOutput::new(addr);
 
     let received = round_trip(input, output, &batch).await;
@@ -248,17 +258,19 @@ mod tls {
 
     #[tokio::test]
     async fn logit_output_to_logit_input_round_trips_a_batch_over_server_tls() {
-        let addr = ephemeral_addr().await;
-        let input = LogitInput::new(addr.clone())
-            .with_tls(
-                &TlsServerSettings {
-                    cert_file: "server.pem".to_string(),
-                    key_file: "server.key".to_string(),
-                    client_ca_file: None,
-                },
-                &testdata_dir(),
-            )
-            .unwrap();
+        let (addr, input) = bound_input(|input| {
+            input
+                .with_tls(
+                    &TlsServerSettings {
+                        cert_file: "server.pem".to_string(),
+                        key_file: "server.key".to_string(),
+                        client_ca_file: None,
+                    },
+                    &testdata_dir(),
+                )
+                .unwrap()
+        })
+        .await;
         let output = LogitOutput::new(addr)
             .with_tls(
                 &TlsClientSettings { ca_file: Some("ca.pem".to_string()), ..Default::default() },
@@ -276,17 +288,19 @@ mod tls {
     /// (`testdata/tls/regen.sh`).
     #[tokio::test]
     async fn logit_output_to_logit_input_round_trips_a_batch_over_mutual_tls() {
-        let addr = ephemeral_addr().await;
-        let input = LogitInput::new(addr.clone())
-            .with_tls(
-                &TlsServerSettings {
-                    cert_file: "server.pem".to_string(),
-                    key_file: "server.key".to_string(),
-                    client_ca_file: Some("ca.pem".to_string()),
-                },
-                &testdata_dir(),
-            )
-            .unwrap();
+        let (addr, input) = bound_input(|input| {
+            input
+                .with_tls(
+                    &TlsServerSettings {
+                        cert_file: "server.pem".to_string(),
+                        key_file: "server.key".to_string(),
+                        client_ca_file: Some("ca.pem".to_string()),
+                    },
+                    &testdata_dir(),
+                )
+                .unwrap()
+        })
+        .await;
         let output = LogitOutput::new(addr)
             .with_tls(
                 &TlsClientSettings {
@@ -309,23 +323,24 @@ mod tls {
     /// sent -- `Fault::Clean`, since nothing of the batch left this sink.
     #[tokio::test]
     async fn a_client_trusting_the_wrong_ca_is_refused_and_classified_clean() {
-        let addr = ephemeral_addr().await;
-        let mut input = LogitInput::new(addr.clone())
-            .with_tls(
-                &TlsServerSettings {
-                    cert_file: "server.pem".to_string(),
-                    key_file: "server.key".to_string(),
-                    client_ca_file: None,
-                },
-                &testdata_dir(),
-            )
-            .unwrap();
+        let (addr, mut input) = bound_input(|input| {
+            input
+                .with_tls(
+                    &TlsServerSettings {
+                        cert_file: "server.pem".to_string(),
+                        key_file: "server.key".to_string(),
+                        client_ca_file: None,
+                    },
+                    &testdata_dir(),
+                )
+                .unwrap()
+        })
+        .await;
         let (tx, _rx) = mpsc::channel(16);
         let sink = Fanout::new(vec![tx]);
         tokio::spawn(async move {
             let _ = input.run(sink).await;
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut output = LogitOutput::new(addr)
             .with_timeout(Duration::from_millis(500))

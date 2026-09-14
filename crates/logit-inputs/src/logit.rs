@@ -4,6 +4,15 @@
 //! compression handshake (`Hello`/`HelloAck`, `logit_proto::native::control`), then a loop of
 //! one native frame in, one `Fanout::send`, one `Ack` out.
 //!
+//! **Binding.** The listening socket is opened by [`Input::bind`], not lazily inside
+//! [`Input::run_until_shutdown`] -- the bind pre-pass `otlp_in` (`crate::otlp`) and the shared TCP
+//! driver (`crate::tcp`) already use (`docs/plans/operator-surface.md`, workstream B). The runtime
+//! calls it for every input before a single node task is spawned, so an unavailable port fails
+//! startup rather than surfacing once every sibling listener is already live, and
+//! [`LogitInput::local_addr`] makes the OS-assigned port of a `:0` bind readable without a
+//! bind-drop-rebind race. `run_until_shutdown` still calls `bind` itself when nobody did, so a
+//! direct caller (this module's own tests) needs no extra step.
+//!
 //! **Ack point.** A connection's `Ack{seq}` is written only *after* `Fanout::send` returns, i.e.
 //! after the batch is in every downstream inbox -- a stalled downstream delays the ack, which
 //! stalls the sender's own `write_loop` on the other end. That *is* the backpressure this
@@ -91,6 +100,13 @@ pub struct LogitInput {
     tls: Option<Arc<rustls::ServerConfig>>,
     max_frame_bytes: u32,
     max_connections: usize,
+    /// Set by [`Input::bind`], taken back out by [`Input::run_until_shutdown`] -- the same
+    /// bind pre-pass `otlp_in` (`crate::otlp`) and the shared TCP driver (`crate::tcp`) use
+    /// (`docs/plans/operator-surface.md`, workstream B). Binding happens *before* `run` rather
+    /// than inside it so a port that can't be opened fails startup with nothing else running yet,
+    /// and so a caller can read the OS-assigned port off [`LogitInput::local_addr`] before
+    /// anything is spawned. `None` again after a run, so a second run rebinds.
+    listener: Option<TcpListener>,
     /// See this module's own doc comment's "Pre-`Hello` timeout" section.
     handshake_timeout: Duration,
 }
@@ -104,8 +120,15 @@ impl LogitInput {
             tls: None,
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             max_connections: MAX_CONCURRENT_CONNECTIONS,
+            listener: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
         }
+    }
+
+    /// The address actually bound, once [`Input::bind`] has run -- lets a caller (a test, the
+    /// runtime's own startup pass) learn the OS-assigned port without a bind-drop-rebind race.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.listener.as_ref().and_then(|l| l.local_addr().ok())
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
@@ -161,6 +184,16 @@ impl LogitInput {
 
 #[async_trait::async_trait]
 impl Input for LogitInput {
+    async fn bind(&mut self) -> anyhow::Result<()> {
+        if self.listener.is_some() {
+            return Ok(()); // idempotent, per `Input::bind`'s contract
+        }
+        let listener = TcpListener::bind(&self.bind).await?;
+        self.diag.info("bound", format_args!("listening on {}", self.bind));
+        self.listener = Some(listener);
+        Ok(())
+    }
+
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         // Mirrors `crate::udp::UdpListener::run`: a never-firing `watch` so `run` and
         // `run_until_shutdown` share one implementation rather than diverging.
@@ -173,7 +206,8 @@ impl Input for LogitInput {
         sink: Fanout,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let listener = TcpListener::bind(&self.bind).await?;
+        self.bind().await?;
+        let listener = self.listener.take().expect("bind() leaves a listener behind");
         let connection_limit = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
         let live_connections = Arc::new(AtomicI64::new(0));
@@ -705,11 +739,16 @@ mod tests {
 
     // ---- fixtures and harness -----------------------------------------------------------
 
+    /// Binds an ephemeral port through [`Input::bind`] and hands back the OS-assigned address
+    /// alongside the already-bound input -- the same shape `crate::tcp`'s own `bound_listener`
+    /// uses, replacing the bind-drop-rebind probe socket this file needed before `logit_in` had a
+    /// bind pre-pass. Because the socket is live on return, every test below can connect as soon
+    /// as it has spawned `run`, with no readiness sleep in between.
     async fn bound_input() -> (String, LogitInput) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        (addr.to_string(), LogitInput::new(addr.to_string()))
+        let mut input = LogitInput::new("127.0.0.1:0");
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("bind() leaves a real address behind").to_string();
+        (addr, input)
     }
 
     fn fanout_into_channel(capacity: usize) -> (Fanout, mpsc::Receiver<logit_pipeline::Delivered>) {
@@ -849,6 +888,56 @@ mod tests {
         })
     }
 
+    // ---- binding ----------------------------------------------------------------------------
+
+    /// The bind pre-pass (this module's "Binding" doc section,
+    /// `docs/plans/operator-surface.md` workstream B): the socket is listening, and its
+    /// OS-assigned address readable, before `run`'s accept loop has been spawned at all -- which
+    /// is what lets `logit run` fail startup on a taken port and lets a test connect with no
+    /// readiness sleep.
+    #[tokio::test]
+    async fn bind_makes_the_port_live_before_run_and_local_addr_reports_it() {
+        let mut input = LogitInput::new("127.0.0.1:0");
+        assert_eq!(input.local_addr(), None, "no address before bind()");
+
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("bind() should leave a real address behind");
+
+        // Nothing is running yet -- this connection sits in the accept backlog, which is exactly
+        // what makes the pre-pass worth having: no startup window where the port refuses.
+        let _early = connect(&addr.to_string()).await;
+    }
+
+    /// A second `bind()` is a no-op, per [`Input::bind`]'s idempotency contract -- the runtime
+    /// binds every input before spawning it and `run_until_shutdown` binds again for callers
+    /// outside the runtime, so the two must not fight over the socket.
+    #[tokio::test]
+    async fn a_second_bind_is_a_no_op() {
+        let mut input = LogitInput::new("127.0.0.1:0");
+        input.bind().await.expect("first bind should succeed");
+        let addr = input.local_addr().expect("bind() should leave a real address behind");
+        input.bind().await.expect("second bind should be a harmless no-op");
+        assert_eq!(input.local_addr(), Some(addr), "the address must not change");
+    }
+
+    /// The failure the pre-pass exists to surface early: a port someone else already holds is an
+    /// `Err` out of `bind`, which `run_with_telemetry`'s startup phase turns into a startup
+    /// failure with no node task spawned.
+    #[tokio::test]
+    async fn binding_a_port_already_held_is_an_error() {
+        let held = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = held.local_addr().unwrap().to_string();
+
+        let mut input = LogitInput::new(addr);
+        let err = input.bind().await.expect_err("the port is still held by `held`");
+        assert!(input.local_addr().is_none(), "a failed bind leaves no listener behind");
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::AddrInUse),
+            "expected AddrInUse, got {err}"
+        );
+    }
+
     // ---- provenance -------------------------------------------------------------------------
 
     /// A v2 client's own `origin`/`previous` cross the wire and come out the other side
@@ -860,7 +949,6 @@ mod tests {
         let (sink, mut rx) = fanout_into_channel_with_component("logit_in_test", 16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = connect(&addr).await;
         client_hello(&mut client, vec![native::CODEC_NATIVE_V2], vec![0]).await;
@@ -888,7 +976,6 @@ mod tests {
         let (sink, mut rx) = fanout_into_channel_with_component("logit_in_test", 16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = connect(&addr).await;
         client_hello(&mut client, vec![native::CODEC_NATIVE_V2], vec![0]).await;
@@ -912,7 +999,6 @@ mod tests {
         let (sink, mut rx) = fanout_into_channel_with_component("logit_in_test", 16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = connect(&addr).await;
         client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
@@ -937,7 +1023,6 @@ mod tests {
         let (sink, _rx) = fanout_into_channel(16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = connect(&addr).await;
         client_hello(&mut client, vec![native::CODEC_NATIVE_V2, native::CODEC_NATIVE_V1], vec![0])
@@ -958,7 +1043,6 @@ mod tests {
         let (sink, mut rx) = fanout_into_channel(16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = connect(&addr).await;
         client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
@@ -981,7 +1065,6 @@ mod tests {
         let (sink, _rx) = fanout_into_channel(16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = connect(&addr).await;
         client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0, Compression::Lz4 as u8])
@@ -1002,7 +1085,6 @@ mod tests {
         let (sink, _rx) = fanout_into_channel(16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = connect(&addr).await;
         client_hello(&mut client, vec![99], vec![0]).await;
@@ -1020,7 +1102,6 @@ mod tests {
         let (sink, _rx) = fanout_into_channel(16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = connect(&addr).await;
         let hello = control::Hello {
@@ -1045,7 +1126,6 @@ mod tests {
         let (sink, _rx) = fanout_into_channel(16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = connect(&addr).await;
         send_data_frame(&mut client, &sample_batch(), Compression::None).await;
@@ -1067,7 +1147,6 @@ mod tests {
         let (sink, _rx) = fanout_into_channel(16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = connect(&addr).await;
         client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
@@ -1097,7 +1176,6 @@ mod tests {
         let (sink, mut rx) = fanout_into_channel(1);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = connect(&addr).await;
         client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
@@ -1128,7 +1206,6 @@ mod tests {
         let (sink, _rx) = fanout_into_channel(16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = connect(&addr).await;
         client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
@@ -1164,7 +1241,6 @@ mod tests {
         let (sink, mut rx) = fanout_into_channel(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(async move { input.run_until_shutdown(sink, shutdown_rx).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Connect and handshake, then go idle -- never send a data frame.
         let mut client = connect(&addr).await;
@@ -1188,11 +1264,12 @@ mod tests {
         let (sink, _rx) = fanout_into_channel(16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // First connection: fills the one available slot, stays open and idle (never
         // handshakes -- holding the permit is all that matters here).
         let _first = connect(&addr).await;
+        // Not a readiness wait (`bound_input` already bound the port) -- this gives the accept
+        // loop time to actually take the permit for that connection before the next one arrives.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Second connection: over the cap -- should receive a Reject and close.
@@ -1281,7 +1358,6 @@ mod tests {
         let (sink, _rx) = fanout_into_channel(16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // First connection: raw TCP, sends nothing (not even a TLS ClientHello) -- takes the
         // listener's one permit, then the TLS accept step it's stuck in must time out and
@@ -1329,11 +1405,12 @@ mod tests {
         let (sink, _rx) = fanout_into_channel(16);
         let mut input = input;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // First connection: raw TCP, holds the one permit for the (default, 5s) handshake
         // timeout -- plenty of time for the rest of this test.
         let _first = connect(&addr).await;
+        // Not a readiness wait (`bound_input` already bound the port) -- this gives the accept
+        // loop time to actually take the permit for that connection before the next one arrives.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Second connection: past the cap, but completes a *real* TLS handshake first -- the
