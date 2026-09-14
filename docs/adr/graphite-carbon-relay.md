@@ -255,7 +255,8 @@ values, not a second, distinct data point. This is
 [`crates/logit-outputs/src/influxdb.rs:191-199`](../../crates/logit-outputs/src/influxdb.rs)'s
 argument (an identical `(measurement, tag set, timestamp)` write is an idempotent overwrite, not a
 duplicate point) applied to Whisper instead of InfluxDB's own idempotent-write semantics, and makes
-`graphite_out` the **first non-HTTP sink** to claim `true`. The argument's boundary, stated plainly
+`graphite_out` the **first non-HTTP sink with a real destination** to report `duplicate_safe: true`
+(`null_out` reports it trivially, having no destination). The argument's boundary, stated plainly
 because it does not generalize automatically: it rests on Whisper's specific storage semantics, and
 a non-Whisper Carbon-protocol backend (a relay that batches/derives rather than storing per-slot
 values) could behave differently. An operator pointing `graphite_out` at something other than a
