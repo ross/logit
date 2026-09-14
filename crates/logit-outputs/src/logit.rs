@@ -143,12 +143,20 @@ impl LogitOutput {
     /// Turns on TLS for this connection (`tls:` in config) -- presence turns it on, the
     /// `otlp_in`/`logit_in` server-side precedent, since `endpoint` here is a bare `host:port`
     /// (the `syslog_out` shape) with no scheme to select TLS the way `otlp_out`'s URL-shaped
-    /// endpoint does.
+    /// endpoint does. Warns via `self.diag` when `insecure_skip_verify` is set, the same
+    /// `otlp_out`/`syslog_out`/`prometheus_in` precedent (`logit-config/src/lib.rs`'s
+    /// `TlsClientConfig::insecure_skip_verify` doc comment promises this everywhere).
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
         base_dir: &Path,
     ) -> anyhow::Result<Self> {
+        if settings.insecure_skip_verify {
+            self.diag.warn(
+                "tls.insecure_skip_verify is set -- the connection is encrypted, but this \
+                 output will accept any certificate the peer presents, self-signed or otherwise",
+            );
+        }
         self.tls = Some(Arc::new(crate::tls::build_client_config(settings, base_dir)?));
         Ok(self)
     }
@@ -605,7 +613,7 @@ mod tests {
     use logit_inputs::logit::LogitInput;
     use logit_inputs::Input;
     use logit_pipeline::{classify, is_explicitly_permanent, Fanout};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
 
@@ -1136,6 +1144,84 @@ mod tests {
         assert!(
             err.to_string().contains("sanity cap"),
             "expected an error mentioning the sanity cap, got: {err}"
+        );
+    }
+
+    // -- `with_tls`'s `insecure_skip_verify` warning -------------------------------------------
+
+    /// A `tracing` subscriber that collects rendered events into a buffer, so the
+    /// `insecure_skip_verify` warning (`Diagnostics::warn`, which reports through `tracing` only
+    /// and has no telemetry counterpart) can actually be asserted on rather than assumed.
+    /// Copied from `syslog.rs`'s own `CapturedLogs`.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn tls_insecure_skip_verify_warns() {
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        let logs = CapturedLogs::default();
+        let guard = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish()
+            .set_default();
+
+        // `with_tls` warns at build time, before any connection is attempted -- no socket needed.
+        LogitOutput::new("localhost:0")
+            .with_diagnostics(Diagnostics::new("logit_out"))
+            .with_tls(
+                &TlsClientSettings { insecure_skip_verify: true, ..Default::default() },
+                Path::new("."),
+            )
+            .expect("insecure_skip_verify is legal, if loud");
+        drop(guard);
+
+        let logged = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+        assert!(
+            logged.contains("tls.insecure_skip_verify is set"),
+            "the warning must actually be emitted: {logged}"
+        );
+    }
+
+    #[test]
+    fn tls_default_settings_emit_no_insecure_skip_verify_warning() {
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        let logs = CapturedLogs::default();
+        let guard = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish()
+            .set_default();
+
+        LogitOutput::new("localhost:0")
+            .with_diagnostics(Diagnostics::new("logit_out"))
+            .with_tls(&TlsClientSettings::default(), Path::new("."))
+            .expect("default tls settings are legal");
+        drop(guard);
+
+        let logged = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+        assert!(
+            !logged.contains("tls.insecure_skip_verify is set"),
+            "default settings must not warn: {logged}"
         );
     }
 }

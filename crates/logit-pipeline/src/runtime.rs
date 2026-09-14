@@ -1360,6 +1360,10 @@ pub fn process_batch(
             None => absorbed += 1,
         }
     }
+    // Inside the timer on purpose: whatever a transform defers to `end_batch` is still its own
+    // per-batch work (`Transform::end_batch`'s doc comment), and attribution
+    // (`docs/design/internal-telemetry.md`) should keep charging it to this node.
+    transform.end_batch();
     drop(process_timer);
     if absorbed > 0 {
         telemetry.count(

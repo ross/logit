@@ -88,9 +88,19 @@ format is flat by construction, so nothing needs this today, and a path syntax i
 concrete consumer would need escaping rules for a literal dot in a real attribute name — speculative
 complexity with no requirement driving it.
 
-**Distributions produce a single-sample `DdSketch`**, exactly as `crates/logit-inputs/src/statsd.rs`
-does for its `ms`/`h`/`d` metric types — one `DdSketch::new()` plus one `add`, left for `aggregate`
-to merge across events the same way statsd-sourced timings already are.
+**Distributions produce a raw, single-observation `MetricKind::Samples`**, exactly as
+`crates/logit-inputs/src/statsd.rs` does for its `ms`/`h`/`d` metric types since
+[lossless-transit](lossless-transit.md)'s W3 — the value rides verbatim (one `f64`, inline in
+`Samples`' own `SmallVec`, no allocation), left for `aggregate` to sketch and merge across events
+the same way statsd-sourced timings already are. This replaced the original single-sample
+`DdSketch` (one `DdSketch::new()` plus one `add` per distribution per event, i.e. one heap `bins`
+allocation each) when the `json-parse` load-test flamegraph showed those allocations and the
+sketch arithmetic as a real share of the transform's per-event cost: summarizing is the named,
+opt-in step `aggregate` owns (`docs/adr/lossless-transit.md`), not something a producer should
+pre-pay per event. A pipeline that sends `kv_metrics` output straight to a sink with no
+`aggregate` in between gets `Samples` records instead of `Distribution` ones; every encoder
+already handles both (`Samples::sketch` is the shared re-summarization for the ones that need a
+sketch).
 
 **Metric names and units are interned once, at construction (`KvMetrics::new`), not per event.**
 `intern`/`resolve` are hash lookups; this runs on the hot path once per configured metric per event,
