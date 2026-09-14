@@ -1079,14 +1079,21 @@ undercounted it, is the `Vec<Event>` backing storage itself --
 `events.capacity() * size_of::<Event>()` -- which every event pays (864 bytes each, §1) *before*
 any nested heap payload; a batch of numeric-only metrics with no string attributes would otherwise
 estimate close to zero despite genuinely holding hundreds of bytes per event. On top of that: a
-batch's attribute keys/values, log bodies, span-owned data (name, every `SpanEvent`/`SpanLink`'s own
+batch's attribute values, log bodies, span-owned data (name, every `SpanEvent`/`SpanLink`'s own
 backing storage and attributes, and -- since ADR `metrics-model-v2` -- a boxed `SpanExt`'s own
-size), and metric records (name/unit/description symbols, exemplars, a spilled `Samples`'s heap
+size), and metric records (exemplars, a spilled `Samples`'s heap
 capacity, a `Set`'s `HyperLogLog::heap_bytes()` -- real state now, not the zero-sized stub it used
 to be (`docs/plans/lossless-transit.md`'s W2) -- `SetMembers`'s own member byte lengths, and
 `Histogram`/`ExponentialHistogram`'s bucket `Vec`s), plus its `Resource`'s and, if present, its
 `Scope`'s attributes, each counted once per
-batch rather than once per event (both are `Arc`-shared across the batch, not copied per event). It
+batch rather than once per event (both are `Arc`-shared across the batch, not copied per event).
+Interned `Symbol`s -- attribute keys, metric names/units/descriptions, a log's `event_name` --
+count for nothing: on the event they are 4-byte handles, the bytes they name live in the
+process-wide interner (§4) for the life of the process, and dropping a batch frees none of them.
+They *used* to be resolved and counted by length, which cost an interner probe per key per event
+on every queue push -- ~30% of the `json-parse` load-test scenario's samples once `kv_metrics`
+was fixed, more than either transform -- for a number that billed shared bytes once per event per
+hop. It
 is an admission-control estimate, not an allocator-accounting figure — unlike §1's numbers, it is
 *not* asserted exactly anywhere, and is deliberately exempt from `type_sizes.rs`/`allocations.rs`'s
 exact-equality discipline: a `MetricKind::Distribution`'s `DDSketch` is approximated with a fixed
