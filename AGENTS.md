@@ -147,7 +147,9 @@ config block it introduces. `syslog_in`, `graphite_in` and `statsd_in` can each 
 `transport: tcp` on a second, generic stream driver, `logit-inputs::tcp::TcpListener` — an accept
 loop, a connection cap, per-listener framing (RFC 6587's auto-detecting pair for `syslog_in`,
 LF-delimited lines for `statsd_in` and carbon plaintext, carbon's 4-byte length prefix for pickle),
-a `handshake_timeout:` bounding each pre-message phase, and a `tls:` block (RFC 5425 for syslog, a
+a `handshake_timeout:` bounding each pre-message phase, an opt-in `idle_timeout:` bounding the
+quiet gaps after them (off by default; [ADR `idle-connection-timeout`](docs/adr/idle-connection-timeout.md)),
+and a `tls:` block (RFC 5425 for syslog, a
 `logit`-to-`logit` or stunnel-shaped relay hop for the other two) — see
 [ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md) and its amendment.
 `logit` now has an operator surface: leveled, structured self-logging through `tracing`
