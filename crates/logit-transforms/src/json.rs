@@ -7,7 +7,7 @@
 //! `process`, taking the trait's default `flush_interval`/`flush`.
 
 use bytes::Bytes;
-use logit_core::interner::{intern, resolve};
+use logit_core::interner::intern;
 use logit_core::{AttrMap, Diagnostics, Event, Resource, Symbol, Value};
 use logit_pipeline::Transform;
 use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
@@ -91,13 +91,14 @@ impl Transform for JsonParser {
             Ok(()) => {
                 // Moved out of `scratch`, not cloned: `scratch` is the sole owner of each `Value`
                 // here and is about to be emptied anyway, so there's nothing left for a clone to
-                // preserve. Still a `resolve` -> `intern` round trip per key -- `AttrMap::insert`
-                // takes `&str`, not `Symbol` -- which a `Symbol`-keyed insert would remove; left
-                // as a follow-up (see PR description) rather than adding one to
-                // `logit-core::attrs` here, since another workstream is already changing
-                // `AttrMap::get`'s interning in that file.
+                // preserve. Merged by `Symbol` (`AttrMap::insert_sym`), the same way `logfmt`'s
+                // `merge_into` drains its scratch: the keys were interned straight off the
+                // deserializer (`KeySeed`), so `resolve`-ing each back to a `&str` for
+                // `AttrMap::insert` to re-intern -- what this loop used to do -- was two more
+                // interner probes per key for nothing. On the `json-parse` load-test scenario
+                // that round trip was roughly a fifth of all samples.
                 for (key, value) in self.scratch.drain(..) {
-                    event.attributes.insert(resolve(key), value);
+                    event.attributes.insert_sym(key, value);
                 }
             }
             Err(err) => {
@@ -330,9 +331,10 @@ fn collect_attrmap<'de, A: MapAccess<'de>>(mut map: A, base: &Bytes) -> Result<A
     let mut attrs = AttrMap::new();
     while let Some(key) = map.next_key_seed(KeySeed)? {
         let value = map.next_value_seed(ValueSeed { base })?;
-        // Last-writer-wins on a duplicate key within one object -- plain `AttrMap::insert`
-        // semantics, same as a parsed key overwriting a pre-existing attribute of the same name.
-        attrs.insert(resolve(key), value);
+        // Last-writer-wins on a duplicate key within one object -- `insert_sym` overwrites on an
+        // equal `Symbol`, same as a parsed key overwriting a pre-existing attribute of the same
+        // name. By `Symbol`, not `resolve(key)` -> `insert(&str)`: see `process`'s merge loop.
+        attrs.insert_sym(key, value);
     }
     Ok(attrs)
 }
@@ -543,6 +545,23 @@ mod tests {
         event.attributes.insert("a", Value::str("old"));
         let event = parser.process(&resource, event).expect("log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::U64(1)));
+    }
+
+    /// Both merge paths -- `process`'s top-level drain and `collect_attrmap`'s nested build --
+    /// insert by `Symbol`, and both must keep last-writer-wins on a key repeated within one
+    /// object (the policy `TopLevelVisitor::visit_map`'s comment relies on).
+    #[test]
+    fn a_duplicate_key_within_one_object_takes_the_last_value_at_every_depth() {
+        let mut parser = JsonParser::new(false);
+        let resource = default_resource();
+        let event = log_event(r#"{"a":1,"n":{"b":1,"b":2},"a":2}"#);
+        let event = parser.process(&resource, event).expect("log events pass through");
+
+        assert_eq!(attr(&event, "a"), Some(&Value::U64(2)));
+        let mut nested = AttrMap::new();
+        nested.insert("b", Value::U64(2));
+        assert_eq!(attr(&event, "n"), Some(&Value::Map(Box::new(nested))));
+        assert_eq!(event.attributes.len(), 2, "a duplicate must overwrite, not add an entry");
     }
 
     #[test]
