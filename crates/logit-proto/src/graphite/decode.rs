@@ -53,6 +53,38 @@ pub struct GraphiteDecoder {
     pickle: PickleReader,
 }
 
+/// Hand-written, not derived: [`PickleReader`] is a reusable *scratch* machine, and a clone must
+/// get a fresh one rather than a copy of whatever the original last left in it.
+///
+/// `Clone` at all because `graphite_in` runs on the shared TCP driver
+/// (`crates/logit-inputs/src/tcp.rs`'s "`D: Clone` is load-bearing" doc section), which hands
+/// every accepted connection its own decoder -- the pickle stack, arenas and memo are per-stream
+/// state and must not be shared between connections. Deriving would be *correct* today only by
+/// accident: every one of those five `Vec`s is cleared at the start of each frame
+/// (`PickleReader::parse`'s five `clear()`s), so no cross-frame state survives to copy -- but the
+/// derive would
+/// also copy each one's spare capacity into every new connection, which is the opposite of the
+/// point, and would silently start carrying real state the day the reader keeps anything across
+/// frames. [`PickleReader::new`] instead: a connection warms its own arenas on its first frame.
+///
+/// `resource` stays one shared [`Arc`], deliberately: `logit_pipeline::BatchAccumulator::absorb`
+/// keys accumulation on `Arc::ptr_eq`, so a resource per connection would stop two connections'
+/// events ever sharing a batch downstream (the `resource` field's own doc). `diag` and
+/// `telemetry` are shared handles too -- a `Diagnostics` clone shares its original's throttle
+/// counts (`logit_core::Diagnostics`' type doc), which is what makes `bad_line` throttle per
+/// listener rather than per connection.
+impl Clone for GraphiteDecoder {
+    fn clone(&self) -> Self {
+        Self {
+            protocol: self.protocol,
+            resource: Arc::clone(&self.resource),
+            diag: self.diag.clone(),
+            telemetry: self.telemetry.clone(),
+            pickle: PickleReader::new(),
+        }
+    }
+}
+
 impl GraphiteDecoder {
     /// A plaintext decoder over `resource`. Use [`GraphiteDecoder::with_protocol`] for pickle.
     pub fn new(resource: Arc<Resource>) -> Self {
