@@ -409,15 +409,43 @@ pub enum ComponentKind {
     /// 17). `transport: udp` runs the shared datagram listener and takes the whole `receive:`
     /// block. `protocol: pickle` requires `transport: tcp` (rule 46): the 4-byte big-endian length
     /// prefix carbon frames a pickle batch with has no meaning in a self-delimiting datagram.
+    ///
+    /// `tls:`'s mere presence turns TLS on **and makes it required** -- there is no plaintext
+    /// fallback on a TLS listener. Like `syslog_in`'s, it applies to `transport: tcp` only (rule
+    /// 43): carbon has no DTLS receiver of any kind, so `tls:` under `transport: udp` is a config
+    /// error rather than a silently ignored block. Plain carbon senders have no TLS of their own
+    /// either -- this is for a `logit`-to-`logit` or stunnel-shaped relay hop.
     GraphiteIn {
         bind: String,
         #[serde(default)]
         transport: GraphiteTransport,
         #[serde(default)]
         protocol: GraphiteProtocol,
+        /// Terminates TLS on this listener when present; plaintext when omitted. Requires
+        /// `transport: tcp`. No ALPN -- like `syslog_in` and `logit_in`, and unlike `otlp_in`,
+        /// this isn't an HTTP-shaped protocol with anything for a client to negotiate down to.
+        /// See [`TlsServerConfig`].
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        /// **`transport: tcp` only** (rule 45 rejects a non-default value under `transport:
+        /// udp`, where a datagram listener has no connection to time out). How long one
+        /// connection has, **per pre-message phase**, to get somewhere before this listener
+        /// closes it and hands back its connection-cap permit: the TLS accept when `tls:` is
+        /// set, and then the wait for the connection's very first byte. Each phase gets its own
+        /// budget of this length, so a TLS connection that says nothing at all costs up to two
+        /// of them -- 10s at the default.
+        ///
+        /// **Not an idle timeout.** Once a connection has sent its first byte there is no bound
+        /// on the gap before the next datapoint -- a carbon relay that flushes once a minute is
+        /// ordinary traffic, not a fault. A connection that goes silent *after* that first byte
+        /// holds its permit indefinitely; that is a known, deliberately separate gap
+        /// (`docs/known-gaps.md`'s "no idle-connection timeout on a TCP listener" row).
+        #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        handshake_timeout: Duration,
         /// The longest plaintext line this listener will assemble before giving up on it and
-        /// draining to the next newline (counted once as `logit.input.metrics.skipped
-        /// {reason="oversize_line"}`; the line *after* it still decodes). Defaults to `"8192"` --
+        /// draining to the next newline (counted once as `logit.input.frames.dropped
+        /// {reason="oversize"}`; the line *after* it still decodes). Defaults to `"8192"` --
         /// carbon itself sets no such bound and Twisted's `LineReceiver` defaults to 16384, so
         /// 8 KiB is comfortably past any real tagged path while keeping one hostile connection
         /// from growing an unbounded read buffer. A string via [`human_bytes`], exactly like
@@ -427,8 +455,9 @@ pub enum ComponentKind {
         #[schemars(with = "String")]
         max_line_bytes: u64,
         /// The largest pickle frame this listener will accept. A frame declaring more than this
-        /// closes the connection (diagnostic `oversize_frame`): a length-framed stream has no
-        /// resync point, so there is nothing to skip forward to. Defaults to `"1MiB"`, Twisted's
+        /// closes the connection (`logit.input.frames.dropped{reason="oversize"}`, diagnostic
+        /// `framing_error`): a length-framed stream has no resync point, so there is nothing to
+        /// skip forward to. Defaults to `"1MiB"`, Twisted's
         /// `Int32StringReceiver.MAX_LENGTH`, which is what carbon's own pickle receiver inherits
         /// -- so a `logit` relay refuses exactly the frames carbon would. Rule 46 rejects `0` and
         /// anything outside `1024..=16MiB`. `protocol: pickle` only.
@@ -3266,7 +3295,8 @@ mod tests {
 
     /// Every `graphite_in` field but `bind` is optional, and the defaults are carbon's own:
     /// TCP plaintext (its default listener is plaintext on 2003), an 8 KiB line bound and
-    /// Twisted's 1 MiB `Int32StringReceiver.MAX_LENGTH` frame bound.
+    /// Twisted's 1 MiB `Int32StringReceiver.MAX_LENGTH` frame bound -- plus no TLS and the
+    /// shared 5s `handshake_timeout` the other TCP listeners default to.
     #[test]
     fn graphite_in_component_defaults_to_tcp_plaintext_with_carbons_bounds() {
         let component: Component =
@@ -3276,16 +3306,43 @@ mod tests {
                 bind,
                 transport,
                 protocol,
+                tls,
+                handshake_timeout,
                 max_line_bytes,
                 max_frame_bytes,
             } => {
                 assert_eq!(bind, "0.0.0.0:2003");
                 assert_eq!(transport, GraphiteTransport::Tcp);
                 assert_eq!(protocol, GraphiteProtocol::Plaintext);
+                assert_eq!(tls, None, "plaintext unless a tls: block says otherwise");
+                assert_eq!(handshake_timeout, Duration::from_secs(5));
                 assert_eq!(max_line_bytes, 8192);
                 assert_eq!(max_frame_bytes, 1 << 20);
             }
             other => panic!("expected GraphiteIn, got {other:?}"),
+        }
+    }
+
+    /// `tls:` and `handshake_timeout:` round-trip on a `graphite_in`, the twin of `syslog_in`'s
+    /// own test -- both reach `GraphiteInput` through `logit-cli`'s `build_spec`, and both are
+    /// rejected on `transport: udp` by graph rules 43/45.
+    #[test]
+    fn graphite_in_component_parses_tls_and_handshake_timeout() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "graphite_in", "bind": "0.0.0.0:2003",
+                "handshake_timeout": "2s",
+                "tls": {"cert_file": "server.pem", "key_file": "server.key",
+                        "client_ca_file": "ca.pem"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::GraphiteIn { tls: Some(tls), handshake_timeout, .. } => {
+                assert_eq!(tls.cert_file, "server.pem");
+                assert_eq!(tls.key_file, "server.key");
+                assert_eq!(tls.client_ca_file, Some("ca.pem".to_string()));
+                assert_eq!(handshake_timeout, Duration::from_secs(2));
+            }
+            other => panic!("expected GraphiteIn with tls set, got {other:?}"),
         }
     }
 

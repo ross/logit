@@ -353,12 +353,23 @@ fn build_spec(
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
         // Both transports go through one component (`logit_inputs::graphite::GraphiteInput`),
-        // which picks its own driver from `transport`: the shared `UdpListener` under `udp`, its
-        // own accept loop under `tcp`. `with_receive` is safe to call either way -- graph rule 17
-        // has already rejected a queue-bounding field on the TCP case, so what reaches the accept
-        // loop is only the batch-assembly half it actually reads.
-        GraphiteIn { bind, transport, protocol, max_line_bytes, max_frame_bytes } => {
-            let input = GraphiteInput::new(
+        // which picks its own shared driver from `transport`: `UdpListener` under `udp`,
+        // `TcpListener` under `tcp`. `with_receive` is safe to call either way -- graph rule 17
+        // has already rejected a queue-bounding field on the TCP case, so what reaches the stream
+        // driver is only the batch-assembly half it actually reads. `handshake_timeout` is a no-op
+        // on the UDP arm, which has no connection to bound (rule 45 has already rejected a
+        // non-default value there); `tls:` is TCP-only -- rule 43 has already rejected it under
+        // UDP, and `GraphiteInput::with_tls` refuses it again on that arm.
+        GraphiteIn {
+            bind,
+            transport,
+            protocol,
+            tls,
+            handshake_timeout,
+            max_line_bytes,
+            max_frame_bytes,
+        } => {
+            let mut input = GraphiteInput::new(
                 bind.clone(),
                 graphite_transport(*transport),
                 graphite_protocol(*protocol),
@@ -367,7 +378,11 @@ fn build_spec(
             .with_telemetry(telemetry.clone())
             .with_receive(receive_config(&component.receive))
             .with_max_line_bytes(*max_line_bytes as usize)
-            .with_max_frame_bytes(*max_frame_bytes as usize);
+            .with_max_frame_bytes(*max_frame_bytes as usize)
+            .with_handshake_timeout(*handshake_timeout);
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
+            }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
         // The transport picks both the constructor and the matching `receive:` translation:
@@ -1890,6 +1905,14 @@ mod tests {
         transport: logit_config::GraphiteTransport,
         protocol: logit_config::GraphiteProtocol,
     ) -> ResolvedComponent {
+        graphite_component_with_tls(transport, protocol, None)
+    }
+
+    fn graphite_component_with_tls(
+        transport: logit_config::GraphiteTransport,
+        protocol: logit_config::GraphiteProtocol,
+        tls: Option<logit_config::TlsServerConfig>,
+    ) -> ResolvedComponent {
         ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig {
@@ -1903,10 +1926,51 @@ mod tests {
                 bind: "127.0.0.1:0".to_string(),
                 transport,
                 protocol,
+                tls,
+                handshake_timeout: Duration::from_secs(5),
                 max_line_bytes: 8192,
                 max_frame_bytes: 1 << 20,
             },
         }
+    }
+
+    /// The `graphite_in` twin of `build_spec_wires_a_tls_server_config_into_a_tcp_syslog_input`,
+    /// with its negative half in the same test for the same reason: the positive case passes even
+    /// with the `with_tls` call deleted (`build_spec` would still hand back a `NodeSpec::Input`),
+    /// so only a cert path that does not exist actually pins that the certificate is being loaded.
+    /// Graph rule 43 never touches the filesystem, so `build_spec` is where a bad path first fails.
+    #[test]
+    fn build_spec_builds_a_tls_graphite_input() {
+        use logit_config::{GraphiteProtocol, GraphiteTransport};
+        let component = graphite_component_with_tls(
+            GraphiteTransport::Tcp,
+            GraphiteProtocol::Plaintext,
+            Some(logit_config::TlsServerConfig {
+                cert_file: "server.pem".to_string(),
+                key_file: "server.key".to_string(),
+                client_ca_file: None,
+            }),
+        );
+        assert!(matches!(
+            build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+
+        let missing = graphite_component_with_tls(
+            GraphiteTransport::Tcp,
+            GraphiteProtocol::Plaintext,
+            Some(logit_config::TlsServerConfig {
+                cert_file: "does-not-exist.pem".to_string(),
+                key_file: "server.key".to_string(),
+                client_ca_file: None,
+            }),
+        );
+        let err = match build_spec("in", &missing, &testdata_tls_dir(), None) {
+            Ok(_) => panic!("expected a missing tls.cert_file to fail build_spec"),
+            Err(err) => format!("{err:?}"),
+        };
+        assert!(err.contains("tls.cert_file"), "got: {err}");
+        assert!(err.contains("does-not-exist.pem"), "got: {err}");
     }
 
     /// Every `transport`/`protocol` pair rule 46 permits builds a real input, and the `receive:`

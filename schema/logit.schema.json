@@ -170,7 +170,7 @@
           }
         },
         {
-          "description": "Graphite/Carbon metric ingress -- carbon's plaintext line protocol or its pickle batch protocol, over TCP or UDP (`docs/adr/graphite-carbon-relay.md`; `crates/logit-inputs/src/graphite/` is the listener, `crates/logit-proto/src/graphite/` the codec). The listener half of the `graphite_in -> graphite_out` lossless pair.\n\n`bind` is an ordinary `host:port` -- carbon's own plaintext port is `2003` and its pickle port is `2004`. There is deliberately no `prefix:`/`template:` field and no `graphite.*` attribute namespace: a datapoint's dotted path **is** the metric name and its `;k=v` tags **are** event attributes, so a `lua`/`set` stage that renames the metric renames the wire path. See `docs/deploying.md`'s `graphite_in` section.\n\n`transport: tcp` (the default, matching carbon's own default listener) runs an accept loop with no receive queue -- TCP's own flow control is the backpressure -- so unlike a datagram listener only `receive:`'s batch-assembly and `shutdown_grace` fields apply to it (rule 17). `transport: udp` runs the shared datagram listener and takes the whole `receive:` block. `protocol: pickle` requires `transport: tcp` (rule 46): the 4-byte big-endian length prefix carbon frames a pickle batch with has no meaning in a self-delimiting datagram.",
+          "description": "Graphite/Carbon metric ingress -- carbon's plaintext line protocol or its pickle batch protocol, over TCP or UDP (`docs/adr/graphite-carbon-relay.md`; `crates/logit-inputs/src/graphite/` is the listener, `crates/logit-proto/src/graphite/` the codec). The listener half of the `graphite_in -> graphite_out` lossless pair.\n\n`bind` is an ordinary `host:port` -- carbon's own plaintext port is `2003` and its pickle port is `2004`. There is deliberately no `prefix:`/`template:` field and no `graphite.*` attribute namespace: a datapoint's dotted path **is** the metric name and its `;k=v` tags **are** event attributes, so a `lua`/`set` stage that renames the metric renames the wire path. See `docs/deploying.md`'s `graphite_in` section.\n\n`transport: tcp` (the default, matching carbon's own default listener) runs an accept loop with no receive queue -- TCP's own flow control is the backpressure -- so unlike a datagram listener only `receive:`'s batch-assembly and `shutdown_grace` fields apply to it (rule 17). `transport: udp` runs the shared datagram listener and takes the whole `receive:` block. `protocol: pickle` requires `transport: tcp` (rule 46): the 4-byte big-endian length prefix carbon frames a pickle batch with has no meaning in a self-delimiting datagram.\n\n`tls:`'s mere presence turns TLS on **and makes it required** -- there is no plaintext fallback on a TLS listener. Like `syslog_in`'s, it applies to `transport: tcp` only (rule 43): carbon has no DTLS receiver of any kind, so `tls:` under `transport: udp` is a config error rather than a silently ignored block. Plain carbon senders have no TLS of their own either -- this is for a `logit`-to-`logit` or stunnel-shaped relay hop.",
           "type": "object",
           "required": [
             "bind",
@@ -180,13 +180,18 @@
             "bind": {
               "type": "string"
             },
+            "handshake_timeout": {
+              "description": "**`transport: tcp` only** (rule 45 rejects a non-default value under `transport: udp`, where a datagram listener has no connection to time out). How long one connection has, **per pre-message phase**, to get somewhere before this listener closes it and hands back its connection-cap permit: the TLS accept when `tls:` is set, and then the wait for the connection's very first byte. Each phase gets its own budget of this length, so a TLS connection that says nothing at all costs up to two of them -- 10s at the default.\n\n**Not an idle timeout.** Once a connection has sent its first byte there is no bound on the gap before the next datapoint -- a carbon relay that flushes once a minute is ordinary traffic, not a fault. A connection that goes silent *after* that first byte holds its permit indefinitely; that is a known, deliberately separate gap (`docs/known-gaps.md`'s \"no idle-connection timeout on a TCP listener\" row).",
+              "default": "5s",
+              "type": "string"
+            },
             "max_frame_bytes": {
-              "description": "The largest pickle frame this listener will accept. A frame declaring more than this closes the connection (diagnostic `oversize_frame`): a length-framed stream has no resync point, so there is nothing to skip forward to. Defaults to `\"1MiB\"`, Twisted's `Int32StringReceiver.MAX_LENGTH`, which is what carbon's own pickle receiver inherits -- so a `logit` relay refuses exactly the frames carbon would. Rule 46 rejects `0` and anything outside `1024..=16MiB`. `protocol: pickle` only.",
+              "description": "The largest pickle frame this listener will accept. A frame declaring more than this closes the connection (`logit.input.frames.dropped{reason=\"oversize\"}`, diagnostic `framing_error`): a length-framed stream has no resync point, so there is nothing to skip forward to. Defaults to `\"1MiB\"`, Twisted's `Int32StringReceiver.MAX_LENGTH`, which is what carbon's own pickle receiver inherits -- so a `logit` relay refuses exactly the frames carbon would. Rule 46 rejects `0` and anything outside `1024..=16MiB`. `protocol: pickle` only.",
               "default": "1048576",
               "type": "string"
             },
             "max_line_bytes": {
-              "description": "The longest plaintext line this listener will assemble before giving up on it and draining to the next newline (counted once as `logit.input.metrics.skipped {reason=\"oversize_line\"}`; the line *after* it still decodes). Defaults to `\"8192\"` -- carbon itself sets no such bound and Twisted's `LineReceiver` defaults to 16384, so 8 KiB is comfortably past any real tagged path while keeping one hostile connection from growing an unbounded read buffer. A string via [`human_bytes`], exactly like `TailOptions::max_line_bytes`. Rule 46 rejects `0`. TCP plaintext only -- a UDP datagram is already its own frame.",
+              "description": "The longest plaintext line this listener will assemble before giving up on it and draining to the next newline (counted once as `logit.input.frames.dropped {reason=\"oversize\"}`; the line *after* it still decodes). Defaults to `\"8192\"` -- carbon itself sets no such bound and Twisted's `LineReceiver` defaults to 16384, so 8 KiB is comfortably past any real tagged path while keeping one hostile connection from growing an unbounded read buffer. A string via [`human_bytes`], exactly like `TailOptions::max_line_bytes`. Rule 46 rejects `0`. TCP plaintext only -- a UDP datagram is already its own frame.",
               "default": "8192",
               "type": "string"
             },
@@ -195,6 +200,18 @@
               "allOf": [
                 {
                   "$ref": "#/definitions/GraphiteProtocol"
+                }
+              ]
+            },
+            "tls": {
+              "description": "Terminates TLS on this listener when present; plaintext when omitted. Requires `transport: tcp`. No ALPN -- like `syslog_in` and `logit_in`, and unlike `otlp_in`, this isn't an HTTP-shaped protocol with anything for a client to negotiate down to. See [`TlsServerConfig`].",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsServerConfig"
+                },
+                {
+                  "type": "null"
                 }
               ]
             },
